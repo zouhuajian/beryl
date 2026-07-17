@@ -25,8 +25,6 @@ pub(crate) const METADATA_RAFT_LOG_DURABLE_WRITE_DURATION_SECONDS: &str =
     "metadata_raft_log_durable_write_duration_seconds";
 pub(crate) const METADATA_RAFT_SNAPSHOT_BYTES_TOTAL: &str = "metadata_raft_snapshot_bytes_total";
 pub(crate) const METADATA_RAFT_SNAPSHOT_DURATION_SECONDS: &str = "metadata_raft_snapshot_duration_seconds";
-pub(crate) const METADATA_RAFT_DEDUP_RECORDS: &str = "metadata_raft_dedup_records";
-pub(crate) const METADATA_RAFT_DEDUP_BYTES: &str = "metadata_raft_dedup_bytes";
 pub(crate) const METADATA_RAFT_STORAGE_CLEANUP_TOTAL: &str = "metadata_raft_storage_cleanup_total";
 pub(crate) const METADATA_RAFT_ACTIVE_GENERATION: &str = "metadata_raft_active_generation";
 pub(crate) const METADATA_RAFT_AUTHORITY_COMMIT_DURATION_SECONDS: &str =
@@ -137,16 +135,6 @@ pub(crate) fn record_raft_snapshot(
         "status" => status
     )
     .record(duration_seconds);
-}
-
-pub(crate) fn record_raft_dedup_insert(bytes: usize) {
-    metrics::gauge!(METADATA_RAFT_DEDUP_RECORDS).increment(1.0);
-    metrics::gauge!(METADATA_RAFT_DEDUP_BYTES).increment(bytes as f64);
-}
-
-pub(crate) fn record_raft_dedup_state(records: u64, bytes: u64) {
-    metrics::gauge!(METADATA_RAFT_DEDUP_RECORDS).set(records as f64);
-    metrics::gauge!(METADATA_RAFT_DEDUP_BYTES).set(bytes as f64);
 }
 
 pub(crate) fn record_raft_storage_cleanup(kind: &'static str, count: usize) {
@@ -418,9 +406,8 @@ fn ufs_error_kind(kind: UfsErrorKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::{AppMetadataRaftState, AppRaftStateMachine, Command, DedupKey, Mutation, RocksDBStorage};
+    use crate::raft::{AppMetadataRaftState, AppRaftStateMachine, Command, RocksDBStorage};
     use beryl_types::fs::{FileAttrs, InodeId};
-    use beryl_types::{CallId, ClientId};
     use metrics::{
         Counter, CounterFn, Gauge, GaugeFn, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
     };
@@ -429,7 +416,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn metadata_metric_contract_names() -> [&'static str; 36] {
+    fn metadata_metric_contract_names() -> [&'static str; 34] {
         [
             METADATA_UP,
             METADATA_BUILD_INFO,
@@ -446,8 +433,6 @@ mod tests {
             METADATA_RAFT_LOG_DURABLE_WRITE_DURATION_SECONDS,
             METADATA_RAFT_SNAPSHOT_BYTES_TOTAL,
             METADATA_RAFT_SNAPSHOT_DURATION_SECONDS,
-            METADATA_RAFT_DEDUP_RECORDS,
-            METADATA_RAFT_DEDUP_BYTES,
             METADATA_RAFT_STORAGE_CLEANUP_TOTAL,
             METADATA_RAFT_ACTIVE_GENERATION,
             METADATA_RAFT_AUTHORITY_COMMIT_DURATION_SECONDS,
@@ -504,8 +489,6 @@ mod tests {
             "metadata_raft_log_durable_write_duration_seconds",
             "metadata_raft_snapshot_bytes_total",
             "metadata_raft_snapshot_duration_seconds",
-            "metadata_raft_dedup_records",
-            "metadata_raft_dedup_bytes",
             "metadata_raft_storage_cleanup_total",
             "metadata_raft_active_generation",
             "metadata_raft_authority_commit_duration_seconds",
@@ -590,8 +573,6 @@ mod tests {
         record_raft_apply("ok", "none", 0.002);
         record_raft_log_durable_write("ok", 128, 0.002);
         record_raft_snapshot("build", "complete", "ok", 1024, 0.002);
-        record_raft_dedup_insert(128);
-        record_raft_dedup_state(1, 128);
         record_raft_storage_cleanup("retired_generation", 1);
         record_raft_active_generation(1);
         record_raft_authority_commit("ok", 0.001);
@@ -609,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn raft_storage_operations_publish_dedup_and_cleanup_metrics() {
+    fn raft_storage_operations_publish_authority_and_cleanup_metrics() {
         let recorder = RaftStorageRecorder::default();
         metrics::with_local_recorder(&recorder, || {
             record_raft_snapshot("build", "complete", "ok", 128, 0.001);
@@ -618,16 +599,13 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let dedup = DedupKey::new(ClientId::new(91), CallId::new());
-        let command = Command::new(
-            dedup,
-            1,
-            Mutation::Mkdir {
-                parent_inode_id: InodeId::new(999),
-                name: "missing-parent".to_string(),
-                attrs: FileAttrs::new(),
-            },
-        );
+        let command = Command::CreateDirectory {
+            proposed_at_ms: 1,
+            root_inode_id: InodeId::new(999),
+            components: vec!["missing-parent".to_string()],
+            attrs: FileAttrs::new(),
+            recursive: false,
+        };
         let raft_state = AppMetadataRaftState {
             last_applied_log_id: Some(LogId::new(LeaderId::new(1, 1), 1)),
             ..AppMetadataRaftState::default()
@@ -637,21 +615,14 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             state_machine.apply_committed(command, &raft_state).unwrap();
         });
-        assert_eq!(recorder.dedup_records.load(Ordering::Relaxed), 1);
-        assert!(recorder.dedup_bytes.load(Ordering::Relaxed) > 0);
         assert_eq!(recorder.authority_commit_samples.load(Ordering::Relaxed), 1);
 
-        recorder.dedup_records.store(0, Ordering::Relaxed);
-        recorder.dedup_bytes.store(0, Ordering::Relaxed);
         drop(state_machine);
         drop(storage);
 
         let reopened = metrics::with_local_recorder(&recorder, || {
             Arc::new(RocksDBStorage::open_existing_for_start(dir.path()).unwrap())
         });
-        assert_eq!(recorder.dedup_records.load(Ordering::Relaxed), 1);
-        assert!(recorder.dedup_bytes.load(Ordering::Relaxed) > 0);
-
         metrics::with_local_recorder(&recorder, || {
             let staged = reopened.create_staged_generation().unwrap();
             reopened
@@ -659,16 +630,12 @@ mod tests {
                 .unwrap();
             reopened.cleanup_retired_generations().unwrap();
         });
-        assert_eq!(recorder.dedup_records.load(Ordering::Relaxed), 0);
-        assert_eq!(recorder.dedup_bytes.load(Ordering::Relaxed), 0);
         assert_eq!(recorder.active_generation.load(Ordering::Relaxed), 2);
         assert_eq!(recorder.cleanup_total.load(Ordering::Relaxed), 1);
     }
 
     #[derive(Default)]
     struct RaftStorageRecorder {
-        dedup_records: Arc<AtomicU64>,
-        dedup_bytes: Arc<AtomicU64>,
         active_generation: Arc<AtomicU64>,
         authority_commit_samples: Arc<AtomicU64>,
         snapshot_stage_seen: Arc<AtomicU64>,
@@ -694,8 +661,6 @@ mod tests {
 
         fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
             let value = match key.name() {
-                "metadata_raft_dedup_records" => Arc::clone(&self.dedup_records),
-                "metadata_raft_dedup_bytes" => Arc::clone(&self.dedup_bytes),
                 "metadata_raft_active_generation" => Arc::clone(&self.active_generation),
                 _ => return Gauge::noop(),
             };

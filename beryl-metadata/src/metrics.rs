@@ -9,13 +9,6 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
 
-// Dedup metrics are updated by Raft storage/state-machine paths. They remain
-// process-wide because dedup is an authority-wide apply concern.
-pub(crate) static DEDUP_LOOKUP_HIT_TOTAL: AtomicU64 = AtomicU64::new(0);
-pub(crate) static DEDUP_LOOKUP_MISS_TOTAL: AtomicU64 = AtomicU64::new(0);
-pub(crate) static DEDUP_LOOKUP_MISMATCH_TOTAL: AtomicU64 = AtomicU64::new(0);
-pub(crate) static DEDUP_STORE_ENTRIES_GAUGE: AtomicU64 = AtomicU64::new(0);
-
 /// Process-local metadata counters.
 #[derive(Clone)]
 pub struct MetadataMetrics {

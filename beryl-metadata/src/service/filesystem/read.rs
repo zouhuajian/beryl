@@ -70,7 +70,7 @@ pub(super) struct GetFileLayoutInput {
 #[derive(Clone, Debug, Default)]
 pub(super) struct GetFileLayoutOutput {
     pub(super) file_size: u64,
-    pub(super) file_version: Option<u64>,
+    pub(super) content_revision: Option<u64>,
     pub(super) locations: Vec<FileBlockLocation>,
 }
 
@@ -105,7 +105,7 @@ pub(crate) struct OpenFileArgs {
 pub(crate) struct OpenFileOutput {
     pub(crate) data_handle_id: DataHandleId,
     pub(crate) file_size: u64,
-    pub(crate) file_version: Option<u64>,
+    pub(crate) content_revision: Option<u64>,
 }
 
 pub(crate) enum BlockLocationsTarget {
@@ -122,7 +122,7 @@ pub(crate) struct GetBlockLocationsArgs {
 pub(crate) struct GetBlockLocationsOutput {
     pub(crate) data_handle_id: DataHandleId,
     pub(crate) file_size: u64,
-    pub(crate) file_version: Option<u64>,
+    pub(crate) content_revision: Option<u64>,
     pub(crate) locations: Vec<FileBlockLocation>,
 }
 
@@ -254,7 +254,7 @@ impl MetadataFileSystem {
             payload: OpenFileOutput {
                 data_handle_id,
                 file_size: success.payload.file_size,
-                file_version: success.payload.file_version,
+                content_revision: success.payload.content_revision,
             },
             group_name: success.group_name,
             mount_epoch: success.mount_epoch,
@@ -326,7 +326,7 @@ impl MetadataFileSystem {
             payload: GetBlockLocationsOutput {
                 data_handle_id,
                 file_size: success.payload.file_size,
-                file_version: success.payload.file_version,
+                content_revision: success.payload.content_revision,
                 locations: success.payload.locations,
             },
             group_name: success.group_name,
@@ -371,9 +371,9 @@ impl MetadataFileSystem {
         }
     }
 
-    fn file_version_for_inode(inode: &beryl_types::fs::Inode) -> Option<u64> {
+    fn content_revision_for_inode(inode: &beryl_types::fs::Inode) -> Option<u64> {
         match &inode.data {
-            beryl_types::fs::InodeData::File { file_version, .. } => *file_version,
+            beryl_types::fs::InodeData::File { content_revision, .. } => *content_revision,
             _ => None,
         }
     }
@@ -671,7 +671,7 @@ impl MetadataFileSystem {
             .validate_read_freshness_for_mount(&req.ctx, req.freshness, inode.mount_id, "GetFileLayout")
             .await?;
 
-        let file_version = Self::file_version_for_inode(&inode);
+        let content_revision = Self::content_revision_for_inode(&inode);
         let extents = match &inode.data {
             beryl_types::fs::InodeData::File { extents, .. } => extents.clone(),
             _ => Vec::new(),
@@ -897,7 +897,7 @@ impl MetadataFileSystem {
             &req.ctx,
             GetFileLayoutOutput {
                 file_size: inode.attrs.size,
-                file_version,
+                content_revision,
                 locations,
             },
             group_name,
@@ -978,10 +978,10 @@ mod tests {
                 block_id,
                 block_offset: 0,
                 len: 512,
-                file_version: None,
+                content_revision: None,
                 block_stamp: Some(41),
             }],
-            file_version: Some(1),
+            content_revision: Some(1),
             lease_epoch: None,
         };
         storage.put_inode(&inode).unwrap();
@@ -1053,10 +1053,10 @@ mod tests {
                 block_id,
                 block_offset: 0,
                 len: 512,
-                file_version: Some(1),
+                content_revision: Some(1),
                 block_stamp: Some(41),
             }],
-            file_version: Some(1),
+            content_revision: Some(1),
             lease_epoch: None,
         };
         storage.put_inode(&inode).unwrap();
@@ -1124,10 +1124,10 @@ mod tests {
                 block_id,
                 block_offset: 0,
                 len: 512,
-                file_version: Some(1),
+                content_revision: Some(1),
                 block_stamp: Some(41),
             }],
-            file_version: Some(1),
+            content_revision: Some(1),
             lease_epoch: None,
         };
         storage.put_inode(&inode).unwrap();
@@ -1196,10 +1196,10 @@ mod tests {
                 block_id,
                 block_offset: 0,
                 len: 512,
-                file_version: Some(1),
+                content_revision: Some(1),
                 block_stamp: Some(41),
             }],
-            file_version: Some(1),
+            content_revision: Some(1),
             lease_epoch: None,
         };
         storage.put_inode(&inode).unwrap();
@@ -1274,10 +1274,10 @@ mod tests {
                 block_id,
                 block_offset: 0,
                 len: 512,
-                file_version: Some(1),
+                content_revision: Some(1),
                 block_stamp: Some(41),
             }],
-            file_version: Some(1),
+            content_revision: Some(1),
             lease_epoch: None,
         };
         storage.put_inode(&inode).unwrap();
@@ -1311,7 +1311,7 @@ mod tests {
             block_id,
             block_offset: 0,
             len: 512,
-            file_version: Some(1),
+            content_revision: Some(1),
             block_stamp: Some(41),
         };
         let reported = vec![ReportedBlockLocation {
@@ -1398,10 +1398,10 @@ mod tests {
                 block_id,
                 block_offset: 0,
                 len: 512,
-                file_version: Some(1),
+                content_revision: Some(1),
                 block_stamp: Some(41),
             }],
-            file_version: Some(1),
+            content_revision: Some(1),
             lease_epoch: None,
         };
         storage.put_inode(&inode).unwrap();
@@ -1486,10 +1486,10 @@ mod tests {
                 block_id,
                 block_offset: 0,
                 len: 512,
-                file_version: Some(1),
+                content_revision: Some(1),
                 block_stamp: Some(41),
             }],
-            file_version: Some(1),
+            content_revision: Some(1),
             lease_epoch: None,
         };
         storage.put_inode(&inode).unwrap();
@@ -1531,10 +1531,10 @@ mod tests {
                 block_id,
                 block_offset: 0,
                 len: 512,
-                file_version: Some(1),
+                content_revision: Some(1),
                 block_stamp: None,
             }],
-            file_version: Some(1),
+            content_revision: Some(1),
             lease_epoch: None,
         };
         storage.put_inode(&inode).unwrap();
@@ -1577,10 +1577,10 @@ mod tests {
                 block_id,
                 block_offset: 0,
                 len: 512,
-                file_version: Some(1),
+                content_revision: Some(1),
                 block_stamp: Some(0),
             }],
-            file_version: Some(1),
+            content_revision: Some(1),
             lease_epoch: Some(1),
         };
         storage.put_inode(&inode).unwrap();
@@ -1883,10 +1883,10 @@ mod tests {
                 block_id,
                 block_offset: 0,
                 len: 512,
-                file_version: Some(4),
+                content_revision: Some(4),
                 block_stamp: Some(4),
             }],
-            file_version: Some(4),
+            content_revision: Some(4),
             lease_epoch: Some(4),
         };
         let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name("g23"))
@@ -1909,7 +1909,7 @@ mod tests {
 
         assert!(success.payload.locations.is_empty());
         assert_eq!(success.payload.file_size, 512);
-        assert_eq!(success.payload.file_version, Some(4));
+        assert_eq!(success.payload.content_revision, Some(4));
     }
 
     #[tokio::test]
@@ -1929,11 +1929,11 @@ mod tests {
                     block_id: BlockId::new(data_handle_id, BlockIndex::new(idx)),
                     block_offset: 0,
                     len: 100,
-                    file_version: Some(5),
+                    content_revision: Some(5),
                     block_stamp: Some(u64::from(idx) + 50),
                 })
                 .collect(),
-            file_version: Some(5),
+            content_revision: Some(5),
             lease_epoch: Some(5),
         };
         let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name("g24"))
@@ -1972,12 +1972,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![50, 51]
         );
-        assert_eq!(success.payload.file_version, Some(5));
+        assert_eq!(success.payload.content_revision, Some(5));
     }
     #[tokio::test]
-    async fn locations_return_file_version() {
+    async fn locations_return_content_revision() {
         let env = write_flow_env(64).await;
-        seed_committed_file_version(&env, 41, 900);
+        seed_committed_content_revision(&env, 41, 900);
         publish_env_block_location(&env, BlockId::new(env.data_handle_id, BlockIndex::new(0)), 41, 1);
 
         let locations = env
@@ -1992,25 +1992,24 @@ mod tests {
             .await
             .expect("locations should succeed");
 
-        assert_eq!(locations.payload.file_version, Some(41));
+        assert_eq!(locations.payload.content_revision, Some(41));
     }
 
     #[tokio::test]
-    async fn worker_report_does_not_change_file_version() {
+    async fn worker_report_does_not_change_content_revision() {
         let env = write_flow_env(0).await;
         let open = env
             .filesystem
-            .open_write_resolved(OpenWriteInput {
-                ctx: request_context(),
-                inode_id: env.inode_id,
-                open_path: "/test".to_string(),
-                desired_len: Some(64),
-                mode: crate::inode_lease::WriteMode::Write,
-                freshness: Freshness::default(),
-            })
+            .open_write_inode(
+                &request_context(),
+                env.inode_id,
+                Some(64),
+                crate::inode_lease::WriteMode::Write,
+                Freshness::default(),
+            )
             .await
             .expect("open write should succeed");
-        let key = open.payload.session_key;
+        let key = open.payload;
         let target = add_block_for_key(&env.filesystem, &key, 64).await;
         let close = commit_for_key(
             &env.filesystem,
@@ -2057,9 +2056,9 @@ mod tests {
             .await
             .expect("locations should succeed");
 
-        assert_eq!(close.payload.file_version, Some(1));
-        assert_eq!(locations.payload.file_version, Some(1));
-        assert_eq!(stored_file_version(&env.storage, env.inode_id), Some(1));
+        assert_eq!(close.payload.content_revision, Some(1));
+        assert_eq!(locations.payload.content_revision, Some(1));
+        assert_eq!(stored_content_revision(&env.storage, env.inode_id), Some(1));
     }
 
     #[tokio::test]
@@ -2067,17 +2066,16 @@ mod tests {
         let env = write_flow_env(0).await;
         let open = env
             .filesystem
-            .open_write_resolved(OpenWriteInput {
-                ctx: request_context(),
-                inode_id: env.inode_id,
-                open_path: "/test".to_string(),
-                desired_len: Some(64),
-                mode: crate::inode_lease::WriteMode::Write,
-                freshness: Freshness::default(),
-            })
+            .open_write_inode(
+                &request_context(),
+                env.inode_id,
+                Some(64),
+                crate::inode_lease::WriteMode::Write,
+                Freshness::default(),
+            )
             .await
             .expect("open write should succeed");
-        let key = open.payload.session_key;
+        let key = open.payload;
         let target = add_block_for_key(&env.filesystem, &key, 64).await;
         commit_for_key(
             &env.filesystem,

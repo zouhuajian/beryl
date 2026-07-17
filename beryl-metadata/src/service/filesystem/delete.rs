@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use super::{Freshness, FsResult, MetadataFileSystem, RequestContext, WriteCommandKind};
+use super::{Freshness, FsResult, MetadataFileSystem, RequestContext};
 use crate::error::MetadataError;
 use crate::observe;
-use crate::raft::{AppDataResponse, Command, FsCommandResult};
+use crate::raft::{Command, FsCommandResult};
 use beryl_types::fs::InodeId;
 
 pub(crate) struct DeleteArgs {
@@ -23,31 +23,6 @@ impl MetadataFileSystem {
             Ok(path) => path,
             Err(err) => return self.failure_from_path_error(ctx, &args.path, err),
         };
-        let (mount_ctx, _) = match self.path_resolver.resolve_mount_components(&path) {
-            Ok(resolved) => resolved,
-            Err(err) => return self.failure_from_path_error(ctx, &path, err),
-        };
-        let fingerprint = Command::delete_fingerprint(&path, args.recursive);
-        match self.replay_namespace_result(&ctx.caller, fingerprint) {
-            Ok(Some(FsCommandResult::Ok(_))) => {
-                return self.success(ctx, (), Some(mount_ctx.owner_group_name), Some(mount_ctx.mount_epoch));
-            }
-            Ok(Some(FsCommandResult::Err(err))) => {
-                return self.fatal_fs_failure(
-                    ctx,
-                    err.errno,
-                    err.message,
-                    Some(mount_ctx.owner_group_name),
-                    Some(mount_ctx.mount_epoch),
-                );
-            }
-            Ok(None) => {}
-            Err(err) => return self.failure_from_resolved_path_error(ctx, err, Some(&mount_ctx)),
-        }
-        if let Err(err) = self.reject_active_session_call_reuse(&ctx.caller) {
-            return self.failure_from_resolved_path_error(ctx, err, Some(&mount_ctx));
-        }
-
         let resolved = match self.path_resolver.resolve_path(&path) {
             Ok(resolved) => resolved,
             Err(err) => return self.failure_from_path_error(ctx, &path, err),
@@ -59,9 +34,22 @@ impl MetadataFileSystem {
                 Some(&resolved.mount_ctx),
             );
         };
-        let target_inode_id = resolved.inode_id;
+        let Some(target_inode_id) = resolved.inode_id else {
+            return self.failure_from_resolved_path_error(
+                ctx,
+                MetadataError::NotFound(format!("Entry not found: {path}")),
+                Some(&resolved.mount_ctx),
+            );
+        };
         let result = self
-            .delete_resolved(ctx, path, parent_inode_id, name, args.recursive, args.freshness)
+            .delete_resolved(
+                ctx,
+                parent_inode_id,
+                name,
+                target_inode_id,
+                args.recursive,
+                args.freshness,
+            )
             .await;
 
         match &result {
@@ -73,7 +61,7 @@ impl MetadataFileSystem {
                 client_id = %ctx.caller.client.client_id,
                 call_id = %ctx.caller.client.call_id,
                 path = %args.path,
-                inode_id = target_inode_id.map(|inode_id| inode_id.as_raw()),
+                inode_id = target_inode_id.as_raw(),
                 parent_inode_id = parent_inode_id.as_raw(),
                 recursive = args.recursive,
                 "Delete committed"
@@ -97,79 +85,17 @@ impl MetadataFileSystem {
     async fn delete_resolved(
         &self,
         request_ctx: &RequestContext,
-        path: String,
         parent_inode_id: InodeId,
         name: String,
+        expected_inode_id: InodeId,
         recursive: bool,
         freshness: Freshness,
     ) -> FsResult<()> {
-        let ctx = match self.route_ctx_for_write(request_ctx, WriteCommandKind::Delete, &[parent_inode_id], freshness) {
+        let ctx = match self.route_ctx_for_write(request_ctx, &[parent_inode_id], freshness) {
             Ok(ctx) => ctx,
             Err(err) => return Err(err),
         };
-        let dedup = match self.dedup_key(&request_ctx.caller) {
-            Ok(key) => key,
-            Err(err) => {
-                return self.failure_from_error(
-                    request_ctx,
-                    err,
-                    Some(ctx.namespace_owner_group_name.clone()),
-                    Some(ctx.mount_epoch),
-                );
-            }
-        };
-        let command = Command::new_namespace(
-            dedup.clone(),
-            crate::raft::proposal_timestamp_ms(),
-            crate::raft::CanonicalNamespaceRequest::Delete { path, recursive },
-            crate::raft::Mutation::Delete {
-                parent_inode_id,
-                name: name.clone(),
-                recursive,
-            },
-        );
-        let fingerprint = command.fingerprint();
-
-        match self.storage.get_applied_result(&dedup) {
-            Ok(Some(existing)) => {
-                if existing.fingerprint != fingerprint {
-                    return self.failure_from_error(
-                        request_ctx,
-                        MetadataError::InvalidArgument(format!(
-                            "call_id {} reused with different command payload",
-                            dedup.call_id
-                        )),
-                        Some(ctx.namespace_owner_group_name.clone()),
-                        Some(ctx.mount_epoch),
-                    );
-                }
-                let result = match existing.result {
-                    AppDataResponse::Fs(result) => result,
-                    _ => FsCommandResult::ok(),
-                };
-                return self.delete_result(request_ctx, &ctx, result);
-            }
-            Ok(None) => {}
-            Err(err) => {
-                return self.failure_from_error(
-                    request_ctx,
-                    err,
-                    Some(ctx.namespace_owner_group_name.clone()),
-                    Some(ctx.mount_epoch),
-                );
-            }
-        }
-
-        if let Err(err) = self.reject_active_session_call_reuse(&request_ctx.caller) {
-            return self.failure_from_error(
-                request_ctx,
-                err,
-                Some(ctx.namespace_owner_group_name.clone()),
-                Some(ctx.mount_epoch),
-            );
-        }
-
-        match self.read_dentry(parent_inode_id, &name) {
+        let expected_file_lease_epochs = match self.read_dentry(parent_inode_id, &name) {
             Ok(Some(inode_id)) => match self.read_inode(inode_id) {
                 Ok(Some(inode)) if inode.kind.is_file() && self.has_active_write(inode_id) => {
                     return self.fatal_fs_failure(
@@ -181,16 +107,22 @@ impl MetadataFileSystem {
                     );
                 }
                 Ok(Some(inode)) if recursive && inode.kind.is_dir() => {
-                    if let Err(err) = self.preflight_delete_tree_runtime(&self.storage, parent_inode_id, &name) {
-                        return self.failure_from_error(
-                            request_ctx,
-                            err,
-                            Some(ctx.namespace_owner_group_name.clone()),
-                            Some(ctx.mount_epoch),
-                        );
+                    match self.preflight_delete_tree_runtime(&self.storage, parent_inode_id, &name) {
+                        Ok(epochs) => epochs,
+                        Err(err) => {
+                            return self.failure_from_error(
+                                request_ctx,
+                                err,
+                                Some(ctx.namespace_owner_group_name.clone()),
+                                Some(ctx.mount_epoch),
+                            );
+                        }
                     }
                 }
-                Ok(_) => {}
+                Ok(Some(inode)) if inode.kind.is_file() => {
+                    vec![(inode_id, Self::file_lease_epoch(&inode))]
+                }
+                Ok(Some(_)) | Ok(None) => Vec::new(),
                 Err(err) => {
                     return self.failure_from_error(
                         request_ctx,
@@ -200,7 +132,7 @@ impl MetadataFileSystem {
                     );
                 }
             },
-            Ok(None) => {}
+            Ok(None) => Vec::new(),
             Err(err) => {
                 return self.failure_from_error(
                     request_ctx,
@@ -209,9 +141,17 @@ impl MetadataFileSystem {
                     Some(ctx.mount_epoch),
                 );
             }
-        }
+        };
+        let command = Command::Delete {
+            proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+            parent_inode_id,
+            name: name.clone(),
+            expected_inode_id,
+            expected_file_lease_epochs,
+            recursive,
+        };
 
-        let result = match self.propose_fs_write_command(WriteCommandKind::Delete, command).await {
+        let result = match self.propose_fs_write_command(command).await {
             Ok(result) => result,
             Err(err) => {
                 return self.failure_from_error(
@@ -223,6 +163,13 @@ impl MetadataFileSystem {
             }
         };
         self.delete_result(request_ctx, &ctx, result)
+    }
+
+    fn file_lease_epoch(inode: &beryl_types::fs::Inode) -> u64 {
+        match &inode.data {
+            beryl_types::fs::InodeData::File { lease_epoch, .. } => lease_epoch.unwrap_or(0),
+            _ => 0,
+        }
     }
 
     fn delete_result(
@@ -253,25 +200,29 @@ impl MetadataFileSystem {
         storage: &crate::raft::RocksDBStorage,
         parent_inode_id: beryl_types::fs::InodeId,
         name: &str,
-    ) -> Result<(), MetadataError> {
+    ) -> Result<Vec<(InodeId, u64)>, MetadataError> {
         let Some(root_inode_id) = self.read_dentry(parent_inode_id, name)? else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let Some(root_inode) = self.read_inode(root_inode_id)? else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let mount_id = root_inode.mount_id;
         let mut stack = vec![(root_inode_id, root_inode)];
+        let mut file_lease_epochs = Vec::new();
 
         while let Some((inode_id, inode)) = stack.pop() {
             if inode.mount_id != mount_id {
                 continue;
             }
-            if inode.kind.is_file() && self.has_active_write(inode_id) {
-                return Err(MetadataError::Busy(format!(
-                    "File has an active write lease: {}",
-                    inode_id
-                )));
+            if inode.kind.is_file() {
+                if self.has_active_write(inode_id) {
+                    return Err(MetadataError::Busy(format!(
+                        "File has an active write lease: {}",
+                        inode_id
+                    )));
+                }
+                file_lease_epochs.push((inode_id, Self::file_lease_epoch(&inode)));
             }
             if inode.kind.is_dir() {
                 for (_, child_inode_id) in storage.list_dentries(inode_id)? {
@@ -281,8 +232,8 @@ impl MetadataFileSystem {
                 }
             }
         }
-
-        Ok(())
+        file_lease_epochs.sort_by_key(|(inode_id, _)| inode_id.as_raw());
+        Ok(file_lease_epochs)
     }
 }
 
@@ -322,9 +273,9 @@ mod tests {
         let failure = filesystem
             .delete_resolved(
                 &request_context(),
-                "/busy".to_string(),
                 parent_inode_id,
                 "busy".to_string(),
+                inode_id,
                 false,
                 Freshness::default(),
             )
@@ -373,9 +324,9 @@ mod tests {
         filesystem
             .delete_resolved(
                 &request_context(),
-                "/expired".to_string(),
                 parent_inode_id,
                 "expired".to_string(),
+                inode_id,
                 false,
                 Freshness::default(),
             )

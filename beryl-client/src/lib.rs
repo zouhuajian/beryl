@@ -6,7 +6,7 @@
 //! The public facade is centered on [`FsClient`], [`FileReader`],
 //! [`FileWriter`], creation/list options, and small namespace snapshot types.
 //! Metadata-facing operations are executed through the internal operation
-//! executor and metadata gateway, with hardened refresh, replay header, and
+//! executor and metadata gateway, with bounded retry, structured refresh, and
 //! invalid response-header handling. Public reads return one complete buffer
 //! through internal data-plane adapters; public writes use internal write-state
 //! tracking and data-plane adapters. `CreateOptions` layout fields apply only
@@ -35,7 +35,7 @@ pub(crate) mod metadata;
 // Re-export commonly used types
 pub use api::ListOptions;
 pub use api::{BlockFormatId, DirectoryEntry, DirectoryListing, FileAttrs, FileStatus, InodeKind};
-pub use api::{CreateMode, CreateOptions, FileReader, FileWriter, FsClient};
+pub use api::{CreateOptions, FileReader, FileWriter, FsClient};
 pub use config::ClientConfig;
 pub use config::{ChannelPoolConfig, RetryConfig, WriteLeaseConfig};
 pub use error::{ClientActionError, ClientError, ClientResult};

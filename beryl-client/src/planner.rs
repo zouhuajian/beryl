@@ -172,7 +172,7 @@ pub(crate) fn plan_block_reads(
 
 pub(crate) fn plan_block_reads_from_layout(
     expected_data_handle_id: DataHandleId,
-    expected_file_version: Option<u64>,
+    expected_content_revision: Option<u64>,
     requested_range: RequestedReadRange,
     response: &ReadLayout,
 ) -> ClientResult<(GroupName, Vec<PlannedBlockRead>)> {
@@ -187,10 +187,12 @@ pub(crate) fn plan_block_reads_from_layout(
             ),
         });
     }
-    let actual_version =
-        file_version_from_response(response.file_version, "GetBlockLocationsResponseProto.file_version")?;
-    let expected_version = expected_file_version.ok_or_else(|| ClientError::StaleHandle {
-        reason: "read handle missing file_version".to_string(),
+    let actual_version = content_revision_from_response(
+        response.content_revision,
+        "GetBlockLocationsResponseProto.content_revision",
+    )?;
+    let expected_version = expected_content_revision.ok_or_else(|| ClientError::StaleHandle {
+        reason: "read handle missing content_revision".to_string(),
     })?;
     if actual_version != expected_version {
         return Err(ClientError::VersionMismatch {
@@ -202,7 +204,7 @@ pub(crate) fn plan_block_reads_from_layout(
     Ok((group_name, block_reads))
 }
 
-fn file_version_from_response(value: Option<u64>, field: &str) -> ClientResult<u64> {
+fn content_revision_from_response(value: Option<u64>, field: &str) -> ClientResult<u64> {
     value.ok_or_else(|| ClientError::InvalidLayout(format!("{field} missing")))
 }
 

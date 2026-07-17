@@ -12,13 +12,13 @@ use thiserror::Error;
 
 /// Application-level response propagated from the state machine to the proposer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) enum AppDataResponse {
+pub(crate) enum CommandResult {
     /// Filesystem command result with errno fidelity.
     Fs(FsCommandResult),
-    /// Mount-related command result.
-    Mount(MountCommandResult),
-    /// Worker-related command result.
-    Worker(WorkerCommandResult),
+    /// Root mount created or confirmed by namespace bootstrap.
+    MountUpserted(crate::mount::MountEntry),
+    /// Durable worker descriptor accepted by the authority state.
+    WorkerUpserted(WorkerId),
     /// Deterministic application rejection committed by the state machine.
     Rejected(ApplyRejection),
     /// Explicitly empty result.
@@ -43,7 +43,7 @@ pub(crate) enum ApplyRejectionKind {
     LeaseFenced { expected: u64, got: u64 },
 }
 
-/// Recoverable application failure stored in dedup state and returned through Raft.
+/// Recoverable application failure returned through Raft.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ApplyRejection {
     pub kind: ApplyRejectionKind,
@@ -173,9 +173,10 @@ impl FsCommandResult {
 pub(crate) struct FsOkResult {
     pub inode_id: Option<InodeId>,
     pub data_handle_id: Option<DataHandleId>,
-    pub file_version: Option<u64>,
+    pub content_revision: Option<u64>,
     pub attrs: Option<FileAttrs>,
     pub layout: Option<FileLayout>,
+    pub lease_epoch: Option<u64>,
 }
 
 /// FS errno surfaced by apply.
@@ -183,18 +184,6 @@ pub(crate) struct FsOkResult {
 pub(crate) struct FsErrnoResult {
     pub errno: FsErrorCode,
     pub message: String,
-}
-
-/// Mount command result.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) enum MountCommandResult {
-    Upserted(crate::mount::MountEntry),
-}
-
-/// Worker command result.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) enum WorkerCommandResult {
-    Upserted(WorkerId),
 }
 
 #[cfg(test)]

@@ -180,7 +180,7 @@ pub struct Extent {
     pub len: u64,
     /// File version for the committed file state that owns this extent.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub file_version: Option<u64>,
+    pub content_revision: Option<u64>,
     /// Metadata-assigned block stamp for direct read validation.
     /// Readable committed extents must carry a non-zero value.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -192,7 +192,7 @@ pub struct Extent {
 #[serde(rename_all = "snake_case")]
 pub enum InodeData {
     /// File inode data.
-    /// Includes extents for the committed block map, file_version for visible
+    /// Includes extents for the committed block map, content_revision for visible
     /// file state, and lease_epoch for lease management.
     File {
         /// File extents (block map).
@@ -203,7 +203,7 @@ pub enum InodeData {
         /// Advanced by authoritative metadata apply when committed content,
         /// size, data handle, or read-plan state changes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        file_version: Option<u64>,
+        content_revision: Option<u64>,
         /// Lease epoch (monotonically increasing, for fencing).
         /// Persisted in inode for lease management.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -270,7 +270,7 @@ impl Inode {
         let data = match kind {
             InodeKind::File => InodeData::File {
                 extents: Vec::new(),
-                file_version: None,
+                content_revision: None,
                 lease_epoch: None,
             },
             InodeKind::Dir => InodeData::Dir,

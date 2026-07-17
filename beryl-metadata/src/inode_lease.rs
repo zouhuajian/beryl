@@ -7,7 +7,7 @@
 //! Leases provide mutual exclusion for writers and enable fencing.
 
 use beryl_types::fs::InodeId;
-use beryl_types::ids::{ClientId, LeaseId};
+use beryl_types::ids::ClientId;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 /// Write mode for lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteMode {
-    /// Write mode (future: can write at any offset).
+    /// Replace the currently visible file contents.
     Write,
     /// Append mode (writes must start from file_size).
     Append,
@@ -27,20 +27,14 @@ pub enum WriteMode {
 /// Active lease entry (runtime-only, not persisted to Raft).
 #[derive(Clone, Debug)]
 pub struct ActiveLease {
-    /// Lease ID.
-    pub lease_id: LeaseId,
     /// Lease epoch (monotonically increasing).
     pub lease_epoch: u64,
     /// Owner client ID.
     pub owner_client_id: ClientId,
-    /// Optional owner call ID (for diagnostics).
-    pub owner_call_id: Option<beryl_types::CallId>,
     /// Expiration time (milliseconds since epoch).
     pub expires_at_ms: u64,
     /// Write mode.
     pub mode: WriteMode,
-    /// Last successful RenewLease call in this lease incarnation.
-    pub last_renew_call: Option<(ClientId, beryl_types::CallId, u64)>,
 }
 
 /// Inode lease manager (runtime, leader-only).
@@ -74,16 +68,15 @@ impl LeaseManager {
     /// Try to acquire a lease for an inode.
     ///
     /// Returns:
-    /// - Ok((lease_id, lease_epoch, expires_at_ms)) if acquired
+    /// - Ok((lease_epoch, expires_at_ms)) if acquired
     /// - Err(EBusy) if there's an active, non-expired lease
     pub fn try_acquire(
         &self,
         inode_id: InodeId,
         client_id: ClientId,
-        call_id: Option<beryl_types::CallId>,
         mode: WriteMode,
         current_lease_epoch: Option<u64>, // From inode (persisted)
-    ) -> Result<(LeaseId, u64, u64), FsErrorCode> {
+    ) -> Result<(u64, u64), FsErrorCode> {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
 
         let mut leases = self.leases.write();
@@ -91,16 +84,9 @@ impl LeaseManager {
         // Check for existing active lease
         if let Some(existing) = leases.get(&inode_id) {
             if now_ms < existing.expires_at_ms {
-                if existing.owner_client_id == client_id && existing.owner_call_id == call_id {
-                    if existing.mode != mode {
-                        return Err(FsErrorCode::EInval);
-                    }
-                    return Ok((existing.lease_id, existing.lease_epoch, existing.expires_at_ms));
-                }
                 // Active lease exists and not expired
                 debug!(
                     inode_id = %inode_id,
-                    existing_lease_id = ?existing.lease_id,
                     existing_epoch = existing.lease_epoch,
                     expires_at = existing.expires_at_ms,
                     "Lease conflict: active lease exists"
@@ -110,85 +96,51 @@ impl LeaseManager {
             // Lease expired, can be stolen
             debug!(
                 inode_id = %inode_id,
-                expired_lease_id = ?existing.lease_id,
+                expired_epoch = existing.lease_epoch,
                 "Lease expired, allowing steal"
             );
         }
 
         // Generate new lease
         let base_epoch = current_lease_epoch.unwrap_or(0);
-        let new_epoch = base_epoch + 1;
-        let lease_id = LeaseId::new((inode_id.as_raw() as u128) << 64 | (new_epoch as u128));
-        let expires_at_ms = now_ms + self.lease_ttl_ms;
+        let new_epoch = base_epoch.checked_add(1).ok_or(FsErrorCode::EInval)?;
+        let expires_at_ms = now_ms.saturating_add(self.lease_ttl_ms);
 
         let active_lease = ActiveLease {
-            lease_id,
             lease_epoch: new_epoch,
             owner_client_id: client_id,
-            owner_call_id: call_id,
             expires_at_ms,
             mode,
-            last_renew_call: None,
         };
 
         leases.insert(inode_id, active_lease.clone());
 
         debug!(
             inode_id = %inode_id,
-            lease_id = ?lease_id,
             lease_epoch = new_epoch,
             expires_at = expires_at_ms,
             mode = ?mode,
             "Lease acquired"
         );
 
-        Ok((lease_id, new_epoch, expires_at_ms))
+        Ok((new_epoch, expires_at_ms))
     }
 
     /// Renew a lease (runtime-only, does not write to Raft).
     ///
     /// Returns:
     /// - Ok(expires_at_ms) if renewed
-    /// - Err(EPerm) if lease_id/lease_epoch mismatch or expired
-    pub fn renew(
-        &self,
-        inode_id: InodeId,
-        lease_id: LeaseId,
-        lease_epoch: u64,
-        client_id: ClientId,
-        call_id: beryl_types::CallId,
-    ) -> Result<u64, FsErrorCode> {
+    /// - Err(EPerm) if the lease epoch, owner, or expiry is invalid
+    pub fn renew(&self, inode_id: InodeId, lease_epoch: u64, client_id: ClientId) -> Result<u64, FsErrorCode> {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
 
         let mut leases = self.leases.write();
 
-        if let Some((renew_inode_id, active_lease, expires_at_ms)) =
-            leases.iter().find_map(|(renew_inode_id, lease)| {
-                lease
-                    .last_renew_call
-                    .filter(|(renew_client_id, renew_call_id, _)| {
-                        *renew_client_id == client_id && *renew_call_id == call_id
-                    })
-                    .map(|(_, _, expires_at_ms)| (*renew_inode_id, lease, expires_at_ms))
-            })
-        {
-            if renew_inode_id == inode_id
-                && active_lease.lease_id == lease_id
-                && active_lease.lease_epoch == lease_epoch
-            {
-                return Ok(expires_at_ms);
-            }
-            return Err(FsErrorCode::EInval);
-        }
-
         let active_lease = leases.get_mut(&inode_id).ok_or(FsErrorCode::EPerm)?;
 
-        // Validate lease_id and lease_epoch
-        if active_lease.lease_id != lease_id || active_lease.lease_epoch != lease_epoch {
+        if active_lease.lease_epoch != lease_epoch {
             warn!(
                 inode_id = %inode_id,
-                expected_lease_id = ?active_lease.lease_id,
-                got_lease_id = ?lease_id,
                 expected_epoch = active_lease.lease_epoch,
                 got_epoch = lease_epoch,
                 "Lease renewal failed: mismatch"
@@ -199,14 +151,11 @@ impl LeaseManager {
         if active_lease.owner_client_id != client_id {
             return Err(FsErrorCode::EPerm);
         }
-        if active_lease.owner_call_id == Some(call_id) {
-            return Err(FsErrorCode::EInval);
-        }
         // Check if already expired
         if now_ms >= active_lease.expires_at_ms {
             warn!(
                 inode_id = %inode_id,
-                lease_id = ?lease_id,
+                lease_epoch,
                 "Lease renewal failed: already expired"
             );
             leases.remove(&inode_id);
@@ -214,12 +163,11 @@ impl LeaseManager {
         }
 
         // Extend expiration
-        active_lease.expires_at_ms = now_ms + self.lease_ttl_ms;
-        active_lease.last_renew_call = Some((client_id, call_id, active_lease.expires_at_ms));
+        active_lease.expires_at_ms = now_ms.saturating_add(self.lease_ttl_ms);
 
         debug!(
             inode_id = %inode_id,
-            lease_id = ?lease_id,
+            lease_epoch,
             new_expires_at = active_lease.expires_at_ms,
             "Lease renewed"
         );
@@ -228,14 +176,14 @@ impl LeaseManager {
     }
 
     /// Release a lease (called on close/commit or error).
-    pub fn release(&self, inode_id: InodeId, lease_id: LeaseId, lease_epoch: u64) {
+    pub fn release(&self, inode_id: InodeId, lease_epoch: u64) {
         let mut leases = self.leases.write();
         if let Some(active) = leases.get(&inode_id) {
-            if active.lease_id == lease_id && active.lease_epoch == lease_epoch {
+            if active.lease_epoch == lease_epoch {
                 leases.remove(&inode_id);
                 debug!(
                     inode_id = %inode_id,
-                    lease_id = ?lease_id,
+                    lease_epoch,
                     "Lease released"
                 );
             }
@@ -247,18 +195,15 @@ impl LeaseManager {
     /// Returns:
     /// - Ok(()) if lease is valid
     /// - Err(EPerm) if lease is invalid (mismatch or expired)
-    pub fn validate_lease(&self, inode_id: InodeId, lease_id: LeaseId, lease_epoch: u64) -> Result<(), FsErrorCode> {
+    pub fn validate_lease(&self, inode_id: InodeId, lease_epoch: u64) -> Result<(), FsErrorCode> {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
 
         let leases = self.leases.read();
         let active_lease = leases.get(&inode_id).ok_or(FsErrorCode::EPerm)?;
 
-        // Check lease_id and lease_epoch match
-        if active_lease.lease_id != lease_id || active_lease.lease_epoch != lease_epoch {
+        if active_lease.lease_epoch != lease_epoch {
             warn!(
                 inode_id = %inode_id,
-                expected_lease_id = ?active_lease.lease_id,
-                got_lease_id = ?lease_id,
                 expected_epoch = active_lease.lease_epoch,
                 got_epoch = lease_epoch,
                 "Lease validation failed: mismatch (fencing)"
@@ -270,7 +215,7 @@ impl LeaseManager {
         if now_ms >= active_lease.expires_at_ms {
             warn!(
                 inode_id = %inode_id,
-                lease_id = ?lease_id,
+                lease_epoch,
                 "Lease validation failed: expired"
             );
             return Err(FsErrorCode::EPerm);
@@ -284,16 +229,6 @@ impl LeaseManager {
         self.leases.read().get(&inode_id).cloned()
     }
 
-    pub(crate) fn has_renew_call(&self, client_id: ClientId, call_id: beryl_types::CallId) -> bool {
-        self.leases.read().values().any(|lease| {
-            lease
-                .last_renew_call
-                .is_some_and(|(renew_client_id, renew_call_id, _)| {
-                    renew_client_id == client_id && renew_call_id == call_id
-                })
-        })
-    }
-
     /// Check if an inode has an active, non-expired lease.
     pub fn has_active_lease(&self, inode_id: InodeId) -> bool {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -305,13 +240,13 @@ impl LeaseManager {
             .unwrap_or(false)
     }
 
-    pub(crate) fn is_active_lease(&self, inode_id: InodeId, lease_id: LeaseId, lease_epoch: u64) -> bool {
+    pub(crate) fn is_active_lease(&self, inode_id: InodeId, lease_epoch: u64) -> bool {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
 
         self.leases
             .read()
             .get(&inode_id)
-            .map(|lease| lease.lease_id == lease_id && lease.lease_epoch == lease_epoch && now_ms < lease.expires_at_ms)
+            .map(|lease| lease.lease_epoch == lease_epoch && now_ms < lease.expires_at_ms)
             .unwrap_or(false)
     }
 

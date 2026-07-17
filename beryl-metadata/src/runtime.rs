@@ -512,7 +512,7 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use crate::config::{BootstrapConfig, MetadataAuthorityConfig, RaftConfig, WorkerConfig};
-    use crate::raft::{Command, DedupKey};
+    use crate::raft::Command;
     use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction};
     use beryl_common::header::{RequestHeader, ResponseHeader};
     use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
@@ -551,13 +551,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         raft_node
-            .propose(Command::new(
-                DedupKey::new(ClientId::new(u128::MAX), beryl_types::CallId::new()),
-                1,
-                crate::raft::Mutation::BootstrapNamespace {
-                    group_name: group_name.clone(),
-                },
-            ))
+            .propose(Command::BootstrapNamespace {
+                proposed_at_ms: 1,
+                group_name: group_name.clone(),
+            })
             .await
             .unwrap();
 

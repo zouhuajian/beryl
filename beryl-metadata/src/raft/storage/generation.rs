@@ -676,12 +676,6 @@ mod tests {
         }
     }
 
-    impl PinnedGeneration<'_> {
-        pub(crate) fn path(&self) -> &Path {
-            self.generation.path()
-        }
-    }
-
     impl GenerationHandle {
         pub(crate) fn publish_staged<F>(&self, staged: StagedGeneration, open_db: F) -> MetadataResult<()>
         where

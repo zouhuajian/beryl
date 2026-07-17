@@ -25,7 +25,6 @@ impl RocksDBStorage {
                 .map_err(|error| missing_rocksdb_state_error(&path_buf, &error.to_string()))?
         };
         let storage = Self { generations };
-        storage.refresh_raft_dedup_metrics()?;
         Ok(storage)
     }
 
@@ -57,7 +56,7 @@ impl RocksDBStorage {
             |old, staged| before_switch(old.db(), staged.db()),
             |new| after_switch(new.db()),
         )?;
-        self.refresh_raft_dedup_metrics()
+        Ok(())
     }
 
     pub(crate) fn cleanup_retired_generations(&self) -> MetadataResult<()> {
@@ -66,23 +65,6 @@ impl RocksDBStorage {
 
     pub(crate) fn cleanup_unreferenced_generations(&self) -> MetadataResult<()> {
         self.generations.cleanup_unreferenced()
-    }
-
-    fn refresh_raft_dedup_metrics(&self) -> MetadataResult<()> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf = Self::cf(db, CF_DEDUP)?;
-        let mut records = 0u64;
-        let mut bytes = 0u64;
-        for item in db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
-            let (_key, value) = item
-                .map_err(|error| MetadataError::Internal(format!("failed to inspect dedup metrics state: {error}")))?;
-            records = records.saturating_add(1);
-            bytes = bytes.saturating_add(value.len() as u64);
-        }
-        DEDUP_STORE_ENTRIES_GAUGE.store(records, Ordering::Relaxed);
-        crate::observe::record_raft_dedup_state(records, bytes);
-        Ok(())
     }
 
     pub(crate) fn with_pinned_snapshot<T>(
@@ -159,7 +141,24 @@ fn open_generation_db(path: &Path, create_missing: bool) -> MetadataResult<Arc<D
     let mut options = Options::default();
     options.create_if_missing(create_missing);
     options.create_missing_column_families(create_missing);
-    let db = DB::open_cf_descriptors(&options, path, cf_descriptors()).map_err(|error| {
+    let mut descriptors = cf_descriptors();
+    let obsolete_column_families = if create_missing {
+        Vec::new()
+    } else {
+        let names = DB::list_cf(&Options::default(), path).map_err(|error| {
+            missing_rocksdb_state_error(path, &format!("RocksDB column-family discovery failed: {error}"))
+        })?;
+        let mut obsolete = Vec::new();
+        for name in names {
+            if name == "default" || is_current_column_family(&name) {
+                continue;
+            }
+            descriptors.push(ColumnFamilyDescriptor::new(name.clone(), Options::default()));
+            obsolete.push(name);
+        }
+        obsolete
+    };
+    let db = DB::open_cf_descriptors(&options, path, descriptors).map_err(|error| {
         if create_missing {
             MetadataError::Internal(format!(
                 "failed to create RocksDB generation at {}: {error}",
@@ -205,7 +204,20 @@ fn open_generation_db(path: &Path, create_missing: bool) -> MetadataResult<Arc<D
             )))
         }
     }
+    if !obsolete_column_families.is_empty() {
+        return Err(MetadataError::InvalidArgument(format!(
+            "obsolete RocksDB column families {:?}; reformat metadata storage",
+            obsolete_column_families
+        )));
+    }
     Ok(Arc::new(db))
+}
+
+fn is_current_column_family(name: &str) -> bool {
+    matches!(
+        name,
+        CF_MOUNTS | CF_WORKERS | CF_META | CF_RAFT_LOG | CF_RAFT_STATE | CF_RAFT_SNAPSHOT | CF_INODES | CF_DENTRIES
+    )
 }
 
 fn can_initialize_missing_schema(db: &DB) -> MetadataResult<bool> {
@@ -221,7 +233,6 @@ fn database_is_pristine(db: &DB, allowed_meta_keys: &[&[u8]]) -> MetadataResult<
 
     for name in [
         CF_MOUNTS,
-        CF_DEDUP,
         CF_WORKERS,
         CF_RAFT_LOG,
         CF_RAFT_STATE,
@@ -263,7 +274,6 @@ fn storage_identity_matches(actual: &StorageIdentity, expected: &StorageIdentity
 pub(super) fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
     vec![
         ColumnFamilyDescriptor::new(CF_MOUNTS, Options::default()),
-        ColumnFamilyDescriptor::new(CF_DEDUP, Options::default()),
         ColumnFamilyDescriptor::new(CF_WORKERS, Options::default()),
         ColumnFamilyDescriptor::new(CF_META, Options::default()),
         ColumnFamilyDescriptor::new(CF_RAFT_LOG, Options::default()),

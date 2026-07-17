@@ -5,7 +5,6 @@
 //!
 //! Keyspace schema:
 //! - mounts/{mount_id} -> MountEntry (serialized)
-//! - dedup/{client_id}:{call_id} -> AppliedResult (serialized)
 //! - route_epoch -> u64
 //! - mount_epoch -> u64
 //!
@@ -32,10 +31,8 @@ pub(crate) use snapshot::{SnapshotFile, SnapshotInstallTracker};
 pub(crate) use state_machine_store::StateMachineStorage;
 
 use crate::error::{MetadataError, MetadataResult};
-use crate::metrics::{DEDUP_LOOKUP_HIT_TOTAL, DEDUP_LOOKUP_MISS_TOTAL, DEDUP_STORE_ENTRIES_GAUGE};
 use crate::mount::MountEntry;
-use crate::raft::AppDataResponse;
-use crate::raft::{AppMetadataRaftState, CommandFingerprint, DedupKey};
+use crate::raft::AppMetadataRaftState;
 use crate::state::RouteEpoch;
 use crate::worker::WorkerInfo;
 use beryl_types::fs::{Inode, InodeId};
@@ -48,7 +45,6 @@ use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, WriteOp
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -56,7 +52,6 @@ type DentryPage = (Vec<(String, InodeId)>, Option<Vec<u8>>, bool);
 
 /// Column family names for RocksDB.
 const CF_MOUNTS: &str = "mounts";
-const CF_DEDUP: &str = "dedup";
 const CF_WORKERS: &str = "workers";
 /// Raft column families
 const CF_META: &str = "meta"; // route_epoch, mount_epoch, file layouts, etc.
@@ -66,7 +61,7 @@ const CF_RAFT_SNAPSHOT: &str = "raft_snapshot"; // Raft snapshots
 
 const ROCKSDB_SCHEMA_VERSION_KEY: &[u8] = b"rocksdb_schema_version";
 const STORAGE_IDENTITY_KEY: &[u8] = b"storage_identity";
-pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 6;
+pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 7;
 const NEXT_INODE_ID_KEY: &[u8] = b"next_inode_id";
 const NEXT_DATA_HANDLE_ID_KEY: &[u8] = b"next_data_handle_id";
 
@@ -86,19 +81,7 @@ const CF_INODES: &str = "inodes"; // inode/{inode_id_be} -> Inode
 const CF_DENTRIES: &str = "dentries"; // dentry/{parent_inode_id_be}/{name} -> child_inode_id_be
 
 /// Column families that hold replicated state to be snapshotted/restored.
-pub const STATE_CFS: &[&str] = &[CF_MOUNTS, CF_DEDUP, CF_WORKERS, CF_META, CF_INODES, CF_DENTRIES];
-
-/// Persisted replay record for an applied mutation command.
-///
-/// AppliedResult stores the minimal deterministic result of an applied mutation
-/// command. It is used for retry/replay, not as a general RPC response cache.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct AppliedResult {
-    pub fingerprint: CommandFingerprint,
-    pub result: AppDataResponse,
-    pub created_at_ms: u64,
-    pub size_bytes: u32,
-}
+pub const STATE_CFS: &[&str] = &[CF_MOUNTS, CF_WORKERS, CF_META, CF_INODES, CF_DENTRIES];
 
 /// Durable identity binding between the lifecycle marker and its RocksDB state.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -238,13 +221,6 @@ mod tests {
     use openraft::{LeaderId, LogId};
     use tempfile::TempDir;
 
-    fn now_millis() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
-    }
-
     #[test]
     fn opening_existing_schema_v1_store_requires_reformat() {
         let dir = TempDir::new().unwrap();
@@ -265,6 +241,48 @@ mod tests {
 
         assert!(error.to_string().contains("schema version is missing"));
         assert!(error.to_string().contains("reformat metadata storage"));
+    }
+
+    #[test]
+    fn opening_previous_command_schema_requires_reformat() {
+        let dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
+        drop(storage);
+
+        let generation_path = dir.path().join("generations/gen-000001");
+        let mut db = DB::open_cf_descriptors(&Options::default(), &generation_path, schema::cf_descriptors()).unwrap();
+        db.create_cf("dedup", &Options::default()).unwrap();
+        let dedup = db.cf_handle("dedup").unwrap();
+        db.put_cf(dedup, b"old-call", b"old-result").unwrap();
+        let meta = db.cf_handle(CF_META).unwrap();
+        let previous = bincode::serde::encode_to_vec(6u64, bincode::config::standard()).unwrap();
+        db.put_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY, previous).unwrap();
+        drop(db);
+
+        let error = match RocksDBStorage::open_existing_for_start(dir.path()) {
+            Ok(_) => panic!("schema 6 store must not open after the Command format change"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported RocksDB schema version 6; expected 7"),
+            "unexpected startup error: {error}"
+        );
+        assert!(
+            error.to_string().contains("reformat metadata storage"),
+            "unexpected startup error: {error}"
+        );
+
+        let mut descriptors = schema::cf_descriptors();
+        descriptors.push(ColumnFamilyDescriptor::new("dedup", Options::default()));
+        let db = DB::open_cf_descriptors(&Options::default(), generation_path, descriptors).unwrap();
+        let dedup = db.cf_handle("dedup").unwrap();
+        assert_eq!(
+            db.get_cf(dedup, b"old-call").unwrap().as_deref(),
+            Some(&b"old-result"[..])
+        );
     }
 
     #[test]
@@ -315,64 +333,8 @@ mod tests {
         assert!(error.to_string().contains("schema version is missing"));
     }
 
-    #[test]
-    fn rejected_schema_does_not_clear_dedup_state() {
-        let dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
-        let generation_path = storage.pin_generation().unwrap().path().to_path_buf();
-        storage
-            .with_pinned_db(|db| {
-                let meta = db.cf_handle(CF_META).unwrap();
-                let dedup = db.cf_handle(CF_DEDUP).unwrap();
-                db.put_cf(dedup, b"sentinel", b"must-survive").unwrap();
-                db.delete_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY).unwrap();
-                Ok(())
-            })
-            .unwrap();
-        drop(storage);
-
-        let error = match RocksDBStorage::create_for_format(dir.path()) {
-            Ok(_) => panic!("schema-less store with dedup state must be rejected"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("schema version is missing"), "{error}");
-
-        let options = Options::default();
-        let db = DB::open_cf_descriptors(&options, generation_path, super::schema::cf_descriptors()).unwrap();
-        let dedup = db.cf_handle(CF_DEDUP).unwrap();
-        assert_eq!(
-            db.get_cf(dedup, b"sentinel").unwrap().as_deref(),
-            Some(b"must-survive".as_slice())
-        );
-    }
     use beryl_types::fs::{FileAttrs, Inode, InodeData, InodeId};
     use beryl_types::ids::MountId;
-    use beryl_types::{CallId, ClientId};
-
-    #[test]
-    fn authority_batch_commits_dedup_and_applied_state() {
-        let temp_dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
-        let dedup = DedupKey::new(ClientId::new(81), CallId::new());
-        let result = AppliedResult {
-            fingerprint: CommandFingerprint(91),
-            result: AppDataResponse::None,
-            created_at_ms: 0,
-            size_bytes: 0,
-        };
-        let applied = LogId::new(LeaderId::new(3, 1), 7);
-        let raft_state = AppMetadataRaftState {
-            last_applied_log_id: Some(applied),
-            ..AppMetadataRaftState::default()
-        };
-
-        storage
-            .commit_apply_batch(AuthorityBatch::default(), &dedup, result, &raft_state)
-            .unwrap();
-
-        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
-        assert_eq!(storage.load_raft_state().unwrap().last_applied_log_id, Some(applied));
-    }
 
     #[test]
     #[ignore = "manual durability latency baseline; run with --release and --ignored"]
@@ -389,19 +351,12 @@ mod tests {
 
         let apply_started = std::time::Instant::now();
         for index in 1..=SAMPLES {
-            let dedup = DedupKey::new(ClientId::new(99), CallId::new());
-            let result = AppliedResult {
-                fingerprint: CommandFingerprint(index),
-                result: AppDataResponse::None,
-                created_at_ms: index,
-                size_bytes: 0,
-            };
             let raft_state = AppMetadataRaftState {
                 last_applied_log_id: Some(LogId::new(LeaderId::new(1, 1), index)),
                 ..AppMetadataRaftState::default()
             };
             storage
-                .commit_apply_batch(AuthorityBatch::default(), &dedup, result, &raft_state)
+                .commit_authority_batch(AuthorityBatch::default(), &raft_state)
                 .unwrap();
         }
         let apply_elapsed = apply_started.elapsed();
@@ -498,7 +453,7 @@ mod tests {
         let layout = FileLayout::new(4096, 4096, 1);
 
         storage
-            .create_file_atomic(parent_inode_id, "file", &inode, &parent, layout)
+            .put_test_file_atomic(parent_inode_id, "file", &inode, &parent, layout)
             .unwrap();
 
         let stored_inode = storage.get_inode(inode_id).unwrap().unwrap();
@@ -513,60 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn create_file_with_apply_result_atomic_persists_namespace_dedup() {
-        let temp_dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
-
-        let parent_inode_id = InodeId::new(10);
-        let mut parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
-        storage.put_inode(&parent).unwrap();
-
-        let inode_id = InodeId::new(11);
-        let data_handle_id = DataHandleId::new(12);
-        let inode = Inode::new_file(inode_id, FileAttrs::new(), parent.mount_id, data_handle_id);
-        parent.attrs.update_mtime_ctime(100);
-        let layout = FileLayout::new(4096, 4096, 1);
-        let dedup = DedupKey::new(ClientId::new(101), beryl_types::CallId::new());
-        let applied = AppliedResult {
-            fingerprint: CommandFingerprint(77),
-            result: AppDataResponse::Fs(crate::raft::FsCommandResult::Ok(crate::raft::response::FsOkResult {
-                inode_id: Some(inode_id),
-                data_handle_id: Some(data_handle_id),
-                file_version: None,
-                ..crate::raft::response::FsOkResult::default()
-            })),
-            created_at_ms: now_millis(),
-            size_bytes: 0,
-        };
-
-        storage
-            .create_file_with_apply_result_atomic(
-                FileAllocation {
-                    inode: InodeAllocation {
-                        inode_id,
-                        next_inode_id: InodeId::new(12),
-                    },
-                    data_handle_id,
-                    next_data_handle_id: DataHandleId::new(13),
-                },
-                parent_inode_id,
-                "file",
-                &inode,
-                &parent,
-                layout,
-                &dedup,
-                applied,
-                &AppMetadataRaftState::default(),
-            )
-            .unwrap();
-
-        assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), Some(inode_id));
-        assert_eq!(storage.get_layout(inode_id).unwrap(), layout);
-        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
-    }
-
-    #[test]
-    fn delete_empty_file_with_apply_result_atomic_removes_namespace_data_owner_dedup() {
+    fn delete_file_atomic_removes_namespace_and_data_owner() {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
 
@@ -578,27 +480,17 @@ mod tests {
         let layout = FileLayout::new(4096, 4096, 1);
         storage.put_inode(&parent).unwrap();
         storage
-            .create_file_atomic(parent_inode_id, "file", &inode, &parent, layout)
+            .put_test_file_atomic(parent_inode_id, "file", &inode, &parent, layout)
             .unwrap();
 
         parent.attrs.update_mtime_ctime(200);
-        let dedup = DedupKey::new(ClientId::new(103), beryl_types::CallId::new());
-        let applied = AppliedResult {
-            fingerprint: CommandFingerprint(99),
-            result: AppDataResponse::Fs(crate::raft::FsCommandResult::ok()),
-            created_at_ms: now_millis(),
-            size_bytes: 0,
-        };
-
         storage
-            .delete_empty_file_with_apply_result_atomic(
+            .delete_file_atomic(
                 parent_inode_id,
                 "file",
                 inode_id,
                 Some(data_handle_id),
                 &parent,
-                &dedup,
-                applied,
                 &AppMetadataRaftState::default(),
             )
             .unwrap();
@@ -607,11 +499,10 @@ mod tests {
         assert!(storage.get_inode(inode_id).unwrap().is_none());
         assert!(storage.get_layout(inode_id).is_err());
         assert_eq!(storage.get_inode_by_data_handle(data_handle_id).unwrap(), None);
-        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
     }
 
     #[test]
-    fn delete_empty_dir_with_apply_result_atomic_removes_namespace_dedup() {
+    fn delete_empty_dir_atomic_removes_namespace() {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
 
@@ -621,26 +512,16 @@ mod tests {
         let inode = Inode::new_dir(inode_id, FileAttrs::new(), parent.mount_id);
         storage.put_inode(&parent).unwrap();
         storage
-            .create_dir_atomic(parent_inode_id, "dir", &inode, &parent)
+            .put_test_dir_atomic(parent_inode_id, "dir", &inode, &parent)
             .unwrap();
 
         parent.attrs.update_mtime_ctime(300);
-        let dedup = DedupKey::new(ClientId::new(104), beryl_types::CallId::new());
-        let applied = AppliedResult {
-            fingerprint: CommandFingerprint(100),
-            result: AppDataResponse::Fs(crate::raft::FsCommandResult::ok()),
-            created_at_ms: now_millis(),
-            size_bytes: 0,
-        };
-
         storage
-            .delete_empty_dir_with_apply_result_atomic(
+            .delete_empty_dir_atomic(
                 parent_inode_id,
                 "dir",
                 inode_id,
                 &parent,
-                &dedup,
-                applied,
                 &AppMetadataRaftState::default(),
             )
             .unwrap();
@@ -648,35 +529,25 @@ mod tests {
         assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), None);
         assert!(storage.get_inode(inode_id).unwrap().is_none());
         assert_eq!(storage.get_inode(parent_inode_id).unwrap().unwrap().attrs.mtime_ms, 300);
-        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
     }
 
     #[test]
-    fn put_inode_with_apply_result_atomic_persists_inode_dedup() {
+    fn put_inode_atomic_persists_inode_and_applied_state() {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
 
         let inode_id = InodeId::new(12);
         let mut inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), DataHandleId::new(120));
         inode.attrs.uid = 44;
-        let dedup = DedupKey::new(ClientId::new(102), beryl_types::CallId::new());
-        let applied = AppliedResult {
-            fingerprint: CommandFingerprint(88),
-            result: AppDataResponse::Fs(crate::raft::FsCommandResult::ok()),
-            created_at_ms: now_millis(),
-            size_bytes: 0,
-        };
-
         storage
-            .put_inode_with_apply_result_atomic(&inode, &dedup, applied, &AppMetadataRaftState::default())
+            .put_inode_atomic(&inode, &AppMetadataRaftState::default())
             .unwrap();
 
         assert_eq!(storage.get_inode(inode_id).unwrap().unwrap().attrs.uid, 44);
-        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
     }
 
     #[test]
-    fn close_write_with_apply_result_atomic_persists_inode_layout_and_dedup() {
+    fn publish_file_atomic_persists_inode_layout_and_applied_state() {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
 
@@ -687,7 +558,7 @@ mod tests {
         let block_id = BlockId::new(data_handle_id, beryl_types::ids::BlockIndex::new(0));
         if let InodeData::File {
             extents,
-            file_version,
+            content_revision,
             lease_epoch,
         } = &mut inode.data
         {
@@ -696,31 +567,22 @@ mod tests {
                 block_id,
                 block_offset: 0,
                 len: 64,
-                file_version: None,
+                content_revision: None,
                 block_stamp: None,
             });
-            *file_version = Some(3);
+            *content_revision = Some(3);
             *lease_epoch = Some(3);
         }
         inode.attrs.size = 64;
         storage.put_layout(inode_id, layout).unwrap();
 
-        let dedup = DedupKey::new(ClientId::new(105), beryl_types::CallId::new());
-        let applied = AppliedResult {
-            fingerprint: CommandFingerprint(101),
-            result: AppDataResponse::Fs(crate::raft::FsCommandResult::ok()),
-            created_at_ms: now_millis(),
-            size_bytes: 0,
-        };
-
         storage
-            .close_write_with_apply_result_atomic(&inode, layout, &dedup, applied, &AppMetadataRaftState::default())
+            .publish_file_atomic(&inode, layout, &AppMetadataRaftState::default())
             .unwrap();
 
         let stored = storage.get_inode(inode_id).unwrap().unwrap();
         assert_eq!(stored.attrs.size, 64);
         assert_eq!(storage.get_layout(inode_id).unwrap(), layout);
-        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
     }
 
     #[test]
@@ -751,7 +613,7 @@ mod tests {
         parent.attrs.update_mtime_ctime(200);
 
         storage
-            .create_dir_atomic(parent_inode_id, "dir", &inode, &parent)
+            .put_test_dir_atomic(parent_inode_id, "dir", &inode, &parent)
             .unwrap();
 
         assert!(storage.get_inode(inode_id).unwrap().unwrap().kind.is_dir());
@@ -781,7 +643,7 @@ mod tests {
         inode.attrs.update_ctime(300);
 
         storage
-            .rename_atomic(crate::raft::storage::RenameAtomicUpdate {
+            .rename_test_atomic(crate::raft::storage::RenameAtomicUpdate {
                 src_parent_inode_id: src_parent_id,
                 src_name: "old",
                 dst_parent_inode_id: dst_parent_id,
@@ -898,53 +760,6 @@ mod tests {
                 );
             }
             Ok(_) => panic!("Expected error but got Ok"),
-        }
-    }
-
-    #[test]
-    fn old_dedup_record_remains_available() {
-        let temp_dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
-        let key = DedupKey::new(ClientId::new(42), CallId::new());
-        let result = AppliedResult {
-            fingerprint: CommandFingerprint(1),
-            result: AppDataResponse::None,
-            created_at_ms: 1,
-            size_bytes: 0,
-        };
-        storage.put_applied_result(&key, result).unwrap();
-
-        let fetched = storage.get_applied_result(&key).unwrap();
-        assert!(fetched.is_some(), "replay records must not expire during lookup");
-    }
-
-    #[test]
-    fn dedup_records_are_not_evicted_by_apply() {
-        let temp_dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
-        let mut keys = Vec::new();
-
-        for _ in 0..130 {
-            let key = DedupKey::new(ClientId::new(7), CallId::new());
-            let result = AppliedResult {
-                fingerprint: CommandFingerprint(2),
-                result: AppDataResponse::None,
-                created_at_ms: now_millis(),
-                size_bytes: 0,
-            };
-            storage
-                .commit_apply_batch(
-                    AuthorityBatch::default(),
-                    &key,
-                    result,
-                    &AppMetadataRaftState::default(),
-                )
-                .unwrap();
-            keys.push(key);
-        }
-
-        for key in keys {
-            assert!(storage.get_applied_result(&key).unwrap().is_some());
         }
     }
 

@@ -57,7 +57,7 @@ impl FileReader {
         let Some(requested_range) = planner::requested_range(offset, len, self.handle.size_hint())? else {
             return Ok(Bytes::new());
         };
-        let file_version = self.handle.file_version();
+        let content_revision = self.handle.content_revision();
         let data_handle_id = self.handle.data_handle_id();
         let operation = OperationContext::new_named(
             self.runtime.executor.client_id(),
@@ -78,8 +78,12 @@ impl FileReader {
                     operation.deadline().clone(),
                 )
                 .await?;
-            let (group_name, block_reads) =
-                planner::plan_block_reads_from_layout(data_handle_id, Some(file_version), requested_range, &layout)?;
+            let (group_name, block_reads) = planner::plan_block_reads_from_layout(
+                data_handle_id,
+                Some(content_revision),
+                requested_range,
+                &layout,
+            )?;
             let ctx = self.runtime.data_context(&operation, attempt_index as u32);
             match self
                 .runtime
@@ -335,7 +339,7 @@ impl FileWriter {
         match self.runtime.executor.commit_file(plan).await {
             Ok(response) => {
                 validate_commit_file_size(response.committed_size, final_size)?;
-                session.mark_closed(response.file_version);
+                session.mark_closed(response.content_revision);
                 Ok(())
             }
             Err(err) if is_unknown_session_barrier_outcome(&err) => {
@@ -440,18 +444,15 @@ impl FileWriter {
         match self
             .runtime
             .executor
-            .sync_write(
-                &session,
-                self.handle.data_handle_id(),
-                committed_blocks,
-                target_size,
-                mode,
-                deadline,
-            )
+            .sync_write(&session, committed_blocks, target_size, mode, deadline)
             .await
         {
             Ok(response) => {
                 validate_sync_write_size(response.synced_size, target_size)?;
+                let content_revision = response.content_revision.ok_or_else(|| {
+                    ClientError::Metadata("SyncWriteResponseProto.content_revision missing".to_string())
+                })?;
+                session.update_published_state(content_revision, target_size);
                 self.handle.store_write_cursor(session.cursor());
                 Ok(())
             }
@@ -559,7 +560,7 @@ fn validate_sync_write_size(synced_size: u64, target_size: u64) -> ClientResult<
 pub(crate) struct ReadHandle {
     path: String,
     data_handle_id: DataHandleId,
-    file_version: u64,
+    content_revision: u64,
     file_size: u64,
 }
 
@@ -572,11 +573,11 @@ impl ReadHandle {
         self.file_size
     }
 
-    pub(crate) fn new(path: String, data_handle_id: DataHandleId, file_version: u64, file_size: u64) -> Self {
+    pub(crate) fn new(path: String, data_handle_id: DataHandleId, content_revision: u64, file_size: u64) -> Self {
         Self {
             path,
             data_handle_id,
-            file_version,
+            content_revision,
             file_size,
         }
     }
@@ -585,8 +586,8 @@ impl ReadHandle {
         self.data_handle_id
     }
 
-    pub(crate) fn file_version(&self) -> u64 {
-        self.file_version
+    pub(crate) fn content_revision(&self) -> u64 {
+        self.content_revision
     }
 }
 
@@ -601,16 +602,14 @@ impl fmt::Debug for ReadHandle {
 
 pub(crate) struct WriteHandle {
     path: String,
-    data_handle_id: DataHandleId,
     write_session: Arc<Mutex<WriteSession>>,
     write_cursor: Arc<AtomicU64>,
 }
 
 impl WriteHandle {
-    pub(crate) fn new(path: String, data_handle_id: DataHandleId, base_size: u64, session: WriteSession) -> Self {
+    pub(crate) fn new(path: String, base_size: u64, session: WriteSession) -> Self {
         Self {
             path,
-            data_handle_id,
             write_session: Arc::new(Mutex::new(session)),
             write_cursor: Arc::new(AtomicU64::new(base_size)),
         }
@@ -618,10 +617,6 @@ impl WriteHandle {
 
     pub(crate) fn path(&self) -> &str {
         &self.path
-    }
-
-    pub(crate) fn data_handle_id(&self) -> DataHandleId {
-        self.data_handle_id
     }
 
     pub(crate) fn write_session(&self) -> Arc<Mutex<WriteSession>> {

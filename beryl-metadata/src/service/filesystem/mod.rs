@@ -18,7 +18,7 @@ use crate::inode_lease::LeaseManager;
 use crate::metrics::MetadataMetrics;
 use crate::mount::MountTable;
 use crate::path_resolver::{MountContext, PathResolver, ResolvedPath};
-use crate::raft::{AppDataResponse, AppRaftNode, CommandFingerprint, DedupKey, FsCommandResult, RocksDBStorage};
+use crate::raft::{AppRaftNode, RocksDBStorage};
 use crate::readiness::RootReadinessGate;
 use crate::session_registry::SessionRegistry;
 use crate::state::StateStore;
@@ -26,19 +26,18 @@ use crate::worker::WorkerManager;
 use beryl_common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail};
 use beryl_common::header::RequestHeader;
 use beryl_types::fs::{FsErrorCode, InodeId};
-use beryl_types::ids::{BlockId, LeaseId, WorkerId};
-use beryl_types::lease::FencingToken;
+use beryl_types::ids::{DataHandleId, WorkerId};
 use beryl_types::{GroupName, GroupStateWatermark, WorkerEndpointInfo};
 use std::sync::Arc;
 
 use admission::{AdmissionFailure, AdmissionGuard};
-use command::{RoutedFsWriteCtx, WriteCommandKind};
+use command::RoutedFsWriteCtx;
 pub(super) use delete::DeleteArgs;
-pub(super) use file_write::{CreateFileArgs, CreateFileMode, OpenWriteArgs};
+pub(super) use file_write::{CreateFileArgs, OpenWriteArgs};
 use freshness::{FreshnessValidator, StaleStateStatus};
 pub(super) use namespace::{CreateDirectoryArgs, RenameArgs};
 pub(super) use read::{BlockLocationsTarget, GetBlockLocationsArgs, GetStatusArgs, ListStatusArgs, OpenFileArgs};
-pub(super) use write_commit::{CommitFileArgs, SyncWriteArgs, SyncWriteMode};
+pub(super) use write_commit::{CommitFileArgs, SyncWriteArgs};
 pub(super) use write_session::{AbortFileWriteArgs, AddBlockArgs, RenewLeaseArgs};
 
 #[derive(Clone, Debug)]
@@ -51,22 +50,6 @@ pub(crate) struct RequestContext {
 pub(crate) struct Freshness {
     pub(crate) mount_epoch: Option<u64>,
     pub(crate) route_epoch: Option<u64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SessionKey {
-    pub(crate) file_handle: u64,
-    pub(crate) lease_id: LeaseId,
-    pub(crate) lease_epoch: u64,
-    pub(crate) open_epoch: u64,
-    pub(crate) fencing_token: FencingToken,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PresentedFencingToken {
-    pub(crate) block_id: Option<BlockId>,
-    pub(crate) owner: beryl_types::ClientId,
-    pub(crate) epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -202,13 +185,10 @@ pub(crate) struct MetadataFileSystemDeps {
     pub(crate) readiness_gate: Option<Arc<RootReadinessGate>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct PresentedWriteHandle {
-    pub(crate) file_handle: u64,
-    pub(crate) lease_id: Option<LeaseId>,
+    pub(crate) data_handle_id: DataHandleId,
     pub(crate) lease_epoch: u64,
-    pub(crate) open_epoch: u64,
-    pub(crate) fencing_token: Option<PresentedFencingToken>,
 }
 
 pub(crate) struct MetadataFileSystem {
@@ -244,58 +224,6 @@ impl MetadataFileSystem {
             worker_manager: deps.worker_manager,
             lease_manager: deps.lease_manager,
         }
-    }
-
-    fn dedup_key(&self, caller_ctx: &RequestHeader) -> MetadataResult<DedupKey> {
-        DedupKey::from_header_identity(&caller_ctx.identity()).map_err(MetadataError::InvalidArgument)
-    }
-
-    fn reject_durable_call_reuse(&self, caller_ctx: &RequestHeader) -> MetadataResult<()> {
-        let dedup = self.dedup_key(caller_ctx)?;
-        if self.storage.get_applied_result(&dedup)?.is_some() {
-            return Err(MetadataError::InvalidArgument(format!(
-                "call_id {} was already used by a durable metadata mutation",
-                dedup.call_id
-            )));
-        }
-        Ok(())
-    }
-
-    fn replay_namespace_result(
-        &self,
-        caller_ctx: &RequestHeader,
-        fingerprint: CommandFingerprint,
-    ) -> MetadataResult<Option<FsCommandResult>> {
-        let dedup = self.dedup_key(caller_ctx)?;
-        let Some(applied) = self.storage.get_applied_result(&dedup)? else {
-            return Ok(None);
-        };
-        if applied.fingerprint != fingerprint {
-            return Err(MetadataError::InvalidArgument(format!(
-                "call_id {} reused with different command payload or RPC method",
-                dedup.call_id
-            )));
-        }
-        match applied.result {
-            AppDataResponse::Fs(result) => Ok(Some(result)),
-            _ => Err(MetadataError::InvalidArgument(format!(
-                "call_id {} was already used by a different durable RPC method",
-                dedup.call_id
-            ))),
-        }
-    }
-
-    fn reject_active_session_call_reuse(&self, caller_ctx: &RequestHeader) -> MetadataResult<()> {
-        let identity = caller_ctx.identity();
-        if self.session_registry.has_call_id(identity.client_id, identity.call_id)
-            || self.lease_manager.has_renew_call(identity.client_id, identity.call_id)
-        {
-            return Err(MetadataError::InvalidArgument(format!(
-                "call_id {} was already used by an active write session RPC",
-                identity.call_id
-            )));
-        }
-        Ok(())
     }
 
     async fn authoritative_route_epoch(&self) -> MetadataResult<u64> {
@@ -487,19 +415,6 @@ impl MetadataFileSystem {
         format!("refresh metadata and reopen write handle, then replay {}", intent)
     }
 
-    fn fencing_token_matches_session(
-        session: &crate::session_registry::WriteSession,
-        token: &PresentedFencingToken,
-    ) -> bool {
-        let session_block_id = session.fencing_token.block_id;
-        let req_block = token.block_id.as_ref();
-        let block_ok = req_block
-            .map(|b| b.data_handle_id == session_block_id.data_handle_id && b.index == session_block_id.index)
-            .unwrap_or(false);
-
-        block_ok && token.owner == session.fencing_token.owner && token.epoch == session.fencing_token.epoch
-    }
-
     fn read_inode(&self, inode_id: InodeId) -> MetadataResult<Option<beryl_types::fs::Inode>> {
         self.storage.get_inode(inode_id)
     }
@@ -519,11 +434,10 @@ mod test_support {
     pub(super) use crate::config::RaftConfig;
     pub(super) use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
     pub(super) use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
-    pub(super) use crate::service::filesystem::read::GetFileLayoutInput;
-    pub(super) use crate::service::filesystem::write_commit::{CloseWriteInput, CloseWriteIntent, CloseWriteOutput};
-    pub(super) use crate::service::filesystem::write_session::{AddBlockInput, OpenWriteInput};
+    pub(super) use crate::service::filesystem::write_commit::{CloseWriteIntent, CloseWriteOutput};
+    pub(super) use crate::service::filesystem::write_session::OpenWriteOutput;
     pub(super) use crate::state::MemoryStateStore;
-    pub(super) use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerInfo, WorkerManager};
+    pub(super) use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerManager};
     pub(super) use beryl_common::error::rpc::{
         ErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail, WorkerErrorKind,
     };
@@ -532,10 +446,7 @@ mod test_support {
     pub(super) use beryl_types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, MountId, WorkerId};
     pub(super) use beryl_types::layout::FileLayout;
     pub(super) use beryl_types::lease::FencingToken;
-    pub(super) use beryl_types::worker::WorkerNetProtocol;
-    pub(super) use beryl_types::{
-        CommittedBlock, GroupName, Tier, TierFree, WorkerEndpointInfo, WorkerRunId, WriteTarget,
-    };
+    pub(super) use beryl_types::{CommittedBlock, GroupName, Tier, TierFree, WorkerRunId, WriteTarget};
     pub(super) use std::sync::Arc;
     pub(super) use std::time::Duration;
     pub(super) use tempfile::TempDir;
@@ -558,9 +469,9 @@ mod test_support {
     impl TestFilesystem {
         pub(super) fn write_session_for_handle(
             &self,
-            file_handle: u64,
+            data_handle_id: DataHandleId,
         ) -> Option<crate::session_registry::WriteSession> {
-            self.session_registry.get_session(file_handle)
+            self.session_registry.get_session(data_handle_id)
         }
 
         pub(super) fn session_registry(&self) -> Arc<crate::session_registry::SessionRegistry> {
@@ -681,10 +592,6 @@ mod test_support {
         TestFilesystemBuilder::new(mount_table)
     }
 
-    pub(super) fn filesystem_with_mount(mount_id: MountId, mount_epoch: u64, group_name: &GroupName) -> TestFilesystem {
-        filesystem_builder_with_mount(mount_id, mount_epoch, group_name).build()
-    }
-
     pub(super) fn worker_run_id(group_name: &GroupName, worker_id: WorkerId) -> WorkerRunId {
         let group_component = group_name
             .as_str()
@@ -780,27 +687,6 @@ mod test_support {
         manager
             .upsert_descriptor(descriptor)
             .expect("descriptor should be restored");
-    }
-
-    pub(super) fn worker_manager_for_tier(group_name: &GroupName, tier: Tier, free_bytes: u64) -> Arc<WorkerManager> {
-        let manager = Arc::new(WorkerManager::new(60));
-        let worker_id = WorkerId::new(11);
-        manager
-            .register_worker(group_name, worker_id, "127.0.0.1:9111".to_string(), 1, None)
-            .unwrap();
-        record_worker_heartbeat_with_tiers(
-            &manager,
-            group_name,
-            worker_id,
-            free_bytes,
-            0,
-            free_bytes,
-            vec![TierFree { tier, free_bytes }],
-            0,
-            0,
-            HealthStatus::Healthy,
-        );
-        manager
     }
 
     pub(super) fn report_block(block_id: BlockId) -> BlockReportBlock {
@@ -933,11 +819,6 @@ mod test_support {
         assert!(matches!(error.recovery, RecoveryAction::RefreshMetadata { .. }));
     }
 
-    pub(super) fn assert_reopen_write_session(error: &RpcErrorDetail, kind: ErrorKind) {
-        assert_eq!(error.kind, kind);
-        assert!(matches!(error.recovery, RecoveryAction::ReopenWriteSession { .. }));
-    }
-
     pub(super) fn refresh_hint(error: &RpcErrorDetail) -> &RefreshHint {
         match &error.recovery {
             RecoveryAction::RefreshMetadata { hint } | RecoveryAction::ReopenWriteSession { hint } => hint,
@@ -945,40 +826,28 @@ mod test_support {
         }
     }
 
-    pub(super) fn install_write_session(filesystem: &TestFilesystem, inode_id: InodeId, mount_id: MountId) -> u64 {
+    pub(super) fn install_write_session(
+        filesystem: &TestFilesystem,
+        inode_id: InodeId,
+        mount_id: MountId,
+    ) -> DataHandleId {
         let writer = ClientId::new(7);
-        let open_call_id = beryl_types::CallId::new();
         let data_handle_id = DataHandleId::new(424_242);
-        let (lease_id, lease_epoch, expires_at_ms) = filesystem
+        let (lease_epoch, expires_at_ms) = filesystem
             .lease_manager()
-            .try_acquire(
-                inode_id,
-                writer,
-                Some(open_call_id),
-                crate::inode_lease::WriteMode::Write,
-                None,
-            )
+            .try_acquire(inode_id, writer, crate::inode_lease::WriteMode::Write, None)
             .expect("lease acquired");
         filesystem
             .session_registry()
-            .get_or_create_session(crate::session_registry::CreateSessionInput {
+            .create_session(crate::session_registry::CreateSessionInput {
                 inode_id,
                 mount_id,
                 data_handle_id,
-                lease_id,
                 lease_epoch,
-                fencing_token: FencingToken {
-                    block_id: BlockId::new(data_handle_id, BlockIndex::new(0)),
-                    owner: writer,
-                    epoch: lease_epoch,
-                },
-                open_epoch: 1234,
                 base_size: 0,
+                content_revision: 0,
                 mode: crate::inode_lease::WriteMode::Write,
                 open_client_id: writer,
-                open_call_id,
-                open_path: "/test".to_string(),
-                open_desired_len: None,
                 layout: FileLayout::new(64, 64, 1),
                 expires_at_ms,
                 write_targets: vec![WriteTarget {
@@ -998,16 +867,8 @@ mod test_support {
                     tier: beryl_types::Tier::Hdd,
                 }],
             })
-            .expect("session created")
-            .0
-    }
-
-    pub(super) fn presented_session_token(session: &crate::session_registry::WriteSession) -> PresentedFencingToken {
-        PresentedFencingToken {
-            block_id: Some(session.fencing_token.block_id),
-            owner: session.fencing_token.owner,
-            epoch: session.fencing_token.epoch,
-        }
+            .expect("session created");
+        data_handle_id
     }
 
     pub(super) fn committed_block(block_id: BlockId, file_offset: u64, len: u64) -> CommittedBlock {
@@ -1019,35 +880,24 @@ mod test_support {
         }
     }
 
-    pub(super) fn presented_key_token(key: &SessionKey) -> PresentedFencingToken {
-        PresentedFencingToken {
-            block_id: Some(key.fencing_token.block_id),
-            owner: key.fencing_token.owner,
-            epoch: key.fencing_token.epoch,
-        }
-    }
-
     pub(super) async fn add_block_for_key(
         filesystem: &MetadataFileSystem,
-        key: &SessionKey,
+        key: &OpenWriteOutput,
         desired_len: u64,
     ) -> WriteTarget {
         let previous_block_id = filesystem
             .session_registry
-            .get_session(key.file_handle)
+            .get_session(key.data_handle_id)
             .and_then(|session| session.issued_targets.last().map(|target| target.block_id));
         filesystem
-            .add_block_resolved(AddBlockInput {
-                ctx: request_context(),
-                file_handle: key.file_handle,
-                lease_id: Some(key.lease_id),
-                lease_epoch: key.lease_epoch,
-                open_epoch: key.open_epoch,
-                fencing_token: Some(presented_key_token(key)),
-                desired_len: Some(desired_len),
+            .add_block_session(
+                &request_context(),
+                key.data_handle_id,
+                key.lease_epoch,
+                Some(desired_len),
                 previous_block_id,
-                freshness: Freshness::default(),
-            })
+                Freshness::default(),
+            )
             .await
             .expect("AddBlock should succeed")
             .payload
@@ -1056,24 +906,29 @@ mod test_support {
 
     pub(super) async fn commit_for_key(
         filesystem: &MetadataFileSystem,
-        key: &SessionKey,
+        key: &OpenWriteOutput,
         committed_blocks: Vec<CommittedBlock>,
         final_size: u64,
     ) -> FsResult<CloseWriteOutput> {
         filesystem
-            .close_write_resolved(CloseWriteInput {
-                ctx: request_context(),
-                file_handle: key.file_handle,
-                lease_id: Some(key.lease_id),
-                lease_epoch: key.lease_epoch,
-                open_epoch: key.open_epoch,
-                fencing_token: Some(presented_key_token(key)),
-                intent: CloseWriteIntent {
+            .close_write_session(
+                &request_context(),
+                PresentedWriteHandle {
+                    data_handle_id: key.data_handle_id,
+                    lease_epoch: key.lease_epoch,
+                },
+                CloseWriteIntent {
                     committed_blocks,
                     final_size,
+                    expected_file_size: key.base_size,
                 },
-                freshness: Freshness::default(),
-            })
+                Freshness::default(),
+                key.content_revision,
+                match key.mode {
+                    crate::inode_lease::WriteMode::Write => crate::raft::PublishMode::ReplaceIfUnchanged,
+                    crate::inode_lease::WriteMode::Append => crate::raft::PublishMode::AppendIfUnchanged,
+                },
+            )
             .await
     }
 
@@ -1088,13 +943,6 @@ mod test_support {
 
     pub(super) async fn write_flow_env(base_size: u64) -> WriteFlowEnv {
         build_write_flow_env(base_size, worker_manager_for_write_targets).await
-    }
-
-    pub(super) async fn write_flow_env_for_tier(base_size: u64, tier: Tier, free_bytes: u64) -> WriteFlowEnv {
-        build_write_flow_env(base_size, |group_name| {
-            worker_manager_for_tier(group_name, tier, free_bytes)
-        })
-        .await
     }
 
     async fn build_write_flow_env(
@@ -1134,7 +982,7 @@ mod test_support {
         }
     }
 
-    pub(super) fn seed_committed_file_version(env: &WriteFlowEnv, file_version: u64, lease_epoch: u64) {
+    pub(super) fn seed_committed_content_revision(env: &WriteFlowEnv, content_revision: u64, lease_epoch: u64) {
         let block_id = BlockId::new(env.data_handle_id, BlockIndex::new(0));
         let mut inode = env
             .storage
@@ -1145,7 +993,7 @@ mod test_support {
         match &mut inode.data {
             beryl_types::fs::InodeData::File {
                 extents,
-                file_version: stored_file_version,
+                content_revision: stored_content_revision,
                 lease_epoch: stored_lease_epoch,
             } => {
                 *extents = vec![beryl_types::fs::Extent {
@@ -1153,10 +1001,10 @@ mod test_support {
                     block_id,
                     block_offset: 0,
                     len: 64,
-                    file_version: Some(file_version),
-                    block_stamp: Some(file_version),
+                    content_revision: Some(content_revision),
+                    block_stamp: Some(content_revision),
                 }];
-                *stored_file_version = Some(file_version);
+                *stored_content_revision = Some(content_revision);
                 *stored_lease_epoch = Some(lease_epoch);
             }
             other => panic!("unexpected inode data: {:?}", other),
@@ -1176,10 +1024,10 @@ mod test_support {
         );
     }
 
-    pub(super) fn stored_file_version(storage: &RocksDBStorage, inode_id: InodeId) -> Option<u64> {
+    pub(super) fn stored_content_revision(storage: &RocksDBStorage, inode_id: InodeId) -> Option<u64> {
         let inode = storage.get_inode(inode_id).unwrap().expect("test inode should exist");
         match inode.data {
-            beryl_types::fs::InodeData::File { file_version, .. } => file_version,
+            beryl_types::fs::InodeData::File { content_revision, .. } => content_revision,
             other => panic!("unexpected inode data: {:?}", other),
         }
     }

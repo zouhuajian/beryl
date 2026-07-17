@@ -6,7 +6,7 @@
 use crate::config::{MetadataConfig, RaftMode};
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::{DataIoPolicy, MountKind, MountTable, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
-use crate::raft::{AppRaftNode, AppRaftStateMachine, Command, DedupKey, Mutation, RocksDBStorage, StorageIdentity};
+use crate::raft::{AppRaftNode, AppRaftStateMachine, Command, RocksDBStorage, StorageIdentity};
 use crate::readiness::{wait_for_root_ready_with_inputs, RootReadinessGate, RootReadinessLogFields, RootReadyInputs};
 use beryl_types::ids::ClientId;
 use beryl_types::{CallId, GroupName};
@@ -79,18 +79,11 @@ pub async fn format_metadata_storage(config: &MetadataConfig) -> MetadataResult<
     wait_for_single_node_leader(&raft_node, config.bootstrap.root_readiness.timeout_ms).await?;
 
     let group_name = config.authority.group_name.clone();
-    let bootstrap_dedup = DedupKey::new(
-        ClientId::parse(&marker.bootstrap_client_id).map_err(MetadataError::InvalidArgument)?,
-        CallId::parse(&marker.bootstrap_call_id).map_err(MetadataError::InvalidArgument)?,
-    );
     raft_node
-        .propose(Command::new(
-            bootstrap_dedup,
-            marker.bootstrap_proposed_at_ms,
-            Mutation::BootstrapNamespace {
-                group_name: group_name.clone(),
-            },
-        ))
+        .propose(Command::BootstrapNamespace {
+            proposed_at_ms: marker.bootstrap_proposed_at_ms,
+            group_name: group_name.clone(),
+        })
         .await?;
     wait_for_root_ready_with_inputs(RootReadyInputs {
         raft_node: Arc::clone(&raft_node),

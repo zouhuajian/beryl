@@ -154,7 +154,7 @@ async fn write_closed_file(
         .client()
         .create(
             path,
-            CreateOptions::overwrite()
+            CreateOptions::create()
                 .with_block_size(block_size)
                 .with_chunk_size(block_size),
         )

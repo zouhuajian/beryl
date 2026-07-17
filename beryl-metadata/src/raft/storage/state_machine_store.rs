@@ -6,7 +6,7 @@
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::{MountEntry, MountTable, MountTableState};
 use crate::observe;
-use crate::raft::response::AppDataResponse;
+use crate::raft::response::CommandResult;
 use crate::raft::storage::snapshot::{
     decode_snapshot, is_node_local_meta_key, SnapshotCodecError, SnapshotIdentity, SnapshotWriter,
 };
@@ -93,7 +93,7 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
         Ok((last_applied, membership))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<AppDataResponse>, StorageError<u64>>
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<CommandResult>, StorageError<u64>>
     where
         I: IntoIterator<Item = Entry<MetadataRaftTypeConfig>> + openraft::OptionalSend,
         I::IntoIter: openraft::OptionalSend,
@@ -154,7 +154,7 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
                     }
                     *current = next;
 
-                    results.push(AppDataResponse::None);
+                    results.push(CommandResult::None);
                     observe::record_raft_apply("ok", "none", apply_started.elapsed().as_secs_f64());
                 }
                 EntryPayload::Blank => {
@@ -169,7 +169,7 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
                     }
                     *current = next;
 
-                    results.push(AppDataResponse::None);
+                    results.push(CommandResult::None);
                     observe::record_raft_apply("ok", "none", apply_started.elapsed().as_secs_f64());
                 }
             }
@@ -968,9 +968,9 @@ mod tests {
     use crate::raft::Command;
     use crate::state::RouteEpoch;
     use beryl_types::fs::{FileAttrs, Inode, InodeId};
-    use beryl_types::ids::{ClientId, DataHandleId, MountId, WorkerId};
+    use beryl_types::ids::{DataHandleId, MountId, WorkerId};
     use beryl_types::layout::FileLayout;
-    use beryl_types::{CallId, GroupName};
+    use beryl_types::GroupName;
     use metrics::{Counter, CounterFn, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
     use openraft::storage::RaftSnapshotBuilder;
     use openraft::LeaderId;
@@ -997,28 +997,11 @@ mod tests {
         }
     }
 
-    fn worker_command(dedup: crate::raft::DedupKey, address: &str) -> Command {
-        Command::new(
-            dedup,
-            crate::raft::proposal_timestamp_ms(),
-            crate::raft::Mutation::RegisterWorkerDescriptor {
-                group_name: GroupName::parse("root").unwrap(),
-                worker_id: WorkerId::new(81),
-                address: address.to_string(),
-                worker_net_protocol: 1,
-                fault_domain: None,
-            },
-        )
-    }
-
-    fn bootstrap_command(dedup: crate::raft::DedupKey) -> Command {
-        Command::new(
-            dedup,
-            1,
-            crate::raft::Mutation::BootstrapNamespace {
-                group_name: GroupName::parse("root").unwrap(),
-            },
-        )
+    fn bootstrap_command() -> Command {
+        Command::BootstrapNamespace {
+            proposed_at_ms: 1,
+            group_name: GroupName::parse("root").unwrap(),
+        }
     }
 
     fn sample_raft_state() -> AppMetadataRaftState {
@@ -1068,13 +1051,7 @@ mod tests {
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
         let mut store =
             StateMachineStorage::new(storage.clone(), state_machine, Arc::clone(&state), read_view).unwrap();
-        store
-            .apply([normal_entry(
-                1,
-                bootstrap_command(crate::raft::DedupKey::new(ClientId::new(21), CallId::new())),
-            )])
-            .await
-            .unwrap();
+        store.apply([normal_entry(1, bootstrap_command())]).await.unwrap();
 
         assert_eq!(
             routing
@@ -1112,12 +1089,7 @@ mod tests {
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
         let mut store =
             StateMachineStorage::new(storage.clone(), state_machine, Arc::clone(&state), read_view).unwrap();
-        let result = store
-            .apply([normal_entry(
-                1,
-                bootstrap_command(crate::raft::DedupKey::new(ClientId::new(22), CallId::new())),
-            )])
-            .await;
+        let result = store.apply([normal_entry(1, bootstrap_command())]).await;
 
         assert!(result.is_err());
         assert!(storage.get_mount(MountId::new(1)).unwrap().is_some());
@@ -1125,60 +1097,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dedup_replay_advances_current_log_without_rewriting_original_result() {
+    async fn business_rejection_advances_applied_state() {
         let (_dir, storage, mut store) = committed_apply_test_store();
-        let dedup = crate::raft::DedupKey::new(ClientId::new(81), CallId::new());
-        let command = worker_command(dedup.clone(), "127.0.0.1:18081");
-
-        store.apply([normal_entry(1, command.clone())]).await.unwrap();
-        let original = storage.get_applied_result(&dedup).unwrap().unwrap();
-        store.apply([normal_entry(2, command)]).await.unwrap();
-        let replayed = storage.get_applied_result(&dedup).unwrap().unwrap();
-
-        assert_eq!(original.fingerprint, replayed.fingerprint);
-        assert_eq!(original.created_at_ms, replayed.created_at_ms);
-        assert_eq!(storage.load_raft_state().unwrap().last_applied_log_id.unwrap().index, 2);
-    }
-
-    #[tokio::test]
-    async fn dedup_fingerprint_conflict_advances_log_without_rewriting_original_result() {
-        let (_dir, storage, mut store) = committed_apply_test_store();
-        let dedup = crate::raft::DedupKey::new(ClientId::new(82), CallId::new());
-        let original_command = worker_command(dedup.clone(), "127.0.0.1:18082");
-
-        store.apply([normal_entry(1, original_command.clone())]).await.unwrap();
-        let original = storage.get_applied_result(&dedup).unwrap().unwrap();
-        let responses = store
-            .apply([normal_entry(2, worker_command(dedup.clone(), "127.0.0.1:28082"))])
-            .await
-            .unwrap();
-        let retained = storage.get_applied_result(&dedup).unwrap().unwrap();
-
-        assert!(matches!(responses.as_slice(), [AppDataResponse::Rejected(_)]));
-        assert_eq!(original.fingerprint, retained.fingerprint);
-        assert_eq!(storage.load_raft_state().unwrap().last_applied_log_id.unwrap().index, 2);
-    }
-
-    #[tokio::test]
-    async fn business_rejection_advances_and_is_deduplicated() {
-        let (_dir, storage, mut store) = committed_apply_test_store();
-        let dedup = crate::raft::DedupKey::new(ClientId::new(83), CallId::new());
-        let command = Command::new(
-            dedup.clone(),
-            crate::raft::proposal_timestamp_ms(),
-            crate::raft::Mutation::RegisterWorkerDescriptor {
-                group_name: GroupName::parse("root").unwrap(),
-                worker_id: WorkerId::new(0),
-                address: "127.0.0.1:18083".to_string(),
-                worker_net_protocol: 1,
-                fault_domain: None,
-            },
-        );
+        let command = Command::RegisterWorkerDescriptor {
+            proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+            group_name: GroupName::parse("root").unwrap(),
+            worker_id: WorkerId::new(0),
+            address: "127.0.0.1:18083".to_string(),
+            worker_net_protocol: 1,
+            fault_domain: None,
+        };
 
         let responses = store.apply([normal_entry(1, command)]).await.unwrap();
 
-        assert!(matches!(responses.as_slice(), [AppDataResponse::Rejected(_)]));
-        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
+        assert!(matches!(responses.as_slice(), [CommandResult::Rejected(_)]));
         assert_eq!(storage.load_raft_state().unwrap().last_applied_log_id.unwrap().index, 1);
     }
 
@@ -1194,47 +1126,38 @@ mod tests {
                     .map_err(|error| MetadataError::Internal(error.to_string()))
             })
             .unwrap();
-        let dedup = crate::raft::DedupKey::new(ClientId::new(84), CallId::new());
-        let command = Command::new(
-            dedup.clone(),
-            crate::raft::proposal_timestamp_ms(),
-            crate::raft::Mutation::Mkdir {
-                parent_inode_id,
-                name: "child".to_string(),
-                attrs: FileAttrs::new(),
-            },
-        );
+        let command = Command::CreateDirectory {
+            proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+            root_inode_id: parent_inode_id,
+            components: vec!["child".to_string()],
+            attrs: FileAttrs::new(),
+            recursive: false,
+        };
 
         assert!(store.apply([normal_entry(1, command)]).await.is_err());
-        assert!(storage.get_applied_result(&dedup).unwrap().is_none());
         assert!(storage.load_raft_state().unwrap().last_applied_log_id.is_none());
     }
 
     #[tokio::test]
-    async fn create_commits_allocators_domain_dedup_and_applied_state() {
+    async fn create_commits_allocators_domain_state_and_applied_state() {
         let (dir, storage, mut store) = committed_apply_test_store();
         let parent_inode_id = InodeId::new(1);
         storage
             .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1)))
             .unwrap();
         storage.set_next_inode_id(InodeId::new(2)).unwrap();
-        let dedup = crate::raft::DedupKey::new(ClientId::new(85), CallId::new());
-        let command = Command::new(
-            dedup.clone(),
-            crate::raft::proposal_timestamp_ms(),
-            crate::raft::Mutation::CreateFile {
-                mode: crate::raft::CreateFileMode::CreateNew,
-                parent_inode_id,
-                name: "file".to_string(),
-                attrs: FileAttrs::new(),
-                layout: FileLayout::new(4096, 4096, 1),
-            },
-        );
+        let command = Command::CreateFile {
+            proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+            parent_inode_id,
+            name: "file".to_string(),
+            attrs: FileAttrs::new(),
+            layout: FileLayout::new(4096, 4096, 1),
+        };
 
         let responses = store.apply([normal_entry(1, command)]).await.unwrap();
         assert!(matches!(
             responses.as_slice(),
-            [AppDataResponse::Fs(crate::raft::FsCommandResult::Ok(_))]
+            [CommandResult::Fs(crate::raft::FsCommandResult::Ok(_))]
         ));
         assert_eq!(
             storage.get_dentry(parent_inode_id, "file").unwrap(),
@@ -1244,7 +1167,6 @@ mod tests {
             storage.get_inode_by_data_handle(DataHandleId::new(1)).unwrap(),
             Some(InodeId::new(2))
         );
-        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
 
         drop(store);
         drop(storage);
@@ -1270,41 +1192,31 @@ mod tests {
             .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1)))
             .unwrap();
         storage.set_next_inode_id(InodeId::new(2)).unwrap();
-        let first = Command::new(
-            crate::raft::DedupKey::new(ClientId::new(86), CallId::new()),
-            crate::raft::proposal_timestamp_ms(),
-            crate::raft::Mutation::CreateFile {
-                mode: crate::raft::CreateFileMode::CreateNew,
-                parent_inode_id,
-                name: "file".to_string(),
-                attrs: FileAttrs::new(),
-                layout: FileLayout::new(4096, 4096, 1),
-            },
-        );
+        let first = Command::CreateFile {
+            proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+            parent_inode_id,
+            name: "file".to_string(),
+            attrs: FileAttrs::new(),
+            layout: FileLayout::new(4096, 4096, 1),
+        };
         store.apply([normal_entry(1, first)]).await.unwrap();
         let before = storage.prepare_file_allocation().unwrap();
-        let rejected_dedup = crate::raft::DedupKey::new(ClientId::new(87), CallId::new());
-        let collision = Command::new(
-            rejected_dedup.clone(),
-            crate::raft::proposal_timestamp_ms(),
-            crate::raft::Mutation::CreateFile {
-                mode: crate::raft::CreateFileMode::CreateNew,
-                parent_inode_id,
-                name: "file".to_string(),
-                attrs: FileAttrs::new(),
-                layout: FileLayout::new(4096, 4096, 1),
-            },
-        );
+        let collision = Command::CreateFile {
+            proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+            parent_inode_id,
+            name: "file".to_string(),
+            attrs: FileAttrs::new(),
+            layout: FileLayout::new(4096, 4096, 1),
+        };
 
         let responses = store.apply([normal_entry(2, collision)]).await.unwrap();
         let after = storage.prepare_file_allocation().unwrap();
 
         assert!(matches!(
             responses.as_slice(),
-            [AppDataResponse::Fs(crate::raft::FsCommandResult::Err(_))]
+            [CommandResult::Fs(crate::raft::FsCommandResult::Err(_))]
         ));
         assert_eq!(before, after);
-        assert!(storage.get_applied_result(&rejected_dedup).unwrap().is_some());
         assert_eq!(storage.load_raft_state().unwrap().last_applied_log_id.unwrap().index, 2);
     }
 

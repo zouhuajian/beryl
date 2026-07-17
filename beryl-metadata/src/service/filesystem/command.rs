@@ -6,7 +6,7 @@
 use super::{fs_failure_from_metadata_error, Freshness, FsFailure, MetadataFileSystem, RequestContext};
 use crate::error::{MetadataError, MetadataResult};
 use crate::observe;
-use crate::raft::{AppDataResponse, Command, FsCommandResult};
+use crate::raft::{Command, CommandResult, FsCommandResult};
 use beryl_types::fs::InodeId;
 use beryl_types::ids::MountId;
 use beryl_types::GroupName;
@@ -21,48 +21,25 @@ pub(super) struct RoutedFsWriteCtx {
     pub(super) mount_epoch: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum WriteCommandKind {
-    Create,
-    Mkdir,
-    Delete,
-    Rename,
-    SetAttr,
-}
-
-impl WriteCommandKind {
-    fn metric_label(self) -> &'static str {
-        match self {
-            WriteCommandKind::Create => "create_file",
-            WriteCommandKind::Mkdir => "create_directory",
-            WriteCommandKind::Delete => "delete",
-            WriteCommandKind::Rename => "rename",
-            WriteCommandKind::SetAttr => "set_attr",
-        }
-    }
-}
-
 impl MetadataFileSystem {
     pub(super) fn route_ctx_for_write(
         &self,
         req_ctx: &RequestContext,
-        op: WriteCommandKind,
         parent_inode_ids: &[InodeId],
         freshness: Freshness,
     ) -> Result<RoutedFsWriteCtx, FsFailure> {
-        self.route_ctx_for_write_with_error_hints(req_ctx, op, parent_inode_ids, freshness, None, None)
+        self.route_ctx_for_write_with_error_hints(req_ctx, parent_inode_ids, freshness, None, None)
     }
 
     pub(super) fn route_ctx_for_write_with_error_hints(
         &self,
         req_ctx: &RequestContext,
-        op: WriteCommandKind,
         parent_inode_ids: &[InodeId],
         freshness: Freshness,
         error_group_name: Option<GroupName>,
         error_mount_epoch: Option<u64>,
     ) -> Result<RoutedFsWriteCtx, FsFailure> {
-        let ctx = match self.route_fs_write_ctx(op, parent_inode_ids) {
+        let ctx = match self.route_fs_write_ctx(parent_inode_ids) {
             Ok(ctx) => ctx,
             Err(err) => {
                 return Err(fs_failure_from_metadata_error(
@@ -89,11 +66,7 @@ impl MetadataFileSystem {
         Ok(ctx)
     }
 
-    pub(super) fn route_fs_write_ctx(
-        &self,
-        op: WriteCommandKind,
-        parent_inode_ids: &[InodeId],
-    ) -> MetadataResult<RoutedFsWriteCtx> {
+    pub(super) fn route_fs_write_ctx(&self, parent_inode_ids: &[InodeId]) -> MetadataResult<RoutedFsWriteCtx> {
         let parent_inode_id = parent_inode_ids
             .first()
             .ok_or_else(|| MetadataError::InvalidArgument("No parent inode provided".to_string()))?;
@@ -119,7 +92,6 @@ impl MetadataFileSystem {
             .ok_or_else(|| MetadataError::NotFound(format!("Mount not found: {:?}", mount_id)))?;
 
         debug!(
-            op = ?op,
             mount_id = %mount_id.as_raw(),
             owner_group_name = %mount_entry.namespace_owner_group_name,
             mount_epoch = mount_entry.mount_epoch,
@@ -139,25 +111,13 @@ impl MetadataFileSystem {
         })
     }
 
-    pub(super) async fn propose_fs_write_command(
-        &self,
-        op: WriteCommandKind,
-        command: Command,
-    ) -> MetadataResult<FsCommandResult> {
+    pub(super) async fn propose_fs_write_command(&self, command: Command) -> MetadataResult<FsCommandResult> {
         let started = Instant::now();
-        let dedup = command.dedup_key();
-        if self.session_registry.has_call_id(dedup.client_id, dedup.call_id)
-            || self.lease_manager.has_renew_call(dedup.client_id, dedup.call_id)
-        {
-            return Err(MetadataError::InvalidArgument(format!(
-                "call_id {} was already used by an active write session RPC",
-                dedup.call_id
-            )));
-        }
+        let operation_name = command.operation_name();
         let raft_node = self.raft_node.as_ref().ok_or_else(|| {
             let error = MetadataError::Internal("Raft node not available".to_string());
             observe::record_fs_op(
-                op.metric_label(),
+                operation_name,
                 "error",
                 observe::metadata_error_kind(&error),
                 started.elapsed().as_secs_f64(),
@@ -167,20 +127,24 @@ impl MetadataFileSystem {
 
         if let Some(metrics) = &self.metrics {
             metrics.fs_raft_appends_total.fetch_add(1, Ordering::Relaxed);
-            match op {
-                WriteCommandKind::Create => {
+            match &command {
+                Command::CreateFile { .. } => {
                     metrics.fs_raft_appends_create.fetch_add(1, Ordering::Relaxed);
                 }
-                WriteCommandKind::Mkdir => {
+                Command::CreateDirectory { .. } => {
                     metrics.fs_raft_appends_mkdir.fetch_add(1, Ordering::Relaxed);
                 }
-                WriteCommandKind::Delete => {}
-                WriteCommandKind::Rename => {
+                Command::Rename { .. } => {
                     metrics.fs_raft_appends_rename.fetch_add(1, Ordering::Relaxed);
                 }
-                WriteCommandKind::SetAttr => {
+                Command::SetAttr { .. } | Command::PublishFile { .. } => {
                     metrics.fs_raft_appends_setattr.fetch_add(1, Ordering::Relaxed);
                 }
+                Command::BootstrapNamespace { .. }
+                | Command::Delete { .. }
+                | Command::AcquireWriteLease { .. }
+                | Command::EndWriteLease { .. }
+                | Command::RegisterWorkerDescriptor { .. } => {}
             }
         }
 
@@ -188,7 +152,7 @@ impl MetadataFileSystem {
             Ok(response) => response,
             Err(error) => {
                 observe::record_fs_op(
-                    op.metric_label(),
+                    operation_name,
                     "error",
                     observe::metadata_error_kind(&error),
                     started.elapsed().as_secs_f64(),
@@ -198,23 +162,23 @@ impl MetadataFileSystem {
         };
 
         let fs_result = match response {
-            AppDataResponse::Fs(res) => res,
+            CommandResult::Fs(res) => res,
             _ => FsCommandResult::ok(),
         };
 
-        record_fs_write_result(op, started, &fs_result);
+        record_fs_write_result(operation_name, started, &fs_result);
         Ok(fs_result)
     }
 }
 
-fn record_fs_write_result(op: WriteCommandKind, started: Instant, result: &FsCommandResult) {
+fn record_fs_write_result(operation_name: &'static str, started: Instant, result: &FsCommandResult) {
     match result {
         FsCommandResult::Ok(_) => {
-            observe::record_fs_op(op.metric_label(), "ok", "none", started.elapsed().as_secs_f64());
+            observe::record_fs_op(operation_name, "ok", "none", started.elapsed().as_secs_f64());
         }
         FsCommandResult::Err(err) => {
             observe::record_fs_op(
-                op.metric_label(),
+                operation_name,
                 "error",
                 observe::fs_errno_kind(err.errno),
                 started.elapsed().as_secs_f64(),

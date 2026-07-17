@@ -19,7 +19,7 @@ async fn local_client_crud_roundtrip() {
     let first = Bytes::from(deterministic_bytes(1_337));
     let suffix = Bytes::from_static(b"-beryl-append-suffix");
     let expected = [first.as_ref(), suffix.as_ref()].concat();
-    let create_options = CreateOptions::overwrite().with_block_size(1024).with_chunk_size(1024);
+    let create_options = CreateOptions::create().with_block_size(1024).with_chunk_size(1024);
 
     let mut writer = client
         .create(path, create_options)
@@ -114,6 +114,49 @@ async fn local_client_crud_roundtrip() {
         !listing.entries.iter().any(|entry| entry.name == "file.renamed"),
         "non-recursive list must not include deleted namespace entry"
     );
+
+    cluster.shutdown().await.expect("local cluster shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn visibility_sync_then_continue_write_roundtrip() {
+    let mut cluster = TestCluster::start().await.expect("start hermetic local cluster");
+    let client = cluster.client();
+    let path = "/sync-continue";
+    let first = Bytes::from(vec![b'a'; 1024]);
+    let second = Bytes::from(vec![b'b'; 1024]);
+
+    let mut writer = client
+        .create(
+            path,
+            CreateOptions::create().with_block_size(1024).with_chunk_size(1024),
+        )
+        .await
+        .expect("create through metadata");
+    writer.write_all(first.clone()).await.expect("write first block");
+    writer
+        .sync_write_visibility()
+        .await
+        .expect("publish first block while keeping session open");
+    writer
+        .write_all(second.clone())
+        .await
+        .expect("write after visibility sync");
+    writer.close().await.expect("close after second block");
+    cluster
+        .converge_block_reports()
+        .await
+        .expect("converge both published block reports");
+
+    let actual = client
+        .open(path)
+        .await
+        .expect("open after close")
+        .read_all()
+        .await
+        .expect("read both publication revisions");
+    let expected = [first.as_ref(), second.as_ref()].concat();
+    assert_eq!(actual.as_ref(), expected.as_slice());
 
     cluster.shutdown().await.expect("local cluster shutdown");
 }

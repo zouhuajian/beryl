@@ -26,7 +26,7 @@ use bytes::Bytes;
 pub(crate) struct ClientRuntime {
     /// Immutable client configuration used by metadata and data-plane attempts.
     pub(crate) config: ClientConfig,
-    /// Metadata RPC executor with retry, refresh, and replay policy.
+    /// Metadata RPC executor with bounded retry, refresh, and deadline handling.
     pub(crate) executor: MetadataExecutor,
     /// Worker data-plane adapter used after metadata returns validated targets.
     pub(crate) data_plane: WorkerDataPlane,

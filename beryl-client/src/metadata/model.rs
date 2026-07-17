@@ -16,7 +16,7 @@ pub(crate) struct ReadLayout {
     /// Authoritative file size at this layout version.
     pub file_size: u64,
     /// Durable visible file-state version for this read plan.
-    pub file_version: Option<u64>,
+    pub content_revision: Option<u64>,
     /// Metadata-authoritative block locations for the requested range.
     pub locations: Vec<FileBlockLocation>,
 }
@@ -46,7 +46,7 @@ impl ReadLayout {
             group_name,
             data_handle_id,
             file_size: response.file_size,
-            file_version: response.file_version,
+            content_revision: response.content_revision,
             locations,
         })
     }

@@ -32,7 +32,7 @@ async fn committed_visible_file_survives_metadata_restart() {
     let client = cluster.client().clone();
     let path = "/restart/committed";
     let payload = Bytes::from(deterministic_bytes(1_537));
-    let create_options = CreateOptions::overwrite().with_block_size(1024).with_chunk_size(1024);
+    let create_options = CreateOptions::create().with_block_size(1024).with_chunk_size(1024);
 
     client.mkdirs("/restart", true).await.expect("create restart dir");
     let mut writer = client.create(path, create_options).await.expect("create file");
@@ -54,7 +54,7 @@ async fn committed_visible_file_survives_metadata_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restart_after_create_before_close_fails_stale_writer_without_publishing_bytes() {
+async fn restart_after_empty_create_allows_noop_close_without_publishing_bytes() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let client = cluster.client().clone();
     client.mkdirs("/restart", true).await.expect("create restart dir");
@@ -62,15 +62,17 @@ async fn restart_after_create_before_close_fails_stale_writer_without_publishing
     let mut writer = client
         .create(
             "/restart/create-before-close",
-            CreateOptions::overwrite().with_block_size(1024).with_chunk_size(1024),
+            CreateOptions::create().with_block_size(1024).with_chunk_size(1024),
         )
         .await
         .expect("create active writer");
 
     cluster.restart_metadata().await.expect("restart metadata");
 
-    let err = writer.close().await.expect_err("stale writer must fail closed");
-    assert_stale_writer_error(&err);
+    writer
+        .close()
+        .await
+        .expect("an empty close is already satisfied by durable file state");
     let mut reopened = client
         .append("/restart/create-before-close")
         .await
@@ -91,7 +93,7 @@ async fn restart_after_add_block_before_worker_commit_rejects_stale_writer_and_h
     let mut writer = client
         .create(
             "/restart/add-block-before-worker-commit",
-            CreateOptions::overwrite().with_block_size(1024).with_chunk_size(1024),
+            CreateOptions::create().with_block_size(1024).with_chunk_size(1024),
         )
         .await
         .expect("create active writer");
@@ -146,7 +148,7 @@ async fn existing_visible_data_remains_readable_while_active_write_fails_closed(
     let active_path = "/restart/active-hidden";
     let visible = Bytes::from_static(b"already-visible");
     let hidden = Bytes::from_static(b"hidden-after-restart");
-    let create_options = CreateOptions::overwrite().with_block_size(1024).with_chunk_size(1024);
+    let create_options = CreateOptions::create().with_block_size(1024).with_chunk_size(1024);
 
     let mut visible_writer = client
         .create(visible_path, create_options)
@@ -190,7 +192,7 @@ async fn existing_visible_data_remains_readable_while_active_write_fails_closed(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn metadata_rpc_response_loss_replay_returns_one_logical_result() {
+async fn session_operations_converge_by_predecessor_and_ensure_absent() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     cluster
         .client()
@@ -218,21 +220,12 @@ async fn metadata_rpc_response_loss_replay_returns_one_logical_result() {
         }),
         create_mode: CreateModeProto::CreateNew as i32,
     };
-    let first_create = metadata
-        .create_file(Request::new(create_request.clone()))
-        .await
-        .expect("first CreateFile")
-        .into_inner();
-    let replay_create = metadata
+    let create = metadata
         .create_file(Request::new(create_request))
         .await
-        .expect("replayed CreateFile")
+        .expect("CreateFile")
         .into_inner();
-    assert_metadata_ok(first_create.header);
-    assert_metadata_ok(replay_create.header);
-    assert_eq!(replay_create.inode_id, first_create.inode_id);
-    assert_eq!(replay_create.data_handle_id, first_create.data_handle_id);
-    assert_eq!(replay_create.layout, first_create.layout);
+    assert_metadata_ok(create.header);
 
     let open_request = OpenWriteRequestProto {
         header: Some(metadata_header(801)),
@@ -240,21 +233,13 @@ async fn metadata_rpc_response_loss_replay_returns_one_logical_result() {
         mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
         desired_len: Some(2048),
     };
-    let first_open = metadata
-        .open_write(Request::new(open_request.clone()))
-        .await
-        .expect("first OpenWrite")
-        .into_inner();
-    let replay_open = metadata
+    let open = metadata
         .open_write(Request::new(open_request))
         .await
-        .expect("replayed OpenWrite")
+        .expect("OpenWrite")
         .into_inner();
-    assert_metadata_ok(first_open.header);
-    assert_metadata_ok(replay_open.header);
-    assert_eq!(replay_open.write_handle, first_open.write_handle);
-    assert_eq!(replay_open.expires_at_ms, first_open.expires_at_ms);
-    let write_handle = first_open.write_handle.expect("write handle");
+    assert_metadata_ok(open.header);
+    let write_handle = open.write_handle.expect("write handle");
 
     let add_header = metadata_header(801);
     let add_request = AddBlockRequestProto {
@@ -310,39 +295,30 @@ async fn metadata_rpc_response_loss_replay_returns_one_logical_result() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn durable_create_result_replays_after_metadata_restart() {
+async fn completed_commit_is_resolved_from_durable_state_after_metadata_restart() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
-    cluster
-        .client()
-        .mkdirs("/restart", true)
+    let active = raw_create_commit_worker_block(&cluster, "/restart/durable-publish", b"durable-publish")
         .await
-        .expect("create restart dir");
-    let request = CreateFileRequestProto {
-        header: Some(metadata_header(811)),
-        path: "/restart/durable-replay".to_string(),
-        attrs: Some(FileAttrsProto {
-            mode: 0o644,
-            uid: 1000,
-            gid: 1000,
-            ..Default::default()
-        }),
-        layout: Some(FileLayoutProto {
-            block_size: 1024,
-            chunk_size: 1024,
-            replication: 1,
-            block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
-        }),
-        create_mode: CreateModeProto::CreateNew as i32,
+        .expect("prepare committed worker block");
+    let request = CommitFileRequestProto {
+        header: Some(metadata_header(401)),
+        write_handle: Some(active.write_handle),
+        committed_blocks: vec![active.committed_block],
+        final_size: b"durable-publish".len() as u64,
+        expected_content_revision: active.expected_content_revision,
+        write_mode: active.write_mode,
+        expected_file_size: active.expected_file_size,
     };
     let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
         .await
         .expect("connect metadata");
     let first = metadata
-        .create_file(Request::new(request.clone()))
+        .commit_file(Request::new(request.clone()))
         .await
-        .expect("first CreateFile")
+        .expect("first CommitFile")
         .into_inner();
     assert_metadata_ok(first.header);
+    let first_revision = first.content_revision.expect("content revision");
 
     cluster.restart_metadata().await.expect("restart metadata");
 
@@ -350,21 +326,22 @@ async fn durable_create_result_replays_after_metadata_restart() {
         .await
         .expect("reconnect metadata");
     let replay = metadata
-        .create_file(Request::new(request))
+        .commit_file(Request::new(request))
         .await
-        .expect("replay CreateFile")
+        .expect("resolve completed CommitFile")
         .into_inner();
     assert_metadata_ok(replay.header);
-    assert_eq!(replay.inode_id, first.inode_id);
-    assert_eq!(replay.data_handle_id, first.data_handle_id);
-    assert_eq!(replay.layout, first.layout);
+    assert_eq!(replay.committed_size, first.committed_size);
+    assert_eq!(replay.content_revision, Some(first_revision));
     cluster.shutdown().await.expect("shutdown cluster");
 }
 
 struct RawWorkerCommittedWrite {
     write_handle: WriteHandleProto,
-    data_handle_id: beryl_proto::common::DataHandleIdProto,
     committed_block: CommittedBlockProto,
+    expected_content_revision: u64,
+    expected_file_size: u64,
+    write_mode: i32,
 }
 
 async fn raw_create_commit_worker_block(
@@ -397,7 +374,6 @@ async fn raw_create_commit_worker_block(
         .await?
         .into_inner();
     assert_metadata_ok(create.header);
-    let data_handle_id = create.data_handle_id.expect("data handle id");
     let open = metadata
         .open_write(Request::new(OpenWriteRequestProto {
             header: Some(metadata_header(401)),
@@ -408,6 +384,9 @@ async fn raw_create_commit_worker_block(
         .await?
         .into_inner();
     assert_metadata_ok(open.header);
+    let expected_content_revision = open.content_revision;
+    let expected_file_size = open.base_size;
+    let write_mode = open.mode;
     let write_handle = open.write_handle.expect("write handle");
 
     let add_block = metadata
@@ -431,8 +410,10 @@ async fn raw_create_commit_worker_block(
 
     Ok(RawWorkerCommittedWrite {
         write_handle,
-        data_handle_id,
         committed_block,
+        expected_content_revision,
+        expected_file_size,
+        write_mode,
     })
 }
 
@@ -443,9 +424,11 @@ async fn assert_stale_commit_file(cluster: &TestCluster, active: RawWorkerCommit
         .commit_file(Request::new(CommitFileRequestProto {
             header: Some(metadata_header(401)),
             write_handle: Some(active.write_handle),
-            data_handle_id: Some(active.data_handle_id),
             committed_blocks: vec![active.committed_block],
             final_size,
+            expected_content_revision: active.expected_content_revision,
+            write_mode: active.write_mode,
+            expected_file_size: active.expected_file_size,
         }))
         .await?
         .into_inner();

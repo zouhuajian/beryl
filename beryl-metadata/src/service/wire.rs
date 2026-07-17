@@ -3,13 +3,11 @@
 
 //! Proto/domain and response-header conversion for metadata services.
 
-use super::filesystem::{FsFailure, FsSuccess, PresentedFencingToken, RequestContext};
+use super::filesystem::{FsFailure, FsSuccess, RequestContext};
 use crate::error::MetadataError;
 use beryl_common::error::rpc::{ErrorKind, ProtocolErrorKind, RpcErrorDetail};
 use beryl_common::header::{RequestHeader, ResponseHeader};
-use beryl_types::ids::{BlockId, LeaseId};
 use beryl_types::layout::FileLayout;
-use beryl_types::lease::FencingToken;
 use beryl_types::{FileBlockLocation, GroupName, GroupStateWatermark, WriteTarget};
 use tracing::Span;
 
@@ -214,33 +212,6 @@ pub(crate) fn file_layout_from_proto(
 ) -> Result<FileLayout, MetadataError> {
     let layout = layout.ok_or_else(|| MetadataError::InvalidArgument("Missing FileLayout".to_string()))?;
     FileLayout::try_from(layout).map_err(MetadataError::InvalidArgument)
-}
-
-pub(crate) fn lease_id_from_proto(lease_id: Option<beryl_proto::common::LeaseIdProto>) -> Option<LeaseId> {
-    lease_id.map(|lease_id_proto| {
-        LeaseId::try_from(lease_id_proto).unwrap_or_else(|()| unreachable!("LeaseIdProto conversion is infallible"))
-    })
-}
-
-pub(crate) fn lease_id_to_proto(lease_id: LeaseId) -> beryl_proto::common::LeaseIdProto {
-    lease_id.into()
-}
-
-pub(crate) fn presented_fencing_from_proto(
-    token: Option<beryl_proto::common::FencingTokenProto>,
-) -> Option<PresentedFencingToken> {
-    token.and_then(|token_proto| {
-        let owner = beryl_proto::convert::required_client_id(token_proto.owner, "owner").ok()?;
-        Some(PresentedFencingToken {
-            block_id: token_proto.block_id.and_then(|block| BlockId::try_from(block).ok()),
-            owner,
-            epoch: token_proto.epoch,
-        })
-    })
-}
-
-pub(crate) fn fencing_to_proto(token: FencingToken) -> beryl_proto::common::FencingTokenProto {
-    token.into()
 }
 
 pub(crate) fn write_target_to_proto(target: &WriteTarget) -> beryl_proto::metadata::WriteTargetProto {

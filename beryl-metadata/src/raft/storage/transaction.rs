@@ -4,56 +4,6 @@
 use super::*;
 
 impl RocksDBStorage {
-    fn dedup_key_bytes(request: &DedupKey) -> Vec<u8> {
-        format!("{}:{}", request.client_id.as_raw(), request.call_id).into_bytes()
-    }
-
-    fn batch_put_applied_result(
-        batch: &mut WriteBatch,
-        cf: &ColumnFamily,
-        request: &DedupKey,
-        result: AppliedResult,
-    ) -> MetadataResult<usize> {
-        let mut result = result;
-        let value = encode_to_vec(&result, standard())
-            .map_err(|e| MetadataError::Internal(format!("Failed to serialize AppliedResult: {}", e)))?;
-        result.size_bytes = value.len() as u32;
-        let value = encode_to_vec(&result, standard())
-            .map_err(|e| MetadataError::Internal(format!("Failed to serialize AppliedResult: {}", e)))?;
-        let bytes = value.len();
-        batch.put_cf(cf, Self::dedup_key_bytes(request), value);
-        Ok(bytes)
-    }
-
-    /// Atomically append dedup tracking to an existing RocksDB batch.
-    pub(crate) fn commit_apply_batch(
-        &self,
-        mut batch: AuthorityBatch,
-        request: &DedupKey,
-        result: AppliedResult,
-        raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<()> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf_dedup = Self::cf(db, CF_DEDUP)?;
-        let dedup_bytes = Self::batch_put_applied_result(&mut batch, cf_dedup, request, result)?;
-        self.commit_authority_batch(batch, raft_state)?;
-        DEDUP_STORE_ENTRIES_GAUGE.fetch_add(1, Ordering::Relaxed);
-        crate::observe::record_raft_dedup_insert(dedup_bytes);
-        Ok(())
-    }
-
-    /// Atomically persist only dedup tracking.
-    pub fn put_apply_result_atomic(
-        &self,
-        request: &DedupKey,
-        result: AppliedResult,
-        raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<()> {
-        let _generation = self.pin_generation()?;
-        self.commit_apply_batch(AuthorityBatch::default(), request, result, raft_state)
-    }
-
     pub(super) fn commit_authority_batch(
         &self,
         mut batch: AuthorityBatch,
@@ -142,13 +92,7 @@ impl RocksDBStorage {
         Ok(())
     }
 
-    pub fn register_worker_with_apply_result_atomic(
-        &self,
-        info: &WorkerInfo,
-        dedup_key: &DedupKey,
-        applied_result: AppliedResult,
-        raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<()> {
+    pub fn register_worker_atomic(&self, info: &WorkerInfo, raft_state: &AppMetadataRaftState) -> MetadataResult<()> {
         let generation = self.pin_generation()?;
         let db = generation.db();
         let cf_workers = Self::cf(db, CF_WORKERS)?;
@@ -160,7 +104,7 @@ impl RocksDBStorage {
 
         let mut batch = WriteBatch::default();
         Self::batch_put_worker(&mut batch, cf_workers, info)?;
-        self.commit_apply_batch(batch.into(), dedup_key, applied_result, raft_state)
+        self.commit_authority_batch(batch.into(), raft_state)
     }
 
     fn batch_put_inode(batch: &mut WriteBatch, cf: &ColumnFamily, inode: &Inode) -> MetadataResult<()> {
@@ -172,30 +116,20 @@ impl RocksDBStorage {
     }
 
     /// Atomically persist a single inode update with apply tracking.
-    pub fn put_inode_with_apply_result_atomic(
-        &self,
-        inode: &Inode,
-        dedup_key: &DedupKey,
-        applied_result: AppliedResult,
-        raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<()> {
+    pub fn put_inode_atomic(&self, inode: &Inode, raft_state: &AppMetadataRaftState) -> MetadataResult<()> {
         let generation = self.pin_generation()?;
         let db = generation.db();
         let cf_inodes = Self::cf(db, CF_INODES)?;
         let mut batch = WriteBatch::default();
         Self::batch_put_inode(&mut batch, cf_inodes, inode)?;
-        self.commit_apply_batch(batch.into(), dedup_key, applied_result, raft_state)
+        self.commit_authority_batch(batch.into(), raft_state)
     }
 
-    /// Atomically persist a CloseWrite commit with replay tracking.
-    // Atomic storage helpers keep every column-family mutation visible at the call boundary.
-    #[allow(clippy::too_many_arguments)]
-    pub fn close_write_with_apply_result_atomic(
+    /// Atomically persist visible file authority and the applied Raft state.
+    pub fn publish_file_atomic(
         &self,
         inode: &Inode,
         layout: FileLayout,
-        dedup_key: &DedupKey,
-        applied_result: AppliedResult,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
         let generation = self.pin_generation()?;
@@ -207,15 +141,13 @@ impl RocksDBStorage {
         Self::batch_put_inode(&mut batch, cf_inodes, inode)?;
         Self::batch_put_layout(&mut batch, cf_meta, inode.inode_id, layout)?;
 
-        self.commit_apply_batch(batch.into(), dedup_key, applied_result, raft_state)
+        self.commit_authority_batch(batch.into(), raft_state)
     }
 
-    pub(crate) fn bootstrap_namespace_with_apply_result_atomic(
+    pub(crate) fn bootstrap_namespace_atomic(
         &self,
         root_inode: &Inode,
         root_mount: &MountEntry,
-        dedup_key: &DedupKey,
-        applied_result: AppliedResult,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
         let generation = self.pin_generation()?;
@@ -241,7 +173,7 @@ impl RocksDBStorage {
                 MetadataError::Internal(format!("Failed to serialize next_data_handle_id: {error}"))
             })?,
         );
-        self.commit_apply_batch(batch.into(), dedup_key, applied_result, raft_state)
+        self.commit_authority_batch(batch.into(), raft_state)
     }
 
     fn create_file_batch(
@@ -284,7 +216,7 @@ impl RocksDBStorage {
     /// Atomically persist create-file mutation with apply tracking.
     // Atomic storage helpers keep every column-family mutation visible at the call boundary.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn create_file_with_apply_result_atomic(
+    pub(crate) fn create_file_atomic(
         &self,
         allocation: FileAllocation,
         parent_inode_id: InodeId,
@@ -292,8 +224,6 @@ impl RocksDBStorage {
         inode: &Inode,
         updated_parent: &Inode,
         layout: FileLayout,
-        dedup_key: &DedupKey,
-        applied_result: AppliedResult,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
         let generation = self.pin_generation()?;
@@ -306,7 +236,7 @@ impl RocksDBStorage {
         let mut batch = self.create_file_batch(parent_inode_id, name, inode, updated_parent, layout)?;
         let cf_meta = Self::cf(db, CF_META)?;
         Self::batch_put_file_allocation(&mut batch, cf_meta, allocation)?;
-        self.commit_apply_batch(batch.into(), dedup_key, applied_result, raft_state)
+        self.commit_authority_batch(batch.into(), raft_state)
     }
 
     fn create_dir_batch(
@@ -335,15 +265,13 @@ impl RocksDBStorage {
 
     /// Atomically persist mkdir mutation with apply tracking.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn create_dir_with_apply_result_atomic(
+    pub(crate) fn create_dir_atomic(
         &self,
         allocation: InodeAllocation,
         parent_inode_id: InodeId,
         name: &str,
         inode: &Inode,
         updated_parent: &Inode,
-        dedup_key: &DedupKey,
-        applied_result: AppliedResult,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
         let generation = self.pin_generation()?;
@@ -356,16 +284,14 @@ impl RocksDBStorage {
         let mut batch = self.create_dir_batch(parent_inode_id, name, inode, updated_parent)?;
         let cf_meta = Self::cf(db, CF_META)?;
         Self::batch_put_inode_allocation(&mut batch, cf_meta, allocation)?;
-        self.commit_apply_batch(batch.into(), dedup_key, applied_result, raft_state)
+        self.commit_authority_batch(batch.into(), raft_state)
     }
 
     /// Atomically persist all missing components of one recursive mkdir command.
-    pub(crate) fn create_directories_with_apply_result_atomic(
+    pub(crate) fn create_directories_atomic(
         &self,
         allocation: InodeAllocation,
         entries: &[RecursiveMkdirEntry],
-        dedup_key: &DedupKey,
-        applied_result: AppliedResult,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
         let generation = self.pin_generation()?;
@@ -384,7 +310,7 @@ impl RocksDBStorage {
             );
         }
         Self::batch_put_inode_allocation(&mut batch, cf_meta, allocation)?;
-        self.commit_apply_batch(batch.into(), dedup_key, applied_result, raft_state)
+        self.commit_authority_batch(batch.into(), raft_state)
     }
 
     fn delete_dentry_inode_batch(
@@ -408,33 +334,29 @@ impl RocksDBStorage {
 
     /// Atomically persist empty-directory deletion with apply tracking.
     #[allow(clippy::too_many_arguments)]
-    pub fn delete_empty_dir_with_apply_result_atomic(
+    pub fn delete_empty_dir_atomic(
         &self,
         parent_inode_id: InodeId,
         name: &str,
         inode_id: InodeId,
         updated_parent: &Inode,
-        dedup_key: &DedupKey,
-        applied_result: AppliedResult,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
         let _generation = self.pin_generation()?;
         let batch = self.delete_dentry_inode_batch(parent_inode_id, name, inode_id, updated_parent)?;
-        self.commit_apply_batch(batch.into(), dedup_key, applied_result, raft_state)
+        self.commit_authority_batch(batch.into(), raft_state)
     }
 
     /// Atomically persist non-directory deletion with namespace and optional data-handle cleanup.
     // Atomic storage helpers keep every column-family mutation visible at the call boundary.
     #[allow(clippy::too_many_arguments)]
-    pub fn delete_empty_file_with_apply_result_atomic(
+    pub fn delete_file_atomic(
         &self,
         parent_inode_id: InodeId,
         name: &str,
         inode_id: InodeId,
         data_handle_id: Option<DataHandleId>,
         updated_parent: &Inode,
-        dedup_key: &DedupKey,
-        applied_result: AppliedResult,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
         let generation = self.pin_generation()?;
@@ -447,15 +369,13 @@ impl RocksDBStorage {
             let owner_key = format!("data_handle_owner:{}", data_handle_id.as_raw());
             batch.delete_cf(cf_meta, owner_key.as_bytes());
         }
-        self.commit_apply_batch(batch.into(), dedup_key, applied_result, raft_state)
+        self.commit_authority_batch(batch.into(), raft_state)
     }
 
     /// Atomically persist a recursive tree delete with apply tracking.
-    pub fn delete_tree_with_apply_result_atomic(
+    pub fn delete_tree_atomic(
         &self,
         update: DeleteTreeAtomicUpdate<'_>,
-        dedup_key: &DedupKey,
-        applied_result: AppliedResult,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
         let generation = self.pin_generation()?;
@@ -479,27 +399,7 @@ impl RocksDBStorage {
         }
         Self::batch_put_inode(&mut batch, cf_inodes, update.updated_parent)?;
 
-        self.commit_apply_batch(batch.into(), dedup_key, applied_result, raft_state)
-    }
-
-    /// Atomically persist truncate shrink effects with apply tracking.
-    pub fn truncate_file_with_apply_result_atomic(
-        &self,
-        inode: &Inode,
-        layout: FileLayout,
-        dedup_key: &DedupKey,
-        applied_result: AppliedResult,
-        raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<()> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf_inodes = Self::cf(db, CF_INODES)?;
-        let cf_meta = Self::cf(db, CF_META)?;
-        let mut batch = WriteBatch::default();
-
-        Self::batch_put_inode(&mut batch, cf_inodes, inode)?;
-        Self::batch_put_layout(&mut batch, cf_meta, inode.inode_id, layout)?;
-        self.commit_apply_batch(batch.into(), dedup_key, applied_result, raft_state)
+        self.commit_authority_batch(batch.into(), raft_state)
     }
 
     fn rename_batch(&self, update: RenameAtomicUpdate<'_>) -> MetadataResult<WriteBatch> {
@@ -547,16 +447,14 @@ impl RocksDBStorage {
     }
 
     /// Atomically persist rename mutation with apply tracking.
-    pub fn rename_with_apply_result_atomic(
+    pub fn rename_atomic(
         &self,
         update: RenameAtomicUpdate<'_>,
-        dedup_key: &DedupKey,
-        applied_result: AppliedResult,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
         let _generation = self.pin_generation()?;
         let batch = self.rename_batch(update)?;
-        self.commit_apply_batch(batch.into(), dedup_key, applied_result, raft_state)
+        self.commit_authority_batch(batch.into(), raft_state)
     }
 }
 
@@ -565,27 +463,6 @@ mod tests {
     use super::*;
 
     impl RocksDBStorage {
-        /// Put applied result for idempotency.
-        pub fn put_applied_result(&self, request: &DedupKey, result: AppliedResult) -> MetadataResult<()> {
-            let generation = self.pin_generation()?;
-            let db = generation.db();
-            let cf = db
-                .cf_handle(CF_DEDUP)
-                .ok_or_else(|| MetadataError::Internal("Dedup CF not found".to_string()))?;
-            let key = format!("{}:{}", request.client_id.as_raw(), request.call_id);
-            let mut result = result;
-            let value = encode_to_vec(&result, standard())
-                .map_err(|e| MetadataError::Internal(format!("Failed to serialize AppliedResult: {}", e)))?;
-            result.size_bytes = value.len() as u32;
-            let value = encode_to_vec(&result, standard())
-                .map_err(|e| MetadataError::Internal(format!("Failed to serialize AppliedResult: {}", e)))?;
-
-            db.put_cf(cf, key.as_bytes(), value)
-                .map_err(|e| MetadataError::Internal(format!("RocksDB error: {}", e)))?;
-            DEDUP_STORE_ENTRIES_GAUGE.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-
         /// Persist the authoritative route epoch used for stale-route validation.
         pub fn put_route_epoch(&self, epoch: RouteEpoch) -> MetadataResult<()> {
             let generation = self.pin_generation()?;
@@ -751,7 +628,7 @@ mod tests {
         }
 
         /// Atomically persist a create-file namespace mutation.
-        pub fn create_file_atomic(
+        pub fn put_test_file_atomic(
             &self,
             parent_inode_id: InodeId,
             name: &str,
@@ -764,7 +641,7 @@ mod tests {
         }
 
         /// Atomically persist a mkdir namespace mutation.
-        pub fn create_dir_atomic(
+        pub fn put_test_dir_atomic(
             &self,
             parent_inode_id: InodeId,
             name: &str,
@@ -776,7 +653,7 @@ mod tests {
         }
 
         /// Atomically persist a rename namespace mutation.
-        pub fn rename_atomic(&self, update: RenameAtomicUpdate<'_>) -> MetadataResult<()> {
+        pub fn rename_test_atomic(&self, update: RenameAtomicUpdate<'_>) -> MetadataResult<()> {
             let _generation = self.pin_generation()?;
             self.write_batch(self.rename_batch(update)?)
         }

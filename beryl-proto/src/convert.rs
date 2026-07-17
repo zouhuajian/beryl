@@ -20,9 +20,7 @@ use ::beryl_common::{
     header::{CallerContext, ClientInfo, RequestHeader, ResponseHeader, TraceContext},
 };
 use beryl_types::chunk::ByteRange;
-use beryl_types::ids::{
-    BlockId, BlockIndex, ChunkId, ChunkIndex, DataHandleId, LeaseId, MountId, ShardId, StreamId, WorkerId,
-};
+use beryl_types::ids::{BlockId, BlockIndex, ChunkId, ChunkIndex, DataHandleId, MountId, ShardId, StreamId, WorkerId};
 use beryl_types::layout::{BlockShape, FileLayout};
 use beryl_types::lease::FencingToken;
 use beryl_types::{
@@ -138,25 +136,6 @@ impl TryFrom<proto_common::StreamIdProto> for StreamId {
     fn try_from(id: proto_common::StreamIdProto) -> Result<Self, Self::Error> {
         let value = ((id.high as u128) << 64) | (id.low as u128);
         Ok(StreamId::new(value))
-    }
-}
-
-impl From<LeaseId> for proto_common::LeaseIdProto {
-    fn from(id: LeaseId) -> Self {
-        let value = id.as_raw();
-        proto_common::LeaseIdProto {
-            high: (value >> 64) as u64,
-            low: value as u64,
-        }
-    }
-}
-
-impl TryFrom<proto_common::LeaseIdProto> for LeaseId {
-    type Error = ();
-
-    fn try_from(id: proto_common::LeaseIdProto) -> Result<Self, Self::Error> {
-        let value = ((id.high as u128) << 64) | (id.low as u128);
-        Ok(LeaseId::new(value))
     }
 }
 
@@ -1801,7 +1780,7 @@ mod tests {
                 ("common.ResponseHeaderProto", "header", 1),
                 ("common.DataHandleIdProto", "data_handle_id", 2),
                 ("uint64", "file_size", 3),
-                ("uint64", "file_version", 4),
+                ("uint64", "content_revision", 4),
             ]
         );
         assert_eq!(
@@ -1811,7 +1790,7 @@ mod tests {
                 ("common.DataHandleIdProto", "data_handle_id", 2),
                 ("uint64", "file_size", 3),
                 ("FileBlockLocationProto", "locations", 4),
-                ("uint64", "file_version", 5),
+                ("uint64", "content_revision", 5),
             ]
         );
         assert_eq!(
@@ -1838,10 +1817,11 @@ mod tests {
             vec![
                 ("common.ResponseHeaderProto", "header", 1),
                 ("WriteHandleProto", "write_handle", 2),
-                ("common.DataHandleIdProto", "data_handle_id", 3),
                 ("uint64", "base_size", 4),
                 ("uint64", "expires_at_ms", 6),
                 ("common.FileLayoutProto", "layout", 7),
+                ("uint64", "content_revision", 8),
+                ("OpenWriteModeProto", "mode", 9),
             ]
         );
         assert_eq!(
@@ -1851,6 +1831,31 @@ mod tests {
                 ("WriteHandleProto", "write_handle", 2),
                 ("uint64", "desired_len", 3),
                 ("common.BlockIdProto", "previous_block_id", 4),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(metadata_proto, "CommitFileRequestProto"),
+            vec![
+                ("common.RequestHeaderProto", "header", 1),
+                ("WriteHandleProto", "write_handle", 2),
+                ("CommittedBlockProto", "committed_blocks", 4),
+                ("uint64", "final_size", 5),
+                ("uint64", "expected_content_revision", 6),
+                ("OpenWriteModeProto", "write_mode", 7),
+                ("uint64", "expected_file_size", 8),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(metadata_proto, "SyncWriteRequestProto"),
+            vec![
+                ("common.RequestHeaderProto", "header", 1),
+                ("WriteHandleProto", "write_handle", 2),
+                ("CommittedBlockProto", "committed_blocks", 4),
+                ("uint64", "target_size", 5),
+                ("WriteSyncModeProto", "mode", 6),
+                ("uint64", "expected_content_revision", 8),
+                ("OpenWriteModeProto", "write_mode", 9),
+                ("uint64", "expected_file_size", 10),
             ]
         );
 

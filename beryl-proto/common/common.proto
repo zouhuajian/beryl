@@ -55,14 +55,6 @@ message StreamIdProto {
   uint64 low = 2;
 }
 
-/// Lease identity (writer lease).
-/// Aligns with types::LeaseId (u128).
-message LeaseIdProto {
-  // u128 encoded as two uint64 (high, low)
-  uint64 high = 1;
-  uint64 low = 2;
-}
-
 /// Shard identity.
 /// Aligns with types::ShardId (u64).
 message ShardIdProto {

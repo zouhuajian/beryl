@@ -9,7 +9,7 @@ use crate::mount::MountTable;
 use crate::observe;
 use crate::raft::command::Command;
 use crate::raft::network::SingleNodeNetworkFactory;
-use crate::raft::response::AppDataResponse;
+use crate::raft::response::CommandResult;
 use crate::raft::state_machine::AppRaftStateMachine as AppStateMachine;
 use crate::raft::storage::{AppLogStorage, RocksDBStorage, SnapshotInstallTracker, StateMachineStorage};
 use crate::raft::types::{MetadataNode, MetadataRaftTypeConfig};
@@ -139,13 +139,13 @@ impl AppRaftNode {
     }
 
     /// Propose a command to Raft.
-    pub async fn propose(&self, command: Command) -> MetadataResult<AppDataResponse> {
+    pub async fn propose(&self, command: Command) -> MetadataResult<CommandResult> {
         let started = Instant::now();
         match self.raft.client_write(command).await {
             Ok(result) => {
                 self.record_current_raft_metrics();
                 match result.data {
-                    AppDataResponse::Rejected(rejection) => {
+                    CommandResult::Rejected(rejection) => {
                         let error = rejection.into_metadata_error();
                         observe::record_raft_proposal(
                             "error",

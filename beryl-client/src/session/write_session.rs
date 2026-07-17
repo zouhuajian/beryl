@@ -5,7 +5,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use beryl_proto::metadata::WriteHandleProto;
+use beryl_proto::metadata::{OpenWriteModeProto, WriteHandleProto};
 use beryl_types::{BlockShape, CallId, ClientId, CommittedBlock, DataHandleId, FileLayout, WriteTarget};
 use bytes::{Bytes, BytesMut};
 
@@ -21,8 +21,10 @@ pub(crate) struct WriteSession {
     path: String,
     data_handle_id: DataHandleId,
     layout: FileLayout,
-    file_version: Option<u64>,
+    content_revision: u64,
+    mode: OpenWriteModeProto,
     write_handle: WriteHandleProto,
+    base_size: u64,
     cursor: u64,
     flush_cursor: u64,
     buffered: BytesMut,
@@ -37,13 +39,14 @@ impl WriteSession {
     /// Create a new client-side write session from metadata open-write state.
     pub(crate) fn new(
         path: String,
-        data_handle_id: DataHandleId,
         layout: FileLayout,
         write_handle: WriteHandleProto,
         base_size: u64,
         expires_at_ms: u64,
+        content_revision: u64,
+        mode: OpenWriteModeProto,
     ) -> ClientResult<Self> {
-        validate_write_handle(&write_handle)?;
+        let data_handle_id = validate_write_handle(&write_handle)?;
         if expires_at_ms == 0 {
             return Err(ClientError::InvalidArgument(
                 "write session expires_at_ms must be non-zero".to_string(),
@@ -56,8 +59,10 @@ impl WriteSession {
             path,
             data_handle_id,
             layout,
-            file_version: None,
+            content_revision,
+            mode,
             write_handle,
+            base_size,
             cursor: base_size,
             flush_cursor: base_size,
             buffered: BytesMut::new(),
@@ -216,10 +221,13 @@ impl WriteSession {
         &mut self,
         client_id: ClientId,
         client_name: &str,
-        committed_blocks: Vec<CommittedBlock>,
+        mut committed_blocks: Vec<CommittedBlock>,
         final_size: u64,
         deadline: OperationDeadline,
     ) -> ClientResult<CommitFilePlan> {
+        if self.mode == OpenWriteModeProto::OpenWriteModeAppend {
+            committed_blocks.retain(|block| block.file_offset >= self.base_size);
+        }
         match self.state {
             WriteSessionState::Open => {
                 self.commit = Some(CommitFileState {
@@ -227,6 +235,9 @@ impl WriteSession {
                     commit_write_handle: self.write_handle,
                     commit_final_size: final_size,
                     commit_committed_blocks_snapshot: committed_blocks,
+                    expected_content_revision: self.content_revision,
+                    expected_file_size: self.base_size,
+                    write_mode: self.mode,
                 });
                 self.state = WriteSessionState::CommitStarted;
             }
@@ -237,7 +248,7 @@ impl WriteSession {
                 if commit.commit_final_size != final_size || commit.commit_committed_blocks_snapshot != committed_blocks
                 {
                     return Err(ClientError::InvalidArgument(
-                        "CommitFile replay payload changed after commit started".to_string(),
+                        "CommitFile payload changed after commit started".to_string(),
                     ));
                 }
                 if commit.commit_write_handle != self.write_handle {
@@ -293,9 +304,11 @@ impl WriteSession {
         Ok(CommitFilePlan {
             operation,
             write_handle: commit.commit_write_handle,
-            data_handle_id: self.data_handle_id,
             committed_blocks: commit.commit_committed_blocks_snapshot.clone(),
             final_size: commit.commit_final_size,
+            expected_content_revision: commit.expected_content_revision,
+            expected_file_size: commit.expected_file_size,
+            write_mode: commit.write_mode,
         })
     }
 
@@ -338,7 +351,7 @@ impl WriteSession {
                 })?;
                 if abort.metadata_write_handle != self.write_handle {
                     return Err(ClientError::InvalidArgument(
-                        "Abort cleanup replay identity changed after cleanup started".to_string(),
+                        "Abort cleanup handle changed after cleanup started".to_string(),
                     ));
                 }
             }
@@ -387,9 +400,29 @@ impl WriteSession {
     }
 
     /// Mark the session closed after metadata commit succeeds.
-    pub(crate) fn mark_closed(&mut self, file_version: Option<u64>) {
-        self.file_version = file_version;
+    pub(crate) fn mark_closed(&mut self, content_revision: Option<u64>) {
+        if let Some(content_revision) = content_revision {
+            self.content_revision = content_revision;
+        }
         self.state = WriteSessionState::Closed;
+    }
+
+    /// Record the durable state returned by a successful SyncWrite.
+    pub(crate) fn update_published_state(&mut self, content_revision: u64, file_size: u64) {
+        self.content_revision = content_revision;
+        self.base_size = file_size;
+    }
+
+    pub(crate) fn content_revision(&self) -> u64 {
+        self.content_revision
+    }
+
+    pub(crate) fn base_size(&self) -> u64 {
+        self.base_size
+    }
+
+    pub(crate) fn mode(&self) -> OpenWriteModeProto {
+        self.mode
     }
 
     /// Mark the session aborted after best-effort cleanup.
@@ -660,6 +693,9 @@ struct CommitFileState {
     commit_write_handle: WriteHandleProto,
     commit_final_size: u64,
     commit_committed_blocks_snapshot: Vec<CommittedBlock>,
+    expected_content_revision: u64,
+    expected_file_size: u64,
+    write_mode: OpenWriteModeProto,
 }
 
 #[derive(Clone)]
@@ -692,9 +728,11 @@ impl std::fmt::Debug for AbortWorkerCleanupState {
 pub(crate) struct CommitFilePlan {
     pub(crate) operation: OperationContext,
     pub(crate) write_handle: WriteHandleProto,
-    pub(crate) data_handle_id: DataHandleId,
     pub(crate) committed_blocks: Vec<CommittedBlock>,
     pub(crate) final_size: u64,
+    pub(crate) expected_content_revision: u64,
+    pub(crate) expected_file_size: u64,
+    pub(crate) write_mode: OpenWriteModeProto,
 }
 
 /// Frozen side-effecting abort cleanup plan.
@@ -741,36 +779,25 @@ impl AbortWorkerCleanupPlan {
     }
 }
 
-fn validate_write_handle(handle: &WriteHandleProto) -> ClientResult<()> {
-    if handle.handle_id == 0 {
-        return Err(ClientError::Metadata(
-            "write handle handle_id must be non-zero".to_string(),
-        ));
-    }
-    if handle.lease_id.is_none() {
-        return Err(ClientError::Metadata("write handle missing lease_id".to_string()));
-    }
+fn validate_write_handle(handle: &WriteHandleProto) -> ClientResult<DataHandleId> {
+    let data_handle_id = handle
+        .data_handle_id
+        .as_ref()
+        .filter(|id| id.value != 0)
+        .ok_or_else(|| ClientError::Metadata("write handle data_handle_id must be present and non-zero".to_string()))?;
     if handle.lease_epoch == 0 {
         return Err(ClientError::Metadata(
             "write handle lease_epoch must be non-zero".to_string(),
         ));
     }
-    if handle.open_epoch == 0 {
-        return Err(ClientError::Metadata(
-            "write handle open_epoch must be non-zero".to_string(),
-        ));
-    }
-    if handle.fencing_token.is_none() {
-        return Err(ClientError::Metadata("write handle missing fencing_token".to_string()));
-    }
-    Ok(())
+    Ok(DataHandleId::new(data_handle_id.value))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use beryl_proto::common::{BlockIdProto, FencingTokenProto, LeaseIdProto, StreamIdProto};
+    use beryl_proto::common::StreamIdProto;
     use beryl_types::lease::FencingToken;
     use beryl_types::{
         BlockId, BlockIndex, ClientId, CommittedBlock, DataHandleId, GroupName, WorkerEndpointInfo, WorkerId,
@@ -784,11 +811,12 @@ mod tests {
     fn prepare_commit_file_reuses_call_id_and_frozen_typed_payload() {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
-            DataHandleId::new(302),
             test_layout(),
             write_handle_proto(1, 302),
             0,
             1_000,
+            0,
+            OpenWriteModeProto::OpenWriteModeWrite,
         )
         .expect("session");
         let blocks = vec![committed_block(302, 0, 0, 5)];
@@ -824,11 +852,12 @@ mod tests {
     fn prepare_commit_file_rejects_changed_payload_after_commit_started() {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
-            DataHandleId::new(302),
             test_layout(),
             write_handle_proto(1, 302),
             0,
             1_000,
+            0,
+            OpenWriteModeProto::OpenWriteModeWrite,
         )
         .expect("session");
 
@@ -858,11 +887,12 @@ mod tests {
     fn prepare_commit_file_rejects_write_handle_change_after_unknown() {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
-            DataHandleId::new(302),
             test_layout(),
             write_handle_proto(1, 302),
             0,
             1_000,
+            0,
+            OpenWriteModeProto::OpenWriteModeWrite,
         )
         .expect("session");
         let blocks = vec![committed_block(302, 0, 0, 5)];
@@ -912,11 +942,12 @@ mod tests {
     fn prepare_abort_cleanup_reuses_call_id_and_frozen_typed_payload() {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
-            DataHandleId::new(302),
             test_layout(),
             write_handle_proto(1, 302),
             0,
             1_000,
+            0,
+            OpenWriteModeProto::OpenWriteModeWrite,
         )
         .expect("session");
         session
@@ -955,11 +986,12 @@ mod tests {
     fn prepare_abort_cleanup_rejects_session_identity_drift_after_unknown_without_replacing_call_id() {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
-            DataHandleId::new(302),
             test_layout(),
             write_handle_proto(1, 302),
             0,
             1_000,
+            0,
+            OpenWriteModeProto::OpenWriteModeWrite,
         )
         .expect("session");
 
@@ -974,7 +1006,7 @@ mod tests {
             Ok(_) => panic!("identity drift must reject abort replay"),
             Err(err) => err,
         };
-        assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("identity changed")));
+        assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("handle changed")));
 
         session.write_handle.lease_epoch = 1;
         let retry = session
@@ -989,11 +1021,12 @@ mod tests {
     fn prepare_abort_cleanup_after_worker_committed_block_is_conservative() {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
-            DataHandleId::new(302),
             test_layout(),
             write_handle_proto(1, 302),
             0,
             1_000,
+            0,
+            OpenWriteModeProto::OpenWriteModeWrite,
         )
         .expect("session");
         session
@@ -1020,11 +1053,12 @@ mod tests {
     fn lease_expiry_guard_marks_session_expired_and_blocks_side_effects() {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
-            DataHandleId::new(302),
             test_layout(),
             write_handle_proto(1, 302),
             0,
             1_000,
+            0,
+            OpenWriteModeProto::OpenWriteModeWrite,
         )
         .expect("session");
 
@@ -1051,11 +1085,12 @@ mod tests {
         let new_session = |expires_at_ms| {
             WriteSession::new(
                 "/alpha".to_string(),
-                DataHandleId::new(302),
                 test_layout(),
                 write_handle_proto(1, 302),
                 0,
                 expires_at_ms,
+                0,
+                OpenWriteModeProto::OpenWriteModeWrite,
             )
             .expect("session")
         };
@@ -1117,11 +1152,12 @@ mod tests {
             for (operation, allowed) in operations.into_iter().zip(expected) {
                 let mut session = WriteSession::new(
                     "/alpha".to_string(),
-                    DataHandleId::new(302),
                     test_layout(),
                     write_handle_proto(1, 302),
                     0,
                     10_000,
+                    0,
+                    OpenWriteModeProto::OpenWriteModeWrite,
                 )
                 .expect("session");
                 session.state = state;
@@ -1140,23 +1176,10 @@ mod tests {
         FileLayout::new(1024, 1024, 1)
     }
 
-    fn write_handle_proto(handle_id: u64, data_handle_id: u64) -> WriteHandleProto {
+    fn write_handle_proto(_handle_id: u64, data_handle_id: u64) -> WriteHandleProto {
         WriteHandleProto {
-            handle_id,
-            lease_id: Some(LeaseIdProto {
-                high: 0,
-                low: handle_id,
-            }),
+            data_handle_id: Some(beryl_proto::common::DataHandleIdProto { value: data_handle_id }),
             lease_epoch: 1,
-            open_epoch: 1,
-            fencing_token: Some(FencingTokenProto {
-                block_id: Some(BlockIdProto {
-                    data_handle_id,
-                    block_index: 0,
-                }),
-                owner: Some(ClientId::new(7).into()),
-                epoch: 1,
-            }),
         }
     }
 

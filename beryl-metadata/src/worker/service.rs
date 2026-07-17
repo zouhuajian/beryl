@@ -11,7 +11,7 @@ use super::metrics::WorkerMetrics;
 use crate::error::{to_rpc_error, MetadataError, MetadataResult};
 use crate::observe;
 use crate::raft::Command;
-use crate::raft::{AppDataResponse, AppRaftNode, WorkerCommandResult};
+use crate::raft::{AppRaftNode, CommandResult};
 use crate::service::extract_and_inject_context;
 use ::beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RpcErrorDetail, WorkerErrorKind};
 use ::beryl_common::header::ResponseHeader;
@@ -600,31 +600,17 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 return self.metadata_error_response(&req.header, register_worker_response_with_header, error);
             }
 
-            let dedup = match crate::raft::DedupKey::from_header_identity(&_caller_ctx.identity()) {
-                Ok(dedup) => dedup,
-                Err(error) => {
-                    return self.metadata_error_response(
-                        &req.header,
-                        register_worker_response_with_header,
-                        MetadataError::InvalidArgument(error),
-                    )
-                }
+            let command = Command::RegisterWorkerDescriptor {
+                proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                group_name: group_name.clone(),
+                worker_id,
+                address: address.clone(),
+                worker_net_protocol,
+                fault_domain: None,
             };
 
-            let command = Command::new(
-                dedup,
-                crate::raft::proposal_timestamp_ms(),
-                crate::raft::Mutation::RegisterWorkerDescriptor {
-                    group_name: group_name.clone(),
-                    worker_id,
-                    address: address.clone(),
-                    worker_net_protocol,
-                    fault_domain: None,
-                },
-            );
-
             let accepted_worker_id = match self.raft_node.propose(command).await {
-                Ok(AppDataResponse::Worker(WorkerCommandResult::Upserted(worker_id))) => worker_id,
+                Ok(CommandResult::WorkerUpserted(worker_id)) => worker_id,
                 Ok(other) => {
                     return self.metadata_error_response(
                         &req.header,

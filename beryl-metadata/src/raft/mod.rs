@@ -16,10 +16,10 @@ mod storage;
 mod types;
 
 pub(crate) use command::proposal_timestamp_ms;
-pub(crate) use command::{CanonicalNamespaceRequest, Command, CreateFileMode, FileCommitMode, Mutation};
+pub(crate) use command::{Command, PublishMode};
 pub(crate) use node::AppRaftNode;
 pub(crate) use read_view::{MetadataReadView, RoutingDelta};
-pub(crate) use response::{AppDataResponse, FsCommandResult, WorkerCommandResult};
+pub(crate) use response::{CommandResult, FsCommandResult};
 pub(crate) use state_machine::AppRaftStateMachine;
 pub(crate) use storage::{RocksDBStorage, StorageIdentity};
-pub(crate) use types::{AppMetadataRaftState, CommandFingerprint, DedupKey};
+pub(crate) use types::AppMetadataRaftState;

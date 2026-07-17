@@ -6,7 +6,7 @@
 use super::*;
 
 impl AppRaftStateMachine {
-    // Raft apply helpers mirror command payload fields for replay clarity.
+    // Keep the state transition inputs explicit at the apply boundary.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn apply_register_worker(
         &self,
@@ -15,10 +15,8 @@ impl AppRaftStateMachine {
         address: String,
         worker_net_protocol: i32,
         fault_domain: Option<String>,
-        dedup_key: &DedupKey,
-        fingerprint: CommandFingerprint,
         raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<WorkerCommandResult> {
+    ) -> MetadataResult<WorkerId> {
         let worker_info = self.storage.prepare_worker_registration(
             group_name,
             worker_id,
@@ -26,12 +24,8 @@ impl AppRaftStateMachine {
             worker_net_protocol,
             fault_domain,
         )?;
-        let result = WorkerCommandResult::Upserted(worker_info.worker_id);
-        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Worker(result.clone()));
-        self.storage
-            .register_worker_with_apply_result_atomic(&worker_info, dedup_key, applied_result, raft_state)?;
-
-        Ok(result)
+        self.storage.register_worker_atomic(&worker_info, raft_state)?;
+        Ok(worker_info.worker_id)
     }
 }
 
@@ -46,17 +40,14 @@ mod tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage));
         let worker_id = WorkerId::new(76);
-        let cmd = Command::new(
-            dedup_for_test(76),
-            crate::raft::proposal_timestamp_ms(),
-            crate::raft::Mutation::RegisterWorkerDescriptor {
-                group_name: group_name("root"),
-                worker_id,
-                address: "127.0.0.1:17076".to_string(),
-                worker_net_protocol: 1,
-                fault_domain: Some("rack-a".to_string()),
-            },
-        );
+        let cmd = Command::RegisterWorkerDescriptor {
+            proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+            group_name: group_name("root"),
+            worker_id,
+            address: "127.0.0.1:17076".to_string(),
+            worker_net_protocol: 1,
+            fault_domain: Some("rack-a".to_string()),
+        };
 
         assert_eq!(expect_worker_upserted(sm.apply(cmd.clone()).unwrap()), worker_id);
         assert_eq!(expect_worker_upserted(sm.apply(cmd).unwrap()), worker_id);
@@ -77,28 +68,22 @@ mod tests {
         let sm = AppRaftStateMachine::new(Arc::clone(&storage));
         let worker_id = WorkerId::new(760);
 
-        let first = Command::new(
-            dedup_for_test(760),
-            crate::raft::proposal_timestamp_ms(),
-            crate::raft::Mutation::RegisterWorkerDescriptor {
-                group_name: group_name("root"),
-                worker_id,
-                address: "127.0.0.1:17060".to_string(),
-                worker_net_protocol: 1,
-                fault_domain: None,
-            },
-        );
-        let second = Command::new(
-            dedup_for_test(761),
-            crate::raft::proposal_timestamp_ms(),
-            crate::raft::Mutation::RegisterWorkerDescriptor {
-                group_name: group_name("root"),
-                worker_id,
-                address: "127.0.0.1:17061".to_string(),
-                worker_net_protocol: 2,
-                fault_domain: Some("rack-b".to_string()),
-            },
-        );
+        let first = Command::RegisterWorkerDescriptor {
+            proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+            group_name: group_name("root"),
+            worker_id,
+            address: "127.0.0.1:17060".to_string(),
+            worker_net_protocol: 1,
+            fault_domain: None,
+        };
+        let second = Command::RegisterWorkerDescriptor {
+            proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+            group_name: group_name("root"),
+            worker_id,
+            address: "127.0.0.1:17061".to_string(),
+            worker_net_protocol: 2,
+            fault_domain: Some("rack-b".to_string()),
+        };
 
         assert_eq!(expect_worker_upserted(sm.apply(first.clone()).unwrap()), worker_id);
         assert_eq!(expect_worker_upserted(sm.apply(first).unwrap()), worker_id);
@@ -125,17 +110,14 @@ mod tests {
 
         assert_eq!(
             expect_worker_upserted(
-                sm.apply(Command::new(
-                    dedup_for_test(762),
-                    crate::raft::proposal_timestamp_ms(),
-                    crate::raft::Mutation::RegisterWorkerDescriptor {
-                        group_name: group_name("root"),
-                        worker_id: endpoint_worker_id,
-                        address: "127.0.0.1:17062".to_string(),
-                        worker_net_protocol: 1,
-                        fault_domain: None
-                    }
-                ))
+                sm.apply(Command::RegisterWorkerDescriptor {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    group_name: group_name("root"),
+                    worker_id: endpoint_worker_id,
+                    address: "127.0.0.1:17062".to_string(),
+                    worker_net_protocol: 1,
+                    fault_domain: None
+                })
                 .unwrap()
             ),
             endpoint_worker_id
@@ -152,17 +134,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             expect_worker_upserted(
-                sm.apply(Command::new(
-                    dedup_for_test(763),
-                    crate::raft::proposal_timestamp_ms(),
-                    crate::raft::Mutation::RegisterWorkerDescriptor {
-                        group_name: group_name("root"),
-                        worker_id: endpoint_worker_id,
-                        address: "127.0.0.1:17063".to_string(),
-                        worker_net_protocol: 1,
-                        fault_domain: None
-                    }
-                ))
+                sm.apply(Command::RegisterWorkerDescriptor {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    group_name: group_name("root"),
+                    worker_id: endpoint_worker_id,
+                    address: "127.0.0.1:17063".to_string(),
+                    worker_net_protocol: 1,
+                    fault_domain: None
+                })
                 .unwrap()
             ),
             endpoint_worker_id
@@ -178,17 +157,14 @@ mod tests {
 
         assert_eq!(
             expect_worker_upserted(
-                sm.apply(Command::new(
-                    dedup_for_test(764),
-                    crate::raft::proposal_timestamp_ms(),
-                    crate::raft::Mutation::RegisterWorkerDescriptor {
-                        group_name: group_name("root"),
-                        worker_id: protocol_worker_id,
-                        address: "127.0.0.1:17064".to_string(),
-                        worker_net_protocol: 1,
-                        fault_domain: None
-                    }
-                ))
+                sm.apply(Command::RegisterWorkerDescriptor {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    group_name: group_name("root"),
+                    worker_id: protocol_worker_id,
+                    address: "127.0.0.1:17064".to_string(),
+                    worker_net_protocol: 1,
+                    fault_domain: None
+                })
                 .unwrap()
             ),
             protocol_worker_id
@@ -205,17 +181,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             expect_worker_upserted(
-                sm.apply(Command::new(
-                    dedup_for_test(765),
-                    crate::raft::proposal_timestamp_ms(),
-                    crate::raft::Mutation::RegisterWorkerDescriptor {
-                        group_name: group_name("root"),
-                        worker_id: protocol_worker_id,
-                        address: "127.0.0.1:17064".to_string(),
-                        worker_net_protocol: 2,
-                        fault_domain: None
-                    }
-                ))
+                sm.apply(Command::RegisterWorkerDescriptor {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    group_name: group_name("root"),
+                    worker_id: protocol_worker_id,
+                    address: "127.0.0.1:17064".to_string(),
+                    worker_net_protocol: 2,
+                    fault_domain: None
+                })
                 .unwrap()
             ),
             protocol_worker_id
@@ -241,17 +214,14 @@ mod tests {
 
         assert_eq!(
             expect_worker_upserted(
-                sm.apply(Command::new(
-                    dedup_for_test(766),
-                    crate::raft::proposal_timestamp_ms(),
-                    crate::raft::Mutation::RegisterWorkerDescriptor {
-                        group_name: group_name("root"),
-                        worker_id,
-                        address: "127.0.0.1:17066".to_string(),
-                        worker_net_protocol: 1,
-                        fault_domain: None
-                    }
-                ))
+                sm.apply(Command::RegisterWorkerDescriptor {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    group_name: group_name("root"),
+                    worker_id,
+                    address: "127.0.0.1:17066".to_string(),
+                    worker_net_protocol: 1,
+                    fault_domain: None
+                })
                 .unwrap()
             ),
             worker_id
@@ -285,17 +255,14 @@ mod tests {
 
         assert_eq!(
             expect_worker_upserted(
-                sm.apply(Command::new(
-                    dedup_for_test(767),
-                    crate::raft::proposal_timestamp_ms(),
-                    crate::raft::Mutation::RegisterWorkerDescriptor {
-                        group_name: group_name("root"),
-                        worker_id,
-                        address: "127.0.0.1:17067".to_string(),
-                        worker_net_protocol: 2,
-                        fault_domain: Some("rack-b".to_string())
-                    }
-                ))
+                sm.apply(Command::RegisterWorkerDescriptor {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    group_name: group_name("root"),
+                    worker_id,
+                    address: "127.0.0.1:17067".to_string(),
+                    worker_net_protocol: 2,
+                    fault_domain: Some("rack-b".to_string())
+                })
                 .unwrap()
             ),
             worker_id
@@ -326,17 +293,14 @@ mod tests {
         assert_eq!(
             expect_worker_upserted(
                 first_sm
-                    .apply(Command::new(
-                        dedup_for_test(7601),
-                        crate::raft::proposal_timestamp_ms(),
-                        crate::raft::Mutation::RegisterWorkerDescriptor {
-                            group_name: group_name.clone(),
-                            worker_id,
-                            address: "127.0.0.1:17601".to_string(),
-                            worker_net_protocol: 1,
-                            fault_domain: None
-                        }
-                    ))
+                    .apply(Command::RegisterWorkerDescriptor {
+                        proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                        group_name: group_name.clone(),
+                        worker_id,
+                        address: "127.0.0.1:17601".to_string(),
+                        worker_net_protocol: 1,
+                        fault_domain: None
+                    })
                     .unwrap()
             ),
             worker_id
@@ -353,17 +317,14 @@ mod tests {
         assert_eq!(
             expect_worker_upserted(
                 reloaded_sm
-                    .apply(Command::new(
-                        dedup_for_test(7602),
-                        crate::raft::proposal_timestamp_ms(),
-                        crate::raft::Mutation::RegisterWorkerDescriptor {
-                            group_name: group_name.clone(),
-                            worker_id,
-                            address: "127.0.0.1:17602".to_string(),
-                            worker_net_protocol: 1,
-                            fault_domain: None
-                        }
-                    ))
+                    .apply(Command::RegisterWorkerDescriptor {
+                        proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                        group_name: group_name.clone(),
+                        worker_id,
+                        address: "127.0.0.1:17602".to_string(),
+                        worker_net_protocol: 1,
+                        fault_domain: None
+                    })
                     .unwrap()
             ),
             worker_id
@@ -388,28 +349,22 @@ mod tests {
         let first_group = group_name("root");
         let second_group = group_name("g2");
 
-        let first = Command::new(
-            dedup_for_test(762),
-            crate::raft::proposal_timestamp_ms(),
-            crate::raft::Mutation::RegisterWorkerDescriptor {
-                group_name: first_group.clone(),
-                worker_id,
-                address: "127.0.0.1:17062".to_string(),
-                worker_net_protocol: 1,
-                fault_domain: None,
-            },
-        );
-        let second = Command::new(
-            dedup_for_test(763),
-            crate::raft::proposal_timestamp_ms(),
-            crate::raft::Mutation::RegisterWorkerDescriptor {
-                group_name: second_group.clone(),
-                worker_id,
-                address: "127.0.0.1:17063".to_string(),
-                worker_net_protocol: 1,
-                fault_domain: None,
-            },
-        );
+        let first = Command::RegisterWorkerDescriptor {
+            proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+            group_name: first_group.clone(),
+            worker_id,
+            address: "127.0.0.1:17062".to_string(),
+            worker_net_protocol: 1,
+            fault_domain: None,
+        };
+        let second = Command::RegisterWorkerDescriptor {
+            proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+            group_name: second_group.clone(),
+            worker_id,
+            address: "127.0.0.1:17063".to_string(),
+            worker_net_protocol: 1,
+            fault_domain: None,
+        };
 
         assert_eq!(expect_worker_upserted(sm.apply(first).unwrap()), worker_id);
         assert_eq!(expect_worker_upserted(sm.apply(second).unwrap()), worker_id);
@@ -434,34 +389,28 @@ mod tests {
 
         assert_eq!(
             expect_worker_upserted(
-                sm.apply(Command::new(
-                    dedup_for_test(764),
-                    crate::raft::proposal_timestamp_ms(),
-                    crate::raft::Mutation::RegisterWorkerDescriptor {
-                        group_name: first_group.clone(),
-                        worker_id,
-                        address: "127.0.0.1:17064".to_string(),
-                        worker_net_protocol: 1,
-                        fault_domain: None
-                    }
-                ))
+                sm.apply(Command::RegisterWorkerDescriptor {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    group_name: first_group.clone(),
+                    worker_id,
+                    address: "127.0.0.1:17064".to_string(),
+                    worker_net_protocol: 1,
+                    fault_domain: None
+                })
                 .unwrap()
             ),
             worker_id
         );
         assert_eq!(
             expect_worker_upserted(
-                sm.apply(Command::new(
-                    dedup_for_test(765),
-                    crate::raft::proposal_timestamp_ms(),
-                    crate::raft::Mutation::RegisterWorkerDescriptor {
-                        group_name: second_group.clone(),
-                        worker_id,
-                        address: "127.0.0.1:17065".to_string(),
-                        worker_net_protocol: 1,
-                        fault_domain: None
-                    }
-                ))
+                sm.apply(Command::RegisterWorkerDescriptor {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    group_name: second_group.clone(),
+                    worker_id,
+                    address: "127.0.0.1:17065".to_string(),
+                    worker_net_protocol: 1,
+                    fault_domain: None
+                })
                 .unwrap()
             ),
             worker_id

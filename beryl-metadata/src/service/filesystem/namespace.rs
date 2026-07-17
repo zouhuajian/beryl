@@ -1,41 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use super::{Freshness, FsResult, FsSuccess, MetadataFileSystem, RequestContext, WriteCommandKind};
+use super::{Freshness, FsResult, MetadataFileSystem, RequestContext};
 use crate::error::MetadataError;
 use crate::observe;
-use crate::raft::{AppDataResponse, Command, FsCommandResult};
+use crate::raft::{Command, FsCommandResult};
 use beryl_types::fs::{FileAttrs, InodeId};
 use std::sync::atomic::Ordering;
-
-#[derive(Clone, Debug)]
-struct MkdirInput {
-    ctx: RequestContext,
-    path: String,
-    parent_inode_id: InodeId,
-    name: String,
-    attrs: FileAttrs,
-    freshness: Freshness,
-}
-
-#[derive(Clone, Debug, Default)]
-struct MkdirOutput {
-    inode_id: Option<InodeId>,
-    attrs: Option<FileAttrs>,
-}
-
-#[derive(Clone, Debug)]
-struct RenameInput {
-    ctx: RequestContext,
-    src_path: String,
-    dst_path: String,
-    src_parent_inode_id: InodeId,
-    src_name: String,
-    dst_parent_inode_id: InodeId,
-    dst_name: String,
-    flags: u32,
-    freshness: Freshness,
-}
 
 pub(crate) struct CreateDirectoryArgs {
     pub(crate) path: String,
@@ -45,15 +16,8 @@ pub(crate) struct CreateDirectoryArgs {
     pub(crate) freshness: Freshness,
 }
 
-struct ValidatedCreateDirectoryArgs {
-    path: String,
-    attrs: FileAttrs,
-    recursive: bool,
-    freshness: Freshness,
-}
-
 pub(crate) struct CreateDirectoryOutput {
-    pub(crate) inode_id: Option<InodeId>,
+    pub(crate) inode_id: InodeId,
     pub(crate) attrs: FileAttrs,
 }
 
@@ -88,57 +52,10 @@ impl MetadataFileSystem {
             Ok(path) => path,
             Err(err) => return self.failure_from_path_error(ctx, &path, err),
         };
-        let (mount_ctx, _) = match self.path_resolver.resolve_mount_components(&path) {
-            Ok(resolved) => resolved,
-            Err(err) => return self.failure_from_path_error(ctx, &path, err),
-        };
-        let fingerprint = Command::create_directory_fingerprint(&path, &attrs, recursive);
-        match self.replay_namespace_result(&ctx.caller, fingerprint) {
-            Ok(Some(FsCommandResult::Ok(ok))) => {
-                let Some(attrs) = ok.attrs else {
-                    return self.failure_from_resolved_path_error(
-                        ctx,
-                        MetadataError::Internal("CreateDirectory replay result is missing attrs".to_string()),
-                        Some(&mount_ctx),
-                    );
-                };
-                return self.success(
-                    ctx,
-                    CreateDirectoryOutput {
-                        inode_id: ok.inode_id,
-                        attrs,
-                    },
-                    Some(mount_ctx.owner_group_name),
-                    Some(mount_ctx.mount_epoch),
-                );
-            }
-            Ok(Some(FsCommandResult::Err(err))) => {
-                return self.fatal_fs_failure(
-                    ctx,
-                    err.errno,
-                    err.message,
-                    Some(mount_ctx.owner_group_name),
-                    Some(mount_ctx.mount_epoch),
-                );
-            }
-            Ok(None) => {}
-            Err(err) => return self.failure_from_resolved_path_error(ctx, err, Some(&mount_ctx)),
-        }
-        if let Err(err) = self.reject_active_session_call_reuse(&ctx.caller) {
-            return self.failure_from_resolved_path_error(ctx, err, Some(&mount_ctx));
-        }
-        let args = ValidatedCreateDirectoryArgs {
-            path,
-            attrs,
-            recursive,
-            freshness,
-        };
-
-        let path = args.path.clone();
-        let result = if args.recursive {
-            self.create_directory_recursive(ctx, args).await
+        let result = if recursive {
+            self.create_directory_recursive(ctx, &path, attrs, freshness).await
         } else {
-            self.create_directory_once(ctx, args).await
+            self.create_directory_once(ctx, &path, attrs, freshness).await
         };
         let parent_inode_id = self
             .path_resolver
@@ -155,7 +72,7 @@ impl MetadataFileSystem {
                 client_id = %ctx.caller.client.client_id,
                 call_id = %ctx.caller.client.call_id,
                 path = %path,
-                inode_id = success.payload.inode_id.map(|id| id.as_raw()),
+                inode_id = success.payload.inode_id.as_raw(),
                 parent_inode_id = parent_inode_id.map(|id| id.as_raw()),
                 mount_epoch = success.mount_epoch,
                 route_epoch = success.route_epoch,
@@ -179,11 +96,13 @@ impl MetadataFileSystem {
     async fn create_directory_once(
         &self,
         ctx: &RequestContext,
-        args: ValidatedCreateDirectoryArgs,
+        path: &str,
+        attrs: FileAttrs,
+        freshness: Freshness,
     ) -> FsResult<CreateDirectoryOutput> {
-        let resolved = match self.path_resolver.resolve_path(&args.path) {
+        let resolved = match self.path_resolver.resolve_path(path) {
             Ok(resolved) => resolved,
-            Err(err) => return self.failure_from_path_error(ctx, &args.path, err),
+            Err(err) => return self.failure_from_path_error(ctx, path, err),
         };
         let (Some(parent_inode_id), Some(name)) = (resolved.parent_inode_id, resolved.name.clone()) else {
             return self.failure_from_resolved_path_error(
@@ -193,43 +112,30 @@ impl MetadataFileSystem {
             );
         };
 
-        let success = self
-            .mkdir_resolved(MkdirInput {
-                ctx: ctx.clone(),
-                path: args.path,
-                parent_inode_id,
-                name,
-                attrs: args.attrs,
-                freshness: args.freshness,
-            })
-            .await?;
-        let Some(attrs) = success.payload.attrs else {
-            return self.failure_from_resolved_path_error(
-                ctx,
-                MetadataError::Internal("CreateDirectory succeeded without attrs".to_string()),
-                Some(&resolved.mount_ctx),
-            );
-        };
-        Ok(FsSuccess {
-            payload: CreateDirectoryOutput {
-                inode_id: success.payload.inode_id,
+        self.execute_create_directory(
+            ctx,
+            Command::CreateDirectory {
+                proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                root_inode_id: parent_inode_id,
+                components: vec![name],
                 attrs,
+                recursive: false,
             },
-            group_name: success.group_name,
-            mount_epoch: success.mount_epoch,
-            route_epoch: success.route_epoch,
-            state: success.state,
-        })
+            freshness,
+        )
+        .await
     }
 
     async fn create_directory_recursive(
         &self,
         ctx: &RequestContext,
-        args: ValidatedCreateDirectoryArgs,
+        path: &str,
+        attrs: FileAttrs,
+        freshness: Freshness,
     ) -> FsResult<CreateDirectoryOutput> {
-        let (mount_ctx, components) = match self.path_resolver.resolve_mount_components(&args.path) {
+        let (mount_ctx, components) = match self.path_resolver.resolve_mount_components(path) {
             Ok(resolved) => resolved,
-            Err(err) => return self.failure_from_path_error(ctx, &args.path, err),
+            Err(err) => return self.failure_from_path_error(ctx, path, err),
         };
         if components.is_empty() {
             return self.failure_from_resolved_path_error(
@@ -239,42 +145,35 @@ impl MetadataFileSystem {
             );
         }
 
-        let routed =
-            match self.route_ctx_for_write(ctx, WriteCommandKind::Mkdir, &[mount_ctx.root_inode_id], args.freshness) {
-                Ok(routed) => routed,
-                Err(err) => return Err(err),
-            };
-        let dedup = match self.dedup_key(&ctx.caller) {
-            Ok(key) => key,
-            Err(err) => {
-                return self.failure_from_error(
-                    ctx,
-                    err,
-                    Some(routed.namespace_owner_group_name.clone()),
-                    Some(routed.mount_epoch),
-                );
-            }
+        self.execute_create_directory(
+            ctx,
+            Command::CreateDirectory {
+                proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                root_inode_id: mount_ctx.root_inode_id,
+                components,
+                attrs,
+                recursive: true,
+            },
+            freshness,
+        )
+        .await
+    }
+
+    async fn execute_create_directory(
+        &self,
+        ctx: &RequestContext,
+        command: Command,
+        freshness: Freshness,
+    ) -> FsResult<CreateDirectoryOutput> {
+        let root_inode_id = match &command {
+            Command::CreateDirectory { root_inode_id, .. } => *root_inode_id,
+            _ => unreachable!("execute_create_directory requires CreateDirectory"),
         };
-        let result = match self
-            .propose_fs_write_command(
-                WriteCommandKind::Mkdir,
-                Command::new_namespace(
-                    dedup,
-                    crate::raft::proposal_timestamp_ms(),
-                    crate::raft::CanonicalNamespaceRequest::CreateDirectory {
-                        path: args.path,
-                        attrs: args.attrs.clone(),
-                        recursive: true,
-                    },
-                    crate::raft::Mutation::CreateDirectory {
-                        root_inode_id: mount_ctx.root_inode_id,
-                        components,
-                        attrs: args.attrs,
-                    },
-                ),
-            )
-            .await
-        {
+        let routed = match self.route_ctx_for_write(ctx, &[root_inode_id], freshness) {
+            Ok(routed) => routed,
+            Err(err) => return Err(err),
+        };
+        let result = match self.propose_fs_write_command(command).await {
             Ok(result) => result,
             Err(err) => {
                 return self.failure_from_error(
@@ -305,10 +204,7 @@ impl MetadataFileSystem {
                 };
                 self.success(
                     ctx,
-                    CreateDirectoryOutput {
-                        inode_id: Some(inode_id),
-                        attrs,
-                    },
+                    CreateDirectoryOutput { inode_id, attrs },
                     Some(routed.namespace_owner_group_name),
                     Some(routed.mount_epoch),
                 )
@@ -335,36 +231,6 @@ impl MetadataFileSystem {
             Ok(path) => path,
             Err(err) => return self.failure_from_path_error(ctx, &args.dst_path, err),
         };
-        let (src_mount_ctx, _) = match self.path_resolver.resolve_mount_components(&src_path) {
-            Ok(resolved) => resolved,
-            Err(err) => return self.failure_from_path_error(ctx, &src_path, err),
-        };
-        let fingerprint = Command::rename_fingerprint(&src_path, &dst_path, args.flags);
-        match self.replay_namespace_result(&ctx.caller, fingerprint) {
-            Ok(Some(FsCommandResult::Ok(_))) => {
-                return self.success(
-                    ctx,
-                    (),
-                    Some(src_mount_ctx.owner_group_name),
-                    Some(src_mount_ctx.mount_epoch),
-                );
-            }
-            Ok(Some(FsCommandResult::Err(err))) => {
-                return self.fatal_fs_failure(
-                    ctx,
-                    err.errno,
-                    err.message,
-                    Some(src_mount_ctx.owner_group_name),
-                    Some(src_mount_ctx.mount_epoch),
-                );
-            }
-            Ok(None) => {}
-            Err(err) => return self.failure_from_resolved_path_error(ctx, err, Some(&src_mount_ctx)),
-        }
-        if let Err(err) = self.reject_active_session_call_reuse(&ctx.caller) {
-            return self.failure_from_resolved_path_error(ctx, err, Some(&src_mount_ctx));
-        }
-
         let (src_resolved, dst_resolved) = match self.path_resolver.resolve_rename(&src_path, &dst_path) {
             Ok(resolved) => resolved,
             Err(err) => return self.failure_from_error(ctx, err, None, None),
@@ -377,6 +243,13 @@ impl MetadataFileSystem {
                 Some(&src_resolved.mount_ctx),
             );
         };
+        let Some(expected_src_inode_id) = src_resolved.inode_id else {
+            return self.failure_from_resolved_path_error(
+                ctx,
+                MetadataError::NotFound(format!("Source not found: {src_path}")),
+                Some(&src_resolved.mount_ctx),
+            );
+        };
         let (Some(dst_parent_inode_id), Some(dst_name)) = (dst_resolved.parent_inode_id, dst_resolved.name.clone())
         else {
             return self.failure_from_resolved_path_error(
@@ -385,19 +258,34 @@ impl MetadataFileSystem {
                 Some(&dst_resolved.mount_ctx),
             );
         };
+        let expected_dst_lease_epoch = match dst_resolved.inode_id {
+            Some(dst_inode_id) => match self.read_inode(dst_inode_id) {
+                Ok(Some(inode)) => match &inode.data {
+                    beryl_types::fs::InodeData::File { lease_epoch, .. } => Some(lease_epoch.unwrap_or(0)),
+                    _ => None,
+                },
+                Ok(None) => None,
+                Err(err) => return self.failure_from_resolved_path_error(ctx, err, Some(&dst_resolved.mount_ctx)),
+            },
+            None => None,
+        };
 
         let result = self
-            .rename_resolved(RenameInput {
-                ctx: ctx.clone(),
-                src_path,
-                dst_path,
-                src_parent_inode_id,
-                src_name,
-                dst_parent_inode_id,
-                dst_name,
-                flags: args.flags,
-                freshness: args.freshness,
-            })
+            .execute_rename(
+                ctx,
+                Command::Rename {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    src_parent_inode_id,
+                    src_name,
+                    expected_src_inode_id,
+                    dst_parent_inode_id,
+                    dst_name,
+                    expected_dst_inode_id: dst_resolved.inode_id,
+                    expected_dst_lease_epoch,
+                    flags: args.flags,
+                },
+                args.freshness,
+            )
             .await;
 
         match &result {
@@ -431,113 +319,59 @@ impl MetadataFileSystem {
         result
     }
 
-    async fn mkdir_resolved(&self, req: MkdirInput) -> FsResult<MkdirOutput> {
-        let ctx =
-            match self.route_ctx_for_write(&req.ctx, WriteCommandKind::Mkdir, &[req.parent_inode_id], req.freshness) {
-                Ok(ctx) => ctx,
-                Err(err) => return Err(err),
-            };
-
-        let dedup = match self.dedup_key(&req.ctx.caller) {
-            Ok(k) => k,
-            Err(err) => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    err,
-                    Some(ctx.namespace_owner_group_name.clone()),
-                    Some(ctx.mount_epoch),
-                );
-            }
+    async fn execute_rename(
+        &self,
+        request_ctx: &RequestContext,
+        command: Command,
+        freshness: Freshness,
+    ) -> FsResult<()> {
+        let Command::Rename {
+            src_parent_inode_id,
+            src_name: _,
+            expected_src_inode_id: _,
+            dst_parent_inode_id,
+            ref dst_name,
+            expected_dst_inode_id: _,
+            expected_dst_lease_epoch: _,
+            flags,
+            ..
+        } = command
+        else {
+            unreachable!("execute_rename requires Rename")
         };
-
-        let result = match self
-            .propose_fs_write_command(
-                WriteCommandKind::Mkdir,
-                Command::new_namespace(
-                    dedup,
-                    crate::raft::proposal_timestamp_ms(),
-                    crate::raft::CanonicalNamespaceRequest::CreateDirectory {
-                        path: req.path,
-                        attrs: req.attrs.clone(),
-                        recursive: false,
-                    },
-                    crate::raft::Mutation::Mkdir {
-                        parent_inode_id: req.parent_inode_id,
-                        name: req.name,
-                        attrs: req.attrs,
-                    },
-                ),
-            )
-            .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    err,
-                    Some(ctx.namespace_owner_group_name.clone()),
-                    Some(ctx.mount_epoch),
-                );
-            }
-        };
-
-        match result {
-            FsCommandResult::Ok(ok) => self.success(
-                &req.ctx,
-                MkdirOutput {
-                    inode_id: ok.inode_id,
-                    attrs: ok.attrs,
-                },
-                Some(ctx.namespace_owner_group_name.clone()),
-                Some(ctx.mount_epoch),
-            ),
-            FsCommandResult::Err(err) => self.fatal_fs_failure(
-                &req.ctx,
-                err.errno,
-                err.message,
-                Some(ctx.namespace_owner_group_name.clone()),
-                Some(ctx.mount_epoch),
-            ),
-        }
-    }
-
-    async fn rename_resolved(&self, req: RenameInput) -> FsResult<()> {
         let supported_mask: u32 = 0x1;
-        if req.flags & !supported_mask != 0 {
+        if flags & !supported_mask != 0 {
             return self.failure_from_error(
-                &req.ctx,
-                MetadataError::NotSupported(format!("Unsupported rename flags: {}", req.flags)),
+                request_ctx,
+                MetadataError::NotSupported(format!("Unsupported rename flags: {flags}")),
                 None,
                 None,
             );
         }
 
-        let src_parent_inode = match self.read_inode(req.src_parent_inode_id) {
+        let src_parent_inode = match self.read_inode(src_parent_inode_id) {
             Ok(Some(inode)) => inode,
             Ok(None) => {
                 return self.failure_from_error(
-                    &req.ctx,
-                    MetadataError::NotFound(format!("Source parent inode not found: {}", req.src_parent_inode_id)),
+                    request_ctx,
+                    MetadataError::NotFound(format!("Source parent inode not found: {src_parent_inode_id}")),
                     None,
                     None,
                 );
             }
-            Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
+            Err(err) => return self.failure_from_error(request_ctx, err, None, None),
         };
-        let dst_parent_inode = match self.read_inode(req.dst_parent_inode_id) {
+        let dst_parent_inode = match self.read_inode(dst_parent_inode_id) {
             Ok(Some(inode)) => inode,
             Ok(None) => {
                 return self.failure_from_error(
-                    &req.ctx,
-                    MetadataError::NotFound(format!(
-                        "Destination parent inode not found: {}",
-                        req.dst_parent_inode_id
-                    )),
+                    request_ctx,
+                    MetadataError::NotFound(format!("Destination parent inode not found: {dst_parent_inode_id}")),
                     None,
                     None,
                 );
             }
-            Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
+            Err(err) => return self.failure_from_error(request_ctx, err, None, None),
         };
 
         if src_parent_inode.mount_id != dst_parent_inode.mount_id {
@@ -550,7 +384,7 @@ impl MetadataFileSystem {
                 .freshness_validator
                 .mount_hints_for_mount(src_parent_inode.mount_id);
             return self.failure_from_error(
-                &req.ctx,
+                request_ctx,
                 MetadataError::CrossMountRename(format!(
                     "Cross-mount rename not allowed: src_mount={:?}, dst_mount={:?}",
                     src_parent_inode.mount_id, dst_parent_inode.mount_id
@@ -560,89 +394,17 @@ impl MetadataFileSystem {
             );
         }
 
-        let ctx = match self.route_ctx_for_write(
-            &req.ctx,
-            WriteCommandKind::Rename,
-            &[req.src_parent_inode_id, req.dst_parent_inode_id],
-            req.freshness,
-        ) {
+        let ctx = match self.route_ctx_for_write(request_ctx, &[src_parent_inode_id, dst_parent_inode_id], freshness) {
             Ok(ctx) => ctx,
             Err(err) => return Err(err),
         };
 
-        let dedup = match self.dedup_key(&req.ctx.caller) {
-            Ok(key) => key,
-            Err(err) => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    err,
-                    Some(ctx.namespace_owner_group_name.clone()),
-                    Some(ctx.mount_epoch),
-                );
-            }
-        };
-        let command = Command::new_namespace(
-            dedup.clone(),
-            crate::raft::proposal_timestamp_ms(),
-            crate::raft::CanonicalNamespaceRequest::Rename {
-                src_path: req.src_path,
-                dst_path: req.dst_path,
-                flags: req.flags,
-            },
-            crate::raft::Mutation::Rename {
-                src_parent_inode_id: req.src_parent_inode_id,
-                src_name: req.src_name.clone(),
-                dst_parent_inode_id: req.dst_parent_inode_id,
-                dst_name: req.dst_name.clone(),
-                flags: req.flags,
-            },
-        );
-        let fingerprint = command.fingerprint();
-        match self.storage.get_applied_result(&dedup) {
-            Ok(Some(existing)) => {
-                if existing.fingerprint != fingerprint {
-                    return self.failure_from_error(
-                        &req.ctx,
-                        MetadataError::InvalidArgument(format!(
-                            "call_id {} reused with different command payload",
-                            dedup.call_id
-                        )),
-                        Some(ctx.namespace_owner_group_name.clone()),
-                        Some(ctx.mount_epoch),
-                    );
-                }
-                let result = match existing.result {
-                    AppDataResponse::Fs(result) => result,
-                    _ => FsCommandResult::ok(),
-                };
-                return self.rename_result(&req.ctx, &ctx, result);
-            }
-            Ok(None) => {}
-            Err(err) => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    err,
-                    Some(ctx.namespace_owner_group_name.clone()),
-                    Some(ctx.mount_epoch),
-                );
-            }
-        }
-
-        if let Err(err) = self.reject_active_session_call_reuse(&req.ctx.caller) {
-            return self.failure_from_error(
-                &req.ctx,
-                err,
-                Some(ctx.namespace_owner_group_name.clone()),
-                Some(ctx.mount_epoch),
-            );
-        }
-
-        match self.read_dentry(req.dst_parent_inode_id, &req.dst_name) {
+        match self.read_dentry(dst_parent_inode_id, dst_name) {
             Ok(Some(dst_inode_id)) => match self.read_inode(dst_inode_id) {
                 Ok(Some(inode)) if inode.kind.is_file() => {
                     if self.has_active_write(dst_inode_id) {
                         return self.fatal_fs_failure(
-                            &req.ctx,
+                            request_ctx,
                             beryl_types::fs::FsErrorCode::EBusy,
                             format!("Rename target has an active write lease: {}", dst_inode_id),
                             Some(ctx.namespace_owner_group_name.clone()),
@@ -653,7 +415,7 @@ impl MetadataFileSystem {
                 Ok(_) => {}
                 Err(err) => {
                     return self.failure_from_error(
-                        &req.ctx,
+                        request_ctx,
                         err,
                         Some(ctx.namespace_owner_group_name.clone()),
                         Some(ctx.mount_epoch),
@@ -663,7 +425,7 @@ impl MetadataFileSystem {
             Ok(None) => {}
             Err(err) => {
                 return self.failure_from_error(
-                    &req.ctx,
+                    request_ctx,
                     err,
                     Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
@@ -671,11 +433,11 @@ impl MetadataFileSystem {
             }
         }
 
-        let result = match self.propose_fs_write_command(WriteCommandKind::Rename, command).await {
+        let result = match self.propose_fs_write_command(command).await {
             Ok(result) => result,
             Err(err) => {
                 return self.failure_from_error(
-                    &req.ctx,
+                    request_ctx,
                     err,
                     Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
@@ -683,7 +445,7 @@ impl MetadataFileSystem {
             }
         };
 
-        self.rename_result(&req.ctx, &ctx, result)
+        self.rename_result(request_ctx, &ctx, result)
     }
 
     fn rename_result(
@@ -766,17 +528,21 @@ mod tests {
         let file_handle = install_write_session(&filesystem, target_inode_id, mount_id);
 
         let failure = filesystem
-            .rename_resolved(RenameInput {
-                ctx: request_context(),
-                src_path: "/source".to_string(),
-                dst_path: "/target".to_string(),
-                src_parent_inode_id: parent_inode_id,
-                src_name: "source".to_string(),
-                dst_parent_inode_id: parent_inode_id,
-                dst_name: "target".to_string(),
-                flags: 0,
-                freshness: Freshness::default(),
-            })
+            .execute_rename(
+                &request_context(),
+                Command::Rename {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    src_parent_inode_id: parent_inode_id,
+                    src_name: "source".to_string(),
+                    expected_src_inode_id: source_inode_id,
+                    dst_parent_inode_id: parent_inode_id,
+                    dst_name: "target".to_string(),
+                    expected_dst_inode_id: Some(target_inode_id),
+                    expected_dst_lease_epoch: Some(0),
+                    flags: 0,
+                },
+                Freshness::default(),
+            )
             .await
             .unwrap_err();
 
@@ -849,17 +615,21 @@ mod tests {
         assert!(filesystem.write_session_for_handle(file_handle).is_some());
 
         filesystem
-            .rename_resolved(RenameInput {
-                ctx: request_context(),
-                src_path: "/source".to_string(),
-                dst_path: "/target".to_string(),
-                src_parent_inode_id: parent_inode_id,
-                src_name: "source".to_string(),
-                dst_parent_inode_id: parent_inode_id,
-                dst_name: "target".to_string(),
-                flags: 0,
-                freshness: Freshness::default(),
-            })
+            .execute_rename(
+                &request_context(),
+                Command::Rename {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    src_parent_inode_id: parent_inode_id,
+                    src_name: "source".to_string(),
+                    expected_src_inode_id: source_inode_id,
+                    dst_parent_inode_id: parent_inode_id,
+                    dst_name: "target".to_string(),
+                    expected_dst_inode_id: Some(target_inode_id),
+                    expected_dst_lease_epoch: Some(0),
+                    flags: 0,
+                },
+                Freshness::default(),
+            )
             .await
             .expect("expired target lease must not leave rename permanently busy");
 
@@ -873,7 +643,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_keeps_file_version() {
+    async fn rename_keeps_content_revision() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_id = MountId::new(59);
@@ -896,22 +666,22 @@ mod tests {
             .unwrap();
         let mut source = Inode::new_file(source_inode_id, FileAttrs::new(), mount_id, source_handle);
         if let beryl_types::fs::InodeData::File {
-            file_version,
+            content_revision,
             lease_epoch,
             ..
         } = &mut source.data
         {
-            *file_version = Some(77);
+            *content_revision = Some(77);
             *lease_epoch = Some(900);
         }
         let mut target = Inode::new_file(target_inode_id, FileAttrs::new(), mount_id, target_handle);
         if let beryl_types::fs::InodeData::File {
-            file_version,
+            content_revision,
             lease_epoch,
             ..
         } = &mut target.data
         {
-            *file_version = Some(12);
+            *content_revision = Some(12);
             *lease_epoch = Some(12);
         }
         storage.put_inode(&source).unwrap();
@@ -928,17 +698,21 @@ mod tests {
         storage.put_data_handle_owner(target_handle, target_inode_id).unwrap();
 
         filesystem
-            .rename_resolved(RenameInput {
-                ctx: request_context(),
-                src_path: "/source".to_string(),
-                dst_path: "/target".to_string(),
-                src_parent_inode_id: parent_inode_id,
-                src_name: "source".to_string(),
-                dst_parent_inode_id: parent_inode_id,
-                dst_name: "target".to_string(),
-                flags: 0,
-                freshness: Freshness::default(),
-            })
+            .execute_rename(
+                &request_context(),
+                Command::Rename {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    src_parent_inode_id: parent_inode_id,
+                    src_name: "source".to_string(),
+                    expected_src_inode_id: source_inode_id,
+                    dst_parent_inode_id: parent_inode_id,
+                    dst_name: "target".to_string(),
+                    expected_dst_inode_id: Some(target_inode_id),
+                    expected_dst_lease_epoch: Some(12),
+                    flags: 0,
+                },
+                Freshness::default(),
+            )
             .await
             .expect("same-mount overwrite rename should succeed");
 
@@ -947,7 +721,7 @@ mod tests {
             storage.get_dentry(parent_inode_id, "target").unwrap(),
             Some(source_inode_id)
         );
-        assert_eq!(stored_file_version(&storage, source_inode_id), Some(77));
+        assert_eq!(stored_content_revision(&storage, source_inode_id), Some(77));
         assert!(storage.get_inode(target_inode_id).unwrap().is_none());
         assert_eq!(storage.get_inode_by_data_handle(target_handle).unwrap(), None);
     }
@@ -984,17 +758,21 @@ mod tests {
             .unwrap();
 
         let failure = filesystem
-            .rename_resolved(RenameInput {
-                ctx: request_context(),
-                src_path: "/source".to_string(),
-                dst_path: "/target".to_string(),
-                src_parent_inode_id,
-                src_name: "source".to_string(),
-                dst_parent_inode_id,
-                dst_name: "target".to_string(),
-                flags: 0,
-                freshness: Freshness::default(),
-            })
+            .execute_rename(
+                &request_context(),
+                Command::Rename {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    src_parent_inode_id,
+                    src_name: "source".to_string(),
+                    expected_src_inode_id: source_inode_id,
+                    dst_parent_inode_id,
+                    dst_name: "target".to_string(),
+                    expected_dst_inode_id: None,
+                    expected_dst_lease_epoch: None,
+                    flags: 0,
+                },
+                Freshness::default(),
+            )
             .await
             .unwrap_err();
 

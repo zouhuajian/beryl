@@ -4,10 +4,9 @@
 //! Tests for lease / append / truncate behavior.
 
 use beryl_metadata::inode_lease::{LeaseManager, WriteMode};
-use beryl_types::fs::InodeId;
+use beryl_types::fs::{FsErrorCode, InodeId};
 use beryl_types::ids::ClientId;
 use beryl_types::ids::{BlockId, BlockIndex, DataHandleId};
-use beryl_types::CallId;
 
 #[test]
 fn test_lease_conflict() {
@@ -17,14 +16,23 @@ fn test_lease_conflict() {
     let client2 = ClientId::new(2);
 
     // Client1 acquires lease
-    let (_lease_id1, epoch1, _) = manager
-        .try_acquire(inode_id, client1, Some(CallId::new()), WriteMode::Write, None)
-        .unwrap();
+    let (epoch1, _) = manager.try_acquire(inode_id, client1, WriteMode::Write, None).unwrap();
 
     // Client2 tries to acquire lease -> should fail with EBusy
-    let result = manager.try_acquire(inode_id, client2, Some(CallId::new()), WriteMode::Write, Some(epoch1));
+    let result = manager.try_acquire(inode_id, client2, WriteMode::Write, Some(epoch1));
     assert!(result.is_err());
     assert_eq!(result.unwrap_err(), beryl_types::fs::FsErrorCode::EBusy);
+}
+
+#[test]
+fn test_lease_epoch_overflow_fails_without_creating_runtime_lease() {
+    let manager = LeaseManager::new(60_000, 10_000);
+    let inode_id = InodeId::new(99);
+
+    let result = manager.try_acquire(inode_id, ClientId::new(1), WriteMode::Write, Some(u64::MAX));
+
+    assert_eq!(result, Err(FsErrorCode::EInval));
+    assert!(manager.get_active_lease(inode_id).is_none());
 }
 
 #[test]
@@ -34,21 +42,14 @@ fn test_lease_renew() {
     let client_id = ClientId::new(1);
 
     // Acquire lease
-    let (lease_id, epoch, expires_at_ms1) = manager
-        .try_acquire(inode_id, client_id, Some(CallId::new()), WriteMode::Write, None)
+    let (epoch, expires_at_ms1) = manager
+        .try_acquire(inode_id, client_id, WriteMode::Write, None)
         .unwrap();
 
     // Renew lease
-    let renew_call_id = CallId::new();
-    let expires_at_ms2 = manager
-        .renew(inode_id, lease_id, epoch, client_id, renew_call_id)
-        .unwrap();
-    let replayed_expiry = manager
-        .renew(inode_id, lease_id, epoch, client_id, renew_call_id)
-        .unwrap();
+    let expires_at_ms2 = manager.renew(inode_id, epoch, client_id).unwrap();
     assert!(expires_at_ms2 >= expires_at_ms1);
-    assert_eq!(replayed_expiry, expires_at_ms2);
-    assert!(manager.validate_lease(inode_id, lease_id, epoch).is_ok());
+    assert!(manager.validate_lease(inode_id, epoch).is_ok());
 }
 
 #[test]
@@ -59,9 +60,7 @@ fn test_lease_expire_and_steal() {
     let _client2 = ClientId::new(2);
 
     // Client1 acquires lease
-    let (_lease_id1, _epoch1, _) = manager
-        .try_acquire(inode_id, client1, Some(CallId::new()), WriteMode::Write, None)
-        .unwrap();
+    let (_epoch1, _) = manager.try_acquire(inode_id, client1, WriteMode::Write, None).unwrap();
 
     // Manually expire the lease (simulate time passing)
     // For testing, we can't easily manipulate time, so we'll test the cleanup logic
@@ -80,22 +79,20 @@ fn test_lease_fencing() {
     let client2 = ClientId::new(2);
 
     // Client1 acquires lease
-    let (lease_id1, epoch1, _) = manager
-        .try_acquire(inode_id, client1, Some(CallId::new()), WriteMode::Write, None)
-        .unwrap();
+    let (epoch1, _) = manager.try_acquire(inode_id, client1, WriteMode::Write, None).unwrap();
 
     // Release client1's lease first (simulate expiration or explicit release)
-    manager.release(inode_id, lease_id1, epoch1);
+    manager.release(inode_id, epoch1);
 
     // Client2 acquires lease (after client1 released)
-    let (_lease_id2, epoch2, _) = manager
-        .try_acquire(inode_id, client2, Some(CallId::new()), WriteMode::Write, Some(epoch1))
+    let (epoch2, _) = manager
+        .try_acquire(inode_id, client2, WriteMode::Write, Some(epoch1))
         .unwrap();
 
     assert!(epoch2 > epoch1);
 
     // Client1 tries to validate old lease -> should fail (fencing)
-    let result = manager.validate_lease(inode_id, lease_id1, epoch1);
+    let result = manager.validate_lease(inode_id, epoch1);
     assert!(result.is_err());
     assert_eq!(result.unwrap_err(), beryl_types::fs::FsErrorCode::EPerm);
 }
@@ -107,8 +104,8 @@ fn test_append_mode_base_size() {
     let client_id = ClientId::new(1);
 
     // Acquire lease in APPEND mode
-    let (_, epoch, _) = manager
-        .try_acquire(inode_id, client_id, Some(CallId::new()), WriteMode::Append, None)
+    let (epoch, _) = manager
+        .try_acquire(inode_id, client_id, WriteMode::Append, None)
         .unwrap();
 
     // Verify lease mode is stored
@@ -130,7 +127,7 @@ fn test_truncate_shrink_extents() {
             block_id: BlockId::new(DataHandleId::new(1), BlockIndex::new(0)),
             block_offset: 0,
             len: 4096,
-            file_version: None,
+            content_revision: None,
             block_stamp: None,
         },
         Extent {
@@ -138,7 +135,7 @@ fn test_truncate_shrink_extents() {
             block_id: BlockId::new(DataHandleId::new(1), BlockIndex::new(1)),
             block_offset: 0,
             len: 4096,
-            file_version: None,
+            content_revision: None,
             block_stamp: None,
         },
     ];

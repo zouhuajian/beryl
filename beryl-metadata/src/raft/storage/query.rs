@@ -4,32 +4,6 @@
 use super::*;
 
 impl RocksDBStorage {
-    /// Get applied result for idempotency.
-    pub fn get_applied_result(&self, request: &DedupKey) -> MetadataResult<Option<AppliedResult>> {
-        crate::observe::record_rocksdb_read("dedup");
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf = db
-            .cf_handle(CF_DEDUP)
-            .ok_or_else(|| MetadataError::Internal("Dedup CF not found".to_string()))?;
-        let key = format!("{}:{}", request.client_id.as_raw(), request.call_id);
-
-        match db.get_cf(cf, key.as_bytes()) {
-            Ok(Some(value)) => {
-                let result: AppliedResult = decode_from_slice(&value, standard())
-                    .map_err(|e| MetadataError::Internal(format!("Failed to deserialize AppliedResult: {}", e)))?
-                    .0;
-                DEDUP_LOOKUP_HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
-                Ok(Some(result))
-            }
-            Ok(None) => {
-                DEDUP_LOOKUP_MISS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                Ok(None)
-            }
-            Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
-        }
-    }
-
     /// Get the authoritative route epoch used for stale-route validation.
     pub fn get_route_epoch(&self) -> MetadataResult<RouteEpoch> {
         let generation = self.pin_generation()?;
@@ -97,7 +71,6 @@ impl RocksDBStorage {
     pub(crate) fn bootstrap_namespace_state(
         &self,
         expected_group_name: &GroupName,
-        expected_proposed_at_ms: u64,
     ) -> MetadataResult<BootstrapNamespaceState> {
         let _generation = self.pin_generation()?;
         let root_inode = self.get_inode(crate::mount::ROOT_INODE_ID)?;
@@ -117,11 +90,13 @@ impl RocksDBStorage {
             return Ok(BootstrapNamespaceState::Empty);
         }
 
-        let mut expected_attrs = beryl_types::FileAttrs::new();
-        expected_attrs.update_timestamps(expected_proposed_at_ms);
-        expected_attrs.nlink = 1;
-        let expected_inode = Inode::new_dir(crate::mount::ROOT_INODE_ID, expected_attrs, MountId::new(1));
-        let matching_inode = root_inode.as_ref() == Some(&expected_inode);
+        let matching_inode = root_inode.as_ref().is_some_and(|inode| {
+            inode.inode_id == crate::mount::ROOT_INODE_ID
+                && inode.kind.is_dir()
+                && matches!(inode.data, beryl_types::fs::InodeData::Dir)
+                && inode.mount_id == MountId::new(1)
+                && inode.current_data_handle_id == DataHandleId::new(0)
+        });
         let matching_mount = mounts.len() == 1
             && mounts.first().is_some_and(|mount| {
                 mount.mount_id == MountId::new(1)
@@ -550,26 +525,6 @@ mod tests {
                     Ok(Some(entry))
                 }
                 Ok(None) => Ok(None),
-                Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
-            }
-        }
-
-        /// Get mount epoch.
-        pub fn get_mount_epoch(&self) -> MetadataResult<u64> {
-            let generation = self.pin_generation()?;
-            let db = generation.db();
-            let cf = db
-                .cf_handle(CF_META)
-                .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
-
-            match db.get_cf(cf, b"mount_epoch") {
-                Ok(Some(value)) => {
-                    let epoch: u64 = decode_from_slice(&value, standard())
-                        .map_err(|e| MetadataError::Internal(format!("Failed to deserialize mount_epoch: {}", e)))?
-                        .0;
-                    Ok(epoch)
-                }
-                Ok(None) => Ok(1), // Default epoch
                 Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
             }
         }
