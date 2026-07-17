@@ -9,10 +9,7 @@
 //! RPC error details and refresh hints.
 
 use crate::error::ClientError;
-use crate::runtime::MetadataRefreshCause;
-use beryl_common::error::rpc::{
-    ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RpcErrorDetail, WorkerErrorKind,
-};
+use beryl_common::error::rpc::{ErrorKind, ProtocolErrorKind, RecoveryAction, RpcErrorDetail};
 use beryl_common::header::ResponseHeader;
 use beryl_proto::convert::rpc_error_from_proto;
 use beryl_types::GroupName;
@@ -74,8 +71,6 @@ pub struct RefreshHint {
 pub(crate) enum ClientAction {
     /// Client must refresh state before retrying.
     Refresh {
-        /// Local runtime refresh strategy label.
-        reason: MetadataRefreshCause,
         /// Structured refresh hints from response header.
         hint: Box<RefreshHint>,
         /// Original RPC error.
@@ -133,12 +128,10 @@ pub(crate) fn validate_data_header_or_action(
 fn validate_rpc_error_with_hint(rpc_error: RpcErrorDetail, hint: RefreshHint) -> Result<(), ClientAction> {
     match &rpc_error.recovery {
         RecoveryAction::RefreshMetadata { .. } => Err(ClientAction::Refresh {
-            reason: metadata_refresh_cause_from_kind(rpc_error.kind),
             hint: Box::new(hint),
             rpc_error: Box::new(rpc_error),
         }),
         RecoveryAction::ReopenWriteSession { .. } => Err(ClientAction::Refresh {
-            reason: MetadataRefreshCause::Unknown,
             hint: Box::new(hint),
             rpc_error: Box::new(rpc_error),
         }),
@@ -147,27 +140,12 @@ fn validate_rpc_error_with_hint(rpc_error: RpcErrorDetail, hint: RefreshHint) ->
             rpc_error: Box::new(rpc_error),
         }),
         RecoveryAction::RegisterWorker | RecoveryAction::SendFullBlockReport => Err(ClientAction::Refresh {
-            reason: MetadataRefreshCause::Unknown,
             hint: Box::new(hint),
             rpc_error: Box::new(rpc_error),
         }),
         RecoveryAction::Fail => Err(ClientAction::Fail {
             rpc_error: Box::new(rpc_error),
         }),
-    }
-}
-
-fn metadata_refresh_cause_from_kind(kind: ErrorKind) -> MetadataRefreshCause {
-    match kind {
-        ErrorKind::Metadata(MetadataErrorKind::NotLeader) => MetadataRefreshCause::NotLeader,
-        ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch)
-        | ErrorKind::Metadata(MetadataErrorKind::GroupMismatch) => MetadataRefreshCause::OwnerGroupMismatch,
-        ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch) => MetadataRefreshCause::MountEpochMismatch,
-        ErrorKind::Metadata(MetadataErrorKind::StaleState) => MetadataRefreshCause::StaleState,
-        ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch) => MetadataRefreshCause::RouteEpochMismatch,
-        ErrorKind::Worker(WorkerErrorKind::RunMismatch) => MetadataRefreshCause::WorkerRunMismatch,
-        ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch) => MetadataRefreshCause::BlockStampMismatch,
-        _ => MetadataRefreshCause::Unknown,
     }
 }
 
@@ -245,7 +223,7 @@ impl From<ClientAction> for ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beryl_common::error::rpc::InternalErrorKind;
+    use beryl_common::error::rpc::{InternalErrorKind, MetadataErrorKind};
     use beryl_common::error::rpc::{RefreshHint as RpcRefreshHint, WorkerEndpointHint};
     use beryl_common::header::{ClientInfo, ResponseHeader};
     use beryl_proto::convert::rpc_error_to_proto;
@@ -309,11 +287,9 @@ mod tests {
         let result = validate_header_or_action(&header);
         match result {
             Err(ClientAction::Refresh {
-                reason,
                 hint,
                 rpc_error: returned,
             }) => {
-                assert_eq!(reason, MetadataRefreshCause::NotLeader);
                 assert_eq!(hint.group_name, Some(GroupName::parse("root").unwrap()));
                 assert_eq!(hint.mount_epoch, Some(12));
                 assert_eq!(returned.kind, rpc_error.kind);

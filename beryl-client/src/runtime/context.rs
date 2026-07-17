@@ -3,8 +3,6 @@
 
 //! Stable logical operation and per-attempt request context.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use beryl_common::header::HeaderIdentity;
@@ -12,14 +10,7 @@ use beryl_proto::common::{ClientInfoProto, RequestHeaderProto};
 use beryl_proto::worker::DataRequestHeaderProto;
 use beryl_types::{CallId, ClientId, GroupName};
 
-#[cfg(test)]
-use crate::config::DEFAULT_CLIENT_NAME;
 use crate::error::{ClientError, ClientResult};
-use crate::runtime::policy::{OperationKind, ReplaySafety};
-
-/// Stable operation fingerprint used to guard replay of mutations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct OperationFingerprint(u64);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClientIdentity {
@@ -65,69 +56,28 @@ impl ClientIdentity {
     }
 }
 
-/// Stable identity fields that define one logical public operation.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct OperationIdentity {
-    original_target_path: Option<String>,
-    secondary_target_path: Option<String>,
-    detail: Option<String>,
-    session_identity: Option<String>,
+/// Shared deadline for every RPC in one public operation.
+#[derive(Clone, Debug)]
+pub(crate) struct OperationDeadline {
+    instant: tokio::time::Instant,
+    unix_ms: i64,
 }
 
-impl OperationIdentity {
-    /// Identity for a path-targeted operation.
-    pub(crate) fn path(path: impl Into<String>) -> Self {
+impl OperationDeadline {
+    pub(crate) fn new(timeout_ms: u64) -> Self {
+        let timeout = Duration::from_millis(timeout_ms);
         Self {
-            original_target_path: Some(path.into()),
-            secondary_target_path: None,
-            detail: None,
-            session_identity: None,
+            instant: tokio::time::Instant::now() + timeout,
+            unix_ms: unix_now_ms().saturating_add(timeout_ms.min(i64::MAX as u64) as i64),
         }
     }
 
-    /// Identity for a two-path operation such as rename.
-    pub(crate) fn path_pair(src: impl Into<String>, dst: impl Into<String>) -> Self {
-        Self {
-            original_target_path: Some(src.into()),
-            secondary_target_path: Some(dst.into()),
-            detail: None,
-            session_identity: None,
-        }
+    pub(crate) fn remaining(&self) -> Duration {
+        self.instant.saturating_duration_since(tokio::time::Instant::now())
     }
 
-    /// Identity for a session-scoped operation.
-    pub(crate) fn session(path: impl Into<String>, session_identity: impl Into<String>) -> Self {
-        Self {
-            original_target_path: Some(path.into()),
-            secondary_target_path: None,
-            detail: None,
-            session_identity: Some(session_identity.into()),
-        }
-    }
-
-    /// Attach an operation-specific stable detail.
-    pub(crate) fn with_detail(mut self, detail: impl Into<String>) -> Self {
-        self.detail = Some(detail.into());
-        self
-    }
-
-    /// Compute the replay fingerprint for this identity.
-    pub(crate) fn fingerprint(&self, kind: OperationKind, operation_name: &str) -> OperationFingerprint {
-        let mut hasher = DefaultHasher::new();
-        kind.hash(&mut hasher);
-        operation_name.hash(&mut hasher);
-        self.hash(&mut hasher);
-        OperationFingerprint(hasher.finish())
-    }
-
-    /// Original path used by this operation, if any.
-    pub(crate) fn original_target_path(&self) -> Option<&str> {
-        self.original_target_path.as_deref()
-    }
-
-    /// Return true when this operation has stable session identity.
-    fn has_session_identity(&self) -> bool {
-        self.session_identity.is_some()
+    fn unix_ms(&self) -> i64 {
+        self.unix_ms
     }
 }
 
@@ -137,142 +87,78 @@ pub(crate) struct OperationContext {
     client_id: ClientId,
     client_name: String,
     call_id: CallId,
-    kind: OperationKind,
-    operation_name: String,
-    replay_safety: ReplaySafety,
-    operation_fingerprint: OperationFingerprint,
-    identity: OperationIdentity,
+    operation_name: &'static str,
+    route_path: Option<String>,
+    deadline: OperationDeadline,
 }
 
 impl OperationContext {
-    /// Create a new logical operation with a fresh call id.
-    #[cfg(test)]
-    pub(crate) fn new(
-        client_id: ClientId,
-        kind: OperationKind,
-        operation_name: impl Into<String>,
-        identity: OperationIdentity,
-    ) -> ClientResult<Self> {
-        Self::with_call_id_named(
-            client_id,
-            DEFAULT_CLIENT_NAME,
-            CallId::new(),
-            kind,
-            operation_name,
-            identity,
-        )
-    }
-
     pub(crate) fn new_with_identity(
         client_identity: &ClientIdentity,
-        kind: OperationKind,
-        operation_name: impl Into<String>,
-        identity: OperationIdentity,
+        operation_name: &'static str,
+        route_path: Option<String>,
+        deadline: OperationDeadline,
     ) -> ClientResult<Self> {
         Self::with_call_id_named(
             client_identity.client_id(),
             client_identity.client_name(),
             client_identity.new_call_id(),
-            kind,
             operation_name,
-            identity,
+            route_path,
+            deadline,
         )
     }
 
     pub(crate) fn new_named(
         client_id: ClientId,
         client_name: impl Into<String>,
-        kind: OperationKind,
-        operation_name: impl Into<String>,
-        identity: OperationIdentity,
+        operation_name: &'static str,
+        route_path: Option<String>,
+        deadline: OperationDeadline,
     ) -> ClientResult<Self> {
-        Self::with_call_id_named(client_id, client_name, CallId::new(), kind, operation_name, identity)
-    }
-
-    /// Create a logical operation with an explicit call id.
-    #[cfg(test)]
-    pub(crate) fn with_call_id(
-        client_id: ClientId,
-        call_id: CallId,
-        kind: OperationKind,
-        operation_name: impl Into<String>,
-        identity: OperationIdentity,
-    ) -> ClientResult<Self> {
-        Self::with_call_id_named(client_id, DEFAULT_CLIENT_NAME, call_id, kind, operation_name, identity)
+        Self::with_call_id_named(
+            client_id,
+            client_name,
+            CallId::new(),
+            operation_name,
+            route_path,
+            deadline,
+        )
     }
 
     pub(crate) fn with_call_id_named(
         client_id: ClientId,
         client_name: impl Into<String>,
         call_id: CallId,
-        kind: OperationKind,
-        operation_name: impl Into<String>,
-        identity: OperationIdentity,
+        operation_name: &'static str,
+        route_path: Option<String>,
+        deadline: OperationDeadline,
     ) -> ClientResult<Self> {
         validate_client_id(client_id)?;
         let client_name = client_name.into();
         validate_client_name(&client_name)?;
-        let operation_name = operation_name.into();
-        let replay_safety = crate::runtime::policy::replay_safety_for(kind);
-        let operation_fingerprint = identity.fingerprint(kind, &operation_name);
         Ok(Self {
             client_id,
             client_name,
             call_id,
-            kind,
             operation_name,
-            replay_safety,
-            operation_fingerprint,
-            identity,
+            route_path,
+            deadline,
         })
     }
 
-    pub(crate) fn with_call_id_named_and_fingerprint(
-        client_id: ClientId,
-        client_name: impl Into<String>,
-        call_id: CallId,
-        kind: OperationKind,
-        operation_name: impl Into<String>,
-        identity: OperationIdentity,
-        expected_fingerprint: OperationFingerprint,
-    ) -> ClientResult<Self> {
-        let operation = Self::with_call_id_named(client_id, client_name, call_id, kind, operation_name, identity)?;
-        if operation.operation_fingerprint != expected_fingerprint {
-            return Err(ClientError::InvalidArgument(
-                "operation fingerprint changed for stable call_id".to_string(),
-            ));
-        }
-        Ok(operation)
-    }
-
-    /// Logical operation kind.
-    pub(crate) fn kind(&self) -> OperationKind {
-        self.kind
-    }
-
     /// Human readable operation name.
-    pub(crate) fn operation_name(&self) -> &str {
-        &self.operation_name
-    }
-
-    /// Replay safety required for this operation.
-    pub(crate) fn replay_safety(&self) -> ReplaySafety {
-        self.replay_safety
-    }
-
-    /// Stable operation fingerprint.
-    pub(crate) fn operation_fingerprint(&self) -> OperationFingerprint {
-        self.operation_fingerprint
+    pub(crate) fn operation_name(&self) -> &'static str {
+        self.operation_name
     }
 
     /// Original target path, if present.
     pub(crate) fn original_target_path(&self) -> Option<&str> {
-        self.identity.original_target_path()
+        self.route_path.as_deref()
     }
 
-    /// Return true when replay is tied to a stable session identity.
-    pub(crate) fn has_session_identity(&self) -> bool {
-        self.identity.has_session_identity()
+    pub(crate) fn deadline(&self) -> &OperationDeadline {
+        &self.deadline
     }
 }
 
@@ -307,7 +193,7 @@ impl AttemptContext {
             mount_epoch: None,
             route_epoch: None,
             state: Vec::new(),
-            deadline_ms: 0,
+            deadline_ms: operation.deadline.unix_ms(),
         })
     }
 
@@ -322,7 +208,7 @@ impl AttemptContext {
             mount_epoch: None,
             route_epoch: None,
             state: Vec::new(),
-            deadline_ms: 0,
+            deadline_ms: operation.deadline.unix_ms(),
         }
     }
 
@@ -347,14 +233,6 @@ impl AttemptContext {
     /// Attach group-scoped state watermarks.
     pub(crate) fn with_state(mut self, state: Vec<beryl_proto::common::GroupStateWatermarkProto>) -> Self {
         self.state = state;
-        self
-    }
-
-    /// Attach an absolute per-attempt deadline derived from the operation timeout.
-    pub(crate) fn with_operation_timeout_ms(mut self, timeout_ms: Option<u64>) -> Self {
-        if let Some(timeout_ms) = timeout_ms {
-            self.deadline_ms = unix_now_ms().saturating_add(timeout_ms.min(i64::MAX as u64) as i64);
-        }
         self
     }
 
@@ -391,20 +269,7 @@ impl AttemptContext {
 
     /// Return the remaining local timeout until this attempt's absolute deadline.
     pub(crate) fn timeout_remaining(&self) -> Option<Duration> {
-        if self.deadline_ms <= 0 {
-            return None;
-        }
-        let now = unix_now_ms();
-        if self.deadline_ms <= now {
-            Some(Duration::ZERO)
-        } else {
-            Some(Duration::from_millis((self.deadline_ms - now) as u64))
-        }
-    }
-
-    /// Return the stable logical operation fingerprint.
-    pub(crate) fn operation_fingerprint(&self) -> OperationFingerprint {
-        self.operation.operation_fingerprint()
+        Some(self.operation.deadline.remaining())
     }
 
     /// Return the selected metadata endpoint for this attempt.
@@ -485,15 +350,15 @@ fn unix_now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use beryl_types::{CallId, ClientId};
 
     fn metadata_operation() -> OperationContext {
-        OperationContext::new(
+        OperationContext::new_named(
             ClientId::new(7),
-            OperationKind::MetadataRead,
+            "prod_ns01",
             "OpenFile",
-            OperationIdentity::path("/alpha"),
+            Some("/alpha".to_string()),
+            OperationDeadline::new(1_000),
         )
         .expect("operation context")
     }
@@ -501,20 +366,17 @@ mod tests {
     #[test]
     fn operation_context_uses_stable_call_id() {
         let call_id = CallId::new();
-        let operation = OperationContext::with_call_id(
+        let operation = OperationContext::with_call_id_named(
             ClientId::new(7),
+            "prod_ns01",
             call_id,
-            OperationKind::MetadataRead,
             "OpenFile",
-            OperationIdentity::path("/alpha"),
+            Some("/alpha".to_string()),
+            OperationDeadline::new(1_000),
         )
         .expect("operation context");
 
         assert_eq!(operation.call_id, call_id);
-        assert_eq!(
-            operation.operation_fingerprint,
-            OperationIdentity::path("/alpha").fingerprint(OperationKind::MetadataRead, "OpenFile")
-        );
     }
 
     #[test]
@@ -522,9 +384,9 @@ mod tests {
         let identity = ClientIdentity::from_parts(ClientId::new(7), "prod_ns01").expect("client identity");
         let operation = OperationContext::new_with_identity(
             &identity,
-            OperationKind::MetadataRead,
             "OpenFile",
-            OperationIdentity::path("/alpha"),
+            Some("/alpha".to_string()),
+            OperationDeadline::new(1_000),
         )
         .expect("operation context");
         let ctx =
@@ -546,12 +408,9 @@ mod tests {
             client_id: ClientId::new(u128::MIN),
             client_name: "default_client".to_string(),
             call_id: CallId::new(),
-            kind: OperationKind::MetadataRead,
-            operation_name: "OpenFile".to_string(),
-            replay_safety: ReplaySafety::Idempotent,
-            operation_fingerprint: OperationIdentity::path("/alpha")
-                .fingerprint(OperationKind::MetadataRead, "OpenFile"),
-            identity: OperationIdentity::path("/alpha"),
+            operation_name: "OpenFile",
+            route_path: Some("/alpha".to_string()),
+            deadline: OperationDeadline::new(1_000),
         };
 
         let err = AttemptContext::for_metadata(&invalid_operation, GroupName::parse("root").unwrap(), 0)
@@ -592,30 +451,14 @@ mod tests {
     }
 
     #[test]
-    fn operation_timeout_sets_attempt_deadline_without_changing_call_id() {
+    fn shared_deadline_is_preserved_across_attempts() {
         let operation = metadata_operation();
         let base = AttemptContext::for_metadata(&operation, GroupName::parse("root").unwrap(), 0).expect("attempt");
         let call_id = base.call_id().to_string();
-
-        let timed = base.with_operation_timeout_ms(Some(50));
-        let deadline_ms = timed.deadline_ms();
-
+        let replay = AttemptContext::for_metadata(&operation, GroupName::parse("root").unwrap(), 1).expect("replay");
+        let deadline_ms = base.deadline_ms();
         assert!(deadline_ms > 0);
-        assert_eq!(timed.call_id(), call_id);
-        assert_eq!(
-            timed.metadata_header().expect("metadata header").deadline_ms,
-            deadline_ms
-        );
-    }
-
-    #[test]
-    fn absent_operation_timeout_keeps_no_deadline_behavior() {
-        let operation = metadata_operation();
-        let ctx = AttemptContext::for_metadata(&operation, GroupName::parse("root").unwrap(), 0)
-            .expect("attempt")
-            .with_operation_timeout_ms(None);
-
-        assert_eq!(ctx.deadline_ms(), 0);
-        assert_eq!(ctx.metadata_header().expect("metadata header").deadline_ms, 0);
+        assert_eq!(replay.call_id(), call_id);
+        assert_eq!(replay.deadline_ms(), deadline_ms);
     }
 }

@@ -8,6 +8,7 @@ use beryl_types::GroupName;
 use std::path::Path;
 
 pub const DEFAULT_CLIENT_NAME: &str = "default_client";
+pub const DEFAULT_OPERATION_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_WRITE_LEASE_RENEW_BEFORE_EXPIRY_MS: u64 = 30_000;
 pub const DEFAULT_WORKER_ENDPOINT_COOLDOWN_MS: u64 = 1_000;
 
@@ -20,10 +21,6 @@ pub struct ClientConfig {
     pub client_name: String,
     /// Retry configuration.
     pub retry: RetryConfig,
-    /// Refresh configuration.
-    pub refresh: RefreshConfig,
-    /// Backoff configuration.
-    pub backoff: BackoffConfig,
     /// Client-side write lease renewal policy.
     pub write_lease: WriteLeaseConfig,
     /// Channel/client pool configuration.
@@ -59,17 +56,10 @@ pub struct ChannelPoolConfig {
 /// Retry configuration.
 #[derive(Clone, Debug)]
 pub struct RetryConfig {
-    /// Maximum retry attempts per logical operation.
-    pub max_retry_attempts: usize,
-    /// Optional per-operation timeout in milliseconds.
-    pub operation_timeout_ms: Option<u64>,
-}
-
-/// Refresh configuration.
-#[derive(Clone, Debug)]
-pub struct RefreshConfig {
-    /// Maximum refresh attempts per logical operation.
-    pub max_refresh_attempts: usize,
+    /// Maximum attempts for one primary RPC, including the first.
+    pub max_attempts: usize,
+    /// Total public-operation timeout in milliseconds.
+    pub operation_timeout_ms: u64,
 }
 
 /// Write lease renewal configuration.
@@ -81,47 +71,18 @@ pub struct WriteLeaseConfig {
     pub renew_before_expiry_ms: u64,
 }
 
-/// Backoff configuration.
-#[derive(Clone, Debug)]
-pub struct BackoffConfig {
-    /// Initial backoff delay in milliseconds.
-    pub initial_backoff_ms: u64,
-    /// Maximum backoff delay in milliseconds.
-    pub max_backoff_ms: u64,
-    /// Multiplicative backoff factor.
-    pub backoff_multiplier: f64,
-}
-
 impl RetryConfig {
-    /// Return the effective maximum retry attempt cap.
-    pub fn max_retry_attempts(&self) -> usize {
-        self.max_retry_attempts
+    /// Return the total primary RPC attempt cap, including the first attempt.
+    pub fn max_attempts(&self) -> usize {
+        self.max_attempts
     }
 }
 
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_retry_attempts: 3,
-            operation_timeout_ms: None,
-        }
-    }
-}
-
-impl Default for RefreshConfig {
-    fn default() -> Self {
-        Self {
-            max_refresh_attempts: 3,
-        }
-    }
-}
-
-impl Default for BackoffConfig {
-    fn default() -> Self {
-        Self {
-            initial_backoff_ms: 100,
-            max_backoff_ms: 5000,
-            backoff_multiplier: 2.0,
+            max_attempts: 3,
+            operation_timeout_ms: DEFAULT_OPERATION_TIMEOUT_MS,
         }
     }
 }
@@ -171,8 +132,6 @@ impl ClientConfig {
         let client_name = client_name_from_flat(&flat)?;
 
         let retry = retry_config_from_flat(&flat)?;
-        let refresh = refresh_config_from_flat(&flat)?;
-        let backoff = backoff_config_from_flat(&flat)?;
         let write_lease = write_lease_config_from_flat(&flat)?;
         let channel_pool = channel_pool_config_from_flat(&flat)?;
 
@@ -182,8 +141,6 @@ impl ClientConfig {
             inner: CommonClientConfig::from_flat(flat),
             client_name,
             retry,
-            refresh,
-            backoff,
             write_lease,
             channel_pool,
             metadata_groups,
@@ -319,23 +276,38 @@ fn parse_metadata_groups(flat: &FlatConfig) -> Result<Vec<MetadataGroupConfig>, 
 }
 
 fn retry_config_from_flat(flat: &FlatConfig) -> Result<RetryConfig, CommonError> {
+    reject_removed_retry_keys(flat)?;
     let defaults = RetryConfig::default();
-    let max_retry_attempts = get_usize_or_strict(flat, "client.retry.max_retry_attempts", defaults.max_retry_attempts)?;
-    let operation_timeout_ms = get_optional_u64(flat, "client.operation.timeout_ms")?;
+    let max_attempts = get_usize_or_strict(flat, "client.retry.max_attempts", defaults.max_attempts)?;
+    if max_attempts == 0 {
+        return Err(invalid_config("client.retry.max_attempts", "must be greater than zero"));
+    }
+    let operation_timeout_ms = get_u64_or_strict(flat, "client.operation.timeout_ms", defaults.operation_timeout_ms)?;
+    if operation_timeout_ms == 0 {
+        return Err(invalid_config(
+            "client.operation.timeout_ms",
+            "must be greater than zero",
+        ));
+    }
     Ok(RetryConfig {
-        max_retry_attempts,
+        max_attempts,
         operation_timeout_ms,
     })
 }
 
-fn refresh_config_from_flat(flat: &FlatConfig) -> Result<RefreshConfig, CommonError> {
-    Ok(RefreshConfig {
-        max_refresh_attempts: get_usize_or_strict(
-            flat,
-            "client.refresh.max_attempts",
-            RefreshConfig::default().max_refresh_attempts,
-        )?,
-    })
+fn reject_removed_retry_keys(flat: &FlatConfig) -> Result<(), CommonError> {
+    for key in [
+        "client.retry.max_retry_attempts",
+        "client.refresh.max_attempts",
+        "client.backoff.initial_ms",
+        "client.backoff.max_ms",
+        "client.backoff.multiplier",
+    ] {
+        if flat.contains_key(key) {
+            return Err(invalid_config(key, "is no longer supported"));
+        }
+    }
+    Ok(())
 }
 
 fn write_lease_config_from_flat(flat: &FlatConfig) -> Result<WriteLeaseConfig, CommonError> {
@@ -355,28 +327,6 @@ fn write_lease_config_from_flat(flat: &FlatConfig) -> Result<WriteLeaseConfig, C
         ));
     }
     Ok(config)
-}
-
-fn backoff_config_from_flat(flat: &FlatConfig) -> Result<BackoffConfig, CommonError> {
-    let defaults = BackoffConfig::default();
-    let backoff = BackoffConfig {
-        initial_backoff_ms: get_u64_or_strict(flat, "client.backoff.initial_ms", defaults.initial_backoff_ms)?,
-        max_backoff_ms: get_u64_or_strict(flat, "client.backoff.max_ms", defaults.max_backoff_ms)?,
-        backoff_multiplier: get_f64_or(flat, "client.backoff.multiplier", defaults.backoff_multiplier)?,
-    };
-    if backoff.max_backoff_ms < backoff.initial_backoff_ms {
-        return Err(invalid_config(
-            "client.backoff.max_ms",
-            "must be greater than or equal to client.backoff.initial_ms",
-        ));
-    }
-    if !backoff.backoff_multiplier.is_finite() || backoff.backoff_multiplier < 1.0 {
-        return Err(invalid_config(
-            "client.backoff.multiplier",
-            "must be finite and greater than or equal to 1.0",
-        ));
-    }
-    Ok(backoff)
 }
 
 fn get_usize_or_strict(flat: &FlatConfig, key: &'static str, default: usize) -> Result<usize, CommonError> {
@@ -405,14 +355,6 @@ fn get_i64_or_strict(flat: &FlatConfig, key: &'static str) -> Result<Option<i64>
     Ok(None)
 }
 
-fn get_optional_u64(flat: &FlatConfig, key: &'static str) -> Result<Option<u64>, CommonError> {
-    match get_i64_or_strict(flat, key)? {
-        Some(value) if value >= 0 => Ok(Some(value as u64)),
-        Some(_) => Err(invalid_config(key, "must be non-negative")),
-        None => Ok(None),
-    }
-}
-
 fn get_bool_or(flat: &FlatConfig, key: &'static str, default: bool) -> Result<bool, CommonError> {
     if let Some(value) = flat.get_bool(key) {
         return Ok(value);
@@ -421,15 +363,6 @@ fn get_bool_or(flat: &FlatConfig, key: &'static str, default: bool) -> Result<bo
         return Err(invalid_config(key, "must be a boolean"));
     }
     Ok(default)
-}
-
-fn get_f64_or(flat: &FlatConfig, key: &'static str, default: f64) -> Result<f64, CommonError> {
-    match flat.get_str(key) {
-        Some(value) => value
-            .parse::<f64>()
-            .map_err(|_| invalid_config(key, "must be a number")),
-        None => Ok(default),
-    }
 }
 
 fn invalid_config(key: &'static str, detail: impl Into<String>) -> CommonError {
@@ -444,25 +377,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_has_conservative_bounded_retry_refresh_and_backoff() {
+    fn default_config_has_bounded_retry_and_deadline() {
         let config = ClientConfig::default();
-
-        assert_eq!(config.retry.max_retry_attempts(), 3);
-        assert_eq!(config.refresh.max_refresh_attempts, 3);
-        assert_eq!(config.backoff.initial_backoff_ms, 100);
-        assert_eq!(config.backoff.max_backoff_ms, 5000);
-        assert!(config.backoff.backoff_multiplier >= 1.0);
+        assert_eq!(config.retry.max_attempts(), 3);
+        assert_eq!(config.retry.operation_timeout_ms, DEFAULT_OPERATION_TIMEOUT_MS);
         assert!(config.write_lease.auto_renew);
         assert_eq!(
             config.write_lease.renew_before_expiry_ms,
             DEFAULT_WRITE_LEASE_RENEW_BEFORE_EXPIRY_MS
         );
-    }
-
-    #[test]
-    fn default_config_has_bounded_pool_settings() {
-        let config = ClientConfig::default();
-
         assert!(config.channel_pool.metadata_channel_pool_enabled);
         assert_eq!(config.channel_pool.metadata_channel_pool_max_per_group, 1);
         assert!(config.channel_pool.worker_channel_pool_enabled);
@@ -491,6 +414,16 @@ mod tests {
     }
 
     #[test]
+    fn current_retry_and_deadline_keys_are_loaded() {
+        let mut flat = FlatConfig::new();
+        flat.set("client.retry.max_attempts", 5i64);
+        flat.set("client.operation.timeout_ms", 7_000i64);
+        let config = ClientConfig::from_flat(flat).expect("retry config");
+        assert_eq!(config.retry.max_attempts(), 5);
+        assert_eq!(config.retry.operation_timeout_ms, 7_000);
+    }
+
+    #[test]
     fn channel_pool_config_is_loaded_from_flat_config() {
         let mut flat = FlatConfig::new();
         flat.set("client.channel_pool.metadata.enabled", false);
@@ -510,51 +443,15 @@ mod tests {
 
     #[test]
     fn invalid_channel_pool_config_is_rejected() {
-        for (key, value) in [
-            ("client.channel_pool.metadata.max_per_group", 0i64),
-            ("client.channel_pool.worker.max_per_worker", 0i64),
+        for key in [
+            "client.channel_pool.metadata.max_per_group",
+            "client.channel_pool.worker.max_per_worker",
         ] {
             let mut flat = FlatConfig::new();
-            flat.set(key, value);
-
+            flat.set(key, 0i64);
             let err = ClientConfig::from_flat(flat).expect_err("invalid pool config must fail");
-
-            assert!(format!("{err}").contains(key));
+            assert!(err.to_string().contains(key));
         }
-    }
-
-    #[test]
-    fn zero_retry_is_valid_and_disables_retry_attempts() {
-        let mut flat = FlatConfig::new();
-        flat.set("client.retry.max_retry_attempts", 0i64);
-
-        let config = ClientConfig::from_flat(flat).expect("zero retry config is valid");
-
-        assert_eq!(config.retry.max_retry_attempts(), 0);
-    }
-
-    #[test]
-    fn current_retry_refresh_and_backoff_keys_are_loaded_from_flat_config() {
-        let mut flat = FlatConfig::new();
-        flat.set("client.retry.max_retry_attempts", 5i64);
-        flat.set("client.refresh.max_attempts", 6i64);
-        flat.set("client.operation.timeout_ms", 7000i64);
-        flat.set("client.backoff.initial_ms", 25i64);
-        flat.set("client.backoff.max_ms", 400i64);
-        flat.set("client.backoff.multiplier", "1.5");
-        flat.set("client.write_lease.auto_renew", false);
-        flat.set("client.write_lease.renew_before_expiry_ms", 60_000i64);
-
-        let config = ClientConfig::from_flat(flat).expect("current retry and backoff config");
-
-        assert_eq!(config.retry.max_retry_attempts(), 5);
-        assert_eq!(config.retry.operation_timeout_ms, Some(7000));
-        assert_eq!(config.refresh.max_refresh_attempts, 6);
-        assert_eq!(config.backoff.initial_backoff_ms, 25);
-        assert_eq!(config.backoff.max_backoff_ms, 400);
-        assert_eq!(config.backoff.backoff_multiplier, 1.5);
-        assert!(!config.write_lease.auto_renew);
-        assert_eq!(config.write_lease.renew_before_expiry_ms, 60_000);
     }
 
     #[test]
@@ -588,45 +485,46 @@ mod tests {
     }
 
     #[test]
-    fn invalid_retry_and_backoff_config_is_rejected() {
-        for (key, value) in [
-            ("client.retry.max_retry_attempts", -1i64),
-            ("client.refresh.max_attempts", -1i64),
-            ("client.backoff.initial_ms", -1i64),
-            ("client.backoff.max_ms", -1i64),
-            ("client.write_lease.renew_before_expiry_ms", -1i64),
-            ("client.channel_pool.worker.endpoint_cooldown_ms", -1i64),
+    fn zero_retry_or_deadline_is_rejected() {
+        for key in ["client.retry.max_attempts", "client.operation.timeout_ms"] {
+            let mut flat = FlatConfig::new();
+            flat.set(key, 0i64);
+            let err = ClientConfig::from_flat(flat).expect_err("zero value must fail");
+            assert!(err.to_string().contains(key));
+        }
+    }
+
+    #[test]
+    fn removed_retry_refresh_and_backoff_keys_are_rejected() {
+        for key in [
+            "client.retry.max_retry_attempts",
+            "client.refresh.max_attempts",
+            "client.backoff.initial_ms",
+            "client.backoff.max_ms",
+            "client.backoff.multiplier",
         ] {
             let mut flat = FlatConfig::new();
-            flat.set(key, value);
+            flat.set(key, 1i64);
+            let err = ClientConfig::from_flat(flat).expect_err("removed key must fail");
+            assert!(err.to_string().contains(key));
+        }
+    }
 
-            let err = ClientConfig::from_flat(flat).expect_err("negative client budget must be rejected");
-
-            assert!(
-                err.to_string().contains(key),
-                "error for {key} should mention the offending key: {err}"
-            );
+    #[test]
+    fn write_lease_and_worker_cooldown_values_are_validated() {
+        for key in [
+            "client.write_lease.renew_before_expiry_ms",
+            "client.channel_pool.worker.endpoint_cooldown_ms",
+        ] {
+            let mut flat = FlatConfig::new();
+            flat.set(key, -1i64);
+            let err = ClientConfig::from_flat(flat).expect_err("negative value must fail");
+            assert!(err.to_string().contains(key));
         }
 
         let mut flat = FlatConfig::new();
         flat.set("client.write_lease.renew_before_expiry_ms", 0i64);
-        let err = ClientConfig::from_flat(flat).expect_err("zero lease renewal threshold must be rejected");
+        let err = ClientConfig::from_flat(flat).expect_err("zero lease renewal threshold must fail");
         assert!(err.to_string().contains("client.write_lease.renew_before_expiry_ms"));
-
-        let mut flat = FlatConfig::new();
-        flat.set("client.backoff.initial_ms", 1000i64);
-        flat.set("client.backoff.max_ms", 100i64);
-        let err = ClientConfig::from_flat(flat).expect_err("max backoff below initial must be rejected");
-        assert!(err.to_string().contains("client.backoff.max_ms"));
-
-        let mut flat = FlatConfig::new();
-        flat.set("client.backoff.multiplier", 0i64);
-        let err = ClientConfig::from_flat(flat).expect_err("backoff multiplier below one must be rejected");
-        assert!(err.to_string().contains("client.backoff.multiplier"));
-
-        let mut flat = FlatConfig::new();
-        flat.set("client.backoff.multiplier", "not-a-number");
-        let err = ClientConfig::from_flat(flat).expect_err("non-numeric backoff multiplier must be rejected");
-        assert!(err.to_string().contains("client.backoff.multiplier"));
     }
 }

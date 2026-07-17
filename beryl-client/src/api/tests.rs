@@ -15,17 +15,17 @@ use crate::error::{ClientError, ClientResult};
 use crate::metadata::{AddBlockResult, MetadataGateway, ReadLayout};
 use crate::planner::PlannedBlockRead;
 use crate::rpc_error::{ClientAction, RefreshHint};
-use crate::runtime::{AttemptContext, ErrorClass, ErrorClassifier, MetadataRefreshCause, MetadataTargets};
+use crate::runtime::{classify_error, AttemptContext, ErrorClass, MetadataTargets};
 use crate::session::write_session::WriteSession;
 use async_trait::async_trait;
 use beryl_common::error::rpc::{
-    ErrorKind, MetadataErrorKind, RefreshHint as RpcRefreshHint, RpcErrorDetail, WorkerErrorKind,
+    ErrorKind, InternalErrorKind, MetadataErrorKind, RefreshHint as RpcRefreshHint, RpcErrorDetail, WorkerErrorKind,
 };
 use beryl_proto::common::{BlockIdProto, FencingTokenProto};
 use beryl_proto::metadata::{
-    AbortFileWriteResponseProto, AppendFileResponseProto, CommitFileResponseProto, CreateDirectoryResponseProto,
-    CreateFileResponseProto, CreateModeProto, DeleteResponseProto, GetStatusResponseProto, ListStatusResponseProto,
-    OpenFileResponseProto, RenameResponseProto, RenewLeaseResponseProto, SyncWriteResponseProto, WriteHandleProto,
+    AbortFileWriteResponseProto, CommitFileResponseProto, CreateDirectoryResponseProto, CreateFileResponseProto,
+    CreateModeProto, DeleteResponseProto, GetStatusResponseProto, ListStatusResponseProto, OpenFileResponseProto,
+    OpenWriteResponseProto, RenameResponseProto, RenewLeaseResponseProto, SyncWriteResponseProto, WriteHandleProto,
     WriteSyncModeProto,
 };
 use beryl_types::lease::FencingToken;
@@ -67,6 +67,77 @@ async fn open_returns_reader_from_metadata_response() {
     assert_eq!(methods(&gateway.calls()), vec!["open_file"]);
 }
 
+#[tokio::test(start_paused = true)]
+async fn metadata_retry_reuses_call_id_across_transport_and_server_retry() {
+    let gateway = Arc::new(MockGateway::with_get_status_outcomes(vec![
+        MetadataOutcome::Transport,
+        MetadataOutcome::ServerRetry,
+        MetadataOutcome::Ok,
+    ]));
+    let client = fs_client_with_gateway(test_config_with_retries("root", 3), gateway.clone()).expect("client");
+
+    client.stat("/alpha").await.expect("third primary attempt succeeds");
+
+    let calls = gateway.calls();
+    assert_eq!(methods(&calls), vec!["get_status", "get_status", "get_status"]);
+    assert!(calls.iter().all(|call| call.call_id == calls[0].call_id));
+    assert!(calls.iter().all(|call| call.deadline_ms == calls[0].deadline_ms));
+}
+
+#[tokio::test(start_paused = true)]
+async fn read_transport_exhaustion_remains_a_transport_error() {
+    let gateway = Arc::new(MockGateway::with_get_status_outcomes(vec![
+        MetadataOutcome::Transport,
+        MetadataOutcome::Transport,
+        MetadataOutcome::Transport,
+    ]));
+    let client = fs_client_with_gateway(test_config_with_retries("root", 3), gateway.clone()).expect("client");
+
+    let err = client
+        .stat("/alpha")
+        .await
+        .expect_err("read transport attempts exhausted");
+
+    assert_eq!(classify_error(&err), ErrorClass::RetryableTransport);
+    let calls = gateway.calls();
+    assert_eq!(methods(&calls), vec!["get_status", "get_status", "get_status"]);
+    assert!(calls.iter().all(|call| call.call_id == calls[0].call_id));
+}
+
+#[tokio::test(start_paused = true)]
+async fn open_write_transport_ambiguity_fails_closed_without_replay() {
+    let gateway = Arc::new(MockGateway::with_open_write_outcomes(vec![
+        MetadataOutcome::Transport,
+        MetadataOutcome::Ok,
+    ]));
+    let client = fs_client_with_gateway(test_config_with_retries("root", 3), gateway.clone()).expect("client");
+
+    let err = client
+        .append("/alpha")
+        .await
+        .expect_err("OpenWrite transport ambiguity must fail closed");
+
+    assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("OpenWrite")));
+    assert_eq!(methods(&gateway.calls()), vec!["open_write"]);
+}
+
+#[tokio::test]
+async fn stale_state_refresh_uses_distinct_msync_call_id_and_shared_deadline() {
+    let gateway = Arc::new(MockGateway::with_get_status_outcomes(vec![
+        MetadataOutcome::StaleState,
+        MetadataOutcome::Ok,
+    ]));
+    let client = fs_client_with_gateway(test_config_with_retries("root", 2), gateway.clone()).expect("client");
+
+    client.stat("/alpha").await.expect("retry after one Msync succeeds");
+
+    let calls = gateway.calls();
+    assert_eq!(methods(&calls), vec!["get_status", "msync", "get_status"]);
+    assert_eq!(calls[0].call_id, calls[2].call_id);
+    assert_ne!(calls[0].call_id, calls[1].call_id);
+    assert!(calls.iter().all(|call| call.deadline_ms == calls[0].deadline_ms));
+}
+
 #[tokio::test]
 async fn file_reader_debug_redacts_identity_names() {
     let config = ClientConfig {
@@ -99,8 +170,11 @@ async fn create_returns_writer_and_maps_create_new_mode() {
 
     assert_eq!(writer.path(), "/created");
     let calls = gateway.calls();
-    assert_eq!(methods(&calls), vec!["create_file"]);
+    assert_eq!(methods(&calls), vec!["create_file", "open_write"]);
     assert_eq!(calls[0].create_mode, Some(CreateModeProto::CreateNew as i32));
+    assert_ne!(calls[0].call_id, calls[1].call_id);
+    assert_eq!(calls[0].deadline_ms, calls[1].deadline_ms);
+    assert!(calls[0].deadline_ms > 0);
 }
 
 #[tokio::test]
@@ -116,7 +190,7 @@ async fn create_options_default_maps_current_layout_defaults() {
         .expect("create writer");
 
     let calls = gateway.calls();
-    assert_eq!(methods(&calls), vec!["create_file"]);
+    assert_eq!(methods(&calls), vec!["create_file", "open_write"]);
     assert_eq!(calls[0].create_layout, Some(default_layout()));
 }
 
@@ -137,7 +211,7 @@ async fn create_options_custom_layout_maps_to_create_request() {
         .expect("create writer");
 
     let calls = gateway.calls();
-    assert_eq!(methods(&calls), vec!["create_file"]);
+    assert_eq!(methods(&calls), vec!["create_file", "open_write"]);
     assert_eq!(
         calls[0].create_layout,
         Some(RecordedLayout {
@@ -225,7 +299,7 @@ async fn overwrite_returns_writer_and_maps_create_or_overwrite_mode() {
 
     assert_eq!(writer.path(), "/overwrite");
     let calls = gateway.calls();
-    assert_eq!(methods(&calls), vec!["create_file"]);
+    assert_eq!(methods(&calls), vec!["create_file", "open_write"]);
     assert_eq!(calls[0].create_mode, Some(CreateModeProto::CreateOrOverwrite as i32));
 }
 
@@ -239,7 +313,7 @@ async fn append_returns_writer_from_metadata_session() {
     assert_eq!(writer.path(), "/append");
     assert_eq!(writer.cursor(), 10);
     let calls = gateway.calls();
-    assert_eq!(methods(&calls), vec!["append_file"]);
+    assert_eq!(methods(&calls), vec!["open_write"]);
     assert_eq!(calls[0].create_layout, None);
 }
 
@@ -254,10 +328,10 @@ async fn append_rejects_missing_response_layout() {
         .expect_err("missing append response layout must fail");
 
     assert!(
-        matches!(&err, ClientError::Metadata(msg) if msg.contains("AppendFileResponseProto.layout missing")),
+        matches!(&err, ClientError::Metadata(msg) if msg.contains("OpenWriteResponseProto.layout missing")),
         "unexpected error: {err:?}"
     );
-    assert_eq!(methods(&gateway.calls()), vec!["append_file"]);
+    assert_eq!(methods(&gateway.calls()), vec!["open_write"]);
 }
 
 #[tokio::test]
@@ -273,10 +347,10 @@ async fn append_rejects_invalid_response_layout() {
         .expect_err("invalid append response layout must fail");
 
     assert!(
-        matches!(&err, ClientError::InvalidLayout(msg) if msg.contains("AppendFileResponseProto.layout invalid")),
+        matches!(&err, ClientError::InvalidLayout(msg) if msg.contains("OpenWriteResponseProto.layout invalid")),
         "unexpected error: {err:?}"
     );
-    assert_eq!(methods(&gateway.calls()), vec!["append_file"]);
+    assert_eq!(methods(&gateway.calls()), vec!["open_write"]);
 }
 
 #[tokio::test]
@@ -443,8 +517,7 @@ async fn reader_rejects_worker_block_stamp_mismatch() {
 
     match &err {
         ClientError::Action(action) => match action.action() {
-            ClientAction::Refresh { reason, rpc_error, .. } => {
-                assert_eq!(*reason, MetadataRefreshCause::BlockStampMismatch);
+            ClientAction::Refresh { rpc_error, .. } => {
                 assert_eq!(rpc_error.kind, ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch));
             }
             other => panic!("expected refresh action, got {other:?}"),
@@ -507,7 +580,7 @@ async fn reader_replans_after_worker_refresh() {
     )));
     let worker = Arc::new(MockDataClient::with_refresh_once(
         b"abcdefghijklmnop",
-        MetadataRefreshCause::WorkerRunMismatch,
+        ErrorKind::Worker(WorkerErrorKind::RunMismatch),
     ));
     let client = fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker)).expect("client");
     let reader = read_reader(&client, 16);
@@ -655,8 +728,8 @@ async fn writer_append_uses_metadata_layout_block_size_for_chunking() {
     let calls = gateway.calls();
     let append = calls
         .iter()
-        .find(|call| call.method == "append_file")
-        .expect("append_file call");
+        .find(|call| call.method == "open_write")
+        .expect("open_write call");
     assert_eq!(append.create_layout, None);
     assert_eq!(add_block_lens(&calls), vec![6, 6, 2]);
     assert_eq!(worker.write_lens(), vec![6, 6, 2]);
@@ -990,16 +1063,23 @@ async fn writer_abort_cleans_worker_then_metadata_and_blocks_session() {
     assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("aborted")));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn writer_unknown_add_block_blocks_followup_writes() {
     let layout = recorded_layout_values(5, 5);
     let gateway = Arc::new(MockGateway {
         create_response_layout: Mutex::new(Some(Some(layout))),
-        add_block_outcomes: Mutex::new(vec![AddBlockOutcome::TransportUnknown].into()),
+        add_block_outcomes: Mutex::new(
+            vec![
+                AddBlockOutcome::TransportUnknown,
+                AddBlockOutcome::TransportUnknown,
+                AddBlockOutcome::TransportUnknown,
+            ]
+            .into(),
+        ),
         ..MockGateway::default()
     });
     let worker = Arc::new(MockDataClient::default());
-    let client = fs_client_with_data_plane(test_config_with_retries("root", 0), gateway.clone(), data_plane(worker))
+    let client = fs_client_with_data_plane(test_config_with_retries("root", 3), gateway.clone(), data_plane(worker))
         .expect("client");
     let mut writer = client
         .create("/created", CreateOptions::create())
@@ -1017,7 +1097,10 @@ async fn writer_unknown_add_block_blocks_followup_writes() {
         .await
         .expect_err("unknown outcome blocks writes");
     assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("unknown outcome")));
-    assert_eq!(method_count(&gateway.calls(), "add_block"), 1);
+    let calls = gateway.calls();
+    let add_calls: Vec<_> = calls.iter().filter(|call| call.method == "add_block").collect();
+    assert_eq!(add_calls.len(), 3);
+    assert!(add_calls.iter().all(|call| call.call_id == add_calls[0].call_id));
 }
 
 #[tokio::test]
@@ -1031,7 +1114,7 @@ async fn writer_session_expiry_blocks_followup_writes() {
         .expect("writer");
 
     let err = writer.renew_lease().await.expect_err("session expired");
-    assert_eq!(ErrorClassifier.classify_error(&err), ErrorClass::SessionExpired);
+    assert_eq!(classify_error(&err), ErrorClass::SessionExpired);
     let err = writer
         .write_all(Bytes::from_static(b"x"))
         .await
@@ -1105,10 +1188,9 @@ fn metadata_group_config(group_name: &str) -> MetadataGroupConfig {
     }
 }
 
-fn test_config_with_retries(group_name: &str, max_retry_attempts: usize) -> ClientConfig {
+fn test_config_with_retries(group_name: &str, max_attempts: usize) -> ClientConfig {
     let mut config = test_config(group_name);
-    config.retry.max_retry_attempts = max_retry_attempts;
-    config.refresh.max_refresh_attempts = max_retry_attempts;
+    config.retry.max_attempts = max_attempts.max(1);
     config
 }
 
@@ -1129,7 +1211,6 @@ fn fs_client_with_data_plane(
         gateway,
         metadata_targets,
         data_plane,
-        Arc::new(crate::runtime::TokioBackoffSleeper),
         Arc::new(crate::metrics::NoopClientMetrics),
     )
 }
@@ -1139,6 +1220,7 @@ struct RecordedCall {
     method: &'static str,
     group_name: GroupName,
     call_id: String,
+    deadline_ms: i64,
     target_data_handle_id: Option<u64>,
     range: Option<(u64, u32)>,
     target_size: Option<u64>,
@@ -1221,6 +1303,8 @@ struct MockGateway {
     sync_response_size: Mutex<Option<u64>>,
     add_block_outcomes: Mutex<VecDeque<AddBlockOutcome>>,
     renew_outcomes: Mutex<VecDeque<RenewOutcome>>,
+    get_status_outcomes: Mutex<VecDeque<MetadataOutcome>>,
+    open_write_outcomes: Mutex<VecDeque<MetadataOutcome>>,
     events: Option<EventLog>,
 }
 
@@ -1291,12 +1375,42 @@ impl MockGateway {
         }
     }
 
+    fn with_get_status_outcomes(outcomes: Vec<MetadataOutcome>) -> Self {
+        Self {
+            get_status_outcomes: Mutex::new(outcomes.into()),
+            ..Self::default()
+        }
+    }
+
+    fn with_open_write_outcomes(outcomes: Vec<MetadataOutcome>) -> Self {
+        Self {
+            open_write_outcomes: Mutex::new(outcomes.into()),
+            ..Self::default()
+        }
+    }
+
+    fn next_get_status_outcome(&self) -> MetadataOutcome {
+        self.get_status_outcomes
+            .lock()
+            .expect("get status outcomes")
+            .pop_front()
+            .unwrap_or(MetadataOutcome::Ok)
+    }
+
     fn next_add_block_outcome(&self) -> AddBlockOutcome {
         self.add_block_outcomes
             .lock()
             .expect("add block outcomes")
             .pop_front()
             .unwrap_or(AddBlockOutcome::Ok)
+    }
+
+    fn next_open_write_outcome(&self) -> MetadataOutcome {
+        self.open_write_outcomes
+            .lock()
+            .expect("open write outcomes")
+            .pop_front()
+            .unwrap_or(MetadataOutcome::Ok)
     }
 
     fn next_renew_outcome(&self) -> RenewOutcome {
@@ -1313,6 +1427,7 @@ impl MockGateway {
             method,
             group_name: group_name_from(&header.group_name),
             call_id: header.client.as_ref().expect("client").call_id.clone(),
+            deadline_ms: header.deadline_ms,
             target_data_handle_id: None,
             range: None,
             target_size: None,
@@ -1332,6 +1447,7 @@ impl MockGateway {
             method: "create_file",
             group_name: group_name_from(&header.group_name),
             call_id: header.client.as_ref().expect("client").call_id.clone(),
+            deadline_ms: header.deadline_ms,
             target_data_handle_id: None,
             range: None,
             target_size: None,
@@ -1356,6 +1472,7 @@ impl MockGateway {
             method: "read_layout",
             group_name: group_name_from(&header.group_name),
             call_id: header.client.as_ref().expect("client").call_id.clone(),
+            deadline_ms: header.deadline_ms,
             target_data_handle_id,
             range,
             target_size: None,
@@ -1376,6 +1493,7 @@ impl MockGateway {
             method: "commit_file",
             group_name: group_name_from(&header.group_name),
             call_id: header.client.as_ref().expect("client").call_id.clone(),
+            deadline_ms: header.deadline_ms,
             target_data_handle_id: req.data_handle_id.as_ref().map(|id| id.value),
             range: None,
             target_size: None,
@@ -1395,6 +1513,7 @@ impl MockGateway {
             method: "sync_write",
             group_name: group_name_from(&header.group_name),
             call_id: header.client.as_ref().expect("client").call_id.clone(),
+            deadline_ms: header.deadline_ms,
             target_data_handle_id: req.data_handle_id.as_ref().map(|id| id.value),
             range: None,
             target_size: Some(req.target_size),
@@ -1414,6 +1533,7 @@ impl MockGateway {
             method: "add_block",
             group_name: group_name_from(&header.group_name),
             call_id: header.client.as_ref().expect("client").call_id.clone(),
+            deadline_ms: header.deadline_ms,
             target_data_handle_id: None,
             range: None,
             target_size: None,
@@ -1442,6 +1562,18 @@ impl MetadataGateway for MockGateway {
         _req: beryl_proto::metadata::GetStatusRequestProto,
     ) -> ClientResult<GetStatusResponseProto> {
         self.record("get_status", &ctx);
+        match self.next_get_status_outcome() {
+            MetadataOutcome::Ok => {}
+            MetadataOutcome::Transport => {
+                return Err(ClientError::from(tonic::Status::unavailable(
+                    "injected metadata transport ambiguity",
+                )))
+            }
+            MetadataOutcome::ServerRetry => return Err(server_retry_error()),
+            MetadataOutcome::StaleState => {
+                return Err(refresh_action_error(ErrorKind::Metadata(MetadataErrorKind::StaleState)))
+            }
+        }
         Ok(GetStatusResponseProto {
             attrs: Some(file_attrs_proto(10)),
             ..GetStatusResponseProto::default()
@@ -1534,48 +1666,77 @@ impl MetadataGateway for MockGateway {
     ) -> ClientResult<CreateFileResponseProto> {
         self.record_create_file(&ctx, &req);
         self.next_offsets.lock().expect("offsets").insert(1, 0);
-        let layout = req.layout.as_ref().map(recorded_layout).unwrap_or_else(default_layout);
-        self.write_layouts.lock().expect("write layouts").insert(1, layout);
+        let requested_layout = req.layout.as_ref().map(recorded_layout).unwrap_or_else(default_layout);
         let response_layout = self
             .create_response_layout
             .lock()
             .expect("create response layout")
-            .unwrap_or(Some(layout));
+            .unwrap_or(Some(requested_layout));
+        if let Some(layout) = response_layout {
+            self.write_layouts.lock().expect("write layouts").insert(1, layout);
+        }
         Ok(CreateFileResponseProto {
-            write_handle: Some(write_handle_proto(1, 302)),
             data_handle_id: Some(beryl_proto::common::DataHandleIdProto { value: 302 }),
-            base_size: 0,
-            expires_at_ms: u64::MAX / 2,
+            inode_id: Some(beryl_proto::fs::InodeIdProto { value: 301 }),
+            file_size: 0,
             layout: response_layout.map(layout_proto),
             ..CreateFileResponseProto::default()
         })
     }
 
-    async fn append_file(
+    async fn open_write(
         &self,
         ctx: AttemptContext,
-        _req: beryl_proto::metadata::AppendFileRequestProto,
-    ) -> ClientResult<AppendFileResponseProto> {
-        self.record("append_file", &ctx);
-        self.next_offsets.lock().expect("offsets").insert(2, 10);
-        let layout = self
-            .append_write_layout
+        req: beryl_proto::metadata::OpenWriteRequestProto,
+    ) -> ClientResult<OpenWriteResponseProto> {
+        self.record("open_write", &ctx);
+        match self.next_open_write_outcome() {
+            MetadataOutcome::Ok => {}
+            MetadataOutcome::Transport => {
+                return Err(ClientError::from(tonic::Status::unavailable(
+                    "injected OpenWrite transport ambiguity",
+                )))
+            }
+            MetadataOutcome::ServerRetry => return Err(server_retry_error()),
+            MetadataOutcome::StaleState => {
+                return Err(refresh_action_error(ErrorKind::Metadata(MetadataErrorKind::StaleState)))
+            }
+        }
+        let append = req.mode == beryl_proto::metadata::OpenWriteModeProto::OpenWriteModeAppend as i32;
+        let (handle_id, data_handle_id, base_size) = if append { (2, 402, 10) } else { (1, 302, 0) };
+        self.next_offsets.lock().expect("offsets").insert(handle_id, base_size);
+        let layout = if append {
+            self.append_write_layout
+                .lock()
+                .expect("append write layout")
+                .unwrap_or_else(default_layout)
+        } else {
+            self.write_layouts
+                .lock()
+                .expect("write layouts")
+                .get(&handle_id)
+                .copied()
+                .unwrap_or_else(default_layout)
+        };
+        self.write_layouts
             .lock()
-            .expect("append write layout")
-            .unwrap_or_else(default_layout);
-        self.write_layouts.lock().expect("write layouts").insert(2, layout);
-        let response_layout = self
-            .append_response_layout
-            .lock()
-            .expect("append response layout")
-            .unwrap_or(Some(layout));
-        Ok(AppendFileResponseProto {
-            write_handle: Some(write_handle_proto(2, 402)),
-            data_handle_id: Some(beryl_proto::common::DataHandleIdProto { value: 402 }),
-            base_size: 10,
+            .expect("write layouts")
+            .insert(handle_id, layout);
+        let response_layout = if append {
+            self.append_response_layout
+                .lock()
+                .expect("append response layout")
+                .unwrap_or(Some(layout))
+        } else {
+            Some(layout)
+        };
+        Ok(OpenWriteResponseProto {
+            write_handle: Some(write_handle_proto(handle_id, data_handle_id)),
+            data_handle_id: Some(beryl_proto::common::DataHandleIdProto { value: data_handle_id }),
+            base_size,
             expires_at_ms: u64::MAX / 2,
             layout: response_layout.map(layout_proto),
-            ..AppendFileResponseProto::default()
+            ..OpenWriteResponseProto::default()
         })
     }
 
@@ -1695,8 +1856,16 @@ impl MetadataGateway for MockGateway {
         ctx: AttemptContext,
         _req: beryl_proto::metadata::MsyncRequestProto,
     ) -> ClientResult<beryl_proto::common::GroupStateWatermarkProto> {
+        let group_name = ctx.metadata_header().expect("metadata header").group_name;
         self.record("msync", &ctx);
-        Ok(beryl_proto::common::GroupStateWatermarkProto::default())
+        Ok(beryl_proto::common::GroupStateWatermarkProto {
+            group_name,
+            state_id: Some(beryl_proto::common::RaftLogIdProto {
+                term: 1,
+                leader_node_id: 1,
+                index: 1,
+            }),
+        })
     }
 }
 
@@ -1714,6 +1883,14 @@ enum RenewOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetadataOutcome {
+    Ok,
+    Transport,
+    ServerRetry,
+    StaleState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkerWriteOutcome {
     Ok,
     WorkerError,
@@ -1722,7 +1899,7 @@ enum WorkerWriteOutcome {
 #[derive(Debug)]
 struct MockDataClient {
     file: Bytes,
-    refresh_once: Mutex<Option<MetadataRefreshCause>>,
+    refresh_once: Mutex<Option<ErrorKind>>,
     calls: Mutex<usize>,
     written: Mutex<Vec<u8>>,
     written_lens: Mutex<Vec<u64>>,
@@ -1764,9 +1941,9 @@ impl MockDataClient {
         }
     }
 
-    fn with_refresh_once(file: &'static [u8], reason: MetadataRefreshCause) -> Self {
+    fn with_refresh_once(file: &'static [u8], kind: ErrorKind) -> Self {
         Self {
-            refresh_once: Mutex::new(Some(reason)),
+            refresh_once: Mutex::new(Some(kind)),
             ..Self::from_file(file)
         }
     }
@@ -2083,11 +2260,7 @@ fn location(data_handle_id: u64, block_index: u32, file_offset: u64, len: u64) -
     }
 }
 
-fn refresh_action_error(reason: MetadataRefreshCause) -> ClientError {
-    let kind = match reason {
-        MetadataRefreshCause::WorkerRunMismatch => ErrorKind::Worker(WorkerErrorKind::RunMismatch),
-        other => panic!("unsupported test metadata refresh cause {other:?}"),
-    };
+fn refresh_action_error(kind: ErrorKind) -> ClientError {
     let rpc_error = RpcErrorDetail::refresh_metadata(
         kind,
         RpcRefreshHint {
@@ -2097,7 +2270,6 @@ fn refresh_action_error(reason: MetadataRefreshCause) -> ClientError {
         "worker requested refresh",
     );
     ClientError::from(ClientAction::Refresh {
-        reason,
         hint: Box::new(RefreshHint {
             worker_resolve_required: true,
             ..RefreshHint::default()
@@ -2106,10 +2278,21 @@ fn refresh_action_error(reason: MetadataRefreshCause) -> ClientError {
     })
 }
 
+fn server_retry_error() -> ClientError {
+    let rpc_error = RpcErrorDetail::retry(
+        ErrorKind::Internal(InternalErrorKind::NodeUnavailable),
+        Some(1),
+        "server requested retry",
+    );
+    ClientError::from(ClientAction::Retry {
+        retry_after_ms_hint: Some(1),
+        rpc_error: Box::new(rpc_error),
+    })
+}
+
 fn session_error(kind: ErrorKind) -> ClientError {
     let rpc_error = RpcErrorDetail::reopen_write_session(kind, RpcRefreshHint::default(), "write session expired");
     ClientError::from(ClientAction::Refresh {
-        reason: MetadataRefreshCause::Unknown,
         hint: Box::default(),
         rpc_error: Box::new(rpc_error),
     })

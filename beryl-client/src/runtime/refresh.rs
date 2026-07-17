@@ -7,6 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::sync::Arc;
 
+use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
 use beryl_types::{GroupName, GroupStateWatermark};
 use parking_lot::RwLock;
 
@@ -14,7 +15,6 @@ use crate::cache::StateIdCache;
 use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
 use crate::rpc_error::RefreshHint;
-use crate::runtime::classify::MetadataRefreshCause;
 use crate::runtime::context::{AttemptContext, OperationContext};
 
 const METADATA_TARGET_CACHE_LIMIT: usize = 300;
@@ -195,17 +195,17 @@ impl MetadataTargets {
     pub(crate) fn record_refresh(
         &self,
         operation: &OperationContext,
-        reason: MetadataRefreshCause,
+        kind: ErrorKind,
         hint: &RefreshHint,
     ) -> ClientResult<()> {
         let mut state = self.state.write();
-        match reason {
-            MetadataRefreshCause::NotLeader => {
+        match kind {
+            ErrorKind::Metadata(MetadataErrorKind::NotLeader) => {
                 if let (Some(group_name), Some(endpoint)) = (hint.group_name.as_ref(), hint.leader_endpoint.as_ref()) {
                     state.leader_cache.insert(group_name.clone(), endpoint.clone());
                 }
             }
-            MetadataRefreshCause::OwnerGroupMismatch => {
+            ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch | MetadataErrorKind::GroupMismatch) => {
                 let Some(group_name) = hint.group_name.as_ref() else {
                     return Err(ClientError::Metadata(
                         "owner group mismatch refresh missing group_name hint".to_string(),
@@ -218,7 +218,7 @@ impl MetadataTargets {
                     state.leader_cache.insert(group_name.clone(), endpoint.clone());
                 }
             }
-            MetadataRefreshCause::MountEpochMismatch => {
+            ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch) => {
                 if let Some(mount_epoch) = hint.mount_epoch {
                     state.record_mount_epoch_hint(
                         operation.original_target_path(),
@@ -227,7 +227,7 @@ impl MetadataTargets {
                     );
                 }
             }
-            MetadataRefreshCause::RouteEpochMismatch => {
+            ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch) => {
                 if let Some(route_epoch) = hint.route_epoch {
                     state.record_route_epoch_hint(
                         operation.original_target_path(),
@@ -236,10 +236,13 @@ impl MetadataTargets {
                     );
                 }
             }
-            MetadataRefreshCause::StaleState
-            | MetadataRefreshCause::WorkerRunMismatch
-            | MetadataRefreshCause::BlockStampMismatch
-            | MetadataRefreshCause::Unknown => {}
+            ErrorKind::Metadata(MetadataErrorKind::StaleState)
+            | ErrorKind::Worker(WorkerErrorKind::RunMismatch | WorkerErrorKind::BlockStampMismatch) => {}
+            _ => {
+                return Err(ClientError::Metadata(format!(
+                    "unsupported metadata refresh error kind: {kind:?}"
+                )))
+            }
         }
         Ok(())
     }
@@ -351,9 +354,8 @@ impl Default for MetadataTargets {
 mod tests {
     use super::*;
     use crate::rpc_error::RefreshHint;
-    use crate::runtime::classify::MetadataRefreshCause;
-    use crate::runtime::policy::OperationKind;
-    use crate::runtime::{OperationContext, OperationIdentity};
+    use crate::runtime::{OperationContext, OperationDeadline};
+    use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
     use beryl_proto::common::{GroupStateWatermarkProto, RaftLogIdProto};
     use beryl_types::{ClientId, GroupName};
 
@@ -366,11 +368,12 @@ mod tests {
     }
 
     fn path_operation() -> OperationContext {
-        OperationContext::new(
+        OperationContext::new_named(
             ClientId::new(7),
-            OperationKind::MetadataRead,
+            "test-client",
             "OpenFile",
-            OperationIdentity::path("/alpha/file"),
+            Some("/alpha/file".to_string()),
+            OperationDeadline::new(1_000),
         )
         .expect("operation context")
     }
@@ -394,7 +397,7 @@ mod tests {
         manager
             .record_refresh(
                 &op,
-                MetadataRefreshCause::OwnerGroupMismatch,
+                ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch),
                 &RefreshHint {
                     group_name: Some(group_name("analytics")),
                     ..RefreshHint::default()
@@ -416,7 +419,7 @@ mod tests {
         manager
             .record_refresh(
                 &op,
-                MetadataRefreshCause::OwnerGroupMismatch,
+                ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch),
                 &RefreshHint {
                     group_name: Some(group_name("analytics")),
                     leader_endpoint: Some("http://127.0.0.1:18082".to_string()),
@@ -445,7 +448,7 @@ mod tests {
         manager
             .record_refresh(
                 &op,
-                MetadataRefreshCause::NotLeader,
+                ErrorKind::Metadata(MetadataErrorKind::NotLeader),
                 &RefreshHint {
                     group_name: Some(group_name("root")),
                     leader_endpoint: Some("http://127.0.0.1:18081".to_string()),
@@ -488,7 +491,7 @@ mod tests {
         targets
             .record_refresh(
                 &op,
-                MetadataRefreshCause::NotLeader,
+                ErrorKind::Metadata(MetadataErrorKind::NotLeader),
                 &RefreshHint {
                     group_name: Some(group_name("root")),
                     leader_endpoint: Some("leader".to_string()),
@@ -511,7 +514,7 @@ mod tests {
         manager
             .record_refresh(
                 &op,
-                MetadataRefreshCause::MountEpochMismatch,
+                ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
                 &RefreshHint {
                     mount_epoch: Some(31),
                     mount_prefix: Some("/alpha".to_string()),
@@ -534,7 +537,7 @@ mod tests {
         manager
             .record_refresh(
                 &op,
-                MetadataRefreshCause::RouteEpochMismatch,
+                ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
                 &RefreshHint {
                     route_epoch: Some(23),
                     mount_prefix: Some("/alpha".to_string()),
@@ -554,17 +557,18 @@ mod tests {
         let manager = manager();
 
         for index in 0..(METADATA_TARGET_CACHE_LIMIT + 50) {
-            let operation = OperationContext::new(
+            let operation = OperationContext::new_named(
                 ClientId::new(7),
-                OperationKind::MetadataRead,
+                "test-client",
                 "OpenFile",
-                OperationIdentity::path(format!("/tenant/{index}/file")),
+                Some(format!("/tenant/{index}/file")),
+                OperationDeadline::new(1_000),
             )
             .expect("operation context");
             manager
                 .record_refresh(
                     &operation,
-                    MetadataRefreshCause::OwnerGroupMismatch,
+                    ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch),
                     &RefreshHint {
                         group_name: Some(group_name("analytics")),
                         ..RefreshHint::default()
@@ -574,7 +578,7 @@ mod tests {
             manager
                 .record_refresh(
                     &operation,
-                    MetadataRefreshCause::MountEpochMismatch,
+                    ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
                     &RefreshHint {
                         mount_epoch: Some(index as u64),
                         mount_prefix: Some(format!("/tenant/{index}")),
@@ -585,7 +589,7 @@ mod tests {
             manager
                 .record_refresh(
                     &operation,
-                    MetadataRefreshCause::RouteEpochMismatch,
+                    ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
                     &RefreshHint {
                         route_epoch: Some(index as u64),
                         mount_prefix: Some(format!("/tenant/{index}")),

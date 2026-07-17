@@ -12,12 +12,6 @@ pub enum ClientMetric {
     RetryAttempt,
     /// Retry budget exhausted.
     RetryExhausted,
-    /// Refresh decision selected for a classified error.
-    RefreshDecision,
-    /// Metadata refresh cause observed.
-    MetadataRefreshCause,
-    /// Refresh budget exhausted.
-    RefreshExhausted,
     /// Unknown outcome observed.
     UnknownOutcome,
     /// Fencing mismatch observed.
@@ -48,12 +42,6 @@ pub enum ClientMetric {
     AbortUnknown,
     /// Unsupported operation observed.
     UnsupportedOperation,
-    /// Session barrier replay denied.
-    SessionBarrierReplayDenied,
-    /// Unsafe replay denied.
-    UnsafeReplayDenied,
-    /// Backoff delay selected.
-    BackoffDelay,
     /// Metadata channel pool hit.
     MetadataChannelPoolHit,
     /// Metadata channel pool miss.
@@ -73,14 +61,10 @@ pub enum ClientMetric {
 /// Low-cardinality labels for client metric events.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClientMetricLabels {
-    /// Logical operation kind.
-    pub(crate) operation_kind: Option<&'static str>,
     /// Stable operation name.
     pub(crate) operation_name: Option<String>,
     /// Classified error class.
     pub(crate) error_class: Option<&'static str>,
-    /// Metadata refresh cause.
-    pub(crate) metadata_refresh_cause: Option<&'static str>,
     /// Target plane.
     pub(crate) target_plane: Option<&'static str>,
     /// Cache or pool name.
@@ -92,11 +76,6 @@ pub struct ClientMetricLabels {
 }
 
 impl ClientMetricLabels {
-    /// Return the logical operation kind label.
-    pub fn operation_kind(&self) -> Option<&'static str> {
-        self.operation_kind
-    }
-
     /// Return the stable operation name label.
     pub fn operation_name(&self) -> Option<&str> {
         self.operation_name.as_deref()
@@ -105,11 +84,6 @@ impl ClientMetricLabels {
     /// Return the classified error class label.
     pub fn error_class(&self) -> Option<&'static str> {
         self.error_class
-    }
-
-    /// Return the metadata refresh cause label.
-    pub fn metadata_refresh_cause(&self) -> Option<&'static str> {
-        self.metadata_refresh_cause
     }
 
     /// Return the target plane label.
@@ -133,13 +107,7 @@ impl ClientMetricLabels {
     }
 
     /// Attach operation identity labels.
-    pub(crate) fn with_operation(
-        mut self,
-        operation_kind: &'static str,
-        operation_name: impl Into<String>,
-        target_plane: &'static str,
-    ) -> Self {
-        self.operation_kind = Some(operation_kind);
+    pub(crate) fn with_operation(mut self, operation_name: impl Into<String>, target_plane: &'static str) -> Self {
         self.operation_name = Some(operation_name.into());
         self.target_plane = Some(target_plane);
         self
@@ -148,12 +116,6 @@ impl ClientMetricLabels {
     /// Attach error class label.
     pub(crate) fn with_error_class(mut self, error_class: &'static str) -> Self {
         self.error_class = Some(error_class);
-        self
-    }
-
-    /// Attach metadata refresh cause label.
-    pub(crate) fn with_metadata_refresh_cause(mut self, metadata_refresh_cause: &'static str) -> Self {
-        self.metadata_refresh_cause = Some(metadata_refresh_cause);
         self
     }
 
@@ -169,13 +131,13 @@ impl ClientMetricLabels {
         self
     }
 
-    /// Attach a target plane label without an operation kind.
+    /// Attach a target plane label.
     pub(crate) fn with_target_plane(mut self, target_plane: &'static str) -> Self {
         self.target_plane = Some(target_plane);
         self
     }
 
-    /// Attach a stable operation label without changing the operation kind.
+    /// Attach a stable operation label.
     pub(crate) fn with_operation_name(mut self, operation_name: &'static str) -> Self {
         self.operation_name = Some(operation_name.to_string());
         self
@@ -185,9 +147,7 @@ impl ClientMetricLabels {
     pub fn has_only_safe_values(&self) -> bool {
         let values = [
             self.operation_name.as_deref(),
-            self.operation_kind,
             self.error_class,
-            self.metadata_refresh_cause,
             self.target_plane,
             self.cache,
             self.reason,

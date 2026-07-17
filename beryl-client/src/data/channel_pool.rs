@@ -16,7 +16,8 @@ use crate::cache::CacheInvalidationReason;
 use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
-use crate::runtime::{ErrorClass, ErrorClassifier, MetadataRefreshCause};
+use crate::runtime::{classify_error, ErrorClass};
+use beryl_common::error::rpc::{ErrorKind, WorkerErrorKind};
 
 const WORKER_ENDPOINT_COOLDOWN_CACHE_LIMIT: usize = 1_024;
 
@@ -259,8 +260,8 @@ fn evict_worker_cooldown_if_needed(cooldowns: &mut HashMap<WorkerChannelKey, Ins
 }
 
 fn worker_run_mismatch_invalidation_reason(err: &ClientError) -> Option<CacheInvalidationReason> {
-    match ErrorClassifier.classify_error(err) {
-        ErrorClass::RefreshMetadata(MetadataRefreshCause::WorkerRunMismatch) => {
+    match classify_error(err) {
+        ErrorClass::RefreshMetadata(ErrorKind::Worker(WorkerErrorKind::RunMismatch)) => {
             Some(CacheInvalidationReason::WorkerRun)
         }
         _ => None,
@@ -278,7 +279,7 @@ mod tests {
 
     use crate::data::protocol::parse_worker_control_header;
     use crate::metrics::NoopClientMetrics;
-    use crate::runtime::{AttemptContext, OperationContext, OperationIdentity, OperationKind};
+    use crate::runtime::{AttemptContext, OperationContext, OperationDeadline};
 
     #[derive(Debug, Default)]
     struct RecordingMetrics {
@@ -490,11 +491,12 @@ mod tests {
     }
 
     fn data_attempt_context() -> AttemptContext {
-        let operation = OperationContext::new(
+        let operation = OperationContext::new_named(
             ClientId::new(7),
-            OperationKind::WorkerReadData,
+            "test-client",
             "OpenReadStream",
-            OperationIdentity::path("/alpha"),
+            Some("/alpha".to_string()),
+            OperationDeadline::new(1_000),
         )
         .expect("operation context");
         AttemptContext::for_data(&operation, 0)
@@ -549,10 +551,8 @@ mod tests {
 
     fn metric_label_values(labels: &ClientMetricLabels) -> impl Iterator<Item = &str> {
         [
-            labels.operation_kind,
             labels.operation_name.as_deref(),
             labels.error_class,
-            labels.metadata_refresh_cause,
             labels.target_plane,
             labels.cache,
             labels.reason,

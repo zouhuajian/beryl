@@ -18,7 +18,7 @@ use crate::inode_lease::LeaseManager;
 use crate::metrics::MetadataMetrics;
 use crate::mount::MountTable;
 use crate::path_resolver::{MountContext, PathResolver, ResolvedPath};
-use crate::raft::{AppRaftNode, DedupKey, RocksDBStorage};
+use crate::raft::{AppDataResponse, AppRaftNode, CommandFingerprint, DedupKey, FsCommandResult, RocksDBStorage};
 use crate::readiness::RootReadinessGate;
 use crate::session_registry::SessionRegistry;
 use crate::state::StateStore;
@@ -34,7 +34,7 @@ use std::sync::Arc;
 use admission::{AdmissionFailure, AdmissionGuard};
 use command::{RoutedFsWriteCtx, WriteCommandKind};
 pub(super) use delete::DeleteArgs;
-pub(super) use file_write::{AppendFileArgs, CreateFileArgs, CreateFileMode};
+pub(super) use file_write::{CreateFileArgs, CreateFileMode, OpenWriteArgs};
 use freshness::{FreshnessValidator, StaleStateStatus};
 pub(super) use namespace::{CreateDirectoryArgs, RenameArgs};
 pub(super) use read::{BlockLocationsTarget, GetBlockLocationsArgs, GetStatusArgs, ListStatusArgs, OpenFileArgs};
@@ -53,7 +53,7 @@ pub(crate) struct Freshness {
     pub(crate) route_epoch: Option<u64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SessionKey {
     pub(crate) file_handle: u64,
     pub(crate) lease_id: LeaseId,
@@ -248,6 +248,54 @@ impl MetadataFileSystem {
 
     fn dedup_key(&self, caller_ctx: &RequestHeader) -> MetadataResult<DedupKey> {
         DedupKey::from_header_identity(&caller_ctx.identity()).map_err(MetadataError::InvalidArgument)
+    }
+
+    fn reject_durable_call_reuse(&self, caller_ctx: &RequestHeader) -> MetadataResult<()> {
+        let dedup = self.dedup_key(caller_ctx)?;
+        if self.storage.get_applied_result(&dedup)?.is_some() {
+            return Err(MetadataError::InvalidArgument(format!(
+                "call_id {} was already used by a durable metadata mutation",
+                dedup.call_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn replay_namespace_result(
+        &self,
+        caller_ctx: &RequestHeader,
+        fingerprint: CommandFingerprint,
+    ) -> MetadataResult<Option<FsCommandResult>> {
+        let dedup = self.dedup_key(caller_ctx)?;
+        let Some(applied) = self.storage.get_applied_result(&dedup)? else {
+            return Ok(None);
+        };
+        if applied.fingerprint != fingerprint {
+            return Err(MetadataError::InvalidArgument(format!(
+                "call_id {} reused with different command payload or RPC method",
+                dedup.call_id
+            )));
+        }
+        match applied.result {
+            AppDataResponse::Fs(result) => Ok(Some(result)),
+            _ => Err(MetadataError::InvalidArgument(format!(
+                "call_id {} was already used by a different durable RPC method",
+                dedup.call_id
+            ))),
+        }
+    }
+
+    fn reject_active_session_call_reuse(&self, caller_ctx: &RequestHeader) -> MetadataResult<()> {
+        let identity = caller_ctx.identity();
+        if self.session_registry.has_call_id(identity.client_id, identity.call_id)
+            || self.lease_manager.has_renew_call(identity.client_id, identity.call_id)
+        {
+            return Err(MetadataError::InvalidArgument(format!(
+                "call_id {} was already used by an active write session RPC",
+                identity.call_id
+            )));
+        }
+        Ok(())
     }
 
     async fn authoritative_route_epoch(&self) -> MetadataResult<u64> {
@@ -899,20 +947,21 @@ mod test_support {
 
     pub(super) fn install_write_session(filesystem: &TestFilesystem, inode_id: InodeId, mount_id: MountId) -> u64 {
         let writer = ClientId::new(7);
+        let open_call_id = beryl_types::CallId::new();
         let data_handle_id = DataHandleId::new(424_242);
-        let (lease_id, lease_epoch, _) = filesystem
+        let (lease_id, lease_epoch, expires_at_ms) = filesystem
             .lease_manager()
             .try_acquire(
                 inode_id,
                 writer,
-                Some(beryl_types::CallId::new()),
+                Some(open_call_id),
                 crate::inode_lease::WriteMode::Write,
                 None,
             )
             .expect("lease acquired");
         filesystem
             .session_registry()
-            .create_session(crate::session_registry::CreateSessionInput {
+            .get_or_create_session(crate::session_registry::CreateSessionInput {
                 inode_id,
                 mount_id,
                 data_handle_id,
@@ -926,6 +975,12 @@ mod test_support {
                 open_epoch: 1234,
                 base_size: 0,
                 mode: crate::inode_lease::WriteMode::Write,
+                open_client_id: writer,
+                open_call_id,
+                open_path: "/test".to_string(),
+                open_desired_len: None,
+                layout: FileLayout::new(64, 64, 1),
+                expires_at_ms,
                 write_targets: vec![WriteTarget {
                     block_id: BlockId::new(data_handle_id, BlockIndex::new(0)),
                     file_offset: 0,
@@ -943,6 +998,8 @@ mod test_support {
                     tier: beryl_types::Tier::Hdd,
                 }],
             })
+            .expect("session created")
+            .0
     }
 
     pub(super) fn presented_session_token(session: &crate::session_registry::WriteSession) -> PresentedFencingToken {
@@ -975,6 +1032,10 @@ mod test_support {
         key: &SessionKey,
         desired_len: u64,
     ) -> WriteTarget {
+        let previous_block_id = filesystem
+            .session_registry
+            .get_session(key.file_handle)
+            .and_then(|session| session.issued_targets.last().map(|target| target.block_id));
         filesystem
             .add_block_resolved(AddBlockInput {
                 ctx: request_context(),
@@ -984,6 +1045,7 @@ mod test_support {
                 open_epoch: key.open_epoch,
                 fencing_token: Some(presented_key_token(key)),
                 desired_len: Some(desired_len),
+                previous_block_id,
                 freshness: Freshness::default(),
             })
             .await

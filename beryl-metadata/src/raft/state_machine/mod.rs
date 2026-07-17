@@ -17,7 +17,7 @@ use crate::raft::response::{
 };
 use crate::raft::storage::{
     AppliedResult, AuthorityBatch, BootstrapNamespaceState, DeleteTreeAtomicUpdate, DeleteTreeEntry, FileAllocation,
-    InodeAllocation, RenameAtomicUpdate, RenameOverwriteCleanup, RocksDBStorage,
+    InodeAllocation, RecursiveMkdirEntry, RenameAtomicUpdate, RenameOverwriteCleanup, RocksDBStorage,
 };
 use crate::raft::types::{AppMetadataRaftState, CommandFingerprint, DedupKey};
 use crate::raft::RoutingDelta;
@@ -188,6 +188,7 @@ impl AppRaftStateMachine {
                     parent_inode_id,
                     name,
                     attrs,
+                    ..
                 } => {
                     // Create/mkdir/rename persist namespace mutation, replay result together.
                     let result = self.apply_mkdir(
@@ -201,17 +202,37 @@ impl AppRaftStateMachine {
                     )?;
                     Ok(AppDataResponse::Fs(result))
                 }
+                Mutation::CreateDirectory {
+                    root_inode_id,
+                    components,
+                    attrs,
+                    ..
+                } => {
+                    let result = self.apply_create_directory(
+                        root_inode_id,
+                        components,
+                        attrs,
+                        proposed_at_ms,
+                        &dedup_key,
+                        fingerprint,
+                        raft_state,
+                    )?;
+                    Ok(AppDataResponse::Fs(result))
+                }
                 Mutation::CreateFile {
                     parent_inode_id,
                     name,
                     attrs,
                     layout,
+                    mode,
+                    ..
                 } => {
                     let result = self.apply_create(
                         parent_inode_id,
                         name,
                         attrs,
                         layout,
+                        mode,
                         proposed_at_ms,
                         &dedup_key,
                         fingerprint,
@@ -219,32 +240,16 @@ impl AppRaftStateMachine {
                     )?;
                     Ok(AppDataResponse::Fs(result))
                 }
-                Mutation::Unlink { parent_inode_id, name } => {
-                    let result = self.apply_unlink(
+                Mutation::Delete {
+                    parent_inode_id,
+                    name,
+                    recursive,
+                    ..
+                } => {
+                    let result = self.apply_delete(
                         parent_inode_id,
                         name,
-                        proposed_at_ms,
-                        &dedup_key,
-                        fingerprint,
-                        raft_state,
-                    )?;
-                    Ok(AppDataResponse::Fs(result))
-                }
-                Mutation::DeleteEmptyDir { parent_inode_id, name } => {
-                    let result = self.apply_delete_empty_dir(
-                        parent_inode_id,
-                        name,
-                        proposed_at_ms,
-                        &dedup_key,
-                        fingerprint,
-                        raft_state,
-                    )?;
-                    Ok(AppDataResponse::Fs(result))
-                }
-                Mutation::DeleteTree { parent_inode_id, name } => {
-                    let result = self.apply_delete_tree(
-                        parent_inode_id,
-                        name,
+                        recursive,
                         proposed_at_ms,
                         &dedup_key,
                         fingerprint,
@@ -258,6 +263,7 @@ impl AppRaftStateMachine {
                     dst_parent_inode_id,
                     dst_name,
                     flags,
+                    ..
                 } => {
                     let result = self.apply_rename(
                         src_parent_inode_id,
@@ -664,6 +670,7 @@ pub(crate) mod tests {
             version: u16,
             dedup: DedupKey,
             proposed_at_ms: u64,
+            canonical_namespace_request: Option<crate::raft::CanonicalNamespaceRequest>,
             mutation: Mutation,
         }
 
@@ -672,6 +679,7 @@ pub(crate) mod tests {
                 version: crate::raft::command::COMMAND_FORMAT_VERSION + 1,
                 dedup: dedup_for_test(99),
                 proposed_at_ms: 100,
+                canonical_namespace_request: None,
                 mutation: Mutation::BootstrapNamespace {
                     group_name: GroupName::parse("root").unwrap(),
                 },

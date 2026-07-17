@@ -4,8 +4,9 @@
 //! Responses produced by committed metadata Raft commands.
 
 use crate::error::MetadataError;
-use beryl_types::fs::{FsErrorCode, InodeId};
+use beryl_types::fs::{FileAttrs, FsErrorCode, InodeId};
 use beryl_types::ids::{DataHandleId, WorkerId};
+use beryl_types::layout::FileLayout;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -173,6 +174,8 @@ pub(crate) struct FsOkResult {
     pub inode_id: Option<InodeId>,
     pub data_handle_id: Option<DataHandleId>,
     pub file_version: Option<u64>,
+    pub attrs: Option<FileAttrs>,
+    pub layout: Option<FileLayout>,
 }
 
 /// FS errno surfaced by apply.

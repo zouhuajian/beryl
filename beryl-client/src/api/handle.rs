@@ -7,6 +7,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
 use beryl_proto::metadata::WriteSyncModeProto;
 use beryl_types::DataHandleId;
 use bytes::{Bytes, BytesMut};
@@ -16,9 +17,8 @@ use crate::error::{invalid_response, ClientError, ClientResult};
 use crate::metrics::ClientMetric;
 use crate::planner;
 use crate::runtime::{
-    is_unknown_session_barrier_outcome, mark_session_after_metadata_error, metric_labels, refresh_hint_from_error,
-    ClientRuntime, ErrorClass, ErrorClassifier, MetadataRefreshCause, OperationContext, OperationIdentity,
-    OperationKind,
+    classify_error, is_unknown_session_barrier_outcome, mark_session_after_metadata_error, metric_labels,
+    refresh_hint_from_error, ClientRuntime, ErrorClass, OperationContext, OperationDeadline,
 };
 use crate::session::write_session::{WorkerCommitLevel, WriteSession};
 
@@ -49,6 +49,11 @@ impl FileReader {
 
     /// Reads a range from the opened file snapshot.
     pub async fn read_at(&self, offset: u64, len: u32) -> ClientResult<Bytes> {
+        self.read_at_with_deadline(offset, len, self.runtime.executor.operation_deadline())
+            .await
+    }
+
+    async fn read_at_with_deadline(&self, offset: u64, len: u32, deadline: OperationDeadline) -> ClientResult<Bytes> {
         let Some(requested_range) = planner::requested_range(offset, len, self.handle.size_hint())? else {
             return Ok(Bytes::new());
         };
@@ -57,16 +62,11 @@ impl FileReader {
         let operation = OperationContext::new_named(
             self.runtime.executor.client_id(),
             self.runtime.executor.client_name(),
-            OperationKind::WorkerReadData,
             "Read",
-            OperationIdentity::path(self.handle.path().to_string()),
+            Some(self.handle.path().to_string()),
+            deadline,
         )?;
-        let mut retry_used = 0usize;
-        let mut refresh_used = 0usize;
-        let retry_budget = self.runtime.config.retry.max_retry_attempts();
-        let refresh_budget = self.runtime.config.refresh.max_refresh_attempts;
-        let mut attempt = 0u32;
-        loop {
+        for attempt_index in 0..self.runtime.config.retry.max_attempts() {
             let layout = self
                 .runtime
                 .executor
@@ -75,84 +75,56 @@ impl FileReader {
                     data_handle_id,
                     requested_range.file_offset,
                     requested_range.len,
+                    operation.deadline().clone(),
                 )
                 .await?;
             let (group_name, block_reads) =
                 planner::plan_block_reads_from_layout(data_handle_id, Some(file_version), requested_range, &layout)?;
-            let ctx = self.runtime.data_context(&operation, attempt);
+            let ctx = self.runtime.data_context(&operation, attempt_index as u32);
             match self
                 .runtime
                 .worker_rpc_with_timeout(
-                    "Read",
-                    OperationKind::WorkerReadData,
+                    &operation,
                     self.runtime.data_plane.read_block_ranges(ctx, group_name, &block_reads),
                 )
                 .await
             {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => {
-                    let class = ErrorClassifier.classify_error(&err);
-                    self.runtime
-                        .record_error_metric("Read", OperationKind::WorkerReadData, &class);
+                    let class = classify_error(&err);
+                    self.runtime.record_error_metric("Read", "worker", &class);
+                    let has_next = attempt_index + 1 < self.runtime.config.retry.max_attempts();
                     match class.clone() {
-                        ErrorClass::RefreshMetadata(MetadataRefreshCause::Unknown) => return Err(err),
-                        ErrorClass::RefreshMetadata(reason) if should_replan_after_worker_error(&err) => {
-                            if refresh_budget.saturating_sub(refresh_used) == 0 {
-                                self.runtime.record_metric(
-                                    ClientMetric::RefreshExhausted,
-                                    metric_labels("Read", OperationKind::WorkerReadData)
-                                        .with_metadata_refresh_cause(reason.label()),
-                                );
-                                return Err(err);
-                            }
-                            if retry_budget.saturating_sub(retry_used) == 0 {
-                                self.runtime.record_metric(
-                                    ClientMetric::RetryExhausted,
-                                    metric_labels("Read", OperationKind::WorkerReadData)
-                                        .with_error_class(class.label()),
-                                );
-                                return Err(err);
-                            }
+                        ErrorClass::RefreshMetadata(reason) if has_next && should_replan_after_worker_error(&err) => {
                             self.runtime.executor.record_data_refresh(
                                 &operation,
                                 reason,
                                 &refresh_hint_from_error(&err),
                             )?;
-                            self.runtime.record_refresh_metric(
-                                "Read",
-                                OperationKind::WorkerReadData,
-                                reason,
-                                "refresh",
-                            );
-                            retry_used += 1;
-                            refresh_used += 1;
-                            attempt = attempt.saturating_add(1);
-                        }
-                        ErrorClass::RefreshMetadata(_) => return Err(err),
-                        ErrorClass::RetryableTransport => {
-                            if retry_budget.saturating_sub(retry_used) == 0 {
-                                self.runtime.record_metric(
-                                    ClientMetric::RetryExhausted,
-                                    metric_labels("Read", OperationKind::WorkerReadData)
-                                        .with_error_class(class.label()),
-                                );
-                                return Err(err);
-                            }
-                            let retry_index = retry_used;
-                            retry_used += 1;
                             self.runtime.record_metric(
                                 ClientMetric::RetryAttempt,
-                                metric_labels("Read", OperationKind::WorkerReadData).with_error_class(class.label()),
+                                metric_labels("Read", "worker").with_error_class(class.label()),
                             );
-                            self.runtime
-                                .sleep_before_retry(retry_index, "Read", OperationKind::WorkerReadData)
-                                .await;
-                            attempt = attempt.saturating_add(1);
+                        }
+                        ErrorClass::RefreshMetadata(_) => return Err(err),
+                        ErrorClass::RetryableTransport | ErrorClass::ServerRetry if has_next => {
+                            self.runtime.record_metric(
+                                ClientMetric::RetryAttempt,
+                                metric_labels("Read", "worker").with_error_class(class.label()),
+                            );
+                            self.runtime.sleep_before_retry(attempt_index, &operation).await?;
+                        }
+                        ErrorClass::RetryableTransport | ErrorClass::ServerRetry => {
+                            self.runtime.record_metric(
+                                ClientMetric::RetryExhausted,
+                                metric_labels("Read", "worker").with_error_class(class.label()),
+                            );
+                            return Err(err);
                         }
                         ErrorClass::UnknownOutcome => {
                             self.runtime.record_metric(
                                 ClientMetric::UnknownOutcome,
-                                metric_labels("Read", OperationKind::WorkerReadData)
+                                metric_labels("Read", "worker")
                                     .with_error_class(class.label())
                                     .with_outcome("unknown"),
                             );
@@ -163,6 +135,7 @@ impl FileReader {
                 }
             }
         }
+        unreachable!("read attempt loop always returns on the final attempt")
     }
 
     /// Reads the entire opened file snapshot into one buffer.
@@ -175,9 +148,11 @@ impl FileReader {
             .map_err(|_| ClientError::InvalidArgument("file is too large to read into one buffer".to_string()))?;
         let mut output = BytesMut::with_capacity(capacity);
         let mut offset = 0u64;
+        let deadline = self.runtime.executor.operation_deadline();
         while offset < size {
             let len = (size - offset).min(u64::from(MAX_CONVENIENCE_READ_CHUNK)) as u32;
-            let bytes = self.read_exact_at(offset, len).await?;
+            let bytes = self.read_at_with_deadline(offset, len, deadline.clone()).await?;
+            ensure_exact_read(offset, len, &bytes)?;
             output.extend_from_slice(&bytes);
             offset += u64::from(len);
         }
@@ -186,17 +161,24 @@ impl FileReader {
 
     /// Reads exactly `len` bytes from `offset`, failing if the file snapshot ends first.
     pub async fn read_exact_at(&self, offset: u64, len: u32) -> ClientResult<Bytes> {
-        let bytes = self.read_at(offset, len).await?;
-        if bytes.len() != len as usize {
-            return Err(ClientError::InvalidArgument(format!(
-                "read_exact_at requested {} bytes at offset {} but read {} bytes",
-                len,
-                offset,
-                bytes.len()
-            )));
-        }
+        let bytes = self
+            .read_at_with_deadline(offset, len, self.runtime.executor.operation_deadline())
+            .await?;
+        ensure_exact_read(offset, len, &bytes)?;
         Ok(bytes)
     }
+}
+
+fn ensure_exact_read(offset: u64, len: u32, bytes: &Bytes) -> ClientResult<()> {
+    if bytes.len() != len as usize {
+        return Err(ClientError::InvalidArgument(format!(
+            "read_exact_at requested {} bytes at offset {} but read {} bytes",
+            len,
+            offset,
+            bytes.len()
+        )));
+    }
+    Ok(())
 }
 
 impl fmt::Debug for FileReader {
@@ -211,11 +193,10 @@ impl fmt::Debug for FileReader {
 /// Returns true when a worker read failure requires a fresh metadata layout.
 fn should_replan_after_worker_error(err: &ClientError) -> bool {
     matches!(
-        ErrorClassifier.classify_error(err),
+        classify_error(err),
         ErrorClass::RefreshMetadata(
-            MetadataRefreshCause::RouteEpochMismatch
-                | MetadataRefreshCause::WorkerRunMismatch
-                | MetadataRefreshCause::BlockStampMismatch
+            ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch)
+                | ErrorKind::Worker(WorkerErrorKind::RunMismatch | WorkerErrorKind::BlockStampMismatch)
         )
     )
 }
@@ -244,9 +225,10 @@ impl FileWriter {
 
     /// Writes all supplied bytes at the current sequential cursor.
     pub async fn write_all(&mut self, data: Bytes) -> ClientResult<()> {
+        let deadline = self.runtime.executor.operation_deadline();
         let session_ref = self.handle.write_session();
         let mut session = session_ref.lock().await;
-        self.renew_lease_if_needed(&mut session).await?;
+        self.renew_lease_if_needed(&mut session, deadline.clone()).await?;
         session.ensure_open_for_write()?;
         if data.is_empty() {
             return Ok(());
@@ -254,7 +236,7 @@ impl FileWriter {
 
         let blocks = buffer_write(&mut session, data)?;
         for block in blocks {
-            self.runtime.write_block(&mut session, block).await?;
+            self.runtime.write_block(&mut session, block, deadline.clone()).await?;
         }
         self.handle.store_write_cursor(session.cursor());
         Ok(())
@@ -274,51 +256,45 @@ impl FileWriter {
 
     /// Renews the writer lease while keeping the write session open.
     pub async fn renew_lease(&mut self) -> ClientResult<()> {
+        let deadline = self.runtime.executor.operation_deadline();
         let session_ref = self.handle.write_session();
         let mut session = session_ref.lock().await;
-        self.renew_lease_locked(&mut session).await
+        self.renew_lease_locked(&mut session, deadline).await
     }
 
-    async fn renew_lease_if_needed(&self, session: &mut WriteSession) -> ClientResult<()> {
+    async fn renew_lease_if_needed(&self, session: &mut WriteSession, deadline: OperationDeadline) -> ClientResult<()> {
         let config = &self.runtime.config.write_lease;
         if !config.auto_renew || !session.should_renew_lease(config.renew_before_expiry_ms)? {
             return Ok(());
         }
-        self.renew_lease_locked(session).await
+        self.renew_lease_locked(session, deadline).await
     }
 
-    async fn renew_lease_locked(&self, session: &mut WriteSession) -> ClientResult<()> {
+    async fn renew_lease_locked(&self, session: &mut WriteSession, deadline: OperationDeadline) -> ClientResult<()> {
         session.ensure_open_for_renew()?;
         let path = session.path().to_string();
-        let session_identity = session.session_identity();
         let write_handle = session.write_handle();
         self.runtime.record_metric(
             ClientMetric::LeaseRenewAttempt,
-            metric_labels("RenewLease", OperationKind::MetadataSessionBarrier).with_outcome("attempt"),
+            metric_labels("RenewLease", "metadata").with_outcome("attempt"),
         );
-        match self
-            .runtime
-            .executor
-            .renew_lease(&path, session_identity, write_handle)
-            .await
-        {
+        match self.runtime.executor.renew_lease(&path, write_handle, deadline).await {
             Ok(response) => {
                 let expires_at_ms = valid_write_session_expiry("RenewLease", response.expires_at_ms)?;
                 session.update_expires_at_ms(expires_at_ms);
                 self.runtime.record_metric(
                     ClientMetric::LeaseRenewSuccess,
-                    metric_labels("RenewLease", OperationKind::MetadataSessionBarrier).with_outcome("success"),
+                    metric_labels("RenewLease", "metadata").with_outcome("success"),
                 );
                 Ok(())
             }
             Err(err) => {
                 mark_session_after_metadata_error(session, &err);
-                let class = ErrorClassifier.classify_error(&err);
-                self.runtime
-                    .record_error_metric("RenewLease", OperationKind::MetadataSessionBarrier, &class);
+                let class = classify_error(&err);
+                self.runtime.record_error_metric("RenewLease", "metadata", &class);
                 self.runtime.record_metric(
                     ClientMetric::LeaseRenewFailure,
-                    metric_labels("RenewLease", OperationKind::MetadataSessionBarrier)
+                    metric_labels("RenewLease", "metadata")
                         .with_error_class(class.label())
                         .with_outcome("failure"),
                 );
@@ -329,16 +305,17 @@ impl FileWriter {
 
     /// Closes the writer and commits the final file metadata.
     pub async fn close(&mut self) -> ClientResult<()> {
+        let deadline = self.runtime.executor.operation_deadline();
         let session_ref = self.handle.write_session();
         let mut session = session_ref.lock().await;
-        self.renew_lease_if_needed(&mut session).await?;
+        self.renew_lease_if_needed(&mut session, deadline.clone()).await?;
         session.ensure_open_for_close()?;
         let path = session.path().to_string();
-        self.flush_pending_bytes(&mut session).await?;
+        self.flush_pending_bytes(&mut session, deadline.clone()).await?;
         let final_size = session.cursor();
         let committed_blocks = self
             .runtime
-            .commit_pending_blocks_for_barrier(&mut session, WorkerCommitLevel::CLOSE_REQUIRED)
+            .commit_pending_blocks_for_barrier(&mut session, WorkerCommitLevel::CLOSE_REQUIRED, deadline.clone())
             .await?;
 
         let retrying_unknown_commit = session.is_commit_unknown();
@@ -347,11 +324,12 @@ impl FileWriter {
             self.runtime.executor.client_name(),
             committed_blocks,
             final_size,
+            deadline,
         )?;
         if retrying_unknown_commit {
             self.runtime.record_metric(
                 ClientMetric::CommitUnknownRetry,
-                metric_labels("CommitFile", OperationKind::MetadataSessionBarrier).with_outcome("retry"),
+                metric_labels("CommitFile", "metadata").with_outcome("retry"),
             );
         }
         match self.runtime.executor.commit_file(plan).await {
@@ -364,7 +342,7 @@ impl FileWriter {
                 session.mark_commit_unknown();
                 self.runtime.record_metric(
                     ClientMetric::UnknownOutcome,
-                    metric_labels("CommitFile", OperationKind::MetadataSessionBarrier).with_outcome("unknown"),
+                    metric_labels("CommitFile", "metadata").with_outcome("unknown"),
                 );
                 Err(ClientError::UnknownOutcome(format!(
                     "CommitFile outcome is unknown for path {}: {}",
@@ -373,9 +351,8 @@ impl FileWriter {
             }
             Err(err) => {
                 mark_session_after_metadata_error(&mut session, &err);
-                let class = ErrorClassifier.classify_error(&err);
-                self.runtime
-                    .record_error_metric("CommitFile", OperationKind::MetadataSessionBarrier, &class);
+                let class = classify_error(&err);
+                self.runtime.record_error_metric("CommitFile", "metadata", &class);
                 Err(err)
             }
         }
@@ -387,12 +364,15 @@ impl FileWriter {
         let mut session = session_ref.lock().await;
         session.ensure_open_for_abort()?;
         session.discard_buffered_bytes();
-        let plan =
-            session.prepare_abort_cleanup(self.runtime.executor.client_id(), self.runtime.executor.client_name())?;
+        let plan = session.prepare_abort_cleanup(
+            self.runtime.executor.client_id(),
+            self.runtime.executor.client_name(),
+            self.runtime.executor.operation_deadline(),
+        )?;
         let mut abort_error = None;
         self.runtime.record_metric(
             ClientMetric::AbortAttempt,
-            metric_labels("AbortFileWrite", OperationKind::CleanupBestEffort).with_outcome("attempt"),
+            metric_labels("AbortFileWrite", "metadata").with_outcome("attempt"),
         );
         for cleanup in plan.worker_cleanups() {
             let operation = cleanup.operation();
@@ -400,8 +380,7 @@ impl FileWriter {
             if let Err(err) = self
                 .runtime
                 .worker_rpc_with_timeout(
-                    "AbortWrite",
-                    OperationKind::CleanupBestEffort,
+                    &operation,
                     self.runtime
                         .data_plane
                         .abort_block_write(ctx, cleanup.block_write_handle()),
@@ -417,34 +396,26 @@ impl FileWriter {
             .abort_file_write(plan.metadata_operation(), plan.metadata_write_handle())
             .await
         {
-            abort_error.get_or_insert(self.runtime.normalize_outcome_error(
-                "AbortFileWrite",
-                OperationKind::CleanupBestEffort,
-                err,
-            ));
+            abort_error.get_or_insert(self.runtime.normalize_outcome_error("AbortFileWrite", "metadata", err));
         }
         match abort_error {
             Some(err) => {
                 session.mark_abort_unknown();
-                let normalized =
-                    self.runtime
-                        .normalize_outcome_error("AbortWrite", OperationKind::CleanupBestEffort, err);
+                let normalized = self.runtime.normalize_outcome_error("AbortWrite", "worker", err);
                 let metric = if matches!(normalized, ClientError::UnknownOutcome(_)) {
                     ClientMetric::AbortUnknown
                 } else {
                     ClientMetric::AbortFailure
                 };
-                self.runtime.record_metric(
-                    metric,
-                    metric_labels("AbortWrite", OperationKind::CleanupBestEffort).with_outcome("unknown"),
-                );
+                self.runtime
+                    .record_metric(metric, metric_labels("AbortWrite", "worker").with_outcome("unknown"));
                 Err(normalized)
             }
             None => {
                 session.mark_aborted();
                 self.runtime.record_metric(
                     ClientMetric::AbortSuccess,
-                    metric_labels("AbortFileWrite", OperationKind::CleanupBestEffort).with_outcome("success"),
+                    metric_labels("AbortFileWrite", "metadata").with_outcome("success"),
                 );
                 Ok(())
             }
@@ -453,17 +424,18 @@ impl FileWriter {
 
     /// Flushes worker data to the requested level and publishes the metadata sync barrier.
     async fn sync_write_barrier(&mut self, mode: WriteSyncModeProto) -> ClientResult<()> {
+        let deadline = self.runtime.executor.operation_deadline();
         let session_ref = self.handle.write_session();
         let mut session = session_ref.lock().await;
-        self.renew_lease_if_needed(&mut session).await?;
+        self.renew_lease_if_needed(&mut session, deadline.clone()).await?;
         session.ensure_open_for_barrier()?;
         let path = session.path().to_string();
-        self.flush_pending_bytes(&mut session).await?;
+        self.flush_pending_bytes(&mut session, deadline.clone()).await?;
         let target_size = session.cursor();
         let required_level = sync_write_required_commit_level(mode)?;
         let committed_blocks = self
             .runtime
-            .commit_pending_blocks_for_barrier(&mut session, required_level)
+            .commit_pending_blocks_for_barrier(&mut session, required_level, deadline.clone())
             .await?;
         match self
             .runtime
@@ -474,6 +446,7 @@ impl FileWriter {
                 committed_blocks,
                 target_size,
                 mode,
+                deadline,
             )
             .await
         {
@@ -483,12 +456,12 @@ impl FileWriter {
                 Ok(())
             }
             Err(err) => {
-                let class = ErrorClassifier.classify_error(&err);
+                let class = classify_error(&err);
                 if is_unknown_session_barrier_outcome(&err) {
                     session.mark_unknown_outcome();
                     self.runtime.record_metric(
                         ClientMetric::UnknownOutcome,
-                        metric_labels("SyncWrite", OperationKind::MetadataSessionBarrier).with_outcome("unknown"),
+                        metric_labels("SyncWrite", "metadata").with_outcome("unknown"),
                     );
                     return Err(ClientError::UnknownOutcome(format!(
                         "SyncWrite outcome is unknown for path {}: {}",
@@ -496,17 +469,16 @@ impl FileWriter {
                     )));
                 }
                 mark_session_after_metadata_error(&mut session, &err);
-                self.runtime
-                    .record_error_metric("SyncWrite", OperationKind::MetadataSessionBarrier, &class);
+                self.runtime.record_error_metric("SyncWrite", "metadata", &class);
                 Err(err)
             }
         }
     }
 
     /// Writes the buffered tail block, if the session currently has one.
-    async fn flush_pending_bytes(&self, session: &mut WriteSession) -> ClientResult<()> {
+    async fn flush_pending_bytes(&self, session: &mut WriteSession, deadline: OperationDeadline) -> ClientResult<()> {
         if let Some(block) = session.take_buffered_tail() {
-            self.runtime.write_block(session, block).await?;
+            self.runtime.write_block(session, block, deadline).await?;
         }
         Ok(())
     }

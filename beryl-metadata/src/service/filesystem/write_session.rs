@@ -3,18 +3,19 @@
 
 use super::file_write::validate_active_write_layout;
 use super::{
-    worker_endpoint_from_parts, AdmissionFailure, Freshness, FsFailure, FsResult, MetadataFileSystem,
-    PresentedFencingToken, PresentedWriteHandle, RequestContext, SessionKey,
+    worker_endpoint_from_parts, AdmissionFailure, Freshness, FsResult, MetadataFileSystem, PresentedFencingToken,
+    PresentedWriteHandle, RequestContext, SessionKey,
 };
 use crate::error::MetadataError;
 use crate::placement::{PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus};
+use crate::session_registry::AbortCallPayload;
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
 use beryl_common::header::CallerContextFields;
 use beryl_types::fs::{FsErrorCode, InodeId};
 use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, LeaseId};
 use beryl_types::layout::FileLayout;
 use beryl_types::lease::FencingToken;
-use beryl_types::{BlockShape, GroupName, Tier, WorkerEndpointInfo, WriteTarget};
+use beryl_types::{BlockShape, Tier, WorkerEndpointInfo, WriteTarget};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug)]
@@ -28,10 +29,25 @@ struct AbortWriteInput {
     freshness: Freshness,
 }
 
+impl AbortWriteInput {
+    fn replay_payload(&self) -> AbortCallPayload {
+        AbortCallPayload {
+            file_handle: self.file_handle,
+            lease_id: self.lease_id,
+            lease_epoch: self.lease_epoch,
+            open_epoch: self.open_epoch,
+            fencing_block_id: self.fencing_token.as_ref().and_then(|token| token.block_id),
+            fencing_owner: self.fencing_token.as_ref().map(|token| token.owner),
+            fencing_epoch: self.fencing_token.as_ref().map(|token| token.epoch),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct OpenWriteInput {
     pub(super) ctx: RequestContext,
     pub(super) inode_id: InodeId,
+    pub(super) open_path: String,
     pub(super) desired_len: Option<u64>,
     pub(super) mode: crate::inode_lease::WriteMode,
     pub(super) freshness: Freshness,
@@ -57,6 +73,7 @@ pub(super) struct AddBlockInput {
     pub(super) open_epoch: u64,
     pub(super) fencing_token: Option<PresentedFencingToken>,
     pub(super) desired_len: Option<u64>,
+    pub(super) previous_block_id: Option<BlockId>,
     pub(super) freshness: Freshness,
 }
 
@@ -84,6 +101,7 @@ pub(crate) struct RenewLeaseOutput {
 pub(crate) struct AddBlockArgs {
     pub(crate) handle: PresentedWriteHandle,
     pub(crate) desired_len: Option<u64>,
+    pub(crate) previous_block_id: Option<BlockId>,
     pub(crate) freshness: Freshness,
 }
 
@@ -112,6 +130,7 @@ impl MetadataFileSystem {
                 open_epoch: handle.open_epoch,
                 fencing_token: handle.fencing_token,
                 desired_len: args.desired_len,
+                previous_block_id: args.previous_block_id,
                 freshness: args.freshness,
             })
             .await;
@@ -281,21 +300,52 @@ struct PlannedWriteTarget {
 impl MetadataFileSystem {
     async fn abort_write_resolved(&self, req: AbortWriteInput) -> FsResult<()> {
         let file_handle = req.file_handle;
+        if let Err(err) = self.reject_durable_call_reuse(&req.ctx.caller) {
+            return self.failure_from_error(&req.ctx, err, None, None);
+        }
+        let identity = req.ctx.caller.identity();
+        let replay_payload = req.replay_payload();
+        match self
+            .session_registry
+            .replay_completed_abort(identity.client_id, identity.call_id, &replay_payload)
+        {
+            Ok(true) => return self.success(&req.ctx, (), None, None),
+            Ok(false) => {}
+            Err(err) => {
+                return self.failure_from_error(&req.ctx, MetadataError::InvalidArgument(err), None, None);
+            }
+        }
+        if let Err(err) = self.reject_active_session_call_reuse(&req.ctx.caller) {
+            if matches!(
+                self.session_registry
+                    .replay_completed_abort(identity.client_id, identity.call_id, &replay_payload,),
+                Ok(true)
+            ) {
+                return self.success(&req.ctx, (), None, None);
+            }
+            return self.failure_from_error(&req.ctx, err, None, None);
+        }
         let session = match self.session_registry.get_session(file_handle) {
             Some(session) => session,
             None => {
-                return self.session_terminal_failure(
-                    &req.ctx,
-                    ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
-                    format!(
-                        "write handle not found for handle={}; AbortFileWrite cannot be replayed automatically",
-                        file_handle,
-                    ),
-                    None,
-                    None,
-                );
+                if let Err(err) =
+                    self.session_registry
+                        .record_completed_abort(identity.client_id, identity.call_id, replay_payload)
+                {
+                    return self.failure_from_error(&req.ctx, MetadataError::InvalidArgument(err), None, None);
+                }
+                return self.success(&req.ctx, (), None, None);
             }
         };
+        if session.open_client_id != req.ctx.caller.client.client_id {
+            return self.session_terminal_failure(
+                &req.ctx,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                format!("AbortFileWrite client does not own handle={file_handle}"),
+                None,
+                None,
+            );
+        }
 
         let (group_name, mount_epoch) =
             match self
@@ -402,12 +452,34 @@ impl MetadataFileSystem {
         self.lease_manager
             .release(session.inode_id, lease_id, session.lease_epoch);
         self.session_registry.remove_session(file_handle);
+        if let Err(err) =
+            self.session_registry
+                .record_completed_abort(identity.client_id, identity.call_id, replay_payload)
+        {
+            return self.failure_from_error(&req.ctx, MetadataError::InvalidArgument(err), group_name, mount_epoch);
+        }
 
         self.success_with_route_epoch(&req.ctx, (), group_name, mount_epoch, route_epoch)
     }
 
     async fn renew_lease_resolved(&self, req: RenewLeaseInput) -> FsResult<RenewLeaseOutput> {
         let file_handle = req.file_handle;
+
+        if let Err(err) = self.reject_durable_call_reuse(&req.ctx.caller) {
+            return self.failure_from_error(&req.ctx, err, None, None);
+        }
+        let identity = req.ctx.caller.identity();
+        if self.session_registry.has_call_id(identity.client_id, identity.call_id) {
+            return self.failure_from_error(
+                &req.ctx,
+                MetadataError::InvalidArgument(format!(
+                    "call_id {} was already used by an OpenWrite or AddBlock RPC",
+                    identity.call_id
+                )),
+                None,
+                None,
+            );
+        }
 
         let session = match self.session_registry.get_session(file_handle) {
             Some(session) => session,
@@ -424,6 +496,15 @@ impl MetadataFileSystem {
                 );
             }
         };
+        if session.open_client_id != req.ctx.caller.client.client_id {
+            return self.session_terminal_failure(
+                &req.ctx,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                format!("RenewLease client does not own handle={file_handle}"),
+                None,
+                None,
+            );
+        }
 
         let (group_name, mount_epoch) =
             match self
@@ -503,10 +584,13 @@ impl MetadataFileSystem {
             );
         }
 
-        let expires_at_ms = match self
-            .lease_manager
-            .renew(session.inode_id, lease_id_typed, req.lease_epoch)
-        {
+        let expires_at_ms = match self.lease_manager.renew(
+            session.inode_id,
+            lease_id_typed,
+            req.lease_epoch,
+            req.ctx.caller.client.client_id,
+            req.ctx.caller.client.call_id,
+        ) {
             Ok(expires) => expires,
             Err(_) => {
                 return self.session_terminal_failure(
@@ -533,6 +617,55 @@ impl MetadataFileSystem {
             mount_epoch,
             route_epoch,
         )
+    }
+
+    pub(super) async fn replay_open_write(
+        &self,
+        ctx: &RequestContext,
+        open_path: &str,
+        mode: crate::inode_lease::WriteMode,
+        desired_len: Option<u64>,
+        freshness: Freshness,
+    ) -> Option<FsResult<OpenWriteOutput>> {
+        let (file_handle, session) = match self.session_registry.get_open_session(
+            ctx.caller.client.client_id,
+            ctx.caller.client.call_id,
+            open_path,
+            mode,
+            desired_len,
+        ) {
+            Ok(Some(replay)) => replay,
+            Ok(None) => return None,
+            Err(message) => {
+                return Some(self.failure_from_error(ctx, MetadataError::InvalidArgument(message), None, None))
+            }
+        };
+        if let Err(failure) = self.admission.check_data_write(ctx, session.mount_id).await {
+            return Some(self.failure_from_admission(failure));
+        }
+        let (group_name, mount_epoch) =
+            match self
+                .freshness_validator
+                .validate_mount_epoch(ctx, freshness, session.mount_id)
+            {
+                Ok(hints) => hints,
+                Err(err) => return Some(Err(err)),
+            };
+        let route_epoch = match self
+            .freshness_validator
+            .validate_route_epoch(ctx, freshness, group_name.clone(), mount_epoch, "OpenWrite")
+            .await
+        {
+            Ok(route_epoch) => route_epoch,
+            Err(err) => return Some(Err(err)),
+        };
+        Some(self.success_with_route_epoch(
+            ctx,
+            open_write_output(file_handle, &session),
+            group_name,
+            mount_epoch,
+            route_epoch,
+        ))
     }
 
     pub(super) async fn open_write_resolved(&self, req: OpenWriteInput) -> FsResult<OpenWriteOutput> {
@@ -601,6 +734,41 @@ impl MetadataFileSystem {
             crate::inode_lease::WriteMode::Append => inode.attrs.size,
             crate::inode_lease::WriteMode::Write => 0,
         };
+
+        match self.session_registry.get_open_session(
+            caller_ctx.client.client_id,
+            caller_ctx.client.call_id,
+            &req.open_path,
+            mode,
+            req.desired_len,
+        ) {
+            Ok(Some((file_handle, session))) => {
+                if session.inode_id != inode_id {
+                    return self.failure_from_error(
+                        &req.ctx,
+                        MetadataError::InvalidArgument("call_id reused with a different OpenWrite target".to_string()),
+                        group_name,
+                        mount_epoch,
+                    );
+                }
+                return self.success_with_route_epoch(
+                    &req.ctx,
+                    open_write_output(file_handle, &session),
+                    group_name,
+                    mount_epoch,
+                    route_epoch,
+                );
+            }
+            Ok(None) => {}
+            Err(message) => {
+                return self.failure_from_error(
+                    &req.ctx,
+                    MetadataError::InvalidArgument(message),
+                    group_name,
+                    mount_epoch,
+                )
+            }
+        }
 
         let desired_len = req.desired_len.unwrap_or(4 * 1024 * 1024);
         let layout = match self.read_layout(inode_id) {
@@ -838,38 +1006,41 @@ impl MetadataFileSystem {
         };
         self.session_registry
             .remove_inactive_for_inode(inode_id, self.lease_manager.as_ref());
-        let file_handle = self
-            .session_registry
-            .create_session(crate::session_registry::CreateSessionInput {
-                inode_id,
-                mount_id: inode.mount_id,
-                data_handle_id,
-                lease_id,
-                lease_epoch,
-                fencing_token: session_token,
-                open_epoch,
-                base_size,
-                mode,
-                write_targets: write_targets.clone(),
-            });
+        let (file_handle, session) =
+            match self
+                .session_registry
+                .get_or_create_session(crate::session_registry::CreateSessionInput {
+                    inode_id,
+                    mount_id: inode.mount_id,
+                    data_handle_id,
+                    lease_id,
+                    lease_epoch,
+                    fencing_token: session_token,
+                    open_epoch,
+                    base_size,
+                    mode,
+                    open_client_id: caller_ctx.client.client_id,
+                    open_call_id: caller_ctx.client.call_id,
+                    open_path: req.open_path.clone(),
+                    open_desired_len: req.desired_len,
+                    layout,
+                    expires_at_ms,
+                    write_targets: write_targets.clone(),
+                }) {
+                Ok(result) => result,
+                Err(message) => {
+                    return self.failure_from_error(
+                        &req.ctx,
+                        MetadataError::InvalidArgument(message),
+                        group_name,
+                        mount_epoch,
+                    )
+                }
+            };
 
         self.success_with_route_epoch(
             &req.ctx,
-            OpenWriteOutput {
-                inode_id,
-                data_handle_id,
-                session_key: SessionKey {
-                    file_handle,
-                    lease_id,
-                    lease_epoch,
-                    open_epoch,
-                    fencing_token: session_token,
-                },
-                layout,
-                write_targets,
-                base_size,
-                expires_at_ms,
-            },
+            open_write_output(file_handle, &session),
             group_name,
             mount_epoch,
             route_epoch,
@@ -878,6 +1049,18 @@ impl MetadataFileSystem {
 
     pub(super) async fn add_block_resolved(&self, req: AddBlockInput) -> FsResult<AddBlockOutput> {
         let file_handle = req.file_handle;
+        if let Err(err) = self.reject_durable_call_reuse(&req.ctx.caller) {
+            return self.failure_from_error(&req.ctx, err, None, None);
+        }
+        let identity = req.ctx.caller.identity();
+        if self.lease_manager.has_renew_call(identity.client_id, identity.call_id) {
+            return self.failure_from_error(
+                &req.ctx,
+                MetadataError::InvalidArgument(format!("call_id {} was already used by RenewLease", identity.call_id)),
+                None,
+                None,
+            );
+        }
         let session = match self.session_registry.get_session(file_handle) {
             Some(session) => session,
             None => {
@@ -893,6 +1076,15 @@ impl MetadataFileSystem {
                 );
             }
         };
+        if session.open_client_id != req.ctx.caller.client.client_id {
+            return self.session_terminal_failure(
+                &req.ctx,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                format!("AddBlock client does not own handle={file_handle}"),
+                None,
+                None,
+            );
+        }
 
         let (group_name, mount_epoch) =
             match self
@@ -987,13 +1179,18 @@ impl MetadataFileSystem {
             );
         }
 
-        let target = match self.session_registry.allocate_target(file_handle, req.desired_len) {
-            Some(target) => target,
-            None => {
-                return self.fatal_fs_failure(
+        let target = match self.session_registry.allocate_target(
+            file_handle,
+            req.ctx.caller.client.client_id,
+            req.ctx.caller.client.call_id,
+            req.previous_block_id,
+            req.desired_len,
+        ) {
+            Ok(target) => target,
+            Err(message) => {
+                return self.failure_from_error(
                     &req.ctx,
-                    FsErrorCode::EAgain,
-                    "no preallocated write target available; reopen with a larger desired_len",
+                    MetadataError::InvalidArgument(format!("AddBlock rejected for handle={file_handle}: {message}")),
                     group_name,
                     mount_epoch,
                 );
@@ -1007,84 +1204,23 @@ impl MetadataFileSystem {
             route_epoch,
         )
     }
+}
 
-    pub(super) fn preflight_open_write_runtime(
-        &self,
-        req_ctx: &RequestContext,
-        desired_len: Option<u64>,
-        layout: FileLayout,
-        group_name: Option<GroupName>,
-        mount_epoch: Option<u64>,
-    ) -> Option<FsFailure> {
-        let worker_manager = match self.worker_manager.as_ref() {
-            Some(worker_manager) => worker_manager,
-            None => {
-                return self
-                    .failure_from_error::<()>(
-                        req_ctx,
-                        MetadataError::ServiceUnavailable("Worker manager not available".to_string()),
-                        group_name,
-                        mount_epoch,
-                    )
-                    .err();
-            }
-        };
-        if let Err(err) = validate_active_write_layout(&layout) {
-            return self
-                .failure_from_error::<()>(req_ctx, err, group_name, mount_epoch)
-                .err();
-        }
-        let placement_group_name = match self.require_worker_lookup_group(
-            req_ctx,
-            group_name.clone(),
-            mount_epoch,
-            None,
-            "OpenWrite preflight",
-        ) {
-            Ok(group_name) => group_name,
-            Err(failure) => return Some(failure),
-        };
-
-        let desired_len = desired_len.unwrap_or(4 * 1024 * 1024);
-        let block_size = u64::from(layout.block_size);
-        let num_blocks = desired_len.div_ceil(block_size).clamp(1, 10);
-        let placement_views = worker_manager.collect_worker_placement_views(&placement_group_name);
-        let caller = req_ctx
-            .caller
-            .caller_context
-            .as_ref()
-            .map(CallerContextFields::from_caller_context);
-        let planner = PlacementPlanner;
-        for i in 0..num_blocks {
-            let block_id = BlockId::new(DataHandleId::new(0), BlockIndex::new(i as u32));
-            let placement_req = PlacementRequest {
-                group_name: placement_group_name.clone(),
-                op: PlacementOp::Write,
-                block_id,
-                block_stamp: None,
-                layout,
-                caller: caller.clone(),
-                existing: Vec::new(),
-                exclude_workers: Vec::new(),
-                target_replicas: layout.replication,
-            };
-            let placement = planner.plan(&placement_req, &placement_views);
-            if placement.status != PlacementStatus::Ok || placement.workers.is_empty() {
-                return self
-                    .failure_from_error::<()>(
-                        req_ctx,
-                        MetadataError::ServiceUnavailable(format!(
-                            "Failed to select write placement: {}",
-                            placement.failure_message(&placement_req)
-                        )),
-                        group_name,
-                        mount_epoch,
-                    )
-                    .err();
-            }
-        }
-
-        None
+fn open_write_output(file_handle: u64, session: &crate::session_registry::WriteSession) -> OpenWriteOutput {
+    OpenWriteOutput {
+        inode_id: session.inode_id,
+        data_handle_id: session.data_handle_id,
+        session_key: SessionKey {
+            file_handle,
+            lease_id: session.lease_id,
+            lease_epoch: session.lease_epoch,
+            open_epoch: session.open_epoch,
+            fencing_token: session.fencing_token,
+        },
+        layout: session.layout,
+        write_targets: session.write_targets.clone(),
+        base_size: session.base_size,
+        expires_at_ms: session.expires_at_ms,
     }
 }
 
@@ -1136,24 +1272,36 @@ mod tests {
             .write_session_for_handle(file_handle)
             .expect("session should be installed");
 
+        let request = abort_input_for_session(&session, file_handle, request_context());
         let success = filesystem
-            .abort_write_resolved(abort_input_for_session(&session, file_handle, request_context()))
+            .abort_write_resolved(request.clone())
             .await
             .expect("abort succeeds");
+        filesystem
+            .abort_write_resolved(request.clone())
+            .await
+            .expect("AbortFileWrite replay is ensure-absent");
+        let mut mismatch = request;
+        mismatch.lease_epoch += 1;
+        let mismatch = filesystem
+            .abort_write_resolved(mismatch)
+            .await
+            .expect_err("AbortFileWrite replay must reject payload drift");
 
         assert!(filesystem.write_session_for_handle(file_handle).is_none());
         assert!(filesystem.lease_manager().get_active_lease(inode_id).is_none());
         assert_eq!(success.mount_epoch, Some(9));
         assert_eq!(success.group_name, Some(group_name_value));
+        assert_fail(&mismatch.error, ErrorKind::Fs(FsErrorCode::EInval));
     }
 
     #[tokio::test]
-    async fn abort_checks_handle() {
+    async fn abort_is_ensure_absent_and_still_checks_present_handle() {
         let mount_id = MountId::new(43);
         let inode_id = InodeId::new(430);
         let filesystem = filesystem_with_mount(mount_id, 9, &group_name("g6"));
 
-        let failure = filesystem
+        let success = filesystem
             .abort_write_resolved(AbortWriteInput {
                 ctx: request_context(),
                 file_handle: 999,
@@ -1168,14 +1316,8 @@ mod tests {
                 freshness: Freshness::default(),
             })
             .await
-            .expect_err("missing write handle must be rejected");
-
-        assert_reopen_write_session(&failure.error, ErrorKind::Metadata(MetadataErrorKind::SessionInvalid));
-        let roundtrip = crate::service::wire::header_from_fs_failure(&request_context(), &failure);
-        let roundtrip_error = beryl_proto::convert::rpc_error_from_proto(
-            roundtrip.error.as_ref().expect("session failure must carry wire error"),
-        );
-        assert_reopen_write_session(&roundtrip_error, ErrorKind::Metadata(MetadataErrorKind::SessionInvalid));
+            .expect("missing write handle is already absent");
+        assert_eq!(success.group_name, None);
 
         let file_handle = install_write_session(&filesystem, inode_id, mount_id);
         let session = filesystem
@@ -1207,10 +1349,16 @@ mod tests {
             .write_session_for_handle(file_handle)
             .expect("session should be installed");
 
-        filesystem
-            .renew_lease_resolved(renew_input_for_session(&session, file_handle, request_context()))
+        let renew_ctx = request_context();
+        let renewed = filesystem
+            .renew_lease_resolved(renew_input_for_session(&session, file_handle, renew_ctx.clone()))
             .await
             .expect("valid full write handle should renew lease");
+        let replay = filesystem
+            .renew_lease_resolved(renew_input_for_session(&session, file_handle, renew_ctx))
+            .await
+            .expect("same RenewLease call should replay");
+        assert_eq!(replay.payload.expires_at_ms, renewed.payload.expires_at_ms);
 
         let mut stale_open = renew_input_for_session(&session, file_handle, request_context());
         stale_open.open_epoch += 1;
@@ -1297,6 +1445,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(4096),
                 mode: crate::inode_lease::WriteMode::Write,
                 freshness: Freshness::default(),
@@ -1317,6 +1466,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id: env.inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(2048),
                 mode: crate::inode_lease::WriteMode::Write,
                 freshness: Freshness::default(),
@@ -1341,6 +1491,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id: env.inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(2048),
                 mode: crate::inode_lease::WriteMode::Write,
                 freshness: Freshness::default(),
@@ -1352,6 +1503,156 @@ mod tests {
         let target = add_block_for_key(&env.filesystem, &key, 2048).await;
 
         assert_eq!(target.tier, Tier::Ssd);
+    }
+
+    #[tokio::test]
+    async fn open_write_replay_returns_exact_session_and_rejects_payload_drift() {
+        let env = write_flow_env(0).await;
+        let ctx = request_context();
+        let request = OpenWriteInput {
+            ctx: ctx.clone(),
+            inode_id: env.inode_id,
+            open_path: "/test".to_string(),
+            desired_len: Some(2048),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        };
+        let first = env
+            .filesystem
+            .open_write_resolved(request.clone())
+            .await
+            .expect("first OpenWrite");
+        let replay = env
+            .filesystem
+            .open_write_resolved(request)
+            .await
+            .expect("same OpenWrite replays");
+
+        assert_eq!(replay.payload.session_key, first.payload.session_key);
+        assert_eq!(replay.payload.expires_at_ms, first.payload.expires_at_ms);
+        assert_eq!(replay.payload.write_targets, first.payload.write_targets);
+
+        let failure = env
+            .filesystem
+            .open_write_resolved(OpenWriteInput {
+                ctx,
+                inode_id: env.inode_id,
+                open_path: "/test".to_string(),
+                desired_len: Some(4096),
+                mode: crate::inode_lease::WriteMode::Write,
+                freshness: Freshness::default(),
+            })
+            .await
+            .expect_err("same call_id with changed payload must fail");
+        assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EInval));
+        assert!(failure.error.message.contains("different OpenWrite payload"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_open_write_duplicate_creates_one_logical_session() {
+        let env = write_flow_env(0).await;
+        let ctx = request_context();
+        let first_request = OpenWriteInput {
+            ctx: ctx.clone(),
+            inode_id: env.inode_id,
+            open_path: "/test".to_string(),
+            desired_len: Some(2048),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        };
+        let second_request = first_request.clone();
+        let (first, second) = tokio::join!(
+            env.filesystem.open_write_resolved(first_request),
+            env.filesystem.open_write_resolved(second_request)
+        );
+        let first = first.expect("first concurrent OpenWrite");
+        let second = second.expect("second concurrent OpenWrite");
+
+        assert_eq!(second.payload.session_key, first.payload.session_key);
+        assert_eq!(second.payload.expires_at_ms, first.payload.expires_at_ms);
+        assert_eq!(second.payload.write_targets, first.payload.write_targets);
+    }
+
+    #[tokio::test]
+    async fn add_block_response_loss_replay_does_not_advance_target() {
+        let env = write_flow_env(0).await;
+        let open = env
+            .filesystem
+            .open_write_resolved(OpenWriteInput {
+                ctx: request_context(),
+                inode_id: env.inode_id,
+                open_path: "/test".to_string(),
+                desired_len: Some(8192),
+                mode: crate::inode_lease::WriteMode::Write,
+                freshness: Freshness::default(),
+            })
+            .await
+            .expect("OpenWrite");
+        let key = open.payload.session_key;
+        let add_ctx = request_context();
+        let request = AddBlockInput {
+            ctx: add_ctx.clone(),
+            file_handle: key.file_handle,
+            lease_id: Some(key.lease_id),
+            lease_epoch: key.lease_epoch,
+            open_epoch: key.open_epoch,
+            fencing_token: Some(presented_key_token(&key)),
+            desired_len: Some(64),
+            previous_block_id: None,
+            freshness: Freshness::default(),
+        };
+        let first = env
+            .filesystem
+            .add_block_resolved(request.clone())
+            .await
+            .expect("first AddBlock");
+        let replay = env
+            .filesystem
+            .add_block_resolved(request)
+            .await
+            .expect("same AddBlock replays");
+        assert_eq!(replay.payload.target, first.payload.target);
+        assert_eq!(
+            env.filesystem
+                .write_session_for_handle(key.file_handle)
+                .unwrap()
+                .next_target_index,
+            1
+        );
+
+        let conflict = env
+            .filesystem
+            .add_block_resolved(AddBlockInput {
+                ctx: add_ctx,
+                file_handle: key.file_handle,
+                lease_id: Some(key.lease_id),
+                lease_epoch: key.lease_epoch,
+                open_epoch: key.open_epoch,
+                fencing_token: Some(presented_key_token(&key)),
+                desired_len: Some(32),
+                previous_block_id: None,
+                freshness: Freshness::default(),
+            })
+            .await
+            .expect_err("same call_id with changed AddBlock payload must fail");
+        assert_fail(&conflict.error, ErrorKind::Fs(FsErrorCode::EInval));
+
+        let second = env
+            .filesystem
+            .add_block_resolved(AddBlockInput {
+                ctx: request_context(),
+                file_handle: key.file_handle,
+                lease_id: Some(key.lease_id),
+                lease_epoch: key.lease_epoch,
+                open_epoch: key.open_epoch,
+                fencing_token: Some(presented_key_token(&key)),
+                desired_len: Some(64),
+                previous_block_id: Some(first.payload.target.block_id),
+                freshness: Freshness::default(),
+            })
+            .await
+            .expect("successor AddBlock");
+        assert_ne!(second.payload.target.block_id, first.payload.target.block_id);
     }
 
     #[tokio::test]

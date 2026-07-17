@@ -16,7 +16,7 @@ mod storage;
 mod types;
 
 pub(crate) use command::proposal_timestamp_ms;
-pub(crate) use command::{Command, FileCommitMode, Mutation};
+pub(crate) use command::{CanonicalNamespaceRequest, Command, CreateFileMode, FileCommitMode, Mutation};
 pub(crate) use node::AppRaftNode;
 pub(crate) use read_view::{MetadataReadView, RoutingDelta};
 pub(crate) use response::{AppDataResponse, FsCommandResult, WorkerCommandResult};

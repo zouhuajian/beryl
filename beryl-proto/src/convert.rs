@@ -1818,24 +1818,39 @@ mod tests {
             proto_message_fields(metadata_proto, "CreateFileResponseProto"),
             vec![
                 ("common.ResponseHeaderProto", "header", 1),
-                ("WriteHandleProto", "write_handle", 2),
                 ("common.DataHandleIdProto", "data_handle_id", 3),
-                ("uint64", "base_size", 4),
-                ("WriteTargetProto", "initial_targets", 5),
-                ("uint64", "expires_at_ms", 6),
                 ("common.FileLayoutProto", "layout", 7),
+                ("fs.InodeIdProto", "inode_id", 8),
+                ("uint64", "file_size", 9),
             ]
         );
         assert_eq!(
-            proto_message_fields(metadata_proto, "AppendFileResponseProto"),
+            proto_message_fields(metadata_proto, "OpenWriteRequestProto"),
+            vec![
+                ("common.RequestHeaderProto", "header", 1),
+                ("string", "path", 2),
+                ("OpenWriteModeProto", "mode", 3),
+                ("uint64", "desired_len", 4),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(metadata_proto, "OpenWriteResponseProto"),
             vec![
                 ("common.ResponseHeaderProto", "header", 1),
                 ("WriteHandleProto", "write_handle", 2),
                 ("common.DataHandleIdProto", "data_handle_id", 3),
                 ("uint64", "base_size", 4),
-                ("WriteTargetProto", "initial_targets", 5),
                 ("uint64", "expires_at_ms", 6),
                 ("common.FileLayoutProto", "layout", 7),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(metadata_proto, "AddBlockRequestProto"),
+            vec![
+                ("common.RequestHeaderProto", "header", 1),
+                ("WriteHandleProto", "write_handle", 2),
+                ("uint64", "desired_len", 3),
+                ("common.BlockIdProto", "previous_block_id", 4),
             ]
         );
 

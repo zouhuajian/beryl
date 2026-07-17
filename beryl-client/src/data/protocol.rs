@@ -483,7 +483,6 @@ fn block_stamp_mismatch_error(block_read: &PlannedBlockRead, actual: u64, operat
         message,
     );
     ClientError::from(crate::rpc_error::ClientAction::Refresh {
-        reason: crate::runtime::MetadataRefreshCause::BlockStampMismatch,
         hint: Box::new(crate::rpc_error::RefreshHint {
             worker_resolve_required: true,
             ..crate::rpc_error::RefreshHint::default()
@@ -565,16 +564,14 @@ mod tests {
     use beryl_types::{BlockId, BlockIndex, ClientId, DataHandleId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol};
 
     use crate::rpc_error::ClientAction;
-    use crate::runtime::{
-        ErrorClass, ErrorClassifier, MetadataRefreshCause, OperationContext, OperationIdentity, OperationKind,
-    };
+    use crate::runtime::{classify_error, ErrorClass, OperationContext, OperationDeadline};
 
     #[test]
     fn missing_worker_control_header_is_invalid_header_action() {
         let attempt = data_attempt_context();
         let err = parse_worker_control_header(&attempt, None).expect_err("missing data header must fail");
 
-        assert_ne!(ErrorClassifier.classify_error(&err), ErrorClass::RetryableTransport);
+        assert_ne!(classify_error(&err), ErrorClass::RetryableTransport);
         match action(&err) {
             ClientAction::Fail { rpc_error } => {
                 assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
@@ -592,7 +589,7 @@ mod tests {
 
         let err = parse_worker_control_header(&attempt, Some(&malformed)).expect_err("malformed data header must fail");
 
-        assert_ne!(ErrorClassifier.classify_error(&err), ErrorClass::RetryableTransport);
+        assert_ne!(classify_error(&err), ErrorClass::RetryableTransport);
         match action(&err) {
             ClientAction::Fail { rpc_error } => {
                 assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
@@ -622,8 +619,7 @@ mod tests {
         let err = parse_worker_control_header(&attempt, Some(&header)).expect_err("refresh error must surface");
 
         match action(&err) {
-            ClientAction::Refresh { reason, hint, .. } => {
-                assert_eq!(*reason, MetadataRefreshCause::BlockStampMismatch);
+            ClientAction::Refresh { hint, .. } => {
                 assert!(hint.worker_resolve_required);
             }
             other => panic!("expected refresh action, got {other:?}"),
@@ -644,8 +640,7 @@ mod tests {
         .expect_err("block stamp mismatch must be typed");
 
         match action(&err) {
-            ClientAction::Refresh { reason, rpc_error, .. } => {
-                assert_eq!(*reason, MetadataRefreshCause::BlockStampMismatch);
+            ClientAction::Refresh { rpc_error, .. } => {
                 assert_eq!(rpc_error.kind, ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch));
             }
             other => panic!("expected block stamp refresh action, got {other:?}"),
@@ -874,8 +869,8 @@ mod tests {
         )
         .expect_err("fatal fencing mismatch must fail");
 
-        assert_eq!(ErrorClassifier.classify_error(&err), ErrorClass::Fencing);
-        assert_ne!(ErrorClassifier.classify_error(&err), ErrorClass::RetryableTransport);
+        assert_eq!(classify_error(&err), ErrorClass::Fencing);
+        assert_ne!(classify_error(&err), ErrorClass::RetryableTransport);
     }
 
     #[test]
@@ -895,14 +890,14 @@ mod tests {
         .expect_err("worker run mismatch must fail");
 
         assert_eq!(
-            ErrorClassifier.classify_error(&err),
-            ErrorClass::RefreshMetadata(crate::runtime::MetadataRefreshCause::WorkerRunMismatch)
+            classify_error(&err),
+            ErrorClass::RefreshMetadata(ErrorKind::Worker(WorkerErrorKind::RunMismatch))
         );
     }
 
     #[test]
     fn tonic_request_uses_attempt_timeout_when_present() {
-        let attempt = write_attempt_context().with_operation_timeout_ms(Some(5_000));
+        let attempt = write_attempt_context();
 
         let request = build_tonic_request(&attempt, ());
 
@@ -910,12 +905,12 @@ mod tests {
     }
 
     #[test]
-    fn tonic_request_has_no_timeout_without_attempt_deadline() {
-        let attempt = write_attempt_context().with_operation_timeout_ms(None);
+    fn tonic_request_uses_public_operation_deadline() {
+        let attempt = write_attempt_context();
 
         let request = build_tonic_request(&attempt, ());
 
-        assert!(request.metadata().get("grpc-timeout").is_none());
+        assert!(request.metadata().get("grpc-timeout").is_some());
     }
 
     #[test]
@@ -997,22 +992,24 @@ mod tests {
     }
 
     fn data_attempt_context() -> AttemptContext {
-        let operation = OperationContext::new(
+        let operation = OperationContext::new_named(
             ClientId::new(7),
-            OperationKind::WorkerReadData,
+            "test-client",
             "OpenReadStream",
-            OperationIdentity::path("/alpha"),
+            Some("/alpha".to_string()),
+            OperationDeadline::new(5_000),
         )
         .expect("operation context");
         AttemptContext::for_data(&operation, 0)
     }
 
     fn write_attempt_context() -> AttemptContext {
-        let operation = OperationContext::new(
+        let operation = OperationContext::new_named(
             ClientId::new(7),
-            OperationKind::WorkerWriteData,
+            "test-client",
             "OpenWriteStream",
-            OperationIdentity::session("/alpha", "handle=1"),
+            Some("/alpha".to_string()),
+            OperationDeadline::new(5_000),
         )
         .expect("operation context");
         AttemptContext::for_data(&operation, 0)
@@ -1117,7 +1114,7 @@ mod tests {
     }
 
     fn assert_invalid_worker_header(err: &ClientError) {
-        assert_ne!(ErrorClassifier.classify_error(err), ErrorClass::RetryableTransport);
+        assert_ne!(classify_error(err), ErrorClass::RetryableTransport);
         match action(err) {
             ClientAction::Fail { rpc_error } => {
                 assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));

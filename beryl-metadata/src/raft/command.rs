@@ -15,7 +15,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(crate) const COMMAND_FORMAT_VERSION: u16 = 3;
+pub(crate) const COMMAND_FORMAT_VERSION: u16 = 5;
+
+/// Durable namespace semantics for CreateFile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum CreateFileMode {
+    CreateNew,
+    CreateOrOverwrite,
+}
 
 /// File layout publication semantics for a committed write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +42,7 @@ pub(crate) struct Command {
     version: u16,
     dedup: DedupKey,
     proposed_at_ms: u64,
+    canonical_namespace_request: Option<CanonicalNamespaceRequest>,
     mutation: Mutation,
 }
 
@@ -44,6 +52,26 @@ impl Command {
             version: COMMAND_FORMAT_VERSION,
             dedup,
             proposed_at_ms,
+            canonical_namespace_request: None,
+            mutation,
+        }
+    }
+
+    pub(crate) fn new_namespace(
+        dedup: DedupKey,
+        proposed_at_ms: u64,
+        canonical_request: CanonicalNamespaceRequest,
+        mutation: Mutation,
+    ) -> Self {
+        assert!(
+            canonical_request.matches_mutation(&mutation),
+            "canonical namespace request must match its authority mutation"
+        );
+        Self {
+            version: COMMAND_FORMAT_VERSION,
+            dedup,
+            proposed_at_ms,
+            canonical_namespace_request: Some(canonical_request),
             mutation,
         }
     }
@@ -74,14 +102,169 @@ impl Command {
     ///
     /// Dedup identity and proposal time are deliberately excluded.
     pub fn fingerprint(&self) -> CommandFingerprint {
-        let bytes = encode_to_vec((self.version, &self.mutation), standard())
-            .expect("fingerprint serialization should not fail");
+        let bytes = match &self.canonical_namespace_request {
+            Some(request) => encode_to_vec((self.version, request), standard())
+                .expect("namespace fingerprint serialization should not fail"),
+            None => encode_to_vec((self.version, &self.mutation), standard())
+                .expect("fingerprint serialization should not fail"),
+        };
+        Self::hash_fingerprint(bytes)
+    }
+
+    pub(crate) fn create_directory_fingerprint(path: &str, attrs: &FileAttrs, recursive: bool) -> CommandFingerprint {
+        Self::hash_fingerprint(
+            encode_to_vec(
+                (
+                    COMMAND_FORMAT_VERSION,
+                    CanonicalNamespaceRequest::CreateDirectory {
+                        path: path.to_string(),
+                        attrs: attrs.clone(),
+                        recursive,
+                    },
+                ),
+                standard(),
+            )
+            .expect("namespace fingerprint serialization should not fail"),
+        )
+    }
+
+    pub(crate) fn create_file_fingerprint(
+        path: &str,
+        attrs: &FileAttrs,
+        layout: &FileLayout,
+        mode: CreateFileMode,
+    ) -> CommandFingerprint {
+        Self::hash_fingerprint(
+            encode_to_vec(
+                (
+                    COMMAND_FORMAT_VERSION,
+                    CanonicalNamespaceRequest::CreateFile {
+                        path: path.to_string(),
+                        attrs: attrs.clone(),
+                        layout: *layout,
+                        mode,
+                    },
+                ),
+                standard(),
+            )
+            .expect("namespace fingerprint serialization should not fail"),
+        )
+    }
+
+    pub(crate) fn delete_fingerprint(path: &str, recursive: bool) -> CommandFingerprint {
+        Self::hash_fingerprint(
+            encode_to_vec(
+                (
+                    COMMAND_FORMAT_VERSION,
+                    CanonicalNamespaceRequest::Delete {
+                        path: path.to_string(),
+                        recursive,
+                    },
+                ),
+                standard(),
+            )
+            .expect("namespace fingerprint serialization should not fail"),
+        )
+    }
+
+    pub(crate) fn rename_fingerprint(src_path: &str, dst_path: &str, flags: u32) -> CommandFingerprint {
+        Self::hash_fingerprint(
+            encode_to_vec(
+                (
+                    COMMAND_FORMAT_VERSION,
+                    CanonicalNamespaceRequest::Rename {
+                        src_path: src_path.to_string(),
+                        dst_path: dst_path.to_string(),
+                        flags,
+                    },
+                ),
+                standard(),
+            )
+            .expect("namespace fingerprint serialization should not fail"),
+        )
+    }
+
+    fn hash_fingerprint(bytes: Vec<u8>) -> CommandFingerprint {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
         let digest = hasher.finalize();
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&digest[..8]);
         CommandFingerprint(u64::from_be_bytes(buf))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) enum CanonicalNamespaceRequest {
+    CreateDirectory {
+        path: String,
+        attrs: FileAttrs,
+        recursive: bool,
+    },
+    CreateFile {
+        path: String,
+        attrs: FileAttrs,
+        layout: FileLayout,
+        mode: CreateFileMode,
+    },
+    Delete {
+        path: String,
+        recursive: bool,
+    },
+    Rename {
+        src_path: String,
+        dst_path: String,
+        flags: u32,
+    },
+}
+
+impl CanonicalNamespaceRequest {
+    fn matches_mutation(&self, mutation: &Mutation) -> bool {
+        match (self, mutation) {
+            (
+                Self::CreateDirectory {
+                    attrs,
+                    recursive: false,
+                    ..
+                },
+                Mutation::Mkdir {
+                    attrs: mutation_attrs, ..
+                },
+            ) => attrs == mutation_attrs,
+            (
+                Self::CreateDirectory {
+                    attrs, recursive: true, ..
+                },
+                Mutation::CreateDirectory {
+                    attrs: mutation_attrs, ..
+                },
+            ) => attrs == mutation_attrs,
+            (
+                Self::CreateFile {
+                    attrs, layout, mode, ..
+                },
+                Mutation::CreateFile {
+                    attrs: mutation_attrs,
+                    layout: mutation_layout,
+                    mode: mutation_mode,
+                    ..
+                },
+            ) => attrs == mutation_attrs && layout == mutation_layout && mode == mutation_mode,
+            (
+                Self::Delete { recursive, .. },
+                Mutation::Delete {
+                    recursive: mutation_recursive,
+                    ..
+                },
+            ) => recursive == mutation_recursive,
+            (
+                Self::Rename { flags, .. },
+                Mutation::Rename {
+                    flags: mutation_flags, ..
+                },
+            ) => flags == mutation_flags,
+            _ => false,
+        }
     }
 }
 
@@ -96,23 +279,22 @@ pub(crate) enum Mutation {
         name: String,
         attrs: FileAttrs,
     },
+    CreateDirectory {
+        root_inode_id: InodeId,
+        components: Vec<String>,
+        attrs: FileAttrs,
+    },
     CreateFile {
         parent_inode_id: InodeId,
         name: String,
         attrs: FileAttrs,
         layout: FileLayout,
+        mode: CreateFileMode,
     },
-    Unlink {
+    Delete {
         parent_inode_id: InodeId,
         name: String,
-    },
-    DeleteEmptyDir {
-        parent_inode_id: InodeId,
-        name: String,
-    },
-    DeleteTree {
-        parent_inode_id: InodeId,
-        name: String,
+        recursive: bool,
     },
     Rename {
         src_parent_inode_id: InodeId,
@@ -215,6 +397,28 @@ mod tests {
         )
     }
 
+    fn canonical_create_command(dedup: DedupKey, parent_inode_id: InodeId, path: &str) -> Command {
+        let attrs = FileAttrs::new();
+        let layout = FileLayout::new(4096, 4096, 1);
+        Command::new_namespace(
+            dedup,
+            100,
+            CanonicalNamespaceRequest::CreateFile {
+                path: path.to_string(),
+                attrs: attrs.clone(),
+                layout,
+                mode: CreateFileMode::CreateNew,
+            },
+            Mutation::CreateFile {
+                parent_inode_id,
+                name: "file".to_string(),
+                attrs,
+                layout,
+                mode: CreateFileMode::CreateNew,
+            },
+        )
+    }
+
     #[test]
     fn fingerprint_is_stable_for_same_payload() {
         let first = rename_command(dedup(7, 1), 100, "new");
@@ -245,6 +449,25 @@ mod tests {
     }
 
     #[test]
+    fn namespace_fingerprint_uses_canonical_path_not_resolved_inode_ids() {
+        let first = canonical_create_command(dedup(7, 40), InodeId::new(10), "/dir/file");
+        let same_request_after_namespace_change = canonical_create_command(dedup(7, 40), InodeId::new(20), "/dir/file");
+        let different_path = canonical_create_command(dedup(7, 40), InodeId::new(20), "/other/file");
+
+        assert_eq!(first.fingerprint(), same_request_after_namespace_change.fingerprint());
+        assert_ne!(first.fingerprint(), different_path.fingerprint());
+        assert_eq!(
+            first.fingerprint(),
+            Command::create_file_fingerprint(
+                "/dir/file",
+                &FileAttrs::new(),
+                &FileLayout::new(4096, 4096, 1),
+                CreateFileMode::CreateNew,
+            )
+        );
+    }
+
+    #[test]
     fn fingerprint_includes_command_version() {
         let current = rename_command(dedup(7, 31), 100, "new");
         let mut future = current.clone();
@@ -255,23 +478,25 @@ mod tests {
 
     #[test]
     fn fingerprint_includes_mutation_type() {
-        let unlink = Command::new(
+        let mkdir = Command::new(
             dedup(7, 5),
             100,
-            Mutation::Unlink {
+            Mutation::Mkdir {
                 parent_inode_id: InodeId::new(10),
                 name: "entry".to_string(),
+                attrs: FileAttrs::new(),
             },
         );
-        let delete_empty_dir = Command::new(
+        let delete = Command::new(
             dedup(7, 6),
             100,
-            Mutation::DeleteEmptyDir {
+            Mutation::Delete {
                 parent_inode_id: InodeId::new(10),
                 name: "entry".to_string(),
+                recursive: false,
             },
         );
-        assert_ne!(unlink.fingerprint(), delete_empty_dir.fingerprint());
+        assert_ne!(mkdir.fingerprint(), delete.fingerprint());
     }
 
     #[test]

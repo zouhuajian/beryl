@@ -8,52 +8,17 @@ use crate::rpc_error::ClientAction;
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RpcErrorDetail};
 use beryl_types::fs::FsErrorCode;
 
-/// Metadata refresh cause used by the runtime executor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MetadataRefreshCause {
-    /// Metadata leader changed or the target is not leader.
-    NotLeader,
-    /// Path or mount owner group changed.
-    OwnerGroupMismatch,
-    /// Mount epoch changed.
-    MountEpochMismatch,
-    /// Metadata state watermark is stale.
-    StaleState,
-    /// Route/layout epoch changed.
-    RouteEpochMismatch,
-    /// Worker process run changed while WorkerId and endpoint may be reused.
-    WorkerRunMismatch,
-    /// Worker reported that the metadata-provided block stamp is stale.
-    BlockStampMismatch,
-    /// Refresh was requested without enough structured detail.
-    Unknown,
-}
-
-impl MetadataRefreshCause {
-    /// Low-cardinality label for metrics.
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::NotLeader => "not_leader",
-            Self::OwnerGroupMismatch => "owner_group_mismatch",
-            Self::MountEpochMismatch => "mount_epoch_mismatch",
-            Self::StaleState => "stale_state",
-            Self::RouteEpochMismatch => "route_epoch_mismatch",
-            Self::WorkerRunMismatch => "worker_run_mismatch",
-            Self::BlockStampMismatch => "block_stamp_mismatch",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-/// Runtime error classification used by [`crate::runtime::OperationExecutor`].
+/// Runtime error classification used by the metadata executor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ErrorClass {
     /// Unrecoverable error.
     Fatal,
     /// Retryable transport/framework failure.
     RetryableTransport,
+    /// Server explicitly asked the client to retry.
+    ServerRetry,
     /// Structured refresh is needed before replay.
-    RefreshMetadata(MetadataRefreshCause),
+    RefreshMetadata(ErrorKind),
     /// Local or server-side invalid argument.
     InvalidArgument,
     /// Malformed successful RPC header.
@@ -78,6 +43,7 @@ impl ErrorClass {
         match self {
             Self::Fatal => "fatal",
             Self::RetryableTransport => "retryable_transport",
+            Self::ServerRetry => "server_retry",
             Self::RefreshMetadata(_) => "refresh_metadata",
             Self::InvalidArgument => "invalid_argument",
             Self::InvalidHeader => "invalid_header",
@@ -91,49 +57,43 @@ impl ErrorClass {
     }
 }
 
-/// Classifies transport, metadata rpc_error, and worker RPC errors.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ErrorClassifier;
-
-impl ErrorClassifier {
-    /// Classify a client error without string matching.
-    pub(crate) fn classify_error(&self, err: &ClientError) -> ErrorClass {
-        match err {
-            ClientError::InvalidArgument(_) | ClientError::InvalidLayout(_) => ErrorClass::InvalidArgument,
-            ClientError::InvalidResponse { .. } => ErrorClass::Fatal,
-            ClientError::Unsupported(_) | ClientError::NotSupported(_) | ClientError::Unimplemented(_) => {
-                ErrorClass::Unsupported
-            }
-            ClientError::Action(action) => self.classify_action(action.action()),
-            ClientError::Common(common) if common.is_retryable() => ErrorClass::RetryableTransport,
-            ClientError::UnknownOutcome(_) => ErrorClass::UnknownOutcome,
-            ClientError::Metadata(_) | ClientError::Worker(_) | ClientError::Routing(_) => ErrorClass::Fatal,
-            ClientError::NotLeader(_) => ErrorClass::RefreshMetadata(MetadataRefreshCause::NotLeader),
-            ClientError::RouteEpochMismatch { .. } => {
-                ErrorClass::RefreshMetadata(MetadataRefreshCause::RouteEpochMismatch)
-            }
-            ClientError::StaleMeta(_) => ErrorClass::RefreshMetadata(MetadataRefreshCause::StaleState),
-            ClientError::Moved(_) => ErrorClass::RefreshMetadata(MetadataRefreshCause::Unknown),
-            ClientError::Common(_)
-            | ClientError::Cache(_)
-            | ClientError::Config(_)
-            | ClientError::StaleHandle { .. }
-            | ClientError::VersionMismatch { .. } => ErrorClass::Fatal,
+/// Classify a client error without string matching.
+pub(crate) fn classify_error(err: &ClientError) -> ErrorClass {
+    match err {
+        ClientError::InvalidArgument(_) | ClientError::InvalidLayout(_) => ErrorClass::InvalidArgument,
+        ClientError::InvalidResponse { .. } => ErrorClass::Fatal,
+        ClientError::Unsupported(_) | ClientError::NotSupported(_) | ClientError::Unimplemented(_) => {
+            ErrorClass::Unsupported
         }
-    }
-
-    fn classify_action(&self, action: &ClientAction) -> ErrorClass {
-        match action {
-            ClientAction::TransportFail { status } if is_retryable_transport(status) => ErrorClass::RetryableTransport,
-            ClientAction::TransportFail { .. } => ErrorClass::Fatal,
-            ClientAction::Retry { .. } => ErrorClass::RetryableTransport,
-            ClientAction::Refresh { reason, rpc_error, .. } => classify_refresh_action(*reason, rpc_error),
-            ClientAction::Fail { rpc_error } => classify_fail_action(rpc_error),
+        ClientError::Action(action) => classify_action(action.action()),
+        ClientError::Common(common) if common.is_retryable() => ErrorClass::RetryableTransport,
+        ClientError::UnknownOutcome(_) => ErrorClass::UnknownOutcome,
+        ClientError::Metadata(_) | ClientError::Worker(_) | ClientError::Routing(_) => ErrorClass::Fatal,
+        ClientError::NotLeader(_) => ErrorClass::RefreshMetadata(ErrorKind::Metadata(MetadataErrorKind::NotLeader)),
+        ClientError::RouteEpochMismatch { .. } => {
+            ErrorClass::RefreshMetadata(ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch))
         }
+        ClientError::StaleMeta(_) => ErrorClass::RefreshMetadata(ErrorKind::Metadata(MetadataErrorKind::StaleState)),
+        ClientError::Moved(_) => ErrorClass::Fatal,
+        ClientError::Common(_)
+        | ClientError::Cache(_)
+        | ClientError::Config(_)
+        | ClientError::StaleHandle { .. }
+        | ClientError::VersionMismatch { .. } => ErrorClass::Fatal,
     }
 }
 
-fn classify_refresh_action(reason: MetadataRefreshCause, rpc_error: &RpcErrorDetail) -> ErrorClass {
+fn classify_action(action: &ClientAction) -> ErrorClass {
+    match action {
+        ClientAction::TransportFail { status } if is_retryable_transport(status) => ErrorClass::RetryableTransport,
+        ClientAction::TransportFail { .. } => ErrorClass::Fatal,
+        ClientAction::Retry { .. } => ErrorClass::ServerRetry,
+        ClientAction::Refresh { rpc_error, .. } => classify_refresh_action(rpc_error),
+        ClientAction::Fail { rpc_error } => classify_fail_action(rpc_error),
+    }
+}
+
+fn classify_refresh_action(rpc_error: &RpcErrorDetail) -> ErrorClass {
     match (&rpc_error.recovery, rpc_error.kind) {
         (RecoveryAction::ReopenWriteSession { .. }, ErrorKind::Metadata(MetadataErrorKind::SessionInvalid)) => {
             ErrorClass::SessionInvalid
@@ -149,7 +109,7 @@ fn classify_refresh_action(reason: MetadataRefreshCause, rpc_error: &RpcErrorDet
             _,
             ErrorKind::Metadata(MetadataErrorKind::Fencing) | ErrorKind::Metadata(MetadataErrorKind::EpochMismatch),
         ) => ErrorClass::Fencing,
-        _ => ErrorClass::RefreshMetadata(reason),
+        _ => ErrorClass::RefreshMetadata(rpc_error.kind),
     }
 }
 
@@ -185,21 +145,20 @@ mod tests {
     use beryl_common::error::rpc::{ErrorKind, RecoveryAction, RefreshHint as RpcRefreshHint, RpcErrorDetail};
 
     #[test]
-    fn refresh_action_uses_runtime_reason_for_refresh_class() {
+    fn refresh_action_uses_rpc_error_kind_for_refresh_class() {
         let rpc_error = RpcErrorDetail::refresh_metadata(
             ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch),
             RpcRefreshHint::default(),
             "owner moved",
         );
         let err = ClientError::from(ClientAction::Refresh {
-            reason: MetadataRefreshCause::OwnerGroupMismatch,
             hint: Box::default(),
             rpc_error: Box::new(rpc_error),
         });
 
         assert_eq!(
-            ErrorClassifier.classify_error(&err),
-            ErrorClass::RefreshMetadata(MetadataRefreshCause::OwnerGroupMismatch)
+            classify_error(&err),
+            ErrorClass::RefreshMetadata(ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch))
         );
     }
 
@@ -207,7 +166,7 @@ mod tests {
     fn non_ok_tonic_status_remains_transport_failure() {
         let err = ClientError::from(tonic::Status::unavailable("metadata unavailable"));
 
-        let classified = ErrorClassifier.classify_error(&err);
+        let classified = classify_error(&err);
 
         assert_eq!(classified, ErrorClass::RetryableTransport);
     }
@@ -219,7 +178,7 @@ mod tests {
             reason: "missing attrs".to_string(),
         };
 
-        let classified = ErrorClassifier.classify_error(&err);
+        let classified = classify_error(&err);
 
         assert_eq!(classified, ErrorClass::Fatal);
     }
@@ -232,12 +191,11 @@ mod tests {
             "expired",
         );
         let err = ClientError::from(ClientAction::Refresh {
-            reason: MetadataRefreshCause::Unknown,
             hint: Box::default(),
             rpc_error: Box::new(rpc_error),
         });
 
-        assert_eq!(ErrorClassifier.classify_error(&err), ErrorClass::SessionExpired);
+        assert_eq!(classify_error(&err), ErrorClass::SessionExpired);
     }
 
     #[test]
@@ -249,7 +207,7 @@ mod tests {
             )),
         });
 
-        let classified = ErrorClassifier.classify_error(&err);
+        let classified = classify_error(&err);
 
         assert_eq!(classified, ErrorClass::Fencing);
         assert_ne!(classified, ErrorClass::RetryableTransport);
@@ -264,7 +222,7 @@ mod tests {
             )),
         });
 
-        let classified = ErrorClassifier.classify_error(&err);
+        let classified = classify_error(&err);
 
         assert_eq!(classified, ErrorClass::InvalidHeader);
         assert_ne!(classified, ErrorClass::RetryableTransport);
@@ -280,6 +238,6 @@ mod tests {
             )),
         });
 
-        assert_eq!(ErrorClassifier.classify_error(&err), ErrorClass::Fatal);
+        assert_eq!(classify_error(&err), ErrorClass::Fatal);
     }
 }

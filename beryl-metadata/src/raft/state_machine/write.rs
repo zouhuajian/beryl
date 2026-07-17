@@ -180,6 +180,7 @@ impl AppRaftStateMachine {
                     inode_id: Some(inode_id),
                     data_handle_id: Some(expected_data_handle_id),
                     file_version: Some(file_version),
+                    ..FsOkResult::default()
                 },
             ))
         })();
@@ -303,6 +304,7 @@ impl AppRaftStateMachine {
                         inode_id: Some(inode_id),
                         data_handle_id: Some(expected_data_handle_id),
                         file_version: current_file_version,
+                        ..FsOkResult::default()
                     },
                     false,
                 ));
@@ -364,6 +366,7 @@ impl AppRaftStateMachine {
                     inode_id: Some(inode_id),
                     data_handle_id: Some(expected_data_handle_id),
                     file_version: Some(file_version),
+                    ..FsOkResult::default()
                 },
                 true,
             ))
@@ -485,6 +488,7 @@ impl AppRaftStateMachine {
                     inode_id: Some(inode_id),
                     data_handle_id: Some(data_handle_id),
                     file_version: Some(next_file_version),
+                    ..FsOkResult::default()
                 },
             ))
         })();
@@ -1441,6 +1445,7 @@ mod tests {
             dedup.clone(),
             crate::raft::proposal_timestamp_ms(),
             crate::raft::Mutation::CreateFile {
+                mode: crate::raft::CreateFileMode::CreateNew,
                 parent_inode_id,
                 name: "first".to_string(),
                 attrs: FileAttrs::new(),
@@ -1451,6 +1456,7 @@ mod tests {
             dedup,
             crate::raft::proposal_timestamp_ms(),
             crate::raft::Mutation::CreateFile {
+                mode: crate::raft::CreateFileMode::CreateNew,
                 parent_inode_id,
                 name: "second".to_string(),
                 attrs: FileAttrs::new(),

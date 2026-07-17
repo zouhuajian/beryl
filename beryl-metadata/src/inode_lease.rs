@@ -39,6 +39,8 @@ pub struct ActiveLease {
     pub expires_at_ms: u64,
     /// Write mode.
     pub mode: WriteMode,
+    /// Last successful RenewLease call in this lease incarnation.
+    pub last_renew_call: Option<(ClientId, beryl_types::CallId, u64)>,
 }
 
 /// Inode lease manager (runtime, leader-only).
@@ -89,6 +91,12 @@ impl LeaseManager {
         // Check for existing active lease
         if let Some(existing) = leases.get(&inode_id) {
             if now_ms < existing.expires_at_ms {
+                if existing.owner_client_id == client_id && existing.owner_call_id == call_id {
+                    if existing.mode != mode {
+                        return Err(FsErrorCode::EInval);
+                    }
+                    return Ok((existing.lease_id, existing.lease_epoch, existing.expires_at_ms));
+                }
                 // Active lease exists and not expired
                 debug!(
                     inode_id = %inode_id,
@@ -120,6 +128,7 @@ impl LeaseManager {
             owner_call_id: call_id,
             expires_at_ms,
             mode,
+            last_renew_call: None,
         };
 
         leases.insert(inode_id, active_lease.clone());
@@ -141,10 +150,36 @@ impl LeaseManager {
     /// Returns:
     /// - Ok(expires_at_ms) if renewed
     /// - Err(EPerm) if lease_id/lease_epoch mismatch or expired
-    pub fn renew(&self, inode_id: InodeId, lease_id: LeaseId, lease_epoch: u64) -> Result<u64, FsErrorCode> {
+    pub fn renew(
+        &self,
+        inode_id: InodeId,
+        lease_id: LeaseId,
+        lease_epoch: u64,
+        client_id: ClientId,
+        call_id: beryl_types::CallId,
+    ) -> Result<u64, FsErrorCode> {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
 
         let mut leases = self.leases.write();
+
+        if let Some((renew_inode_id, active_lease, expires_at_ms)) =
+            leases.iter().find_map(|(renew_inode_id, lease)| {
+                lease
+                    .last_renew_call
+                    .filter(|(renew_client_id, renew_call_id, _)| {
+                        *renew_client_id == client_id && *renew_call_id == call_id
+                    })
+                    .map(|(_, _, expires_at_ms)| (*renew_inode_id, lease, expires_at_ms))
+            })
+        {
+            if renew_inode_id == inode_id
+                && active_lease.lease_id == lease_id
+                && active_lease.lease_epoch == lease_epoch
+            {
+                return Ok(expires_at_ms);
+            }
+            return Err(FsErrorCode::EInval);
+        }
 
         let active_lease = leases.get_mut(&inode_id).ok_or(FsErrorCode::EPerm)?;
 
@@ -161,6 +196,12 @@ impl LeaseManager {
             return Err(FsErrorCode::EPerm);
         }
 
+        if active_lease.owner_client_id != client_id {
+            return Err(FsErrorCode::EPerm);
+        }
+        if active_lease.owner_call_id == Some(call_id) {
+            return Err(FsErrorCode::EInval);
+        }
         // Check if already expired
         if now_ms >= active_lease.expires_at_ms {
             warn!(
@@ -174,6 +215,7 @@ impl LeaseManager {
 
         // Extend expiration
         active_lease.expires_at_ms = now_ms + self.lease_ttl_ms;
+        active_lease.last_renew_call = Some((client_id, call_id, active_lease.expires_at_ms));
 
         debug!(
             inode_id = %inode_id,
@@ -240,6 +282,16 @@ impl LeaseManager {
     /// Get active lease for an inode (if any).
     pub fn get_active_lease(&self, inode_id: InodeId) -> Option<ActiveLease> {
         self.leases.read().get(&inode_id).cloned()
+    }
+
+    pub(crate) fn has_renew_call(&self, client_id: ClientId, call_id: beryl_types::CallId) -> bool {
+        self.leases.read().values().any(|lease| {
+            lease
+                .last_renew_call
+                .is_some_and(|(renew_client_id, renew_call_id, _)| {
+                    renew_client_id == client_id && renew_call_id == call_id
+                })
+        })
     }
 
     /// Check if an inode has an active, non-expired lease.

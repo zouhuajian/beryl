@@ -66,7 +66,7 @@ const CF_RAFT_SNAPSHOT: &str = "raft_snapshot"; // Raft snapshots
 
 const ROCKSDB_SCHEMA_VERSION_KEY: &[u8] = b"rocksdb_schema_version";
 const STORAGE_IDENTITY_KEY: &[u8] = b"storage_identity";
-pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 4;
+pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 6;
 const NEXT_INODE_ID_KEY: &[u8] = b"next_inode_id";
 const NEXT_DATA_HANDLE_ID_KEY: &[u8] = b"next_data_handle_id";
 
@@ -140,7 +140,15 @@ impl From<WriteBatch> for AuthorityBatch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct InodeAllocation {
     pub(crate) inode_id: InodeId,
-    next_inode_id: InodeId,
+    pub(crate) next_inode_id: InodeId,
+}
+
+/// One directory insertion in an atomic recursive mkdir mutation.
+pub(crate) struct RecursiveMkdirEntry {
+    pub(crate) parent_inode_id: InodeId,
+    pub(crate) name: String,
+    pub(crate) inode: Inode,
+    pub(crate) updated_parent: Inode,
 }
 
 /// File identities reserved by a read-only allocator preparation.
@@ -525,6 +533,7 @@ mod tests {
                 inode_id: Some(inode_id),
                 data_handle_id: Some(data_handle_id),
                 file_version: None,
+                ..crate::raft::response::FsOkResult::default()
             })),
             created_at_ms: now_millis(),
             size_bytes: 0,

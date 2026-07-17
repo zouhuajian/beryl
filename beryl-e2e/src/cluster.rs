@@ -389,12 +389,8 @@ fn client_for(metadata_addr: SocketAddr, group_name: GroupName) -> TestResult<Fs
         &format!("client.metadata.group.{}.endpoints", group_name.as_str()),
         metadata_addr.to_string(),
     );
-    flat.set("client.retry.max_retry_attempts", 3i64);
-    flat.set("client.refresh.max_attempts", 3i64);
+    flat.set("client.retry.max_attempts", 3i64);
     flat.set("client.operation.timeout_ms", 2_000i64);
-    flat.set("client.backoff.initial_ms", 10i64);
-    flat.set("client.backoff.max_ms", 100i64);
-    flat.set("client.backoff.multiplier", "2.0");
     Ok(FsClient::try_new(ClientConfig::from_flat(flat)?)?)
 }
 

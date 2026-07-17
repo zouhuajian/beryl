@@ -7,30 +7,6 @@ use crate::observe;
 use crate::raft::{AppDataResponse, Command, FsCommandResult};
 use beryl_types::fs::InodeId;
 
-#[derive(Clone, Debug)]
-struct UnlinkInput {
-    ctx: RequestContext,
-    parent_inode_id: InodeId,
-    name: String,
-    freshness: Freshness,
-}
-
-#[derive(Clone, Debug)]
-struct DeleteEmptyDirInput {
-    ctx: RequestContext,
-    parent_inode_id: InodeId,
-    name: String,
-    freshness: Freshness,
-}
-
-#[derive(Clone, Debug)]
-struct DeleteTreeInput {
-    ctx: RequestContext,
-    parent_inode_id: InodeId,
-    name: String,
-    freshness: Freshness,
-}
-
 pub(crate) struct DeleteArgs {
     pub(crate) path: String,
     pub(crate) recursive: bool,
@@ -43,9 +19,38 @@ impl MetadataFileSystem {
             return self.failure_from_admission(failure);
         }
 
-        let resolved = match self.path_resolver.resolve_path(&args.path) {
-            Ok(resolved) => resolved,
+        let path = match crate::path_resolver::PathResolver::normalize(&args.path) {
+            Ok(path) => path,
             Err(err) => return self.failure_from_path_error(ctx, &args.path, err),
+        };
+        let (mount_ctx, _) = match self.path_resolver.resolve_mount_components(&path) {
+            Ok(resolved) => resolved,
+            Err(err) => return self.failure_from_path_error(ctx, &path, err),
+        };
+        let fingerprint = Command::delete_fingerprint(&path, args.recursive);
+        match self.replay_namespace_result(&ctx.caller, fingerprint) {
+            Ok(Some(FsCommandResult::Ok(_))) => {
+                return self.success(ctx, (), Some(mount_ctx.owner_group_name), Some(mount_ctx.mount_epoch));
+            }
+            Ok(Some(FsCommandResult::Err(err))) => {
+                return self.fatal_fs_failure(
+                    ctx,
+                    err.errno,
+                    err.message,
+                    Some(mount_ctx.owner_group_name),
+                    Some(mount_ctx.mount_epoch),
+                );
+            }
+            Ok(None) => {}
+            Err(err) => return self.failure_from_resolved_path_error(ctx, err, Some(&mount_ctx)),
+        }
+        if let Err(err) = self.reject_active_session_call_reuse(&ctx.caller) {
+            return self.failure_from_resolved_path_error(ctx, err, Some(&mount_ctx));
+        }
+
+        let resolved = match self.path_resolver.resolve_path(&path) {
+            Ok(resolved) => resolved,
+            Err(err) => return self.failure_from_path_error(ctx, &path, err),
         };
         let (Some(parent_inode_id), Some(name)) = (resolved.parent_inode_id, resolved.name.clone()) else {
             return self.failure_from_resolved_path_error(
@@ -54,53 +59,10 @@ impl MetadataFileSystem {
                 Some(&resolved.mount_ctx),
             );
         };
-        let target_inode = match resolved.inode_id {
-            Some(target_inode_id) => match self.read_inode(target_inode_id) {
-                Ok(Some(inode)) => Some(inode),
-                Ok(None) => {
-                    return self.failure_from_resolved_path_error(
-                        ctx,
-                        MetadataError::NotFound(format!("Target inode not found: {}", target_inode_id)),
-                        Some(&resolved.mount_ctx),
-                    )
-                }
-                Err(err) => return self.failure_from_resolved_path_error(ctx, err, Some(&resolved.mount_ctx)),
-            },
-            None => None,
-        };
-
-        let result = if args.recursive && target_inode.as_ref().map(|inode| inode.kind.is_dir()).unwrap_or(true) {
-            self.delete_tree_resolved(DeleteTreeInput {
-                ctx: ctx.clone(),
-                parent_inode_id,
-                name,
-                freshness: args.freshness,
-            })
-            .await
-        } else if target_inode.as_ref().is_some_and(|inode| inode.kind.is_dir()) {
-            self.delete_empty_dir_resolved(DeleteEmptyDirInput {
-                ctx: ctx.clone(),
-                parent_inode_id,
-                name,
-                freshness: args.freshness,
-            })
-            .await
-        } else {
-            if target_inode.is_none() {
-                return self.failure_from_resolved_path_error(
-                    ctx,
-                    MetadataError::NotFound(format!("Entry not found: {}", name)),
-                    Some(&resolved.mount_ctx),
-                );
-            }
-            self.unlink_resolved(UnlinkInput {
-                ctx: ctx.clone(),
-                parent_inode_id,
-                name,
-                freshness: args.freshness,
-            })
-            .await
-        };
+        let target_inode_id = resolved.inode_id;
+        let result = self
+            .delete_resolved(ctx, path, parent_inode_id, name, args.recursive, args.freshness)
+            .await;
 
         match &result {
             Ok(_) => tracing::info!(
@@ -111,7 +73,7 @@ impl MetadataFileSystem {
                 client_id = %ctx.caller.client.client_id,
                 call_id = %ctx.caller.client.call_id,
                 path = %args.path,
-                inode_id = target_inode.as_ref().map(|inode| inode.inode_id.as_raw()),
+                inode_id = target_inode_id.map(|inode_id| inode_id.as_raw()),
                 parent_inode_id = parent_inode_id.as_raw(),
                 recursive = args.recursive,
                 "Delete committed"
@@ -132,198 +94,38 @@ impl MetadataFileSystem {
         result
     }
 
-    async fn unlink_resolved(&self, req: UnlinkInput) -> FsResult<()> {
-        let ctx = match self.route_ctx_for_write(
-            &req.ctx,
-            WriteCommandKind::Unlink,
-            &[req.parent_inode_id],
-            req.freshness,
-        ) {
+    async fn delete_resolved(
+        &self,
+        request_ctx: &RequestContext,
+        path: String,
+        parent_inode_id: InodeId,
+        name: String,
+        recursive: bool,
+        freshness: Freshness,
+    ) -> FsResult<()> {
+        let ctx = match self.route_ctx_for_write(request_ctx, WriteCommandKind::Delete, &[parent_inode_id], freshness) {
             Ok(ctx) => ctx,
             Err(err) => return Err(err),
         };
-
-        match self.read_dentry(req.parent_inode_id, &req.name) {
-            Ok(Some(child_inode_id)) => match self.read_inode(child_inode_id) {
-                Ok(Some(inode)) if inode.kind.is_file() => {
-                    if self.has_active_write(child_inode_id) {
-                        return self.fatal_fs_failure(
-                            &req.ctx,
-                            beryl_types::fs::FsErrorCode::EBusy,
-                            format!("File has an active write lease: {}", child_inode_id),
-                            Some(ctx.namespace_owner_group_name.clone()),
-                            Some(ctx.mount_epoch),
-                        );
-                    }
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    return self.failure_from_error(
-                        &req.ctx,
-                        err,
-                        Some(ctx.namespace_owner_group_name.clone()),
-                        Some(ctx.mount_epoch),
-                    );
-                }
-            },
-            Ok(None) => {}
+        let dedup = match self.dedup_key(&request_ctx.caller) {
+            Ok(key) => key,
             Err(err) => {
                 return self.failure_from_error(
-                    &req.ctx,
-                    err,
-                    Some(ctx.namespace_owner_group_name.clone()),
-                    Some(ctx.mount_epoch),
-                );
-            }
-        }
-
-        let dedup = match self.dedup_key(&req.ctx.caller) {
-            Ok(k) => k,
-            Err(err) => {
-                return self.failure_from_error(
-                    &req.ctx,
+                    request_ctx,
                     err,
                     Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
         };
-
-        let result = match self
-            .propose_fs_write_command(
-                WriteCommandKind::Unlink,
-                Command::new(
-                    dedup,
-                    crate::raft::proposal_timestamp_ms(),
-                    crate::raft::Mutation::Unlink {
-                        parent_inode_id: req.parent_inode_id,
-                        name: req.name,
-                    },
-                ),
-            )
-            .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    err,
-                    Some(ctx.namespace_owner_group_name.clone()),
-                    Some(ctx.mount_epoch),
-                );
-            }
-        };
-
-        match result {
-            FsCommandResult::Ok(_) => self.success(
-                &req.ctx,
-                (),
-                Some(ctx.namespace_owner_group_name.clone()),
-                Some(ctx.mount_epoch),
-            ),
-            FsCommandResult::Err(err) => self.fatal_fs_failure(
-                &req.ctx,
-                err.errno,
-                err.message,
-                Some(ctx.namespace_owner_group_name.clone()),
-                Some(ctx.mount_epoch),
-            ),
-        }
-    }
-
-    async fn delete_empty_dir_resolved(&self, req: DeleteEmptyDirInput) -> FsResult<()> {
-        let ctx = match self.route_ctx_for_write(
-            &req.ctx,
-            WriteCommandKind::DeleteEmptyDir,
-            &[req.parent_inode_id],
-            req.freshness,
-        ) {
-            Ok(ctx) => ctx,
-            Err(err) => return Err(err),
-        };
-
-        let dedup = match self.dedup_key(&req.ctx.caller) {
-            Ok(k) => k,
-            Err(err) => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    err,
-                    Some(ctx.namespace_owner_group_name.clone()),
-                    Some(ctx.mount_epoch),
-                );
-            }
-        };
-
-        let result = match self
-            .propose_fs_write_command(
-                WriteCommandKind::DeleteEmptyDir,
-                Command::new(
-                    dedup,
-                    crate::raft::proposal_timestamp_ms(),
-                    crate::raft::Mutation::DeleteEmptyDir {
-                        parent_inode_id: req.parent_inode_id,
-                        name: req.name,
-                    },
-                ),
-            )
-            .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    err,
-                    Some(ctx.namespace_owner_group_name.clone()),
-                    Some(ctx.mount_epoch),
-                );
-            }
-        };
-
-        match result {
-            FsCommandResult::Ok(_) => self.success(
-                &req.ctx,
-                (),
-                Some(ctx.namespace_owner_group_name.clone()),
-                Some(ctx.mount_epoch),
-            ),
-            FsCommandResult::Err(err) => self.fatal_fs_failure(
-                &req.ctx,
-                err.errno,
-                err.message,
-                Some(ctx.namespace_owner_group_name.clone()),
-                Some(ctx.mount_epoch),
-            ),
-        }
-    }
-
-    async fn delete_tree_resolved(&self, req: DeleteTreeInput) -> FsResult<()> {
-        let ctx = match self.route_ctx_for_write(
-            &req.ctx,
-            WriteCommandKind::DeleteTree,
-            &[req.parent_inode_id],
-            req.freshness,
-        ) {
-            Ok(ctx) => ctx,
-            Err(err) => return Err(err),
-        };
-
-        let dedup = match self.dedup_key(&req.ctx.caller) {
-            Ok(k) => k,
-            Err(err) => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    err,
-                    Some(ctx.namespace_owner_group_name.clone()),
-                    Some(ctx.mount_epoch),
-                );
-            }
-        };
-        let command = Command::new(
+        let command = Command::new_namespace(
             dedup.clone(),
             crate::raft::proposal_timestamp_ms(),
-            crate::raft::Mutation::DeleteTree {
-                parent_inode_id: req.parent_inode_id,
-                name: req.name.clone(),
+            crate::raft::CanonicalNamespaceRequest::Delete { path, recursive },
+            crate::raft::Mutation::Delete {
+                parent_inode_id,
+                name: name.clone(),
+                recursive,
             },
         );
         let fingerprint = command.fingerprint();
@@ -332,7 +134,7 @@ impl MetadataFileSystem {
             Ok(Some(existing)) => {
                 if existing.fingerprint != fingerprint {
                     return self.failure_from_error(
-                        &req.ctx,
+                        request_ctx,
                         MetadataError::InvalidArgument(format!(
                             "call_id {} reused with different command payload",
                             dedup.call_id
@@ -345,12 +147,12 @@ impl MetadataFileSystem {
                     AppDataResponse::Fs(result) => result,
                     _ => FsCommandResult::ok(),
                 };
-                return self.delete_tree_result(&req, &ctx, result);
+                return self.delete_result(request_ctx, &ctx, result);
             }
             Ok(None) => {}
             Err(err) => {
                 return self.failure_from_error(
-                    &req.ctx,
+                    request_ctx,
                     err,
                     Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
@@ -358,48 +160,86 @@ impl MetadataFileSystem {
             }
         }
 
-        if let Err(err) = self.preflight_delete_tree_runtime(&self.storage, req.parent_inode_id, &req.name) {
+        if let Err(err) = self.reject_active_session_call_reuse(&request_ctx.caller) {
             return self.failure_from_error(
-                &req.ctx,
+                request_ctx,
                 err,
                 Some(ctx.namespace_owner_group_name.clone()),
                 Some(ctx.mount_epoch),
             );
         }
 
-        let result = match self
-            .propose_fs_write_command(WriteCommandKind::DeleteTree, command)
-            .await
-        {
+        match self.read_dentry(parent_inode_id, &name) {
+            Ok(Some(inode_id)) => match self.read_inode(inode_id) {
+                Ok(Some(inode)) if inode.kind.is_file() && self.has_active_write(inode_id) => {
+                    return self.fatal_fs_failure(
+                        request_ctx,
+                        beryl_types::fs::FsErrorCode::EBusy,
+                        format!("File has an active write lease: {inode_id}"),
+                        Some(ctx.namespace_owner_group_name.clone()),
+                        Some(ctx.mount_epoch),
+                    );
+                }
+                Ok(Some(inode)) if recursive && inode.kind.is_dir() => {
+                    if let Err(err) = self.preflight_delete_tree_runtime(&self.storage, parent_inode_id, &name) {
+                        return self.failure_from_error(
+                            request_ctx,
+                            err,
+                            Some(ctx.namespace_owner_group_name.clone()),
+                            Some(ctx.mount_epoch),
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    return self.failure_from_error(
+                        request_ctx,
+                        err,
+                        Some(ctx.namespace_owner_group_name.clone()),
+                        Some(ctx.mount_epoch),
+                    );
+                }
+            },
+            Ok(None) => {}
+            Err(err) => {
+                return self.failure_from_error(
+                    request_ctx,
+                    err,
+                    Some(ctx.namespace_owner_group_name.clone()),
+                    Some(ctx.mount_epoch),
+                );
+            }
+        }
+
+        let result = match self.propose_fs_write_command(WriteCommandKind::Delete, command).await {
             Ok(result) => result,
             Err(err) => {
                 return self.failure_from_error(
-                    &req.ctx,
+                    request_ctx,
                     err,
                     Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
         };
-
-        self.delete_tree_result(&req, &ctx, result)
+        self.delete_result(request_ctx, &ctx, result)
     }
 
-    fn delete_tree_result(
+    fn delete_result(
         &self,
-        req: &DeleteTreeInput,
+        request_ctx: &RequestContext,
         ctx: &super::RoutedFsWriteCtx,
         result: FsCommandResult,
     ) -> FsResult<()> {
         match result {
             FsCommandResult::Ok(_) => self.success(
-                &req.ctx,
+                request_ctx,
                 (),
                 Some(ctx.namespace_owner_group_name.clone()),
                 Some(ctx.mount_epoch),
             ),
             FsCommandResult::Err(err) => self.fatal_fs_failure(
-                &req.ctx,
+                request_ctx,
                 err.errno,
                 err.message,
                 Some(ctx.namespace_owner_group_name.clone()),
@@ -480,12 +320,14 @@ mod tests {
         let file_handle = install_write_session(&filesystem, inode_id, mount_id);
 
         let failure = filesystem
-            .unlink_resolved(UnlinkInput {
-                ctx: request_context(),
+            .delete_resolved(
+                &request_context(),
+                "/busy".to_string(),
                 parent_inode_id,
-                name: "busy".to_string(),
-                freshness: Freshness::default(),
-            })
+                "busy".to_string(),
+                false,
+                Freshness::default(),
+            )
             .await
             .unwrap_err();
 
@@ -529,12 +371,14 @@ mod tests {
         assert!(filesystem.write_session_for_handle(file_handle).is_some());
 
         filesystem
-            .unlink_resolved(UnlinkInput {
-                ctx: request_context(),
+            .delete_resolved(
+                &request_context(),
+                "/expired".to_string(),
                 parent_inode_id,
-                name: "expired".to_string(),
-                freshness: Freshness::default(),
-            })
+                "expired".to_string(),
+                false,
+                Freshness::default(),
+            )
             .await
             .expect("expired lease must not leave delete permanently busy");
 

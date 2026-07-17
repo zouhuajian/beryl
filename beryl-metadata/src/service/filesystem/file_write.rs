@@ -18,18 +18,24 @@ use beryl_types::WriteTarget;
 #[derive(Clone, Debug)]
 struct CreateInput {
     ctx: RequestContext,
+    path: String,
     parent_inode_id: InodeId,
     name: String,
     attrs: FileAttrs,
     layout: FileLayout,
+    mode: CreateFileMode,
     freshness: Freshness,
 }
 
 #[derive(Clone, Debug, Default)]
 struct CreateOutput {
     inode_id: Option<InodeId>,
+    data_handle_id: Option<DataHandleId>,
+    attrs: Option<FileAttrs>,
+    layout: Option<FileLayout>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CreateFileMode {
     CreateNew,
     CreateOrOverwrite,
@@ -41,7 +47,6 @@ pub(crate) struct CreateFileArgs {
     pub(crate) parsed_attrs: Result<FileAttrs, MetadataError>,
     pub(crate) parsed_layout: Result<FileLayout, MetadataError>,
     pub(crate) parsed_mode: Result<CreateFileMode, MetadataError>,
-    pub(crate) desired_len: Option<u64>,
     pub(crate) freshness: Freshness,
 }
 
@@ -50,14 +55,21 @@ struct ValidatedCreateFileArgs {
     attrs: FileAttrs,
     layout: FileLayout,
     mode: CreateFileMode,
-    desired_len: Option<u64>,
     freshness: Freshness,
 }
 
-pub(crate) struct AppendFileArgs {
+pub(crate) struct OpenWriteArgs {
     pub(crate) path: String,
     pub(crate) desired_len: Option<u64>,
+    pub(crate) mode: WriteMode,
     pub(crate) freshness: Freshness,
+}
+
+pub(crate) struct CreatedFileOutput {
+    pub(crate) inode_id: InodeId,
+    pub(crate) data_handle_id: DataHandleId,
+    pub(crate) layout: FileLayout,
+    pub(crate) file_size: u64,
 }
 
 pub(crate) struct OpenedWriteOutput {
@@ -71,9 +83,8 @@ pub(crate) struct OpenedWriteOutput {
 }
 
 impl MetadataFileSystem {
-    pub(crate) async fn create_file(&self, ctx: &RequestContext, args: CreateFileArgs) -> FsResult<OpenedWriteOutput> {
+    pub(crate) async fn create_file(&self, ctx: &RequestContext, args: CreateFileArgs) -> FsResult<CreatedFileOutput> {
         let path = args.path.clone();
-        let desired_len = args.desired_len;
         let result = self.create_file_inner(ctx, args).await;
         match &result {
             Ok(success) => {
@@ -88,14 +99,9 @@ impl MetadataFileSystem {
                     path = %path,
                     inode_id = payload.inode_id.as_raw(),
                     data_handle_id = payload.data_handle_id.as_raw(),
-                    file_handle = payload.session_key.file_handle,
-                    lease_id = payload.session_key.lease_id.as_raw(),
-                    lease_epoch = payload.session_key.lease_epoch,
                     layout_block_size = payload.layout.block_size,
                     layout_chunk_size = payload.layout.chunk_size,
                     replication = payload.layout.replication,
-                    initial_target_count = payload.write_targets.len(),
-                    desired_len,
                     mount_epoch = success.mount_epoch,
                     route_epoch = success.route_epoch,
                     "CreateFile committed"
@@ -115,7 +121,7 @@ impl MetadataFileSystem {
         result
     }
 
-    async fn create_file_inner(&self, ctx: &RequestContext, args: CreateFileArgs) -> FsResult<OpenedWriteOutput> {
+    async fn create_file_inner(&self, ctx: &RequestContext, args: CreateFileArgs) -> FsResult<CreatedFileOutput> {
         if let Err(failure) = self.admission.check_meta_write(ctx).await {
             return self.failure_from_admission(failure);
         }
@@ -125,7 +131,6 @@ impl MetadataFileSystem {
             parsed_attrs,
             parsed_layout,
             parsed_mode,
-            desired_len,
             freshness,
         } = args;
         let mode = match parsed_mode {
@@ -145,45 +150,67 @@ impl MetadataFileSystem {
             attrs,
             layout,
             mode,
-            desired_len,
             freshness,
         };
         if let Err(err) = validate_active_write_layout(&args.layout) {
             return self.failure_from_path_error(ctx, &args.path, err);
         }
 
-        let inode_id = if matches!(args.mode, CreateFileMode::CreateOrOverwrite) {
-            match self.path_resolver.resolve_path(&args.path) {
-                Ok(resolved) => match resolved.inode_id {
-                    Some(inode_id) => {
-                        if let Err(failure) = self.admission.check_data_write(ctx, resolved.mount_ctx.mount_id).await {
-                            return self.failure_from_admission(failure);
-                        }
-                        inode_id
-                    }
-                    None => self.create_new_file_inode(ctx, &args).await?.payload,
-                },
-                Err(err) => return self.failure_from_path_error(ctx, &args.path, err),
-            }
-        } else {
-            self.create_new_file_inode(ctx, &args).await?.payload
-        };
-
-        self.open_write_resolved(OpenWriteInput {
-            ctx: ctx.clone(),
-            inode_id,
-            desired_len: args.desired_len,
-            mode: WriteMode::Write,
-            freshness: args.freshness,
-        })
-        .await
-        .map(Self::opened_write_success)
-    }
-
-    async fn create_new_file_inode(&self, ctx: &RequestContext, args: &ValidatedCreateFileArgs) -> FsResult<InodeId> {
-        let resolved = match self.path_resolver.resolve_path(&args.path) {
-            Ok(resolved) => resolved,
+        let path = match crate::path_resolver::PathResolver::normalize(&args.path) {
+            Ok(path) => path,
             Err(err) => return self.failure_from_path_error(ctx, &args.path, err),
+        };
+        let (mount_ctx, _) = match self.path_resolver.resolve_mount_components(&path) {
+            Ok(resolved) => resolved,
+            Err(err) => return self.failure_from_path_error(ctx, &path, err),
+        };
+        let raft_mode = match args.mode {
+            CreateFileMode::CreateNew => crate::raft::CreateFileMode::CreateNew,
+            CreateFileMode::CreateOrOverwrite => crate::raft::CreateFileMode::CreateOrOverwrite,
+        };
+        let fingerprint = Command::create_file_fingerprint(&path, &args.attrs, &args.layout, raft_mode);
+        match self.replay_namespace_result(&ctx.caller, fingerprint) {
+            Ok(Some(FsCommandResult::Ok(ok))) => {
+                let (Some(inode_id), Some(data_handle_id), Some(attrs), Some(layout)) =
+                    (ok.inode_id, ok.data_handle_id, ok.attrs, ok.layout)
+                else {
+                    return self.failure_from_resolved_path_error(
+                        ctx,
+                        MetadataError::Internal("CreateFile replay result is incomplete".to_string()),
+                        Some(&mount_ctx),
+                    );
+                };
+                return self.success(
+                    ctx,
+                    CreatedFileOutput {
+                        inode_id,
+                        data_handle_id,
+                        layout,
+                        file_size: attrs.size,
+                    },
+                    Some(mount_ctx.owner_group_name),
+                    Some(mount_ctx.mount_epoch),
+                );
+            }
+            Ok(Some(FsCommandResult::Err(err))) => {
+                return self.fatal_fs_failure(
+                    ctx,
+                    err.errno,
+                    err.message,
+                    Some(mount_ctx.owner_group_name),
+                    Some(mount_ctx.mount_epoch),
+                );
+            }
+            Ok(None) => {}
+            Err(err) => return self.failure_from_resolved_path_error(ctx, err, Some(&mount_ctx)),
+        }
+        if let Err(err) = self.reject_active_session_call_reuse(&ctx.caller) {
+            return self.failure_from_resolved_path_error(ctx, err, Some(&mount_ctx));
+        }
+
+        let resolved = match self.path_resolver.resolve_path(&path) {
+            Ok(resolved) => resolved,
+            Err(err) => return self.failure_from_path_error(ctx, &path, err),
         };
         let (Some(parent_inode_id), Some(name)) = (resolved.parent_inode_id, resolved.name.clone()) else {
             return self.failure_from_resolved_path_error(
@@ -195,51 +222,53 @@ impl MetadataFileSystem {
         if let Err(failure) = self.admission.check_data_write(ctx, resolved.mount_ctx.mount_id).await {
             return self.failure_from_admission(failure);
         }
-        if let Some(failure) = self.preflight_open_write_runtime(
-            ctx,
-            args.desired_len,
-            args.layout,
-            Some(resolved.mount_ctx.owner_group_name.clone()),
-            Some(resolved.mount_ctx.mount_epoch),
-        ) {
-            return Err(failure);
-        }
-
         let success = self
             .create_resolved(CreateInput {
                 ctx: ctx.clone(),
+                path,
                 parent_inode_id,
                 name,
                 attrs: args.attrs.clone(),
                 layout: args.layout,
+                mode: args.mode,
                 freshness: args.freshness,
             })
             .await?;
-        match success.payload.inode_id {
-            Some(inode_id) => Ok(FsSuccess {
-                payload: inode_id,
+        match (
+            success.payload.inode_id,
+            success.payload.data_handle_id,
+            success.payload.attrs,
+            success.payload.layout,
+        ) {
+            (Some(inode_id), Some(data_handle_id), Some(attrs), Some(layout)) => Ok(FsSuccess {
+                payload: CreatedFileOutput {
+                    inode_id,
+                    data_handle_id,
+                    layout,
+                    file_size: attrs.size,
+                },
                 group_name: success.group_name,
                 mount_epoch: success.mount_epoch,
                 route_epoch: success.route_epoch,
                 state: success.state,
             }),
-            None => self.failure_from_resolved_path_error(
+            _ => self.failure_from_resolved_path_error(
                 ctx,
-                MetadataError::Internal("create did not return inode_id".to_string()),
+                MetadataError::Internal("CreateFile did not return its frozen applied result".to_string()),
                 Some(&resolved.mount_ctx),
             ),
         }
     }
 
-    pub(crate) async fn append_file(&self, ctx: &RequestContext, args: AppendFileArgs) -> FsResult<OpenedWriteOutput> {
+    pub(crate) async fn open_write(&self, ctx: &RequestContext, args: OpenWriteArgs) -> FsResult<OpenedWriteOutput> {
         let path = args.path.clone();
-        let result = self.append_file_inner(ctx, args).await;
+        let result = self.open_write_inner(ctx, args).await;
         match &result {
             Ok(success) => {
                 let payload = &success.payload;
                 tracing::info!(
                     target: "metadata.state",
-                    op = "AppendFile",
+                    op = "OpenWrite",
                     result = "opened",
                     error_code = "none",
                     client_id = %ctx.caller.client.client_id,
@@ -253,28 +282,44 @@ impl MetadataFileSystem {
                     initial_target_count = payload.write_targets.len(),
                     mount_epoch = success.mount_epoch,
                     route_epoch = success.route_epoch,
-                    "AppendFile opened"
+                    "OpenWrite opened"
                 );
             }
             Err(failure) => tracing::warn!(
                 target: "metadata.state",
-                op = "AppendFile",
+                op = "OpenWrite",
                 result = "rejected",
                 error_code = observe::rpc_error_kind(&failure.error),
                 client_id = %ctx.caller.client.client_id,
                 call_id = %ctx.caller.client.call_id,
                 path = %path,
-                "AppendFile rejected"
+                "OpenWrite rejected"
             ),
         }
         result
     }
 
-    async fn append_file_inner(&self, ctx: &RequestContext, args: AppendFileArgs) -> FsResult<OpenedWriteOutput> {
+    async fn open_write_inner(&self, ctx: &RequestContext, args: OpenWriteArgs) -> FsResult<OpenedWriteOutput> {
         if let Err(failure) = self.admission.check_meta_write(ctx).await {
             return self.failure_from_admission(failure);
         }
-        let resolved = match self.path_resolver.resolve_path(&args.path) {
+        let open_path = match crate::path_resolver::PathResolver::normalize(&args.path) {
+            Ok(path) => path,
+            Err(err) => return self.failure_from_path_error(ctx, &args.path, err),
+        };
+        if let Some(replay) = self
+            .replay_open_write(ctx, &open_path, args.mode, args.desired_len, args.freshness)
+            .await
+        {
+            return replay.map(Self::opened_write_success);
+        }
+        if let Err(err) = self.reject_durable_call_reuse(&ctx.caller) {
+            return self.failure_from_path_error(ctx, &open_path, err);
+        }
+        if let Err(err) = self.reject_active_session_call_reuse(&ctx.caller) {
+            return self.failure_from_path_error(ctx, &open_path, err);
+        }
+        let resolved = match self.path_resolver.resolve_path(&open_path) {
             Ok(resolved) => resolved,
             Err(err) => return self.failure_from_path_error(ctx, &args.path, err),
         };
@@ -291,8 +336,9 @@ impl MetadataFileSystem {
         self.open_write_resolved(OpenWriteInput {
             ctx: ctx.clone(),
             inode_id,
+            open_path,
             desired_len: args.desired_len,
-            mode: WriteMode::Append,
+            mode: args.mode,
             freshness: args.freshness,
         })
         .await
@@ -348,14 +394,27 @@ impl MetadataFileSystem {
         let result = match self
             .propose_fs_write_command(
                 WriteCommandKind::Create,
-                Command::new(
+                Command::new_namespace(
                     dedup,
                     crate::raft::proposal_timestamp_ms(),
+                    crate::raft::CanonicalNamespaceRequest::CreateFile {
+                        path: req.path,
+                        attrs: req.attrs.clone(),
+                        layout: req.layout,
+                        mode: match req.mode {
+                            CreateFileMode::CreateNew => crate::raft::CreateFileMode::CreateNew,
+                            CreateFileMode::CreateOrOverwrite => crate::raft::CreateFileMode::CreateOrOverwrite,
+                        },
+                    },
                     crate::raft::Mutation::CreateFile {
                         parent_inode_id: req.parent_inode_id,
                         name: req.name,
                         attrs: req.attrs,
                         layout: req.layout,
+                        mode: match req.mode {
+                            CreateFileMode::CreateNew => crate::raft::CreateFileMode::CreateNew,
+                            CreateFileMode::CreateOrOverwrite => crate::raft::CreateFileMode::CreateOrOverwrite,
+                        },
                     },
                 ),
             )
@@ -375,7 +434,12 @@ impl MetadataFileSystem {
         match result {
             FsCommandResult::Ok(ok) => self.success(
                 &req.ctx,
-                CreateOutput { inode_id: ok.inode_id },
+                CreateOutput {
+                    inode_id: ok.inode_id,
+                    data_handle_id: ok.data_handle_id,
+                    attrs: ok.attrs,
+                    layout: ok.layout,
+                },
                 Some(ctx.namespace_owner_group_name.clone()),
                 Some(ctx.mount_epoch),
             ),
@@ -425,6 +489,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(4096),
                 mode: crate::inode_lease::WriteMode::Write,
                 freshness: Freshness::default(),
@@ -459,6 +524,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(4096),
                 mode: crate::inode_lease::WriteMode::Write,
                 freshness: Freshness::default(),
@@ -507,6 +573,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(4096),
                 mode: crate::inode_lease::WriteMode::Write,
                 freshness: Freshness::default(),
@@ -540,10 +607,12 @@ mod tests {
         let success = filesystem
             .create_resolved(CreateInput {
                 ctx: request_context(),
+                path: "/file".to_string(),
                 parent_inode_id,
                 name: "file".to_string(),
                 attrs: FileAttrs::new(),
                 layout,
+                mode: CreateFileMode::CreateNew,
                 freshness: Freshness::default(),
             })
             .await
@@ -573,10 +642,12 @@ mod tests {
             .build();
         let request = CreateInput {
             ctx: request_context(),
+            path: "/replayed-file".to_string(),
             parent_inode_id,
             name: "replayed-file".to_string(),
             attrs: FileAttrs::new(),
             layout: FileLayout::new(4096, 4096, 1),
+            mode: CreateFileMode::CreateNew,
             freshness: Freshness::default(),
         };
 
@@ -587,6 +658,7 @@ mod tests {
         let replay_applied = raft_node.get_last_applied_state_id().unwrap();
         let mut mismatch = request;
         mismatch.name = "different-file".to_string();
+        mismatch.path = "/different-file".to_string();
         let mismatch_failure = filesystem.create_resolved(mismatch).await.unwrap_err();
         let mismatch_applied = raft_node.get_last_applied_state_id().unwrap();
 
@@ -621,6 +693,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(4096),
                 mode: crate::inode_lease::WriteMode::Write,
                 freshness: Freshness::default(),
@@ -633,32 +706,6 @@ mod tests {
                 .error
                 .message
                 .contains("multi-replica write is not supported yet; replication must be 1"),
-            "unexpected error: {}",
-            failure.error.message
-        );
-    }
-
-    #[test]
-    fn open_write_preflight_rejects_placement_without_authoritative_group() {
-        let filesystem = filesystem_builder_without_mount()
-            .with_worker_manager(worker_manager_for_write_targets(&group_name("root")))
-            .build();
-
-        let failure = filesystem
-            .preflight_open_write_runtime(
-                &request_context(),
-                Some(4096),
-                FileLayout::new(4096, 4096, 1),
-                None,
-                None,
-            )
-            .expect("missing authoritative group must reject placement preflight");
-
-        assert!(
-            failure
-                .error
-                .message
-                .contains("OpenWrite preflight worker lookup requires authoritative metadata group"),
             "unexpected error: {}",
             failure.error.message
         );

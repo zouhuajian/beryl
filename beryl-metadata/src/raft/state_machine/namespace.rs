@@ -107,6 +107,8 @@ impl AppRaftStateMachine {
                 inode_id: Some(inode_id),
                 data_handle_id: None,
                 file_version: None,
+                attrs: Some(inode.attrs.clone()),
+                layout: None,
             })
             .map(|ok| (allocation, inode, updated_parent, ok))
         })();
@@ -130,6 +132,119 @@ impl AppRaftStateMachine {
         Ok(result)
     }
 
+    /// Apply one recursive CreateDirectory command as a single authority batch.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn apply_create_directory(
+        &self,
+        root_inode_id: InodeId,
+        components: Vec<String>,
+        attrs: FileAttrs,
+        proposed_at_ms: u64,
+        dedup_key: &DedupKey,
+        fingerprint: CommandFingerprint,
+        raft_state: &AppMetadataRaftState,
+    ) -> MetadataResult<FsCommandResult> {
+        if components.is_empty() || components.iter().any(|component| component.is_empty()) {
+            return self.persist_fs_error(
+                MetadataError::InvalidArgument("CreateDirectory requires non-empty path components".to_string()),
+                dedup_key,
+                fingerprint,
+                raft_state,
+            );
+        }
+        let mut parent = match self.storage.get_inode(root_inode_id)? {
+            Some(inode) if inode.kind.is_dir() => inode,
+            Some(_) => {
+                return self.persist_fs_error(
+                    MetadataError::NotDir(format!("Root is not a directory: {root_inode_id}")),
+                    dedup_key,
+                    fingerprint,
+                    raft_state,
+                );
+            }
+            None => {
+                return self.persist_fs_error(
+                    MetadataError::NotFound(format!("Root inode not found: {root_inode_id}")),
+                    dedup_key,
+                    fingerprint,
+                    raft_state,
+                );
+            }
+        };
+        let mut allocation = self.storage.prepare_inode_allocation()?;
+        let mut next_raw = allocation.inode_id.as_raw();
+        let mut entries = Vec::new();
+
+        for name in components {
+            if let Some(child_inode_id) = self.storage.get_dentry(parent.inode_id, &name)? {
+                let child = match self.storage.get_inode(child_inode_id)? {
+                    Some(inode) if inode.kind.is_dir() => inode,
+                    Some(_) => {
+                        return self.persist_fs_error(
+                            MetadataError::NotDir(format!("Path component is not a directory: {name}")),
+                            dedup_key,
+                            fingerprint,
+                            raft_state,
+                        );
+                    }
+                    None => {
+                        return self.persist_fs_error(
+                            MetadataError::NotFound(format!("Target inode not found: {child_inode_id}")),
+                            dedup_key,
+                            fingerprint,
+                            raft_state,
+                        );
+                    }
+                };
+                parent = child;
+                continue;
+            }
+
+            let inode_id = InodeId::new(next_raw);
+            next_raw = next_raw
+                .checked_add(1)
+                .ok_or_else(|| MetadataError::Internal("inode ID allocator overflow".to_string()))?;
+            let mut child_attrs = attrs.clone();
+            child_attrs.update_timestamps(proposed_at_ms);
+            child_attrs.nlink = 1;
+            let child = Inode::new_dir(inode_id, child_attrs, parent.mount_id);
+            let mut updated_parent = parent.clone();
+            updated_parent
+                .attrs
+                .update_mtime_ctime(Self::mutation_timestamp(&parent, proposed_at_ms));
+            entries.push(RecursiveMkdirEntry {
+                parent_inode_id: parent.inode_id,
+                name,
+                inode: child.clone(),
+                updated_parent,
+            });
+            parent = child;
+        }
+
+        let result = FsCommandResult::Ok(FsOkResult {
+            inode_id: Some(parent.inode_id),
+            data_handle_id: None,
+            file_version: None,
+            attrs: Some(parent.attrs.clone()),
+            layout: None,
+        });
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Fs(result.clone()));
+        if entries.is_empty() {
+            self.storage
+                .put_apply_result_atomic(dedup_key, applied_result, raft_state)?;
+        } else {
+            allocation.next_inode_id = InodeId::new(next_raw);
+            self.storage.create_directories_with_apply_result_atomic(
+                allocation,
+                &entries,
+                dedup_key,
+                applied_result,
+                raft_state,
+            )?;
+        }
+        Ok(result)
+    }
+
     /// Apply Create command.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn apply_create(
@@ -138,11 +253,52 @@ impl AppRaftStateMachine {
         name: String,
         mut attrs: FileAttrs,
         layout: FileLayout,
+        mode: crate::raft::CreateFileMode,
         proposed_at_ms: u64,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<FsCommandResult> {
+        let existing: MetadataResult<Option<FsCommandResult>> = (|| {
+            let Some(existing_inode_id) = self.storage.get_dentry(parent_inode_id, &name)? else {
+                return Ok(None);
+            };
+            if mode == crate::raft::CreateFileMode::CreateNew {
+                return Err(MetadataError::AlreadyExists(format!("File already exists: {name}")));
+            }
+            let existing = self
+                .storage
+                .get_inode(existing_inode_id)?
+                .ok_or_else(|| MetadataError::NotFound(format!("Existing inode not found: {existing_inode_id}")))?;
+            if !existing.kind.is_file() {
+                return Err(MetadataError::IsDir(format!("Existing entry is not a file: {name}")));
+            }
+            let data_handle_id = existing.current_data_handle_id;
+            self.storage
+                .validate_data_handle_owner(data_handle_id, Some(existing_inode_id))?;
+            let existing_layout = self.storage.get_layout(existing_inode_id)?;
+            Ok(Some(FsCommandResult::Ok(FsOkResult {
+                inode_id: Some(existing_inode_id),
+                data_handle_id: Some(data_handle_id),
+                file_version: match &existing.data {
+                    InodeData::File { file_version, .. } => *file_version,
+                    _ => None,
+                },
+                attrs: Some(existing.attrs.clone()),
+                layout: Some(existing_layout),
+            })))
+        })();
+        match existing {
+            Ok(Some(result)) => {
+                let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Fs(result.clone()));
+                self.storage
+                    .put_apply_result_atomic(dedup_key, applied_result, raft_state)?;
+                return Ok(result);
+            }
+            Ok(None) => {}
+            Err(err) => return self.persist_fs_error(err, dedup_key, fingerprint, raft_state),
+        }
+
         let prepared: MetadataResult<(FileAllocation, Inode, Inode, FsOkResult)> = (|| {
             // Check parent exists and is a directory
             let parent_inode = self
@@ -154,11 +310,6 @@ impl AppRaftStateMachine {
                     "Parent is not a directory: {}",
                     parent_inode_id
                 )));
-            }
-
-            // Check if name already exists
-            if self.storage.get_dentry(parent_inode_id, &name)?.is_some() {
-                return Err(MetadataError::AlreadyExists(format!("File already exists: {}", name)));
             }
 
             // Generate inode ID
@@ -184,6 +335,8 @@ impl AppRaftStateMachine {
                 inode_id: Some(inode_id),
                 data_handle_id: Some(data_handle_id),
                 file_version: None,
+                attrs: Some(inode.attrs.clone()),
+                layout: Some(layout),
             })
             .map(|ok| (allocation, inode, updated_parent, ok))
         })();
@@ -206,6 +359,73 @@ impl AppRaftStateMachine {
             raft_state,
         )?;
         Ok(result)
+    }
+
+    /// Apply the stable Delete command by deciding the target kind atomically.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn apply_delete(
+        &self,
+        parent_inode_id: InodeId,
+        name: String,
+        recursive: bool,
+        proposed_at_ms: u64,
+        dedup_key: &DedupKey,
+        fingerprint: CommandFingerprint,
+        raft_state: &AppMetadataRaftState,
+    ) -> MetadataResult<FsCommandResult> {
+        let child_inode_id = match self.storage.get_dentry(parent_inode_id, &name)? {
+            Some(inode_id) => inode_id,
+            None => {
+                return self.persist_fs_error(
+                    MetadataError::NotFound(format!("Entry not found: {name}")),
+                    dedup_key,
+                    fingerprint,
+                    raft_state,
+                );
+            }
+        };
+        let child_inode = match self.storage.get_inode(child_inode_id)? {
+            Some(inode) => inode,
+            None => {
+                return self.persist_fs_error(
+                    MetadataError::NotFound(format!("Child inode not found: {child_inode_id}")),
+                    dedup_key,
+                    fingerprint,
+                    raft_state,
+                );
+            }
+        };
+
+        if child_inode.kind.is_dir() {
+            if recursive {
+                self.apply_delete_tree(
+                    parent_inode_id,
+                    name,
+                    proposed_at_ms,
+                    dedup_key,
+                    fingerprint,
+                    raft_state,
+                )
+            } else {
+                self.apply_delete_empty_dir(
+                    parent_inode_id,
+                    name,
+                    proposed_at_ms,
+                    dedup_key,
+                    fingerprint,
+                    raft_state,
+                )
+            }
+        } else {
+            self.apply_unlink(
+                parent_inode_id,
+                name,
+                proposed_at_ms,
+                dedup_key,
+                fingerprint,
+                raft_state,
+            )
+        }
     }
 
     /// Apply Unlink command.
@@ -799,6 +1019,7 @@ mod tests {
             crate::raft::DedupKey::new(ClientId::new(10), CallId::new()),
             crate::raft::proposal_timestamp_ms(),
             crate::raft::Mutation::CreateFile {
+                mode: crate::raft::CreateFileMode::CreateNew,
                 parent_inode_id,
                 name: "file".to_string(),
                 attrs: FileAttrs::new(),
@@ -841,6 +1062,7 @@ mod tests {
             dedup.clone(),
             crate::raft::proposal_timestamp_ms(),
             crate::raft::Mutation::CreateFile {
+                mode: crate::raft::CreateFileMode::CreateNew,
                 parent_inode_id,
                 name: "file".to_string(),
                 attrs: FileAttrs::new(),
@@ -856,6 +1078,89 @@ mod tests {
         let inode_id = first.inode_id.expect("inode id should be returned");
         assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), Some(inode_id));
         assert!(storage.get_applied_result(&dedup).unwrap().is_some());
+    }
+
+    #[test]
+    fn create_or_overwrite_reuses_existing_file_authority_atomically() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage));
+        let parent_inode_id = InodeId::new(10);
+        storage
+            .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1)))
+            .unwrap();
+        let first = expect_fs_ok(
+            sm.apply(Command::new(
+                dedup_for_test(411),
+                crate::raft::proposal_timestamp_ms(),
+                crate::raft::Mutation::CreateFile {
+                    mode: crate::raft::CreateFileMode::CreateNew,
+                    parent_inode_id,
+                    name: "file".to_string(),
+                    attrs: FileAttrs::new(),
+                    layout: FileLayout::new(4096, 4096, 1),
+                },
+            ))
+            .unwrap(),
+        );
+        let overwrite = expect_fs_ok(
+            sm.apply(Command::new(
+                dedup_for_test(412),
+                crate::raft::proposal_timestamp_ms(),
+                crate::raft::Mutation::CreateFile {
+                    mode: crate::raft::CreateFileMode::CreateOrOverwrite,
+                    parent_inode_id,
+                    name: "file".to_string(),
+                    attrs: FileAttrs::new(),
+                    layout: FileLayout::new(8192, 8192, 1),
+                },
+            ))
+            .unwrap(),
+        );
+
+        assert_eq!(overwrite.inode_id, first.inode_id);
+        assert_eq!(overwrite.data_handle_id, first.data_handle_id);
+        let inode_id = first.inode_id.unwrap();
+        assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), Some(inode_id));
+        assert_eq!(storage.get_layout(inode_id).unwrap(), FileLayout::new(4096, 4096, 1));
+    }
+
+    #[test]
+    fn dedup_rejects_same_call_id_for_different_mutation_method() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage));
+        let parent_inode_id = InodeId::new(10);
+        storage
+            .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1)))
+            .unwrap();
+        let dedup = dedup_for_test(413);
+        sm.apply(Command::new(
+            dedup.clone(),
+            crate::raft::proposal_timestamp_ms(),
+            crate::raft::Mutation::CreateFile {
+                mode: crate::raft::CreateFileMode::CreateNew,
+                parent_inode_id,
+                name: "file".to_string(),
+                attrs: FileAttrs::new(),
+                layout: FileLayout::new(4096, 4096, 1),
+            },
+        ))
+        .unwrap();
+        let err = sm
+            .apply(Command::new(
+                dedup,
+                crate::raft::proposal_timestamp_ms(),
+                crate::raft::Mutation::Mkdir {
+                    parent_inode_id,
+                    name: "dir".to_string(),
+                    attrs: FileAttrs::new(),
+                },
+            ))
+            .unwrap_err();
+
+        assert!(matches!(err, MetadataError::InvalidArgument(_)));
+        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), None);
     }
 
     #[test]
@@ -937,6 +1242,7 @@ mod tests {
                 dedup_for_test(36),
                 crate::raft::proposal_timestamp_ms(),
                 crate::raft::Mutation::CreateFile {
+                    mode: crate::raft::CreateFileMode::CreateNew,
                     parent_inode_id,
                     name: "old".to_string(),
                     attrs: FileAttrs::new(),
@@ -983,6 +1289,7 @@ mod tests {
                 dedup_for_test(43),
                 crate::raft::proposal_timestamp_ms(),
                 crate::raft::Mutation::CreateFile {
+                    mode: crate::raft::CreateFileMode::CreateNew,
                     parent_inode_id,
                     name: "old".to_string(),
                     attrs: FileAttrs::new(),
@@ -1068,6 +1375,7 @@ mod tests {
                 dedup_for_test(38),
                 crate::raft::proposal_timestamp_ms(),
                 crate::raft::Mutation::CreateFile {
+                    mode: crate::raft::CreateFileMode::CreateNew,
                     parent_inode_id,
                     name: "source".to_string(),
                     attrs: FileAttrs::new(),
@@ -1085,6 +1393,7 @@ mod tests {
                 dedup_for_test(39),
                 crate::raft::proposal_timestamp_ms(),
                 crate::raft::Mutation::CreateFile {
+                    mode: crate::raft::CreateFileMode::CreateNew,
                     parent_inode_id,
                     name: "target".to_string(),
                     attrs: FileAttrs::new(),
@@ -1149,6 +1458,7 @@ mod tests {
                 dedup_for_test(110),
                 crate::raft::proposal_timestamp_ms(),
                 crate::raft::Mutation::CreateFile {
+                    mode: crate::raft::CreateFileMode::CreateNew,
                     parent_inode_id,
                     name: "source".to_string(),
                     attrs: FileAttrs::new(),
@@ -1210,6 +1520,7 @@ mod tests {
                 dedup_for_test(120),
                 crate::raft::proposal_timestamp_ms(),
                 crate::raft::Mutation::CreateFile {
+                    mode: crate::raft::CreateFileMode::CreateNew,
                     parent_inode_id,
                     name: "source".to_string(),
                     attrs: FileAttrs::new(),
@@ -1324,6 +1635,7 @@ mod tests {
                 dedup_for_test(150),
                 crate::raft::proposal_timestamp_ms(),
                 crate::raft::Mutation::CreateFile {
+                    mode: crate::raft::CreateFileMode::CreateNew,
                     parent_inode_id,
                     name: "source".to_string(),
                     attrs: FileAttrs::new(),
@@ -1338,6 +1650,7 @@ mod tests {
                 dedup_for_test(151),
                 crate::raft::proposal_timestamp_ms(),
                 crate::raft::Mutation::CreateFile {
+                    mode: crate::raft::CreateFileMode::CreateNew,
                     parent_inode_id,
                     name: "target".to_string(),
                     attrs: FileAttrs::new(),
@@ -1388,6 +1701,7 @@ mod tests {
                 dedup_for_test(160),
                 crate::raft::proposal_timestamp_ms(),
                 crate::raft::Mutation::CreateFile {
+                    mode: crate::raft::CreateFileMode::CreateNew,
                     parent_inode_id,
                     name: "source".to_string(),
                     attrs: FileAttrs::new(),
@@ -1441,6 +1755,7 @@ mod tests {
                 dedup_for_test(170),
                 crate::raft::proposal_timestamp_ms(),
                 crate::raft::Mutation::CreateFile {
+                    mode: crate::raft::CreateFileMode::CreateNew,
                     parent_inode_id,
                     name: "source".to_string(),
                     attrs: FileAttrs::new(),
@@ -1505,6 +1820,7 @@ mod tests {
                 dedup_for_test(30),
                 crate::raft::proposal_timestamp_ms(),
                 crate::raft::Mutation::CreateFile {
+                    mode: crate::raft::CreateFileMode::CreateNew,
                     parent_inode_id,
                     name: "first".to_string(),
                     attrs: FileAttrs::new(),
@@ -1517,6 +1833,7 @@ mod tests {
                 dedup_for_test(31),
                 crate::raft::proposal_timestamp_ms(),
                 crate::raft::Mutation::CreateFile {
+                    mode: crate::raft::CreateFileMode::CreateNew,
                     parent_inode_id,
                     name: "second".to_string(),
                     attrs: FileAttrs::new(),
@@ -1552,6 +1869,7 @@ mod tests {
                     dedup_for_test(32),
                     crate::raft::proposal_timestamp_ms(),
                     crate::raft::Mutation::CreateFile {
+                        mode: crate::raft::CreateFileMode::CreateNew,
                         parent_inode_id,
                         name: "before-reopen".to_string(),
                         attrs: FileAttrs::new(),
@@ -1572,6 +1890,7 @@ mod tests {
                 dedup_for_test(33),
                 crate::raft::proposal_timestamp_ms(),
                 crate::raft::Mutation::CreateFile {
+                    mode: crate::raft::CreateFileMode::CreateNew,
                     parent_inode_id,
                     name: "after-reopen".to_string(),
                     attrs: FileAttrs::new(),
@@ -1609,9 +1928,10 @@ mod tests {
         let command = Command::new(
             dedup.clone(),
             crate::raft::proposal_timestamp_ms(),
-            crate::raft::Mutation::Unlink {
+            crate::raft::Mutation::Delete {
                 parent_inode_id,
                 name: "file".to_string(),
+                recursive: false,
             },
         );
 
@@ -1648,9 +1968,10 @@ mod tests {
         let command = Command::new(
             dedup_for_test(81),
             crate::raft::proposal_timestamp_ms(),
-            crate::raft::Mutation::Unlink {
+            crate::raft::Mutation::Delete {
                 parent_inode_id,
                 name: "file".to_string(),
+                recursive: false,
             },
         );
 
@@ -1681,9 +2002,10 @@ mod tests {
         let command = Command::new(
             dedup.clone(),
             crate::raft::proposal_timestamp_ms(),
-            crate::raft::Mutation::DeleteEmptyDir {
+            crate::raft::Mutation::Delete {
                 parent_inode_id,
                 name: "dir".to_string(),
+                recursive: false,
             },
         );
 
@@ -1718,9 +2040,10 @@ mod tests {
         let command = Command::new(
             dedup.clone(),
             crate::raft::proposal_timestamp_ms(),
-            crate::raft::Mutation::DeleteEmptyDir {
+            crate::raft::Mutation::Delete {
                 parent_inode_id,
                 name: "dir".to_string(),
+                recursive: false,
             },
         );
 
@@ -1778,9 +2101,10 @@ mod tests {
         let command = Command::new(
             dedup_for_test(99),
             crate::raft::proposal_timestamp_ms(),
-            crate::raft::Mutation::DeleteTree {
+            crate::raft::Mutation::Delete {
                 parent_inode_id,
                 name: "dir".to_string(),
+                recursive: true,
             },
         );
 
@@ -1833,9 +2157,10 @@ mod tests {
         let command = Command::new(
             dedup.clone(),
             crate::raft::proposal_timestamp_ms(),
-            crate::raft::Mutation::DeleteTree {
+            crate::raft::Mutation::Delete {
                 parent_inode_id,
                 name: "dir".to_string(),
+                recursive: true,
             },
         );
 
@@ -1880,9 +2205,10 @@ mod tests {
             sm.apply(Command::new(
                 dedup.clone(),
                 crate::raft::proposal_timestamp_ms(),
-                crate::raft::Mutation::DeleteTree {
+                crate::raft::Mutation::Delete {
                     parent_inode_id,
                     name: "first".to_string(),
+                    recursive: true,
                 },
             ))
             .unwrap(),
@@ -1890,9 +2216,10 @@ mod tests {
         let mismatch = sm.apply(Command::new(
             dedup,
             crate::raft::proposal_timestamp_ms(),
-            crate::raft::Mutation::DeleteTree {
+            crate::raft::Mutation::Delete {
                 parent_inode_id,
                 name: "second".to_string(),
+                recursive: true,
             },
         ));
 

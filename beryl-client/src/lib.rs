@@ -37,6 +37,6 @@ pub use api::ListOptions;
 pub use api::{BlockFormatId, DirectoryEntry, DirectoryListing, FileAttrs, FileStatus, InodeKind};
 pub use api::{CreateMode, CreateOptions, FileReader, FileWriter, FsClient};
 pub use config::ClientConfig;
-pub use config::{BackoffConfig, ChannelPoolConfig, RefreshConfig, RetryConfig, WriteLeaseConfig};
+pub use config::{ChannelPoolConfig, RetryConfig, WriteLeaseConfig};
 pub use error::{ClientActionError, ClientError, ClientResult};
 pub use metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics, NoopClientMetrics};

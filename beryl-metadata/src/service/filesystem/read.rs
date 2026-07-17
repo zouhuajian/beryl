@@ -2003,6 +2003,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id: env.inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(64),
                 mode: crate::inode_lease::WriteMode::Write,
                 freshness: Freshness::default(),
@@ -2069,6 +2070,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id: env.inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(64),
                 mode: crate::inode_lease::WriteMode::Write,
                 freshness: Freshness::default(),

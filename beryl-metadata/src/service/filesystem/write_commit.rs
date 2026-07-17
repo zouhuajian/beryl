@@ -209,6 +209,16 @@ impl MetadataFileSystem {
 
     async fn sync_write_resolved(&self, req: SyncWriteInput) -> FsResult<SyncWriteOutput> {
         let file_handle = req.file_handle;
+        let dedup = match self.dedup_key(&req.ctx.caller) {
+            Ok(key) => key,
+            Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
+        };
+        if let Some(replay) = self.replay_sync_write_if_applied(&req, &dedup).await {
+            return replay;
+        }
+        if let Err(err) = self.reject_active_session_call_reuse(&req.ctx.caller) {
+            return self.failure_from_error(&req.ctx, err, None, None);
+        }
 
         let session = match self.session_registry.get_session(file_handle) {
             Some(session) => session,
@@ -225,6 +235,15 @@ impl MetadataFileSystem {
                 );
             }
         };
+        if session.open_client_id != req.ctx.caller.client.client_id {
+            return self.session_terminal_failure(
+                &req.ctx,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                format!("SyncWrite client does not own handle={file_handle}"),
+                None,
+                None,
+            );
+        }
 
         let (group_name, mount_epoch) =
             match self
@@ -383,10 +402,6 @@ impl MetadataFileSystem {
             Err(failure) => return Err(failure),
         };
 
-        let dedup = match self.dedup_key(&req.ctx.caller) {
-            Ok(k) => k,
-            Err(err) => return self.failure_from_error(&req.ctx, err, group_name.clone(), mount_epoch),
-        };
         let command = Command::new(
             dedup,
             crate::raft::proposal_timestamp_ms(),
@@ -431,6 +446,131 @@ impl MetadataFileSystem {
             Some(ctx.mount_epoch),
             route_epoch,
         )
+    }
+
+    async fn replay_sync_write_if_applied(
+        &self,
+        req: &SyncWriteInput,
+        dedup: &DedupKey,
+    ) -> Option<FsResult<SyncWriteOutput>> {
+        let applied = match self.storage.get_applied_result(dedup) {
+            Ok(Some(applied)) => applied,
+            Ok(None) => return None,
+            Err(err) => return Some(self.failure_from_error(&req.ctx, err, None, None)),
+        };
+        let (command, group_name, mount_epoch) =
+            match self.sync_write_replay_command(req, dedup, &self.storage, applied.fingerprint) {
+                Ok(replay) => replay,
+                Err(err) => return Some(self.failure_from_error(&req.ctx, err, None, None)),
+            };
+        if command.fingerprint() != applied.fingerprint {
+            return Some(self.failure_from_error(
+                &req.ctx,
+                MetadataError::InvalidArgument(format!(
+                    "call_id {} reused with different command payload",
+                    dedup.call_id
+                )),
+                group_name,
+                mount_epoch,
+            ));
+        }
+        let route_epoch = match self.authoritative_route_epoch().await {
+            Ok(route_epoch) => Some(route_epoch),
+            Err(err) => return Some(self.failure_from_error(&req.ctx, err, group_name, mount_epoch)),
+        };
+        match applied.result {
+            AppDataResponse::Fs(FsCommandResult::Ok(ok)) => Some(self.success_with_route_epoch(
+                &req.ctx,
+                SyncWriteOutput {
+                    synced_size: req.target_size,
+                    file_version: ok.file_version,
+                },
+                group_name,
+                mount_epoch,
+                route_epoch,
+            )),
+            AppDataResponse::Fs(FsCommandResult::Err(err)) => {
+                Some(self.fatal_fs_failure(&req.ctx, err.errno, err.message, group_name, mount_epoch))
+            }
+            _ => Some(self.failure_from_error(
+                &req.ctx,
+                MetadataError::InvalidArgument(format!(
+                    "applied result for call_id {} is not a SyncWrite filesystem result",
+                    dedup.call_id
+                )),
+                group_name,
+                mount_epoch,
+            )),
+        }
+    }
+
+    fn sync_write_replay_command(
+        &self,
+        req: &SyncWriteInput,
+        dedup: &DedupKey,
+        storage: &RocksDBStorage,
+        applied_fingerprint: CommandFingerprint,
+    ) -> MetadataResult<(Command, Option<GroupName>, Option<u64>)> {
+        let lease_id = req
+            .lease_id
+            .ok_or_else(|| MetadataError::InvalidArgument("Missing lease_id".to_string()))?;
+        let token_block = req
+            .fencing_token
+            .as_ref()
+            .and_then(|token| token.block_id)
+            .ok_or_else(|| MetadataError::InvalidArgument("Missing fencing_token block_id".to_string()))?;
+        let inode_id = storage
+            .get_inode_by_data_handle(token_block.data_handle_id)?
+            .ok_or_else(|| {
+                MetadataError::StaleState(format!(
+                    "Missing owner for data_handle_id {}, refresh metadata state",
+                    token_block.data_handle_id
+                ))
+            })?;
+        let inode = self
+            .read_inode(inode_id)?
+            .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {inode_id}")))?;
+        let (group_name, mount_epoch) = self.freshness_validator.mount_hints_for_mount(inode.mount_id);
+        let extents = req
+            .committed_blocks
+            .iter()
+            .map(|block| Extent {
+                file_offset: block.file_offset,
+                block_id: block.block_id,
+                block_offset: 0,
+                len: block.len,
+                file_version: None,
+                block_stamp: None,
+            })
+            .collect::<Vec<_>>();
+        let build = |commit_mode| {
+            Command::new(
+                dedup.clone(),
+                crate::raft::proposal_timestamp_ms(),
+                crate::raft::Mutation::SyncWrite {
+                    inode_id,
+                    extents: extents.clone(),
+                    target_size: req.target_size,
+                    lease_id,
+                    open_epoch: req.open_epoch,
+                    lease_epoch: req.lease_epoch,
+                    commit_mode,
+                },
+            )
+        };
+        let replace = build(FileCommitMode::Replace);
+        let append = build(FileCommitMode::Append);
+        let command = if replace.fingerprint() == applied_fingerprint {
+            replace
+        } else if append.fingerprint() == applied_fingerprint {
+            append
+        } else {
+            return Err(MetadataError::InvalidArgument(format!(
+                "call_id {} reused with different command payload",
+                dedup.call_id
+            )));
+        };
+        Ok((command, group_name, mount_epoch))
     }
 
     fn invalid_commit_failure(
@@ -593,12 +733,16 @@ impl MetadataFileSystem {
             Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
         };
 
+        if let Some(replay) = self.replay_close_write_if_applied(&req, &dedup).await {
+            return replay;
+        }
+        if let Err(err) = self.reject_active_session_call_reuse(&req.ctx.caller) {
+            return self.failure_from_error(&req.ctx, err, None, None);
+        }
+
         let session = match self.session_registry.get_session(file_handle) {
             Some(session) => session,
             None => {
-                if let Some(replay) = self.replay_close_write_if_applied(&req, &dedup).await {
-                    return replay;
-                }
                 return self.session_terminal_failure(
                     &req.ctx,
                     ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
@@ -611,6 +755,15 @@ impl MetadataFileSystem {
                 );
             }
         };
+        if session.open_client_id != req.ctx.caller.client.client_id {
+            return self.session_terminal_failure(
+                &req.ctx,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                format!("CommitFile client does not own handle={file_handle}"),
+                None,
+                None,
+            );
+        }
 
         let (group_name, mount_epoch) =
             match self
@@ -1012,19 +1165,20 @@ mod tests {
             .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
             .unwrap();
         let writer = ClientId::new(7);
-        let (lease_id, lease_epoch, _) = filesystem
+        let open_call_id = beryl_types::CallId::new();
+        let (lease_id, lease_epoch, expires_at_ms) = filesystem
             .lease_manager()
             .try_acquire(
                 inode_id,
                 writer,
-                Some(beryl_types::CallId::new()),
+                Some(open_call_id),
                 crate::inode_lease::WriteMode::Write,
                 None,
             )
             .expect("lease acquired");
         let file_handle = filesystem
             .session_registry()
-            .create_session(crate::session_registry::CreateSessionInput {
+            .get_or_create_session(crate::session_registry::CreateSessionInput {
                 inode_id,
                 mount_id,
                 data_handle_id,
@@ -1038,6 +1192,12 @@ mod tests {
                 open_epoch: 777,
                 base_size: 0,
                 mode: crate::inode_lease::WriteMode::Write,
+                open_client_id: writer,
+                open_call_id,
+                open_path: "/test".to_string(),
+                open_desired_len: None,
+                layout: FileLayout::new(64, 64, 1),
+                expires_at_ms,
                 write_targets: vec![WriteTarget {
                     block_id,
                     file_offset: 0,
@@ -1059,7 +1219,9 @@ mod tests {
                     block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
                     tier: beryl_types::Tier::Hdd,
                 }],
-            });
+            })
+            .expect("session created")
+            .0;
         let session = filesystem
             .write_session_for_handle(file_handle)
             .expect("session should be installed");
@@ -1072,6 +1234,7 @@ mod tests {
                 open_epoch: session.open_epoch,
                 fencing_token: Some(presented_session_token(&session)),
                 desired_len: Some(64),
+                previous_block_id: None,
                 freshness: Freshness::default(),
             })
             .await
@@ -1117,6 +1280,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id: env.inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(64),
                 mode: crate::inode_lease::WriteMode::Write,
                 freshness: Freshness::default(),
@@ -1152,6 +1316,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id: env.inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(64),
                 mode: crate::inode_lease::WriteMode::Write,
                 freshness: Freshness::default(),
@@ -1206,6 +1371,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id: env.inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(64),
                 mode: crate::inode_lease::WriteMode::Write,
                 freshness: Freshness::default(),
@@ -1272,6 +1438,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id: env.inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(64),
                 mode: crate::inode_lease::WriteMode::Write,
                 freshness: Freshness::default(),
@@ -1305,6 +1472,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id: env.inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(64),
                 mode: crate::inode_lease::WriteMode::Write,
                 freshness: Freshness::default(),
@@ -1331,6 +1499,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id: env.inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(64),
                 mode: crate::inode_lease::WriteMode::Append,
                 freshness: Freshness::default(),
@@ -1483,6 +1652,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id: env.inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(256),
                 mode: crate::inode_lease::WriteMode::Write,
                 freshness: Freshness::default(),
@@ -1517,6 +1687,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id: env.inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(8192),
                 mode: crate::inode_lease::WriteMode::Write,
                 freshness: Freshness::default(),
@@ -1581,6 +1752,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id: env.inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(64),
                 mode: crate::inode_lease::WriteMode::Write,
                 freshness: Freshness::default(),
@@ -1610,13 +1782,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_identical_sync_write_is_idempotent_without_file_version_advance() {
+    async fn sync_write_applied_result_replays_after_session_cleanup() {
         let env = write_flow_env(0).await;
         let open = env
             .filesystem
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id: env.inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(64),
                 mode: crate::inode_lease::WriteMode::Write,
                 freshness: Freshness::default(),
@@ -1631,16 +1804,47 @@ mod tests {
             target.effective_len,
         )];
 
-        let first = sync_for_key(&env.filesystem, &key, blocks.clone(), 64, SyncWriteMode::Visibility)
+        let request = SyncWriteInput {
+            ctx: request_context(),
+            file_handle: key.file_handle,
+            lease_id: Some(key.lease_id),
+            lease_epoch: key.lease_epoch,
+            open_epoch: key.open_epoch,
+            fencing_token: Some(presented_key_token(&key)),
+            data_handle_id: key.fencing_token.block_id.data_handle_id,
+            committed_blocks: blocks,
+            target_size: 64,
+            _flags: 0,
+            mode: SyncWriteMode::Visibility,
+            freshness: Freshness::default(),
+        };
+        let first = env
+            .filesystem
+            .sync_write_resolved(request.clone())
             .await
             .expect("first SyncWrite should publish");
         let first_version = stored_file_version(&env.storage, env.inode_id).expect("file version");
-        let second = sync_for_key(&env.filesystem, &key, blocks, 64, SyncWriteMode::Visibility)
+        env.filesystem
+            .session_registry()
+            .remove_session(key.file_handle)
+            .expect("session removed to model cleanup or restart");
+        let second = env
+            .filesystem
+            .sync_write_resolved(request.clone())
             .await
-            .expect("repeated SyncWrite should be a no-op");
+            .expect("applied SyncWrite should replay before session lookup");
 
         assert_eq!(second.payload.file_version, first.payload.file_version);
         assert_eq!(stored_file_version(&env.storage, env.inode_id), Some(first_version));
+
+        let mut mismatch = request;
+        mismatch.target_size = 63;
+        let failure = env
+            .filesystem
+            .sync_write_resolved(mismatch)
+            .await
+            .expect_err("same call_id with changed SyncWrite payload must fail");
+        assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EInval));
     }
 
     #[tokio::test]
@@ -1651,6 +1855,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id: env.inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(64),
                 mode: crate::inode_lease::WriteMode::Append,
                 freshness: Freshness::default(),
@@ -1698,7 +1903,13 @@ mod tests {
             .expect("session should be installed");
         filesystem
             .session_registry()
-            .allocate_target(file_handle, None)
+            .allocate_target(
+                file_handle,
+                ClientId::new(99),
+                beryl_types::CallId::new(),
+                None,
+                Some(64),
+            )
             .expect("target should be issued");
         let ctx = request_context();
         let request = CloseWriteInput {
@@ -1756,6 +1967,7 @@ mod tests {
             .open_write_resolved(OpenWriteInput {
                 ctx: request_context(),
                 inode_id: env.inode_id,
+                open_path: "/test".to_string(),
                 desired_len: Some(64),
                 mode: crate::inode_lease::WriteMode::Append,
                 freshness: Freshness::default(),

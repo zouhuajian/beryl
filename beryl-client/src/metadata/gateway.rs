@@ -71,19 +71,19 @@ pub(crate) trait MetadataGateway: Send + Sync {
         req: beryl_proto::metadata::GetBlockLocationsRequestProto,
     ) -> ClientResult<ReadLayout>;
 
-    /// Create a file and seed a write session.
+    /// Apply the durable CreateFile namespace mutation.
     async fn create_file(
         &self,
         ctx: AttemptContext,
         req: beryl_proto::metadata::CreateFileRequestProto,
     ) -> ClientResult<beryl_proto::metadata::CreateFileResponseProto>;
 
-    /// Append to an existing file and seed a write session.
-    async fn append_file(
+    /// Open a leader-local write session.
+    async fn open_write(
         &self,
         ctx: AttemptContext,
-        req: beryl_proto::metadata::AppendFileRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::AppendFileResponseProto>;
+        req: beryl_proto::metadata::OpenWriteRequestProto,
+    ) -> ClientResult<beryl_proto::metadata::OpenWriteResponseProto>;
 
     /// Allocate a worker write target for a write session.
     async fn add_block(
@@ -413,16 +413,16 @@ impl MetadataGateway for GrpcMetadataGateway {
         Ok(response)
     }
 
-    async fn append_file(
+    async fn open_write(
         &self,
         ctx: AttemptContext,
-        mut req: beryl_proto::metadata::AppendFileRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::AppendFileResponseProto> {
+        mut req: beryl_proto::metadata::OpenWriteRequestProto,
+    ) -> ClientResult<beryl_proto::metadata::OpenWriteResponseProto> {
         req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
             .await?
-            .append_file(tonic_request(&ctx, req))
+            .open_write(tonic_request(&ctx, req))
             .await
             .map_err(ClientError::from)?
             .into_inner();
@@ -629,9 +629,7 @@ fn tonic_request<T>(ctx: &AttemptContext, message: T) -> tonic::Request<T> {
 mod tests {
     use super::*;
     use crate::rpc_error::ClientAction;
-    use crate::runtime::{
-        ErrorClass, ErrorClassifier, MetadataRefreshCause, OperationContext, OperationIdentity, OperationKind,
-    };
+    use crate::runtime::{classify_error, ErrorClass, OperationContext, OperationDeadline};
     use beryl_common::error::rpc::{
         ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RefreshHint as RpcRefreshHint, RpcErrorDetail,
     };
@@ -764,8 +762,7 @@ mod tests {
 
         let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("need refresh must be surfaced");
         match action(&err) {
-            ClientAction::Refresh { reason, hint, .. } => {
-                assert_eq!(*reason, MetadataRefreshCause::RouteEpochMismatch);
+            ClientAction::Refresh { hint, .. } => {
                 assert_eq!(hint.leader_endpoint.as_deref(), Some("http://127.0.0.1:18081"));
                 assert_eq!(hint.group_name, Some(GroupName::parse("analytics").unwrap()));
                 assert_eq!(hint.route_epoch, Some(23));
@@ -782,7 +779,7 @@ mod tests {
         let ctx = metadata_attempt("root", None);
         let err = parse_metadata_response_header(&ctx, None).expect_err("missing response header must fail");
 
-        assert_ne!(ErrorClassifier.classify_error(&err), ErrorClass::RetryableTransport);
+        assert_ne!(classify_error(&err), ErrorClass::RetryableTransport);
         match action(&err) {
             ClientAction::Fail { rpc_error } => {
                 assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
@@ -801,7 +798,7 @@ mod tests {
         let err =
             parse_metadata_response_header(&ctx, Some(&malformed)).expect_err("malformed response header must fail");
 
-        assert_ne!(ErrorClassifier.classify_error(&err), ErrorClass::RetryableTransport);
+        assert_ne!(classify_error(&err), ErrorClass::RetryableTransport);
         match action(&err) {
             ClientAction::Fail { rpc_error } => {
                 assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
@@ -853,7 +850,7 @@ mod tests {
     }
 
     fn assert_invalid_metadata_header(err: &ClientError, message_fragment: &str) {
-        assert_eq!(ErrorClassifier.classify_error(err), ErrorClass::InvalidHeader);
+        assert_eq!(classify_error(err), ErrorClass::InvalidHeader);
         match action(err) {
             ClientAction::Fail { rpc_error } => {
                 assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
@@ -900,10 +897,8 @@ mod tests {
 
     fn metric_label_values(labels: &ClientMetricLabels) -> impl Iterator<Item = &str> {
         [
-            labels.operation_kind,
             labels.operation_name.as_deref(),
             labels.error_class,
-            labels.metadata_refresh_cause,
             labels.target_plane,
             labels.cache,
             labels.reason,
@@ -914,11 +909,12 @@ mod tests {
     }
 
     fn metadata_attempt(group_name: &str, endpoint: Option<&str>) -> AttemptContext {
-        let operation = OperationContext::new(
+        let operation = OperationContext::new_named(
             ClientId::new(7),
-            OperationKind::MetadataRead,
+            "test-client",
             "GetStatus",
-            OperationIdentity::path("/alpha"),
+            Some("/alpha".to_string()),
+            OperationDeadline::new(5_000),
         )
         .expect("operation");
         let ctx = AttemptContext::for_metadata(&operation, GroupName::parse(group_name).unwrap(), 0).expect("attempt");

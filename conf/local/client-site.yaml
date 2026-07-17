@@ -7,12 +7,8 @@ client.name: "default_client"
 client.metadata.group.names: "root"
 client.metadata.group.root.endpoints: "127.0.0.1:18080"
 
-client.retry.max_retry_attempts: 3
-client.refresh.max_attempts: 3
-client.operation.timeout_ms: null
-client.backoff.initial_ms: 100
-client.backoff.max_ms: 5000
-client.backoff.multiplier: "2.0"
+client.retry.max_attempts: 3
+client.operation.timeout_ms: 30000
 
 client.write_lease.auto_renew: true
 client.write_lease.renew_before_expiry_ms: 30000

@@ -30,7 +30,7 @@ use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
 use crate::metrics::{ClientMetrics, NoopClientMetrics};
 use crate::planner::{block_location_unavailable_error, PlannedBlockRead};
-use crate::runtime::{AttemptContext, ErrorClass, ErrorClassifier};
+use crate::runtime::{classify_error, AttemptContext, ErrorClass};
 use beryl_types::{GroupName, WriteTarget};
 
 #[derive(Debug)]
@@ -180,7 +180,7 @@ impl WorkerDataClient for GrpcWorkerDataClient {
             };
             let bytes = match read_stream_to_bytes(&mut stream, block_read).await {
                 Ok(bytes) => bytes,
-                Err(err) if ErrorClassifier.classify_error(&err) == ErrorClass::RetryableTransport => {
+                Err(err) if classify_error(&err) == ErrorClass::RetryableTransport => {
                     self.channel_pool
                         .mark_worker_unavailable(worker, CacheInvalidationReason::Unavailable);
                     last_transport_error = Some(err);
@@ -475,9 +475,7 @@ mod tests {
     use tonic::{Request, Response, Status};
 
     use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetrics};
-    use crate::runtime::{
-        ErrorClass, ErrorClassifier, MetadataRefreshCause, OperationContext, OperationIdentity, OperationKind,
-    };
+    use crate::runtime::{classify_error, ErrorClass, OperationContext, OperationDeadline};
 
     #[derive(Debug, Default)]
     struct RecordingMetrics {
@@ -642,11 +640,7 @@ mod tests {
             .await
             .expect_err("exhausted stale candidates must surface typed location error");
 
-        assert_rpc_refresh(
-            &err,
-            ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
-            MetadataRefreshCause::Unknown,
-        );
+        assert_rpc_refresh(&err, ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable));
         assert_eq!(first_state.open_read_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second_state.open_read_calls.load(Ordering::SeqCst), 1);
         let _ = first_shutdown.send(());
@@ -673,11 +667,7 @@ mod tests {
             .await
             .expect_err("stamp mismatch must surface typed refresh error");
 
-        assert_rpc_refresh(
-            &err,
-            ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
-            MetadataRefreshCause::BlockStampMismatch,
-        );
+        assert_rpc_refresh(&err, ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch));
         assert_eq!(state.open_read_calls.load(Ordering::SeqCst), 1);
         assert_eq!(state.read_stream_calls.load(Ordering::SeqCst), 0);
         let _ = shutdown.send(());
@@ -703,11 +693,7 @@ mod tests {
             .await
             .expect_err("worker run mismatch must surface typed refresh error");
 
-        assert_rpc_refresh(
-            &err,
-            ErrorKind::Worker(WorkerErrorKind::RunMismatch),
-            MetadataRefreshCause::WorkerRunMismatch,
-        );
+        assert_rpc_refresh(&err, ErrorKind::Worker(WorkerErrorKind::RunMismatch));
         assert_eq!(state.open_read_calls.load(Ordering::SeqCst), 1);
         assert_eq!(state.read_stream_calls.load(Ordering::SeqCst), 0);
         let _ = shutdown.send(());
@@ -861,7 +847,7 @@ mod tests {
                 if msg.contains("worker read frame offset mismatch")
                     && msg.contains("expected 0, got 1")
         ));
-        assert_ne!(ErrorClassifier.classify_error(&err), ErrorClass::RetryableTransport);
+        assert_ne!(classify_error(&err), ErrorClass::RetryableTransport);
         assert_eq!(first_state.open_read_calls.load(Ordering::SeqCst), 1);
         assert_eq!(first_state.read_stream_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second_state.open_read_calls.load(Ordering::SeqCst), 0);
@@ -908,8 +894,8 @@ mod tests {
             }
             other => panic!("expected UnknownOutcome, got {other:?}"),
         }
-        assert_eq!(ErrorClassifier.classify_error(&err), ErrorClass::UnknownOutcome);
-        assert_ne!(ErrorClassifier.classify_error(&err), ErrorClass::RetryableTransport);
+        assert_eq!(classify_error(&err), ErrorClass::UnknownOutcome);
+        assert_ne!(classify_error(&err), ErrorClass::RetryableTransport);
         assert_eq!(commit_state.commit_calls.load(Ordering::SeqCst), 1);
         assert_worker_channel_cached(&client, &metrics, &worker, false);
         assert_metric(&metrics.events(), ClientMetric::CachePreciseInvalidation);
@@ -940,8 +926,8 @@ mod tests {
             .expect_err("worker run mismatch must fail");
 
         assert_eq!(
-            ErrorClassifier.classify_error(&err),
-            ErrorClass::RefreshMetadata(crate::runtime::MetadataRefreshCause::WorkerRunMismatch)
+            classify_error(&err),
+            ErrorClass::RefreshMetadata(ErrorKind::Worker(WorkerErrorKind::RunMismatch))
         );
         assert_metric(&metrics.events(), ClientMetric::CachePreciseInvalidation);
         let _ = shutdown.send(());
@@ -1187,11 +1173,12 @@ mod tests {
     }
 
     fn data_attempt_context(operation_name: &'static str) -> AttemptContext {
-        let operation = OperationContext::new(
+        let operation = OperationContext::new_named(
             ClientId::new(7),
-            OperationKind::WorkerWriteData,
+            "test-client",
             operation_name,
-            OperationIdentity::path("/alpha"),
+            Some("/alpha".to_string()),
+            OperationDeadline::new(5_000),
         )
         .expect("operation context");
         AttemptContext::for_data(&operation, 0)
@@ -1223,11 +1210,10 @@ mod tests {
         }
     }
 
-    fn assert_rpc_refresh(err: &ClientError, expected_kind: ErrorKind, expected_reason: MetadataRefreshCause) {
+    fn assert_rpc_refresh(err: &ClientError, expected_kind: ErrorKind) {
         match err {
             ClientError::Action(action) => match action.action() {
-                crate::rpc_error::ClientAction::Refresh { reason, rpc_error, .. } => {
-                    assert_eq!(*reason, expected_reason);
+                crate::rpc_error::ClientAction::Refresh { rpc_error, .. } => {
                     assert_eq!(rpc_error.kind, expected_kind);
                 }
                 other => panic!("expected refresh action, got {other:?}"),

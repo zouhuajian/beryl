@@ -216,7 +216,6 @@ pub(crate) fn block_location_unavailable_error(message: impl Into<String>) -> Cl
         message,
     );
     ClientError::from(crate::rpc_error::ClientAction::Refresh {
-        reason: crate::runtime::MetadataRefreshCause::Unknown,
         hint: Box::new(crate::rpc_error::RefreshHint {
             worker_resolve_required: true,
             ..crate::rpc_error::RefreshHint::default()
@@ -386,12 +385,7 @@ mod tests {
     fn assert_block_location_unavailable(err: &ClientError) {
         match err {
             ClientError::Action(action) => match action.action() {
-                crate::rpc_error::ClientAction::Refresh {
-                    reason,
-                    rpc_error,
-                    hint,
-                } => {
-                    assert_eq!(*reason, crate::runtime::MetadataRefreshCause::Unknown);
+                crate::rpc_error::ClientAction::Refresh { rpc_error, hint } => {
                     assert_eq!(
                         rpc_error.kind,
                         beryl_common::error::rpc::ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable)

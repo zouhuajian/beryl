@@ -15,7 +15,7 @@ use super::{
 };
 use crate::error::{ClientError, ClientResult};
 use crate::planner::PlannedBlockRead;
-use crate::runtime::{AttemptContext, OperationContext, OperationIdentity, OperationKind};
+use crate::runtime::{AttemptContext, OperationContext, OperationDeadline};
 
 #[tokio::test]
 async fn data_plane_rejects_zero_block_stamp_before_worker_io() {
@@ -86,11 +86,12 @@ impl WorkerDataClient for NoWorkerIo {
 }
 
 fn data_attempt_context() -> AttemptContext {
-    let operation = OperationContext::new(
+    let operation = OperationContext::new_named(
         ClientId::new(7),
-        OperationKind::WorkerReadData,
+        "test-client",
         "OpenReadStream",
-        OperationIdentity::path("/alpha"),
+        Some("/alpha".to_string()),
+        OperationDeadline::new(1_000),
     )
     .expect("operation context");
     AttemptContext::for_data(&operation, 0)

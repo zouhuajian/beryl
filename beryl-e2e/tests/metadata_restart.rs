@@ -11,8 +11,9 @@ use beryl_proto::fs::FileAttrsProto;
 use beryl_proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
 use beryl_proto::metadata::get_block_locations_request_proto;
 use beryl_proto::metadata::{
-    AddBlockRequestProto, CommitFileRequestProto, CommittedBlockProto, CreateFileRequestProto, CreateModeProto,
-    GetBlockLocationsRequestProto, WriteHandleProto, WriteTargetProto,
+    AbortFileWriteRequestProto, AddBlockRequestProto, CommitFileRequestProto, CommittedBlockProto,
+    CreateFileRequestProto, CreateModeProto, GetBlockLocationsRequestProto, OpenWriteModeProto, OpenWriteRequestProto,
+    WriteHandleProto, WriteTargetProto,
 };
 use beryl_proto::worker::worker_data_service_client::WorkerDataServiceClient;
 use beryl_proto::worker::{
@@ -70,6 +71,11 @@ async fn restart_after_create_before_close_fails_stale_writer_without_publishing
 
     let err = writer.close().await.expect_err("stale writer must fail closed");
     assert_stale_writer_error(&err);
+    let mut reopened = client
+        .append("/restart/create-before-close")
+        .await
+        .expect("new OpenWrite call establishes a new session after restart");
+    reopened.abort().await.expect("abort reopened session");
     assert_no_committed_bytes(&cluster, "/restart/create-before-close")
         .await
         .expect("no committed bytes");
@@ -183,6 +189,178 @@ async fn existing_visible_data_remains_readable_while_active_write_fails_closed(
     cluster.shutdown().await.expect("shutdown cluster");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_rpc_response_loss_replay_returns_one_logical_result() {
+    let mut cluster = TestCluster::start().await.expect("start cluster");
+    cluster
+        .client()
+        .mkdirs("/restart", true)
+        .await
+        .expect("create restart dir");
+    let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
+        .await
+        .expect("connect metadata");
+    let path = "/restart/replay";
+    let create_request = CreateFileRequestProto {
+        header: Some(metadata_header(801)),
+        path: path.to_string(),
+        attrs: Some(FileAttrsProto {
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+            ..Default::default()
+        }),
+        layout: Some(FileLayoutProto {
+            block_size: 1024,
+            chunk_size: 1024,
+            replication: 1,
+            block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
+        }),
+        create_mode: CreateModeProto::CreateNew as i32,
+    };
+    let first_create = metadata
+        .create_file(Request::new(create_request.clone()))
+        .await
+        .expect("first CreateFile")
+        .into_inner();
+    let replay_create = metadata
+        .create_file(Request::new(create_request))
+        .await
+        .expect("replayed CreateFile")
+        .into_inner();
+    assert_metadata_ok(first_create.header);
+    assert_metadata_ok(replay_create.header);
+    assert_eq!(replay_create.inode_id, first_create.inode_id);
+    assert_eq!(replay_create.data_handle_id, first_create.data_handle_id);
+    assert_eq!(replay_create.layout, first_create.layout);
+
+    let open_request = OpenWriteRequestProto {
+        header: Some(metadata_header(801)),
+        path: path.to_string(),
+        mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
+        desired_len: Some(2048),
+    };
+    let first_open = metadata
+        .open_write(Request::new(open_request.clone()))
+        .await
+        .expect("first OpenWrite")
+        .into_inner();
+    let replay_open = metadata
+        .open_write(Request::new(open_request))
+        .await
+        .expect("replayed OpenWrite")
+        .into_inner();
+    assert_metadata_ok(first_open.header);
+    assert_metadata_ok(replay_open.header);
+    assert_eq!(replay_open.write_handle, first_open.write_handle);
+    assert_eq!(replay_open.expires_at_ms, first_open.expires_at_ms);
+    let write_handle = first_open.write_handle.expect("write handle");
+
+    let add_header = metadata_header(801);
+    let add_request = AddBlockRequestProto {
+        header: Some(add_header.clone()),
+        write_handle: Some(write_handle),
+        desired_len: Some(1024),
+        previous_block_id: None,
+    };
+    let first_add = metadata
+        .add_block(Request::new(add_request.clone()))
+        .await
+        .expect("first AddBlock")
+        .into_inner();
+    let replay_add = metadata
+        .add_block(Request::new(add_request))
+        .await
+        .expect("replayed AddBlock")
+        .into_inner();
+    assert_metadata_ok(first_add.header);
+    assert_metadata_ok(replay_add.header);
+    assert_eq!(replay_add.target, first_add.target);
+
+    let conflict = metadata
+        .add_block(Request::new(AddBlockRequestProto {
+            header: Some(add_header),
+            write_handle: Some(write_handle),
+            desired_len: Some(512),
+            previous_block_id: None,
+        }))
+        .await
+        .expect("AddBlock conflict response")
+        .into_inner();
+    let error = conflict.header.expect("conflict header").error.expect("conflict error");
+    assert_eq!(rpc_error_from_proto(&error).kind, ErrorKind::Fs(FsErrorCode::EInval));
+
+    let abort_request = AbortFileWriteRequestProto {
+        header: Some(metadata_header(801)),
+        write_handle: Some(write_handle),
+    };
+    let first_abort = metadata
+        .abort_file_write(Request::new(abort_request.clone()))
+        .await
+        .expect("first AbortFileWrite")
+        .into_inner();
+    let replay_abort = metadata
+        .abort_file_write(Request::new(abort_request))
+        .await
+        .expect("replayed AbortFileWrite")
+        .into_inner();
+    assert_metadata_ok(first_abort.header);
+    assert_metadata_ok(replay_abort.header);
+    cluster.shutdown().await.expect("shutdown cluster");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_create_result_replays_after_metadata_restart() {
+    let mut cluster = TestCluster::start().await.expect("start cluster");
+    cluster
+        .client()
+        .mkdirs("/restart", true)
+        .await
+        .expect("create restart dir");
+    let request = CreateFileRequestProto {
+        header: Some(metadata_header(811)),
+        path: "/restart/durable-replay".to_string(),
+        attrs: Some(FileAttrsProto {
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+            ..Default::default()
+        }),
+        layout: Some(FileLayoutProto {
+            block_size: 1024,
+            chunk_size: 1024,
+            replication: 1,
+            block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
+        }),
+        create_mode: CreateModeProto::CreateNew as i32,
+    };
+    let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
+        .await
+        .expect("connect metadata");
+    let first = metadata
+        .create_file(Request::new(request.clone()))
+        .await
+        .expect("first CreateFile")
+        .into_inner();
+    assert_metadata_ok(first.header);
+
+    cluster.restart_metadata().await.expect("restart metadata");
+
+    let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
+        .await
+        .expect("reconnect metadata");
+    let replay = metadata
+        .create_file(Request::new(request))
+        .await
+        .expect("replay CreateFile")
+        .into_inner();
+    assert_metadata_ok(replay.header);
+    assert_eq!(replay.inode_id, first.inode_id);
+    assert_eq!(replay.data_handle_id, first.data_handle_id);
+    assert_eq!(replay.layout, first.layout);
+    cluster.shutdown().await.expect("shutdown cluster");
+}
+
 struct RawWorkerCommittedWrite {
     write_handle: WriteHandleProto,
     data_handle_id: beryl_proto::common::DataHandleIdProto,
@@ -215,19 +393,29 @@ async fn raw_create_commit_worker_block(
                 block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
             }),
             create_mode: CreateModeProto::CreateNew as i32,
-            desired_len: Some(payload.len() as u64),
         }))
         .await?
         .into_inner();
     assert_metadata_ok(create.header);
-    let write_handle = create.write_handle.expect("write handle");
     let data_handle_id = create.data_handle_id.expect("data handle id");
+    let open = metadata
+        .open_write(Request::new(OpenWriteRequestProto {
+            header: Some(metadata_header(401)),
+            path: path.to_string(),
+            mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
+            desired_len: Some(payload.len() as u64),
+        }))
+        .await?
+        .into_inner();
+    assert_metadata_ok(open.header);
+    let write_handle = open.write_handle.expect("write handle");
 
     let add_block = metadata
         .add_block(Request::new(AddBlockRequestProto {
-            header: Some(metadata_header(402)),
+            header: Some(metadata_header(401)),
             write_handle: Some(write_handle),
             desired_len: Some(payload.len() as u64),
+            previous_block_id: None,
         }))
         .await?
         .into_inner();
@@ -253,7 +441,7 @@ async fn assert_stale_commit_file(cluster: &TestCluster, active: RawWorkerCommit
     let final_size = active.committed_block.len;
     let stale_commit = metadata
         .commit_file(Request::new(CommitFileRequestProto {
-            header: Some(metadata_header(403)),
+            header: Some(metadata_header(401)),
             write_handle: Some(active.write_handle),
             data_handle_id: Some(active.data_handle_id),
             committed_blocks: vec![active.committed_block],
@@ -377,11 +565,10 @@ fn data_header(client_id: u128) -> DataRequestHeaderProto {
     (&RequestHeader::new(ClientId::new(client_id))).into()
 }
 
+#[track_caller]
 fn assert_metadata_ok(header: Option<ResponseHeaderProto>) {
-    assert!(
-        header.expect("metadata response header").error.is_none(),
-        "metadata response must not carry business error"
-    );
+    let error = header.expect("metadata response header").error;
+    assert!(error.is_none(), "metadata response carried business error: {error:?}");
 }
 
 fn assert_worker_ok(header: Option<DataResponseHeaderProto>) {

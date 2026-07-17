@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use super::read::GetAttrInput;
-use super::{Freshness, FsResult, FsSuccess, MetadataFileSystem, RequestContext, StaleStateStatus, WriteCommandKind};
+use super::{Freshness, FsResult, FsSuccess, MetadataFileSystem, RequestContext, WriteCommandKind};
 use crate::error::MetadataError;
 use crate::observe;
-use crate::raft::{Command, FsCommandResult};
+use crate::raft::{AppDataResponse, Command, FsCommandResult};
 use beryl_types::fs::{FileAttrs, InodeId};
 use std::sync::atomic::Ordering;
 
 #[derive(Clone, Debug)]
 struct MkdirInput {
     ctx: RequestContext,
+    path: String,
     parent_inode_id: InodeId,
     name: String,
     attrs: FileAttrs,
@@ -27,6 +27,8 @@ struct MkdirOutput {
 #[derive(Clone, Debug)]
 struct RenameInput {
     ctx: RequestContext,
+    src_path: String,
+    dst_path: String,
     src_parent_inode_id: InodeId,
     src_name: String,
     dst_parent_inode_id: InodeId,
@@ -82,6 +84,49 @@ impl MetadataFileSystem {
             Ok(attrs) => attrs,
             Err(err) => return self.failure_from_path_error(ctx, &path, err),
         };
+        let path = match crate::path_resolver::PathResolver::normalize(&path) {
+            Ok(path) => path,
+            Err(err) => return self.failure_from_path_error(ctx, &path, err),
+        };
+        let (mount_ctx, _) = match self.path_resolver.resolve_mount_components(&path) {
+            Ok(resolved) => resolved,
+            Err(err) => return self.failure_from_path_error(ctx, &path, err),
+        };
+        let fingerprint = Command::create_directory_fingerprint(&path, &attrs, recursive);
+        match self.replay_namespace_result(&ctx.caller, fingerprint) {
+            Ok(Some(FsCommandResult::Ok(ok))) => {
+                let Some(attrs) = ok.attrs else {
+                    return self.failure_from_resolved_path_error(
+                        ctx,
+                        MetadataError::Internal("CreateDirectory replay result is missing attrs".to_string()),
+                        Some(&mount_ctx),
+                    );
+                };
+                return self.success(
+                    ctx,
+                    CreateDirectoryOutput {
+                        inode_id: ok.inode_id,
+                        attrs,
+                    },
+                    Some(mount_ctx.owner_group_name),
+                    Some(mount_ctx.mount_epoch),
+                );
+            }
+            Ok(Some(FsCommandResult::Err(err))) => {
+                return self.fatal_fs_failure(
+                    ctx,
+                    err.errno,
+                    err.message,
+                    Some(mount_ctx.owner_group_name),
+                    Some(mount_ctx.mount_epoch),
+                );
+            }
+            Ok(None) => {}
+            Err(err) => return self.failure_from_resolved_path_error(ctx, err, Some(&mount_ctx)),
+        }
+        if let Err(err) = self.reject_active_session_call_reuse(&ctx.caller) {
+            return self.failure_from_resolved_path_error(ctx, err, Some(&mount_ctx));
+        }
         let args = ValidatedCreateDirectoryArgs {
             path,
             attrs,
@@ -151,6 +196,7 @@ impl MetadataFileSystem {
         let success = self
             .mkdir_resolved(MkdirInput {
                 ctx: ctx.clone(),
+                path: args.path,
                 parent_inode_id,
                 name,
                 attrs: args.attrs,
@@ -193,100 +239,133 @@ impl MetadataFileSystem {
             );
         }
 
-        let mut parent_inode_id = mount_ctx.root_inode_id;
-        let mut last_create_success = None;
-        for name in components {
-            match self.read_dentry(parent_inode_id, &name) {
-                Ok(Some(child_inode_id)) => {
-                    let inode = match self.read_inode(child_inode_id) {
-                        Ok(Some(inode)) => inode,
-                        Ok(None) => {
-                            return self.failure_from_resolved_path_error(
-                                ctx,
-                                MetadataError::NotFound(format!("Target inode not found: {}", child_inode_id)),
-                                Some(&mount_ctx),
-                            )
-                        }
-                        Err(err) => return self.failure_from_resolved_path_error(ctx, err, Some(&mount_ctx)),
-                    };
-                    if !inode.kind.is_dir() {
-                        return self.failure_from_resolved_path_error(
-                            ctx,
-                            MetadataError::NotDir(format!("Path component is not a directory: {}", name)),
-                            Some(&mount_ctx),
-                        );
-                    }
-                    parent_inode_id = child_inode_id;
-                }
-                Ok(None) => {
-                    let mut child_ctx = ctx.clone();
-                    child_ctx.caller = ctx.caller.child();
-                    let success = self
-                        .mkdir_resolved(MkdirInput {
-                            ctx: child_ctx,
-                            parent_inode_id,
-                            name,
-                            attrs: args.attrs.clone(),
-                            freshness: args.freshness,
-                        })
-                        .await?;
-                    let Some(created_inode_id) = success.payload.inode_id else {
-                        return self.failure_from_resolved_path_error(
-                            ctx,
-                            MetadataError::Internal("CreateDirectory succeeded without inode_id".to_string()),
-                            Some(&mount_ctx),
-                        );
-                    };
-                    parent_inode_id = created_inode_id;
-                    last_create_success = Some(success);
-                }
-                Err(err) => return self.failure_from_resolved_path_error(ctx, err, Some(&mount_ctx)),
-            }
-        }
-
-        if let Some(success) = last_create_success {
-            let Some(attrs) = success.payload.attrs else {
-                return self.failure_from_resolved_path_error(
-                    ctx,
-                    MetadataError::Internal("CreateDirectory succeeded without attrs".to_string()),
-                    Some(&mount_ctx),
-                );
+        let routed =
+            match self.route_ctx_for_write(ctx, WriteCommandKind::Mkdir, &[mount_ctx.root_inode_id], args.freshness) {
+                Ok(routed) => routed,
+                Err(err) => return Err(err),
             };
-            return Ok(FsSuccess {
-                payload: CreateDirectoryOutput {
-                    inode_id: success.payload.inode_id,
-                    attrs,
-                },
-                group_name: success.group_name,
-                mount_epoch: success.mount_epoch,
-                route_epoch: success.route_epoch,
-                state: success.state,
-            });
+        let dedup = match self.dedup_key(&ctx.caller) {
+            Ok(key) => key,
+            Err(err) => {
+                return self.failure_from_error(
+                    ctx,
+                    err,
+                    Some(routed.namespace_owner_group_name.clone()),
+                    Some(routed.mount_epoch),
+                );
+            }
+        };
+        let result = match self
+            .propose_fs_write_command(
+                WriteCommandKind::Mkdir,
+                Command::new_namespace(
+                    dedup,
+                    crate::raft::proposal_timestamp_ms(),
+                    crate::raft::CanonicalNamespaceRequest::CreateDirectory {
+                        path: args.path,
+                        attrs: args.attrs.clone(),
+                        recursive: true,
+                    },
+                    crate::raft::Mutation::CreateDirectory {
+                        root_inode_id: mount_ctx.root_inode_id,
+                        components,
+                        attrs: args.attrs,
+                    },
+                ),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                return self.failure_from_error(
+                    ctx,
+                    err,
+                    Some(routed.namespace_owner_group_name.clone()),
+                    Some(routed.mount_epoch),
+                );
+            }
+        };
+        match result {
+            FsCommandResult::Ok(ok) => {
+                let Some(inode_id) = ok.inode_id else {
+                    return self.failure_from_error(
+                        ctx,
+                        MetadataError::Internal("CreateDirectory succeeded without inode_id".to_string()),
+                        Some(routed.namespace_owner_group_name.clone()),
+                        Some(routed.mount_epoch),
+                    );
+                };
+                let Some(attrs) = ok.attrs else {
+                    return self.failure_from_error(
+                        ctx,
+                        MetadataError::Internal("CreateDirectory succeeded without frozen attrs".to_string()),
+                        Some(routed.namespace_owner_group_name.clone()),
+                        Some(routed.mount_epoch),
+                    );
+                };
+                self.success(
+                    ctx,
+                    CreateDirectoryOutput {
+                        inode_id: Some(inode_id),
+                        attrs,
+                    },
+                    Some(routed.namespace_owner_group_name),
+                    Some(routed.mount_epoch),
+                )
+            }
+            FsCommandResult::Err(err) => self.fatal_fs_failure(
+                ctx,
+                err.errno,
+                err.message,
+                Some(routed.namespace_owner_group_name),
+                Some(routed.mount_epoch),
+            ),
         }
-
-        self.get_attr_resolved(GetAttrInput {
-            ctx: ctx.clone(),
-            inode_id: parent_inode_id,
-            freshness: args.freshness,
-        })
-        .await
-        .map(|success| FsSuccess {
-            payload: CreateDirectoryOutput {
-                inode_id: Some(parent_inode_id),
-                attrs: success.payload.attrs,
-            },
-            group_name: success.group_name,
-            mount_epoch: success.mount_epoch,
-            route_epoch: success.route_epoch,
-            state: success.state,
-        })
     }
 
     pub(crate) async fn rename(&self, ctx: &RequestContext, args: RenameArgs) -> FsResult<()> {
         if let Err(failure) = self.admission.check_meta_write(ctx).await {
             return self.failure_from_admission(failure);
         }
-        let (src_resolved, dst_resolved) = match self.path_resolver.resolve_rename(&args.src_path, &args.dst_path) {
+        let src_path = match crate::path_resolver::PathResolver::normalize(&args.src_path) {
+            Ok(path) => path,
+            Err(err) => return self.failure_from_path_error(ctx, &args.src_path, err),
+        };
+        let dst_path = match crate::path_resolver::PathResolver::normalize(&args.dst_path) {
+            Ok(path) => path,
+            Err(err) => return self.failure_from_path_error(ctx, &args.dst_path, err),
+        };
+        let (src_mount_ctx, _) = match self.path_resolver.resolve_mount_components(&src_path) {
+            Ok(resolved) => resolved,
+            Err(err) => return self.failure_from_path_error(ctx, &src_path, err),
+        };
+        let fingerprint = Command::rename_fingerprint(&src_path, &dst_path, args.flags);
+        match self.replay_namespace_result(&ctx.caller, fingerprint) {
+            Ok(Some(FsCommandResult::Ok(_))) => {
+                return self.success(
+                    ctx,
+                    (),
+                    Some(src_mount_ctx.owner_group_name),
+                    Some(src_mount_ctx.mount_epoch),
+                );
+            }
+            Ok(Some(FsCommandResult::Err(err))) => {
+                return self.fatal_fs_failure(
+                    ctx,
+                    err.errno,
+                    err.message,
+                    Some(src_mount_ctx.owner_group_name),
+                    Some(src_mount_ctx.mount_epoch),
+                );
+            }
+            Ok(None) => {}
+            Err(err) => return self.failure_from_resolved_path_error(ctx, err, Some(&src_mount_ctx)),
+        }
+        if let Err(err) = self.reject_active_session_call_reuse(&ctx.caller) {
+            return self.failure_from_resolved_path_error(ctx, err, Some(&src_mount_ctx));
+        }
+
+        let (src_resolved, dst_resolved) = match self.path_resolver.resolve_rename(&src_path, &dst_path) {
             Ok(resolved) => resolved,
             Err(err) => return self.failure_from_error(ctx, err, None, None),
         };
@@ -310,6 +389,8 @@ impl MetadataFileSystem {
         let result = self
             .rename_resolved(RenameInput {
                 ctx: ctx.clone(),
+                src_path,
+                dst_path,
                 src_parent_inode_id,
                 src_name,
                 dst_parent_inode_id,
@@ -372,9 +453,14 @@ impl MetadataFileSystem {
         let result = match self
             .propose_fs_write_command(
                 WriteCommandKind::Mkdir,
-                Command::new(
+                Command::new_namespace(
                     dedup,
                     crate::raft::proposal_timestamp_ms(),
+                    crate::raft::CanonicalNamespaceRequest::CreateDirectory {
+                        path: req.path,
+                        attrs: req.attrs.clone(),
+                        recursive: false,
+                    },
                     crate::raft::Mutation::Mkdir {
                         parent_inode_id: req.parent_inode_id,
                         name: req.name,
@@ -396,32 +482,15 @@ impl MetadataFileSystem {
         };
 
         match result {
-            FsCommandResult::Ok(ok) => {
-                let created_attrs = match ok.inode_id {
-                    Some(inode_id) => match self.read_inode(inode_id) {
-                        Ok(inode) => inode.map(|inode| inode.attrs),
-                        Err(err) => {
-                            return self.failure_from_error(
-                                &req.ctx,
-                                err,
-                                Some(ctx.namespace_owner_group_name.clone()),
-                                Some(ctx.mount_epoch),
-                            );
-                        }
-                    },
-                    None => None,
-                };
-
-                self.success(
-                    &req.ctx,
-                    MkdirOutput {
-                        inode_id: ok.inode_id,
-                        attrs: created_attrs,
-                    },
-                    Some(ctx.namespace_owner_group_name.clone()),
-                    Some(ctx.mount_epoch),
-                )
-            }
+            FsCommandResult::Ok(ok) => self.success(
+                &req.ctx,
+                MkdirOutput {
+                    inode_id: ok.inode_id,
+                    attrs: ok.attrs,
+                },
+                Some(ctx.namespace_owner_group_name.clone()),
+                Some(ctx.mount_epoch),
+            ),
             FsCommandResult::Err(err) => self.fatal_fs_failure(
                 &req.ctx,
                 err.errno,
@@ -501,49 +570,71 @@ impl MetadataFileSystem {
             Err(err) => return Err(err),
         };
 
-        if req.flags & 0x1 != 0 {
-            if let Some(raft_node) = self.raft_node.as_ref() {
-                if raft_node.is_leader() {
-                    let mut can_precheck = true;
-                    match self.freshness_validator.validate_stale_state(
+        let dedup = match self.dedup_key(&req.ctx.caller) {
+            Ok(key) => key,
+            Err(err) => {
+                return self.failure_from_error(
+                    &req.ctx,
+                    err,
+                    Some(ctx.namespace_owner_group_name.clone()),
+                    Some(ctx.mount_epoch),
+                );
+            }
+        };
+        let command = Command::new_namespace(
+            dedup.clone(),
+            crate::raft::proposal_timestamp_ms(),
+            crate::raft::CanonicalNamespaceRequest::Rename {
+                src_path: req.src_path,
+                dst_path: req.dst_path,
+                flags: req.flags,
+            },
+            crate::raft::Mutation::Rename {
+                src_parent_inode_id: req.src_parent_inode_id,
+                src_name: req.src_name.clone(),
+                dst_parent_inode_id: req.dst_parent_inode_id,
+                dst_name: req.dst_name.clone(),
+                flags: req.flags,
+            },
+        );
+        let fingerprint = command.fingerprint();
+        match self.storage.get_applied_result(&dedup) {
+            Ok(Some(existing)) => {
+                if existing.fingerprint != fingerprint {
+                    return self.failure_from_error(
                         &req.ctx,
-                        raft_node.get_last_applied_state_id(),
+                        MetadataError::InvalidArgument(format!(
+                            "call_id {} reused with different command payload",
+                            dedup.call_id
+                        )),
                         Some(ctx.namespace_owner_group_name.clone()),
                         Some(ctx.mount_epoch),
-                    ) {
-                        Ok(StaleStateStatus::Ready) => {}
-                        Ok(StaleStateStatus::UnknownLastApplied) => {
-                            can_precheck = false;
-                        }
-                        Err(failure) => return Err(failure),
-                    }
-
-                    if can_precheck {
-                        match self.read_dentry(req.dst_parent_inode_id, &req.dst_name) {
-                            Ok(Some(_)) => {
-                                return self.failure_from_error(
-                                    &req.ctx,
-                                    MetadataError::AlreadyExists(format!(
-                                        "Destination exists and RENAME_NOREPLACE set: {}",
-                                        req.dst_name
-                                    )),
-                                    Some(ctx.namespace_owner_group_name.clone()),
-                                    Some(ctx.mount_epoch),
-                                );
-                            }
-                            Ok(None) => {}
-                            Err(err) => {
-                                return self.failure_from_error(
-                                    &req.ctx,
-                                    err,
-                                    Some(ctx.namespace_owner_group_name.clone()),
-                                    Some(ctx.mount_epoch),
-                                );
-                            }
-                        }
-                    }
+                    );
                 }
+                let result = match existing.result {
+                    AppDataResponse::Fs(result) => result,
+                    _ => FsCommandResult::ok(),
+                };
+                return self.rename_result(&req.ctx, &ctx, result);
             }
+            Ok(None) => {}
+            Err(err) => {
+                return self.failure_from_error(
+                    &req.ctx,
+                    err,
+                    Some(ctx.namespace_owner_group_name.clone()),
+                    Some(ctx.mount_epoch),
+                );
+            }
+        }
+
+        if let Err(err) = self.reject_active_session_call_reuse(&req.ctx.caller) {
+            return self.failure_from_error(
+                &req.ctx,
+                err,
+                Some(ctx.namespace_owner_group_name.clone()),
+                Some(ctx.mount_epoch),
+            );
         }
 
         match self.read_dentry(req.dst_parent_inode_id, &req.dst_name) {
@@ -580,35 +671,7 @@ impl MetadataFileSystem {
             }
         }
 
-        let dedup = match self.dedup_key(&req.ctx.caller) {
-            Ok(k) => k,
-            Err(err) => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    err,
-                    Some(ctx.namespace_owner_group_name.clone()),
-                    Some(ctx.mount_epoch),
-                );
-            }
-        };
-
-        let result = match self
-            .propose_fs_write_command(
-                WriteCommandKind::Rename,
-                Command::new(
-                    dedup,
-                    crate::raft::proposal_timestamp_ms(),
-                    crate::raft::Mutation::Rename {
-                        src_parent_inode_id: req.src_parent_inode_id,
-                        src_name: req.src_name,
-                        dst_parent_inode_id: req.dst_parent_inode_id,
-                        dst_name: req.dst_name,
-                        flags: req.flags,
-                    },
-                ),
-            )
-            .await
-        {
+        let result = match self.propose_fs_write_command(WriteCommandKind::Rename, command).await {
             Ok(result) => result,
             Err(err) => {
                 return self.failure_from_error(
@@ -620,15 +683,24 @@ impl MetadataFileSystem {
             }
         };
 
+        self.rename_result(&req.ctx, &ctx, result)
+    }
+
+    fn rename_result(
+        &self,
+        request_ctx: &RequestContext,
+        ctx: &super::RoutedFsWriteCtx,
+        result: FsCommandResult,
+    ) -> FsResult<()> {
         match result {
             FsCommandResult::Ok(_) => self.success(
-                &req.ctx,
+                request_ctx,
                 (),
                 Some(ctx.namespace_owner_group_name.clone()),
                 Some(ctx.mount_epoch),
             ),
             FsCommandResult::Err(err) => self.fatal_fs_failure(
-                &req.ctx,
+                request_ctx,
                 err.errno,
                 err.message,
                 Some(ctx.namespace_owner_group_name.clone()),
@@ -696,6 +768,8 @@ mod tests {
         let failure = filesystem
             .rename_resolved(RenameInput {
                 ctx: request_context(),
+                src_path: "/source".to_string(),
+                dst_path: "/target".to_string(),
                 src_parent_inode_id: parent_inode_id,
                 src_name: "source".to_string(),
                 dst_parent_inode_id: parent_inode_id,
@@ -777,6 +851,8 @@ mod tests {
         filesystem
             .rename_resolved(RenameInput {
                 ctx: request_context(),
+                src_path: "/source".to_string(),
+                dst_path: "/target".to_string(),
                 src_parent_inode_id: parent_inode_id,
                 src_name: "source".to_string(),
                 dst_parent_inode_id: parent_inode_id,
@@ -854,6 +930,8 @@ mod tests {
         filesystem
             .rename_resolved(RenameInput {
                 ctx: request_context(),
+                src_path: "/source".to_string(),
+                dst_path: "/target".to_string(),
                 src_parent_inode_id: parent_inode_id,
                 src_name: "source".to_string(),
                 dst_parent_inode_id: parent_inode_id,
@@ -908,6 +986,8 @@ mod tests {
         let failure = filesystem
             .rename_resolved(RenameInput {
                 ctx: request_context(),
+                src_path: "/source".to_string(),
+                dst_path: "/target".to_string(),
                 src_parent_inode_id,
                 src_name: "source".to_string(),
                 dst_parent_inode_id,

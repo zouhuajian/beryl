@@ -202,34 +202,40 @@ message CreateFileRequestProto {
   fs.FileAttrsProto attrs = 3;
   common.FileLayoutProto layout = 4;
   CreateModeProto create_mode = 5;
-  optional uint64 desired_len = 6;
+  reserved 6;
 }
 
 message CreateFileResponseProto {
+  reserved 2, 4, 5, 6;
+
   common.ResponseHeaderProto header = 1;
-  WriteHandleProto write_handle = 2;
   common.DataHandleIdProto data_handle_id = 3;
-  uint64 base_size = 4;
-  // CreateFile does not issue write targets; callers must use AddBlock.
-  repeated WriteTargetProto initial_targets = 5;
-  uint64 expires_at_ms = 6;
-  // Metadata-stored FileLayout accepted for this write session.
+  // Metadata-stored FileLayout accepted by the durable namespace mutation.
   common.FileLayoutProto layout = 7;
+  fs.InodeIdProto inode_id = 8;
+  uint64 file_size = 9;
 }
 
-message AppendFileRequestProto {
+enum OpenWriteModeProto {
+  OPEN_WRITE_MODE_UNSPECIFIED = 0;
+  OPEN_WRITE_MODE_WRITE = 1;
+  OPEN_WRITE_MODE_APPEND = 2;
+}
+
+message OpenWriteRequestProto {
   common.RequestHeaderProto header = 1;
   string path = 2;
-  optional uint64 desired_len = 3;
+  OpenWriteModeProto mode = 3;
+  optional uint64 desired_len = 4;
 }
 
-message AppendFileResponseProto {
+message OpenWriteResponseProto {
+  reserved 5;
+
   common.ResponseHeaderProto header = 1;
   WriteHandleProto write_handle = 2;
   common.DataHandleIdProto data_handle_id = 3;
   uint64 base_size = 4;
-  // AppendFile does not issue write targets; callers must use AddBlock.
-  repeated WriteTargetProto initial_targets = 5;
   uint64 expires_at_ms = 6;
   // Metadata-stored FileLayout for the existing file.
   common.FileLayoutProto layout = 7;
@@ -239,6 +245,9 @@ message AddBlockRequestProto {
   common.RequestHeaderProto header = 1;
   WriteHandleProto write_handle = 2;
   optional uint64 desired_len = 3;
+  // The first allocation has no predecessor. Every later logical allocation
+  // names the block returned by the preceding AddBlock.
+  optional common.BlockIdProto previous_block_id = 4;
 }
 
 message AddBlockResponseProto {
@@ -333,7 +342,7 @@ service FileSystemServiceProto {
 
   // write
   rpc CreateFile(CreateFileRequestProto) returns (CreateFileResponseProto);
-  rpc AppendFile(AppendFileRequestProto) returns (AppendFileResponseProto);
+  rpc OpenWrite(OpenWriteRequestProto) returns (OpenWriteResponseProto);
   rpc AddBlock(AddBlockRequestProto) returns (AddBlockResponseProto);
   rpc CommitFile(CommitFileRequestProto) returns (CommitFileResponseProto);
   rpc AbortFileWrite(AbortFileWriteRequestProto) returns (AbortFileWriteResponseProto);

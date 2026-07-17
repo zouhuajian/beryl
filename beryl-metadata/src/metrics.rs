@@ -31,8 +31,6 @@ pub struct MetadataMetrics {
     pub(crate) fs_raft_appends_total: Arc<AtomicU64>,
     pub(crate) fs_raft_appends_create: Arc<AtomicU64>,
     pub(crate) fs_raft_appends_mkdir: Arc<AtomicU64>,
-    pub(crate) fs_raft_appends_unlink: Arc<AtomicU64>,
-    pub(crate) fs_raft_appends_directory_delete: Arc<AtomicU64>,
     pub(crate) fs_raft_appends_rename: Arc<AtomicU64>,
     pub(crate) fs_raft_appends_setattr: Arc<AtomicU64>,
 }
@@ -49,8 +47,6 @@ impl MetadataMetrics {
             fs_raft_appends_total: Arc::new(AtomicU64::new(0)),
             fs_raft_appends_create: Arc::new(AtomicU64::new(0)),
             fs_raft_appends_mkdir: Arc::new(AtomicU64::new(0)),
-            fs_raft_appends_unlink: Arc::new(AtomicU64::new(0)),
-            fs_raft_appends_directory_delete: Arc::new(AtomicU64::new(0)),
             fs_raft_appends_rename: Arc::new(AtomicU64::new(0)),
             fs_raft_appends_setattr: Arc::new(AtomicU64::new(0)),
         }

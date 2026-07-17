@@ -39,8 +39,15 @@ fn test_lease_renew() {
         .unwrap();
 
     // Renew lease
-    let expires_at_ms2 = manager.renew(inode_id, lease_id, epoch).unwrap();
+    let renew_call_id = CallId::new();
+    let expires_at_ms2 = manager
+        .renew(inode_id, lease_id, epoch, client_id, renew_call_id)
+        .unwrap();
+    let replayed_expiry = manager
+        .renew(inode_id, lease_id, epoch, client_id, renew_call_id)
+        .unwrap();
     assert!(expires_at_ms2 >= expires_at_ms1);
+    assert_eq!(replayed_expiry, expires_at_ms2);
     assert!(manager.validate_lease(inode_id, lease_id, epoch).is_ok());
 }
 

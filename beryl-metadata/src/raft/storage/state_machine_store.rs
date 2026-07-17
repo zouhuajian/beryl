@@ -1223,6 +1223,7 @@ mod tests {
             dedup.clone(),
             crate::raft::proposal_timestamp_ms(),
             crate::raft::Mutation::CreateFile {
+                mode: crate::raft::CreateFileMode::CreateNew,
                 parent_inode_id,
                 name: "file".to_string(),
                 attrs: FileAttrs::new(),
@@ -1273,6 +1274,7 @@ mod tests {
             crate::raft::DedupKey::new(ClientId::new(86), CallId::new()),
             crate::raft::proposal_timestamp_ms(),
             crate::raft::Mutation::CreateFile {
+                mode: crate::raft::CreateFileMode::CreateNew,
                 parent_inode_id,
                 name: "file".to_string(),
                 attrs: FileAttrs::new(),
@@ -1286,6 +1288,7 @@ mod tests {
             rejected_dedup.clone(),
             crate::raft::proposal_timestamp_ms(),
             crate::raft::Mutation::CreateFile {
+                mode: crate::raft::CreateFileMode::CreateNew,
                 parent_inode_id,
                 name: "file".to_string(),
                 attrs: FileAttrs::new(),

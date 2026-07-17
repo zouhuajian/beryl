@@ -25,9 +25,7 @@ pub(super) struct RoutedFsWriteCtx {
 pub(super) enum WriteCommandKind {
     Create,
     Mkdir,
-    Unlink,
-    DeleteEmptyDir,
-    DeleteTree,
+    Delete,
     Rename,
     SetAttr,
 }
@@ -37,9 +35,7 @@ impl WriteCommandKind {
         match self {
             WriteCommandKind::Create => "create_file",
             WriteCommandKind::Mkdir => "create_directory",
-            WriteCommandKind::Unlink => "delete_file",
-            WriteCommandKind::DeleteEmptyDir => "delete_empty_dir",
-            WriteCommandKind::DeleteTree => "delete_tree",
+            WriteCommandKind::Delete => "delete",
             WriteCommandKind::Rename => "rename",
             WriteCommandKind::SetAttr => "set_attr",
         }
@@ -149,6 +145,15 @@ impl MetadataFileSystem {
         command: Command,
     ) -> MetadataResult<FsCommandResult> {
         let started = Instant::now();
+        let dedup = command.dedup_key();
+        if self.session_registry.has_call_id(dedup.client_id, dedup.call_id)
+            || self.lease_manager.has_renew_call(dedup.client_id, dedup.call_id)
+        {
+            return Err(MetadataError::InvalidArgument(format!(
+                "call_id {} was already used by an active write session RPC",
+                dedup.call_id
+            )));
+        }
         let raft_node = self.raft_node.as_ref().ok_or_else(|| {
             let error = MetadataError::Internal("Raft node not available".to_string());
             observe::record_fs_op(
@@ -169,15 +174,7 @@ impl MetadataFileSystem {
                 WriteCommandKind::Mkdir => {
                     metrics.fs_raft_appends_mkdir.fetch_add(1, Ordering::Relaxed);
                 }
-                WriteCommandKind::Unlink => {
-                    metrics.fs_raft_appends_unlink.fetch_add(1, Ordering::Relaxed);
-                }
-                WriteCommandKind::DeleteEmptyDir => {
-                    metrics.fs_raft_appends_directory_delete.fetch_add(1, Ordering::Relaxed);
-                }
-                WriteCommandKind::DeleteTree => {
-                    metrics.fs_raft_appends_directory_delete.fetch_add(1, Ordering::Relaxed);
-                }
+                WriteCommandKind::Delete => {}
                 WriteCommandKind::Rename => {
                     metrics.fs_raft_appends_rename.fetch_add(1, Ordering::Relaxed);
                 }

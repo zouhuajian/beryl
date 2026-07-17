@@ -60,26 +60,6 @@ impl ClientActionError {
         })
     }
 
-    /// Return whether the action is retryable under client retry policy.
-    pub fn is_retryable(&self) -> bool {
-        match self.action.as_ref() {
-            ClientAction::Refresh { rpc_error, .. } => matches!(
-                rpc_error.recovery,
-                RecoveryAction::RefreshMetadata { .. }
-                    | RecoveryAction::RegisterWorker
-                    | RecoveryAction::SendFullBlockReport
-            ),
-            ClientAction::Retry { .. } => true,
-            ClientAction::TransportFail { status } => {
-                matches!(
-                    status.code(),
-                    tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::ResourceExhausted
-                )
-            }
-            ClientAction::Fail { .. } => false,
-        }
-    }
-
     /// Return whether the action requires refreshing client metadata state.
     pub fn is_refresh_required(&self) -> bool {
         matches!(self.action.as_ref(), ClientAction::Refresh { .. })
@@ -95,10 +75,10 @@ impl std::fmt::Debug for ClientActionError {
 impl std::fmt::Display for ClientActionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.action.as_ref() {
-            ClientAction::Refresh { reason, rpc_error, .. } => write!(
+            ClientAction::Refresh { rpc_error, .. } => write!(
                 f,
-                "Client action error: kind={:?}, recovery={:?}, reason={:?}, message={}",
-                rpc_error.kind, rpc_error.recovery, reason, rpc_error.message
+                "Client action error: kind={:?}, recovery={:?}, message={}",
+                rpc_error.kind, rpc_error.recovery, rpc_error.message
             ),
             ClientAction::Retry {
                 retry_after_ms_hint,
@@ -240,47 +220,6 @@ pub(crate) fn invalid_response(operation: &'static str, reason: impl Into<String
 }
 
 impl ClientError {
-    /// Check if this error is retryable.
-    pub fn is_retryable(&self) -> bool {
-        match self {
-            ClientError::Common(e) => e.is_retryable(),
-            ClientError::Metadata(_) => false,
-            ClientError::Worker(_) => false,
-            ClientError::UnknownOutcome(_) => false,
-            ClientError::Routing(_) => false,
-            ClientError::NotLeader(_) => true,
-            ClientError::RouteEpochMismatch { .. } => true,
-            ClientError::StaleMeta(_) => true,
-            ClientError::Action(action) => match action.action() {
-                ClientAction::Refresh { rpc_error, .. } => matches!(
-                    rpc_error.recovery,
-                    RecoveryAction::RefreshMetadata { .. }
-                        | RecoveryAction::RegisterWorker
-                        | RecoveryAction::SendFullBlockReport
-                ),
-                ClientAction::Retry { .. } => true,
-                ClientAction::TransportFail { status } => {
-                    matches!(
-                        status.code(),
-                        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::ResourceExhausted
-                    )
-                }
-                ClientAction::Fail { .. } => false,
-            },
-            ClientError::VersionMismatch { .. } => false, // Cache invalidation, not retry
-            ClientError::Cache(_) => false,
-            ClientError::Moved(_) => false,
-            ClientError::Unimplemented(_) => false,
-            ClientError::Unsupported(_) => false,
-            ClientError::NotSupported(_) => false,
-            ClientError::Config(_) => false,
-            ClientError::InvalidArgument(_) => false,
-            ClientError::InvalidResponse { .. } => false,
-            ClientError::StaleHandle { .. } => false,
-            ClientError::InvalidLayout(_) => false,
-        }
-    }
-
     /// Check if this error requires cache invalidation.
     pub fn requires_cache_invalidation(&self) -> bool {
         matches!(
@@ -405,7 +344,6 @@ fn rpc_error_from_common_error(err: CommonError) -> RpcErrorDetail {
 mod tests {
     use super::*;
     use crate::rpc_error::{ClientAction, RefreshHint};
-    use crate::runtime::MetadataRefreshCause;
     use beryl_common::error::rpc::RefreshHint as RpcRefreshHint;
 
     #[test]
@@ -416,7 +354,6 @@ mod tests {
             "route epoch is stale",
         );
         let err = ClientActionError::new(ClientAction::Refresh {
-            reason: MetadataRefreshCause::RouteEpochMismatch,
             hint: Box::new(RefreshHint::default()),
             rpc_error: Box::new(rpc_error.clone()),
         });
@@ -429,7 +366,6 @@ mod tests {
         assert_eq!(err.recovery(), Some(&rpc_error.recovery));
         assert_eq!(err.message(), Some("route epoch is stale"));
         assert_eq!(err.retry_after_ms(), None);
-        assert!(err.is_retryable());
         assert!(err.is_refresh_required());
 
         let displayed = ClientError::Action(err).to_string();
@@ -446,14 +382,12 @@ mod tests {
             "fatal transport text",
         );
         let refresh = ClientError::from(ClientAction::Refresh {
-            reason: MetadataRefreshCause::NotLeader,
             hint: Box::new(RefreshHint::default()),
             rpc_error: Box::new(refresh_rpc_error),
         });
         match refresh {
             ClientError::Action(action) => match action.action() {
-                ClientAction::Refresh { reason, rpc_error, .. } => {
-                    assert_eq!(*reason, MetadataRefreshCause::NotLeader);
+                ClientAction::Refresh { rpc_error, .. } => {
                     assert_eq!(rpc_error.kind, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
                     assert!(matches!(rpc_error.recovery, RecoveryAction::RefreshMetadata { .. }));
                 }

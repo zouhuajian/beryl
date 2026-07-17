@@ -13,7 +13,7 @@ use crate::data::WorkerDataPlane;
 use crate::error::ClientResult;
 use crate::metadata::{GrpcMetadataGateway, MetadataGateway};
 use crate::metrics::{ClientMetrics, NoopClientMetrics};
-use crate::runtime::{BackoffSleeper, ClientRuntime, MetadataTargets, OperationKind, TokioBackoffSleeper};
+use crate::runtime::{ClientRuntime, MetadataTargets};
 
 /// Public filesystem-facing client facade.
 #[derive(Clone)]
@@ -43,14 +43,7 @@ impl FsClient {
         )?);
         let data_plane = WorkerDataPlane::from_config(&config, Arc::clone(&metrics));
 
-        Self::with_runtime_hooks(
-            config,
-            gateway,
-            metadata_targets,
-            data_plane,
-            Arc::new(TokioBackoffSleeper),
-            metrics,
-        )
+        Self::with_runtime_hooks(config, gateway, metadata_targets, data_plane, metrics)
     }
 
     /// Builds a client with injected runtime dependencies for tests and internal wiring.
@@ -59,7 +52,6 @@ impl FsClient {
         gateway: Arc<dyn MetadataGateway>,
         metadata_targets: MetadataTargets,
         data_plane: WorkerDataPlane,
-        sleeper: Arc<dyn BackoffSleeper>,
         metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
         Ok(Self {
@@ -68,7 +60,6 @@ impl FsClient {
                 gateway,
                 metadata_targets,
                 data_plane,
-                sleeper,
                 metrics,
             )?),
         })
@@ -127,14 +118,7 @@ impl FsClient {
     /// creation. Metadata validates and persists the accepted `FileLayout`.
     pub async fn create(&self, path: &str, options: CreateOptions) -> ClientResult<FileWriter> {
         let path = NamespacePathBuf::parse(path)?;
-        let response = match self.runtime.executor.create_file(path, options).await {
-            Ok(response) => response,
-            Err(err) => {
-                return Err(self
-                    .runtime
-                    .normalize_outcome_error("CreateFile", OperationKind::MetadataMutation, err));
-            }
-        };
+        let response = self.runtime.executor.create_file(path, options).await?;
         Ok(FileWriter::new(Arc::clone(&self.runtime), response))
     }
 
@@ -144,14 +128,7 @@ impl FsClient {
     /// layout override.
     pub async fn append(&self, path: &str) -> ClientResult<FileWriter> {
         let path = NamespacePathBuf::parse(path)?;
-        let response = match self.runtime.executor.append_file(path).await {
-            Ok(response) => response,
-            Err(err) => {
-                return Err(self
-                    .runtime
-                    .normalize_outcome_error("AppendFile", OperationKind::MetadataMutation, err));
-            }
-        };
+        let response = self.runtime.executor.open_append(path).await?;
         Ok(FileWriter::new(Arc::clone(&self.runtime), response))
     }
 }

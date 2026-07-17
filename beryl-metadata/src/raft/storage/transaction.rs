@@ -359,6 +359,34 @@ impl RocksDBStorage {
         self.commit_apply_batch(batch.into(), dedup_key, applied_result, raft_state)
     }
 
+    /// Atomically persist all missing components of one recursive mkdir command.
+    pub(crate) fn create_directories_with_apply_result_atomic(
+        &self,
+        allocation: InodeAllocation,
+        entries: &[RecursiveMkdirEntry],
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        raft_state: &AppMetadataRaftState,
+    ) -> MetadataResult<()> {
+        let generation = self.pin_generation()?;
+        let db = generation.db();
+        let cf_inodes = Self::cf(db, CF_INODES)?;
+        let cf_dentries = Self::cf(db, CF_DENTRIES)?;
+        let cf_meta = Self::cf(db, CF_META)?;
+        let mut batch = WriteBatch::default();
+        for entry in entries {
+            Self::batch_put_inode(&mut batch, cf_inodes, &entry.inode)?;
+            Self::batch_put_inode(&mut batch, cf_inodes, &entry.updated_parent)?;
+            batch.put_cf(
+                cf_dentries,
+                Self::encode_dentry_key(entry.parent_inode_id, &entry.name),
+                entry.inode.inode_id.to_be_bytes(),
+            );
+        }
+        Self::batch_put_inode_allocation(&mut batch, cf_meta, allocation)?;
+        self.commit_apply_batch(batch.into(), dedup_key, applied_result, raft_state)
+    }
+
     fn delete_dentry_inode_batch(
         &self,
         parent_inode_id: InodeId,
