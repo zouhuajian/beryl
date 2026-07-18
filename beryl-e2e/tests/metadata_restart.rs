@@ -7,9 +7,9 @@ use beryl_common::header::RequestHeader;
 use beryl_e2e::{data::deterministic_bytes, TestCluster, TestResult};
 use beryl_proto::common::{ByteRangeProto, FileLayoutProto, RequestHeaderProto, ResponseHeaderProto};
 use beryl_proto::convert::rpc_error_from_proto;
-use beryl_proto::fs::FileAttrsProto;
 use beryl_proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
 use beryl_proto::metadata::get_block_locations_request_proto;
+use beryl_proto::metadata::FileAttrsProto;
 use beryl_proto::metadata::{
     AbortFileWriteRequestProto, AddBlockRequestProto, CommitFileRequestProto, CommittedBlockProto,
     CreateFileRequestProto, GetBlockLocationsRequestProto, OpenWriteModeProto, OpenWriteRequestProto, WriteHandleProto,

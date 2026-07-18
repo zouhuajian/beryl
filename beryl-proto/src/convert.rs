@@ -7,7 +7,6 @@
 //! and domain types defined in the types crate.
 
 use crate::common as proto_common;
-use crate::fs as proto_fs;
 use crate::metadata as proto_metadata;
 use ::beryl_common::{
     Deadline,
@@ -200,8 +199,8 @@ impl From<FileLayout> for proto_common::FileLayoutProto {
 // FS Domain Conversions
 // ============================================================================
 
-impl From<proto_fs::FileAttrsProto> for FileAttrs {
-    fn from(attrs: proto_fs::FileAttrsProto) -> Self {
+impl From<proto_metadata::FileAttrsProto> for FileAttrs {
+    fn from(attrs: proto_metadata::FileAttrsProto) -> Self {
         Self {
             mode: attrs.mode,
             uid: attrs.uid,
@@ -215,7 +214,7 @@ impl From<proto_fs::FileAttrsProto> for FileAttrs {
     }
 }
 
-impl From<&FileAttrs> for proto_fs::FileAttrsProto {
+impl From<&FileAttrs> for proto_metadata::FileAttrsProto {
     fn from(attrs: &FileAttrs) -> Self {
         Self {
             mode: attrs.mode,
@@ -230,28 +229,28 @@ impl From<&FileAttrs> for proto_fs::FileAttrsProto {
     }
 }
 
-impl From<FileAttrs> for proto_fs::FileAttrsProto {
+impl From<FileAttrs> for proto_metadata::FileAttrsProto {
     fn from(attrs: FileAttrs) -> Self {
         Self::from(&attrs)
     }
 }
 
-impl TryFrom<proto_fs::InodeKindProto> for InodeKind {
+impl TryFrom<proto_metadata::InodeKindProto> for InodeKind {
     type Error = String;
 
-    fn try_from(kind: proto_fs::InodeKindProto) -> Result<Self, Self::Error> {
+    fn try_from(kind: proto_metadata::InodeKindProto) -> Result<Self, Self::Error> {
         match kind {
-            proto_fs::InodeKindProto::InodeKindFile => Ok(Self::File),
-            proto_fs::InodeKindProto::InodeKindDir => Ok(Self::Dir),
-            proto_fs::InodeKindProto::InodeKindSymlink => Ok(Self::Symlink),
-            proto_fs::InodeKindProto::InodeKindUnspecified => {
+            proto_metadata::InodeKindProto::InodeKindFile => Ok(Self::File),
+            proto_metadata::InodeKindProto::InodeKindDir => Ok(Self::Dir),
+            proto_metadata::InodeKindProto::InodeKindSymlink => Ok(Self::Symlink),
+            proto_metadata::InodeKindProto::InodeKindUnspecified => {
                 Err("unspecified inode kind is not a domain value".to_string())
             }
         }
     }
 }
 
-impl From<InodeKind> for proto_fs::InodeKindProto {
+impl From<InodeKind> for proto_metadata::InodeKindProto {
     fn from(kind: InodeKind) -> Self {
         match kind {
             InodeKind::File => Self::InodeKindFile,
@@ -1237,7 +1236,7 @@ mod tests {
 
     #[test]
     fn file_attrs_proto_converts_to_domain_file_attrs() {
-        let proto_attrs = crate::fs::FileAttrsProto {
+        let proto_attrs = crate::metadata::FileAttrsProto {
             mode: 0o100755,
             uid: 501,
             gid: 20,
@@ -1278,10 +1277,10 @@ mod tests {
             nlink: 3,
         };
 
-        let proto_attrs: crate::fs::FileAttrsProto = (&attrs).into();
-        let owned_proto_attrs: crate::fs::FileAttrsProto = attrs.into();
+        let proto_attrs: crate::metadata::FileAttrsProto = (&attrs).into();
+        let owned_proto_attrs: crate::metadata::FileAttrsProto = attrs.into();
 
-        let expected = crate::fs::FileAttrsProto {
+        let expected = crate::metadata::FileAttrsProto {
             mode: 0o040755,
             uid: 502,
             gid: 21,
@@ -1570,14 +1569,14 @@ mod tests {
             proto_message_fields(metadata_proto, "GetStatusResponseProto"),
             vec![
                 ("common.ResponseHeaderProto", "header", 1),
-                ("fs.FileAttrsProto", "attrs", 2),
+                ("FileAttrsProto", "attrs", 2),
             ]
         );
         assert_eq!(
             proto_message_fields(metadata_proto, "CreateDirectoryResponseProto"),
             vec![
                 ("common.ResponseHeaderProto", "header", 1),
-                ("fs.FileAttrsProto", "attrs", 2),
+                ("FileAttrsProto", "attrs", 2),
             ]
         );
         assert_eq!(
@@ -1863,7 +1862,6 @@ mod tests {
             ("common/common.proto", include_str!("../common/common.proto")),
             ("common/errors.proto", include_str!("../common/errors.proto")),
             ("common/header.proto", include_str!("../common/header.proto")),
-            ("fs/types.proto", include_str!("../fs/types.proto")),
             (
                 "metadata/filesystem.proto",
                 include_str!("../metadata/filesystem.proto"),
@@ -1887,22 +1885,28 @@ mod tests {
     #[test]
     fn inode_kind_proto_converts_to_domain_inode_kind() {
         let cases = [
-            (crate::fs::InodeKindProto::InodeKindFile, beryl_types::InodeKind::File),
-            (crate::fs::InodeKindProto::InodeKindDir, beryl_types::InodeKind::Dir),
             (
-                crate::fs::InodeKindProto::InodeKindSymlink,
+                crate::metadata::InodeKindProto::InodeKindFile,
+                beryl_types::InodeKind::File,
+            ),
+            (
+                crate::metadata::InodeKindProto::InodeKindDir,
+                beryl_types::InodeKind::Dir,
+            ),
+            (
+                crate::metadata::InodeKindProto::InodeKindSymlink,
                 beryl_types::InodeKind::Symlink,
             ),
         ];
 
         for (proto_kind, domain_kind) in cases {
             let decoded: beryl_types::InodeKind = proto_kind.try_into().expect("known inode kind");
-            let encoded: crate::fs::InodeKindProto = domain_kind.into();
+            let encoded: crate::metadata::InodeKindProto = domain_kind.into();
             assert_eq!(decoded, domain_kind);
             assert_eq!(encoded, proto_kind);
         }
 
-        let err = beryl_types::InodeKind::try_from(crate::fs::InodeKindProto::InodeKindUnspecified);
+        let err = beryl_types::InodeKind::try_from(crate::metadata::InodeKindProto::InodeKindUnspecified);
         assert!(err.is_err(), "unspecified inode kind is not a domain value");
     }
 

@@ -306,19 +306,19 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 let entries = payload
                     .entries
                     .into_iter()
-                    .map(|entry| beryl_proto::fs::DirEntryProto {
+                    .map(|entry| beryl_proto::metadata::DirEntryProto {
                         name: entry.name,
                         kind: match entry.kind {
                             Some(beryl_types::fs::InodeKind::File) => {
-                                beryl_proto::fs::InodeKindProto::InodeKindFile as i32
+                                beryl_proto::metadata::InodeKindProto::InodeKindFile as i32
                             }
                             Some(beryl_types::fs::InodeKind::Dir) => {
-                                beryl_proto::fs::InodeKindProto::InodeKindDir as i32
+                                beryl_proto::metadata::InodeKindProto::InodeKindDir as i32
                             }
                             Some(beryl_types::fs::InodeKind::Symlink) => {
-                                beryl_proto::fs::InodeKindProto::InodeKindSymlink as i32
+                                beryl_proto::metadata::InodeKindProto::InodeKindSymlink as i32
                             }
-                            None => beryl_proto::fs::InodeKindProto::InodeKindUnspecified as i32,
+                            None => beryl_proto::metadata::InodeKindProto::InodeKindUnspecified as i32,
                         },
                         attrs: entry.attrs.as_ref().map(file_attrs_to_proto),
                     })
@@ -1199,7 +1199,7 @@ mod tests {
             Request::new(CreateFileRequestProto {
                 header: header(client_id),
                 path: path.to_string(),
-                attrs: Some(beryl_proto::fs::FileAttrsProto {
+                attrs: Some(beryl_proto::metadata::FileAttrsProto {
                     mode: 0o644,
                     uid: 1000,
                     gid: 1000,
@@ -1287,7 +1287,7 @@ mod tests {
         let request = CreateDirectoryRequestProto {
             header: header(707),
             path: "/mnt/test/a/b/c".to_string(),
-            attrs: Some(beryl_proto::fs::FileAttrsProto {
+            attrs: Some(beryl_proto::metadata::FileAttrsProto {
                 mode: 0o755,
                 uid: 1000,
                 gid: 1000,
@@ -1370,7 +1370,7 @@ mod tests {
             Request::new(CreateDirectoryRequestProto {
                 header: header(708),
                 path: "/mnt/test/file/child".to_string(),
-                attrs: Some(beryl_proto::fs::FileAttrsProto {
+                attrs: Some(beryl_proto::metadata::FileAttrsProto {
                     mode: 0o755,
                     uid: 1000,
                     gid: 1000,
@@ -1787,7 +1787,7 @@ mod tests {
             Request::new(CreateFileRequestProto {
                 header: header(client_id),
                 path: "/mnt/test/unopened-empty".to_string(),
-                attrs: Some(beryl_proto::fs::FileAttrsProto {
+                attrs: Some(beryl_proto::metadata::FileAttrsProto {
                     mode: 0o644,
                     uid: 1000,
                     gid: 1000,
@@ -2024,7 +2024,7 @@ mod tests {
             Request::new(CreateFileRequestProto {
                 header: header(client_id),
                 path: path.to_string(),
-                attrs: Some(beryl_proto::fs::FileAttrsProto {
+                attrs: Some(beryl_proto::metadata::FileAttrsProto {
                     mode: 0o644,
                     uid: 1000,
                     gid: 1000,
@@ -2280,7 +2280,7 @@ mod tests {
             Request::new(CreateFileRequestProto {
                 header: header(20),
                 path: "/mnt/test/new-file".to_string(),
-                attrs: Some(beryl_proto::fs::FileAttrsProto {
+                attrs: Some(beryl_proto::metadata::FileAttrsProto {
                     mode: 0o644,
                     uid: 1000,
                     gid: 1000,
@@ -2316,7 +2316,7 @@ mod tests {
             Request::new(CreateFileRequestProto {
                 header: header(30),
                 path: "/mnt/test/replay-file".to_string(),
-                attrs: Some(beryl_proto::fs::FileAttrsProto {
+                attrs: Some(beryl_proto::metadata::FileAttrsProto {
                     mode: 0o644,
                     uid: 1000,
                     gid: 1000,
@@ -2619,7 +2619,7 @@ mod tests {
             Request::new(CreateFileRequestProto {
                 header: header(143),
                 path: "/mnt/test/dir/file".to_string(),
-                attrs: Some(beryl_proto::fs::FileAttrsProto {
+                attrs: Some(beryl_proto::metadata::FileAttrsProto {
                     mode: 0o644,
                     uid: 1000,
                     gid: 1000,

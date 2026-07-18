@@ -5,7 +5,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Watch all proto files for changes
     println!("cargo:rerun-if-changed=common/common.proto");
     println!("cargo:rerun-if-changed=common/header.proto");
-    println!("cargo:rerun-if-changed=fs/types.proto");
     println!("cargo:rerun-if-changed=common/errors.proto");
     println!("cargo:rerun-if-changed=metadata/filesystem.proto");
     println!("cargo:rerun-if-changed=metadata/worker.proto");
@@ -23,7 +22,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[
                 "common/common.proto",
                 "common/header.proto",
-                "fs/types.proto",
                 "common/errors.proto",
                 "metadata/filesystem.proto",
                 "metadata/worker.proto",

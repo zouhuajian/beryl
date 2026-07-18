@@ -178,8 +178,8 @@ pub fn header_from_rpc_error(
     header
 }
 
-pub(crate) fn file_attrs_to_proto(attrs: &beryl_types::fs::FileAttrs) -> beryl_proto::fs::FileAttrsProto {
-    beryl_proto::fs::FileAttrsProto {
+pub(crate) fn file_attrs_to_proto(attrs: &beryl_types::fs::FileAttrs) -> beryl_proto::metadata::FileAttrsProto {
+    beryl_proto::metadata::FileAttrsProto {
         mode: attrs.mode,
         uid: attrs.uid,
         gid: attrs.gid,
@@ -192,7 +192,7 @@ pub(crate) fn file_attrs_to_proto(attrs: &beryl_types::fs::FileAttrs) -> beryl_p
 }
 
 pub(crate) fn file_attrs_from_proto(
-    attrs: Option<beryl_proto::fs::FileAttrsProto>,
+    attrs: Option<beryl_proto::metadata::FileAttrsProto>,
 ) -> Result<beryl_types::fs::FileAttrs, MetadataError> {
     let attrs = attrs.ok_or_else(|| MetadataError::InvalidArgument("Missing FileAttrs".to_string()))?;
     Ok(beryl_types::fs::FileAttrs {

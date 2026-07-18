@@ -23,11 +23,6 @@ pub mod common {
     tonic::include_proto!("common");
 }
 
-// FS domain shared types (FileAttrs, DirEntry, etc.)
-pub mod fs {
-    tonic::include_proto!("fs");
-}
-
 // Client → metadata RPC
 pub mod metadata {
     tonic::include_proto!("metadata");

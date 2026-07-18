@@ -767,8 +767,8 @@ fn default_write_preallocation_len() -> u64 {
     u64::from(DEFAULT_BLOCK_SIZE) * MAX_PREALLOCATED_WRITE_BLOCKS
 }
 
-fn default_file_attrs() -> beryl_proto::fs::FileAttrsProto {
-    beryl_proto::fs::FileAttrsProto {
+fn default_file_attrs() -> beryl_proto::metadata::FileAttrsProto {
+    beryl_proto::metadata::FileAttrsProto {
         mode: 0o644,
         uid: 0,
         gid: 0,
@@ -780,8 +780,8 @@ fn default_file_attrs() -> beryl_proto::fs::FileAttrsProto {
     }
 }
 
-fn default_dir_attrs() -> beryl_proto::fs::FileAttrsProto {
-    beryl_proto::fs::FileAttrsProto {
+fn default_dir_attrs() -> beryl_proto::metadata::FileAttrsProto {
+    beryl_proto::metadata::FileAttrsProto {
         mode: 0o755,
         uid: 0,
         gid: 0,
@@ -865,7 +865,7 @@ fn directory_listing_from_response(
         .entries
         .into_iter()
         .map(|entry| {
-            let kind = beryl_proto::fs::InodeKindProto::try_from(entry.kind)
+            let kind = beryl_proto::metadata::InodeKindProto::try_from(entry.kind)
                 .ok()
                 .and_then(|kind| kind.try_into().ok());
             DirectoryEntry::new(entry.name, kind, entry.attrs.map(Into::into))

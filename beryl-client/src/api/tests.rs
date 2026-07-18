@@ -1648,9 +1648,9 @@ impl MetadataGateway for MockGateway {
         self.record("list_status", &ctx);
         self.list_requests.lock().expect("list requests").push(req);
         Ok(ListStatusResponseProto {
-            entries: vec![beryl_proto::fs::DirEntryProto {
+            entries: vec![beryl_proto::metadata::DirEntryProto {
                 name: "child".to_string(),
-                kind: beryl_proto::fs::InodeKindProto::InodeKindFile as i32,
+                kind: beryl_proto::metadata::InodeKindProto::InodeKindFile as i32,
                 attrs: Some(file_attrs_proto(4)),
             }],
             eof: true,
@@ -2235,8 +2235,8 @@ fn layout_response(
     }
 }
 
-fn file_attrs_proto(size: u64) -> beryl_proto::fs::FileAttrsProto {
-    beryl_proto::fs::FileAttrsProto {
+fn file_attrs_proto(size: u64) -> beryl_proto::metadata::FileAttrsProto {
+    beryl_proto::metadata::FileAttrsProto {
         mode: 0o100644,
         uid: 1000,
         gid: 1000,
