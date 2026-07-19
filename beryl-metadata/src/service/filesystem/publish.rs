@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
+//! Durable file visibility publication for sync and commit.
+
 use super::{Freshness, FsFailure, FsResult, MetadataFileSystem, PresentedWriteHandle, RequestContext};
 use crate::error::{MetadataError, MetadataResult};
 use crate::observe;
@@ -497,17 +499,12 @@ impl MetadataFileSystem {
                     ctx,
                     err.errno,
                     err.message,
-                    Some(routed.namespace_owner_group_name.clone()),
+                    Some(routed.group_name.clone()),
                     Some(routed.mount_epoch),
                 );
             }
             Err(err) => {
-                return self.failure_from_error(
-                    ctx,
-                    err,
-                    Some(routed.namespace_owner_group_name.clone()),
-                    Some(routed.mount_epoch),
-                );
+                return self.failure_from_error(ctx, err, Some(routed.group_name.clone()), Some(routed.mount_epoch));
             }
         };
         let content_revision = match content_revision {
@@ -516,7 +513,7 @@ impl MetadataFileSystem {
                 return self.failure_from_error(
                     ctx,
                     MetadataError::Internal("PublishFile returned no content revision".to_string()),
-                    Some(routed.namespace_owner_group_name.clone()),
+                    Some(routed.group_name.clone()),
                     Some(routed.mount_epoch),
                 )
             }
@@ -530,7 +527,7 @@ impl MetadataFileSystem {
             return self.failure_from_error(
                 ctx,
                 MetadataError::Internal(message),
-                Some(routed.namespace_owner_group_name.clone()),
+                Some(routed.group_name.clone()),
                 Some(routed.mount_epoch),
             );
         }
@@ -541,7 +538,7 @@ impl MetadataFileSystem {
                 synced_size: intent.final_size,
                 content_revision: Some(content_revision),
             },
-            Some(routed.namespace_owner_group_name.clone()),
+            Some(routed.group_name.clone()),
             Some(routed.mount_epoch),
             route_epoch,
         )
@@ -892,24 +889,19 @@ impl MetadataFileSystem {
                     ctx,
                     err.errno,
                     err.message,
-                    Some(routed.namespace_owner_group_name.clone()),
+                    Some(routed.group_name.clone()),
                     Some(routed.mount_epoch),
                 );
             }
             Err(err) => {
-                return self.failure_from_error(
-                    ctx,
-                    err,
-                    Some(routed.namespace_owner_group_name.clone()),
-                    Some(routed.mount_epoch),
-                );
+                return self.failure_from_error(ctx, err, Some(routed.group_name.clone()), Some(routed.mount_epoch));
             }
         };
         if content_revision.is_none() {
             return self.failure_from_error(
                 ctx,
                 MetadataError::Internal("PublishFile returned no content revision".to_string()),
-                Some(routed.namespace_owner_group_name.clone()),
+                Some(routed.group_name.clone()),
                 Some(routed.mount_epoch),
             );
         }
@@ -923,7 +915,7 @@ impl MetadataFileSystem {
             CloseWriteOutput {
                 committed_size: intent.final_size,
             },
-            Some(routed.namespace_owner_group_name.clone()),
+            Some(routed.group_name.clone()),
             Some(routed.mount_epoch),
             route_epoch,
         )

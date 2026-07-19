@@ -3,15 +3,12 @@
 
 //! Filesystem semantics shared by metadata RPC handlers.
 
-mod admission;
 mod command;
-mod delete;
-mod file_write;
-mod freshness;
+mod guard;
 mod namespace;
+mod publish;
 mod read;
-mod write_commit;
-mod write_session;
+mod write;
 
 use crate::error::{to_fs_error_detail, MetadataError, MetadataResult};
 use crate::inode_lease::LeaseManager;
@@ -30,15 +27,12 @@ use beryl_types::ids::{DataHandleId, WorkerId};
 use beryl_types::{GroupName, GroupStateWatermark, WorkerEndpointInfo};
 use std::sync::Arc;
 
-use admission::{AdmissionFailure, AdmissionGuard};
 use command::RoutedFsWriteCtx;
-pub(super) use delete::DeleteArgs;
-pub(super) use file_write::{CreateFileArgs, OpenWriteArgs};
-use freshness::{FreshnessValidator, StaleStateStatus};
-pub(super) use namespace::{CreateDirectoryArgs, RenameArgs};
+use guard::{AdmissionFailure, AdmissionGuard, FreshnessValidator, StaleStateStatus};
+pub(super) use namespace::{CreateDirectoryArgs, CreateFileArgs, DeleteArgs, RenameArgs};
+pub(super) use publish::{CommitFileArgs, SyncWriteArgs};
 pub(super) use read::{BlockLocationsTarget, GetBlockLocationsArgs, GetStatusArgs, ListStatusArgs, OpenFileArgs};
-pub(super) use write_commit::{CommitFileArgs, SyncWriteArgs};
-pub(super) use write_session::{AbortFileWriteArgs, AddBlockArgs, RenewLeaseArgs};
+pub(super) use write::{AbortFileWriteArgs, AddBlockArgs, OpenWriteArgs, RenewLeaseArgs};
 
 #[derive(Clone, Debug)]
 pub(crate) struct RequestContext {
@@ -428,14 +422,23 @@ impl MetadataFileSystem {
     }
 }
 
+fn validate_active_write_layout(layout: &beryl_types::layout::FileLayout) -> Result<(), MetadataError> {
+    if layout.replication != 1 {
+        return Err(MetadataError::InvalidArgument(
+            "multi-replica write is not supported yet; replication must be 1".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod test_support {
     pub(super) use super::*;
     pub(super) use crate::config::RaftConfig;
     pub(super) use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
     pub(super) use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
-    pub(super) use crate::service::filesystem::write_commit::{CloseWriteIntent, CloseWriteOutput};
-    pub(super) use crate::service::filesystem::write_session::OpenWriteOutput;
+    pub(super) use crate::service::filesystem::publish::{CloseWriteIntent, CloseWriteOutput};
+    pub(super) use crate::service::filesystem::write::OpenWriteOutput;
     pub(super) use crate::state::MemoryStateStore;
     pub(super) use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerManager};
     pub(super) use beryl_common::error::rpc::{
@@ -453,8 +456,8 @@ mod test_support {
 
     pub(super) struct TestFilesystem {
         filesystem: MetadataFileSystem,
-        session_registry: Arc<crate::session_registry::SessionRegistry>,
-        lease_manager: Arc<crate::inode_lease::LeaseManager>,
+        session_registry: Arc<SessionRegistry>,
+        lease_manager: Arc<LeaseManager>,
         _storage_dir: Option<TempDir>,
     }
 
@@ -474,11 +477,11 @@ mod test_support {
             self.session_registry.get_session(data_handle_id)
         }
 
-        pub(super) fn session_registry(&self) -> Arc<crate::session_registry::SessionRegistry> {
+        pub(super) fn session_registry(&self) -> Arc<SessionRegistry> {
             Arc::clone(&self.session_registry)
         }
 
-        pub(super) fn lease_manager(&self) -> Arc<crate::inode_lease::LeaseManager> {
+        pub(super) fn lease_manager(&self) -> Arc<LeaseManager> {
             Arc::clone(&self.lease_manager)
         }
     }
@@ -487,7 +490,7 @@ mod test_support {
         mount_table: Arc<MountTable>,
         storage: Option<Arc<RocksDBStorage>>,
         raft_node: Option<Arc<AppRaftNode>>,
-        lease_manager: Option<Arc<crate::inode_lease::LeaseManager>>,
+        lease_manager: Option<Arc<LeaseManager>>,
         worker_manager: Option<Arc<WorkerManager>>,
     }
 
@@ -521,7 +524,7 @@ mod test_support {
             self
         }
 
-        pub(super) fn with_lease_manager(mut self, lease_manager: Arc<crate::inode_lease::LeaseManager>) -> Self {
+        pub(super) fn with_lease_manager(mut self, lease_manager: Arc<LeaseManager>) -> Self {
             self.lease_manager = Some(lease_manager);
             self
         }
@@ -535,10 +538,10 @@ mod test_support {
                     (storage, Some(storage_dir))
                 }
             };
-            let session_registry = Arc::new(crate::session_registry::SessionRegistry::default());
+            let session_registry = Arc::new(SessionRegistry::default());
             let lease_manager = self
                 .lease_manager
-                .unwrap_or_else(|| Arc::new(crate::inode_lease::LeaseManager::default()));
+                .unwrap_or_else(|| Arc::new(LeaseManager::default()));
             let filesystem = MetadataFileSystem::new(MetadataFileSystemDeps {
                 state_store: Arc::new(MemoryStateStore::new()),
                 mount_table: self.mount_table,

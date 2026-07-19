@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use super::file_write::validate_active_write_layout;
+//! Leader-local write lease, placement, and session lifecycle.
+
+use super::{missing_resolved_target_error, validate_active_write_layout};
 use super::{
     worker_endpoint_from_parts, AdmissionFailure, Freshness, FsResult, MetadataFileSystem, PresentedWriteHandle,
     RequestContext,
 };
 use crate::error::MetadataError;
+use crate::inode_lease::WriteMode;
+use crate::observe;
 use crate::placement::{PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus};
 use crate::raft::FsCommandResult;
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
@@ -837,5 +841,264 @@ fn open_write_output(session: &crate::session_registry::WriteSession) -> OpenWri
         base_size: session.base_size,
         expires_at_ms: session.expires_at_ms,
         content_revision: session.content_revision,
+    }
+}
+
+pub(crate) struct OpenWriteArgs {
+    pub(crate) path: String,
+    pub(crate) desired_len: Option<u64>,
+    pub(crate) mode: WriteMode,
+    pub(crate) freshness: Freshness,
+}
+
+impl MetadataFileSystem {
+    pub(crate) async fn open_write(&self, ctx: &RequestContext, args: OpenWriteArgs) -> FsResult<OpenWriteOutput> {
+        let path = args.path.clone();
+        let result = self.open_write_inner(ctx, args).await;
+        match &result {
+            Ok(success) => {
+                let payload = &success.payload;
+                tracing::info!(
+                    target: "metadata.state",
+                    op = "OpenWrite",
+                    result = "opened",
+                    error_code = "none",
+                    client_id = %ctx.caller.client.client_id,
+                    call_id = %ctx.caller.client.call_id,
+                    path = %path,
+                    inode_id = payload.inode_id.as_raw(),
+                    data_handle_id = payload.data_handle_id.as_raw(),
+                    lease_epoch = payload.lease_epoch,
+                    mount_epoch = success.mount_epoch,
+                    route_epoch = success.route_epoch,
+                    "OpenWrite opened"
+                );
+            }
+            Err(failure) => tracing::warn!(
+                target: "metadata.state",
+                op = "OpenWrite",
+                result = "rejected",
+                error_code = observe::rpc_error_kind(&failure.error),
+                client_id = %ctx.caller.client.client_id,
+                call_id = %ctx.caller.client.call_id,
+                path = %path,
+                "OpenWrite rejected"
+            ),
+        }
+        result
+    }
+
+    async fn open_write_inner(&self, ctx: &RequestContext, args: OpenWriteArgs) -> FsResult<OpenWriteOutput> {
+        if let Err(failure) = self.admission.check_meta_write(ctx).await {
+            return self.failure_from_admission(failure);
+        }
+        let open_path = match crate::path_resolver::PathResolver::normalize(&args.path) {
+            Ok(path) => path,
+            Err(err) => return self.failure_from_path_error(ctx, &args.path, err),
+        };
+        let resolved = match self.path_resolver.resolve_path(&open_path) {
+            Ok(resolved) => resolved,
+            Err(err) => return self.failure_from_path_error(ctx, &args.path, err),
+        };
+        let Some(inode_id) = resolved.inode_id else {
+            return self.failure_from_resolved_path_error(
+                ctx,
+                missing_resolved_target_error(&resolved),
+                Some(&resolved.mount_ctx),
+            );
+        };
+        if let Err(failure) = self.admission.check_data_write(ctx, resolved.mount_ctx.mount_id).await {
+            return self.failure_from_admission(failure);
+        }
+        self.open_write_inode(ctx, inode_id, args.desired_len, args.mode, args.freshness)
+            .await
+    }
+}
+
+#[cfg(test)]
+mod open_write_tests {
+    use super::*;
+    use crate::service::filesystem::test_support::*;
+
+    #[tokio::test]
+    async fn open_write_cleans_lease_on_error() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_id = MountId::new(50);
+        let inode_id = InodeId::new(500);
+        let data_handle_id = DataHandleId::new(9500);
+        storage
+            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+        let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name("g7"))
+            .with_storage(storage)
+            .build();
+
+        let failure = filesystem
+            .open_write_inode(
+                &request_context(),
+                inode_id,
+                Some(4096),
+                crate::inode_lease::WriteMode::Write,
+                Freshness::default(),
+            )
+            .await
+            .expect_err("missing worker manager should fail open_write");
+
+        assert!(failure.error.message.contains("Worker manager not available"));
+        assert!(filesystem.lease_manager().get_active_lease(inode_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn open_write_uses_current_data_handle_and_duplicate_fails_without_advancing_epoch() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_id = MountId::new(51);
+        let group_name_value = group_name("g9");
+        let inode_id = InodeId::new(510);
+        let data_handle_id = DataHandleId::new(9510);
+        storage
+            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
+        let mount_table = builder.mount_table();
+        let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
+        let filesystem = builder
+            .with_storage(Arc::clone(&storage))
+            .with_raft_node(raft_node)
+            .with_worker_manager(worker_manager_for_write_targets(&group_name_value))
+            .build();
+
+        let success = filesystem
+            .open_write_inode(
+                &request_context(),
+                inode_id,
+                Some(4096),
+                crate::inode_lease::WriteMode::Write,
+                Freshness::default(),
+            )
+            .await
+            .expect("open_write should succeed");
+
+        assert_ne!(inode_id.as_raw(), data_handle_id.as_raw());
+        let session = filesystem
+            .write_session_for_handle(success.payload.data_handle_id)
+            .expect("session should be stored");
+        assert!(!session.write_targets.is_empty());
+        for target in &session.write_targets {
+            assert_eq!(target.block_id.data_handle_id, data_handle_id);
+            assert_eq!(target.block_size, 4096);
+            assert_eq!(target.effective_len, 4096);
+            assert_eq!(target.chunk_size, 4096);
+            assert_eq!(target.block_format_id, beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE);
+        }
+        assert_eq!(success.payload.data_handle_id, data_handle_id);
+        assert_eq!(session.data_handle_id, data_handle_id);
+
+        let persisted_epoch = storage
+            .get_inode(inode_id)
+            .unwrap()
+            .and_then(|inode| match inode.data {
+                beryl_types::fs::InodeData::File { lease_epoch, .. } => lease_epoch,
+                _ => None,
+            })
+            .expect("OpenWrite must persist the acquired lease epoch");
+        let duplicate = filesystem
+            .open_write_inode(
+                &request_context(),
+                inode_id,
+                Some(4096),
+                crate::inode_lease::WriteMode::Write,
+                Freshness::default(),
+            )
+            .await
+            .expect_err("a duplicate OpenWrite must fail closed while the lease is active");
+        assert_fail(
+            &duplicate.error,
+            beryl_common::error::rpc::ErrorKind::Fs(FsErrorCode::EBusy),
+        );
+        let epoch_after_duplicate = storage.get_inode(inode_id).unwrap().and_then(|inode| match inode.data {
+            beryl_types::fs::InodeData::File { lease_epoch, .. } => lease_epoch,
+            _ => None,
+        });
+        assert_eq!(epoch_after_duplicate, Some(persisted_epoch));
+    }
+
+    #[tokio::test]
+    async fn open_write_rejects_missing_file_layout_without_default_fallback() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_id = MountId::new(52);
+        let group_name_value = group_name("g9");
+        let inode_id = InodeId::new(520);
+        let data_handle_id = DataHandleId::new(9520);
+        storage
+            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+            .unwrap();
+        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+        let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
+            .with_storage(storage)
+            .with_worker_manager(worker_manager_for_write_targets(&group_name_value))
+            .build();
+
+        let failure = filesystem
+            .open_write_inode(
+                &request_context(),
+                inode_id,
+                Some(4096),
+                crate::inode_lease::WriteMode::Write,
+                Freshness::default(),
+            )
+            .await
+            .expect_err("missing persisted layout must fail open_write");
+
+        assert!(failure.error.message.contains("Layout not found"));
+    }
+
+    #[tokio::test]
+    async fn open_write_rejects_multi_replica_layout_until_durable_replication_exists() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_id = MountId::new(54);
+        let group_name_value = group_name("g9");
+        let inode_id = InodeId::new(540);
+        let data_handle_id = DataHandleId::new(9540);
+        storage
+            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 2)).unwrap();
+        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+        let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
+            .with_storage(storage)
+            .with_worker_manager(worker_manager_for_write_targets(&group_name_value))
+            .build();
+
+        let failure = filesystem
+            .open_write_inode(
+                &request_context(),
+                inode_id,
+                Some(4096),
+                crate::inode_lease::WriteMode::Write,
+                Freshness::default(),
+            )
+            .await
+            .expect_err("multi-replica layout must fail active write");
+
+        assert!(
+            failure
+                .error
+                .message
+                .contains("multi-replica write is not supported yet; replication must be 1"),
+            "unexpected error: {}",
+            failure.error.message
+        );
     }
 }

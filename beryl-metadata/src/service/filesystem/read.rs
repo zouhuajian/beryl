@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
+//! Namespace and file-location read operations.
+
 use super::refresh_metadata_fs_failure;
 use super::{
     missing_resolved_target_error, worker_endpoint_from_parts, FileRange, Freshness, FsFailure, FsResult, FsSuccess,

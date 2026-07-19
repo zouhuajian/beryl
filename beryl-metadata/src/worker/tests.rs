@@ -609,8 +609,8 @@ fn production_worker_lookup_sources_reject_implicit_group_patterns() {
             include_str!("../service/filesystem/read.rs"),
         ),
         (
-            "beryl-metadata/src/service/filesystem/write_session.rs",
-            include_str!("../service/filesystem/write_session.rs"),
+            "beryl-metadata/src/service/filesystem/write.rs",
+            include_str!("../service/filesystem/write.rs"),
         ),
         (
             "beryl-metadata/src/maintenance/repair/planner.rs",

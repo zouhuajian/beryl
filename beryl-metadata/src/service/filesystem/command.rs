@@ -17,7 +17,8 @@ use tracing::debug;
 #[derive(Clone, Debug)]
 pub(super) struct RoutedFsWriteCtx {
     pub(super) mount_id: MountId,
-    pub(super) namespace_owner_group_name: GroupName,
+    /// Namespace owner group selected from the resolved mount.
+    pub(super) group_name: GroupName,
     pub(super) mount_epoch: u64,
 }
 
@@ -106,7 +107,7 @@ impl MetadataFileSystem {
 
         Ok(RoutedFsWriteCtx {
             mount_id,
-            namespace_owner_group_name: mount_entry.namespace_owner_group_name,
+            group_name: mount_entry.namespace_owner_group_name,
             mount_epoch: mount_entry.mount_epoch,
         })
     }
