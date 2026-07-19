@@ -232,6 +232,7 @@ impl MetadataFileSystem {
                 extents,
                 content_revision,
                 lease_epoch,
+                ..
             } => (extents, content_revision.unwrap_or(0), lease_epoch.unwrap_or(0)),
             _ => {
                 return Err(MetadataError::InvalidArgument(format!(
@@ -802,7 +803,7 @@ impl MetadataFileSystem {
         if let Some(worker_manager) = self.worker_manager.as_ref() {
             let worker_lookup_group_name =
                 self.require_worker_lookup_group(ctx, group_name.clone(), mount_epoch, route_epoch, "CommitFile")?;
-            for target in &session.write_targets {
+            for target in &session.issued_targets {
                 for endpoint in &target.worker_endpoints {
                     let worker_id = endpoint.worker_id;
                     let current_run_id = worker_manager

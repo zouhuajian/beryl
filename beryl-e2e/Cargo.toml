@@ -4,6 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 publish = false
 
+[[bin]]
+name = "metadata-e2e-server"
+path = "src/bin/metadata_e2e_server.rs"
+
 [dependencies]
 beryl-client = { path = "../beryl-client" }
 beryl-common = { path = "../beryl-common" }

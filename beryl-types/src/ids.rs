@@ -75,9 +75,10 @@ impl fmt::Display for DataHandleId {
 }
 
 id_new_uint!(
-    /// A monotonically increasing block index within a file.
+    /// A monotonically allocated block index within one data handle.
     ///
-    /// This is an ordinal (0,1,2,...) not a byte offset.
+    /// This is a stable ordinal, not a byte offset. Failed allocations may
+    /// leave gaps, and an allocated value is never reused.
     BlockIndex(u32)
 );
 

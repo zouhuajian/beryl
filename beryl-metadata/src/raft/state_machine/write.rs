@@ -4,6 +4,55 @@
 use super::*;
 
 impl AppRaftStateMachine {
+    pub(super) fn apply_allocate_block(
+        &self,
+        inode_id: InodeId,
+        data_handle_id: DataHandleId,
+        lease_epoch: u64,
+        raft_state: &AppMetadataRaftState,
+    ) -> MetadataResult<BlockId> {
+        let mut inode = self
+            .storage
+            .get_inode(inode_id)?
+            .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {inode_id}")))?;
+        if inode.data_handle_id != data_handle_id {
+            return Err(MetadataError::InvalidArgument(format!(
+                "data handle changed for inode {inode_id}: expected {data_handle_id}, current {}",
+                inode.data_handle_id
+            )));
+        }
+        let next_block_index = match &mut inode.data {
+            InodeData::File {
+                lease_epoch: stored_lease_epoch,
+                next_block_index,
+                ..
+            } => {
+                let current_lease_epoch = stored_lease_epoch.unwrap_or(0);
+                if current_lease_epoch != lease_epoch {
+                    return Err(MetadataError::LeaseFenced {
+                        expected: current_lease_epoch,
+                        got: lease_epoch,
+                    });
+                }
+                let allocated = *next_block_index;
+                *next_block_index = allocated.checked_add(1).ok_or_else(|| {
+                    MetadataError::InvalidArgument(format!("block index overflow for inode {inode_id}"))
+                })?;
+                allocated
+            }
+            _ => {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "Inode is not a file: {inode_id}"
+                )))
+            }
+        };
+        let block_index = u32::try_from(next_block_index)
+            .map_err(|_| MetadataError::InvalidArgument(format!("block index exhausted for inode {inode_id}")))?;
+        let block_id = BlockId::new(data_handle_id, BlockIndex::new(block_index));
+        self.storage.put_inode_atomic(&inode, raft_state)?;
+        Ok(block_id)
+    }
+
     pub(super) fn apply_acquire_write_lease(
         &self,
         inode_id: InodeId,
@@ -150,6 +199,7 @@ impl AppRaftStateMachine {
                     extents,
                     content_revision,
                     lease_epoch,
+                    ..
                 } => (extents.clone(), content_revision.unwrap_or(0), lease_epoch.unwrap_or(0)),
                 _ => unreachable!("file inode must carry file data"),
             };
@@ -320,6 +370,122 @@ impl AppRaftStateMachine {
 mod tests {
     use super::*;
     use crate::raft::state_machine::tests::*;
+
+    fn expect_block_allocated(result: CommandResult) -> BlockId {
+        match result {
+            CommandResult::BlockAllocated(block_id) => block_id,
+            other => panic!("unexpected apply response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_allocation_is_durable_and_rejects_stale_authority_without_consuming_an_index() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let inode_id = InodeId::new(106);
+        let data_handle_id = DataHandleId::new(206);
+        install_file_with_extents(
+            &storage,
+            InodeId::new(100),
+            "file",
+            inode_id,
+            data_handle_id,
+            Vec::new(),
+            0,
+        );
+        let allocate = || Command::AllocateBlock {
+            inode_id,
+            data_handle_id,
+            lease_epoch: 1,
+        };
+
+        let first = expect_block_allocated(
+            AppRaftStateMachine::new(Arc::clone(&storage))
+                .apply(allocate())
+                .unwrap(),
+        );
+        assert_eq!(first, BlockId::new(data_handle_id, BlockIndex::new(0)));
+        expect_fs_ok(
+            AppRaftStateMachine::new(Arc::clone(&storage))
+                .apply(Command::PublishFile {
+                    proposed_at_ms: 1,
+                    inode_id,
+                    extents: vec![extent(first, 0, 1024)],
+                    target_size: 1024,
+                    expected_content_revision: 0,
+                    expected_file_size: 0,
+                    lease_epoch: 1,
+                    mode: PublishMode::ReplaceIfUnchanged,
+                })
+                .unwrap(),
+        );
+
+        let restarted = AppRaftStateMachine::new(Arc::clone(&storage));
+        let second = expect_block_allocated(restarted.apply(allocate()).unwrap());
+        assert_eq!(second, BlockId::new(data_handle_id, BlockIndex::new(1)));
+        assert!(matches!(
+            restarted.apply(Command::AllocateBlock {
+                inode_id,
+                data_handle_id: DataHandleId::new(999),
+                lease_epoch: 1,
+            }),
+            Err(MetadataError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            restarted.apply(Command::AllocateBlock {
+                inode_id,
+                data_handle_id,
+                lease_epoch: 0,
+            }),
+            Err(MetadataError::LeaseFenced { expected: 1, got: 0 })
+        ));
+
+        let inode = storage.get_inode(inode_id).unwrap().unwrap();
+        let InodeData::File { next_block_index, .. } = inode.data else {
+            panic!("expected file inode")
+        };
+        assert_eq!(next_block_index, 2);
+    }
+
+    #[test]
+    fn block_allocation_exhaustion_fails_closed_without_wrapping() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let inode_id = InodeId::new(107);
+        let data_handle_id = DataHandleId::new(207);
+        let mut inode = install_file_with_extents(
+            &storage,
+            InodeId::new(100),
+            "file",
+            inode_id,
+            data_handle_id,
+            Vec::new(),
+            0,
+        );
+        let InodeData::File { next_block_index, .. } = &mut inode.data else {
+            panic!("expected file inode")
+        };
+        *next_block_index = u64::from(u32::MAX);
+        storage.put_inode(&inode).unwrap();
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage));
+        let command = || Command::AllocateBlock {
+            inode_id,
+            data_handle_id,
+            lease_epoch: 1,
+        };
+
+        let last = expect_block_allocated(sm.apply(command()).unwrap());
+        assert_eq!(last.index, BlockIndex::new(u32::MAX));
+        assert!(matches!(
+            sm.apply(command()),
+            Err(MetadataError::InvalidArgument(message)) if message.contains("exhausted")
+        ));
+        let inode = storage.get_inode(inode_id).unwrap().unwrap();
+        let InodeData::File { next_block_index, .. } = inode.data else {
+            panic!("expected file inode")
+        };
+        assert_eq!(next_block_index, u64::from(u32::MAX) + 1);
+    }
 
     #[test]
     fn acquire_write_lease_uses_durable_compare_and_increment() {

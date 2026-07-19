@@ -8,7 +8,6 @@ use beryl_types::BlockFormatId;
 pub(crate) const DEFAULT_BLOCK_SIZE: u32 = 64 * 1024 * 1024;
 pub(crate) const DEFAULT_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
 pub(crate) const DEFAULT_REPLICATION: u8 = 1;
-pub(crate) const MAX_PREALLOCATED_WRITE_BLOCKS: u64 = 10;
 
 /// Options for creating a file write session and, for new files only, proposing a `FileLayout`.
 ///

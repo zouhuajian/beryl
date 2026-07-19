@@ -61,7 +61,7 @@ const CF_RAFT_SNAPSHOT: &str = "raft_snapshot"; // Raft snapshots
 
 const ROCKSDB_SCHEMA_VERSION_KEY: &[u8] = b"rocksdb_schema_version";
 const STORAGE_IDENTITY_KEY: &[u8] = b"storage_identity";
-pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 7;
+pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 8;
 const NEXT_INODE_ID_KEY: &[u8] = b"next_inode_id";
 const NEXT_DATA_HANDLE_ID_KEY: &[u8] = b"next_data_handle_id";
 
@@ -244,30 +244,27 @@ mod tests {
     }
 
     #[test]
-    fn opening_previous_command_schema_requires_reformat() {
+    fn opening_previous_inode_schema_requires_reformat() {
         let dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
         drop(storage);
 
         let generation_path = dir.path().join("generations/gen-000001");
-        let mut db = DB::open_cf_descriptors(&Options::default(), &generation_path, schema::cf_descriptors()).unwrap();
-        db.create_cf("dedup", &Options::default()).unwrap();
-        let dedup = db.cf_handle("dedup").unwrap();
-        db.put_cf(dedup, b"old-call", b"old-result").unwrap();
+        let db = DB::open_cf_descriptors(&Options::default(), &generation_path, schema::cf_descriptors()).unwrap();
         let meta = db.cf_handle(CF_META).unwrap();
-        let previous = bincode::serde::encode_to_vec(6u64, bincode::config::standard()).unwrap();
-        db.put_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY, previous).unwrap();
+        let previous = bincode::serde::encode_to_vec(7u64, bincode::config::standard()).unwrap();
+        db.put_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY, &previous).unwrap();
         drop(db);
 
         let error = match RocksDBStorage::open_existing_for_start(dir.path()) {
-            Ok(_) => panic!("schema 6 store must not open after the Command format change"),
+            Ok(_) => panic!("schema 7 store must not open after the inode format change"),
             Err(error) => error,
         };
 
         assert!(
             error
                 .to_string()
-                .contains("unsupported RocksDB schema version 6; expected 7"),
+                .contains("unsupported RocksDB schema version 7; expected 8"),
             "unexpected startup error: {error}"
         );
         assert!(
@@ -275,13 +272,11 @@ mod tests {
             "unexpected startup error: {error}"
         );
 
-        let mut descriptors = schema::cf_descriptors();
-        descriptors.push(ColumnFamilyDescriptor::new("dedup", Options::default()));
-        let db = DB::open_cf_descriptors(&Options::default(), generation_path, descriptors).unwrap();
-        let dedup = db.cf_handle("dedup").unwrap();
+        let db = DB::open_cf_descriptors(&Options::default(), generation_path, schema::cf_descriptors()).unwrap();
+        let meta = db.cf_handle(CF_META).unwrap();
         assert_eq!(
-            db.get_cf(dedup, b"old-call").unwrap().as_deref(),
-            Some(&b"old-result"[..])
+            db.get_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY).unwrap().as_deref(),
+            Some(previous.as_slice())
         );
     }
 
@@ -560,6 +555,7 @@ mod tests {
             extents,
             content_revision,
             lease_epoch,
+            next_block_index,
         } = &mut inode.data
         {
             extents.push(beryl_types::fs::Extent {
@@ -572,6 +568,7 @@ mod tests {
             });
             *content_revision = Some(3);
             *lease_epoch = Some(3);
+            *next_block_index = 1;
         }
         inode.attrs.size = 64;
         storage.put_layout(inode_id, layout).unwrap();

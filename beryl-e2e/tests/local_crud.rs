@@ -161,6 +161,38 @@ async fn visibility_sync_then_continue_write_roundtrip() {
     cluster.shutdown().await.expect("local cluster shutdown");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_more_than_ten_blocks_roundtrip() {
+    let mut cluster = TestCluster::start().await.expect("start hermetic local cluster");
+    let client = cluster.client();
+    let path = "/many-blocks";
+    let payload = Bytes::from(deterministic_bytes(12 * 1024 + 17));
+    let mut writer = client
+        .create(
+            path,
+            CreateOptions::create().with_block_size(1024).with_chunk_size(1024),
+        )
+        .await
+        .expect("create file");
+
+    writer
+        .write_all(payload.clone())
+        .await
+        .expect("write more than ten blocks");
+    writer.close().await.expect("close file");
+    cluster.converge_block_reports().await.expect("converge block reports");
+
+    let actual = client
+        .open(path)
+        .await
+        .expect("open file")
+        .read_all()
+        .await
+        .expect("read file");
+    assert_eq!(actual, payload);
+    cluster.shutdown().await.expect("local cluster shutdown");
+}
+
 fn assert_not_found<T: std::fmt::Debug>(result: ClientResult<T>, context: &str) {
     let err = result.expect_err(context);
     let message = err.to_string().to_ascii_lowercase();

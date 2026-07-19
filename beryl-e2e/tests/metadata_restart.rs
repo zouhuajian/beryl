@@ -230,7 +230,6 @@ async fn session_operations_converge_by_predecessor_and_ensure_absent() {
         header: Some(metadata_header(801)),
         path: path.to_string(),
         mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
-        desired_len: Some(2048),
     };
     let open = metadata
         .open_write(Request::new(open_request))
@@ -260,6 +259,25 @@ async fn session_operations_converge_by_predecessor_and_ensure_absent() {
     assert_metadata_ok(first_add.header);
     assert_metadata_ok(replay_add.header);
     assert_eq!(replay_add.target, first_add.target);
+    let first_target = first_add.target.expect("first target");
+    let first_block_id = first_target.block_id.expect("first block id");
+    let second_add = metadata
+        .add_block(Request::new(AddBlockRequestProto {
+            header: Some(metadata_header(801)),
+            write_handle: Some(write_handle),
+            desired_len: Some(1024),
+            previous_block_id: Some(first_block_id),
+        }))
+        .await
+        .expect("second logical AddBlock")
+        .into_inner();
+    assert_metadata_ok(second_add.header);
+    let second_block_id = second_add
+        .target
+        .expect("second target")
+        .block_id
+        .expect("second block id");
+    assert_eq!(second_block_id.block_index, first_block_id.block_index + 1);
 
     let conflict = metadata
         .add_block(Request::new(AddBlockRequestProto {
@@ -290,6 +308,155 @@ async fn session_operations_converge_by_predecessor_and_ensure_absent() {
         .into_inner();
     assert_metadata_ok(first_abort.header);
     assert_metadata_ok(replay_abort.header);
+    cluster.shutdown().await.expect("shutdown cluster");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
+    let mut cluster = TestCluster::start().await.expect("start cluster");
+    cluster.start_additional_worker().await.expect("start second worker");
+    assert_eq!(cluster.current_worker_run_ids().len(), 2);
+    cluster
+        .start_metadata_process(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .expect("start metadata child process");
+    cluster
+        .client()
+        .mkdirs("/restart", true)
+        .await
+        .expect("create restart dir");
+    let path = "/restart/many-blocks";
+    let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
+        .await
+        .expect("connect metadata");
+    let create = metadata
+        .create_file(Request::new(CreateFileRequestProto {
+            header: Some(metadata_header(900)),
+            path: path.to_string(),
+            attrs: Some(FileAttrsProto {
+                mode: 0o644,
+                ..Default::default()
+            }),
+            layout: Some(FileLayoutProto {
+                block_size: 1024,
+                chunk_size: 1024,
+                replication: 1,
+                block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
+            }),
+        }))
+        .await
+        .expect("CreateFile")
+        .into_inner();
+    assert_metadata_ok(create.header);
+    let open = metadata
+        .open_write(Request::new(OpenWriteRequestProto {
+            header: Some(metadata_header(900)),
+            path: path.to_string(),
+            mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
+        }))
+        .await
+        .expect("OpenWrite")
+        .into_inner();
+    assert_metadata_ok(open.header);
+    let old_handle = open.write_handle.expect("write handle");
+    let mut previous_block_id = None;
+    for index in 0..12 {
+        let add = metadata
+            .add_block(Request::new(AddBlockRequestProto {
+                header: Some(metadata_header(900)),
+                write_handle: Some(old_handle),
+                desired_len: Some(1024),
+                previous_block_id,
+            }))
+            .await
+            .expect("AddBlock")
+            .into_inner();
+        assert_metadata_ok(add.header);
+        let block_id = add.target.expect("write target").block_id.expect("block id");
+        assert_eq!(block_id.block_index, index as u32);
+        previous_block_id = Some(block_id);
+    }
+
+    cluster
+        .kill_metadata_process_and_restart()
+        .await
+        .expect("SIGKILL metadata child and restart in-process metadata");
+    let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
+        .await
+        .expect("reconnect metadata");
+    let reopened = metadata
+        .open_write(Request::new(OpenWriteRequestProto {
+            header: Some(metadata_header(900)),
+            path: path.to_string(),
+            mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
+        }))
+        .await
+        .expect("reopen write")
+        .into_inner();
+    assert_metadata_ok(reopened.header);
+    let new_handle = reopened.write_handle.expect("new write handle");
+    let payload = deterministic_bytes(1024);
+    let next = metadata
+        .add_block(Request::new(AddBlockRequestProto {
+            header: Some(metadata_header(900)),
+            write_handle: Some(new_handle),
+            desired_len: Some(1024),
+            previous_block_id: None,
+        }))
+        .await
+        .expect("AddBlock after restart")
+        .into_inner();
+    assert_metadata_ok(next.header);
+    let target = next.target.expect("write target after restart");
+    let block_id = target.block_id.expect("block id after restart");
+    assert_eq!(block_id.block_index, 12);
+    let selected_run_id = &target
+        .worker_endpoints
+        .first()
+        .expect("write target has a worker")
+        .worker_run_id;
+    assert!(
+        cluster
+            .current_worker_run_ids()
+            .iter()
+            .any(|run_id| run_id.to_string() == *selected_run_id),
+        "placement must use one of the two currently registered worker runs"
+    );
+
+    write_and_commit_worker_target(&target, &payload)
+        .await
+        .expect("write and commit restarted target on selected worker");
+    let commit = metadata
+        .commit_file(Request::new(CommitFileRequestProto {
+            header: Some(metadata_header(900)),
+            write_handle: Some(new_handle),
+            committed_blocks: vec![CommittedBlockProto {
+                block_id: Some(block_id),
+                file_offset: target.file_offset,
+                len: payload.len() as u64,
+            }],
+            final_size: payload.len() as u64,
+            expected_content_revision: reopened.content_revision,
+            write_mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
+            expected_file_size: reopened.base_size,
+        }))
+        .await
+        .expect("publish restarted target")
+        .into_inner();
+    assert_metadata_ok(commit.header);
+    cluster
+        .converge_block_reports()
+        .await
+        .expect("converge both worker reports after publish");
+    let read = cluster
+        .client()
+        .open(path)
+        .await
+        .expect("open restarted write")
+        .read_all()
+        .await
+        .expect("read restarted write");
+    assert_eq!(read.as_ref(), payload.as_slice());
     cluster.shutdown().await.expect("shutdown cluster");
 }
 
@@ -376,7 +543,6 @@ async fn raw_create_commit_worker_block(
             header: Some(metadata_header(401)),
             path: path.to_string(),
             mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
-            desired_len: Some(payload.len() as u64),
         }))
         .await?
         .into_inner();

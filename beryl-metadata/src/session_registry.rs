@@ -37,14 +37,10 @@ pub struct WriteSession {
     pub layout: FileLayout,
     /// Exact lease expiry returned by OpenWrite.
     pub expires_at_ms: u64,
-    /// Precomputed write targets for AddBlock.
-    pub write_targets: Vec<WriteTarget>,
     /// Targets already issued to the client through AddBlock.
     pub issued_targets: Vec<WriteTarget>,
     /// Logical AddBlock steps issued for predecessor-based replay.
-    issued_steps: Vec<IssuedTarget>,
-    /// Next write target to hand out through AddBlock.
-    pub next_target_index: usize,
+    issued_steps: HashMap<Option<BlockId>, IssuedTarget>,
 }
 
 #[cfg(test)]
@@ -65,7 +61,7 @@ mod tests {
             fencing_token: FencingToken {
                 block_id,
                 owner: ClientId::new(1),
-                epoch: 1,
+                epoch: 7,
             },
             block_stamp: 1,
             chunk_size: 64,
@@ -86,8 +82,25 @@ mod tests {
             open_client_id: ClientId::new(1),
             layout: FileLayout::new(64, 64, 1),
             expires_at_ms: 1_000,
-            write_targets: vec![write_target(data_handle_id, 0), write_target(data_handle_id, 1)],
         }
+    }
+
+    fn issue_target(
+        registry: &SessionRegistry,
+        data_handle_id: DataHandleId,
+        previous_block_id: Option<BlockId>,
+        desired_len: u64,
+        index: u32,
+        file_offset: u64,
+        block_stamp: u64,
+    ) -> WriteTarget {
+        let mut target = write_target(data_handle_id, index);
+        target.file_offset = file_offset;
+        target.effective_len = desired_len;
+        target.block_stamp = block_stamp;
+        registry
+            .install_issued_target(data_handle_id, 7, previous_block_id, Some(desired_len), target)
+            .unwrap()
     }
 
     #[test]
@@ -122,16 +135,49 @@ mod tests {
         let data_handle_id = DataHandleId::new(11);
         registry.create_session(create_input(data_handle_id)).unwrap();
 
-        let first = registry.allocate_target(data_handle_id, 7, None, Some(32)).unwrap();
-        let replay = registry.allocate_target(data_handle_id, 7, None, Some(32)).unwrap();
-        assert_eq!(replay, first);
-        assert_eq!(registry.get_session(data_handle_id).unwrap().next_target_index, 1);
-
-        let second = registry
-            .allocate_target(data_handle_id, 7, Some(first.block_id), Some(64))
+        assert!(registry
+            .lookup_issued_target(data_handle_id, 7, None, Some(32))
+            .unwrap()
+            .is_none());
+        let first = issue_target(&registry, data_handle_id, None, 32, 0, 0, 1);
+        let replay = registry
+            .lookup_issued_target(data_handle_id, 7, None, Some(32))
+            .unwrap()
             .unwrap();
+        assert_eq!(replay, first);
+
+        let second = issue_target(&registry, data_handle_id, Some(first.block_id), 64, 1, 32, 1);
         assert_eq!(second.block_id.index, BlockIndex::new(1));
         assert_eq!(second.file_offset, 32);
+    }
+
+    #[test]
+    fn concurrent_duplicate_add_block_installs_one_target_and_returns_one_result() {
+        let registry = std::sync::Arc::new(SessionRegistry::default());
+        let data_handle_id = DataHandleId::new(15);
+        registry.create_session(create_input(data_handle_id)).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let mut joins = Vec::new();
+        for index in 0..2 {
+            let registry = std::sync::Arc::clone(&registry);
+            let barrier = std::sync::Arc::clone(&barrier);
+            joins.push(std::thread::spawn(move || {
+                let mut target = write_target(data_handle_id, index);
+                target.effective_len = 32;
+                barrier.wait();
+                registry
+                    .install_issued_target(data_handle_id, 7, None, Some(32), target)
+                    .unwrap()
+            }));
+        }
+
+        let first = joins.remove(0).join().unwrap();
+        let second = joins.remove(0).join().unwrap();
+        assert_eq!(first, second);
+        let session = registry.get_session(data_handle_id).unwrap();
+        assert_eq!(session.issued_targets, vec![first]);
+        assert_eq!(session.issued_steps.len(), 1);
     }
 
     #[test]
@@ -139,11 +185,15 @@ mod tests {
         let registry = SessionRegistry::default();
         let data_handle_id = DataHandleId::new(12);
         registry.create_session(create_input(data_handle_id)).unwrap();
-        registry.allocate_target(data_handle_id, 7, None, Some(32)).unwrap();
+        issue_target(&registry, data_handle_id, None, 32, 0, 0, 1);
 
-        assert!(registry.allocate_target(data_handle_id, 7, None, Some(64)).is_err());
-        assert!(registry.allocate_target(data_handle_id, 6, None, Some(32)).is_err());
-        assert_eq!(registry.get_session(data_handle_id).unwrap().next_target_index, 1);
+        assert!(registry
+            .lookup_issued_target(data_handle_id, 7, None, Some(64))
+            .is_err());
+        assert!(registry
+            .lookup_issued_target(data_handle_id, 6, None, Some(32))
+            .is_err());
+        assert_eq!(registry.get_session(data_handle_id).unwrap().issued_targets.len(), 1);
     }
 
     #[test]
@@ -154,10 +204,10 @@ mod tests {
         let unknown = BlockId::new(data_handle_id, BlockIndex::new(99));
 
         assert!(registry
-            .allocate_target(data_handle_id, 7, Some(unknown), Some(32))
+            .lookup_issued_target(data_handle_id, 7, Some(unknown), Some(32))
             .unwrap_err()
             .contains("predecessor mismatch"));
-        assert_eq!(registry.get_session(data_handle_id).unwrap().next_target_index, 0);
+        assert!(registry.get_session(data_handle_id).unwrap().issued_targets.is_empty());
     }
 
     #[test]
@@ -166,17 +216,18 @@ mod tests {
         let data_handle_id = DataHandleId::new(14);
         registry.create_session(create_input(data_handle_id)).unwrap();
 
-        let first = registry.allocate_target(data_handle_id, 7, None, Some(32)).unwrap();
+        let first = issue_target(&registry, data_handle_id, None, 32, 0, 0, 1);
         assert_eq!(first.block_stamp, 1);
         registry
             .update_published_state(data_handle_id, 7, 1, 32)
             .expect("advance published state");
 
-        let replay = registry.allocate_target(data_handle_id, 7, None, Some(32)).unwrap();
-        assert_eq!(replay, first);
-        let second = registry
-            .allocate_target(data_handle_id, 7, Some(first.block_id), Some(32))
+        let replay = registry
+            .lookup_issued_target(data_handle_id, 7, None, Some(32))
+            .unwrap()
             .unwrap();
+        assert_eq!(replay, first);
+        let second = issue_target(&registry, data_handle_id, Some(first.block_id), 32, 1, 32, 2);
         assert_eq!(second.block_stamp, 2);
         assert_eq!(second.file_offset, 32);
     }
@@ -195,12 +246,10 @@ pub struct CreateSessionInput {
     pub open_client_id: ClientId,
     pub layout: FileLayout,
     pub expires_at_ms: u64,
-    pub write_targets: Vec<WriteTarget>,
 }
 
 #[derive(Clone, Debug)]
 struct IssuedTarget {
-    previous_block_id: Option<BlockId>,
     desired_len: Option<u64>,
     target: WriteTarget,
 }
@@ -230,38 +279,33 @@ impl SessionRegistry {
             open_client_id: input.open_client_id,
             layout: input.layout,
             expires_at_ms: input.expires_at_ms,
-            write_targets: input.write_targets,
             issued_targets: Vec::new(),
-            issued_steps: Vec::new(),
-            next_target_index: 0,
+            issued_steps: HashMap::new(),
         };
 
         sessions.insert(input.data_handle_id, session.clone());
         Ok(session)
     }
 
-    /// Allocate or replay one predecessor-addressed AddBlock step.
-    pub fn allocate_target(
+    /// Return an issued predecessor-addressed AddBlock step, or validate that
+    /// the caller may allocate the next step.
+    pub fn lookup_issued_target(
         &self,
         data_handle_id: DataHandleId,
         lease_epoch: u64,
         previous_block_id: Option<BlockId>,
         desired_len: Option<u64>,
-    ) -> Result<WriteTarget, String> {
-        let mut sessions = self.sessions.write();
+    ) -> Result<Option<WriteTarget>, String> {
+        let sessions = self.sessions.read();
         let session = sessions
-            .get_mut(&data_handle_id)
+            .get(&data_handle_id)
             .ok_or_else(|| "write session not found".to_string())?;
         if session.lease_epoch != lease_epoch {
             return Err("write session lease epoch mismatch".to_string());
         }
-        if let Some(step) = session
-            .issued_steps
-            .iter()
-            .find(|step| step.previous_block_id == previous_block_id)
-        {
+        if let Some(step) = session.issued_steps.get(&previous_block_id) {
             if step.desired_len == desired_len {
-                return Ok(step.target.clone());
+                return Ok(Some(step.target.clone()));
             }
             return Err("AddBlock predecessor reused with a different desired_len".to_string());
         }
@@ -272,42 +316,95 @@ impl SessionRegistry {
                 "AddBlock predecessor mismatch: expected {expected_previous:?}, got {previous_block_id:?}"
             ));
         }
+        Ok(None)
+    }
 
-        let mut target = session
-            .write_targets
-            .get(session.next_target_index)
-            .cloned()
-            .ok_or_else(|| "no write target available".to_string())?;
+    /// Install one newly allocated target, or return the winner of a concurrent
+    /// request for the same predecessor.
+    pub fn install_issued_target(
+        &self,
+        data_handle_id: DataHandleId,
+        lease_epoch: u64,
+        previous_block_id: Option<BlockId>,
+        desired_len: Option<u64>,
+        target: WriteTarget,
+    ) -> Result<WriteTarget, String> {
+        let mut sessions = self.sessions.write();
+        let session = sessions
+            .get_mut(&data_handle_id)
+            .ok_or_else(|| "write session not found".to_string())?;
+        if session.lease_epoch != lease_epoch {
+            return Err("write session lease epoch mismatch".to_string());
+        }
+        if let Some(step) = session.issued_steps.get(&previous_block_id) {
+            if step.desired_len == desired_len {
+                return Ok(step.target.clone());
+            }
+            return Err("AddBlock predecessor reused with a different desired_len".to_string());
+        }
+        let expected_previous = session.issued_targets.last().map(|issued| issued.block_id);
+        if previous_block_id != expected_previous {
+            return Err(format!(
+                "AddBlock predecessor mismatch: expected {expected_previous:?}, got {previous_block_id:?}"
+            ));
+        }
+        if target.block_id.data_handle_id != data_handle_id {
+            return Err("write target data handle mismatch".to_string());
+        }
+        if target.fencing_token.block_id != target.block_id
+            || target.fencing_token.owner != session.open_client_id
+            || target.fencing_token.epoch != lease_epoch
+        {
+            return Err("write target fencing token mismatch".to_string());
+        }
+        let expected_effective_len = desired_len.unwrap_or(target.block_size);
+        if target.effective_len != expected_effective_len {
+            return Err(format!(
+                "write target effective length mismatch: expected {expected_effective_len}, got {}",
+                target.effective_len
+            ));
+        }
         let next_file_offset = session
             .issued_targets
             .last()
             .and_then(|issued| issued.file_offset.checked_add(issued.effective_len))
             .unwrap_or(session.base_size);
-        target.file_offset = next_file_offset;
-        if let Some(len) = desired_len {
-            target.effective_len = len.min(target.effective_len).max(1);
+        if target.file_offset != next_file_offset {
+            return Err(format!(
+                "write target file offset changed: expected {next_file_offset}, got {}",
+                target.file_offset
+            ));
         }
-        if BlockShape::new(
+        let target_shape = BlockShape::new(
             target.block_format_id,
             target.block_size,
             target.chunk_size,
             target.effective_len,
         )
-        .is_err()
-        {
-            return Err("invalid write target shape".to_string());
+        .map_err(|error| format!("invalid write target shape: {error}"))?;
+        let expected_shape = BlockShape::for_effective_len(&session.layout, target.effective_len)
+            .map_err(|error| format!("invalid session layout shape: {error}"))?;
+        if target_shape != expected_shape {
+            return Err("write target shape does not match the session layout".to_string());
         }
-        target.block_stamp = session
+        let expected_block_stamp = session
             .content_revision
             .checked_add(1)
             .ok_or_else(|| "content revision overflow".to_string())?;
-        session.next_target_index += 1;
+        if target.block_stamp != expected_block_stamp {
+            return Err(format!(
+                "write target block stamp changed: expected {expected_block_stamp}, got {}",
+                target.block_stamp
+            ));
+        }
         session.issued_targets.push(target.clone());
-        session.issued_steps.push(IssuedTarget {
+        session.issued_steps.insert(
             previous_block_id,
-            desired_len,
-            target: target.clone(),
-        });
+            IssuedTarget {
+                desired_len,
+                target: target.clone(),
+            },
+        );
         Ok(target)
     }
 

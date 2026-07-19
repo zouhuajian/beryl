@@ -193,7 +193,8 @@ pub struct Extent {
 pub enum InodeData {
     /// File inode data.
     /// Includes extents for the committed block map, content_revision for visible
-    /// file state, and lease_epoch for lease management.
+    /// file state, lease_epoch for lease management, and the next durable block
+    /// ordinal reserved for this data handle.
     File {
         /// File extents (block map).
         /// Supports append-only write path.
@@ -208,6 +209,9 @@ pub enum InodeData {
         /// Persisted in inode for lease management.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         lease_epoch: Option<u64>,
+        /// Next block ordinal to allocate for this file's data handle.
+        /// This counter is monotonic and is not derived from visible extents.
+        next_block_index: u64,
     },
     /// Directory inode data.
     /// Payload intentionally empty; entries live in dentry/direntry index.
@@ -272,6 +276,7 @@ impl Inode {
                 extents: Vec::new(),
                 content_revision: None,
                 lease_epoch: None,
+                next_block_index: 0,
             },
             InodeKind::Dir => InodeData::Dir,
             InodeKind::Symlink => InodeData::Symlink { target: None },

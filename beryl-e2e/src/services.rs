@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use std::{path::Path, process::Stdio};
 
 use beryl_metadata::runtime::MetadataAuthority;
 use beryl_metadata::service::MetadataFileSystemServiceImpl;
@@ -14,6 +15,7 @@ use beryl_worker::control::RegistrationSet;
 use beryl_worker::net::server::grpc::WorkerDataServiceImpl;
 use beryl_worker::WorkerCore;
 use tokio::net::TcpListener;
+use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -63,6 +65,39 @@ impl MetadataServiceInstance {
 
     pub fn abort(&mut self) {
         self.handle.abort();
+        self.authority.take();
+    }
+}
+
+pub struct MetadataProcessInstance {
+    child: Child,
+}
+
+impl MetadataProcessInstance {
+    pub fn start(executable: &Path, config_path: &Path) -> TestResult<Self> {
+        let mut command = Command::new(executable);
+        command
+            .arg(config_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        Ok(Self {
+            child: command.spawn()?,
+        })
+    }
+
+    pub async fn kill(mut self) -> TestResult<()> {
+        self.child.kill().await?;
+        let status = self.child.wait().await?;
+        if status.success() {
+            return Err("metadata process exited successfully instead of being killed".into());
+        }
+        Ok(())
+    }
+
+    pub fn abort(&mut self) {
+        let _ = self.child.start_kill();
     }
 }
 

@@ -16,10 +16,10 @@ use crate::raft::FsCommandResult;
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
 use beryl_common::header::CallerContextFields;
 use beryl_types::fs::{FsErrorCode, InodeId};
-use beryl_types::ids::{BlockId, BlockIndex, DataHandleId};
+use beryl_types::ids::{BlockId, DataHandleId};
 use beryl_types::layout::FileLayout;
 use beryl_types::lease::FencingToken;
-use beryl_types::{BlockShape, Tier, WorkerEndpointInfo, WriteTarget};
+use beryl_types::{BlockShape, WriteTarget};
 
 #[derive(Clone, Debug)]
 pub(crate) struct OpenWriteOutput {
@@ -216,15 +216,6 @@ impl MetadataFileSystem {
     }
 }
 
-struct PlannedWriteTarget {
-    block_id: BlockId,
-    file_offset: u64,
-    block_size: u64,
-    effective_len: u64,
-    worker_endpoints: Vec<WorkerEndpointInfo>,
-    tier: Tier,
-}
-
 impl MetadataFileSystem {
     async fn abort_session(
         &self,
@@ -390,7 +381,6 @@ impl MetadataFileSystem {
         &self,
         ctx: &RequestContext,
         inode_id: InodeId,
-        desired_len: Option<u64>,
         mode: crate::inode_lease::WriteMode,
         freshness: Freshness,
     ) -> FsResult<OpenWriteOutput> {
@@ -454,11 +444,10 @@ impl MetadataFileSystem {
         };
 
         let base_size = match mode {
-            crate::inode_lease::WriteMode::Append => inode.attrs.size,
-            crate::inode_lease::WriteMode::Write => 0,
+            WriteMode::Append => inode.attrs.size,
+            WriteMode::Write => 0,
         };
 
-        let desired_len = desired_len.unwrap_or(4 * 1024 * 1024);
         let layout = match self.read_layout(inode_id) {
             Ok(layout) => layout,
             Err(err) => {
@@ -468,129 +457,10 @@ impl MetadataFileSystem {
         if let Err(err) = validate_active_write_layout(&layout) {
             return self.failure_from_error(ctx, err, group_name, mount_epoch);
         }
-        let block_size = u64::from(layout.block_size);
-        let chunk_size = layout.chunk_size;
         let current_content_revision = match &inode.data {
             beryl_types::fs::InodeData::File { content_revision, .. } => *content_revision,
             _ => None,
         };
-        let block_stamp = match current_content_revision.unwrap_or(0).checked_add(1) {
-            Some(block_stamp) => block_stamp,
-            None => {
-                return self.failure_from_error(
-                    ctx,
-                    MetadataError::InvalidArgument(format!("content_revision overflow for inode {}", inode_id)),
-                    group_name,
-                    mount_epoch,
-                );
-            }
-        };
-        let num_blocks = desired_len.div_ceil(block_size).clamp(1, 10);
-        let start_index = match &inode.data {
-            beryl_types::fs::InodeData::File { extents, .. } => extents
-                .iter()
-                .map(|extent| extent.block_id.index.as_raw())
-                .max()
-                .map(|index| index + 1)
-                .unwrap_or(0),
-            _ => 0,
-        };
-
-        let worker_manager = match self.worker_manager.as_ref() {
-            Some(worker_manager) => worker_manager,
-            None => {
-                return self.failure_from_error(
-                    ctx,
-                    MetadataError::ServiceUnavailable("Worker manager not available".to_string()),
-                    group_name,
-                    mount_epoch,
-                );
-            }
-        };
-        let placement_group_name =
-            self.require_worker_lookup_group(ctx, group_name.clone(), mount_epoch, route_epoch, "OpenWrite")?;
-
-        let placement_views = worker_manager.collect_worker_placement_views(&placement_group_name);
-        let caller = ctx
-            .caller
-            .caller_context
-            .as_ref()
-            .map(CallerContextFields::from_caller_context);
-        let planner = PlacementPlanner;
-        let mut planned_targets = Vec::with_capacity(num_blocks as usize);
-        for i in 0..num_blocks {
-            let block_index = BlockIndex::new(start_index + i as u32);
-            let block_id = BlockId::new(data_handle_id, block_index);
-            let file_offset = base_size + i * block_size;
-            let effective_len = desired_len.saturating_sub(i * block_size).min(block_size).max(1);
-            let placement_req = PlacementRequest {
-                group_name: placement_group_name.clone(),
-                op: PlacementOp::Write,
-                block_id,
-                block_stamp: Some(block_stamp),
-                layout,
-                caller: caller.clone(),
-                existing: Vec::new(),
-                exclude_workers: Vec::new(),
-                target_replicas: layout.replication,
-            };
-            let placement = planner.plan(&placement_req, &placement_views);
-            if placement.status != PlacementStatus::Ok {
-                return self.failure_from_error(
-                    ctx,
-                    MetadataError::ServiceUnavailable(format!(
-                        "Failed to select write placement: {}",
-                        placement.failure_message(&placement_req)
-                    )),
-                    group_name,
-                    mount_epoch,
-                );
-            }
-
-            let mut worker_endpoints = Vec::with_capacity(placement.workers.len());
-            let mut selected_tier = None;
-            for worker in placement.workers {
-                selected_tier = selected_tier.or(worker.tier);
-                let endpoint = match worker_endpoint_from_parts(
-                    worker.worker_id,
-                    worker.endpoint,
-                    worker.worker_net_protocol,
-                    worker.worker_run_id,
-                ) {
-                    Ok(endpoint) => endpoint,
-                    Err(err) => {
-                        return self.failure_from_error(ctx, err, group_name, mount_epoch);
-                    }
-                };
-                worker_endpoints.push(endpoint);
-            }
-            let Some(tier) = selected_tier else {
-                return self.failure_from_error(
-                    ctx,
-                    MetadataError::ServiceUnavailable("selected write placement is missing storage tier".to_string()),
-                    group_name,
-                    mount_epoch,
-                );
-            };
-
-            if worker_endpoints.is_empty() {
-                return self.failure_from_error(
-                    ctx,
-                    MetadataError::ServiceUnavailable("selected placement has no live worker endpoints".to_string()),
-                    group_name,
-                    mount_epoch,
-                );
-            }
-
-            planned_targets.push(PlannedWriteTarget {
-                block_id,
-                file_offset,
-                block_size,
-                effective_len,
-                worker_endpoints,
-                tier,
-            });
-        }
 
         let current_lease_epoch = match &inode.data {
             beryl_types::fs::InodeData::File { lease_epoch, .. } => *lease_epoch,
@@ -651,66 +521,6 @@ impl MetadataFileSystem {
             }
         }
 
-        let mut write_targets = Vec::with_capacity(planned_targets.len());
-        for planned in planned_targets {
-            let block_id = planned.block_id;
-            let target_token = FencingToken {
-                block_id,
-                owner: caller_ctx.client.client_id,
-                epoch: lease_epoch,
-            };
-            let target = WriteTarget {
-                block_id,
-                file_offset: planned.file_offset,
-                block_size: planned.block_size,
-                effective_len: planned.effective_len,
-                worker_endpoints: planned.worker_endpoints,
-                fencing_token: target_token,
-                block_stamp,
-                chunk_size,
-                block_format_id: layout.block_format_id,
-                tier: planned.tier,
-            };
-            let target_shape = match BlockShape::new(
-                target.block_format_id,
-                target.block_size,
-                target.chunk_size,
-                target.effective_len,
-            ) {
-                Ok(shape) => shape,
-                Err(err) => {
-                    return self.failure_from_error(
-                        ctx,
-                        MetadataError::InvalidArgument(format!("invalid write target shape: {err}")),
-                        group_name,
-                        mount_epoch,
-                    );
-                }
-            };
-            let expected_shape = match BlockShape::for_effective_len(&layout, target.effective_len) {
-                Ok(shape) => shape,
-                Err(err) => {
-                    return self.failure_from_error(
-                        ctx,
-                        MetadataError::InvalidArgument(format!("invalid write target shape: {err}")),
-                        group_name,
-                        mount_epoch,
-                    );
-                }
-            };
-            if target_shape != expected_shape {
-                return self.failure_from_error(
-                    ctx,
-                    MetadataError::InvalidArgument(
-                        "write target shape does not match persisted FileLayout".to_string(),
-                    ),
-                    group_name,
-                    mount_epoch,
-                );
-            }
-            write_targets.push(target);
-        }
-
         self.session_registry
             .remove_inactive_for_inode(inode_id, self.lease_manager.as_ref());
         let session = match self
@@ -726,7 +536,6 @@ impl MetadataFileSystem {
                 open_client_id: caller_ctx.client.client_id,
                 layout,
                 expires_at_ms,
-                write_targets: write_targets.clone(),
             }) {
             Ok(result) => result,
             Err(message) => {
@@ -811,23 +620,200 @@ impl MetadataFileSystem {
             );
         }
 
-        let target =
-            match self
-                .session_registry
-                .allocate_target(data_handle_id, lease_epoch, previous_block_id, desired_len)
-            {
-                Ok(target) => target,
-                Err(message) => {
-                    return self.failure_from_error(
-                        ctx,
-                        MetadataError::InvalidArgument(format!(
-                            "AddBlock rejected for data_handle_id={data_handle_id}: {message}"
-                        )),
-                        group_name,
-                        mount_epoch,
-                    );
-                }
+        match self
+            .session_registry
+            .lookup_issued_target(data_handle_id, lease_epoch, previous_block_id, desired_len)
+        {
+            Ok(Some(target)) => {
+                return self.success_with_route_epoch(
+                    ctx,
+                    AddBlockOutput { target },
+                    group_name,
+                    mount_epoch,
+                    route_epoch,
+                )
+            }
+            Ok(None) => {}
+            Err(message) => {
+                return self.failure_from_error(
+                    ctx,
+                    MetadataError::InvalidArgument(format!(
+                        "AddBlock rejected for data_handle_id={data_handle_id}: {message}"
+                    )),
+                    group_name,
+                    mount_epoch,
+                )
+            }
+        }
+
+        let effective_len = desired_len.unwrap_or(u64::from(session.layout.block_size));
+        if let Err(error) = BlockShape::for_effective_len(&session.layout, effective_len) {
+            return self.failure_from_error(
+                ctx,
+                MetadataError::InvalidArgument(format!("invalid AddBlock desired_len: {error}")),
+                group_name,
+                mount_epoch,
+            );
+        }
+        let file_offset = match session
+            .issued_targets
+            .last()
+            .map(|target| target.file_offset.checked_add(target.effective_len))
+            .unwrap_or(Some(session.base_size))
+        {
+            Some(file_offset) => file_offset,
+            None => {
+                return self.failure_from_error(
+                    ctx,
+                    MetadataError::InvalidArgument("write target file offset overflow".to_string()),
+                    group_name,
+                    mount_epoch,
+                )
+            }
+        };
+        let block_stamp = match session.content_revision.checked_add(1) {
+            Some(block_stamp) => block_stamp,
+            None => {
+                return self.failure_from_error(
+                    ctx,
+                    MetadataError::InvalidArgument("content revision overflow".to_string()),
+                    group_name,
+                    mount_epoch,
+                )
+            }
+        };
+        let block_id = match self
+            .propose_block_allocation(crate::raft::Command::AllocateBlock {
+                inode_id: session.inode_id,
+                data_handle_id,
+                lease_epoch,
+            })
+            .await
+        {
+            Ok(block_id) => block_id,
+            Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
+        };
+
+        let worker_manager = match self.worker_manager.as_ref() {
+            Some(worker_manager) => worker_manager,
+            None => {
+                return self.failure_from_error(
+                    ctx,
+                    MetadataError::ServiceUnavailable("Worker manager not available".to_string()),
+                    group_name,
+                    mount_epoch,
+                )
+            }
+        };
+        let placement_group_name =
+            self.require_worker_lookup_group(ctx, group_name.clone(), mount_epoch, route_epoch, "AddBlock")?;
+        let placement_views = worker_manager.collect_worker_placement_views(&placement_group_name);
+        let placement_request = PlacementRequest {
+            group_name: placement_group_name,
+            op: PlacementOp::Write,
+            block_id,
+            block_stamp: Some(block_stamp),
+            layout: session.layout,
+            caller: ctx
+                .caller
+                .caller_context
+                .as_ref()
+                .map(CallerContextFields::from_caller_context),
+            existing: Vec::new(),
+            exclude_workers: Vec::new(),
+            target_replicas: session.layout.replication,
+        };
+        let placement = PlacementPlanner.plan(&placement_request, &placement_views);
+        if placement.status != PlacementStatus::Ok {
+            return self.failure_from_error(
+                ctx,
+                MetadataError::ServiceUnavailable(format!(
+                    "Failed to select write placement: {}",
+                    placement.failure_message(&placement_request)
+                )),
+                group_name,
+                mount_epoch,
+            );
+        }
+        let mut worker_endpoints = Vec::with_capacity(placement.workers.len());
+        let mut selected_tier = None;
+        for worker in placement.workers {
+            selected_tier = selected_tier.or(worker.tier);
+            let endpoint = match worker_endpoint_from_parts(
+                worker.worker_id,
+                worker.endpoint,
+                worker.worker_net_protocol,
+                worker.worker_run_id,
+            ) {
+                Ok(endpoint) => endpoint,
+                Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
             };
+            worker_endpoints.push(endpoint);
+        }
+        let Some(tier) = selected_tier else {
+            return self.failure_from_error(
+                ctx,
+                MetadataError::ServiceUnavailable("selected write placement is missing storage tier".to_string()),
+                group_name,
+                mount_epoch,
+            );
+        };
+        if worker_endpoints.is_empty() {
+            return self.failure_from_error(
+                ctx,
+                MetadataError::ServiceUnavailable("selected placement has no live worker endpoints".to_string()),
+                group_name,
+                mount_epoch,
+            );
+        }
+        let target = WriteTarget {
+            block_id,
+            file_offset,
+            block_size: u64::from(session.layout.block_size),
+            effective_len,
+            worker_endpoints,
+            fencing_token: FencingToken {
+                block_id,
+                owner: session.open_client_id,
+                epoch: lease_epoch,
+            },
+            block_stamp,
+            chunk_size: session.layout.chunk_size,
+            block_format_id: session.layout.block_format_id,
+            tier,
+        };
+        if self
+            .lease_manager
+            .validate_lease(session.inode_id, lease_epoch)
+            .is_err()
+        {
+            return self.session_terminal_failure(
+                ctx,
+                ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
+                format!("lease validation rejected for data_handle_id={data_handle_id}; reopen before AddBlock"),
+                group_name,
+                mount_epoch,
+            );
+        }
+        let target = match self.session_registry.install_issued_target(
+            data_handle_id,
+            lease_epoch,
+            previous_block_id,
+            desired_len,
+            target,
+        ) {
+            Ok(target) => target,
+            Err(message) => {
+                return self.failure_from_error(
+                    ctx,
+                    MetadataError::InvalidArgument(format!(
+                        "AddBlock rejected for data_handle_id={data_handle_id}: {message}"
+                    )),
+                    group_name,
+                    mount_epoch,
+                )
+            }
+        };
         self.success_with_route_epoch(ctx, AddBlockOutput { target }, group_name, mount_epoch, route_epoch)
     }
 }
@@ -846,7 +832,6 @@ fn open_write_output(session: &crate::session_registry::WriteSession) -> OpenWri
 
 pub(crate) struct OpenWriteArgs {
     pub(crate) path: String,
-    pub(crate) desired_len: Option<u64>,
     pub(crate) mode: WriteMode,
     pub(crate) freshness: Freshness,
 }
@@ -910,8 +895,7 @@ impl MetadataFileSystem {
         if let Err(failure) = self.admission.check_data_write(ctx, resolved.mount_ctx.mount_id).await {
             return self.failure_from_admission(failure);
         }
-        self.open_write_inode(ctx, inode_id, args.desired_len, args.mode, args.freshness)
-            .await
+        self.open_write_inode(ctx, inode_id, args.mode, args.freshness).await
     }
 }
 
@@ -921,7 +905,7 @@ mod open_write_tests {
     use crate::service::filesystem::test_support::*;
 
     #[tokio::test]
-    async fn open_write_cleans_lease_on_error() {
+    async fn open_write_does_not_require_worker_placement() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_id = MountId::new(50);
@@ -933,23 +917,25 @@ mod open_write_tests {
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
-        let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name("g7"))
-            .with_storage(storage)
-            .build();
+        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name("g7"));
+        let mount_table = builder.mount_table();
+        let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
+        let filesystem = builder.with_storage(storage).with_raft_node(raft_node).build();
 
-        let failure = filesystem
+        let success = filesystem
             .open_write_inode(
                 &request_context(),
                 inode_id,
-                Some(4096),
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
             .await
-            .expect_err("missing worker manager should fail open_write");
+            .expect("OpenWrite must not require a worker manager");
 
-        assert!(failure.error.message.contains("Worker manager not available"));
-        assert!(filesystem.lease_manager().get_active_lease(inode_id).is_none());
+        let session = filesystem
+            .write_session_for_handle(success.payload.data_handle_id)
+            .expect("write session");
+        assert!(session.issued_targets.is_empty());
     }
 
     #[tokio::test]
@@ -979,7 +965,6 @@ mod open_write_tests {
             .open_write_inode(
                 &request_context(),
                 inode_id,
-                Some(4096),
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -990,14 +975,7 @@ mod open_write_tests {
         let session = filesystem
             .write_session_for_handle(success.payload.data_handle_id)
             .expect("session should be stored");
-        assert!(!session.write_targets.is_empty());
-        for target in &session.write_targets {
-            assert_eq!(target.block_id.data_handle_id, data_handle_id);
-            assert_eq!(target.block_size, 4096);
-            assert_eq!(target.effective_len, 4096);
-            assert_eq!(target.chunk_size, 4096);
-            assert_eq!(target.block_format_id, beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE);
-        }
+        assert!(session.issued_targets.is_empty());
         assert_eq!(success.payload.data_handle_id, data_handle_id);
         assert_eq!(session.data_handle_id, data_handle_id);
 
@@ -1013,7 +991,6 @@ mod open_write_tests {
             .open_write_inode(
                 &request_context(),
                 inode_id,
-                Some(4096),
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -1052,7 +1029,6 @@ mod open_write_tests {
             .open_write_inode(
                 &request_context(),
                 inode_id,
-                Some(4096),
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -1085,7 +1061,6 @@ mod open_write_tests {
             .open_write_inode(
                 &request_context(),
                 inode_id,
-                Some(4096),
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -1100,5 +1075,144 @@ mod open_write_tests {
             "unexpected error: {}",
             failure.error.message
         );
+    }
+
+    #[tokio::test]
+    async fn add_block_placement_failure_leaves_a_durable_gap() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_id = MountId::new(55);
+        let group_name_value = group_name("g10");
+        let inode_id = InodeId::new(550);
+        let data_handle_id = DataHandleId::new(9550);
+        storage
+            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
+        let mount_table = builder.mount_table();
+        let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
+        let filesystem = builder
+            .with_storage(Arc::clone(&storage))
+            .with_raft_node(raft_node)
+            .with_worker_manager(Arc::clone(&worker_manager))
+            .build();
+        let opened = filesystem
+            .open_write_inode(
+                &request_context(),
+                inode_id,
+                crate::inode_lease::WriteMode::Write,
+                Freshness::default(),
+            )
+            .await
+            .expect("OpenWrite");
+
+        filesystem
+            .add_block_session(
+                &request_context(),
+                data_handle_id,
+                opened.payload.lease_epoch,
+                Some(4096),
+                None,
+                Freshness::default(),
+            )
+            .await
+            .expect_err("placement without a live worker must fail after durable allocation");
+        let first_next_index = storage.get_inode(inode_id).unwrap().and_then(|inode| match inode.data {
+            beryl_types::fs::InodeData::File { next_block_index, .. } => Some(next_block_index),
+            _ => None,
+        });
+        assert_eq!(first_next_index, Some(1));
+
+        let worker_id = WorkerId::new(1);
+        worker_manager
+            .register_worker(&group_name_value, worker_id, "127.0.0.1:9001".to_string(), 1, None)
+            .unwrap();
+        record_worker_heartbeat(
+            &worker_manager,
+            &group_name_value,
+            worker_id,
+            1024 * 1024,
+            0,
+            1024 * 1024,
+            0,
+            0,
+            HealthStatus::Healthy,
+        );
+
+        let target = filesystem
+            .add_block_session(
+                &request_context(),
+                data_handle_id,
+                opened.payload.lease_epoch,
+                Some(4096),
+                None,
+                Freshness::default(),
+            )
+            .await
+            .expect("retry after placement recovery")
+            .payload
+            .target;
+        assert_eq!(target.block_id.index, BlockIndex::new(1));
+        let second_next_index = storage.get_inode(inode_id).unwrap().and_then(|inode| match inode.data {
+            beryl_types::fs::InodeData::File { next_block_index, .. } => Some(next_block_index),
+            _ => None,
+        });
+        assert_eq!(second_next_index, Some(2));
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_add_block_exposes_one_target_and_keeps_the_loser_gap() {
+        let env = write_flow_env(0).await;
+        let opened = env
+            .filesystem
+            .open_write_inode(
+                &request_context(),
+                env.inode_id,
+                crate::inode_lease::WriteMode::Write,
+                Freshness::default(),
+            )
+            .await
+            .expect("OpenWrite");
+        let first_context = request_context();
+        let second_context = request_context();
+        let first = env.filesystem.add_block_session(
+            &first_context,
+            env.data_handle_id,
+            opened.payload.lease_epoch,
+            Some(4096),
+            None,
+            Freshness::default(),
+        );
+        let second = env.filesystem.add_block_session(
+            &second_context,
+            env.data_handle_id,
+            opened.payload.lease_epoch,
+            Some(4096),
+            None,
+            Freshness::default(),
+        );
+        let (first, second) = tokio::join!(first, second);
+        let first = first.expect("first AddBlock").payload.target;
+        let second = second.expect("second AddBlock").payload.target;
+
+        assert_eq!(first, second);
+        let session = env
+            .filesystem
+            .write_session_for_handle(env.data_handle_id)
+            .expect("active session");
+        assert_eq!(session.issued_targets, vec![first]);
+        let next_block_index = env
+            .storage
+            .get_inode(env.inode_id)
+            .unwrap()
+            .and_then(|inode| match inode.data {
+                beryl_types::fs::InodeData::File { next_block_index, .. } => Some(next_block_index),
+                _ => None,
+            });
+        assert_eq!(next_block_index, Some(2));
     }
 }

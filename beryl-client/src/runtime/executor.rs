@@ -12,7 +12,7 @@ use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
 use beryl_types::{BlockId, CommittedBlock, DataHandleId, FileLayout};
 
 use crate::api::handle::{ReadHandle, WriteHandle};
-use crate::api::options::{DEFAULT_BLOCK_SIZE, DEFAULT_REPLICATION, MAX_PREALLOCATED_WRITE_BLOCKS};
+use crate::api::options::DEFAULT_REPLICATION;
 use crate::api::path::NamespacePathBuf;
 use crate::api::{CreateOptions, DirectoryEntry, DirectoryListing, FileStatus, ListOptions};
 use crate::config::{ClientConfig, RetryConfig};
@@ -317,7 +317,6 @@ impl MetadataExecutor {
                 header: None,
                 path: path.to_string(),
                 mode: mode as i32,
-                desired_len: Some(default_write_preallocation_len()),
             },
             |gateway, ctx, req| async move {
                 match gateway.open_write(ctx, req).await {
@@ -761,10 +760,6 @@ fn timeout_error(target_plane: &str, operation: &str) -> ClientError {
     ClientError::from(tonic::Status::deadline_exceeded(format!(
         "{target_plane} {operation} exceeded the public operation deadline"
     )))
-}
-
-fn default_write_preallocation_len() -> u64 {
-    u64::from(DEFAULT_BLOCK_SIZE) * MAX_PREALLOCATED_WRITE_BLOCKS
 }
 
 fn default_file_attrs() -> beryl_proto::metadata::FileAttrsProto {

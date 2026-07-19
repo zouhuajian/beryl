@@ -985,6 +985,7 @@ mod tests {
             }],
             content_revision: Some(1),
             lease_epoch: None,
+            next_block_index: 1,
         };
         storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
@@ -1059,6 +1060,7 @@ mod tests {
             }],
             content_revision: Some(1),
             lease_epoch: None,
+            next_block_index: 1,
         };
         storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
@@ -1130,6 +1132,7 @@ mod tests {
             }],
             content_revision: Some(1),
             lease_epoch: None,
+            next_block_index: 1,
         };
         storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
@@ -1202,6 +1205,7 @@ mod tests {
             }],
             content_revision: Some(1),
             lease_epoch: None,
+            next_block_index: 1,
         };
         storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
@@ -1280,6 +1284,7 @@ mod tests {
             }],
             content_revision: Some(1),
             lease_epoch: None,
+            next_block_index: 1,
         };
         storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
@@ -1404,6 +1409,7 @@ mod tests {
             }],
             content_revision: Some(1),
             lease_epoch: None,
+            next_block_index: 1,
         };
         storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
@@ -1492,6 +1498,7 @@ mod tests {
             }],
             content_revision: Some(1),
             lease_epoch: None,
+            next_block_index: 1,
         };
         storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
@@ -1537,6 +1544,7 @@ mod tests {
             }],
             content_revision: Some(1),
             lease_epoch: None,
+            next_block_index: 1,
         };
         storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
@@ -1583,6 +1591,7 @@ mod tests {
             }],
             content_revision: Some(1),
             lease_epoch: Some(1),
+            next_block_index: 1,
         };
         storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
@@ -1889,6 +1898,7 @@ mod tests {
             }],
             content_revision: Some(4),
             lease_epoch: Some(4),
+            next_block_index: 1,
         };
         let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name("g23"))
             .with_storage(Arc::clone(&storage))
@@ -1936,6 +1946,7 @@ mod tests {
                 .collect(),
             content_revision: Some(5),
             lease_epoch: Some(5),
+            next_block_index: 3,
         };
         let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name("g24"))
             .with_storage(Arc::clone(&storage))
@@ -2004,7 +2015,6 @@ mod tests {
             .open_write_inode(
                 &request_context(),
                 env.inode_id,
-                Some(64),
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -2069,7 +2079,6 @@ mod tests {
             .open_write_inode(
                 &request_context(),
                 env.inode_id,
-                Some(64),
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )

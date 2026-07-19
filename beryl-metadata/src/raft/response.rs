@@ -5,7 +5,7 @@
 
 use crate::error::MetadataError;
 use beryl_types::fs::{FileAttrs, FsErrorCode, InodeId};
-use beryl_types::ids::{DataHandleId, WorkerId};
+use beryl_types::ids::{BlockId, DataHandleId, WorkerId};
 use beryl_types::layout::FileLayout;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -19,6 +19,8 @@ pub(crate) enum CommandResult {
     MountUpserted(crate::mount::MountEntry),
     /// Durable worker descriptor accepted by the authority state.
     WorkerUpserted(WorkerId),
+    /// Durable block ordinal allocated for one active write lease.
+    BlockAllocated(BlockId),
     /// Deterministic application rejection committed by the state machine.
     Rejected(ApplyRejection),
     /// Explicitly empty result.

@@ -21,7 +21,7 @@ use crate::raft::storage::{
 use crate::raft::types::AppMetadataRaftState;
 use crate::raft::RoutingDelta;
 use beryl_types::fs::{Extent, FileAttrs, FsErrorCode, Inode, InodeData, InodeId};
-use beryl_types::ids::{DataHandleId, MountId, WorkerId};
+use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, MountId, WorkerId};
 use beryl_types::layout::FileLayout;
 use beryl_types::GroupName;
 use std::sync::Arc;
@@ -37,7 +37,7 @@ fn meta_err_to_fs_errno(err: &MetadataError) -> Option<FsErrorCode> {
 pub(crate) mod tests {
     pub(crate) use super::*;
     pub(crate) use beryl_types::fs::{FileAttrs, Inode};
-    pub(crate) use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, MountId, WorkerId};
+    pub(crate) use beryl_types::ids::{BlockId, DataHandleId, MountId, WorkerId};
     pub(crate) use beryl_types::layout::FileLayout;
     pub(crate) use tempfile::TempDir;
 
@@ -116,9 +116,15 @@ pub(crate) mod tests {
         let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
         let mut inode = Inode::new_file(inode_id, FileAttrs::new(), parent.mount_id, data_handle_id);
         inode.attrs.size = size;
+        let next_block_index = extents
+            .iter()
+            .map(|extent| u64::from(extent.block_id.index.as_raw()) + 1)
+            .max()
+            .unwrap_or(0);
         let InodeData::File {
             extents: stored_extents,
             lease_epoch,
+            next_block_index: stored_next_block_index,
             ..
         } = &mut inode.data
         else {
@@ -126,6 +132,7 @@ pub(crate) mod tests {
         };
         *stored_extents = extents;
         *lease_epoch = Some(1);
+        *stored_next_block_index = next_block_index;
         storage.put_inode(&parent).unwrap();
         storage.put_inode(&inode).unwrap();
         storage.put_dentry(parent_inode_id, name, inode_id).unwrap();
@@ -401,6 +408,14 @@ impl AppRaftStateMachine {
             } => {
                 let result = self.apply_acquire_write_lease(inode_id, expected_lease_epoch, raft_state)?;
                 Ok(CommandResult::Fs(result))
+            }
+            Command::AllocateBlock {
+                inode_id,
+                data_handle_id,
+                lease_epoch,
+            } => {
+                let block_id = self.apply_allocate_block(inode_id, data_handle_id, lease_epoch, raft_state)?;
+                Ok(CommandResult::BlockAllocated(block_id))
             }
             Command::EndWriteLease {
                 proposed_at_ms: _,

@@ -1612,7 +1612,6 @@ mod tests {
                 ("common.RequestHeaderProto", "header", 1),
                 ("string", "path", 2),
                 ("OpenWriteModeProto", "mode", 3),
-                ("uint64", "desired_len", 4),
             ]
         );
         assert_eq!(

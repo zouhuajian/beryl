@@ -27,7 +27,7 @@ use tokio::net::TcpListener;
 
 use crate::ports::PortReservation;
 use crate::readiness;
-use crate::services::{MetadataServiceInstance, WorkerServiceInstance};
+use crate::services::{MetadataProcessInstance, MetadataServiceInstance, WorkerServiceInstance};
 use crate::temp_state::TempState;
 use crate::TestResult;
 
@@ -50,7 +50,9 @@ pub struct TestCluster {
     heartbeat: MetadataHeartbeatLoop,
     block_store: Arc<StoreDirs>,
     metadata_server: MetadataServiceInstance,
+    metadata_process: Option<MetadataProcessInstance>,
     worker_server: WorkerServiceInstance,
+    additional_workers: Vec<StartedWorkerService>,
 }
 
 impl TestCluster {
@@ -107,7 +109,9 @@ impl TestCluster {
             heartbeat: worker.heartbeat,
             block_store: worker.block_store,
             metadata_server,
+            metadata_process: None,
             worker_server: worker.worker_server,
+            additional_workers: Vec::new(),
         };
         cluster.converge_block_reports().await?;
         Ok(cluster)
@@ -122,13 +126,70 @@ impl TestCluster {
     }
 
     pub fn ready_block_count(&self) -> TestResult<usize> {
-        Ok(self.block_store.scan_group_blocks(&self.group_name)?.len())
+        let primary = self.block_store.scan_group_blocks(&self.group_name)?.len();
+        self.additional_workers.iter().try_fold(primary, |count, worker| {
+            Ok(count + worker.block_store.scan_group_blocks(&self.group_name)?.len())
+        })
     }
 
     pub fn current_worker_run_id(&self) -> Option<WorkerRunId> {
         self.registration_state
             .registration_for_group(&self.group_name)
             .map(|registration| registration.worker_run_id)
+    }
+
+    pub fn current_worker_run_ids(&self) -> Vec<WorkerRunId> {
+        let mut run_ids = self.current_worker_run_id().into_iter().collect::<Vec<_>>();
+        run_ids.extend(self.additional_workers.iter().filter_map(|worker| {
+            worker
+                .registration_state
+                .registration_for_group(&self.group_name)
+                .map(|registration| registration.worker_run_id)
+        }));
+        run_ids
+    }
+
+    pub async fn start_additional_worker(&mut self) -> TestResult<WorkerId> {
+        let worker_port = PortReservation::reserve_localhost().await?;
+        let worker_addr = worker_port.addr();
+        let worker_root = self
+            ._temp_state
+            .root()
+            .join(format!("worker-extra-{}", self.additional_workers.len() + 1));
+        let config = worker_config(worker_root, worker_addr, self.metadata_addr, self.group_name.clone())?;
+        let worker = start_worker_instance(&config, worker_port.into_listener())?;
+        if worker.worker_id == self.worker_id {
+            return Err("additional worker reused the primary worker ID".into());
+        }
+        worker.registrar.register_once().await?;
+        readiness::wait_for_worker_registration(
+            &worker.registration_state,
+            &self.worker_manager,
+            &self.group_name,
+            worker.worker_id,
+        )
+        .await?;
+        readiness::send_heartbeat(&worker.heartbeat, &worker.block_store).await?;
+        readiness::wait_for_worker_heartbeat(
+            &worker.registration_state,
+            &self.worker_manager,
+            &self.group_name,
+            worker.worker_id,
+        )
+        .await?;
+        readiness::converge_block_reports(
+            &worker.heartbeat,
+            &worker.block_report,
+            &worker.block_store,
+            &worker.registration_state,
+            &self.worker_manager,
+            &self.group_name,
+            worker.worker_id,
+        )
+        .await?;
+        let worker_id = worker.worker_id;
+        self.additional_workers.push(worker);
+        Ok(worker_id)
     }
 
     pub async fn restart_worker(&mut self) -> TestResult<()> {
@@ -170,6 +231,38 @@ impl TestCluster {
 
     pub async fn restart_metadata(&mut self) -> TestResult<()> {
         self.metadata_server.shutdown().await?;
+        self.start_metadata_from_disk().await
+    }
+
+    pub async fn start_metadata_process(&mut self, executable: &std::path::Path) -> TestResult<()> {
+        if self.metadata_process.is_some() {
+            return Err("metadata child process is already running".into());
+        }
+        self.metadata_server.shutdown().await?;
+        let metrics_port = PortReservation::reserve_localhost().await?;
+        let metrics_addr = metrics_port.addr();
+        let config_path = self.write_metadata_process_config(metrics_addr)?;
+        drop(metrics_port);
+        self.metadata_process = Some(MetadataProcessInstance::start(executable, &config_path)?);
+        if let Err(error) = readiness::wait_for_metadata_filesystem(&self.client).await {
+            if let Some(mut process) = self.metadata_process.take() {
+                process.abort();
+            }
+            return Err(error);
+        }
+        self.register_workers_with_external_metadata().await
+    }
+
+    pub async fn kill_metadata_process_and_restart(&mut self) -> TestResult<()> {
+        let process = self
+            .metadata_process
+            .take()
+            .ok_or("metadata child process is not running")?;
+        process.kill().await?;
+        self.start_metadata_from_disk().await
+    }
+
+    async fn start_metadata_from_disk(&mut self) -> TestResult<()> {
         let listener = TcpListener::bind(self.metadata_addr).await?;
         let (metadata_server, worker_manager) = start_metadata_instance(&self.metadata_config, listener).await?;
         self.metadata_server = metadata_server;
@@ -193,6 +286,25 @@ impl TestCluster {
             self.worker_id,
         )
         .await?;
+        for worker in &self.additional_workers {
+            worker.registration_state.mark_needs_register(&self.group_name);
+            worker.registrar.register_once().await?;
+            readiness::wait_for_worker_registration(
+                &worker.registration_state,
+                &self.worker_manager,
+                &self.group_name,
+                worker.worker_id,
+            )
+            .await?;
+            readiness::send_heartbeat(&worker.heartbeat, &worker.block_store).await?;
+            readiness::wait_for_worker_heartbeat(
+                &worker.registration_state,
+                &self.worker_manager,
+                &self.group_name,
+                worker.worker_id,
+            )
+            .await?;
+        }
         self.converge_block_reports().await
     }
 
@@ -206,21 +318,120 @@ impl TestCluster {
             &self.group_name,
             self.worker_id,
         )
-        .await
+        .await?;
+        for worker in &self.additional_workers {
+            readiness::converge_block_reports(
+                &worker.heartbeat,
+                &worker.block_report,
+                &worker.block_store,
+                &worker.registration_state,
+                &self.worker_manager,
+                &self.group_name,
+                worker.worker_id,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     pub async fn shutdown(&mut self) -> TestResult<()> {
+        for worker in &mut self.additional_workers {
+            worker.worker_server.shutdown().await?;
+        }
         self.worker_server.shutdown().await?;
-        self.metadata_server.shutdown().await?;
+        if let Some(process) = self.metadata_process.take() {
+            process.kill().await?;
+        } else {
+            self.metadata_server.shutdown().await?;
+        }
         Ok(())
+    }
+
+    async fn register_workers_with_external_metadata(&self) -> TestResult<()> {
+        register_worker_with_external_metadata(
+            &self.registrar,
+            &self.registration_state,
+            &self.heartbeat,
+            &self.block_report,
+            &self.block_store,
+            &self.group_name,
+        )
+        .await?;
+        for worker in &self.additional_workers {
+            register_worker_with_external_metadata(
+                &worker.registrar,
+                &worker.registration_state,
+                &worker.heartbeat,
+                &worker.block_report,
+                &worker.block_store,
+                &self.group_name,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    fn write_metadata_process_config(&self, metrics_addr: SocketAddr) -> TestResult<std::path::PathBuf> {
+        let config_path = self._temp_state.root().join("metadata-process.yaml");
+        let storage_dir = self.metadata_config.storage_dir.to_string_lossy();
+        let config = format!(
+            r#"cluster.id: {cluster_id:?}
+metadata.group.name: {group_name:?}
+metadata.storage.dir: {storage_dir:?}
+metadata.rpc.addr: {rpc_addr:?}
+metadata.rpc.port: {rpc_port}
+metadata.raft.mode: "single"
+metadata.raft.node_id: 1
+metadata.bootstrap.ready.timeout_ms: 10000
+metadata.bootstrap.ready.warn_after_ms: 1000
+metadata.bootstrap.ready.fail_fast: false
+observe.log.format: "compact"
+observe.log.output: "stderr"
+observe.log.level: "warn,openraft=warn"
+observe.metrics.prometheus.bind: {metrics_addr:?}
+observe.metrics.prometheus.path: "/metrics"
+"#,
+            cluster_id = self.metadata_config.cluster_id,
+            group_name = self.group_name.as_str(),
+            storage_dir = storage_dir,
+            rpc_addr = self.metadata_addr.ip().to_string(),
+            rpc_port = self.metadata_addr.port(),
+            metrics_addr = metrics_addr.to_string(),
+        );
+        std::fs::write(&config_path, config)?;
+        Ok(config_path)
     }
 }
 
 impl Drop for TestCluster {
     fn drop(&mut self) {
+        for worker in &mut self.additional_workers {
+            worker.worker_server.abort();
+        }
         self.worker_server.abort();
+        if let Some(process) = &mut self.metadata_process {
+            process.abort();
+        }
         self.metadata_server.abort();
     }
+}
+
+async fn register_worker_with_external_metadata(
+    registrar: &MetadataRegistrar,
+    registration_state: &beryl_worker::control::RegistrationSet,
+    heartbeat: &MetadataHeartbeatLoop,
+    block_report: &MetadataBlockReportLoop,
+    block_store: &StoreDirs,
+    group_name: &GroupName,
+) -> TestResult<()> {
+    registration_state.mark_needs_register(group_name);
+    registrar.register_once().await?;
+    readiness::send_heartbeat(heartbeat, block_store).await?;
+    let report = block_report.send_full_once().await?;
+    if report.accepted_peers == 0 || report.needs_register || report.worker_run_mismatch {
+        return Err(format!("external metadata rejected full block report: {report:?}").into());
+    }
+    Ok(())
 }
 
 async fn start_metadata_instance(

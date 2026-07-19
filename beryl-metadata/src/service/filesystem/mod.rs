@@ -539,9 +539,7 @@ mod test_support {
                 }
             };
             let session_registry = Arc::new(SessionRegistry::default());
-            let lease_manager = self
-                .lease_manager
-                .unwrap_or_else(|| Arc::new(LeaseManager::default()));
+            let lease_manager = self.lease_manager.unwrap_or_else(|| Arc::new(LeaseManager::default()));
             let filesystem = MetadataFileSystem::new(MetadataFileSystemDeps {
                 state_store: Arc::new(MemoryStateStore::new()),
                 mount_table: self.mount_table,
@@ -836,6 +834,23 @@ mod test_support {
             .lease_manager()
             .try_acquire(inode_id, writer, crate::inode_lease::WriteMode::Write, None)
             .expect("lease acquired");
+        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+        let target = WriteTarget {
+            block_id,
+            file_offset: 0,
+            block_size: 64,
+            effective_len: 64,
+            worker_endpoints: Vec::new(),
+            fencing_token: FencingToken {
+                block_id,
+                owner: writer,
+                epoch: lease_epoch,
+            },
+            block_stamp: 1,
+            chunk_size: 64,
+            block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
+            tier: beryl_types::Tier::Hdd,
+        };
         filesystem
             .session_registry()
             .create_session(crate::session_registry::CreateSessionInput {
@@ -849,24 +864,12 @@ mod test_support {
                 open_client_id: writer,
                 layout: FileLayout::new(64, 64, 1),
                 expires_at_ms,
-                write_targets: vec![WriteTarget {
-                    block_id: BlockId::new(data_handle_id, BlockIndex::new(0)),
-                    file_offset: 0,
-                    block_size: 64,
-                    effective_len: 64,
-                    worker_endpoints: Vec::new(),
-                    fencing_token: FencingToken {
-                        block_id: BlockId::new(data_handle_id, BlockIndex::new(0)),
-                        owner: writer,
-                        epoch: lease_epoch,
-                    },
-                    block_stamp: 1,
-                    chunk_size: 64,
-                    block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
-                    tier: beryl_types::Tier::Hdd,
-                }],
             })
             .expect("session created");
+        filesystem
+            .session_registry()
+            .install_issued_target(data_handle_id, lease_epoch, None, Some(64), target)
+            .expect("target installed");
         data_handle_id
     }
 
@@ -998,6 +1001,7 @@ mod test_support {
                 extents,
                 content_revision: stored_content_revision,
                 lease_epoch: stored_lease_epoch,
+                next_block_index,
             } => {
                 *extents = vec![beryl_types::fs::Extent {
                     file_offset: 0,
@@ -1009,6 +1013,7 @@ mod test_support {
                 }];
                 *stored_content_revision = Some(content_revision);
                 *stored_lease_epoch = Some(lease_epoch);
+                *next_block_index = 1;
             }
             other => panic!("unexpected inode data: {:?}", other),
         }

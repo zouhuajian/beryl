@@ -498,7 +498,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 &req_ctx,
                 OpenWriteArgs {
                     path: req.path,
-                    desired_len: req.desired_len,
                     mode,
                     freshness: Self::freshness_from_header(&req.header),
                 },
@@ -1224,7 +1223,6 @@ mod tests {
                 header: header(client_id),
                 path: path.to_string(),
                 mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
-                desired_len: Some(128),
             }),
         )
         .await
@@ -1474,6 +1472,7 @@ mod tests {
             extents,
             content_revision,
             lease_epoch,
+            next_block_index,
         } = &mut inode.data
         {
             *extents = vec![Extent {
@@ -1486,6 +1485,7 @@ mod tests {
             }];
             *content_revision = Some(1);
             *lease_epoch = Some(1);
+            *next_block_index = u64::from(block_id.index.as_raw()) + 1;
         }
         env.storage.put_inode(&inode).expect("put extent file inode");
         env.storage
@@ -1712,7 +1712,6 @@ mod tests {
                 header: header(3),
                 path: "/mnt/test/file".to_string(),
                 mode: OpenWriteModeProto::OpenWriteModeAppend as i32,
-                desired_len: Some(0),
             }),
         )
         .await
@@ -2049,7 +2048,6 @@ mod tests {
                 header: header(client_id),
                 path: path.to_string(),
                 mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
-                desired_len: Some(8192),
             }),
         )
         .await
@@ -2172,6 +2170,7 @@ mod tests {
             }],
             content_revision: Some(4),
             lease_epoch: Some(4),
+            next_block_index: 1,
         };
         env.storage.put_inode(&inode).expect("put file inode");
         env.storage
@@ -2228,6 +2227,7 @@ mod tests {
             }],
             content_revision: Some(8),
             lease_epoch: Some(8),
+            next_block_index: 1,
         };
         env.storage.put_inode(&inode).expect("put file inode");
         env.storage
@@ -2342,7 +2342,6 @@ mod tests {
                 header: header(30),
                 path: "/mnt/test/replay-file".to_string(),
                 mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
-                desired_len: Some(128),
             }),
         )
         .await
@@ -2644,7 +2643,6 @@ mod tests {
                 header: header(144),
                 path: "/mnt/test/dir/file".to_string(),
                 mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
-                desired_len: Some(128),
             }),
         )
         .await
