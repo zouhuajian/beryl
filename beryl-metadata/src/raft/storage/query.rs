@@ -95,7 +95,7 @@ impl RocksDBStorage {
                 && inode.kind.is_dir()
                 && matches!(inode.data, beryl_types::fs::InodeData::Dir)
                 && inode.mount_id == MountId::new(1)
-                && inode.current_data_handle_id == DataHandleId::new(0)
+                && inode.data_handle_id == DataHandleId::new(0)
         });
         let matching_mount = mounts.len() == 1
             && mounts.first().is_some_and(|mount| {

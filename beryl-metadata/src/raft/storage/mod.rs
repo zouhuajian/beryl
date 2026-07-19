@@ -457,7 +457,7 @@ mod tests {
             .unwrap();
 
         let stored_inode = storage.get_inode(inode_id).unwrap().unwrap();
-        assert_eq!(stored_inode.current_data_handle_id, data_handle_id);
+        assert_eq!(stored_inode.data_handle_id, data_handle_id);
         assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), Some(inode_id));
         assert_eq!(storage.get_layout(inode_id).unwrap(), layout);
         assert_eq!(

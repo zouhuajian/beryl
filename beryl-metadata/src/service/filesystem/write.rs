@@ -422,11 +422,11 @@ impl MetadataFileSystem {
             );
         }
 
-        let data_handle_id = inode.current_data_handle_id;
+        let data_handle_id = inode.data_handle_id;
         if data_handle_id.as_raw() == 0 {
             return self.failure_from_error(
                 ctx,
-                MetadataError::Internal(format!("File inode {} is missing current_data_handle_id", inode_id)),
+                MetadataError::Internal(format!("File inode {} is missing data_handle_id", inode_id)),
                 None,
                 None,
             );

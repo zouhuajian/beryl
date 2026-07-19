@@ -252,10 +252,10 @@ pub struct Inode {
     /// Root inode is set at mount creation; child inodes inherit from parent.
     /// Used for O(1) mount resolution during FS write routing.
     pub mount_id: MountId,
-    /// Current data handle for this inode (data-plane identity for the active data instance).
+    /// Data handle for this inode (data-plane identity for the active data instance).
     /// This is the authoritative link from namespace (inode) to data-plane blocks.
     /// Non-file inodes should use DataHandleId::new(0) and ignore this field.
-    pub current_data_handle_id: DataHandleId,
+    pub data_handle_id: DataHandleId,
 }
 
 impl Inode {
@@ -265,7 +265,7 @@ impl Inode {
         kind: InodeKind,
         attrs: FileAttrs,
         mount_id: MountId,
-        current_data_handle_id: DataHandleId,
+        data_handle_id: DataHandleId,
     ) -> Self {
         let data = match kind {
             InodeKind::File => InodeData::File {
@@ -282,18 +282,13 @@ impl Inode {
             attrs,
             data,
             mount_id,
-            current_data_handle_id,
+            data_handle_id,
         }
     }
 
     /// Creates a new file inode.
-    pub fn new_file(
-        inode_id: InodeId,
-        attrs: FileAttrs,
-        mount_id: MountId,
-        current_data_handle_id: DataHandleId,
-    ) -> Self {
-        Self::new(inode_id, InodeKind::File, attrs, mount_id, current_data_handle_id)
+    pub fn new_file(inode_id: InodeId, attrs: FileAttrs, mount_id: MountId, data_handle_id: DataHandleId) -> Self {
+        Self::new(inode_id, InodeKind::File, attrs, mount_id, data_handle_id)
     }
 
     /// Creates a new directory inode.
@@ -309,7 +304,7 @@ impl Inode {
             attrs,
             data: InodeData::Symlink { target: Some(target) },
             mount_id,
-            current_data_handle_id: DataHandleId::new(0),
+            data_handle_id: DataHandleId::new(0),
         }
     }
 }

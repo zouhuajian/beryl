@@ -136,10 +136,10 @@ impl AppRaftStateMachine {
                     "Inode is not a file: {inode_id}"
                 )));
             }
-            let data_handle_id = inode.current_data_handle_id;
+            let data_handle_id = inode.data_handle_id;
             if data_handle_id.as_raw() == 0 {
                 return Err(MetadataError::Internal(format!(
-                    "File inode {inode_id} is missing current_data_handle_id"
+                    "File inode {inode_id} is missing data_handle_id"
                 )));
             }
             let layout = self.storage.get_layout(inode_id)?;

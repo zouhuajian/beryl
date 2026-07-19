@@ -396,10 +396,10 @@ impl AppRaftStateMachine {
 
             let data_handle_id = match &child_inode.data {
                 InodeData::File { .. } => {
-                    let data_handle_id = child_inode.current_data_handle_id;
+                    let data_handle_id = child_inode.data_handle_id;
                     if data_handle_id.as_raw() == 0 {
                         return Err(MetadataError::Internal(format!(
-                            "File inode {} is missing current_data_handle_id",
+                            "File inode {} is missing data_handle_id",
                             child_inode_id
                         )));
                     }
@@ -598,10 +598,10 @@ impl AppRaftStateMachine {
             }
             InodeData::File { lease_epoch, .. } => {
                 plan.file_lease_epochs.push((inode_id, lease_epoch.unwrap_or(0)));
-                let data_handle_id = inode.current_data_handle_id;
+                let data_handle_id = inode.data_handle_id;
                 if data_handle_id.as_raw() == 0 {
                     return Err(MetadataError::Internal(format!(
-                        "File inode {} is missing current_data_handle_id",
+                        "File inode {} is missing data_handle_id",
                         inode_id
                     )));
                 }
@@ -824,10 +824,10 @@ impl AppRaftStateMachine {
     ) -> MetadataResult<PreparedRenameOverwrite> {
         match &dst_inode.data {
             InodeData::File { .. } => {
-                let data_handle_id = dst_inode.current_data_handle_id;
+                let data_handle_id = dst_inode.data_handle_id;
                 if data_handle_id.as_raw() == 0 {
                     return Err(MetadataError::Internal(format!(
-                        "File inode {} is missing current_data_handle_id",
+                        "File inode {} is missing data_handle_id",
                         dst_inode_id
                     )));
                 }

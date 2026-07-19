@@ -449,7 +449,7 @@ fn verify_root(storage: &RocksDBStorage, mount_table: &MountTable, group_name: &
         || !inode.kind.is_dir()
         || !matches!(inode.data, beryl_types::fs::InodeData::Dir)
         || inode.mount_id != root.mount_id
-        || inode.current_data_handle_id.as_raw() != 0
+        || inode.data_handle_id.as_raw() != 0
     {
         return Err(MetadataError::InvalidArgument(
             "root inode exists but violates bootstrap invariants".to_string(),

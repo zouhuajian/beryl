@@ -242,7 +242,7 @@ impl MetadataFileSystem {
                 Some(&resolved.mount_ctx),
             );
         }
-        let data_handle_id = inode.current_data_handle_id;
+        let data_handle_id = inode.data_handle_id;
 
         self.get_file_layout_resolved(GetFileLayoutInput {
             ctx: ctx.clone(),
@@ -314,7 +314,7 @@ impl MetadataFileSystem {
             }
             Err(err) => return self.failure_from_error(ctx, err, None, None),
         };
-        let data_handle_id = inode.current_data_handle_id;
+        let data_handle_id = inode.data_handle_id;
 
         self.get_file_layout_resolved(GetFileLayoutInput {
             ctx: ctx.clone(),
@@ -678,11 +678,11 @@ impl MetadataFileSystem {
             beryl_types::fs::InodeData::File { extents, .. } => extents.clone(),
             _ => Vec::new(),
         };
-        let data_handle_id = inode.current_data_handle_id;
+        let data_handle_id = inode.data_handle_id;
         if data_handle_id.as_raw() == 0 {
             return self.failure_from_error_with_route_epoch(
                 &req.ctx,
-                MetadataError::Internal(format!("File inode {} is missing current_data_handle_id", req.inode_id)),
+                MetadataError::Internal(format!("File inode {} is missing data_handle_id", req.inode_id)),
                 group_name,
                 mount_epoch,
                 route_epoch,
@@ -713,7 +713,7 @@ impl MetadataFileSystem {
                 return self.failure_from_error_with_route_epoch(
                     &req.ctx,
                     MetadataError::Internal(format!(
-                        "Extent block data_handle_id {} does not match inode {} current_data_handle_id {}",
+                        "Extent block data_handle_id {} does not match inode {} data_handle_id {}",
                         extent.block_id.data_handle_id, req.inode_id, data_handle_id
                     )),
                     group_name,

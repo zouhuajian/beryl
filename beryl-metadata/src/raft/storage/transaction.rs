@@ -204,7 +204,7 @@ impl RocksDBStorage {
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize file layout: {}", e)))?;
         batch.put_cf(cf_meta, layout_key.as_bytes(), layout_value);
 
-        let data_handle_id = inode.current_data_handle_id;
+        let data_handle_id = inode.data_handle_id;
         let owner_key = format!("data_handle_owner:{}", data_handle_id.as_raw());
         let owner_value = encode_to_vec(inode.inode_id.as_raw(), standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize inode_id: {}", e)))?;
@@ -228,7 +228,7 @@ impl RocksDBStorage {
     ) -> MetadataResult<()> {
         let generation = self.pin_generation()?;
         let db = generation.db();
-        if inode.inode_id != allocation.inode.inode_id || inode.current_data_handle_id != allocation.data_handle_id {
+        if inode.inode_id != allocation.inode.inode_id || inode.data_handle_id != allocation.data_handle_id {
             return Err(MetadataError::Internal(
                 "file allocation does not match prepared inode".to_string(),
             ));
