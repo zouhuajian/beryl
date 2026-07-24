@@ -1625,22 +1625,19 @@ mod tests {
         );
         let output = Arc::new(Mutex::new(Vec::new()));
         let dispatch = captured_json_subscriber(&output);
+        let _subscriber_guard = tracing::dispatcher::set_default(&dispatch);
 
-        async {
-            let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
-                &service,
-                Request::new(register_request_with_header(
-                    Some(valid_request_header(&group_name("root"), ClientId::new(181))),
-                    WorkerId::new(181),
-                )),
-            )
-            .await
-            .expect("register worker response")
-            .into_inner();
-            assert!(response.header.expect("header").error.is_none());
-        }
-        .with_subscriber(dispatch)
-        .await;
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
+            &service,
+            Request::new(register_request_with_header(
+                Some(valid_request_header(&group_name("root"), ClientId::new(181))),
+                WorkerId::new(181),
+            )),
+        )
+        .await
+        .expect("register worker response")
+        .into_inner();
+        assert!(response.header.expect("header").error.is_none());
 
         let logs = captured_logs(&output);
         assert!(
