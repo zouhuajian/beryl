@@ -750,3 +750,195 @@ impl RepairQueue {
         observe::set_repair_queue_depth(0);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
+
+    fn make_block_id(data_handle_id: u64, index: u32) -> BlockId {
+        BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(index))
+    }
+
+    fn make_worker_id(id: u64) -> WorkerId {
+        WorkerId::new(id)
+    }
+
+    #[test]
+    fn queue_state_machine_handles_ack_and_timeout_transitions() {
+        queue_ack_success_case();
+        queue_retryable_backoff_case();
+        queue_timeout_requeue_case();
+    }
+
+    fn queue_ack_success_case() {
+        let queue = RepairQueue::new(1000);
+        let block_id = make_block_id(1, 0);
+        let worker1 = make_worker_id(1);
+
+        let task = RepairTask::Replicate {
+            block_id,
+            src_workers: vec![],
+            target_worker: worker1,
+            replication_factor: Some(3),
+            reason: None,
+        };
+
+        let _task_id = queue.enqueue(task).unwrap();
+        assert_eq!(queue.len_pending(), 1);
+
+        // Poll task
+        let records = queue.poll_for_worker(worker1, 10);
+        assert_eq!(records.len(), 1);
+        let polled_id = records[0].id;
+        assert_eq!(queue.len_pending(), 0);
+        assert_eq!(queue.len_inflight(), 1);
+
+        // Ack success
+        let followup = queue
+            .ack(polled_id, worker1, TaskAckStatus::Success, None, None)
+            .unwrap();
+        assert!(followup.is_none());
+
+        // Task should be removed
+        assert_eq!(queue.len_total(), 0);
+        assert_eq!(queue.len_pending(), 0);
+        assert_eq!(queue.len_inflight(), 0);
+    }
+
+    fn queue_retryable_backoff_case() {
+        let queue = RepairQueue::with_config(1000, 3, 300_000, 1_000, 60_000, 4);
+        let block_id = make_block_id(1, 0);
+        let worker1 = make_worker_id(1);
+
+        let task = RepairTask::Replicate {
+            block_id,
+            src_workers: vec![],
+            target_worker: worker1,
+            replication_factor: Some(3),
+            reason: None,
+        };
+
+        let _task_id = queue.enqueue(task).unwrap();
+        let records = queue.poll_for_worker(worker1, 10);
+        assert_eq!(records.len(), 1);
+        let polled_id = records[0].id;
+
+        // Ack with retryable error
+        let _ = queue.ack(
+            polled_id,
+            worker1,
+            TaskAckStatus::RetryableFailed,
+            Some("Temporary error".to_string()),
+            Some(TaskFailureClass::Retryable),
+        );
+
+        // Task should be back to pending with backoff
+        assert_eq!(queue.len_pending(), 1);
+        assert_eq!(queue.len_inflight(), 0);
+
+        // Should not be pollable immediately (backoff not expired)
+        let records2 = queue.poll_for_worker(worker1, 10);
+        assert_eq!(records2.len(), 0);
+    }
+
+    fn queue_timeout_requeue_case() {
+        let queue = RepairQueue::with_config(1000, 3, 300_000, 1_000, 60_000, 4);
+        let block_id = make_block_id(1, 0);
+        let worker1 = make_worker_id(1);
+
+        let task = RepairTask::Replicate {
+            block_id,
+            src_workers: vec![],
+            target_worker: worker1,
+            replication_factor: Some(3),
+            reason: None,
+        };
+
+        let _task_id = queue.enqueue(task).unwrap();
+        let records = queue.poll_for_worker(worker1, 10);
+        assert_eq!(records.len(), 1);
+        let _polled_id = records[0].id;
+
+        // Simulate timeout by calling requeue_timeouts with future time
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 400_000; // 400 seconds in future (exceeds 300s timeout)
+
+        let timeout_count = queue.requeue_timeouts(future_ms);
+        assert_eq!(timeout_count, 1);
+
+        // Task should be back to pending
+        assert_eq!(queue.len_pending(), 1);
+        assert_eq!(queue.len_inflight(), 0);
+    }
+
+    #[test]
+    fn test_dedup_same_key_returns_existing_id() {
+        let queue = RepairQueue::new(1000);
+        let block_id = make_block_id(1, 0);
+        let worker1 = make_worker_id(1);
+
+        let task1 = RepairTask::Replicate {
+            block_id,
+            src_workers: vec![],
+            target_worker: worker1,
+            replication_factor: Some(3),
+            reason: Some("Reason 1".to_string()),
+        };
+
+        let task2 = RepairTask::Replicate {
+            block_id,
+            src_workers: vec![make_worker_id(2)], // Different src_workers
+            target_worker: worker1,               // Same target_worker
+            replication_factor: Some(5),          // Different replication_factor
+            reason: Some("Reason 2".to_string()), // Different reason
+        };
+
+        let id1 = queue.enqueue(task1).unwrap();
+        let id2 = queue.enqueue(task2).unwrap();
+
+        // Should return same ID (dedup key is block_id + target_worker)
+        assert_eq!(id1, id2);
+        assert_eq!(queue.len_pending(), 1);
+    }
+
+    #[test]
+    fn replica_eviction_dedup_returns_existing_task_id() {
+        let repair_queue = Arc::new(RepairQueue::with_config(1000, 3, 60_000, 1_000, 60_000, 10));
+
+        let block_id = make_block_id(1, 0);
+        let target_worker = make_worker_id(1);
+
+        let task_id1 = repair_queue
+            .enqueue(RepairTask::EvictReplica {
+                target_worker,
+                block_id,
+                reason: "excess replica cleanup".to_string(),
+            })
+            .unwrap();
+
+        let task_id2 = repair_queue
+            .enqueue(RepairTask::EvictReplica {
+                target_worker,
+                block_id,
+                reason: "move follow-up duplicate".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(task_id1, task_id2);
+
+        let second_task_id = repair_queue
+            .enqueue(RepairTask::EvictReplica {
+                target_worker: make_worker_id(2),
+                block_id,
+                reason: "different target replica cleanup".to_string(),
+            })
+            .unwrap();
+
+        assert_ne!(second_task_id, task_id1);
+        assert_eq!(repair_queue.len_pending(), 2);
+    }
+}

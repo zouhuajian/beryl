@@ -137,69 +137,6 @@ impl MountTable {
         })
     }
 
-    /// Build a derived mount entry for tests.
-    #[cfg(test)]
-    pub(crate) fn create_mount(
-        &self,
-        mount_prefix: String,
-        mount_kind: MountKind,
-        ufs_uri: Option<String>,
-        data_io_policy: DataIoPolicy,
-        namespace_owner_group_name: GroupName,
-        root_inode_id: InodeId,
-    ) -> MetadataResult<MountEntry> {
-        let mut state = self.state.write();
-
-        // Check if prefix already exists
-        if state.prefix_index.contains_key(&mount_prefix) {
-            return Err(MetadataError::AlreadyExists(format!(
-                "Mount prefix already exists: {}",
-                mount_prefix
-            )));
-        }
-
-        let next_mount_id = state
-            .entries
-            .keys()
-            .map(|mount_id| mount_id.as_raw())
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| MetadataError::Internal("test mount ID allocator exhausted".to_string()))?;
-        let mount_id = MountId::new(next_mount_id);
-
-        let entry = MountEntry {
-            mount_id,
-            mount_prefix: mount_prefix.clone(),
-            mount_kind,
-            ufs_uri,
-            data_io_policy,
-            mount_epoch: state.epoch,
-            namespace_owner_group_name,
-            root_inode_id,
-        };
-
-        state.entries.insert(mount_id, entry.clone());
-        state.prefix_index.insert(mount_prefix, mount_id);
-        state.epoch += 1;
-
-        Ok(entry)
-    }
-
-    /// Delete a derived mount entry in tests.
-    #[cfg(test)]
-    pub(crate) fn delete_mount(&self, mount_id: MountId) -> MetadataResult<()> {
-        let mut state = self.state.write();
-
-        if let Some(entry) = state.entries.remove(&mount_id) {
-            state.prefix_index.remove(&entry.mount_prefix);
-            state.epoch += 1;
-            Ok(())
-        } else {
-            Err(MetadataError::NotFound(format!("Mount not found: {:?}", mount_id)))
-        }
-    }
-
     /// Upsert (insert or update) a mount entry.
     ///
     /// Used by Raft read-view publication after the authoritative RocksDB commit.
@@ -232,12 +169,6 @@ impl MountTable {
         state.epoch = entry.mount_epoch.max(state.epoch);
 
         Ok(())
-    }
-
-    /// Remove a derived mount entry in tests.
-    #[cfg(test)]
-    pub(crate) fn remove(&self, mount_id: MountId) -> MetadataResult<()> {
-        self.delete_mount(mount_id)
     }
 
     /// List all mount entries.
@@ -306,26 +237,34 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    fn publish_external_mount(
+        table: &MountTable,
+        mount_id: u64,
+        mount_prefix: &str,
+        ufs_uri: &str,
+        group_name: &str,
+        root_inode_id: InodeId,
+    ) {
+        table
+            .upsert(MountEntry {
+                mount_id: MountId::new(mount_id),
+                mount_prefix: mount_prefix.to_string(),
+                mount_kind: MountKind::External,
+                ufs_uri: Some(ufs_uri.to_string()),
+                data_io_policy: DataIoPolicy::Allow,
+                mount_epoch: mount_id,
+                namespace_owner_group_name: GroupName::parse(group_name).unwrap(),
+                root_inode_id,
+            })
+            .unwrap();
+    }
+
     #[test]
-    fn test_mount_create_and_resolve() {
+    fn published_mount_resolves_external_path() {
         let table = MountTable::new();
 
-        // Create mount (test-only: use placeholder values)
-        use beryl_types::fs::InodeId;
-        use beryl_types::GroupName;
-        let root_inode_id = InodeId::new(1);
-        let _entry = table
-            .create_mount(
-                "/mnt/s3".to_string(),
-                MountKind::External,
-                Some("s3://bucket/path".to_string()),
-                DataIoPolicy::Allow,
-                GroupName::parse("g1").unwrap(),
-                root_inode_id,
-            )
-            .unwrap();
+        publish_external_mount(&table, 1, "/mnt/s3", "s3://bucket/path", "g1", InodeId::new(1));
 
-        // Resolve path
         let result = table.resolve_path("/mnt/s3/file.txt").unwrap();
         assert!(result.is_some());
         let (ufs_uri, relative_path) = result.unwrap();
@@ -337,32 +276,9 @@ mod tests {
     fn test_mount_longest_prefix() {
         let table = MountTable::new();
 
-        use beryl_types::fs::InodeId;
-        use beryl_types::GroupName;
-        let root1 = InodeId::new(1);
-        let root2 = InodeId::new(2);
-        table
-            .create_mount(
-                "/mnt".to_string(),
-                MountKind::External,
-                Some("s3://bucket1".to_string()),
-                DataIoPolicy::Allow,
-                GroupName::parse("g1").unwrap(),
-                root1,
-            )
-            .unwrap();
-        table
-            .create_mount(
-                "/mnt/s3".to_string(),
-                MountKind::External,
-                Some("s3://bucket2".to_string()),
-                DataIoPolicy::Allow,
-                GroupName::parse("g2").unwrap(),
-                root2,
-            )
-            .unwrap();
+        publish_external_mount(&table, 1, "/mnt", "s3://bucket1", "g1", InodeId::new(1));
+        publish_external_mount(&table, 2, "/mnt/s3", "s3://bucket2", "g2", InodeId::new(2));
 
-        // Should match longest prefix
         let result = table.resolve_path("/mnt/s3/file.txt").unwrap();
         assert!(result.is_some());
         let (ufs_uri, _) = result.unwrap();
@@ -373,38 +289,9 @@ mod tests {
     fn test_mount_prefix_component_boundaries() {
         let table = MountTable::new();
 
-        use beryl_types::fs::InodeId;
-        use beryl_types::GroupName;
-        table
-            .create_mount(
-                "/".to_string(),
-                MountKind::External,
-                Some("ufs://root".to_string()),
-                DataIoPolicy::Allow,
-                GroupName::parse("g1").unwrap(),
-                InodeId::new(1),
-            )
-            .unwrap();
-        table
-            .create_mount(
-                "/mnt".to_string(),
-                MountKind::External,
-                Some("ufs://mnt".to_string()),
-                DataIoPolicy::Allow,
-                GroupName::parse("g2").unwrap(),
-                InodeId::new(2),
-            )
-            .unwrap();
-        table
-            .create_mount(
-                "/mnt/s3".to_string(),
-                MountKind::External,
-                Some("ufs://s3".to_string()),
-                DataIoPolicy::Allow,
-                GroupName::parse("g3").unwrap(),
-                InodeId::new(3),
-            )
-            .unwrap();
+        publish_external_mount(&table, 1, "/", "ufs://root", "g1", InodeId::new(1));
+        publish_external_mount(&table, 2, "/mnt", "ufs://mnt", "g2", InodeId::new(2));
+        publish_external_mount(&table, 3, "/mnt/s3", "ufs://s3", "g3", InodeId::new(3));
 
         let (uri, relative) = table.resolve_path("/other/file").unwrap().unwrap();
         assert_eq!(uri, "ufs://root");
@@ -494,8 +381,8 @@ mod tests {
         storage.delete_mount(MountId::new(1)).unwrap();
         storage.put_mount_epoch(3).unwrap();
 
-        // Synchronize MountTable (simulating apply_delete_mount calling remove)
-        mount_table.remove(MountId::new(1)).unwrap();
+        // Reload the derived table from authoritative storage.
+        let mount_table = MountTable::load_from_storage(&storage).unwrap();
 
         // Verify deleted mount no longer resolves
         let result_deleted = mount_table.resolve_path("/mnt/s3/file.txt").unwrap();
@@ -530,16 +417,7 @@ mod tests {
     #[test]
     fn duplicate_prefix_replacement_does_not_change_current_table() {
         let table = MountTable::new();
-        table
-            .create_mount(
-                "/current".to_string(),
-                MountKind::External,
-                Some("ufs://current".to_string()),
-                DataIoPolicy::Allow,
-                GroupName::parse("root").unwrap(),
-                InodeId::new(1),
-            )
-            .unwrap();
+        publish_external_mount(&table, 1, "/current", "ufs://current", "root", InodeId::new(1));
         let original_epoch = table.epoch();
 
         let duplicate_prefix = vec![
@@ -579,16 +457,7 @@ mod tests {
     #[test]
     fn replacement_updates_entries_prefix_and_epoch_together() {
         let table = MountTable::new();
-        table
-            .create_mount(
-                "/old".to_string(),
-                MountKind::External,
-                Some("ufs://old".to_string()),
-                DataIoPolicy::Allow,
-                GroupName::parse("root").unwrap(),
-                InodeId::new(1),
-            )
-            .unwrap();
+        publish_external_mount(&table, 1, "/old", "ufs://old", "root", InodeId::new(1));
 
         let replacement = MountTable::build_replacement(vec![MountEntry {
             mount_id: MountId::new(9),

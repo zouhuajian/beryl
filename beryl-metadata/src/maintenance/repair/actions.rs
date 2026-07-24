@@ -69,3 +69,50 @@ impl RepairAction {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
+
+    fn make_block_id(data_handle_id: u64, index: u32) -> BlockId {
+        BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(index))
+    }
+
+    fn make_worker_id(id: u64) -> WorkerId {
+        WorkerId::new(id)
+    }
+
+    #[test]
+    fn test_action_into_task() {
+        let block_id = make_block_id(1, 0);
+        let target_worker = make_worker_id(2);
+        let src_workers = vec![make_worker_id(1)];
+
+        let action = RepairAction::Replicate {
+            block_id,
+            src_workers: src_workers.clone(),
+            target_worker,
+            replication_factor: Some(3),
+            reason: Some("Test".to_string()),
+        };
+
+        let task = action.into_task();
+        match task {
+            RepairTask::Replicate {
+                block_id: bid,
+                src_workers: sw,
+                target_worker: tw,
+                replication_factor: rf,
+                reason: r,
+            } => {
+                assert_eq!(bid, block_id);
+                assert_eq!(sw, src_workers);
+                assert_eq!(tw, target_worker);
+                assert_eq!(rf, Some(3));
+                assert_eq!(r, Some("Test".to_string()));
+            }
+            _ => panic!("Expected Replicate task"),
+        }
+    }
+}

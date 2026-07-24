@@ -401,6 +401,7 @@ dependencies = [
  "beryl-common",
  "beryl-types",
  "prost",
+ "prost-types",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

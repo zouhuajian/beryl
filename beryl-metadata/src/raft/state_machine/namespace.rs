@@ -943,7 +943,7 @@ impl AppRaftStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::state_machine::tests::*;
+    use crate::raft::state_machine::test_support::*;
 
     fn test_state() -> (TempDir, Arc<RocksDBStorage>, AppRaftStateMachine, InodeId) {
         let dir = TempDir::new().unwrap();

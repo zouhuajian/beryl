@@ -238,15 +238,38 @@ impl PathResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mount::{DataIoPolicy, MountKind, MountTable};
+    use crate::mount::{DataIoPolicy, MountEntry, MountKind, MountTable};
     use crate::raft::RocksDBStorage;
     use beryl_types::fs::{FileAttrs, Inode, InodeId};
-    use beryl_types::ids::DataHandleId;
+    use beryl_types::ids::{DataHandleId, MountId};
     use beryl_types::GroupName;
     use tempfile::TempDir;
 
     fn test_resolver(mount_table: Arc<MountTable>, storage: Arc<RocksDBStorage>) -> PathResolver {
         PathResolver::new(mount_table, storage)
+    }
+
+    fn publish_mount(
+        table: &MountTable,
+        mount_id: u64,
+        mount_prefix: &str,
+        mount_kind: MountKind,
+        ufs_uri: Option<&str>,
+        group_name: &str,
+        root_inode_id: InodeId,
+    ) -> MountEntry {
+        let entry = MountEntry {
+            mount_id: MountId::new(mount_id),
+            mount_prefix: mount_prefix.to_string(),
+            mount_kind,
+            ufs_uri: ufs_uri.map(str::to_string),
+            data_io_policy: DataIoPolicy::Allow,
+            mount_epoch: mount_id,
+            namespace_owner_group_name: GroupName::parse(group_name).unwrap(),
+            root_inode_id,
+        };
+        table.upsert(entry.clone()).unwrap();
+        entry
     }
 
     #[test]
@@ -265,18 +288,16 @@ mod tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
 
-        // Create test mount
         let root_inode_id = InodeId::new(1);
-        mount_table
-            .create_mount(
-                "/mnt/s3".to_string(),
-                crate::mount::MountKind::External,
-                Some("s3://bucket/path".to_string()),
-                crate::mount::DataIoPolicy::Allow,
-                GroupName::parse("g1").unwrap(),
-                root_inode_id,
-            )
-            .unwrap();
+        publish_mount(
+            &mount_table,
+            1,
+            "/mnt/s3",
+            MountKind::External,
+            Some("s3://bucket/path"),
+            "g1",
+            root_inode_id,
+        );
 
         let resolver = test_resolver(mount_table.clone(), storage);
 
@@ -289,30 +310,20 @@ mod tests {
         assert_eq!(components, vec!["dir", "file.txt"]);
 
         // Test longest prefix match
-        mount_table
-            .create_mount(
-                "/mnt".to_string(),
-                crate::mount::MountKind::External,
-                Some("s3://bucket2".to_string()),
-                crate::mount::DataIoPolicy::Allow,
-                GroupName::parse("g2").unwrap(),
-                InodeId::new(2),
-            )
-            .unwrap();
+        publish_mount(
+            &mount_table,
+            2,
+            "/mnt",
+            MountKind::External,
+            Some("s3://bucket2"),
+            "g2",
+            InodeId::new(2),
+        );
 
         let (mount, _) = resolver.resolve_mount("/mnt/s3/file.txt").unwrap();
         assert_eq!(mount.mount_prefix, "/mnt/s3"); // Should match longer prefix
 
-        mount_table
-            .create_mount(
-                "/".to_string(),
-                crate::mount::MountKind::Internal,
-                None,
-                crate::mount::DataIoPolicy::Allow,
-                GroupName::parse("g3").unwrap(),
-                InodeId::new(3),
-            )
-            .unwrap();
+        publish_mount(&mount_table, 3, "/", MountKind::Internal, None, "g3", InodeId::new(3));
 
         let (mount, components) = resolver.resolve_mount("/mnt2/file.txt").unwrap();
         assert_eq!(mount.mount_prefix, "/");
@@ -334,16 +345,15 @@ mod tests {
         let mount_table = Arc::new(MountTable::new());
 
         let root_inode_id = InodeId::new(100);
-        let mount = mount_table
-            .create_mount(
-                "/mnt/test".to_string(),
-                MountKind::External,
-                Some("file:///tmp/test".to_string()),
-                DataIoPolicy::Allow,
-                GroupName::parse("g1").unwrap(),
-                root_inode_id,
-            )
-            .unwrap();
+        let mount = publish_mount(
+            &mount_table,
+            1,
+            "/mnt/test",
+            MountKind::External,
+            Some("file:///tmp/test"),
+            "g1",
+            root_inode_id,
+        );
 
         let mut root_attrs = FileAttrs::new();
         root_attrs.mode = 0o755;
@@ -399,16 +409,15 @@ mod tests {
         let mount_table = Arc::new(MountTable::new());
 
         let root_inode_id = InodeId::new(200);
-        let mount = mount_table
-            .create_mount(
-                "/mnt/test2".to_string(),
-                MountKind::External,
-                Some("file:///tmp/test2".to_string()),
-                DataIoPolicy::Allow,
-                GroupName::parse("g2").unwrap(),
-                root_inode_id,
-            )
-            .unwrap();
+        let mount = publish_mount(
+            &mount_table,
+            1,
+            "/mnt/test2",
+            MountKind::External,
+            Some("file:///tmp/test2"),
+            "g2",
+            root_inode_id,
+        );
 
         let mut root_attrs = FileAttrs::new();
         root_attrs.mode = 0o755;

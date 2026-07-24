@@ -256,10 +256,6 @@ impl From<CommonErrorKind> for CommonError {
 }
 
 #[cfg(test)]
-#[path = "rpc_tests.rs"]
-mod rpc_tests;
-
-#[cfg(test)]
 mod tests {
     use super::rpc::{ErrorKind, InternalErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail};
     use super::{CommonError, CommonErrorKind};
@@ -275,14 +271,11 @@ mod tests {
     }
 
     #[test]
-    fn rpc_fs_error_fails() {
+    fn rpc_error_constructors_preserve_kind_and_recovery() {
         let err = RpcErrorDetail::fs(FsErrorCode::ENoEnt, "no such file");
         assert_eq!(err.kind, ErrorKind::Fs(FsErrorCode::ENoEnt));
         assert_eq!(err.recovery, RecoveryAction::Fail);
-    }
 
-    #[test]
-    fn rpc_refresh_carries_hint() {
         let hint = RefreshHint {
             group_name: Some("root".to_string()),
             ..RefreshHint::default()
@@ -294,10 +287,7 @@ mod tests {
         );
         assert_eq!(err.kind, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
         assert!(matches!(err.recovery, RecoveryAction::RefreshMetadata { .. }));
-    }
 
-    #[test]
-    fn rpc_retry_keeps_backoff_in_recovery() {
         let err = RpcErrorDetail::retry(
             ErrorKind::Internal(InternalErrorKind::NodeUnavailable),
             Some(1000),

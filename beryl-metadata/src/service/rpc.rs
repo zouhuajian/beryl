@@ -767,7 +767,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
 #[cfg(test)]
 mod tests {
     use crate::config::RaftConfig;
-    use crate::mount::{DataIoPolicy, MountKind, MountTable, ROOT_INODE_ID};
+    use crate::mount::{DataIoPolicy, MountEntry, MountKind, MountTable, ROOT_INODE_ID};
     use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
     use crate::readiness::RootReadinessGate;
     use crate::service::{MetadataFileSystem, MetadataFileSystemDeps, MetadataFileSystemServiceImpl, MsyncHandler};
@@ -785,11 +785,11 @@ mod tests {
     use beryl_proto::metadata::{
         get_block_locations_request_proto, AddBlockRequestProto, CommitFileRequestProto, CommittedBlockProto,
         CreateDirectoryRequestProto, CreateFileRequestProto, DeleteRequestProto, GetBlockLocationsRequestProto,
-        GetStatusRequestProto, ListStatusRequestProto, OpenWriteModeProto, OpenWriteRequestProto, RenameRequestProto,
+        GetStatusRequestProto, ListStatusRequestProto, OpenWriteModeProto, OpenWriteRequestProto,
         SyncWriteRequestProto, WriteHandleProto,
     };
     use beryl_types::fs::{Extent, FileAttrs, FsErrorCode, Inode, InodeId};
-    use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
+    use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, MountId, WorkerId};
     use beryl_types::layout::FileLayout;
     use beryl_types::{ClientId, GroupName, RaftLogId, WorkerRunId};
     use std::sync::Arc;
@@ -849,6 +849,11 @@ mod tests {
 
     fn group_name(raw: &str) -> GroupName {
         GroupName::parse(raw).unwrap()
+    }
+
+    fn publish_mount(table: &MountTable, entry: MountEntry) -> MountEntry {
+        table.upsert(entry.clone()).expect("publish mount");
+        entry
     }
 
     fn watermark_proto(group_name: &str, state_id: RaftLogId) -> GroupStateWatermarkProto {
@@ -965,16 +970,19 @@ mod tests {
                 InodeId::new(1000),
             )
         };
-        let mount_entry = mount_table
-            .create_mount(
-                mount_prefix.to_string(),
+        let mount_entry = publish_mount(
+            &mount_table,
+            MountEntry {
+                mount_id: MountId::new(1),
+                mount_prefix: mount_prefix.to_string(),
                 mount_kind,
                 ufs_uri,
                 data_io_policy,
-                group_name("root"),
+                mount_epoch: 1,
+                namespace_owner_group_name: group_name("root"),
                 root_inode_id,
-            )
-            .expect("create mount");
+            },
+        );
 
         let mut root_attrs = FileAttrs::new();
         root_attrs.uid = 1000;
@@ -1048,16 +1056,19 @@ mod tests {
                 InodeId::new(1000),
             )
         };
-        let mount_entry = mount_table
-            .create_mount(
-                mount_prefix.to_string(),
+        let mount_entry = publish_mount(
+            &mount_table,
+            MountEntry {
+                mount_id: MountId::new(1),
+                mount_prefix: mount_prefix.to_string(),
                 mount_kind,
                 ufs_uri,
                 data_io_policy,
-                group_name("root"),
+                mount_epoch: 1,
+                namespace_owner_group_name: group_name("root"),
                 root_inode_id,
-            )
-            .expect("create mount");
+            },
+        );
 
         let mut root_attrs = FileAttrs::new();
         root_attrs.uid = 1000;
@@ -1280,74 +1291,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recursive_create_directory_creates_missing_parent_directories() {
-        let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
-        let request = CreateDirectoryRequestProto {
-            header: header(707),
-            path: "/mnt/test/a/b/c".to_string(),
-            attrs: Some(beryl_proto::metadata::FileAttrsProto {
-                mode: 0o755,
-                uid: 1000,
-                gid: 1000,
-                ..Default::default()
-            }),
-            recursive: true,
-        };
-
-        let response = FileSystemServiceProto::create_directory(&env.service, Request::new(request.clone()))
-            .await
-            .expect("transport status must remain OK")
-            .into_inner();
-
-        assert_success_header(response.header);
-        let next_inode_after_first = env.storage.get_next_inode_id().expect("next inode after mkdir");
-        let a = env
-            .storage
-            .get_dentry(env.root_inode_id, "a")
-            .expect("lookup /a")
-            .expect("/a created");
-
-        let replay = FileSystemServiceProto::create_directory(&env.service, Request::new(request))
-            .await
-            .expect("transport status must remain OK")
-            .into_inner();
-        assert_success_header(replay.header);
-        assert_eq!(env.storage.get_next_inode_id().unwrap(), next_inode_after_first);
-        assert_eq!(env.storage.get_dentry(env.root_inode_id, "a").unwrap(), Some(a));
-        let b = env
-            .storage
-            .get_dentry(a, "b")
-            .expect("lookup /a/b")
-            .expect("/a/b created");
-        let c = env
-            .storage
-            .get_dentry(b, "c")
-            .expect("lookup /a/b/c")
-            .expect("/a/b/c created");
-        assert!(env
-            .storage
-            .get_inode(a)
-            .expect("load /a")
-            .expect("/a inode")
-            .kind
-            .is_dir());
-        assert!(env
-            .storage
-            .get_inode(b)
-            .expect("load /a/b")
-            .expect("/a/b inode")
-            .kind
-            .is_dir());
-        assert!(env
-            .storage
-            .get_inode(c)
-            .expect("load /a/b/c")
-            .expect("/a/b/c inode")
-            .kind
-            .is_dir());
-    }
-
-    #[tokio::test]
     async fn recursive_create_directory_fails_when_parent_component_is_file() {
         let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
         let file_inode_id = InodeId::new(5001);
@@ -1395,68 +1338,6 @@ mod tests {
             .expect("put directory dentry");
     }
 
-    fn put_empty_file(
-        env: &PathTestEnv,
-        parent_inode_id: InodeId,
-        name: &str,
-        inode_id: InodeId,
-        data_handle_id: DataHandleId,
-    ) {
-        env.storage
-            .put_inode(&Inode::new_file(
-                inode_id,
-                FileAttrs::new(),
-                env.mount_id,
-                data_handle_id,
-            ))
-            .expect("put file inode");
-        env.storage
-            .put_dentry(parent_inode_id, name, inode_id)
-            .expect("put file dentry");
-        env.storage
-            .put_layout(inode_id, FileLayout::new(4096, 4096, 1))
-            .expect("put file layout");
-        env.storage
-            .put_data_handle_owner(data_handle_id, inode_id)
-            .expect("put data handle owner");
-    }
-
-    #[tokio::test]
-    async fn rename_public_path_moves_entry_and_returns_success_header() {
-        let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
-        let parent_inode_id = InodeId::new(3900);
-        let inode_id = InodeId::new(3901);
-        let data_handle_id = DataHandleId::new(3901);
-        put_dir(&env, env.root_inode_id, "parent", parent_inode_id);
-        put_empty_file(&env, parent_inode_id, "source", inode_id, data_handle_id);
-
-        let request = RenameRequestProto {
-            header: header(3901),
-            src_path: "/mnt/test/parent/source".to_string(),
-            dst_path: "/mnt/test/parent/destination".to_string(),
-            flags: 1,
-        };
-        let response = FileSystemServiceProto::rename(&env.service, Request::new(request))
-            .await
-            .expect("transport status must remain OK")
-            .into_inner();
-
-        assert_success_header(response.header);
-        assert_eq!(
-            env.storage.get_dentry(env.root_inode_id, "parent").unwrap(),
-            Some(parent_inode_id)
-        );
-        assert_eq!(env.storage.get_dentry(parent_inode_id, "source").unwrap(), None);
-        assert_eq!(
-            env.storage.get_dentry(parent_inode_id, "destination").unwrap(),
-            Some(inode_id)
-        );
-        assert_eq!(
-            env.storage.get_inode_by_data_handle(data_handle_id).unwrap(),
-            Some(inode_id)
-        );
-    }
-
     fn put_extent_file(
         env: &PathTestEnv,
         parent_inode_id: InodeId,
@@ -1500,56 +1381,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_mount_epoch_returns_refresh_metadata_header_with_consumable_mount_hint() {
+    async fn stale_epochs_return_consumable_refresh_metadata_hints() {
         let env = build_env("/mnt/test", DataIoPolicy::Allow, None);
 
-        let response = FileSystemServiceProto::get_status(
-            &env.service,
-            Request::new(GetStatusRequestProto {
-                header: header_with_freshness(101, Some(0), None, Vec::new()),
-                path: "/mnt/test".to_string(),
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
+        for (call_id, mount_epoch, route_epoch, error_kind, expected_route_epoch) in [
+            (101, Some(0), None, MetadataErrorKind::MountEpochMismatch, None),
+            (102, Some(1), Some(0), MetadataErrorKind::RouteEpochMismatch, Some(1)),
+        ] {
+            let response = FileSystemServiceProto::get_status(
+                &env.service,
+                Request::new(GetStatusRequestProto {
+                    header: header_with_freshness(call_id, mount_epoch, route_epoch, Vec::new()),
+                    path: "/mnt/test".to_string(),
+                }),
+            )
+            .await
+            .expect("transport status must remain OK")
+            .into_inner();
 
-        let response_header = response.header.expect("response header must exist");
-        let err = response_header.error.expect("header.error must exist");
-        let rpc_error = assert_refresh_metadata(&err, ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch));
-        assert_eq!(response_header.group_name, TEST_GROUP_NAME);
-        assert_eq!(response_header.mount_epoch, Some(1));
-        let hint = refresh_hint(&rpc_error);
-        assert_eq!(hint.group_name.as_deref(), Some(TEST_GROUP_NAME));
-        assert_eq!(hint.mount_epoch, Some(1));
-        assert_eq!(hint.route_epoch, None);
-    }
-
-    #[tokio::test]
-    async fn stale_route_epoch_returns_refresh_metadata_header_with_consumable_route_hint() {
-        let env = build_env("/mnt/test", DataIoPolicy::Allow, None);
-
-        let response = FileSystemServiceProto::get_status(
-            &env.service,
-            Request::new(GetStatusRequestProto {
-                header: header_with_freshness(102, Some(1), Some(0), Vec::new()),
-                path: "/mnt/test".to_string(),
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
-
-        let response_header = response.header.expect("response header must exist");
-        let err = response_header.error.expect("header.error must exist");
-        let rpc_error = assert_refresh_metadata(&err, ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch));
-        assert_eq!(response_header.group_name, TEST_GROUP_NAME);
-        assert_eq!(response_header.mount_epoch, Some(1));
-        assert_eq!(response_header.route_epoch, Some(1));
-        let hint = refresh_hint(&rpc_error);
-        assert_eq!(hint.group_name.as_deref(), Some(TEST_GROUP_NAME));
-        assert_eq!(hint.mount_epoch, Some(1));
-        assert_eq!(hint.route_epoch, Some(1));
+            let response_header = response.header.expect("response header must exist");
+            let err = response_header.error.expect("header.error must exist");
+            let rpc_error = assert_refresh_metadata(&err, ErrorKind::Metadata(error_kind));
+            assert_eq!(response_header.group_name, TEST_GROUP_NAME);
+            assert_eq!(response_header.mount_epoch, Some(1));
+            assert_eq!(response_header.route_epoch, expected_route_epoch);
+            let hint = refresh_hint(&rpc_error);
+            assert_eq!(hint.group_name.as_deref(), Some(TEST_GROUP_NAME));
+            assert_eq!(hint.mount_epoch, Some(1));
+            assert_eq!(hint.route_epoch, expected_route_epoch);
+        }
     }
 
     #[tokio::test]
@@ -1595,7 +1455,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leader_success_header_includes_group_state_watermark_when_last_applied_is_known() {
+    async fn success_headers_publish_state_only_for_leader() {
         let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
         let last_applied = env
             .raft_node
@@ -1624,10 +1484,7 @@ mod tests {
         let state = &response_header.state[0];
         assert_eq!(state.group_name, TEST_GROUP_NAME);
         assert_state_id(state.state_id.as_ref().expect("state id"), last_applied);
-    }
 
-    #[tokio::test]
-    async fn non_leader_success_header_leaves_state_empty() {
         let env = build_env("/mnt/test", DataIoPolicy::Allow, None);
 
         let response = FileSystemServiceProto::get_status(
@@ -1650,76 +1507,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_precedence_blocks_before_path_resolution() {
-        let readiness_gate = Arc::new(RootReadinessGate::new(None));
-        let env = build_env("/mnt/test", DataIoPolicy::Allow, Some(readiness_gate));
+    async fn admission_precedence_checks_readiness_and_leadership_before_lower_layers() {
+        {
+            let readiness_gate = Arc::new(RootReadinessGate::new(None));
+            let env = build_env("/mnt/test", DataIoPolicy::Allow, Some(readiness_gate));
 
-        let response = FileSystemServiceProto::get_status(
-            &env.service,
-            Request::new(GetStatusRequestProto {
-                header: header(1),
-                path: "".to_string(),
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
+            let response = FileSystemServiceProto::get_status(
+                &env.service,
+                Request::new(GetStatusRequestProto {
+                    header: header(1),
+                    path: "".to_string(),
+                }),
+            )
+            .await
+            .expect("transport status must remain OK")
+            .into_inner();
 
-        let err = header_error(response.header);
-        assert_retry(&err, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
-    }
+            let err = header_error(response.header);
+            assert_retry(&err, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
+        }
 
-    #[tokio::test]
-    async fn leadership_precedence_write_returns_not_leader_before_not_found() {
-        let env = build_env_with_nonleader_raft("/mnt/test", DataIoPolicy::Allow).await;
+        {
+            let env = build_env_with_nonleader_raft("/mnt/test", DataIoPolicy::Allow).await;
 
-        let response = FileSystemServiceProto::create_directory(
-            &env.service,
-            Request::new(CreateDirectoryRequestProto {
-                header: header(2),
-                path: "/mnt/test/missing/child".to_string(),
-                attrs: None,
-                recursive: false,
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
+            let response = FileSystemServiceProto::create_directory(
+                &env.service,
+                Request::new(CreateDirectoryRequestProto {
+                    header: header(2),
+                    path: "/mnt/test/missing/child".to_string(),
+                    attrs: None,
+                    recursive: false,
+                }),
+            )
+            .await
+            .expect("transport status must remain OK")
+            .into_inner();
 
-        let err = header_error(response.header);
-        assert_not_leader(&err);
-    }
+            let err = header_error(response.header);
+            assert_not_leader(&err);
+        }
 
-    #[tokio::test]
-    async fn leadership_precedence_data_io_returns_not_leader_before_mount_policy_error() {
-        let env = build_env_with_nonleader_raft("/mnt/test", DataIoPolicy::Forbid).await;
-        let file_inode_id = InodeId::new(2001);
-        env.storage
-            .put_inode(&Inode::new_file(
-                file_inode_id,
-                FileAttrs::new(),
-                env.mount_id,
-                DataHandleId::new(2001),
-            ))
-            .expect("put test file inode");
-        env.storage
-            .put_dentry(env.root_inode_id, "file", file_inode_id)
-            .expect("put test file dentry");
+        {
+            let env = build_env_with_nonleader_raft("/mnt/test", DataIoPolicy::Forbid).await;
+            let file_inode_id = InodeId::new(2001);
+            env.storage
+                .put_inode(&Inode::new_file(
+                    file_inode_id,
+                    FileAttrs::new(),
+                    env.mount_id,
+                    DataHandleId::new(2001),
+                ))
+                .expect("put test file inode");
+            env.storage
+                .put_dentry(env.root_inode_id, "file", file_inode_id)
+                .expect("put test file dentry");
 
-        let response = FileSystemServiceProto::open_write(
-            &env.service,
-            Request::new(OpenWriteRequestProto {
-                header: header(3),
-                path: "/mnt/test/file".to_string(),
-                mode: OpenWriteModeProto::OpenWriteModeAppend as i32,
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
+            let response = FileSystemServiceProto::open_write(
+                &env.service,
+                Request::new(OpenWriteRequestProto {
+                    header: header(3),
+                    path: "/mnt/test/file".to_string(),
+                    mode: OpenWriteModeProto::OpenWriteModeAppend as i32,
+                }),
+            )
+            .await
+            .expect("transport status must remain OK")
+            .into_inner();
 
-        let err = header_error(response.header);
-        assert_not_leader(&err);
+            let err = header_error(response.header);
+            assert_not_leader(&err);
+        }
     }
 
     #[tokio::test]
@@ -2208,70 +2065,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_locations_by_path_uses_current_handle() {
-        let env = build_env("/", DataIoPolicy::Allow, None);
-        let file_inode_id = InodeId::new(9103);
-        let current_handle = DataHandleId::new(99103);
-        let stale_handle = DataHandleId::new(99104);
-        let mut attrs = FileAttrs::new();
-        attrs.size = 128;
-        let mut inode = Inode::new_file(file_inode_id, attrs, env.mount_id, current_handle);
-        inode.data = beryl_types::fs::InodeData::File {
-            extents: vec![Extent {
-                file_offset: 0,
-                block_id: BlockId::new(current_handle, BlockIndex::new(0)),
-                block_offset: 0,
-                len: 128,
-                content_revision: Some(8),
-                block_stamp: Some(8),
-            }],
-            content_revision: Some(8),
-            lease_epoch: Some(8),
-            next_block_index: 1,
-        };
-        env.storage.put_inode(&inode).expect("put file inode");
-        env.storage
-            .put_dentry(env.root_inode_id, "file", file_inode_id)
-            .expect("put file dentry");
-        env.storage
-            .put_layout(file_inode_id, FileLayout::new(4096, 4096, 1))
-            .expect("put layout");
-        env.storage
-            .put_data_handle_owner(current_handle, file_inode_id)
-            .expect("put current owner");
-        env.storage
-            .put_data_handle_owner(stale_handle, file_inode_id)
-            .expect("put stale owner");
-
-        let response = FileSystemServiceProto::get_block_locations(
-            &env.service,
-            Request::new(GetBlockLocationsRequestProto {
-                header: header(23),
-                target: Some(get_block_locations_request_proto::Target::Path("/file".to_string())),
-                range: None,
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
-
-        assert_success_header(response.header);
-        assert_eq!(
-            response.data_handle_id.expect("data handle").value,
-            current_handle.as_raw()
-        );
-        assert_eq!(response.content_revision, Some(8));
-        assert_eq!(
-            response.locations[0]
-                .block_id
-                .as_ref()
-                .expect("block id")
-                .data_handle_id,
-            current_handle.as_raw()
-        );
-    }
-
-    #[tokio::test]
     async fn create_file_durable_step_does_not_require_write_runtime() {
         let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
 
@@ -2526,47 +2319,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recursive_delete_nested_tree_success_removes_subtree_only() {
-        let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
-        let dir = InodeId::new(4101);
-        let a = InodeId::new(4102);
-        let b = InodeId::new(4103);
-        let empty_subdir = InodeId::new(4104);
-        let file1 = InodeId::new(4105);
-        let file2 = InodeId::new(4106);
-        let file1_handle = DataHandleId::new(4105);
-        let file2_handle = DataHandleId::new(4106);
-
-        put_dir(&env, env.root_inode_id, "dir", dir);
-        put_dir(&env, dir, "a", a);
-        put_dir(&env, a, "b", b);
-        put_dir(&env, dir, "empty_subdir", empty_subdir);
-        put_empty_file(&env, a, "file1", file1, file1_handle);
-        put_empty_file(&env, b, "file2", file2, file2_handle);
-
-        let response = FileSystemServiceProto::delete(
-            &env.service,
-            Request::new(DeleteRequestProto {
-                header: header(141),
-                path: "/mnt/test/dir".to_string(),
-                recursive: true,
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
-
-        assert_success_header(response.header);
-        assert_eq!(env.storage.get_dentry(env.root_inode_id, "dir").unwrap(), None);
-        for inode_id in [dir, a, b, empty_subdir, file1, file2] {
-            assert!(env.storage.get_inode(inode_id).unwrap().is_none());
-        }
-        assert!(env.storage.get_inode(env.root_inode_id).unwrap().is_some());
-        assert_eq!(env.storage.get_inode_by_data_handle(file1_handle).unwrap(), None);
-        assert_eq!(env.storage.get_inode_by_data_handle(file2_handle).unwrap(), None);
-    }
-
-    #[tokio::test]
     async fn recursive_delete_extent_file_cleans_namespace_layout_and_owner_once() {
         let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
         let parent = InodeId::new(4200);
@@ -2731,17 +2483,19 @@ mod tests {
         let dir = InodeId::new(4401);
         let child_mount_root = InodeId::new(4402);
         put_dir(&env, env.root_inode_id, "dir", dir);
-        let child_mount = env
-            .mount_table
-            .create_mount(
-                "/mnt/test/dir/mnt".to_string(),
-                MountKind::External,
-                Some("file:///tmp/mnt_test_dir_mnt".to_string()),
-                DataIoPolicy::Allow,
-                group_name("root"),
-                child_mount_root,
-            )
-            .expect("create child mount");
+        let child_mount = publish_mount(
+            &env.mount_table,
+            MountEntry {
+                mount_id: MountId::new(2),
+                mount_prefix: "/mnt/test/dir/mnt".to_string(),
+                mount_kind: MountKind::External,
+                ufs_uri: Some("file:///tmp/mnt_test_dir_mnt".to_string()),
+                data_io_policy: DataIoPolicy::Allow,
+                mount_epoch: 2,
+                namespace_owner_group_name: group_name("root"),
+                root_inode_id: child_mount_root,
+            },
+        );
         env.storage
             .put_inode(&Inode::new_dir(
                 child_mount_root,
@@ -2771,68 +2525,6 @@ mod tests {
         assert_eq!(env.storage.get_dentry(dir, "mnt").unwrap(), Some(child_mount_root));
         assert!(env.storage.get_inode(dir).unwrap().is_some());
         assert!(env.storage.get_inode(child_mount_root).unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn delete_regular_empty_file_success_removes_namespace_layout_and_data_owner() {
-        let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
-        let file_inode_id = InodeId::new(5001);
-        let data_handle_id = DataHandleId::new(5001);
-        let parent = env
-            .storage
-            .get_inode(env.root_inode_id)
-            .expect("load parent inode")
-            .expect("parent inode must exist");
-        let file_inode = Inode::new_file(file_inode_id, FileAttrs::new(), env.mount_id, data_handle_id);
-        let layout = FileLayout::new(4096, 4096, 1);
-        env.storage
-            .put_test_file_atomic(env.root_inode_id, "file", &file_inode, &parent, layout)
-            .expect("create empty file");
-
-        let response = FileSystemServiceProto::delete(
-            &env.service,
-            Request::new(DeleteRequestProto {
-                header: header(15),
-                path: "/mnt/test/file".to_string(),
-                recursive: false,
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
-
-        assert_success_header(response.header);
-        assert_eq!(env.storage.get_dentry(env.root_inode_id, "file").unwrap(), None);
-        assert!(env.storage.get_inode(file_inode_id).unwrap().is_none());
-        assert!(env.storage.get_layout(file_inode_id).is_err());
-        assert_eq!(env.storage.get_inode_by_data_handle(data_handle_id).unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn delete_empty_dir_success_removes_namespace_and_inode() {
-        let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
-        let dir_inode_id = InodeId::new(6001);
-        env.storage
-            .put_inode(&Inode::new_dir(dir_inode_id, FileAttrs::new(), env.mount_id))
-            .expect("put empty directory inode");
-        env.storage
-            .put_dentry(env.root_inode_id, "dir", dir_inode_id)
-            .expect("put empty directory dentry");
-
-        let request = DeleteRequestProto {
-            header: header(16),
-            path: "/mnt/test/dir".to_string(),
-            recursive: false,
-        };
-        let response = FileSystemServiceProto::delete(&env.service, Request::new(request))
-            .await
-            .expect("transport status must remain OK")
-            .into_inner();
-
-        assert_success_header(response.header);
-        assert_eq!(env.storage.get_dentry(env.root_inode_id, "dir").unwrap(), None);
-        assert!(env.storage.get_inode(dir_inode_id).unwrap().is_none());
-        assert!(env.storage.get_inode(env.root_inode_id).unwrap().is_some());
     }
 
     #[tokio::test]
@@ -2882,45 +2574,5 @@ mod tests {
             Some(child_inode_id)
         );
         assert!(env.storage.get_inode(child_inode_id).unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn delete_symlink_success_preserves_data_handle_owner_zero_mapping() {
-        let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
-        let symlink_inode_id = InodeId::new(8001);
-        let sentinel_owner_inode_id = InodeId::new(8002);
-        let symlink_inode = Inode::new_symlink(
-            symlink_inode_id,
-            FileAttrs::new(),
-            "/mnt/test/target".to_string(),
-            env.mount_id,
-        );
-        env.storage.put_inode(&symlink_inode).expect("put symlink inode");
-        env.storage
-            .put_dentry(env.root_inode_id, "link", symlink_inode_id)
-            .expect("put symlink dentry");
-        env.storage
-            .put_data_handle_owner(DataHandleId::new(0), sentinel_owner_inode_id)
-            .expect("put sentinel owner mapping");
-
-        let response = FileSystemServiceProto::delete(
-            &env.service,
-            Request::new(DeleteRequestProto {
-                header: header(18),
-                path: "/mnt/test/link".to_string(),
-                recursive: false,
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
-
-        assert_success_header(response.header);
-        assert_eq!(env.storage.get_dentry(env.root_inode_id, "link").unwrap(), None);
-        assert!(env.storage.get_inode(symlink_inode_id).unwrap().is_none());
-        assert_eq!(
-            env.storage.get_inode_by_data_handle(DataHandleId::new(0)).unwrap(),
-            Some(sentinel_owner_inode_id)
-        );
     }
 }

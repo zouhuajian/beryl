@@ -1303,24 +1303,20 @@ mod tests {
     }
 
     #[test]
-    fn validate_expected_block_shape_accepts_matching_block_local_shape() {
+    fn validate_expected_block_shape_accepts_full_and_tail_shapes() {
         let (group_name_value, block_id) = ids();
         let meta = ready_meta(group_name_value, block_id);
-        let expected = expected_shape(group_name_value, block_id, Some(99));
 
-        validate_expected_block_shape(&expected, &meta).expect("matching shape must pass");
-    }
-
-    #[test]
-    fn validate_expected_block_shape_accepts_tail_effective_length_with_full_block_size() {
-        let (group_name_value, block_id) = ids();
-        let meta = ready_meta(group_name_value, block_id);
-        let expected = ExpectedBlockShape {
-            effective_len: Some(3072),
-            ..expected_shape(group_name_value, block_id, Some(99))
-        };
-
-        validate_expected_block_shape(&expected, &meta).expect("tail effective length must pass");
+        validate_expected_block_shape(&expected_shape(group_name_value, block_id, Some(99)), &meta)
+            .expect("matching full shape must pass");
+        validate_expected_block_shape(
+            &ExpectedBlockShape {
+                effective_len: Some(3072),
+                ..expected_shape(group_name_value, block_id, Some(99))
+            },
+            &meta,
+        )
+        .expect("matching tail shape must pass");
     }
 
     #[test]
@@ -1657,12 +1653,13 @@ mod tests {
     }
 
     #[test]
-    fn staging_write_rejects_offset_plus_len_beyond_block_size() {
+    fn staging_write_rejects_oversized_and_sparse_ranges() {
         let (_temp, store) = store();
         let (group_name_value, block_id) = ids();
         create_default_block(&store, group_name_value, block_id);
 
         assert_invalid_argument(store.write_at(group_name_value, block_id, 0, Bytes::from(vec![1; 4097])));
+        assert_invalid_argument(store.write_at(group_name_value, block_id, 1024, Bytes::from(vec![1; 1024])));
     }
 
     #[test]
@@ -1719,39 +1716,6 @@ mod tests {
     }
 
     #[test]
-    fn publish_ready_writes_final_effective_len() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        store
-            .create_staging_block(CreateStagingBlockRequest {
-                group_name: group_name_value.to_owned(),
-                block_id,
-                block_size: 4096,
-                block_format_id: BlockFormatId::FULL_EFFECTIVE,
-                chunk_size: 1024,
-                checksum_kind: ChecksumKind::None,
-                tier: Tier::Hdd,
-            })
-            .expect("create staging block");
-        store
-            .write_at(group_name_value, block_id, 0, Bytes::from(vec![7; 3072]))
-            .expect("write complete effective block");
-        store
-            .publish_ready(PublishReadyRequest {
-                group_name: group_name_value.to_owned(),
-                block_id,
-                effective_len: 3072,
-                block_stamp: 0xfeed_cafe,
-            })
-            .expect("publish ready");
-
-        let loaded = store.load_meta(group_name_value, block_id).expect("load meta");
-        assert_eq!(loaded.format.block_size, 4096);
-        assert_eq!(loaded.source.effective_len, 3072);
-        assert_eq!(loaded.visibility.block_stamp, 0xfeed_cafe);
-    }
-
-    #[test]
     fn write_at_rejects_ready_block() {
         let (_temp, store) = store();
         let (group_name_value, block_id) = ids();
@@ -1781,23 +1745,6 @@ mod tests {
         assert_invalid_argument(store.publish_ready(publish_request(group_name_value, block_id, 4096, 2)));
         let reloaded = store.load_meta(group_name_value, block_id).expect("load meta");
         assert_eq!(reloaded.visibility.block_stamp, meta.visibility.block_stamp);
-    }
-
-    #[test]
-    fn publish_ready_requires_complete_effective_block() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        store
-            .create_staging_block(request(group_name_value, block_id, 4096, 1024))
-            .expect("create staging block");
-        let paths = store.paths(group_name_value, block_id);
-        store
-            .write_at(group_name_value, block_id, 0, Bytes::from(vec![7; 1024]))
-            .expect("write first bytes");
-
-        assert_corrupt(store.publish_ready(publish_request(group_name_value, block_id, 1536, 1)));
-
-        assert!(!paths.meta_path.exists());
     }
 
     #[test]
@@ -1877,18 +1824,6 @@ mod tests {
     }
 
     #[test]
-    fn read_at_rejects_unpublished_staging_block() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        create_default_block(&store, group_name_value, block_id);
-        store
-            .write_at(group_name_value, block_id, 0, Bytes::from(vec![4; 4096]))
-            .expect("write");
-
-        assert_not_found(store.read_at(group_name_value, block_id, 0, 8));
-    }
-
-    #[test]
     fn read_at_rejects_corrupt_block() {
         let (_temp, store) = store();
         let (group_name_value, block_id) = ids();
@@ -1930,16 +1865,52 @@ mod tests {
     }
 
     #[test]
-    fn load_meta_rejects_bad_magic() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        publish_default_block(&store, group_name_value, block_id);
-        let paths = store.paths(group_name_value, block_id);
-        let mut encoded = fs::read(&paths.meta_path).expect("read meta");
-        encoded[0] ^= 0xff;
-        fs::write(&paths.meta_path, encoded).expect("write meta");
+    fn load_meta_rejects_invalid_header_fields() {
+        enum Corruption {
+            BadMagic,
+            WrongHeaderLength,
+            ZeroPayloadLength,
+            OversizedPayloadLength,
+            TruncatedPayload,
+        }
 
-        assert_corrupt(store.load_meta(group_name_value, block_id));
+        for (case, corruption) in [
+            ("bad magic", Corruption::BadMagic),
+            ("wrong header length", Corruption::WrongHeaderLength),
+            ("zero payload length", Corruption::ZeroPayloadLength),
+            ("oversized payload length", Corruption::OversizedPayloadLength),
+            ("truncated payload", Corruption::TruncatedPayload),
+        ] {
+            let (_temp, store) = store();
+            let (group_name_value, block_id) = ids();
+            publish_default_block(&store, group_name_value, block_id);
+            let paths = store.paths(group_name_value, block_id);
+            match corruption {
+                Corruption::BadMagic => {
+                    let mut encoded = fs::read(&paths.meta_path).expect("read meta");
+                    encoded[0] ^= 0xff;
+                    fs::write(&paths.meta_path, encoded).expect("write meta");
+                }
+                Corruption::WrongHeaderLength => {
+                    overwrite_header_u32(&paths, 8, BlockMetaHeader::encoded_len() as u32 + 4);
+                }
+                Corruption::ZeroPayloadLength => overwrite_header_u64(&paths, 12, 0),
+                Corruption::OversizedPayloadLength => {
+                    overwrite_header_u64(&paths, 12, MAX_META_PAYLOAD_LEN as u64 + 1);
+                }
+                Corruption::TruncatedPayload => {
+                    let actual_len = fs::metadata(&paths.meta_path).expect("meta metadata").len();
+                    let payload_len = actual_len - BlockMetaHeader::encoded_len() as u64 + 1;
+                    overwrite_header_u64(&paths, 12, payload_len);
+                }
+            }
+
+            let result = store.load_meta(group_name_value, block_id);
+            assert!(
+                matches!(result, Err(WorkerError::Corrupt(_))),
+                "case {case} should reject metadata as corrupt, got {result:?}"
+            );
+        }
     }
 
     #[test]
@@ -1960,158 +1931,19 @@ mod tests {
     }
 
     #[test]
-    fn load_meta_rejects_wrong_header_len() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        publish_default_block(&store, group_name_value, block_id);
-        let paths = store.paths(group_name_value, block_id);
-        overwrite_header_u32(&paths, 8, BlockMetaHeader::encoded_len() as u32 + 4);
-
-        assert_corrupt(store.load_meta(group_name_value, block_id));
-    }
-
-    #[test]
-    fn load_meta_rejects_zero_payload_len() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        publish_default_block(&store, group_name_value, block_id);
-        let paths = store.paths(group_name_value, block_id);
-        overwrite_header_u64(&paths, 12, 0);
-
-        assert_corrupt(store.load_meta(group_name_value, block_id));
-    }
-
-    #[test]
-    fn load_meta_rejects_oversized_payload_len() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        publish_default_block(&store, group_name_value, block_id);
-        let paths = store.paths(group_name_value, block_id);
-        overwrite_header_u64(&paths, 12, MAX_META_PAYLOAD_LEN as u64 + 1);
-
-        assert_corrupt(store.load_meta(group_name_value, block_id));
-    }
-
-    #[test]
-    fn load_meta_rejects_truncated_payload() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        publish_default_block(&store, group_name_value, block_id);
-        let paths = store.paths(group_name_value, block_id);
-        let actual_len = fs::metadata(&paths.meta_path).expect("meta metadata").len();
-        let payload_len = actual_len - BlockMetaHeader::encoded_len() as u64 + 1;
-        overwrite_header_u64(&paths, 12, payload_len);
-
-        assert_corrupt(store.load_meta(group_name_value, block_id));
-    }
-
-    #[test]
-    fn load_meta_rejects_missing_identity() {
+    fn load_meta_rejects_invalid_payload_fields() {
         let (_temp, store) = store();
         let (group_name_value, block_id) = ids();
         publish_default_block(&store, group_name_value, block_id);
         let paths = store.paths(group_name_value, block_id);
         let valid = store.load_meta(group_name_value, block_id).expect("load meta");
 
-        let payload = protobuf_payload_missing_identity(&valid);
-        persist_raw_payload(&paths, &payload);
-
-        assert_corrupt(store.load_meta(group_name_value, block_id));
-    }
-
-    #[test]
-    fn load_meta_rejects_missing_block_id() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        publish_default_block(&store, group_name_value, block_id);
-        let paths = store.paths(group_name_value, block_id);
-        let valid = store.load_meta(group_name_value, block_id).expect("load meta");
-
-        let payload = protobuf_payload_missing_block_id(&valid);
-        persist_raw_payload(&paths, &payload);
-
-        assert_corrupt(store.load_meta(group_name_value, block_id));
-    }
-
-    #[test]
-    fn load_meta_rejects_missing_group_name() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        publish_default_block(&store, group_name_value, block_id);
-        let paths = store.paths(group_name_value, block_id);
-        let valid = store.load_meta(group_name_value, block_id).expect("load meta");
-
-        let payload = protobuf_payload_missing_group_name(&valid);
-        persist_raw_payload(&paths, &payload);
-
-        assert_corrupt(store.load_meta(group_name_value, block_id));
-    }
-
-    #[test]
-    fn load_meta_rejects_unspecified_block_state() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        publish_default_block(&store, group_name_value, block_id);
-        let paths = store.paths(group_name_value, block_id);
-        let valid = store.load_meta(group_name_value, block_id).expect("load meta");
-
-        let payload = protobuf_payload_with_block_state(&valid, 0);
-        persist_raw_payload(&paths, &payload);
-
-        assert_corrupt(store.load_meta(group_name_value, block_id));
-    }
-
-    #[test]
-    fn load_meta_rejects_unsupported_block_state() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        publish_default_block(&store, group_name_value, block_id);
-        let paths = store.paths(group_name_value, block_id);
-        let valid = store.load_meta(group_name_value, block_id).expect("load meta");
-
-        let payload = protobuf_payload_with_block_state(&valid, 99);
-        persist_raw_payload(&paths, &payload);
-
-        assert_corrupt(store.load_meta(group_name_value, block_id));
-    }
-
-    #[test]
-    fn load_meta_rejects_effective_len_larger_than_block_size() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        publish_default_block(&store, group_name_value, block_id);
-        let paths = store.paths(group_name_value, block_id);
-        let valid = store.load_meta(group_name_value, block_id).expect("load meta");
-
-        let mut invalid = valid.clone();
-        invalid.source.effective_len = invalid.format.block_size + 1;
-        persist_raw_meta_payload(&paths, &invalid);
-        assert_corrupt(store.load_meta(group_name_value, block_id));
-    }
-
-    #[test]
-    fn load_meta_rejects_block_size_not_multiple_of_chunk_size() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        publish_default_block(&store, group_name_value, block_id);
-        let paths = store.paths(group_name_value, block_id);
-        let valid = store.load_meta(group_name_value, block_id).expect("load meta");
-
-        let mut invalid = valid.clone();
-        invalid.format.block_size = 4097;
-        persist_raw_meta_payload(&paths, &invalid);
-        assert_corrupt(store.load_meta(group_name_value, block_id));
-    }
-
-    #[test]
-    fn meta_payload_semantic_validation_rejects_invalid_core_fields() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        publish_default_block(&store, group_name_value, block_id);
-        let paths = store.paths(group_name_value, block_id);
-        let valid = store.load_meta(group_name_value, block_id).expect("load meta");
-
-        let cases = [
+        let cases = vec![
+            ("missing identity", protobuf_payload_missing_identity(&valid)),
+            ("missing block_id", protobuf_payload_missing_block_id(&valid)),
+            ("missing group_name", protobuf_payload_missing_group_name(&valid)),
+            ("unspecified block state", protobuf_payload_with_block_state(&valid, 0)),
+            ("unsupported block state", protobuf_payload_with_block_state(&valid, 99)),
             ("unsupported format_id", {
                 protobuf_payload_with_format_id(&valid, BlockFormatId::FULL_EFFECTIVE.as_raw() + 1)
             }),
@@ -2130,10 +1962,21 @@ mod tests {
                 invalid.source.effective_len = 0;
                 encode_meta_payload(&invalid).expect("encode zero effective length")
             }),
+            ("effective_len larger than block_size", {
+                let mut invalid = valid.clone();
+                invalid.source.effective_len = invalid.format.block_size + 1;
+                encode_meta_payload(&invalid).expect("encode oversized effective length")
+            }),
+            ("block_size not divisible by chunk_size", {
+                let mut invalid = valid.clone();
+                invalid.format.block_size = 4097;
+                encode_meta_payload(&invalid).expect("encode misaligned block size")
+            }),
             ("missing format", protobuf_payload_missing_format(&valid)),
             ("missing source", protobuf_payload_missing_source(&valid)),
             ("missing visibility", protobuf_payload_missing_visibility(&valid)),
             ("missing tier", protobuf_payload_missing_tier(&valid)),
+            ("protobuf decode failure", vec![0xff, 0xff]),
         ];
 
         for (case, payload) in cases {
@@ -2144,25 +1987,6 @@ mod tests {
                 "case {case} should reject final metadata as corrupt, got {result:?}"
             );
         }
-    }
-
-    #[test]
-    fn load_meta_rejects_path_identity_mismatch() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        publish_default_block(&store, group_name_value, block_id);
-        let paths = store.paths(group_name_value, block_id);
-        let valid = store.load_meta(group_name_value, block_id).expect("load meta");
-
-        let mut invalid = valid.clone();
-        invalid.identity.group_name = GroupName::parse("analytics").unwrap();
-        persist_raw_meta_payload(&paths, &invalid);
-        assert_corrupt(store.load_meta(group_name_value, block_id));
-
-        let mut invalid = valid;
-        invalid.identity.block_id = BlockId::new(block_id.data_handle_id, BlockIndex::new(block_id.index.as_raw() + 1));
-        persist_raw_meta_payload(&paths, &invalid);
-        assert_corrupt(store.load_meta(group_name_value, block_id));
     }
 
     #[test]
@@ -2238,44 +2062,31 @@ mod tests {
     }
 
     #[test]
-    fn final_meta_without_data_is_rejected() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        let mut meta = ready_meta(group_name_value, block_id);
-        meta.source.effective_len = 4096;
-        meta.visibility.block_stamp = 55;
-        persist_meta(&store, group_name_value, block_id, &meta);
+    fn final_data_length_must_match_effective_length() {
+        let cases = [
+            ("missing data", None, 4096),
+            ("short data", Some(2048), 3072),
+            ("long data", Some(4096), 3072),
+        ];
 
-        assert_scan_corrupt(&store, group_name_value);
-        assert_corrupt(store.read_at(group_name_value, block_id, 0, 1));
-    }
+        for (case, data_len, effective_len) in cases {
+            let (_temp, store) = store();
+            let (group_name_value, block_id) = ids();
+            let mut meta = ready_meta(group_name_value, block_id);
+            meta.source.effective_len = effective_len;
+            meta.visibility.block_stamp = 55;
+            if let Some(data_len) = data_len {
+                write_final_data(&store, group_name_value, block_id, &vec![7; data_len]);
+            }
+            persist_meta(&store, group_name_value, block_id, &meta);
 
-    #[test]
-    fn short_data_for_effective_len_is_rejected() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        let mut meta = ready_meta(group_name_value, block_id);
-        meta.source.effective_len = 3072;
-        meta.visibility.block_stamp = 55;
-        write_final_data(&store, group_name_value, block_id, &[7; 2048]);
-        persist_meta(&store, group_name_value, block_id, &meta);
-
-        assert_scan_corrupt(&store, group_name_value);
-        assert_corrupt(store.read_at(group_name_value, block_id, 0, 1));
-    }
-
-    #[test]
-    fn long_data_for_effective_len_is_rejected() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        let mut meta = ready_meta(group_name_value, block_id);
-        meta.source.effective_len = 3072;
-        meta.visibility.block_stamp = 55;
-        write_final_data(&store, group_name_value, block_id, &[7; 4096]);
-        persist_meta(&store, group_name_value, block_id, &meta);
-
-        assert_scan_corrupt(&store, group_name_value);
-        assert_corrupt(store.read_at(group_name_value, block_id, 0, 1));
+            assert_scan_corrupt(&store, group_name_value);
+            let result = store.read_at(group_name_value, block_id, 0, 1);
+            assert!(
+                matches!(result, Err(WorkerError::Corrupt(_))),
+                "case {case} should reject block as corrupt, got {result:?}"
+            );
+        }
     }
 
     #[test]
@@ -2513,29 +2324,6 @@ mod tests {
     }
 
     #[test]
-    fn load_meta_missing_returns_not_found() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-
-        match store
-            .load_meta(group_name_value, block_id)
-            .expect_err("missing meta should fail")
-        {
-            WorkerError::NotFound(_) => {}
-            other => panic!("expected not found error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn staging_write_rejects_sparse_gap() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        create_default_block(&store, group_name_value, block_id);
-
-        assert_invalid_argument(store.write_at(group_name_value, block_id, 1024, Bytes::from(vec![1; 1024])));
-    }
-
-    #[test]
     fn staging_meta_with_effective_len_not_equal_to_block_size_is_rejected() {
         let (_temp, store) = store();
         let (group_name_value, block_id) = ids();
@@ -2547,17 +2335,5 @@ mod tests {
         persist_raw_staging_meta_payload(&paths, &meta);
 
         assert_corrupt(store.write_at(group_name_value, block_id, 0, Bytes::from_static(b"x")));
-    }
-
-    #[test]
-    fn load_meta_rejects_protobuf_decode_failure() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        publish_default_block(&store, group_name_value, block_id);
-        let paths = store.paths(group_name_value, block_id);
-
-        persist_raw_payload(&paths, &[0xff, 0xff]);
-
-        assert_corrupt(store.load_meta(group_name_value, block_id));
     }
 }

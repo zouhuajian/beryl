@@ -439,7 +439,6 @@ mod test_support {
     pub(super) use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
     pub(super) use crate::service::filesystem::publish::{CloseWriteIntent, CloseWriteOutput};
     pub(super) use crate::service::filesystem::write::OpenWriteOutput;
-    pub(super) use crate::state::MemoryStateStore;
     pub(super) use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerManager};
     pub(super) use beryl_common::error::rpc::{
         ErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail, WorkerErrorKind,
@@ -453,6 +452,21 @@ mod test_support {
     pub(super) use std::sync::Arc;
     pub(super) use std::time::Duration;
     pub(super) use tempfile::TempDir;
+
+    pub(super) struct MemoryStateStore;
+
+    impl MemoryStateStore {
+        pub(super) fn new() -> Self {
+            Self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StateStore for MemoryStateStore {
+        async fn get_route_epoch(&self) -> MetadataResult<crate::state::RouteEpoch> {
+            Ok(crate::state::RouteEpoch::new(1))
+        }
+    }
 
     pub(super) struct TestFilesystem {
         filesystem: MetadataFileSystem,

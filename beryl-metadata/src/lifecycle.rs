@@ -481,6 +481,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beryl_types::ids::MountId;
     use tempfile::TempDir;
 
     #[test]
@@ -497,5 +498,74 @@ mod tests {
 
         drop(first);
         acquire_format_lock(&config).expect("format lock must be released when its owner exits");
+    }
+
+    fn lifecycle_config(dir: &TempDir) -> MetadataConfig {
+        MetadataConfig {
+            storage_dir: dir.path().join("metadata"),
+            ..MetadataConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_format_creates_root_namespace_through_raft_path() {
+        let dir = TempDir::new().unwrap();
+        let config = lifecycle_config(&dir);
+        format_metadata_storage(&config).await.unwrap();
+
+        prepare_metadata_start(&config).await.unwrap();
+
+        let storage = RocksDBStorage::create_for_format(&config.storage_dir).unwrap();
+        let mount_table = MountTable::load_from_storage(&storage).unwrap();
+        assert!(storage.get_inode(ROOT_INODE_ID).unwrap().is_some());
+        let mounts = mount_table.list_mounts();
+        assert_eq!(mounts.len(), 1);
+        let root = &mounts[0];
+        assert_eq!(root.mount_id, MountId::new(1));
+        assert_eq!(root.mount_prefix, ROOT_MOUNT_PREFIX);
+        assert_eq!(root.mount_kind, MountKind::Internal);
+        assert_eq!(root.data_io_policy, DataIoPolicy::Allow);
+        assert_eq!(root.namespace_owner_group_name, GroupName::parse("root").unwrap());
+    }
+
+    #[tokio::test]
+    async fn metadata_start_rejects_root_without_data_io() {
+        let dir = TempDir::new().unwrap();
+        let config = lifecycle_config(&dir);
+        format_metadata_storage(&config).await.unwrap();
+        let storage = RocksDBStorage::create_for_format(&config.storage_dir).unwrap();
+        let mut root = MountTable::load_from_storage(&storage)
+            .unwrap()
+            .list_mounts()
+            .into_iter()
+            .find(|mount| mount.mount_prefix == ROOT_MOUNT_PREFIX)
+            .expect("root mount after format");
+        root.data_io_policy = DataIoPolicy::Forbid;
+        storage.put_mount(&root).unwrap();
+        drop(storage);
+
+        let err = prepare_metadata_start(&config)
+            .await
+            .expect_err("root must be writable for data IO on start");
+        let message = err.to_string();
+
+        assert!(message.contains("root mount exists"), "{message}");
+        assert!(message.contains("violates root invariants"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn metadata_start_accepts_root_attributes_changed_by_normal_namespace_mutation() {
+        let dir = TempDir::new().unwrap();
+        let config = lifecycle_config(&dir);
+        format_metadata_storage(&config).await.unwrap();
+        let storage = RocksDBStorage::create_for_format(&config.storage_dir).unwrap();
+        let mut root = storage.get_inode(ROOT_INODE_ID).unwrap().unwrap();
+        root.attrs.mtime_ms = root.attrs.mtime_ms.saturating_add(1);
+        root.attrs.ctime_ms = root.attrs.ctime_ms.saturating_add(1);
+        root.attrs.size = 4096;
+        storage.put_inode(&root).unwrap();
+        drop(storage);
+
+        prepare_metadata_start(&config).await.unwrap();
     }
 }

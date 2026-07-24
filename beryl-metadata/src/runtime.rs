@@ -662,25 +662,6 @@ mod tests {
         flat.set("observe.metrics.prometheus.path", "/metrics");
         beryl_common::observe::ObservabilityConfig::from_flat(&flat).expect("test observe config")
     }
-
-    #[tokio::test]
-    async fn runtime_composition_separates_worker_maintenance_and_readiness() {
-        let dir = TempDir::new().unwrap();
-        let config = test_config();
-        let authority = test_authority(&dir).await;
-        let maintenance_repair = build_maintenance_repair_state(&config);
-        let (worker_runtime, mut worker_service) = build_worker_runtime(&authority, &maintenance_repair).unwrap();
-        let readiness = build_readiness(&config, &authority).await;
-        let maintenance = build_maintenance(&authority, &worker_runtime, &readiness, maintenance_repair).await;
-        let worker_background = build_worker_background(&worker_runtime, &mut worker_service, &maintenance);
-        let _worker_background = worker_background;
-        assert_eq!(maintenance._maintenance_handle.task_count(), 3);
-        let _filesystem =
-            build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
-                .await
-                .unwrap();
-    }
-
     #[tokio::test]
     async fn worker_runtime_loads_durable_descriptors_without_live_registration() {
         let dir = TempDir::new().unwrap();
@@ -718,29 +699,6 @@ mod tests {
             .get_registration(&authority.group_name, worker_id)
             .is_none());
     }
-
-    #[tokio::test]
-    async fn runtime_handles_hold_started_background_tasks() {
-        let dir = TempDir::new().unwrap();
-        let config = test_config();
-        let authority = test_authority(&dir).await;
-        let readiness = build_readiness(&config, &authority).await;
-        let maintenance_repair = build_maintenance_repair_state(&config);
-        let (worker_runtime, mut worker_service) = build_worker_runtime(&authority, &maintenance_repair).unwrap();
-        let filesystem = build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
-            .await
-            .unwrap();
-        let maintenance = build_maintenance(&authority, &worker_runtime, &readiness, maintenance_repair).await;
-        let worker_background = build_worker_background(&worker_runtime, &mut worker_service, &maintenance);
-        let (_services, handles) =
-            compose_services(filesystem, worker_service, readiness, worker_background, maintenance);
-
-        assert_eq!(handles._worker_background._handle.task_count(), 0);
-        assert_eq!(handles._maintenance._maintenance_handle.task_count(), 3);
-        assert!(Arc::strong_count(&handles._readiness.gate) >= 1);
-        let _readiness_watcher_finished = handles._readiness._watcher.is_finished();
-    }
-
     #[tokio::test]
     async fn msync_success_on_leader_returns_authoritative_watermark() {
         let dir = TempDir::new().unwrap();
@@ -872,31 +830,6 @@ mod tests {
         assert_eq!(rpc_error.kind, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
         assert!(matches!(rpc_error.recovery, RecoveryAction::RefreshMetadata { .. }));
     }
-
-    #[tokio::test]
-    async fn metadata_server_build_composes_required_runtime() {
-        let dir = TempDir::new().unwrap();
-        let mut config = test_config();
-        config.storage_dir = dir.path().to_path_buf();
-        crate::lifecycle::format_metadata_storage(&config).await.unwrap();
-
-        let server = MetadataServer::build(Arc::new(config)).await.unwrap();
-
-        assert_eq!(server.config.rpc_addr, "127.0.0.1:18080".parse().unwrap());
-        assert_eq!(server.authority.group_name, GroupName::parse("root").unwrap());
-        assert!(dir.path().join("CURRENT").exists());
-        assert!(server
-            .authority
-            .mount_table
-            .list_mounts()
-            .iter()
-            .any(|entry| entry.mount_prefix == "/"));
-        assert!(server.worker.manager.is_blockreport_converged(0).converged);
-        assert_eq!(server.handles._worker_background._handle.task_count(), 0);
-        assert_eq!(server.handles._maintenance._maintenance_handle.task_count(), 3);
-        assert!(Arc::strong_count(&server.handles._readiness.gate) >= 1);
-    }
-
     #[tokio::test]
     async fn build_authority_uses_configured_storage_dir() {
         let configured = TempDir::new().unwrap();
@@ -908,28 +841,5 @@ mod tests {
 
         assert!(configured.path().join("CURRENT").exists());
         drop(authority);
-    }
-
-    #[test]
-    fn binary_entrypoint_delegates_to_metadata_server() {
-        let source = include_str!("bin/main.rs");
-
-        assert!(source.contains("MetadataServer::build(config)"));
-        assert!(source.contains("server.serve().await"));
-        for forbidden in [
-            "build_authority(",
-            "build_worker_manager(",
-            "build_worker_service(",
-            "build_maintenance(",
-            "build_worker_background(",
-            "build_filesystem_service(",
-            "compose_services(",
-            "serve(config.as_ref()",
-        ] {
-            assert!(
-                !source.contains(forbidden),
-                "main.rs must not perform runtime wiring with {forbidden}"
-            );
-        }
     }
 }

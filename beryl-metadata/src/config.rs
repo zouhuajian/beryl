@@ -431,33 +431,6 @@ mod tests {
     }
 
     #[test]
-    fn storage_dir_parses_from_metadata_storage_key() {
-        let mut flat = test_flat();
-        flat.set("metadata.storage.dir", "/var/lib/beryl/metadata");
-
-        let config = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap();
-        assert_eq!(config.storage_dir, std::path::PathBuf::from("/var/lib/beryl/metadata"));
-    }
-
-    #[test]
-    fn rpc_port_rejects_out_of_range_value() {
-        let mut flat = test_flat();
-        flat.set("metadata.rpc.port", 70000i64);
-
-        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
-        assert!(err.message.contains("metadata.rpc.port"));
-    }
-
-    #[test]
-    fn rpc_port_rejects_present_non_integer_value() {
-        let mut flat = test_flat();
-        flat.set("metadata.rpc.port", true);
-
-        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
-        assert!(err.message.contains("metadata.rpc.port"));
-    }
-
-    #[test]
     fn string_keys_reject_present_wrong_type_values() {
         for key in [METADATA_RPC_ADDR, METADATA_STORAGE_DIR] {
             let mut flat = test_flat();
@@ -506,8 +479,20 @@ mod tests {
     }
 
     #[test]
-    fn unsigned_numeric_keys_reject_negative_values() {
-        for key in [
+    fn invalid_numeric_values_are_rejected() {
+        for port in [0i64, 70_000] {
+            let mut flat = test_flat();
+            flat.set(METADATA_RPC_PORT, port);
+            let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
+            assert!(err.message.contains(METADATA_RPC_PORT));
+        }
+
+        let mut non_integer_port = test_flat();
+        non_integer_port.set(METADATA_RPC_PORT, true);
+        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(non_integer_port)).unwrap_err();
+        assert!(err.message.contains(METADATA_RPC_PORT));
+
+        let positive_keys = [
             METADATA_RAFT_NODE_ID,
             METADATA_REPAIR_MAX_QUEUE_SIZE,
             METADATA_REPAIR_MAX_ATTEMPTS,
@@ -518,54 +503,23 @@ mod tests {
             METADATA_BOOTSTRAP_ROOT_READY_INITIAL_BACKOFF_MS,
             METADATA_BOOTSTRAP_ROOT_READY_MAX_BACKOFF_MS,
             METADATA_BOOTSTRAP_ROOT_READY_WARN_AFTER_MS,
-        ] {
-            let mut flat = test_flat();
-            flat.set(key, -1i64);
-
-            let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
-
-            assert!(
-                err.message.contains(key),
-                "error for {key} should mention the offending key: {}",
-                err.message
-            );
+        ];
+        for value in [-1i64, 0] {
+            for key in positive_keys {
+                let mut flat = test_flat();
+                flat.set(key, value);
+                let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
+                assert!(
+                    err.message.contains(key),
+                    "error for {key}={value} should mention the offending key: {}",
+                    err.message
+                );
+            }
         }
-    }
 
-    #[test]
-    fn positive_numeric_keys_reject_zero_values() {
-        for key in [
-            METADATA_RAFT_NODE_ID,
-            METADATA_REPAIR_MAX_QUEUE_SIZE,
-            METADATA_REPAIR_MAX_ATTEMPTS,
-            METADATA_REPAIR_INFLIGHT_TIMEOUT_MS,
-            METADATA_REPAIR_INITIAL_BACKOFF_MS,
-            METADATA_REPAIR_MAX_BACKOFF_MS,
-            METADATA_REPAIR_WORKER_INFLIGHT_LIMIT,
-            METADATA_BOOTSTRAP_ROOT_READY_INITIAL_BACKOFF_MS,
-            METADATA_BOOTSTRAP_ROOT_READY_MAX_BACKOFF_MS,
-            METADATA_BOOTSTRAP_ROOT_READY_WARN_AFTER_MS,
-        ] {
-            let mut flat = test_flat();
-            flat.set(key, 0i64);
-
-            let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
-
-            assert!(
-                err.message.contains(key),
-                "error for {key} should mention the offending key: {}",
-                err.message
-            );
-        }
-    }
-
-    #[test]
-    fn metadata_repair_max_attempts_rejects_u32_overflow() {
         let mut flat = test_flat();
         flat.set(METADATA_REPAIR_MAX_ATTEMPTS, i64::from(u32::MAX) + 1);
-
         let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
-
         assert!(err.message.contains(METADATA_REPAIR_MAX_ATTEMPTS));
     }
 }

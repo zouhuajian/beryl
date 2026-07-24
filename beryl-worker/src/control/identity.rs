@@ -140,3 +140,23 @@ impl std::fmt::Display for IdentityFileError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn local_identity_generation_and_load_are_stable() {
+        let temp = TempDir::new().expect("tempdir");
+        let identity_path = temp.path().join("worker.identity");
+
+        let first = load_or_create_identity(&identity_path).expect("generated worker id");
+        let second = load_or_create_identity(&identity_path).expect("loaded worker id");
+
+        assert_ne!(first.as_raw(), 0);
+        assert_eq!(second, first);
+        let stored = std::fs::read_to_string(identity_path).expect("identity file");
+        assert!(stored.trim().parse::<Uuid>().is_ok());
+    }
+}

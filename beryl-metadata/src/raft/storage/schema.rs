@@ -294,11 +294,159 @@ fn missing_rocksdb_state_error(path: &Path, detail: &str) -> MetadataError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     impl RocksDBStorage {
         pub(crate) fn with_pinned_db<T>(&self, operation: impl FnOnce(&DB) -> MetadataResult<T>) -> MetadataResult<T> {
             let generation = self.pin_generation()?;
             operation(generation.db())
+        }
+    }
+
+    #[test]
+    fn opening_existing_schema_v1_store_requires_reformat() {
+        let dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
+        storage
+            .with_pinned_db(|db| {
+                let meta = db.cf_handle(CF_META).unwrap();
+                db.delete_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        drop(storage);
+
+        let error = match RocksDBStorage::open_existing_for_start(dir.path()) {
+            Ok(_) => panic!("schema v1 store must not open"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("schema version is missing"));
+        assert!(error.to_string().contains("reformat metadata storage"));
+    }
+
+    #[test]
+    fn opening_previous_inode_schema_requires_reformat() {
+        let dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
+        drop(storage);
+
+        let generation_path = dir.path().join("generations/gen-000001");
+        let db = DB::open_cf_descriptors(&Options::default(), &generation_path, cf_descriptors()).unwrap();
+        let meta = db.cf_handle(CF_META).unwrap();
+        let previous = bincode::serde::encode_to_vec(7u64, bincode::config::standard()).unwrap();
+        db.put_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY, &previous).unwrap();
+        drop(db);
+
+        let error = match RocksDBStorage::open_existing_for_start(dir.path()) {
+            Ok(_) => panic!("schema 7 store must not open after the inode format change"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported RocksDB schema version 7; expected 8"),
+            "unexpected startup error: {error}"
+        );
+        assert!(
+            error.to_string().contains("reformat metadata storage"),
+            "unexpected startup error: {error}"
+        );
+
+        let db = DB::open_cf_descriptors(&Options::default(), generation_path, cf_descriptors()).unwrap();
+        let meta = db.cf_handle(CF_META).unwrap();
+        assert_eq!(
+            db.get_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY).unwrap().as_deref(),
+            Some(previous.as_slice())
+        );
+    }
+
+    #[test]
+    fn format_resume_rejects_missing_schema_even_when_generation_is_pristine() {
+        let dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
+        storage
+            .with_pinned_db(|db| {
+                let meta = db.cf_handle(CF_META).unwrap();
+                db.delete_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        drop(storage);
+
+        let error = match RocksDBStorage::create_for_format(dir.path()) {
+            Ok(_) => panic!("schema-less generation must not resume"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("schema version is missing"));
+    }
+
+    #[test]
+    fn format_resume_does_not_upgrade_missing_schema_with_authority_state() {
+        let dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
+        storage
+            .put_inode(&Inode::new_dir(
+                InodeId::new(1),
+                beryl_types::FileAttrs::new(),
+                MountId::new(1),
+            ))
+            .unwrap();
+        storage
+            .with_pinned_db(|db| {
+                let meta = db.cf_handle(CF_META).unwrap();
+                db.delete_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        drop(storage);
+
+        let error = match RocksDBStorage::create_for_format(dir.path()) {
+            Ok(_) => panic!("non-empty schema-less store must not be upgraded"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("schema version is missing"));
+    }
+
+    #[test]
+    fn test_obsolete_cf_detection() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_db");
+
+        // Create a RocksDB with obsolete "files" CF.
+        {
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            opts.create_missing_column_families(true);
+
+            let cfs = vec![
+                ColumnFamilyDescriptor::new("files", Options::default()),
+                ColumnFamilyDescriptor::new("blocks", Options::default()),
+            ];
+
+            let db = DB::open_cf_descriptors(&opts, &db_path, cfs).unwrap();
+            // Write something to files CF to ensure it exists
+            let files_cf = db.cf_handle("files").unwrap();
+            db.put_cf(files_cf, b"test_key", b"test_value").unwrap();
+        }
+
+        // Try to open with new code; obsolete CF layouts must fail fast.
+        let result = RocksDBStorage::create_for_format(&db_path);
+        assert!(result.is_err(), "Opening DB with obsolete 'files' CF should fail");
+        match result {
+            Err(e) => {
+                let error_msg = format!("{}", e);
+                assert!(
+                    error_msg.contains("invalid CURRENT")
+                        || error_msg.contains("obsolete column family")
+                        || error_msg.contains("files"),
+                    "Error message should mention obsolete column family 'files', got: {}",
+                    error_msg
+                );
+            }
+            Ok(_) => panic!("Expected error but got Ok"),
         }
     }
 }

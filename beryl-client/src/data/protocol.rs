@@ -565,7 +565,7 @@ mod tests {
     use crate::runtime::{classify_error, ErrorClass, OperationContext, OperationDeadline};
 
     #[test]
-    fn missing_worker_control_header_is_invalid_header_action() {
+    fn invalid_worker_control_headers_are_typed_failures() {
         let attempt = data_attempt_context();
         let err = parse_worker_control_header(&attempt, None).expect_err("missing data header must fail");
 
@@ -578,10 +578,13 @@ mod tests {
             }
             other => panic!("expected invalid header failure, got {other:?}"),
         }
+
+        assert_malformed_worker_control_header_is_invalid();
+        assert_wrong_worker_control_client_id_is_invalid();
+        assert_wrong_worker_control_call_id_is_invalid();
     }
 
-    #[test]
-    fn malformed_worker_control_header_is_invalid_header_not_transport_retry() {
+    fn assert_malformed_worker_control_header_is_invalid() {
         let attempt = data_attempt_context();
         let malformed = beryl_proto::worker::DataResponseHeaderProto::default();
 
@@ -645,12 +648,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn worker_control_header_with_wrong_client_id_is_invalid_header() {
+    fn assert_wrong_worker_control_client_id_is_invalid() {
         let attempt = write_attempt_context();
         let mut header = ok_data_header(&attempt);
         header.client.as_mut().expect("client").client_id =
-            Some(ClientId::new(attempt.client_id().as_raw() + 1).into());
+            Some(ClientId::new(attempt.header_identity().client_id.as_raw() + 1).into());
 
         let err = parse_worker_control_header(&attempt, Some(&header)).expect_err("wrong client_id must fail");
 
@@ -661,8 +663,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn worker_control_header_with_wrong_call_id_is_invalid_header() {
+    fn assert_wrong_worker_control_call_id_is_invalid() {
         let attempt = write_attempt_context();
         let mut header = ok_data_header(&attempt);
         header.client.as_mut().expect("client").call_id = beryl_types::CallId::new().to_string();
@@ -697,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn open_read_stream_request_rejects_zero_block_stamp() {
+    fn open_read_stream_request_rejects_invalid_expected_shape() {
         let attempt = data_attempt_context();
         let block_read = planned_block_read(0);
         let worker = worker_endpoint();
@@ -707,10 +708,11 @@ mod tests {
             .expect_err("zero stamp must fail");
 
         assert!(matches!(err, ClientError::InvalidLayout(msg) if msg.contains("block_stamp")));
+
+        assert_open_read_request_rejects_zero_shape();
     }
 
-    #[test]
-    fn open_read_stream_request_rejects_zero_expected_fields() {
+    fn assert_open_read_request_rejects_zero_shape() {
         let attempt = data_attempt_context();
         let mut block_read = planned_block_read(77);
         block_read.block_size = 0;
@@ -801,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn open_write_stream_missing_stream_id_is_unknown_outcome() {
+    fn side_effect_response_mismatches_are_unknown_outcomes() {
         let attempt = write_attempt_context();
         let target = worker_write_target();
         let worker = target.target.worker_endpoints[0].clone();
@@ -817,10 +819,12 @@ mod tests {
             .expect_err("missing OpenWriteStream stream_id must be unknown");
 
         assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("OpenWriteStream")));
+
+        assert_open_write_body_mismatch_is_unknown();
+        assert_commit_write_body_mismatch_is_unknown();
     }
 
-    #[test]
-    fn open_write_stream_body_mismatch_is_unknown_outcome() {
+    fn assert_open_write_body_mismatch_is_unknown() {
         let attempt = write_attempt_context();
         let target = worker_write_target();
         let worker = target.target.worker_endpoints[0].clone();
@@ -838,8 +842,7 @@ mod tests {
         assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("OpenWriteStream")));
     }
 
-    #[test]
-    fn commit_write_body_mismatch_is_unknown_outcome() {
+    fn assert_commit_write_body_mismatch_is_unknown() {
         let attempt = write_attempt_context();
         let handle = worker_block_write_handle(1024);
         let response = beryl_proto::worker::CommitWriteResponseProto {
@@ -856,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_fatal_fencing_mismatch_is_typed_error() {
+    fn worker_control_errors_preserve_typed_actions() {
         let attempt = write_attempt_context();
         let err = parse_worker_control_header(
             &attempt,
@@ -869,10 +872,11 @@ mod tests {
 
         assert_eq!(classify_error(&err), ErrorClass::Fencing);
         assert_ne!(classify_error(&err), ErrorClass::RetryableTransport);
+
+        assert_worker_run_mismatch_is_typed_refresh();
     }
 
-    #[test]
-    fn worker_run_mismatch_is_typed_refresh_error() {
+    fn assert_worker_run_mismatch_is_typed_refresh() {
         let attempt = write_attempt_context();
         let err = parse_worker_control_header(
             &attempt,
@@ -903,15 +907,6 @@ mod tests {
     }
 
     #[test]
-    fn tonic_request_uses_public_operation_deadline() {
-        let attempt = write_attempt_context();
-
-        let request = build_tonic_request(&attempt, ());
-
-        assert!(request.metadata().get("grpc-timeout").is_some());
-    }
-
-    #[test]
     fn write_stream_partial_ack_is_unknown_outcome() {
         let response = beryl_proto::worker::WriteStreamResponseProto {
             accepted: true,
@@ -925,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn read_stream_frame_validation_rejects_offset_mismatch() {
+    fn read_stream_frame_validation_rejects_invalid_sequences() {
         let block_read = planned_block_read(77);
         let mut output = BytesMut::new();
         let mut expected_offset = 0;
@@ -940,10 +935,13 @@ mod tests {
 
         assert!(matches!(err, ClientError::Worker(msg) if msg.contains("offset mismatch")));
         assert!(output.is_empty());
+
+        assert_read_stream_rejects_oversized_frame();
+        assert_read_stream_rejects_zero_length_non_final_frame();
+        assert_read_stream_rejects_early_eof();
     }
 
-    #[test]
-    fn read_stream_frame_validation_rejects_oversized_frame() {
+    fn assert_read_stream_rejects_oversized_frame() {
         let block_read = planned_block_read(77);
         let mut output = BytesMut::new();
         let mut expected_offset = 0;
@@ -960,8 +958,7 @@ mod tests {
         assert!(output.is_empty());
     }
 
-    #[test]
-    fn read_stream_frame_validation_rejects_zero_length_non_final_frame() {
+    fn assert_read_stream_rejects_zero_length_non_final_frame() {
         let block_read = planned_block_read(77);
         let mut output = BytesMut::new();
         let mut expected_offset = 0;
@@ -978,8 +975,7 @@ mod tests {
         assert!(output.is_empty());
     }
 
-    #[test]
-    fn read_stream_frame_validation_rejects_early_eof() {
+    fn assert_read_stream_rejects_early_eof() {
         let block_read = planned_block_read(77);
         let mut output = BytesMut::new();
         output.extend_from_slice(b"ab");

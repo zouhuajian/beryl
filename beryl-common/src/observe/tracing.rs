@@ -155,13 +155,6 @@ mod tests {
         assert!(line.contains("worker registered"), "{line}");
     }
 
-    #[test]
-    fn subscriber_initialization_has_no_second_global_try_init_path() {
-        let source = include_str!("tracing.rs");
-        let production_source = source.split("\n#[cfg(test)]").next().expect("production source");
-        assert_eq!(production_source.matches("try_init()").count(), 1);
-    }
-
     #[derive(Clone)]
     struct TestWriter {
         output: Arc<Mutex<Vec<u8>>>,

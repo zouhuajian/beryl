@@ -442,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_channel_pool_config_is_rejected() {
+    fn invalid_client_config_values_are_rejected() {
         for key in [
             "client.channel_pool.metadata.max_per_group",
             "client.channel_pool.worker.max_per_worker",
@@ -452,6 +452,47 @@ mod tests {
             let err = ClientConfig::from_flat(flat).expect_err("invalid pool config must fail");
             assert!(err.to_string().contains(key));
         }
+
+        let mut flat = FlatConfig::new();
+        flat.set("client.metadata.group.names", "root,analytics");
+        flat.set("client.metadata.group.root.endpoints", "a,b");
+        let err = ClientConfig::from_flat(flat).expect_err("missing group endpoints must fail");
+        assert!(err.to_string().contains("client.metadata.group.analytics.endpoints"));
+
+        for key in ["client.retry.max_attempts", "client.operation.timeout_ms"] {
+            let mut flat = FlatConfig::new();
+            flat.set(key, 0i64);
+            let err = ClientConfig::from_flat(flat).expect_err("zero value must fail");
+            assert!(err.to_string().contains(key));
+        }
+
+        for key in [
+            "client.retry.max_retry_attempts",
+            "client.refresh.max_attempts",
+            "client.backoff.initial_ms",
+            "client.backoff.max_ms",
+            "client.backoff.multiplier",
+        ] {
+            let mut flat = FlatConfig::new();
+            flat.set(key, 1i64);
+            let err = ClientConfig::from_flat(flat).expect_err("removed key must fail");
+            assert!(err.to_string().contains(key));
+        }
+
+        for key in [
+            "client.write_lease.renew_before_expiry_ms",
+            "client.channel_pool.worker.endpoint_cooldown_ms",
+        ] {
+            let mut flat = FlatConfig::new();
+            flat.set(key, -1i64);
+            let err = ClientConfig::from_flat(flat).expect_err("negative value must fail");
+            assert!(err.to_string().contains(key));
+        }
+
+        let mut flat = FlatConfig::new();
+        flat.set("client.write_lease.renew_before_expiry_ms", 0i64);
+        let err = ClientConfig::from_flat(flat).expect_err("zero lease renewal threshold must fail");
+        assert!(err.to_string().contains("client.write_lease.renew_before_expiry_ms"));
     }
 
     #[test]
@@ -471,60 +512,5 @@ mod tests {
             GroupName::parse("analytics").unwrap()
         );
         assert_eq!(config.metadata_groups[1].endpoints, vec!["c", "d"]);
-    }
-
-    #[test]
-    fn metadata_group_missing_endpoints_is_rejected() {
-        let mut flat = FlatConfig::new();
-        flat.set("client.metadata.group.names", "root,analytics");
-        flat.set("client.metadata.group.root.endpoints", "a,b");
-
-        let err = ClientConfig::from_flat(flat).expect_err("missing group endpoints must fail");
-
-        assert!(err.to_string().contains("client.metadata.group.analytics.endpoints"));
-    }
-
-    #[test]
-    fn zero_retry_or_deadline_is_rejected() {
-        for key in ["client.retry.max_attempts", "client.operation.timeout_ms"] {
-            let mut flat = FlatConfig::new();
-            flat.set(key, 0i64);
-            let err = ClientConfig::from_flat(flat).expect_err("zero value must fail");
-            assert!(err.to_string().contains(key));
-        }
-    }
-
-    #[test]
-    fn removed_retry_refresh_and_backoff_keys_are_rejected() {
-        for key in [
-            "client.retry.max_retry_attempts",
-            "client.refresh.max_attempts",
-            "client.backoff.initial_ms",
-            "client.backoff.max_ms",
-            "client.backoff.multiplier",
-        ] {
-            let mut flat = FlatConfig::new();
-            flat.set(key, 1i64);
-            let err = ClientConfig::from_flat(flat).expect_err("removed key must fail");
-            assert!(err.to_string().contains(key));
-        }
-    }
-
-    #[test]
-    fn write_lease_and_worker_cooldown_values_are_validated() {
-        for key in [
-            "client.write_lease.renew_before_expiry_ms",
-            "client.channel_pool.worker.endpoint_cooldown_ms",
-        ] {
-            let mut flat = FlatConfig::new();
-            flat.set(key, -1i64);
-            let err = ClientConfig::from_flat(flat).expect_err("negative value must fail");
-            assert!(err.to_string().contains(key));
-        }
-
-        let mut flat = FlatConfig::new();
-        flat.set("client.write_lease.renew_before_expiry_ms", 0i64);
-        let err = ClientConfig::from_flat(flat).expect_err("zero lease renewal threshold must fail");
-        assert!(err.to_string().contains("client.write_lease.renew_before_expiry_ms"));
     }
 }

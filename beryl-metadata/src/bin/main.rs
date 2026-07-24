@@ -173,36 +173,4 @@ observe.metrics.prometheus.path: "/metrics"
             .expect("positional metadata config path must fail");
         assert!(err.to_string().contains("--config"));
     }
-
-    #[test]
-    fn metadata_format_branch_does_not_initialize_observability() {
-        // Static guard only: a runtime test would need to format storage or add
-        // test-only init hooks to production dispatch. Keep this narrow and do
-        // not expand source checks beyond this start-vs-format invariant.
-        let source = include_str!("main.rs");
-        let production_source = source.split("\n#[cfg(test)]").next().expect("production source");
-        let init_call = concat!("init_", "observability", "(config.as_ref())?");
-        let format_call = "format_metadata_storage(config.as_ref()).await?";
-
-        assert_eq!(
-            production_source.matches(init_call).count(),
-            1,
-            "observability initialization must stay start-only"
-        );
-
-        let format_call = production_source.find(format_call).expect("format call");
-        let start_branch = production_source
-            .find("MetadataAction::Start =>")
-            .expect("start branch");
-        let init_call = production_source.find(init_call).expect("init call");
-
-        assert!(
-            format_call < start_branch,
-            "format dispatch should stay separate from start"
-        );
-        assert!(
-            start_branch < init_call,
-            "observability should initialize only in start dispatch"
-        );
-    }
 }

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use crate::error::rpc::{ErrorKind, InternalErrorKind, RecoveryAction, RpcErrorDetail};
-use crate::header::ClientInfo;
-use crate::time::Deadline;
-use crate::{CallerContext, CallerContextFields, RequestHeader, ResponseHeader};
+use beryl_common::error::rpc::{ErrorKind, InternalErrorKind, RecoveryAction, RpcErrorDetail};
+use beryl_common::header::ClientInfo;
+use beryl_common::time::Deadline;
+use beryl_common::{CallerContext, CallerContextFields, RequestHeader, ResponseHeader};
 use beryl_types::{CallId, ClientId, GroupName, GroupStateWatermark, RaftLogId};
 use std::time::Duration;
 
@@ -87,13 +87,13 @@ fn header_identity_matches_request_client_call_and_group() {
 
     assert!(same.matches_request(&request.identity()));
 
-    let wrong_call = crate::header::HeaderIdentity {
+    let wrong_call = beryl_common::header::HeaderIdentity {
         call_id: CallId::new(),
         ..same.clone()
     };
     assert!(!wrong_call.matches_request(&request.identity()));
 
-    let wrong_group = crate::header::HeaderIdentity {
+    let wrong_group = beryl_common::header::HeaderIdentity {
         group_name: Some(GroupName::parse("other").unwrap()),
         ..same
     };

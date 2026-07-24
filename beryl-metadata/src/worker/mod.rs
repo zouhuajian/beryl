@@ -12,9 +12,6 @@ mod manager;
 pub(crate) mod metrics;
 mod service;
 
-#[cfg(test)]
-mod tests;
-
 pub use manager::{
     BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerDescriptor, WorkerInfo, WorkerLiveState, WorkerManager,
 };

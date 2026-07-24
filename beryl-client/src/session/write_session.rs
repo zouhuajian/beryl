@@ -840,7 +840,7 @@ mod tests {
 
         let first_ctx = AttemptContext::for_metadata(&first.operation, test_group_name(), 0).expect("first context");
         let second_ctx = AttemptContext::for_metadata(&second.operation, test_group_name(), 0).expect("second context");
-        assert_eq!(first_ctx.call_id(), second_ctx.call_id());
+        assert_eq!(metadata_call_id(&first_ctx), metadata_call_id(&second_ctx));
         assert_eq!(first.committed_blocks, second.committed_blocks);
         assert_eq!(first.final_size, second.final_size);
     }
@@ -930,7 +930,7 @@ mod tests {
             .expect("retry commit plan");
         let retry_ctx = AttemptContext::for_metadata(&retry.operation, test_group_name(), 0).expect("retry context");
 
-        assert_eq!(first_ctx.call_id(), retry_ctx.call_id());
+        assert_eq!(metadata_call_id(&first_ctx), metadata_call_id(&retry_ctx));
         assert_eq!(retry.final_size, 5);
         assert_eq!(retry.committed_blocks, vec![committed_block(302, 0, 0, 5)]);
     }
@@ -969,10 +969,10 @@ mod tests {
         let second_worker = second.worker_cleanups()[0].operation();
         let second_worker_ctx = AttemptContext::for_data(&second_worker, 0);
 
-        assert_eq!(first_metadata.call_id(), second_metadata.call_id());
+        assert_eq!(metadata_call_id(&first_metadata), metadata_call_id(&second_metadata));
         assert_eq!(first.metadata_write_handle(), second.metadata_write_handle());
         assert_eq!(second.worker_cleanups().len(), 1);
-        assert_eq!(first_worker_ctx.call_id(), second_worker_ctx.call_id());
+        assert_eq!(data_call_id(&first_worker_ctx), data_call_id(&second_worker_ctx));
         assert_eq!(
             first_worker_snapshot,
             block_write_handle_signature(second.worker_cleanups()[0].block_write_handle())
@@ -1011,7 +1011,7 @@ mod tests {
             .expect("retry abort plan");
         let retry_ctx = AttemptContext::for_metadata(&retry.metadata_operation(), test_group_name(), 0)
             .expect("retry metadata context");
-        assert_eq!(first_ctx.call_id(), retry_ctx.call_id());
+        assert_eq!(metadata_call_id(&first_ctx), metadata_call_id(&retry_ctx));
     }
 
     #[test]
@@ -1253,6 +1253,19 @@ mod tests {
             block.stream_id.high,
             block.stream_id.low,
         )
+    }
+
+    fn metadata_call_id(context: &AttemptContext) -> String {
+        context
+            .metadata_header()
+            .expect("metadata header")
+            .client
+            .expect("metadata client")
+            .call_id
+    }
+
+    fn data_call_id(context: &AttemptContext) -> String {
+        context.data_header().client.expect("data client").call_id
     }
 
     fn test_group_name() -> GroupName {

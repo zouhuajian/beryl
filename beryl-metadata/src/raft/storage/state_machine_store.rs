@@ -1302,7 +1302,7 @@ mod tests {
             Some(beryl_types::fs::InodeId::new(77))
         );
         assert_eq!(
-            storage_b.allocate_inode_id().unwrap(),
+            storage_b.prepare_inode_allocation().unwrap().inode_id,
             beryl_types::fs::InodeId::new(77)
         );
         assert_eq!(

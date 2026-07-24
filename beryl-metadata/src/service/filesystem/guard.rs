@@ -186,7 +186,7 @@ impl DataIoPolicyGuard {
 mod admission_tests {
     use super::*;
     use crate::config::RaftConfig;
-    use crate::mount::{DataIoPolicy, MountKind, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
+    use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
     use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
     use crate::readiness::RootReadinessGate;
     use beryl_common::error::rpc::InternalErrorKind;
@@ -262,16 +262,17 @@ mod admission_tests {
     #[tokio::test]
     async fn check_data_write_checks_leadership_before_data_io_policy() {
         let mount_table = Arc::new(MountTable::new());
-        let mount_entry = mount_table
-            .create_mount(
-                "/archive".to_string(),
-                MountKind::External,
-                Some("s3://archive".to_string()),
-                DataIoPolicy::Forbid,
-                group_name("root"),
-                ROOT_INODE_ID,
-            )
-            .unwrap();
+        let mount_entry = MountEntry {
+            mount_id: MountId::new(1),
+            mount_prefix: "/archive".to_string(),
+            mount_kind: MountKind::External,
+            ufs_uri: Some("s3://archive".to_string()),
+            data_io_policy: DataIoPolicy::Forbid,
+            mount_epoch: 1,
+            namespace_owner_group_name: group_name("root"),
+            root_inode_id: ROOT_INODE_ID,
+        };
+        mount_table.upsert(mount_entry.clone()).unwrap();
         let chain = AdmissionGuard::new(Arc::clone(&mount_table));
 
         let err = chain
@@ -285,16 +286,17 @@ mod admission_tests {
     #[tokio::test]
     async fn data_io_guard_allows_writable_root() {
         let mount_table = Arc::new(MountTable::new());
-        let root_entry = mount_table
-            .create_mount(
-                ROOT_MOUNT_PREFIX.to_string(),
-                MountKind::Internal,
-                None,
-                DataIoPolicy::Allow,
-                group_name("root"),
-                ROOT_INODE_ID,
-            )
-            .unwrap();
+        let root_entry = MountEntry {
+            mount_id: MountId::new(1),
+            mount_prefix: ROOT_MOUNT_PREFIX.to_string(),
+            mount_kind: MountKind::Internal,
+            ufs_uri: None,
+            data_io_policy: DataIoPolicy::Allow,
+            mount_epoch: 1,
+            namespace_owner_group_name: group_name("root"),
+            root_inode_id: ROOT_INODE_ID,
+        };
+        mount_table.upsert(root_entry.clone()).unwrap();
         let chain = AdmissionGuard::new(Arc::clone(&mount_table));
 
         chain

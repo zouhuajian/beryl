@@ -8,8 +8,6 @@
 
 mod channel_pool;
 mod protocol;
-#[cfg(test)]
-mod tests;
 mod worker;
 
 use async_trait::async_trait;

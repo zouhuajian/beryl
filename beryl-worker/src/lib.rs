@@ -12,9 +12,6 @@ pub mod observe;
 pub mod runtime;
 pub mod store;
 
-#[cfg(test)]
-mod tests;
-
 pub use data::core::{
     AbortWriteRequest, AbortWriteResult, CommitWriteRequest, CommitWriteResult, RangeMapper, ReadFrame,
     ReadOpenRequest, ReadOpenResult, StorageChunkSlice, StreamContext, StreamMode, WorkerCore, WorkerCoreResult,

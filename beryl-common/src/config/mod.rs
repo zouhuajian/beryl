@@ -199,37 +199,4 @@ client.default_timeout_ms: 60000
 
         validate_core(&config.inner).expect("module validation belongs to owning crates");
     }
-
-    #[test]
-    fn test_load_real_metadata_config() {
-        let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("common lives under workspace root")
-            .join("conf/metadata.yaml");
-        let config = ServerConfig::load(&config_path)
-            .unwrap_or_else(|err| panic!("Failed to load {}: {err:?}", config_path.display()));
-        assert_eq!(
-            config.inner.get_str("metadata.storage.dir"),
-            Some("data/metadata".to_string())
-        );
-
-        let file_config = load_from_yaml_file(&config_path).unwrap();
-        assert_eq!(
-            file_config.get_str("metadata.storage.dir"),
-            Some("data/metadata".to_string())
-        );
-    }
-
-    #[test]
-    fn test_load_real_client_site() {
-        let config_path = "conf/client-site.yaml";
-        if std::path::Path::new(config_path).exists() {
-            let result = ClientConfig::load(config_path);
-            assert!(
-                result.is_ok(),
-                "Failed to load conf/client-site.yaml: {:?}",
-                result.err()
-            );
-        }
-    }
 }

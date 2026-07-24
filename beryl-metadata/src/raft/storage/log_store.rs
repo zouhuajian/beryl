@@ -426,9 +426,11 @@ mod tests {
     use super::*;
     use crate::mount::MountTable;
     use crate::raft::state_machine::AppRaftStateMachine;
+    use crate::raft::storage::AuthorityBatch;
     use crate::raft::storage::{StateMachineStorage, StorageIdentity};
     use crate::raft::MetadataReadView;
     use openraft::testing::{StoreBuilder, Suite};
+    use openraft::LeaderId;
     use tempfile::{tempdir, TempDir};
 
     struct TestStoreBuilder;
@@ -490,5 +492,85 @@ mod tests {
         assert!(storage.get_raft_log(1).unwrap().is_some());
         assert!(state.read().last_purged_log_id.is_none());
         assert_eq!(token.complete().unwrap().unwrap().index, 1);
+    }
+
+    #[test]
+    #[ignore = "manual durability latency baseline; run with --release and --ignored"]
+    fn raft_durable_append_and_apply_latency_baseline() {
+        const SAMPLES: u64 = 50;
+
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
+        let append_started = std::time::Instant::now();
+        for index in 1..=SAMPLES {
+            storage.append_raft_logs_durable(&[(index, vec![0; 256])]).unwrap();
+        }
+        let append_elapsed = append_started.elapsed();
+
+        let apply_started = std::time::Instant::now();
+        for index in 1..=SAMPLES {
+            let raft_state = AppMetadataRaftState {
+                last_applied_log_id: Some(LogId::new(LeaderId::new(1, 1), index)),
+                ..AppMetadataRaftState::default()
+            };
+            storage
+                .commit_authority_batch(AuthorityBatch::default(), &raft_state)
+                .unwrap();
+        }
+        let apply_elapsed = apply_started.elapsed();
+
+        eprintln!(
+            "raft durability baseline: sync_append_ns_per_op={}, apply_batch_ns_per_op={}",
+            append_elapsed.as_nanos() / SAMPLES as u128,
+            apply_elapsed.as_nanos() / SAMPLES as u128
+        );
+    }
+
+    #[test]
+    fn raft_log_batch_rejects_a_hole_before_writing() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
+        let entries = vec![(7, vec![7]), (9, vec![9])];
+
+        assert!(storage.append_raft_logs_durable(&entries).is_err());
+        assert_eq!(None, storage.get_raft_log(7).unwrap());
+        assert_eq!(None, storage.get_raft_log(9).unwrap());
+    }
+
+    #[test]
+    fn raft_log_truncate_removes_the_complete_suffix() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
+        storage
+            .append_raft_logs_durable(&[(1, vec![1]), (2, vec![2]), (3, vec![3])])
+            .unwrap();
+
+        storage.truncate_raft_logs(2).unwrap();
+
+        assert_eq!(Some(vec![1]), storage.get_raft_log(1).unwrap());
+        assert_eq!(None, storage.get_raft_log(2).unwrap());
+        assert_eq!(None, storage.get_raft_log(3).unwrap());
+    }
+
+    #[test]
+    fn raft_log_purge_and_last_purged_state_commit_together() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
+        storage
+            .append_raft_logs_durable(&[(1, vec![1]), (2, vec![2]), (3, vec![3])])
+            .unwrap();
+        let purged = LogId::new(LeaderId::new(2, 1), 2);
+        let state = AppMetadataRaftState {
+            last_purged_log_id: Some(purged),
+            ..AppMetadataRaftState::default()
+        };
+
+        storage.purge_raft_logs_and_state(2, &state).unwrap();
+
+        assert_eq!(None, storage.get_raft_log(1).unwrap());
+        assert_eq!(None, storage.get_raft_log(2).unwrap());
+        assert_eq!(Some(vec![3]), storage.get_raft_log(3).unwrap());
+        let stored: AppMetadataRaftState = serde_json::from_slice(&storage.get_raft_state().unwrap().unwrap()).unwrap();
+        assert_eq!(Some(purged), stored.last_purged_log_id);
     }
 }

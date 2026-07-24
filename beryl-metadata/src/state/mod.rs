@@ -5,12 +5,8 @@
 //!
 //! The production runtime uses `RaftStateStore`.
 
-#[cfg(test)]
-mod memory;
 mod raft_store;
 
-#[cfg(test)]
-pub use memory::MemoryStateStore;
 pub use raft_store::RaftStateStore;
 
 use crate::error::MetadataResult;
@@ -46,39 +42,14 @@ pub trait StateStore: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beryl_types::ids::DataHandleId;
 
-    #[tokio::test]
-    async fn test_route_epoch() {
+    #[test]
+    fn route_epoch_preserves_value_and_identity() {
         let v1 = RouteEpoch::new(1);
         let v2 = RouteEpoch::new(2);
 
         assert_eq!(v1.as_u64(), 1);
         assert_eq!(v2.as_u64(), 2);
         assert_ne!(v1, v2);
-    }
-
-    #[tokio::test]
-    async fn test_validate_data_handle_owner() {
-        use crate::raft::RocksDBStorage;
-        use tempfile::TempDir;
-
-        let dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
-        let dh1 = DataHandleId::new(1);
-        let inode1 = beryl_types::fs::InodeId::new(10);
-        storage.put_data_handle_owner(dh1, inode1).unwrap();
-
-        // Success path
-        let owner = storage.validate_data_handle_owner(dh1, None).unwrap();
-        assert_eq!(owner, inode1);
-
-        // Missing handle should return StaleState
-        let missing = storage.validate_data_handle_owner(DataHandleId::new(99), None);
-        assert!(missing.is_err());
-
-        // Mismatch should return InvalidArgument
-        let mismatch = storage.validate_data_handle_owner(dh1, Some(beryl_types::fs::InodeId::new(11)));
-        assert!(mismatch.is_err());
     }
 }

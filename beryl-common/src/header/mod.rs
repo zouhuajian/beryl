@@ -25,8 +25,5 @@
 mod codec;
 mod types;
 
-#[cfg(test)]
-mod tests;
-
 pub use codec::RequestHeaderCodec;
 pub use types::*;

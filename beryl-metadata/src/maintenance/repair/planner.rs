@@ -120,3 +120,86 @@ impl RepairPlanner {
         Vec::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
+
+    fn make_block_id(data_handle_id: u64, index: u32) -> BlockId {
+        BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(index))
+    }
+
+    fn make_worker_id(id: u64) -> WorkerId {
+        WorkerId::new(id)
+    }
+
+    #[test]
+    fn test_planner_stable_output() {
+        let planner = RepairPlanner::new();
+
+        let block_id = make_block_id(1, 0);
+        let current_locations = vec![make_worker_id(1)];
+        let replication_factor = 3;
+        let available_workers = vec![make_worker_id(1), make_worker_id(2), make_worker_id(3)];
+
+        // Call multiple times, should get same result
+        let actions1 = planner.plan_replication(block_id, &current_locations, replication_factor, &available_workers);
+        let actions2 = planner.plan_replication(block_id, &current_locations, replication_factor, &available_workers);
+
+        assert_eq!(actions1.len(), actions2.len());
+        assert_eq!(actions1.len(), 2);
+
+        for (a1, a2) in actions1.iter().zip(actions2.iter()) {
+            match (a1, a2) {
+                (
+                    RepairAction::Replicate {
+                        block_id: first_block_id,
+                        target_worker: tw1,
+                        replication_factor: first_replication_factor,
+                        ..
+                    },
+                    RepairAction::Replicate { target_worker: tw2, .. },
+                ) => {
+                    assert_eq!(*first_block_id, block_id);
+                    assert_eq!(*first_replication_factor, Some(replication_factor));
+                    assert_ne!(*tw1, make_worker_id(1));
+                    assert_eq!(tw1, tw2);
+                }
+                _ => panic!("Expected Replicate actions"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_planner_overrep_evict_replicas() {
+        // Verify over-replication scenario produces EvictReplica actions.
+        let planner = RepairPlanner::new();
+
+        let block_id = make_block_id(1, 0);
+        let current_locations = vec![
+            make_worker_id(1),
+            make_worker_id(2),
+            make_worker_id(3),
+            make_worker_id(4),
+            make_worker_id(5),
+        ]; // 5 replicas
+        let replication_factor = 3; // desired 3
+
+        let actions = planner.plan_replication(block_id, &current_locations, replication_factor, &current_locations);
+
+        // Should return 2 EvictReplica actions (5 - 3 = 2 excess)
+        assert_eq!(actions.len(), 2);
+        for action in &actions {
+            match action {
+                RepairAction::EvictReplica {
+                    block_id: bid, reason, ..
+                } => {
+                    assert_eq!(*bid, block_id);
+                    assert!(reason.contains("Excess replica"));
+                }
+                _ => panic!("Expected EvictReplica action"),
+            }
+        }
+    }
+}

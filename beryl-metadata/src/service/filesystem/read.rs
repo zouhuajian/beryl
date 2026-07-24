@@ -231,7 +231,7 @@ impl MetadataFileSystem {
                     ctx,
                     MetadataError::NotFound(format!("Inode not found: {}", inode_id)),
                     Some(&resolved.mount_ctx),
-                )
+                );
             }
             Err(err) => return self.failure_from_resolved_path_error(ctx, err, Some(&resolved.mount_ctx)),
         };
@@ -310,7 +310,7 @@ impl MetadataFileSystem {
                     MetadataError::NotFound(format!("Inode not found: {}", inode_id)),
                     None,
                     None,
-                )
+                );
             }
             Err(err) => return self.failure_from_error(ctx, err, None, None),
         };
@@ -930,6 +930,34 @@ mod tests {
     use super::*;
     use crate::service::filesystem::test_support::*;
 
+    fn seed_visible_block(
+        storage: &RocksDBStorage,
+        mount_id: MountId,
+        inode_id: InodeId,
+        data_handle_id: DataHandleId,
+        block_id: BlockId,
+    ) {
+        let mut attrs = FileAttrs::new();
+        attrs.size = 512;
+        let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
+        inode.data = beryl_types::fs::InodeData::File {
+            extents: vec![beryl_types::fs::Extent {
+                file_offset: 0,
+                block_id,
+                block_offset: 0,
+                len: 512,
+                content_revision: Some(1),
+                block_stamp: Some(41),
+            }],
+            content_revision: Some(1),
+            lease_epoch: None,
+            next_block_index: 1,
+        };
+        storage.put_inode(&inode).unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+    }
+
     #[tokio::test]
     async fn get_file_layout_uses_inode_authority_without_reverse_owner_read() {
         let dir = TempDir::new().unwrap();
@@ -1033,275 +1061,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_file_layout_rejects_visible_block_when_report_is_missing() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_id = MountId::new(53);
-        let group_name_value = group_name("g8");
-        let inode_id = InodeId::new(530);
-        let data_handle_id = DataHandleId::new(9530);
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-        let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
-            .with_storage(Arc::clone(&storage))
-            .with_worker_manager(Arc::new(WorkerManager::new(60)))
-            .build();
+    async fn get_file_layout_rejects_unavailable_or_stale_reported_locations() {
+        #[derive(Clone, Copy, Debug)]
+        enum Case {
+            MissingReport,
+            NonReady,
+            StampMismatch,
+            ExpiredWorker,
+        }
 
-        let mut attrs = FileAttrs::new();
-        attrs.size = 512;
-        let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
-        inode.data = beryl_types::fs::InodeData::File {
-            extents: vec![beryl_types::fs::Extent {
-                file_offset: 0,
-                block_id,
-                block_offset: 0,
-                len: 512,
-                content_revision: Some(1),
-                block_stamp: Some(41),
-            }],
-            content_revision: Some(1),
-            lease_epoch: None,
-            next_block_index: 1,
-        };
-        storage.put_inode(&inode).unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+        for (offset, case) in [
+            (0, Case::MissingReport),
+            (1, Case::NonReady),
+            (2, Case::StampMismatch),
+            (3, Case::ExpiredWorker),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+            let mount_id = MountId::new(53 + offset);
+            let group_name_value = group_name("g8");
+            let inode_id = InodeId::new(530 + offset);
+            let data_handle_id = DataHandleId::new(9530 + offset);
+            let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+            let worker_id = WorkerId::new(1);
+            let worker_manager = Arc::new(WorkerManager::new(if matches!(case, Case::ExpiredWorker) {
+                1
+            } else {
+                60
+            }));
 
-        let failure = filesystem
-            .get_file_layout_resolved(GetFileLayoutInput {
-                ctx: request_context(),
-                inode_id,
-                range: None,
-                requested_data_handle_id: None,
-                freshness: Freshness::default(),
-            })
-            .await
-            .expect_err("visible block without reported location must fail precisely");
+            if !matches!(case, Case::MissingReport) {
+                worker_manager
+                    .register_worker(&group_name_value, worker_id, "127.0.0.1:9101".to_string(), 1, None)
+                    .unwrap();
+                record_worker_heartbeat(
+                    &worker_manager,
+                    &group_name_value,
+                    worker_id,
+                    1024,
+                    0,
+                    1024,
+                    0,
+                    0,
+                    HealthStatus::Healthy,
+                );
+            }
+            match case {
+                Case::MissingReport => {}
+                Case::NonReady => publish_report_block(
+                    &worker_manager,
+                    &group_name_value,
+                    worker_id,
+                    1,
+                    report_block_with_stamp_and_state(block_id, 41, BlockReportBlockState::Partial),
+                ),
+                Case::StampMismatch => publish_report_locations_with_stamp(
+                    &worker_manager,
+                    &group_name_value,
+                    worker_id,
+                    1,
+                    Some(40),
+                    vec![block_id],
+                ),
+                Case::ExpiredWorker => {
+                    publish_report_locations_with_stamp(
+                        &worker_manager,
+                        &group_name_value,
+                        worker_id,
+                        1,
+                        Some(41),
+                        vec![block_id],
+                    );
+                    std::thread::sleep(Duration::from_millis(1100));
+                    assert_eq!(
+                        worker_manager.expire_liveness(),
+                        vec![(group_name_value.clone(), worker_id)]
+                    );
+                }
+            }
 
-        assert_block_location_unavailable(&failure, block_id);
-    }
+            let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
+                .with_storage(Arc::clone(&storage))
+                .with_worker_manager(worker_manager)
+                .build();
+            seed_visible_block(&storage, mount_id, inode_id, data_handle_id, block_id);
 
-    #[tokio::test]
-    async fn get_file_layout_filters_non_ready_reported_locations() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_id = MountId::new(54);
-        let group_name_value = group_name("g8");
-        let inode_id = InodeId::new(540);
-        let data_handle_id = DataHandleId::new(9540);
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-        let worker_id = WorkerId::new(1);
-        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        worker_manager
-            .register_worker(&group_name_value, worker_id, "127.0.0.1:9101".to_string(), 1, None)
-            .unwrap();
-        record_worker_heartbeat(
-            &worker_manager,
-            &group_name_value,
-            worker_id,
-            1024,
-            0,
-            1024,
-            0,
-            0,
-            HealthStatus::Healthy,
-        );
-        publish_report_block(
-            &worker_manager,
-            &group_name_value,
-            worker_id,
-            1,
-            report_block_with_stamp_and_state(block_id, 41, BlockReportBlockState::Partial),
-        );
-        let filesystem = builder
-            .with_storage(Arc::clone(&storage))
-            .with_worker_manager(worker_manager)
-            .build();
+            let failure = match filesystem
+                .get_file_layout_resolved(GetFileLayoutInput {
+                    ctx: request_context(),
+                    inode_id,
+                    range: None,
+                    requested_data_handle_id: None,
+                    freshness: Freshness::default(),
+                })
+                .await
+            {
+                Ok(success) => panic!("case {case:?} unexpectedly returned {success:?}"),
+                Err(failure) => failure,
+            };
 
-        let mut attrs = FileAttrs::new();
-        attrs.size = 512;
-        let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
-        inode.data = beryl_types::fs::InodeData::File {
-            extents: vec![beryl_types::fs::Extent {
-                file_offset: 0,
-                block_id,
-                block_offset: 0,
-                len: 512,
-                content_revision: Some(1),
-                block_stamp: Some(41),
-            }],
-            content_revision: Some(1),
-            lease_epoch: None,
-            next_block_index: 1,
-        };
-        storage.put_inode(&inode).unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
-
-        let failure = filesystem
-            .get_file_layout_resolved(GetFileLayoutInput {
-                ctx: request_context(),
-                inode_id,
-                range: None,
-                requested_data_handle_id: None,
-                freshness: Freshness::default(),
-            })
-            .await
-            .expect_err("non-ready report must not produce an empty worker location");
-
-        assert_block_location_unavailable(&failure, block_id);
-    }
-
-    #[tokio::test]
-    async fn get_file_layout_filters_reported_locations_with_mismatched_block_stamp() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_id = MountId::new(55);
-        let group_name_value = group_name("g8");
-        let inode_id = InodeId::new(550);
-        let data_handle_id = DataHandleId::new(9550);
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-        let worker_id = WorkerId::new(1);
-        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        worker_manager
-            .register_worker(&group_name_value, worker_id, "127.0.0.1:9101".to_string(), 1, None)
-            .unwrap();
-        record_worker_heartbeat(
-            &worker_manager,
-            &group_name_value,
-            worker_id,
-            1024,
-            0,
-            1024,
-            0,
-            0,
-            HealthStatus::Healthy,
-        );
-        publish_report_locations_with_stamp(
-            &worker_manager,
-            &group_name_value,
-            worker_id,
-            1,
-            Some(40),
-            vec![block_id],
-        );
-        let filesystem = builder
-            .with_storage(Arc::clone(&storage))
-            .with_worker_manager(worker_manager)
-            .build();
-
-        let mut attrs = FileAttrs::new();
-        attrs.size = 512;
-        let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
-        inode.data = beryl_types::fs::InodeData::File {
-            extents: vec![beryl_types::fs::Extent {
-                file_offset: 0,
-                block_id,
-                block_offset: 0,
-                len: 512,
-                content_revision: Some(1),
-                block_stamp: Some(41),
-            }],
-            content_revision: Some(1),
-            lease_epoch: None,
-            next_block_index: 1,
-        };
-        storage.put_inode(&inode).unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
-
-        let failure = filesystem
-            .get_file_layout_resolved(GetFileLayoutInput {
-                ctx: request_context(),
-                inode_id,
-                range: None,
-                requested_data_handle_id: None,
-                freshness: Freshness::default(),
-            })
-            .await
-            .expect_err("mismatched reported block stamp must fail precisely");
-
-        assert_refresh_metadata(&failure.error, ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch));
-        assert!(failure.error.message.contains(&block_id.to_string()));
-    }
-
-    #[tokio::test]
-    async fn get_file_layout_rejects_visible_block_when_reported_worker_is_not_live() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_id = MountId::new(56);
-        let group_name_value = group_name("g8");
-        let inode_id = InodeId::new(560);
-        let data_handle_id = DataHandleId::new(9560);
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-        let worker_id = WorkerId::new(1);
-        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
-        let worker_manager = Arc::new(WorkerManager::new(1));
-        worker_manager
-            .register_worker(&group_name_value, worker_id, "127.0.0.1:9101".to_string(), 1, None)
-            .unwrap();
-        record_worker_heartbeat(
-            &worker_manager,
-            &group_name_value,
-            worker_id,
-            1024,
-            0,
-            1024,
-            0,
-            0,
-            HealthStatus::Healthy,
-        );
-        publish_report_locations_with_stamp(
-            &worker_manager,
-            &group_name_value,
-            worker_id,
-            1,
-            Some(41),
-            vec![block_id],
-        );
-        std::thread::sleep(Duration::from_millis(1100));
-        assert_eq!(
-            worker_manager.expire_liveness(),
-            vec![(group_name_value.clone(), worker_id)]
-        );
-        let filesystem = builder
-            .with_storage(Arc::clone(&storage))
-            .with_worker_manager(worker_manager)
-            .build();
-
-        let mut attrs = FileAttrs::new();
-        attrs.size = 512;
-        let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
-        inode.data = beryl_types::fs::InodeData::File {
-            extents: vec![beryl_types::fs::Extent {
-                file_offset: 0,
-                block_id,
-                block_offset: 0,
-                len: 512,
-                content_revision: Some(1),
-                block_stamp: Some(41),
-            }],
-            content_revision: Some(1),
-            lease_epoch: None,
-            next_block_index: 1,
-        };
-        storage.put_inode(&inode).unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
-
-        let failure = filesystem
-            .get_file_layout_resolved(GetFileLayoutInput {
-                ctx: request_context(),
-                inode_id,
-                range: None,
-                requested_data_handle_id: None,
-                freshness: Freshness::default(),
-            })
-            .await
-            .expect_err("reported block on an expired worker must fail precisely");
-
-        assert_block_location_unavailable(&failure, block_id);
+            match case {
+                Case::StampMismatch => {
+                    assert_refresh_metadata(&failure.error, ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch));
+                    assert!(failure.error.message.contains(&block_id.to_string()));
+                }
+                _ => assert_block_location_unavailable(&failure, block_id),
+            }
+        }
     }
 
     #[test]
@@ -1519,97 +1385,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_file_layout_rejects_returned_extent_without_block_stamp() {
+    async fn get_file_layout_rejects_invalid_returned_block_stamps() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_id = MountId::new(49);
-        let inode_id = InodeId::new(490);
-        let data_handle_id = DataHandleId::new(9490);
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
         let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name("g8"))
             .with_storage(Arc::clone(&storage))
             .build();
 
-        let mut attrs = FileAttrs::new();
-        attrs.size = 512;
-        let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
-        inode.data = beryl_types::fs::InodeData::File {
-            extents: vec![beryl_types::fs::Extent {
-                file_offset: 0,
-                block_id,
-                block_offset: 0,
-                len: 512,
+        for (offset, block_stamp, expected_message) in [(0_u64, None, "block_stamp"), (1, Some(0), "zero block_stamp")]
+        {
+            let inode_id = InodeId::new(490 + offset);
+            let data_handle_id = DataHandleId::new(9490 + offset);
+            let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+            let mut attrs = FileAttrs::new();
+            attrs.size = 512;
+            let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
+            inode.data = beryl_types::fs::InodeData::File {
+                extents: vec![beryl_types::fs::Extent {
+                    file_offset: 0,
+                    block_id,
+                    block_offset: 0,
+                    len: 512,
+                    content_revision: Some(1),
+                    block_stamp,
+                }],
                 content_revision: Some(1),
-                block_stamp: None,
-            }],
-            content_revision: Some(1),
-            lease_epoch: None,
-            next_block_index: 1,
-        };
-        storage.put_inode(&inode).unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+                lease_epoch: None,
+                next_block_index: 1,
+            };
+            storage.put_inode(&inode).unwrap();
+            storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+            storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
-        let failure = filesystem
-            .get_file_layout_resolved(GetFileLayoutInput {
-                ctx: request_context(),
-                inode_id,
-                range: None,
-                requested_data_handle_id: None,
-                freshness: Freshness::default(),
-            })
-            .await
-            .expect_err("missing block_stamp must reject returned layout");
+            let failure = filesystem
+                .get_file_layout_resolved(GetFileLayoutInput {
+                    ctx: request_context(),
+                    inode_id,
+                    range: None,
+                    requested_data_handle_id: None,
+                    freshness: Freshness::default(),
+                })
+                .await
+                .expect_err("invalid block_stamp must reject returned layout");
 
-        assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EInval));
-        assert!(failure.error.message.contains("block_stamp"));
-    }
-
-    #[tokio::test]
-    async fn get_file_layout_rejects_returned_extent_with_zero_block_stamp() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_id = MountId::new(50);
-        let inode_id = InodeId::new(500);
-        let data_handle_id = DataHandleId::new(9500);
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-        let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name("g8"))
-            .with_storage(Arc::clone(&storage))
-            .build();
-
-        let mut attrs = FileAttrs::new();
-        attrs.size = 512;
-        let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
-        inode.data = beryl_types::fs::InodeData::File {
-            extents: vec![beryl_types::fs::Extent {
-                file_offset: 0,
-                block_id,
-                block_offset: 0,
-                len: 512,
-                content_revision: Some(1),
-                block_stamp: Some(0),
-            }],
-            content_revision: Some(1),
-            lease_epoch: Some(1),
-            next_block_index: 1,
-        };
-        storage.put_inode(&inode).unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
-
-        let failure = filesystem
-            .get_file_layout_resolved(GetFileLayoutInput {
-                ctx: request_context(),
-                inode_id,
-                range: None,
-                requested_data_handle_id: None,
-                freshness: Freshness::default(),
-            })
-            .await
-            .expect_err("zero block_stamp must reject returned layout");
-
-        assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EInval));
-        assert!(failure.error.message.contains("zero block_stamp"));
+            assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EInval));
+            assert!(
+                failure.error.message.contains(expected_message),
+                "unexpected error for block_stamp {block_stamp:?}: {}",
+                failure.error.message
+            );
+        }
     }
 
     #[tokio::test]
@@ -1843,93 +1669,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_locations_rejects_range_overflow() {
+    async fn get_locations_handles_range_boundaries() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_id = MountId::new(75);
         let inode_id = InodeId::new(750);
         let data_handle_id = DataHandleId::new(9750);
-        let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name("g22"))
-            .with_storage(Arc::clone(&storage))
-            .build();
-        storage
-            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
-            .unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
-
-        let failure = filesystem
-            .get_file_layout_resolved(GetFileLayoutInput {
-                ctx: request_context(),
-                inode_id,
-                range: Some(FileRange {
-                    offset: u64::MAX,
-                    len: 1,
-                }),
-                requested_data_handle_id: None,
-                freshness: Freshness::default(),
-            })
-            .await
-            .expect_err("overflowing range must be rejected");
-
-        assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EInval));
-        assert!(failure.error.message.contains("range end overflows"));
-    }
-
-    #[tokio::test]
-    async fn get_locations_handles_empty_range() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_id = MountId::new(76);
-        let inode_id = InodeId::new(760);
-        let data_handle_id = DataHandleId::new(9760);
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-        let mut attrs = FileAttrs::new();
-        attrs.size = 512;
-        let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
-        inode.data = beryl_types::fs::InodeData::File {
-            extents: vec![beryl_types::fs::Extent {
-                file_offset: 0,
-                block_id,
-                block_offset: 0,
-                len: 512,
-                content_revision: Some(4),
-                block_stamp: Some(4),
-            }],
-            content_revision: Some(4),
-            lease_epoch: Some(4),
-            next_block_index: 1,
-        };
-        let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name("g23"))
-            .with_storage(Arc::clone(&storage))
-            .build();
-        storage.put_inode(&inode).unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
-
-        let success = filesystem
-            .get_file_layout_resolved(GetFileLayoutInput {
-                ctx: request_context(),
-                inode_id,
-                range: Some(FileRange { offset: 0, len: 0 }),
-                requested_data_handle_id: None,
-                freshness: Freshness::default(),
-            })
-            .await
-            .expect("empty range should be stable");
-
-        assert!(success.payload.locations.is_empty());
-        assert_eq!(success.payload.file_size, 512);
-        assert_eq!(success.payload.content_revision, Some(4));
-    }
-
-    #[tokio::test]
-    async fn get_locations_filters_range() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_id = MountId::new(77);
-        let inode_id = InodeId::new(770);
-        let data_handle_id = DataHandleId::new(9770);
         let mut attrs = FileAttrs::new();
         attrs.size = 300;
         let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
@@ -1948,14 +1693,44 @@ mod tests {
             lease_epoch: Some(5),
             next_block_index: 3,
         };
-        let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name("g24"))
+        let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name("g22"))
             .with_storage(Arc::clone(&storage))
             .build();
         storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
-        let success = filesystem
+        let overflow = filesystem
+            .get_file_layout_resolved(GetFileLayoutInput {
+                ctx: request_context(),
+                inode_id,
+                range: Some(FileRange {
+                    offset: u64::MAX,
+                    len: 1,
+                }),
+                requested_data_handle_id: None,
+                freshness: Freshness::default(),
+            })
+            .await
+            .expect_err("overflowing range must be rejected");
+        assert_fail(&overflow.error, ErrorKind::Fs(FsErrorCode::EInval));
+        assert!(overflow.error.message.contains("range end overflows"));
+
+        let empty = filesystem
+            .get_file_layout_resolved(GetFileLayoutInput {
+                ctx: request_context(),
+                inode_id,
+                range: Some(FileRange { offset: 0, len: 0 }),
+                requested_data_handle_id: None,
+                freshness: Freshness::default(),
+            })
+            .await
+            .expect("empty range should be stable");
+        assert!(empty.payload.locations.is_empty());
+        assert_eq!(empty.payload.file_size, 300);
+        assert_eq!(empty.payload.content_revision, Some(5));
+
+        let filtered = filesystem
             .get_file_layout_resolved(GetFileLayoutInput {
                 ctx: request_context(),
                 inode_id,
@@ -1965,9 +1740,8 @@ mod tests {
             })
             .await
             .expect("range filter should succeed");
-
         assert_eq!(
-            success
+            filtered
                 .payload
                 .locations
                 .iter()
@@ -1976,7 +1750,7 @@ mod tests {
             vec![0, 1]
         );
         assert_eq!(
-            success
+            filtered
                 .payload
                 .locations
                 .iter()
@@ -1984,8 +1758,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![50, 51]
         );
-        assert_eq!(success.payload.content_revision, Some(5));
+        assert_eq!(filtered.payload.content_revision, Some(5));
     }
+
     #[tokio::test]
     async fn locations_return_content_revision() {
         let env = write_flow_env(64).await;

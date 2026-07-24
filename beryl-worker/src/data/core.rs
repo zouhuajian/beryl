@@ -1077,3 +1077,1260 @@ fn rejected_write_frame(state: &StreamState) -> WriteFrameResult {
         written_through: state.written_through,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
+    use beryl_types::chunk::ByteRange;
+    use beryl_types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, StreamId};
+    use beryl_types::layout::BlockFormatId;
+    use beryl_types::lease::FencingToken;
+    use beryl_types::{GroupName, Tier, WorkerRunId};
+    use bytes::Bytes;
+    use tempfile::TempDir;
+
+    use crate::data::core::{
+        AbortWriteRequest, CommitWriteRequest, RangeMapper, ReadOpenRequest, StreamContext, StreamMode,
+        SyncCommittedBlockRequest, WorkerCore, WorkerCoreResult, WriteFrame, WriteOpenRequest,
+    };
+    use crate::error::WorkerError;
+    use crate::runtime::stream::StreamState;
+    use crate::store::block::{
+        ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, PublishReadyRequest,
+    };
+
+    const BLOCK_SIZE: u64 = 4096;
+    const CHUNK_SIZE: u32 = 1024;
+    const BLOCK_STAMP: u64 = 55;
+
+    fn block_id() -> BlockId {
+        BlockId::new(DataHandleId::new(7), BlockIndex::new(3))
+    }
+
+    fn group_name() -> GroupName {
+        GroupName::parse("root").expect("test group name is valid")
+    }
+
+    fn stream_id() -> StreamId {
+        StreamId::new((1u128 << 64) | 42)
+    }
+
+    fn token() -> FencingToken {
+        FencingToken::new(block_id(), ClientId::new(9), 11)
+    }
+
+    fn assert_refresh_metadata<T: std::fmt::Debug>(result: WorkerCoreResult<T>, expected_kind: ErrorKind) {
+        let error = result.expect_err("operation should need refresh");
+        match error {
+            WorkerError::RefreshMetadata { kind, .. } => assert_eq!(kind, expected_kind),
+            other => panic!("expected RefreshMetadata, got {other:?}"),
+        }
+    }
+
+    fn assert_invalid_argument<T: std::fmt::Debug>(result: WorkerCoreResult<T>) {
+        match result.expect_err("operation should fail") {
+            WorkerError::InvalidArgument(_) => {}
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    fn assert_not_found<T: std::fmt::Debug>(result: WorkerCoreResult<T>) {
+        match result.expect_err("operation should fail") {
+            WorkerError::NotFound(_) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    fn test_worker_run_id() -> WorkerRunId {
+        "550e8400-e29b-41d4-a716-446655440000".parse().unwrap()
+    }
+
+    fn write_open_request() -> WriteOpenRequest {
+        WriteOpenRequest {
+            group_name: group_name(),
+            block_id: block_id(),
+            worker_run_id: test_worker_run_id(),
+            token: token(),
+            block_stamp: BLOCK_STAMP,
+            frame_size: 8192,
+            block_size: BLOCK_SIZE,
+            block_format_id: BlockFormatId::FULL_EFFECTIVE,
+            chunk_size: CHUNK_SIZE,
+            effective_len: BLOCK_SIZE,
+            checksum_kind: ChecksumKind::None,
+            tier: Tier::Hdd,
+        }
+    }
+
+    fn commit_write_request() -> CommitWriteRequest {
+        CommitWriteRequest {
+            stream_id: stream_id(),
+            group_name: group_name(),
+            block_id: block_id(),
+            worker_run_id: test_worker_run_id(),
+            token: token(),
+            commit_seq: 8,
+            effective_len: 4096,
+            block_stamp: BLOCK_STAMP,
+            block_format_id: BlockFormatId::FULL_EFFECTIVE,
+            block_size: BLOCK_SIZE,
+            chunk_size: CHUNK_SIZE,
+            require_sync: true,
+        }
+    }
+
+    fn abort_write_request() -> AbortWriteRequest {
+        AbortWriteRequest {
+            stream_id: stream_id(),
+            group_name: group_name(),
+            block_id: block_id(),
+            token: token(),
+        }
+    }
+
+    fn sync_committed_block_request(block_stamp: u64, expected_block_len: u64) -> SyncCommittedBlockRequest {
+        SyncCommittedBlockRequest {
+            group_name: group_name(),
+            block_id: block_id(),
+            worker_run_id: test_worker_run_id(),
+            block_stamp,
+            expected_block_len,
+            block_format_id: BlockFormatId::FULL_EFFECTIVE,
+            block_size: BLOCK_SIZE,
+            chunk_size: CHUNK_SIZE,
+        }
+    }
+
+    fn stream_context() -> StreamContext {
+        StreamContext {
+            stream_id: stream_id(),
+            group_name: group_name(),
+            block_id: block_id(),
+            mode: StreamMode::Read,
+            start_offset: 0,
+            end_offset: 4096,
+            frame_size: 8192,
+            block_stamp: 17,
+            block_format_id: BlockFormatId::FULL_EFFECTIVE,
+            block_size: BLOCK_SIZE,
+            chunk_size: CHUNK_SIZE,
+            committed_length: 4096,
+            effective_len: 4096,
+            worker_run_id: test_worker_run_id(),
+            fencing_token: None,
+        }
+    }
+
+    pub(super) fn payload() -> Bytes {
+        Bytes::from((0..BLOCK_SIZE).map(|idx| (idx % 251) as u8).collect::<Vec<_>>())
+    }
+
+    fn core_with_store(default_frame_size: u32, max_frame_size: u32) -> (TempDir, Arc<FullBlockFileStore>, WorkerCore) {
+        let temp = TempDir::new().expect("tempdir");
+        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
+            temp.path().to_path_buf(),
+        )));
+        let core = WorkerCore::with_local_store(
+            default_frame_size,
+            max_frame_size,
+            Duration::from_secs(60),
+            store.clone(),
+        );
+        (temp, store, core)
+    }
+
+    fn publish_ready_block(store: &FullBlockFileStore, data: Bytes, block_stamp: u64) {
+        store
+            .create_staging_block(CreateStagingBlockRequest {
+                group_name: group_name(),
+                block_id: block_id(),
+                block_size: BLOCK_SIZE,
+                block_format_id: BlockFormatId::FULL_EFFECTIVE,
+                chunk_size: CHUNK_SIZE,
+                checksum_kind: ChecksumKind::None,
+                tier: Tier::Hdd,
+            })
+            .expect("create staging block");
+        store
+            .write_at(&group_name(), block_id(), 0, data.clone())
+            .expect("write staging block");
+        store
+            .publish_ready(PublishReadyRequest {
+                group_name: group_name(),
+                block_id: block_id(),
+                effective_len: data.len() as u64,
+                block_stamp,
+            })
+            .expect("publish ready block");
+    }
+
+    fn read_open_request_for(offset: u64, len: u32, block_stamp: u64, frame_size: u32) -> ReadOpenRequest {
+        read_open_request_for_len(offset, len, block_stamp, BLOCK_SIZE, frame_size)
+    }
+
+    fn read_open_request_for_len(
+        offset: u64,
+        len: u32,
+        block_stamp: u64,
+        effective_len: u64,
+        frame_size: u32,
+    ) -> ReadOpenRequest {
+        ReadOpenRequest {
+            group_name: group_name(),
+            block_id: block_id(),
+            worker_run_id: test_worker_run_id(),
+            byte_range: ByteRange { offset, len },
+            block_stamp,
+            block_format_id: BlockFormatId::FULL_EFFECTIVE,
+            block_size: BLOCK_SIZE,
+            chunk_size: CHUNK_SIZE,
+            effective_len,
+            frame_size,
+        }
+    }
+
+    async fn collect_core_read(core: &WorkerCore, stream_id: StreamId, max_bytes: u32) -> Bytes {
+        let mut out = Vec::new();
+        loop {
+            let frames = core.read_stream(stream_id, max_bytes).await.expect("read stream");
+            let Some(frame) = frames.into_iter().next() else {
+                break;
+            };
+            let eos = frame.eos;
+            out.extend_from_slice(&frame.data);
+            if eos {
+                break;
+            }
+        }
+        Bytes::from(out)
+    }
+
+    fn write_stream_context() -> StreamContext {
+        StreamContext {
+            mode: StreamMode::Write,
+            fencing_token: Some(token()),
+            ..stream_context()
+        }
+    }
+
+    #[test]
+    fn range_mapper_covers_chunk_boundaries() {
+        let cases = [
+            ("inside one chunk", 100, 200, vec![(0, 100, 200)]),
+            ("across two chunks", 900, 300, vec![(0, 900, 124), (1, 0, 176)]),
+            ("at chunk boundary", 1024, 100, vec![(1, 0, 100)]),
+            ("empty range", 512, 0, vec![]),
+            (
+                "non-aligned across three chunks",
+                1537,
+                2000,
+                vec![(1, 513, 511), (2, 0, 1024), (3, 0, 465)],
+            ),
+        ];
+
+        for (case, offset, len, expected) in cases {
+            let actual = RangeMapper::map_range(ByteRange { offset, len }, 1024)
+                .unwrap()
+                .into_iter()
+                .map(|slice| (slice.chunk_index.as_raw(), slice.offset_in_chunk, slice.len))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "case {case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn open_write_creates_staging_stream() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+
+        let result = core.open_write(write_open_request()).await.expect("open write");
+
+        assert_eq!(result.frame_size, 2048);
+        assert_eq!(result.block_stamp, BLOCK_STAMP);
+        assert_eq!(result.committed_length, 0);
+
+        let paths = store.paths(&group_name(), block_id());
+        assert!(paths.staging_data_path.exists());
+        assert!(paths.staging_meta_path.exists());
+        assert!(!paths.meta_path.exists());
+        assert_not_found(store.read_at(&group_name(), block_id(), 0, 1));
+
+        let state = core
+            .stream_manager()
+            .get(result.stream_id)
+            .await
+            .expect("write stream registered");
+        assert_eq!(state.context.group_name, group_name());
+        assert_eq!(state.context.block_id, block_id());
+        assert_eq!(state.context.mode, StreamMode::Write);
+        assert_eq!(state.context.end_offset, BLOCK_SIZE);
+        assert_eq!(state.cursor, 0);
+        assert_eq!(state.last_acked_seq, 0);
+        assert_eq!(state.written_through, 0);
+    }
+
+    #[tokio::test]
+    async fn open_write_rejects_invalid_metadata_shape_before_staging() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+        let paths = store.paths(&group_name(), block_id());
+
+        let mut zero_stamp = write_open_request();
+        zero_stamp.block_stamp = 0;
+        assert_invalid_argument(core.open_write(zero_stamp).await);
+
+        let mut non_aligned = write_open_request();
+        non_aligned.chunk_size = 1000;
+        assert_invalid_argument(core.open_write(non_aligned).await);
+
+        let mut over_len = write_open_request();
+        over_len.effective_len = BLOCK_SIZE + 1;
+        assert_invalid_argument(core.open_write(over_len).await);
+
+        assert!(!paths.staging_data_path.exists());
+        assert!(!paths.staging_meta_path.exists());
+        assert_eq!(core.stream_manager().active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn open_write_rejects_invalid_fencing_token() {
+        let (_temp, _store, core) = core_with_store(512, 2048);
+        let mut req = write_open_request();
+        req.token = FencingToken::new(block_id(), ClientId::new(9), 0);
+
+        match core.open_write(req).await.expect_err("zero epoch must be rejected") {
+            WorkerError::Fencing(message) => assert!(message.contains("epoch")),
+            other => panic!("expected Fencing, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn open_write_rejects_ready_block_conflicts() {
+        for (case, stored_stamp, block_size, expected) in [
+            (
+                "already ready",
+                BLOCK_STAMP,
+                BLOCK_SIZE,
+                ErrorKind::Metadata(MetadataErrorKind::StaleState),
+            ),
+            (
+                "shape mismatch",
+                BLOCK_STAMP,
+                BLOCK_SIZE * 2,
+                ErrorKind::Metadata(MetadataErrorKind::StaleState),
+            ),
+            (
+                "stamp mismatch",
+                BLOCK_STAMP + 1,
+                BLOCK_SIZE,
+                ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
+            ),
+        ] {
+            let (_temp, store, core) = core_with_store(512, 2048);
+            publish_ready_block(&store, payload(), stored_stamp);
+            let mut request = write_open_request();
+            request.block_size = block_size;
+
+            assert_refresh_metadata(core.open_write(request).await, expected);
+            assert_eq!(
+                core.stream_manager().active_count().await,
+                0,
+                "case {case} must not register a stream"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn write_stream_writes_staging_data_and_advances_state() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        let data = Bytes::from_static(b"abcd");
+
+        let result = core
+            .write_stream(WriteFrame {
+                stream_id: open.stream_id,
+                seq: 1,
+                offset_in_block: 0,
+                data: data.clone(),
+                checksum32: 0,
+            })
+            .await
+            .expect("write frame");
+
+        assert!(result.accepted);
+        assert_eq!(result.last_acked_seq, 1);
+        assert_eq!(result.written_through, data.len() as u64);
+        let state = core.stream_manager().get(open.stream_id).await.expect("stream state");
+        assert_eq!(state.cursor, data.len() as u64);
+        assert_eq!(state.last_acked_seq, 1);
+        assert_eq!(state.written_through, data.len() as u64);
+        assert!(!store.paths(&group_name(), block_id()).meta_path.exists());
+    }
+
+    #[tokio::test]
+    async fn write_stream_rejects_sequence_and_offset_gaps() {
+        let (_temp, _store, core) = core_with_store(512, 2048);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+
+        for (case, seq, offset_in_block) in [("sequence", 2, 0), ("offset", 1, 1)] {
+            let result = core
+                .write_stream(WriteFrame {
+                    stream_id: open.stream_id,
+                    seq,
+                    offset_in_block,
+                    data: Bytes::from_static(b"abcd"),
+                    checksum32: 0,
+                })
+                .await
+                .unwrap_or_else(|error| panic!("{case} gap should return a negative acknowledgement: {error}"));
+
+            assert!(!result.accepted, "{case} gap must be rejected");
+            assert_eq!(result.last_acked_seq, 0, "{case} gap");
+            assert_eq!(result.written_through, 0, "{case} gap");
+            assert_eq!(
+                core.stream_manager().get(open.stream_id).await.expect("stream").cursor,
+                0,
+                "{case} gap must not advance the cursor"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn write_stream_rejects_read_stream() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+        let open = core
+            .open_read(read_open_request_for(0, 4, BLOCK_STAMP, 512))
+            .await
+            .expect("open read");
+
+        match core
+            .write_stream(WriteFrame {
+                stream_id: open.stream_id,
+                seq: 1,
+                offset_in_block: 0,
+                data: Bytes::from_static(b"abcd"),
+                checksum32: 0,
+            })
+            .await
+            .expect_err("read stream must reject writes")
+        {
+            WorkerError::InvalidArgument(message) => assert!(message.contains("not a write stream")),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_write_publishes_ready_block() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        let data = payload();
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: data.slice(0..2048),
+            checksum32: 0,
+        })
+        .await
+        .expect("first frame");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 2,
+            offset_in_block: 2048,
+            data: data.slice(2048..4096),
+            checksum32: 0,
+        })
+        .await
+        .expect("second frame");
+
+        let result = core
+            .commit_write(CommitWriteRequest {
+                stream_id: open.stream_id,
+                commit_seq: 2,
+                effective_len: BLOCK_SIZE,
+                ..commit_write_request()
+            })
+            .await
+            .expect("commit write");
+
+        assert_eq!(result.effective_len, BLOCK_SIZE);
+        assert_eq!(result.block_stamp, BLOCK_STAMP);
+        assert_eq!(result.written_through, BLOCK_SIZE);
+        let meta = store.load_meta(&group_name(), block_id()).expect("ready meta");
+        assert_eq!(meta.visibility.block_state, crate::store::block::BlockState::Ready);
+        assert_eq!(meta.visibility.block_stamp, BLOCK_STAMP);
+        assert_eq!(store.read_at(&group_name(), block_id(), 0, BLOCK_SIZE).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn multichunk_write_commit_and_read_returns_exact_effective_bytes() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+        let effective_len = 3073;
+        let data = payload().slice(0..effective_len as usize);
+        let mut open_req = write_open_request();
+        open_req.effective_len = effective_len;
+        let open = core.open_write(open_req).await.expect("open write");
+
+        let chunks = [
+            data.slice(0..700),
+            data.slice(700..1536),
+            data.slice(1536..2500),
+            data.slice(2500..effective_len as usize),
+        ];
+        let mut offset = 0u64;
+        for (idx, chunk) in chunks.into_iter().enumerate() {
+            core.write_stream(WriteFrame {
+                stream_id: open.stream_id,
+                seq: (idx + 1) as u64,
+                offset_in_block: offset,
+                data: chunk.clone(),
+                checksum32: 0,
+            })
+            .await
+            .expect("write chunk");
+            offset += chunk.len() as u64;
+        }
+
+        let result = core
+            .commit_write(CommitWriteRequest {
+                stream_id: open.stream_id,
+                commit_seq: 4,
+                effective_len,
+                ..commit_write_request()
+            })
+            .await
+            .expect("commit write");
+
+        assert_eq!(result.effective_len, effective_len);
+        assert_eq!(result.written_through, effective_len);
+        let meta = store.load_meta(&group_name(), block_id()).expect("ready meta");
+        assert_eq!(meta.source.effective_len, effective_len);
+        assert_eq!(
+            store.read_at(&group_name(), block_id(), 0, effective_len).unwrap(),
+            data
+        );
+
+        let open_read = core
+            .open_read(read_open_request_for_len(
+                0,
+                effective_len as u32,
+                BLOCK_STAMP,
+                effective_len,
+                600,
+            ))
+            .await
+            .expect("open read");
+        assert_eq!(collect_core_read(&core, open_read.stream_id, 600).await, data);
+
+        let eof_read = core
+            .open_read(read_open_request_for_len(
+                effective_len,
+                0,
+                BLOCK_STAMP,
+                effective_len,
+                600,
+            ))
+            .await
+            .expect("open eof read");
+        assert!(collect_core_read(&core, eof_read.stream_id, 600).await.is_empty());
+        assert_invalid_argument(
+            core.open_read(read_open_request_for_len(
+                effective_len,
+                1,
+                BLOCK_STAMP,
+                effective_len,
+                600,
+            ))
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_write_accepts_non_chunk_aligned_tail_and_persists_full_block_shape() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        let effective_len = u64::from(CHUNK_SIZE) + 1;
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: Bytes::from(vec![7; effective_len as usize]),
+            checksum32: 0,
+        })
+        .await
+        .expect("tail frame");
+
+        let result = core
+            .commit_write(CommitWriteRequest {
+                stream_id: open.stream_id,
+                commit_seq: 1,
+                effective_len,
+                ..commit_write_request()
+            })
+            .await
+            .expect("tail commit");
+
+        assert_eq!(result.effective_len, effective_len);
+        assert_eq!(result.written_through, effective_len);
+        let meta = store.load_meta(&group_name(), block_id()).expect("ready meta");
+        assert_eq!(meta.format.block_size, BLOCK_SIZE);
+        assert_eq!(meta.source.effective_len, effective_len);
+    }
+
+    #[tokio::test]
+    async fn commit_write_rejects_effective_len_larger_than_block_size() {
+        let (_temp, _store, core) = core_with_store(512, 2048);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+
+        assert_invalid_argument(
+            core.commit_write(CommitWriteRequest {
+                stream_id: open.stream_id,
+                commit_seq: 0,
+                effective_len: BLOCK_SIZE + 1,
+                ..commit_write_request()
+            })
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_write_rejects_layout_mismatch_against_open_request() {
+        let (_temp, _store, core) = core_with_store(512, 2048);
+        let mut open_req = write_open_request();
+        open_req.effective_len = 4;
+        let open = core.open_write(open_req).await.expect("open write");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: Bytes::from_static(b"abcd"),
+            checksum32: 0,
+        })
+        .await
+        .expect("write frame");
+
+        assert_refresh_metadata(
+            core.commit_write(CommitWriteRequest {
+                stream_id: open.stream_id,
+                commit_seq: 1,
+                effective_len: 4,
+                chunk_size: CHUNK_SIZE * 2,
+                ..commit_write_request()
+            })
+            .await,
+            ErrorKind::Metadata(MetadataErrorKind::StaleState),
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_write_rejects_incomplete_block() {
+        let (_temp, _store, core) = core_with_store(512, 2048);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: Bytes::from_static(b"abcd"),
+            checksum32: 0,
+        })
+        .await
+        .expect("write frame");
+
+        assert_invalid_argument(
+            core.commit_write(CommitWriteRequest {
+                stream_id: open.stream_id,
+                commit_seq: 1,
+                effective_len: BLOCK_SIZE,
+                ..commit_write_request()
+            })
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_write_rejects_token_mismatch() {
+        let (_temp, _store, core) = core_with_store(512, 2048);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        let data = payload();
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data,
+            checksum32: 0,
+        })
+        .await
+        .expect("write frame");
+
+        match core
+            .commit_write(CommitWriteRequest {
+                stream_id: open.stream_id,
+                token: FencingToken::new(block_id(), ClientId::new(99), 11),
+                commit_seq: 1,
+                effective_len: BLOCK_SIZE,
+                ..commit_write_request()
+            })
+            .await
+            .expect_err("token mismatch must be rejected")
+        {
+            WorkerError::Fencing(message) => assert!(message.contains("token")),
+            other => panic!("expected Fencing, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_commit_fails_without_republishing_or_corrupting_ready_block() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        let data = payload();
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: data.clone(),
+            checksum32: 0,
+        })
+        .await
+        .expect("write frame");
+
+        core.commit_write(CommitWriteRequest {
+            stream_id: open.stream_id,
+            commit_seq: 1,
+            effective_len: BLOCK_SIZE,
+            ..commit_write_request()
+        })
+        .await
+        .expect("first commit");
+        assert!(core.stream_manager().get(open.stream_id).await.is_none());
+        assert_not_found(
+            core.commit_write(CommitWriteRequest {
+                stream_id: open.stream_id,
+                commit_seq: 1,
+                effective_len: BLOCK_SIZE,
+                ..commit_write_request()
+            })
+            .await,
+        );
+
+        let scanned = store.scan_group_blocks(&group_name()).expect("scan group");
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(
+            scanned[0].visibility.block_state,
+            crate::store::block::BlockState::Ready
+        );
+        assert_eq!(store.read_at(&group_name(), block_id(), 0, BLOCK_SIZE).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn sync_committed_block_succeeds_after_terminal_commit_without_stream() {
+        let (_temp, _store, core) = core_with_store(512, 2048);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: payload(),
+            checksum32: 0,
+        })
+        .await
+        .expect("write frame");
+        core.commit_write(CommitWriteRequest {
+            stream_id: open.stream_id,
+            commit_seq: 1,
+            effective_len: BLOCK_SIZE,
+            require_sync: false,
+            ..commit_write_request()
+        })
+        .await
+        .expect("visibility commit");
+        assert!(core.stream_manager().get(open.stream_id).await.is_none());
+
+        let result = core
+            .sync_committed_block(sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE))
+            .await
+            .expect("sync committed block");
+
+        assert_eq!(result.effective_len, BLOCK_SIZE);
+        assert_eq!(result.block_stamp, BLOCK_STAMP);
+    }
+
+    #[tokio::test]
+    async fn sync_committed_block_rejects_missing_wrong_generation_and_uncommitted_block() {
+        let (_temp, _store, core) = core_with_store(512, 2048);
+        assert_refresh_metadata(
+            core.sync_committed_block(sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE))
+                .await,
+            ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
+        );
+
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: payload(),
+            checksum32: 0,
+        })
+        .await
+        .expect("write frame");
+        assert_refresh_metadata(
+            core.sync_committed_block(sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE))
+                .await,
+            ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
+        );
+
+        core.commit_write(CommitWriteRequest {
+            stream_id: open.stream_id,
+            commit_seq: 1,
+            effective_len: BLOCK_SIZE,
+            ..commit_write_request()
+        })
+        .await
+        .expect("commit write");
+        assert_refresh_metadata(
+            core.sync_committed_block(sync_committed_block_request(BLOCK_STAMP + 1, BLOCK_SIZE))
+                .await,
+            ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
+        );
+        assert_refresh_metadata(
+            core.sync_committed_block(sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE - 1))
+                .await,
+            ErrorKind::Metadata(MetadataErrorKind::StaleState),
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_committed_block_rejects_block_layout_mismatch() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+        publish_ready_block(store.as_ref(), payload(), BLOCK_STAMP);
+
+        let mut block_size_mismatch = sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE);
+        block_size_mismatch.block_size = BLOCK_SIZE * 2;
+        assert_refresh_metadata(
+            core.sync_committed_block(block_size_mismatch).await,
+            ErrorKind::Metadata(MetadataErrorKind::StaleState),
+        );
+
+        let mut chunk_size_mismatch = sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE);
+        chunk_size_mismatch.chunk_size = CHUNK_SIZE * 2;
+        assert_refresh_metadata(
+            core.sync_committed_block(chunk_size_mismatch).await,
+            ErrorKind::Metadata(MetadataErrorKind::StaleState),
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_sync_committed_block_is_idempotent() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+        publish_ready_block(store.as_ref(), payload(), BLOCK_STAMP);
+
+        let first = core
+            .sync_committed_block(sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE))
+            .await
+            .expect("first sync");
+        let second = core
+            .sync_committed_block(sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE))
+            .await
+            .expect("second sync");
+
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn abort_discards_partial_write_and_keeps_no_ready_block() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: Bytes::from_static(b"partial"),
+            checksum32: 0,
+        })
+        .await
+        .expect("partial frame");
+
+        let result = core
+            .abort_write(AbortWriteRequest {
+                stream_id: open.stream_id,
+                ..abort_write_request()
+            })
+            .await
+            .expect("abort write");
+
+        assert!(result.aborted);
+        assert!(core.stream_manager().get(open.stream_id).await.is_none());
+        let paths = store.paths(&group_name(), block_id());
+        assert!(!paths.staging_data_path.exists());
+        assert!(!paths.staging_meta_path.exists());
+        assert!(!paths.meta_path.exists());
+        assert_not_found(store.read_at(&group_name(), block_id(), 0, 1));
+        assert_refresh_metadata(
+            core.open_read(read_open_request_for(0, 1, BLOCK_STAMP, 512)).await,
+            ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
+        );
+        assert!(store.scan_group_blocks(&group_name()).expect("scan group").is_empty());
+
+        assert_not_found(
+            core.commit_write(CommitWriteRequest {
+                stream_id: open.stream_id,
+                commit_seq: 1,
+                effective_len: 7,
+                ..commit_write_request()
+            })
+            .await,
+        );
+        assert_not_found(
+            core.abort_write(AbortWriteRequest {
+                stream_id: open.stream_id,
+                ..abort_write_request()
+            })
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_after_successful_commit_does_not_damage_ready_block() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        let data = payload();
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: data.clone(),
+            checksum32: 0,
+        })
+        .await
+        .expect("write frame");
+        core.commit_write(CommitWriteRequest {
+            stream_id: open.stream_id,
+            commit_seq: 1,
+            effective_len: BLOCK_SIZE,
+            ..commit_write_request()
+        })
+        .await
+        .expect("commit write");
+
+        assert_not_found(
+            core.abort_write(AbortWriteRequest {
+                stream_id: open.stream_id,
+                ..abort_write_request()
+            })
+            .await,
+        );
+
+        let scanned = store.scan_group_blocks(&group_name()).expect("scan group");
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(store.read_at(&group_name(), block_id(), 0, BLOCK_SIZE).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn recover_after_uncommitted_write_is_not_readable() {
+        let (temp, _store, core) = core_with_store(512, 2048);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: Bytes::from_static(b"abcd"),
+            checksum32: 0,
+        })
+        .await
+        .expect("write frame");
+
+        let recovered_store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(temp.path().to_path_buf()));
+        assert_not_found(recovered_store.recover_block(&group_name(), block_id()));
+        assert_not_found(recovered_store.read_at(&group_name(), block_id(), 0, 1));
+    }
+
+    #[tokio::test]
+    async fn incomplete_staging_write_is_ignored_by_ready_block_scan() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: Bytes::from_static(b"partial"),
+            checksum32: 0,
+        })
+        .await
+        .expect("partial frame");
+
+        let paths = store.paths(&group_name(), block_id());
+        assert!(paths.staging_data_path.exists());
+        assert!(paths.staging_meta_path.exists());
+        assert!(!paths.meta_path.exists());
+        assert!(store.scan_group_blocks(&group_name()).expect("scan group").is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_read_ready_block_succeeds() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+
+        let result = core
+            .open_read(read_open_request_for(128, 1024, BLOCK_STAMP, 0))
+            .await
+            .expect("open read");
+
+        assert_eq!(result.frame_size, 512);
+        assert_eq!(result.block_stamp, BLOCK_STAMP);
+        assert_eq!(result.committed_length, BLOCK_SIZE);
+
+        let state = core
+            .stream_manager()
+            .get(result.stream_id)
+            .await
+            .expect("read stream registered");
+        assert_eq!(state.context.group_name, group_name());
+        assert_eq!(state.context.block_id, block_id());
+        assert_eq!(state.context.mode, StreamMode::Read);
+        assert_eq!(state.context.start_offset, 128);
+        assert_eq!(state.context.end_offset, 1152);
+        assert_eq!(state.cursor, 128);
+        assert_eq!(state.context.effective_len, BLOCK_SIZE);
+    }
+
+    #[tokio::test]
+    async fn worker_core_uses_configured_store_dir() {
+        let custom_dir = TempDir::new().expect("custom store dir");
+        let other_dir = TempDir::new().expect("other store dir");
+        let store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(custom_dir.path().to_path_buf()));
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+
+        let core = WorkerCore::with_options(512, 2048, Duration::from_secs(60), custom_dir.path().to_path_buf());
+
+        let result = core
+            .open_read(read_open_request_for(0, 8, BLOCK_STAMP, 512))
+            .await
+            .expect("open read from configured store dir");
+        assert!(core.stream_manager().get(result.stream_id).await.is_some());
+
+        let paths = store.paths(&group_name(), block_id());
+        assert!(paths.data_path.starts_with(custom_dir.path()));
+        assert!(paths.meta_path.starts_with(custom_dir.path()));
+        assert!(
+            paths.data_path.exists(),
+            "ready block data must exist under custom store dir"
+        );
+        assert!(
+            paths.meta_path.exists(),
+            "ready block metadata must exist under custom store dir"
+        );
+
+        let other_store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(other_dir.path().to_path_buf()));
+        let other_paths = other_store.paths(&group_name(), block_id());
+        assert!(
+            !other_paths.data_path.exists(),
+            "ready block data must not be created under other store dir"
+        );
+        assert!(
+            !other_paths.meta_path.exists(),
+            "ready block metadata must not be created under other store dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_read_rejects_invalid_ready_block_requests() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+
+        let mut block_size_mismatch = read_open_request_for(0, 1024, BLOCK_STAMP, 512);
+        block_size_mismatch.block_size = BLOCK_SIZE * 2;
+        let mut chunk_size_mismatch = read_open_request_for(0, 1024, BLOCK_STAMP, 512);
+        chunk_size_mismatch.chunk_size = CHUNK_SIZE * 2;
+        let cases = [
+            (
+                "stamp mismatch",
+                read_open_request_for(0, 1024, BLOCK_STAMP + 1, 512),
+                Some(ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch)),
+            ),
+            (
+                "block size mismatch",
+                block_size_mismatch,
+                Some(ErrorKind::Metadata(MetadataErrorKind::StaleState)),
+            ),
+            (
+                "chunk size mismatch",
+                chunk_size_mismatch,
+                Some(ErrorKind::Metadata(MetadataErrorKind::StaleState)),
+            ),
+            ("zero block stamp", read_open_request_for(0, 1024, 0, 512), None),
+            (
+                "out of bounds range",
+                read_open_request_for(4090, 16, BLOCK_STAMP, 512),
+                None,
+            ),
+        ];
+
+        for (case, request, refresh_error) in cases {
+            let result = core.open_read(request).await;
+            if let Some(expected) = refresh_error {
+                assert_refresh_metadata(result, expected);
+            } else {
+                assert_invalid_argument(result);
+            }
+            assert_eq!(
+                core.stream_manager().active_count().await,
+                0,
+                "case {case} must not register a stream"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn open_read_rejects_missing_block() {
+        let (_temp, _store, core) = core_with_store(512, 2048);
+
+        assert_refresh_metadata(
+            core.open_read(read_open_request_for(0, 1024, BLOCK_STAMP, 512)).await,
+            ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
+        );
+        assert_eq!(core.stream_manager().active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn read_stream_advances_cursor_and_respects_max_bytes() {
+        let (_temp, store, core) = core_with_store(8, 16);
+        let data = payload();
+        publish_ready_block(&store, data.clone(), BLOCK_STAMP);
+        let open = core
+            .open_read(read_open_request_for(0, 8, BLOCK_STAMP, 8))
+            .await
+            .expect("open read");
+
+        let first = core.read_stream(open.stream_id, 3).await.expect("first read");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].data, data.slice(0..3));
+        assert!(!first[0].eos);
+        assert_eq!(
+            core.stream_manager().get(open.stream_id).await.expect("stream").cursor,
+            3
+        );
+
+        let second = core.read_stream(open.stream_id, 4).await.expect("second read");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].data, data.slice(3..7));
+        assert!(!second[0].eos);
+        assert_eq!(
+            core.stream_manager().get(open.stream_id).await.expect("stream").cursor,
+            7
+        );
+
+        let third = core.read_stream(open.stream_id, 4).await.expect("third read");
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].data, data.slice(7..8));
+        assert!(third[0].eos);
+        assert!(core.stream_manager().get(open.stream_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_stream_offset_length_and_eof_boundaries_are_exact() {
+        let (_temp, store, core) = core_with_store(513, 2048);
+        let effective_len = u64::from(CHUNK_SIZE) * 2 + 17;
+        let data = payload().slice(0..effective_len as usize);
+        publish_ready_block(&store, data.clone(), BLOCK_STAMP);
+
+        let full = core
+            .open_read(read_open_request_for_len(
+                0,
+                effective_len as u32,
+                BLOCK_STAMP,
+                effective_len,
+                513,
+            ))
+            .await
+            .expect("open full read");
+        assert_eq!(collect_core_read(&core, full.stream_id, 513).await, data);
+
+        let nonzero = core
+            .open_read(read_open_request_for_len(17, 100, BLOCK_STAMP, effective_len, 64))
+            .await
+            .expect("open nonzero read");
+        assert_eq!(
+            collect_core_read(&core, nonzero.stream_id, 64).await,
+            data.slice(17..117)
+        );
+
+        let short = core
+            .open_read(read_open_request_for_len(100, 3, BLOCK_STAMP, effective_len, 64))
+            .await
+            .expect("open short read");
+        assert_eq!(
+            collect_core_read(&core, short.stream_id, 64).await,
+            data.slice(100..103)
+        );
+
+        let boundary_offset = u64::from(CHUNK_SIZE) - 3;
+        let across_chunk = core
+            .open_read(read_open_request_for_len(
+                boundary_offset,
+                10,
+                BLOCK_STAMP,
+                effective_len,
+                4,
+            ))
+            .await
+            .expect("open chunk boundary read");
+        assert_eq!(
+            collect_core_read(&core, across_chunk.stream_id, 4).await,
+            data.slice(boundary_offset as usize..boundary_offset as usize + 10)
+        );
+
+        let eof = core
+            .open_read(read_open_request_for_len(
+                effective_len,
+                0,
+                BLOCK_STAMP,
+                effective_len,
+                64,
+            ))
+            .await
+            .expect("open eof read");
+        assert!(collect_core_read(&core, eof.stream_id, 64).await.is_empty());
+
+        assert_invalid_argument(
+            core.open_read(read_open_request_for_len(
+                effective_len,
+                1,
+                BLOCK_STAMP,
+                effective_len,
+                64,
+            ))
+            .await,
+        );
+        assert_invalid_argument(
+            core.open_read(read_open_request_for_len(
+                effective_len - 1,
+                2,
+                BLOCK_STAMP,
+                effective_len,
+                64,
+            ))
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn read_stream_rejects_missing_and_write_streams() {
+        let (_temp, _store, core) = core_with_store(8, 16);
+
+        assert_not_found(core.read_stream(stream_id(), 1024).await);
+        let state = StreamState::new(write_stream_context());
+        core.stream_manager().register(state).await;
+
+        match core
+            .read_stream(stream_id(), 1024)
+            .await
+            .expect_err("write stream must not be readable")
+        {
+            WorkerError::InvalidArgument(message) => assert!(message.contains("not a read stream")),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        assert_eq!(core.stream_manager().get(stream_id()).await.expect("stream").cursor, 0);
+    }
+}

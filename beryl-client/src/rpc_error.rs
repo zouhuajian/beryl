@@ -415,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_rpc_envelope_missing_header_is_fatal_rpc_error() {
+    fn parse_rpc_envelope_rejects_invalid_success_headers() {
         match parse_rpc_envelope(Ok(()), None) {
             RpcEnvelope::RpcErrorDetail(err) => {
                 assert_eq!(err.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
@@ -423,10 +423,12 @@ mod tests {
             }
             _ => panic!("expected fatal rpc error envelope"),
         }
+
+        assert_malformed_ok_header_is_fatal();
+        assert_missing_group_name_ok_header_is_fatal();
     }
 
-    #[test]
-    fn parse_rpc_envelope_malformed_ok_header_is_fatal_rpc_error() {
+    fn assert_malformed_ok_header_is_fatal() {
         let malformed = beryl_proto::common::ResponseHeaderProto::default();
 
         match parse_rpc_envelope(Ok(()), Some(&malformed)) {
@@ -439,8 +441,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_rpc_envelope_missing_group_name_ok_header_is_fatal_rpc_error() {
+    fn assert_missing_group_name_ok_header_is_fatal() {
         let header = beryl_proto::common::ResponseHeaderProto {
             client: Some(beryl_proto::common::ClientInfoProto {
                 call_id: beryl_types::CallId::new().to_string(),

@@ -267,37 +267,33 @@ mod tests {
     use serde_yaml::Value;
 
     #[test]
-    fn test_get_str() {
+    fn typed_getters_parse_supported_values() {
         let mut config = FlatConfig::new();
         config.insert("key1".to_string(), Value::String("value1".to_string()));
         config.insert("key2".to_string(), Value::Number(serde_yaml::Number::from(42)));
-
         assert_eq!(config.get_str("key1"), Some("value1".to_string()));
         assert_eq!(config.get_str("key2"), Some("42".to_string()));
         assert_eq!(config.get_str("key3"), None);
-    }
 
-    #[test]
-    fn test_get_i64() {
-        let mut config = FlatConfig::new();
         config.insert("num1".to_string(), Value::Number(serde_yaml::Number::from(42)));
         config.insert("num2".to_string(), Value::String("100".to_string()));
-
         assert_eq!(config.get_i64("num1"), Some(42));
         assert_eq!(config.get_i64("num2"), Some(100));
         assert_eq!(config.get_i64("num3"), None);
-    }
 
-    #[test]
-    fn test_get_bool() {
-        let mut config = FlatConfig::new();
         config.insert("bool1".to_string(), Value::Bool(true));
         config.insert("bool2".to_string(), Value::String("false".to_string()));
         config.insert("bool3".to_string(), Value::String("yes".to_string()));
-
         assert_eq!(config.get_bool("bool1"), Some(true));
         assert_eq!(config.get_bool("bool2"), Some(false));
         assert_eq!(config.get_bool("bool3"), Some(true));
+
+        config.insert("size1".to_string(), Value::String("1KB".to_string()));
+        config.insert("size2".to_string(), Value::String("2MB".to_string()));
+        config.insert("size3".to_string(), Value::Number(serde_yaml::Number::from(1024)));
+        assert_eq!(config.get_bytes("size1"), Some(1024));
+        assert_eq!(config.get_bytes("size2"), Some(2 * 1024 * 1024));
+        assert_eq!(config.get_bytes("size3"), Some(1024));
     }
 
     #[test]
@@ -330,17 +326,5 @@ mod tests {
         assert_eq!(redacted.get_str("password"), Some("***".to_string()));
         assert_eq!(redacted.get_str("api_key"), Some("***".to_string()));
         assert_eq!(redacted.get_str("normal_name"), Some("value".to_string()));
-    }
-
-    #[test]
-    fn test_get_bytes() {
-        let mut config = FlatConfig::new();
-        config.insert("size1".to_string(), Value::String("1KB".to_string()));
-        config.insert("size2".to_string(), Value::String("2MB".to_string()));
-        config.insert("size3".to_string(), Value::Number(serde_yaml::Number::from(1024)));
-
-        assert_eq!(config.get_bytes("size1"), Some(1024));
-        assert_eq!(config.get_bytes("size2"), Some(2 * 1024 * 1024));
-        assert_eq!(config.get_bytes("size3"), Some(1024));
     }
 }

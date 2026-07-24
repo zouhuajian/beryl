@@ -249,57 +249,40 @@ mod tests {
     }
 
     #[test]
-    fn external_request_context_rejects_missing_header() {
-        let error = request_context_from_proto(&None).expect_err("missing header must fail");
+    fn external_request_context_rejects_invalid_headers() {
+        let valid_client_id = Some(ClientId::new(7).into());
+        let cases = [
+            (None, "RequestHeader"),
+            (request_header_with_client(None), "client"),
+            (
+                request_header_with_client(Some(beryl_proto::common::ClientInfoProto {
+                    call_id: beryl_types::CallId::new().to_string(),
+                    client_id: None,
+                    client_name: "worker-control".to_string(),
+                })),
+                "client_id",
+            ),
+            (
+                request_header_with_client(Some(beryl_proto::common::ClientInfoProto {
+                    call_id: beryl_types::CallId::new().to_string(),
+                    client_id: Some(beryl_proto::common::ClientIdProto { high: 0, low: 0 }),
+                    client_name: "worker-control".to_string(),
+                })),
+                "client_id",
+            ),
+            (
+                request_header_with_client(Some(beryl_proto::common::ClientInfoProto {
+                    call_id: "not-a-uuid".to_string(),
+                    client_id: valid_client_id,
+                    client_name: "worker-control".to_string(),
+                })),
+                "call_id",
+            ),
+        ];
 
-        assert_invalid_header_error(&error, "RequestHeader");
-    }
-
-    #[test]
-    fn external_request_context_rejects_missing_client_info() {
-        let header = request_header_with_client(None);
-
-        let error = request_context_from_proto(&header).expect_err("missing client info must fail");
-
-        assert_invalid_header_error(&error, "client");
-    }
-
-    #[test]
-    fn external_request_context_rejects_missing_client_id() {
-        let header = request_header_with_client(Some(beryl_proto::common::ClientInfoProto {
-            call_id: beryl_types::CallId::new().to_string(),
-            client_id: None,
-            client_name: "worker-control".to_string(),
-        }));
-
-        let error = request_context_from_proto(&header).expect_err("missing client_id must fail");
-
-        assert_invalid_header_error(&error, "client_id");
-    }
-
-    #[test]
-    fn external_request_context_rejects_zero_client_id() {
-        let header = request_header_with_client(Some(beryl_proto::common::ClientInfoProto {
-            call_id: beryl_types::CallId::new().to_string(),
-            client_id: Some(beryl_proto::common::ClientIdProto { high: 0, low: 0 }),
-            client_name: "worker-control".to_string(),
-        }));
-
-        let error = request_context_from_proto(&header).expect_err("zero client_id must fail");
-
-        assert_invalid_header_error(&error, "client_id");
-    }
-
-    #[test]
-    fn external_request_context_rejects_invalid_call_id() {
-        let header = request_header_with_client(Some(beryl_proto::common::ClientInfoProto {
-            call_id: "not-a-uuid".to_string(),
-            client_id: Some(ClientId::new(7).into()),
-            client_name: "worker-control".to_string(),
-        }));
-
-        let error = request_context_from_proto(&header).expect_err("invalid call_id must fail");
-
-        assert_invalid_header_error(&error, "call_id");
+        for (header, expected_message) in cases {
+            let error = request_context_from_proto(&header).expect_err("invalid header must fail");
+            assert_invalid_header_error(&error, expected_message);
+        }
     }
 }

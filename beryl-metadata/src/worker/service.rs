@@ -1586,22 +1586,6 @@ mod tests {
         assert_eq!(header.client.expect("client info").call_id, original_call_id);
     }
 
-    #[test]
-    fn merge_empty_transport_context_keeps_trace_context_absent() {
-        let mut header = Some(valid_request_header(&group_name("root"), ClientId::new(90)));
-
-        merge_request_header_transport_context(
-            &mut header,
-            &ExtractedContext {
-                traceparent: None,
-                tracestate: None,
-                baggage: None,
-            },
-        );
-
-        assert!(header.expect("header").trace_context.is_none());
-    }
-
     fn register_request_with_header(
         header: Option<beryl_proto::common::RequestHeaderProto>,
         worker_id: WorkerId,
@@ -1728,232 +1712,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heartbeat_need_register_with_new_worker_run_id_emits_new_metadata_worker_warn_log() {
-        let _log_guard = log_test_mutex().lock().await;
-        let dir = TempDir::new().unwrap();
-        let raft_node = nonleader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let worker_id = WorkerId::new(190);
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            worker_manager,
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let dispatch = captured_json_subscriber(&output);
-
-        async {
-            for (heartbeat_seq, worker_run_id) in [(1, test_worker_run_id()), (2, second_worker_run_id())] {
-                let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
-                    &service,
-                    Request::new(heartbeat_request(
-                        group_name("root"),
-                        worker_id,
-                        worker_run_id,
-                        heartbeat_seq,
-                        9090,
-                    )),
-                )
-                .await
-                .expect("heartbeat business error uses gRPC OK")
-                .into_inner();
-                let error = response.header.expect("header").error.expect("header error");
-                assert_error_register_worker(&error, ErrorKind::Worker(WorkerErrorKind::NotRegistered));
-            }
-        }
-        .with_subscriber(dispatch)
-        .await;
-
-        let logs = captured_logs(&output);
-        let warn_logs: Vec<_> = logs
-            .iter()
-            .filter(|log| {
-                log["target"] == "metadata.worker"
-                    && log["level"] == "WARN"
-                    && log["op"] == "Heartbeat"
-                    && log["result"] == "rejected"
-                    && log["error_code"] == "need_register"
-            })
-            .collect();
-        assert_eq!(warn_logs.len(), 2, "{logs:?}");
-    }
-
-    #[tokio::test]
-    async fn heartbeat_rejection_reason_change_emits_new_metadata_worker_warn_log() {
-        let _log_guard = log_test_mutex().lock().await;
-        let dir = TempDir::new().unwrap();
-        let raft_node = nonleader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let worker_id = WorkerId::new(191);
-        let worker_run_id = test_worker_run_id();
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            Arc::clone(&worker_manager),
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let dispatch = captured_json_subscriber(&output);
-
-        async {
-            let need_register = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
-                &service,
-                Request::new(heartbeat_request(group_name("root"), worker_id, worker_run_id, 1, 9090)),
-            )
-            .await
-            .expect("need-register heartbeat returns gRPC OK")
-            .into_inner();
-            let need_register_error = need_register.header.expect("header").error.expect("header error");
-            assert_error_register_worker(&need_register_error, ErrorKind::Worker(WorkerErrorKind::NotRegistered));
-
-            worker_manager
-                .register_worker_run(
-                    &group_name("root"),
-                    worker_id,
-                    "127.0.0.1:9090".to_string(),
-                    1,
-                    second_worker_run_id(),
-                    None,
-                )
-                .unwrap();
-
-            let run_mismatch = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
-                &service,
-                Request::new(heartbeat_request(group_name("root"), worker_id, worker_run_id, 2, 9090)),
-            )
-            .await
-            .expect("run-mismatch heartbeat returns gRPC OK")
-            .into_inner();
-            let run_mismatch_error = run_mismatch.header.expect("header").error.expect("header error");
-            assert_error_register_worker(&run_mismatch_error, ErrorKind::Worker(WorkerErrorKind::RunMismatch));
-        }
-        .with_subscriber(dispatch)
-        .await;
-
-        let logs = captured_logs(&output);
-        let warn_logs: Vec<_> = logs
-            .iter()
-            .filter(|log| log["target"] == "metadata.worker" && log["level"] == "WARN" && log["op"] == "Heartbeat")
-            .collect();
-        assert_eq!(warn_logs.len(), 2, "{logs:?}");
-        assert_eq!(warn_logs[0]["error_code"], "need_register");
-        assert_eq!(warn_logs[1]["error_code"], "worker_run_mismatch");
-    }
-
-    #[tokio::test]
-    async fn repeated_heartbeat_worker_run_mismatch_emits_one_metadata_worker_warn_log() {
-        let _log_guard = log_test_mutex().lock().await;
-        let dir = TempDir::new().unwrap();
-        let raft_node = nonleader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let worker_id = WorkerId::new(183);
-        worker_manager
-            .register_worker_run(
-                &group_name("root"),
-                worker_id,
-                "127.0.0.1:9090".to_string(),
-                1,
-                test_worker_run_id(),
-                None,
-            )
-            .unwrap();
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            worker_manager,
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let dispatch = captured_json_subscriber(&output);
-
-        async {
-            for heartbeat_seq in [1, 2] {
-                let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
-                    &service,
-                    Request::new(heartbeat_request(
-                        group_name("root"),
-                        worker_id,
-                        second_worker_run_id(),
-                        heartbeat_seq,
-                        9090,
-                    )),
-                )
-                .await
-                .expect("heartbeat business error uses gRPC OK")
-                .into_inner();
-                let error = response.header.expect("header").error.expect("header error");
-                assert_error_register_worker(&error, ErrorKind::Worker(WorkerErrorKind::RunMismatch));
-            }
-        }
-        .with_subscriber(dispatch)
-        .await;
-
-        let logs = captured_logs(&output);
-        let warn_logs: Vec<_> = logs
-            .iter()
-            .filter(|log| {
-                log["target"] == "metadata.worker"
-                    && log["level"] == "WARN"
-                    && log["op"] == "Heartbeat"
-                    && log["result"] == "rejected"
-                    && log["error_code"] == "worker_run_mismatch"
-            })
-            .collect();
-        assert_eq!(warn_logs.len(), 1, "{logs:?}");
-    }
-
-    #[tokio::test]
-    async fn accepted_heartbeat_without_state_change_emits_no_metadata_worker_info_log() {
-        let _log_guard = log_test_mutex().lock().await;
-        let dir = TempDir::new().unwrap();
-        let raft_node = nonleader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let group_name = group_name("root");
-        let worker_id = WorkerId::new(186);
-        let worker_run_id = test_worker_run_id();
-        worker_manager
-            .register_worker_run(
-                &group_name,
-                worker_id,
-                "127.0.0.1:9090".to_string(),
-                1,
-                worker_run_id,
-                None,
-            )
-            .unwrap();
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            worker_manager,
-            Arc::new(MountTable::new()),
-            group_name.clone(),
-        );
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let dispatch = captured_json_subscriber(&output);
-
-        async {
-            let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
-                &service,
-                Request::new(heartbeat_request(group_name, worker_id, worker_run_id, 1, 9090)),
-            )
-            .await
-            .expect("heartbeat response")
-            .into_inner();
-            assert!(response.header.expect("header").error.is_none());
-        }
-        .with_subscriber(dispatch)
-        .await;
-
-        let logs = captured_logs(&output);
-        assert!(
-            logs.iter().all(|log| {
-                !(log["target"] == "metadata.worker" && log["level"] == "INFO" && log["op"] == "Heartbeat")
-            }),
-            "{logs:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn full_block_report_processed_emits_metadata_block_summary_log() {
         let _log_guard = log_test_mutex().lock().await;
         let dir = TempDir::new().unwrap();
@@ -2019,347 +1777,6 @@ mod tests {
             }),
             "{logs:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn repeated_full_block_report_without_changes_emits_no_metadata_block_info_summary() {
-        let _log_guard = log_test_mutex().lock().await;
-        let dir = TempDir::new().unwrap();
-        let raft_node = leader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let group_name = group_name("root");
-        let worker_id = WorkerId::new(192);
-        let block_id = BlockId::from_u64_u32(1920, 0);
-        worker_manager
-            .register_worker(&group_name, worker_id, "127.0.0.1:9090".to_string(), 1, None)
-            .unwrap();
-        let worker_run_id = record_heartbeat(
-            &worker_manager,
-            &group_name,
-            worker_id,
-            1_000,
-            100,
-            900,
-            0,
-            0,
-            HealthStatus::Healthy,
-        );
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            worker_manager,
-            Arc::new(MountTable::new()),
-            group_name.clone(),
-        );
-
-        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
-            &service,
-            Request::new(full_report_request(
-                group_name.clone(),
-                worker_id,
-                worker_run_id,
-                1,
-                0,
-                true,
-                vec![block_id],
-            )),
-        )
-        .await
-        .expect("initial full block report response")
-        .into_inner();
-        assert!(response.header.expect("header").error.is_none());
-
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let dispatch = captured_json_subscriber(&output);
-        async {
-            let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
-                &service,
-                Request::new(full_report_request(
-                    group_name,
-                    worker_id,
-                    worker_run_id,
-                    2,
-                    0,
-                    true,
-                    vec![block_id],
-                )),
-            )
-            .await
-            .expect("repeated full block report response")
-            .into_inner();
-            assert!(response.header.expect("header").error.is_none());
-        }
-        .with_subscriber(dispatch)
-        .await;
-
-        let logs = captured_logs(&output);
-        assert!(
-            logs.iter().all(|log| !(log["target"] == "metadata.block"
-                && log["level"] == "INFO"
-                && log["op"] == "FullBlockReport")),
-            "{logs:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn changed_full_block_report_emits_one_metadata_block_info_summary() {
-        let _log_guard = log_test_mutex().lock().await;
-        let dir = TempDir::new().unwrap();
-        let raft_node = leader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let group_name = group_name("root");
-        let worker_id = WorkerId::new(193);
-        let initial_block = BlockId::from_u64_u32(1930, 0);
-        let replacement_block = BlockId::from_u64_u32(1931, 0);
-        worker_manager
-            .register_worker(&group_name, worker_id, "127.0.0.1:9090".to_string(), 1, None)
-            .unwrap();
-        let worker_run_id = record_heartbeat(
-            &worker_manager,
-            &group_name,
-            worker_id,
-            1_000,
-            100,
-            900,
-            0,
-            0,
-            HealthStatus::Healthy,
-        );
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            worker_manager,
-            Arc::new(MountTable::new()),
-            group_name.clone(),
-        );
-
-        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
-            &service,
-            Request::new(full_report_request(
-                group_name.clone(),
-                worker_id,
-                worker_run_id,
-                1,
-                0,
-                true,
-                vec![initial_block],
-            )),
-        )
-        .await
-        .expect("initial full block report response")
-        .into_inner();
-        assert!(response.header.expect("header").error.is_none());
-
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let dispatch = captured_json_subscriber(&output);
-        let request = full_report_request(
-            group_name.clone(),
-            worker_id,
-            worker_run_id,
-            2,
-            0,
-            true,
-            vec![replacement_block],
-        );
-        let (expected_client_id, expected_call_id) = header_client_identity(request.header.as_ref().expect("header"));
-        async {
-            let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
-                &service,
-                Request::new(request),
-            )
-            .await
-            .expect("changed full block report response")
-            .into_inner();
-            assert!(response.header.expect("header").error.is_none());
-        }
-        .with_subscriber(dispatch)
-        .await;
-
-        let logs = captured_logs(&output);
-        let summaries: Vec<_> = logs
-            .iter()
-            .filter(|log| log["target"] == "metadata.block" && log["level"] == "INFO" && log["op"] == "FullBlockReport")
-            .collect();
-        assert_eq!(summaries.len(), 1, "{logs:?}");
-        let summary = summaries[0];
-        assert_eq!(summary["changed_block_count"], 2);
-        assert_eq!(summary["added_blocks"], 1);
-        assert_eq!(summary["removed_blocks"], 1);
-        assert_eq!(summary["client_id"], expected_client_id);
-        assert_eq!(summary["call_id"], expected_call_id);
-    }
-
-    #[tokio::test]
-    async fn zero_change_delta_block_report_emits_no_processed_info_summary() {
-        let _log_guard = log_test_mutex().lock().await;
-        let dir = TempDir::new().unwrap();
-        let raft_node = leader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let group_name = group_name("root");
-        let worker_id = WorkerId::new(187);
-        let block_id = BlockId::from_u64_u32(1870, 0);
-        worker_manager
-            .register_worker(&group_name, worker_id, "127.0.0.1:9090".to_string(), 1, None)
-            .unwrap();
-        let worker_run_id = record_heartbeat(
-            &worker_manager,
-            &group_name,
-            worker_id,
-            1_000,
-            100,
-            900,
-            0,
-            0,
-            HealthStatus::Healthy,
-        );
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            worker_manager,
-            Arc::new(MountTable::new()),
-            group_name.clone(),
-        );
-
-        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
-            &service,
-            Request::new(full_report_request(
-                group_name.clone(),
-                worker_id,
-                worker_run_id,
-                1,
-                0,
-                true,
-                vec![block_id],
-            )),
-        )
-        .await
-        .expect("full block report response")
-        .into_inner();
-        assert!(response.header.expect("header").error.is_none());
-
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let dispatch = captured_json_subscriber(&output);
-        async {
-            let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
-                &service,
-                Request::new(delta_report_request(
-                    group_name,
-                    worker_id,
-                    worker_run_id,
-                    1,
-                    0,
-                    Vec::new(),
-                )),
-            )
-            .await
-            .expect("delta block report response")
-            .into_inner();
-            assert!(response.header.expect("header").error.is_none());
-        }
-        .with_subscriber(dispatch)
-        .await;
-
-        let logs = captured_logs(&output);
-        assert!(
-            logs.iter().all(|log| {
-                !(log["level"] == "INFO"
-                    && (log["target"] == "metadata.worker" || log["target"] == "metadata.block")
-                    && log["op"].as_str().is_some_and(|op| op.contains("BlockReport")))
-            }),
-            "{logs:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn changed_delta_block_report_emits_one_metadata_block_info_summary() {
-        let _log_guard = log_test_mutex().lock().await;
-        let dir = TempDir::new().unwrap();
-        let raft_node = leader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let group_name = group_name("root");
-        let worker_id = WorkerId::new(188);
-        let baseline_block = BlockId::from_u64_u32(1880, 0);
-        let delta_block = BlockId::from_u64_u32(1881, 0);
-        worker_manager
-            .register_worker(&group_name, worker_id, "127.0.0.1:9090".to_string(), 1, None)
-            .unwrap();
-        let worker_run_id = record_heartbeat(
-            &worker_manager,
-            &group_name,
-            worker_id,
-            1_000,
-            100,
-            900,
-            0,
-            0,
-            HealthStatus::Healthy,
-        );
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            worker_manager,
-            Arc::new(MountTable::new()),
-            group_name.clone(),
-        );
-
-        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
-            &service,
-            Request::new(full_report_request(
-                group_name.clone(),
-                worker_id,
-                worker_run_id,
-                1,
-                0,
-                true,
-                vec![baseline_block],
-            )),
-        )
-        .await
-        .expect("full block report response")
-        .into_inner();
-        assert!(response.header.expect("header").error.is_none());
-
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let dispatch = captured_json_subscriber(&output);
-        let request = delta_report_request(
-            group_name.clone(),
-            worker_id,
-            worker_run_id,
-            1,
-            0,
-            vec![(BlockReportDeltaOpProto::BlockReportDeltaOpAddUpdate, delta_block)],
-        );
-        let (expected_client_id, expected_call_id) = header_client_identity(request.header.as_ref().expect("header"));
-        async {
-            let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
-                &service,
-                Request::new(request),
-            )
-            .await
-            .expect("delta block report response")
-            .into_inner();
-            assert!(response.header.expect("header").error.is_none());
-        }
-        .with_subscriber(dispatch)
-        .await;
-
-        let logs = captured_logs(&output);
-        let summaries: Vec<_> = logs
-            .iter()
-            .filter(|log| {
-                log["level"] == "INFO"
-                    && (log["target"] == "metadata.worker" || log["target"] == "metadata.block")
-                    && log["op"].as_str().is_some_and(|op| op.contains("BlockReport"))
-            })
-            .collect();
-        assert_eq!(summaries.len(), 1, "{logs:?}");
-        let summary = summaries[0];
-        assert_eq!(summary["target"], "metadata.block");
-        assert_eq!(summary["op"], "DeltaBlockReport");
-        assert_eq!(summary["changed_block_count"], 1);
-        assert_eq!(summary["added_blocks"], 1);
-        assert_eq!(summary["removed_blocks"], 0);
-        assert_eq!(summary["report_seq"], 1);
-        assert_eq!(summary["delta_seq"], 0);
-        assert_eq!(summary["client_id"], expected_client_id);
-        assert_eq!(summary["call_id"], expected_call_id);
-        assert!(summary["next_delta_seq"].as_u64().is_some(), "{summary:?}");
     }
 
     #[tokio::test]
@@ -2664,96 +2081,6 @@ mod tests {
             .is_empty());
     }
 
-    #[tokio::test]
-    async fn register_worker_invalid_request_returns_header_error() {
-        let dir = TempDir::new().unwrap();
-        let raft_node = leader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            worker_manager,
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
-
-        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
-            &service,
-            Request::new(RegisterWorkerRequestProto {
-                header: Some(valid_request_header(&group_name("root"), ClientId::new(80))),
-                worker_id: 9,
-                worker_run_id: test_worker_run_id().to_string(),
-                advertised_endpoint: None,
-            }),
-        )
-        .await
-        .expect("business validation must return gRPC OK")
-        .into_inner();
-
-        let error = response.header.expect("header").error.expect("header error");
-        let error = assert_error_fail(&error, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
-        assert!(error.message.contains("Missing advertised_endpoint"));
-    }
-
-    #[tokio::test]
-    async fn register_worker_invalid_request_records_error_metrics() {
-        let dir = TempDir::new().unwrap();
-        let raft_node = leader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            worker_manager,
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
-        let recorder = MetadataWorkerMetricsRecorder::default();
-
-        metrics::with_local_recorder(&recorder, || {
-            futures::executor::block_on(async {
-                let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
-                    &service,
-                    Request::new(RegisterWorkerRequestProto {
-                        header: Some(valid_request_header(&group_name("root"), ClientId::new(180))),
-                        worker_id: 9,
-                        worker_run_id: test_worker_run_id().to_string(),
-                        advertised_endpoint: None,
-                    }),
-                )
-                .await
-                .expect("business validation must return gRPC OK")
-                .into_inner();
-
-                assert!(response.header.expect("header").error.is_some());
-            });
-        });
-
-        assert!(recorder.has_counter(
-            observe::METADATA_RPC_REQUESTS_TOTAL,
-            &[
-                ("service", "metadata_worker"),
-                ("method", "register_worker"),
-                ("status", "error"),
-                ("error_kind", "invalid_argument"),
-            ],
-        ));
-        assert!(recorder.has_counter(
-            observe::METADATA_WORKER_REGISTERED_TOTAL,
-            &[("status", "error"), ("error_kind", "invalid_argument")],
-        ));
-        assert!(recorder.has_histogram(
-            observe::METADATA_RPC_REQUEST_DURATION_SECONDS,
-            &[
-                ("service", "metadata_worker"),
-                ("method", "register_worker"),
-                ("status", "error"),
-                ("error_kind", "invalid_argument"),
-            ],
-        ));
-        assert!(recorder.has_histogram(
-            observe::METADATA_WORKER_REGISTRATION_DURATION_SECONDS,
-            &[("status", "error"), ("error_kind", "invalid_argument")],
-        ));
-    }
-
     #[test]
     fn metadata_worker_error_label_uses_kind_not_message_text() {
         for message in [
@@ -2766,78 +2093,6 @@ mod tests {
             let detail = beryl_proto::convert::rpc_error_to_proto(&rpc_error);
             assert_eq!(metadata_worker_error_detail_kind(&detail), "internal");
         }
-    }
-
-    #[tokio::test]
-    async fn heartbeat_success_records_worker_metrics() {
-        let dir = TempDir::new().unwrap();
-        let raft_node = nonleader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let worker_id = WorkerId::new(17);
-        worker_manager
-            .register_worker_run(
-                &group_name("root"),
-                worker_id,
-                "127.0.0.1:9090".to_string(),
-                WORKER_NET_PROTOCOL_GRPC,
-                test_worker_run_id(),
-                None,
-            )
-            .unwrap();
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            worker_manager,
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
-        let recorder = MetadataWorkerMetricsRecorder::default();
-
-        metrics::with_local_recorder(&recorder, || {
-            futures::executor::block_on(async {
-                let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
-                    &service,
-                    Request::new(heartbeat_request(
-                        group_name("root"),
-                        worker_id,
-                        test_worker_run_id(),
-                        1,
-                        9090,
-                    )),
-                )
-                .await
-                .expect("heartbeat succeeds")
-                .into_inner();
-
-                assert!(response.header.expect("header").error.is_none());
-            });
-        });
-
-        assert!(recorder.has_counter(
-            observe::METADATA_RPC_REQUESTS_TOTAL,
-            &[
-                ("service", "metadata_worker"),
-                ("method", "heartbeat"),
-                ("status", "ok"),
-                ("error_kind", "none"),
-            ],
-        ));
-        assert!(recorder.has_counter(
-            observe::METADATA_WORKER_HEARTBEAT_TOTAL,
-            &[("status", "ok"), ("error_kind", "none")],
-        ));
-        assert!(recorder.has_histogram(
-            observe::METADATA_RPC_REQUEST_DURATION_SECONDS,
-            &[
-                ("service", "metadata_worker"),
-                ("method", "heartbeat"),
-                ("status", "ok"),
-                ("error_kind", "none"),
-            ],
-        ));
-        assert!(recorder.has_histogram(
-            observe::METADATA_WORKER_HEARTBEAT_DURATION_SECONDS,
-            &[("status", "ok"), ("error_kind", "none")],
-        ));
     }
 
     #[tokio::test]
@@ -2990,81 +2245,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn block_report_error_records_worker_metrics_without_block_counter() {
-        let dir = TempDir::new().unwrap();
-        let raft_node = nonleader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            worker_manager,
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
-        let recorder = MetadataWorkerMetricsRecorder::default();
-
-        metrics::with_local_recorder(&recorder, || {
-            futures::executor::block_on(async {
-                let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
-                    &service,
-                    Request::new(full_report_request(
-                        group_name("root"),
-                        WorkerId::new(20),
-                        test_worker_run_id(),
-                        1,
-                        0,
-                        true,
-                        vec![BlockId::from_u64_u32(2_000, 0)],
-                    )),
-                )
-                .await
-                .expect("block report header error returns gRPC OK")
-                .into_inner();
-
-                assert!(response.header.expect("header").error.is_some());
-            });
-        });
-
-        assert!(recorder.has_counter(
-            observe::METADATA_RPC_REQUESTS_TOTAL,
-            &[
-                ("service", "metadata_worker"),
-                ("method", "block_report"),
-                ("status", "error"),
-                ("error_kind", "worker_not_registered"),
-            ],
-        ));
-        assert!(recorder.has_counter(
-            observe::METADATA_WORKER_BLOCK_REPORT_TOTAL,
-            &[
-                ("kind", "full"),
-                ("status", "error"),
-                ("error_kind", "worker_not_registered")
-            ],
-        ));
-        assert!(!recorder.has_counter(
-            observe::METADATA_WORKER_BLOCK_REPORT_BLOCKS_TOTAL,
-            &[("change", "added")],
-        ));
-        assert!(recorder.has_histogram(
-            observe::METADATA_RPC_REQUEST_DURATION_SECONDS,
-            &[
-                ("service", "metadata_worker"),
-                ("method", "block_report"),
-                ("status", "error"),
-                ("error_kind", "worker_not_registered"),
-            ],
-        ));
-        assert!(recorder.has_histogram(
-            observe::METADATA_WORKER_BLOCK_REPORT_DURATION_SECONDS,
-            &[
-                ("kind", "full"),
-                ("status", "error"),
-                ("error_kind", "worker_not_registered")
-            ],
-        ));
-    }
-
-    #[tokio::test]
     async fn worker_service_rejects_non_served_header_group() {
         let dir = TempDir::new().unwrap();
         let raft_node = leader_raft(&dir).await;
@@ -3175,52 +2355,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_worker_response_confirms_worker_id_and_run_id() {
-        let dir = TempDir::new().unwrap();
-        let raft_node = leader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let worker_run_id = test_worker_run_id();
-        let service = MetadataWorkerServiceImpl::new(
-            Arc::clone(&raft_node),
-            Arc::clone(&worker_manager),
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
-
-        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
-            &service,
-            Request::new(RegisterWorkerRequestProto {
-                header: Some(valid_request_header(&group_name("root"), ClientId::new(83))),
-                worker_id: 123,
-                worker_run_id: worker_run_id.to_string(),
-                advertised_endpoint: Some(beryl_proto::common::EndpointProto {
-                    host: "127.0.0.1".to_string(),
-                    port: 9090,
-                }),
-            }),
-        )
-        .await
-        .expect("register worker response")
-        .into_inner();
-
-        assert!(response.header.as_ref().expect("header").error.is_none());
-        assert_eq!(response.header.as_ref().expect("header").group_name, "root");
-        assert_eq!(response.worker_id, 123);
-        assert_eq!(response.accepted_worker_run_id, worker_run_id.to_string());
-        let descriptor = worker_manager
-            .get_descriptor(&group_name("root"), WorkerId::new(123))
-            .unwrap();
-        assert_eq!(descriptor.address, "127.0.0.1:9090");
-        assert_eq!(
-            worker_manager
-                .get_registration(&group_name("root"), WorkerId::new(123))
-                .expect("live registration")
-                .worker_run_id,
-            worker_run_id
-        );
-    }
-
-    #[tokio::test]
     async fn register_worker_publishes_live_run_only_after_raft_success() {
         let dir = TempDir::new().unwrap();
         let raft_node = leader_raft(&dir).await;
@@ -3264,267 +2398,6 @@ mod tests {
                 .worker_run_id,
             worker_run_id
         );
-    }
-
-    #[tokio::test]
-    async fn register_worker_replaces_different_run_id_on_same_endpoint() {
-        let dir = TempDir::new().unwrap();
-        let raft_node = leader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let service = MetadataWorkerServiceImpl::new(
-            Arc::clone(&raft_node),
-            Arc::clone(&worker_manager),
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
-        let request = |worker_run_id: WorkerRunId| RegisterWorkerRequestProto {
-            header: Some(valid_request_header(&group_name("root"), ClientId::new(85))),
-            worker_id: 123,
-            worker_run_id: worker_run_id.to_string(),
-            advertised_endpoint: Some(beryl_proto::common::EndpointProto {
-                host: "127.0.0.1".to_string(),
-                port: 9090,
-            }),
-        };
-
-        let first = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
-            &service,
-            Request::new(request(test_worker_run_id())),
-        )
-        .await
-        .expect("first register")
-        .into_inner();
-        assert!(first.header.expect("header").error.is_none());
-
-        let first_heartbeat = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
-            &service,
-            Request::new(heartbeat_request(
-                group_name("root"),
-                WorkerId::new(123),
-                test_worker_run_id(),
-                1,
-                9090,
-            )),
-        )
-        .await
-        .expect("first heartbeat")
-        .into_inner();
-        assert!(first_heartbeat.header.expect("header").error.is_none());
-
-        let second = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
-            &service,
-            Request::new(request(second_worker_run_id())),
-        )
-        .await
-        .expect("restart register returns success")
-        .into_inner();
-        assert!(second.header.as_ref().expect("header").error.is_none());
-        assert_eq!(
-            worker_manager
-                .get_registration(&group_name("root"), WorkerId::new(123))
-                .expect("registration")
-                .worker_run_id,
-            second_worker_run_id()
-        );
-
-        let old_heartbeat = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
-            &service,
-            Request::new(heartbeat_request(
-                group_name("root"),
-                WorkerId::new(123),
-                test_worker_run_id(),
-                2,
-                9090,
-            )),
-        )
-        .await
-        .expect("old heartbeat returns header error")
-        .into_inner();
-        let old_error = old_heartbeat.header.expect("header").error.expect("header error");
-        assert_error_register_worker(&old_error, ErrorKind::Worker(WorkerErrorKind::RunMismatch));
-
-        let new_heartbeat = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
-            &service,
-            Request::new(heartbeat_request(
-                group_name("root"),
-                WorkerId::new(123),
-                second_worker_run_id(),
-                1,
-                9090,
-            )),
-        )
-        .await
-        .expect("new heartbeat succeeds")
-        .into_inner();
-        assert!(new_heartbeat.header.expect("header").error.is_none());
-
-        let mut next_request = request(second_worker_run_id());
-        next_request.worker_id = 124;
-        next_request.advertised_endpoint = Some(beryl_proto::common::EndpointProto {
-            host: "127.0.0.1".to_string(),
-            port: 9091,
-        });
-        let next = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
-            &service,
-            Request::new(next_request),
-        )
-        .await
-        .expect("raft core remains available after restart register")
-        .into_inner();
-        assert!(next.header.expect("header").error.is_none());
-    }
-
-    #[tokio::test]
-    async fn register_worker_rejects_live_endpoint_conflict() {
-        let dir = TempDir::new().unwrap();
-        let raft_node = leader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let service = MetadataWorkerServiceImpl::new(
-            Arc::clone(&raft_node),
-            Arc::clone(&worker_manager),
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
-        let request = |worker_run_id: WorkerRunId, port: u32| RegisterWorkerRequestProto {
-            header: Some(valid_request_header(&group_name("root"), ClientId::new(86))),
-            worker_id: 125,
-            worker_run_id: worker_run_id.to_string(),
-            advertised_endpoint: Some(beryl_proto::common::EndpointProto {
-                host: "127.0.0.1".to_string(),
-                port,
-            }),
-        };
-
-        let first = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
-            &service,
-            Request::new(request(test_worker_run_id(), 9090)),
-        )
-        .await
-        .expect("first register")
-        .into_inner();
-        assert!(first.header.expect("header").error.is_none());
-        let heartbeat = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
-            &service,
-            Request::new(heartbeat_request(
-                group_name("root"),
-                WorkerId::new(125),
-                test_worker_run_id(),
-                1,
-                9090,
-            )),
-        )
-        .await
-        .expect("heartbeat makes worker live")
-        .into_inner();
-        assert!(heartbeat.header.expect("header").error.is_none());
-
-        let conflict = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
-            &service,
-            Request::new(request(second_worker_run_id(), 9091)),
-        )
-        .await
-        .expect("active conflict returns header error")
-        .into_inner();
-        let error = conflict.header.expect("header").error.expect("header error");
-        let error = assert_error_fail(&error, ErrorKind::Metadata(MetadataErrorKind::Conflict));
-        assert!(error.message.contains("active worker conflict"));
-        assert_eq!(
-            worker_manager
-                .get_registration(&group_name("root"), WorkerId::new(125))
-                .expect("registration")
-                .worker_run_id,
-            test_worker_run_id()
-        );
-    }
-
-    #[tokio::test]
-    async fn register_worker_rejects_same_run_endpoint_mismatch_without_clearing_state() {
-        let dir = TempDir::new().unwrap();
-        let raft_node = leader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let service = MetadataWorkerServiceImpl::new(
-            Arc::clone(&raft_node),
-            Arc::clone(&worker_manager),
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
-        let request = |port: u32| RegisterWorkerRequestProto {
-            header: Some(valid_request_header(&group_name("root"), ClientId::new(87))),
-            worker_id: 126,
-            worker_run_id: test_worker_run_id().to_string(),
-            advertised_endpoint: Some(beryl_proto::common::EndpointProto {
-                host: "127.0.0.1".to_string(),
-                port,
-            }),
-        };
-        let worker_id = WorkerId::new(126);
-
-        let first = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
-            &service,
-            Request::new(request(9090)),
-        )
-        .await
-        .expect("first register")
-        .into_inner();
-        assert!(first.header.expect("header").error.is_none());
-        let heartbeat = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
-            &service,
-            Request::new(heartbeat_request(
-                group_name("root"),
-                worker_id,
-                test_worker_run_id(),
-                1,
-                9090,
-            )),
-        )
-        .await
-        .expect("heartbeat makes worker live")
-        .into_inner();
-        assert!(heartbeat.header.expect("header").error.is_none());
-        let full_report = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
-            &service,
-            Request::new(full_report_request(
-                group_name("root"),
-                worker_id,
-                test_worker_run_id(),
-                1,
-                0,
-                true,
-                Vec::new(),
-            )),
-        )
-        .await
-        .expect("full report")
-        .into_inner();
-        assert!(full_report.header.expect("header").error.is_none());
-        assert!(!worker_manager.needs_full_block_report(&group_name("root"), worker_id));
-
-        let mismatch = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
-            &service,
-            Request::new(request(9091)),
-        )
-        .await
-        .expect("same-run descriptor mismatch returns header error")
-        .into_inner();
-        let error = mismatch.header.expect("header").error.expect("header error");
-        let error = assert_error_fail(&error, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
-        assert!(error.message.contains("worker descriptor mismatch"));
-        assert_eq!(
-            worker_manager
-                .get_descriptor(&group_name("root"), worker_id)
-                .expect("descriptor")
-                .address,
-            "127.0.0.1:9090"
-        );
-        assert_eq!(
-            worker_manager
-                .get_registration(&group_name("root"), worker_id)
-                .expect("registration")
-                .worker_run_id,
-            test_worker_run_id()
-        );
-        assert!(worker_manager.is_worker_live(&group_name("root"), worker_id));
-        assert!(!worker_manager.needs_full_block_report(&group_name("root"), worker_id));
     }
 
     #[tokio::test]
@@ -3594,90 +2467,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heartbeat_missing_live_registration_returns_need_register() {
+    async fn heartbeat_maps_registration_mismatches_to_recovery_headers() {
         let dir = TempDir::new().unwrap();
         let raft_node = nonleader_raft(&dir).await;
         let worker_manager = Arc::new(WorkerManager::new(60));
-        let worker_id = WorkerId::new(10);
-        worker_manager
-            .register_worker(&group_name("root"), worker_id, "127.0.0.1:9090".to_string(), 1, None)
-            .unwrap();
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            worker_manager,
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
-
-        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
-            &service,
-            Request::new(heartbeat_request(
-                group_name("root"),
-                worker_id,
-                test_worker_run_id(),
-                1,
-                9090,
-            )),
-        )
-        .await
-        .expect("heartbeat business error uses gRPC OK")
-        .into_inner();
-
-        let error = response.header.expect("header").error.expect("header error");
-        assert_error_register_worker(&error, ErrorKind::Worker(WorkerErrorKind::NotRegistered));
-    }
-
-    #[tokio::test]
-    async fn heartbeat_stale_worker_run_returns_run_mismatch() {
-        let dir = TempDir::new().unwrap();
-        let raft_node = nonleader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let worker_id = WorkerId::new(11);
+        let group_name = group_name("root");
         worker_manager
             .register_worker_run(
-                &group_name("root"),
-                worker_id,
-                "127.0.0.1:9090".to_string(),
-                1,
-                test_worker_run_id(),
-                None,
-            )
-            .unwrap();
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            worker_manager,
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
-
-        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
-            &service,
-            Request::new(heartbeat_request(
-                group_name("root"),
-                worker_id,
-                second_worker_run_id(),
-                1,
-                9090,
-            )),
-        )
-        .await
-        .expect("heartbeat business error uses gRPC OK")
-        .into_inner();
-
-        let error = response.header.expect("header").error.expect("header error");
-        assert_error_register_worker(&error, ErrorKind::Worker(WorkerErrorKind::RunMismatch));
-    }
-
-    #[tokio::test]
-    async fn heartbeat_stale_run_after_liveness_timeout_returns_run_mismatch() {
-        let dir = TempDir::new().unwrap();
-        let raft_node = nonleader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(1));
-        let worker_id = WorkerId::new(110);
-        worker_manager
-            .register_worker_run(
-                &group_name("root"),
-                worker_id,
+                &group_name,
+                WorkerId::new(11),
                 "127.0.0.1:9090".to_string(),
                 1,
                 test_worker_run_id(),
@@ -3685,169 +2483,9 @@ mod tests {
             )
             .unwrap();
         worker_manager
-            .record_heartbeat(
-                &group_name("root"),
-                worker_id,
-                test_worker_run_id(),
-                1,
-                "127.0.0.1:9090",
-                1,
-                1_000,
-                100,
-                900,
-                0,
-                0,
-                HealthStatus::Healthy,
-            )
-            .unwrap();
-        tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            worker_manager,
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
-
-        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
-            &service,
-            Request::new(heartbeat_request(
-                group_name("root"),
-                worker_id,
-                second_worker_run_id(),
-                1,
-                9090,
-            )),
-        )
-        .await
-        .expect("stale run heartbeat returns gRPC OK")
-        .into_inner();
-
-        let error = response.header.expect("header").error.expect("header error");
-        assert_error_register_worker(&error, ErrorKind::Worker(WorkerErrorKind::RunMismatch));
-    }
-
-    #[tokio::test]
-    async fn follower_heartbeat_accepts_liveness() {
-        let dir = TempDir::new().unwrap();
-        let raft_node = nonleader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let worker_id = WorkerId::new(12);
-        worker_manager
             .register_worker_run(
-                &group_name("root"),
-                worker_id,
-                "127.0.0.1:9090".to_string(),
-                1,
-                test_worker_run_id(),
-                None,
-            )
-            .unwrap();
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            Arc::clone(&worker_manager),
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
-
-        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
-            &service,
-            Request::new(heartbeat_request(
-                group_name("root"),
-                worker_id,
-                test_worker_run_id(),
-                7,
-                9090,
-            )),
-        )
-        .await
-        .expect("follower heartbeat succeeds")
-        .into_inner();
-
-        assert!(response.header.as_ref().expect("header").error.is_none());
-        assert_eq!(response.header.as_ref().expect("header").group_name, "root");
-        assert_eq!(response.worker_id, worker_id.as_raw());
-        assert_eq!(response.accepted_worker_run_id, test_worker_run_id().to_string());
-        assert!(worker_manager.is_worker_live(&group_name("root"), worker_id));
-    }
-
-    #[tokio::test]
-    async fn leader_heartbeat_accepts_liveness_without_raft_propose() {
-        let dir = TempDir::new().unwrap();
-        let raft_node = leader_raft(&dir).await;
-        let before_state_id = raft_node.get_last_applied_state_id();
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let worker_id = WorkerId::new(13);
-        worker_manager
-            .register_worker_run(
-                &group_name("root"),
-                worker_id,
-                "127.0.0.1:9090".to_string(),
-                1,
-                test_worker_run_id(),
-                None,
-            )
-            .unwrap();
-        let service = MetadataWorkerServiceImpl::new(
-            Arc::clone(&raft_node),
-            Arc::clone(&worker_manager),
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
-
-        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
-            &service,
-            Request::new(heartbeat_request(
-                group_name("root"),
-                worker_id,
-                test_worker_run_id(),
-                1,
-                9090,
-            )),
-        )
-        .await
-        .expect("leader heartbeat succeeds")
-        .into_inner();
-
-        assert!(response.header.as_ref().expect("header").error.is_none());
-        assert_eq!(raft_node.get_last_applied_state_id(), before_state_id);
-        assert!(worker_manager.is_worker_live(&group_name("root"), worker_id));
-    }
-
-    #[tokio::test]
-    async fn heartbeat_wrong_group_returns_group_mismatch() {
-        let dir = TempDir::new().unwrap();
-        let raft_node = nonleader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            worker_manager,
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
-
-        let mut request = heartbeat_request(group_name("root"), WorkerId::new(14), test_worker_run_id(), 1, 9090);
-        request.header.as_mut().expect("header").group_name = "other".to_string();
-
-        let response =
-            <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(&service, Request::new(request))
-                .await
-                .expect("wrong group returns gRPC OK")
-                .into_inner();
-
-        let error = response.header.expect("header").error.expect("header error");
-        assert_error_fail(&error, ErrorKind::Metadata(MetadataErrorKind::GroupMismatch));
-    }
-
-    #[tokio::test]
-    async fn heartbeat_descriptor_mismatch_returns_need_register_header_error() {
-        let dir = TempDir::new().unwrap();
-        let raft_node = leader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let worker_id = WorkerId::new(9);
-        worker_manager
-            .register_worker_run(
-                &group_name("root"),
-                worker_id,
+                &group_name,
+                WorkerId::new(9),
                 "127.0.0.1:9099".to_string(),
                 1,
                 test_worker_run_id(),
@@ -3858,26 +2496,93 @@ mod tests {
             raft_node,
             worker_manager,
             Arc::new(MountTable::new()),
-            group_name("root"),
+            group_name.clone(),
         );
 
-        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+        let run_mismatch = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
             &service,
             Request::new(heartbeat_request(
-                group_name("root"),
-                worker_id,
+                group_name.clone(),
+                WorkerId::new(11),
+                second_worker_run_id(),
+                1,
+                9090,
+            )),
+        )
+        .await
+        .expect("run mismatch returns gRPC OK")
+        .into_inner();
+        let error = run_mismatch.header.expect("header").error.expect("header error");
+        assert_error_register_worker(&error, ErrorKind::Worker(WorkerErrorKind::RunMismatch));
+
+        let descriptor_mismatch = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+            &service,
+            Request::new(heartbeat_request(
+                group_name,
+                WorkerId::new(9),
                 test_worker_run_id(),
                 1,
                 9098,
             )),
         )
         .await
-        .expect("business validation must return gRPC OK")
+        .expect("descriptor mismatch returns gRPC OK")
         .into_inner();
+        let error = descriptor_mismatch.header.expect("header").error.expect("header error");
+        assert_error_register_worker(&error, ErrorKind::Worker(WorkerErrorKind::DescriptorMismatch));
+    }
 
-        let error = response.header.expect("header").error.expect("header error");
-        let error = assert_error_register_worker(&error, ErrorKind::Worker(WorkerErrorKind::DescriptorMismatch));
-        assert!(error.message.contains("registration"));
+    #[tokio::test]
+    async fn heartbeat_accepts_liveness_without_raft_propose_for_leader_and_follower() {
+        for (worker_id, leader, report_seq) in [(WorkerId::new(12), false, 7), (WorkerId::new(13), true, 1)] {
+            let dir = TempDir::new().unwrap();
+            let raft_node = if leader {
+                leader_raft(&dir).await
+            } else {
+                nonleader_raft(&dir).await
+            };
+            let before_state_id = raft_node.get_last_applied_state_id();
+            let worker_manager = Arc::new(WorkerManager::new(60));
+            worker_manager
+                .register_worker_run(
+                    &group_name("root"),
+                    worker_id,
+                    "127.0.0.1:9090".to_string(),
+                    1,
+                    test_worker_run_id(),
+                    None,
+                )
+                .unwrap();
+            let service = MetadataWorkerServiceImpl::new(
+                Arc::clone(&raft_node),
+                Arc::clone(&worker_manager),
+                Arc::new(MountTable::new()),
+                group_name("root"),
+            );
+
+            let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+                &service,
+                Request::new(heartbeat_request(
+                    group_name("root"),
+                    worker_id,
+                    test_worker_run_id(),
+                    report_seq,
+                    9090,
+                )),
+            )
+            .await
+            .expect("heartbeat succeeds")
+            .into_inner();
+
+            assert!(response.header.as_ref().expect("header").error.is_none());
+            assert_eq!(response.header.as_ref().expect("header").group_name, "root");
+            assert_eq!(response.worker_id, worker_id.as_raw());
+            assert_eq!(response.accepted_worker_run_id, test_worker_run_id().to_string());
+            assert!(worker_manager.is_worker_live(&group_name("root"), worker_id));
+            if leader {
+                assert_eq!(raft_node.get_last_applied_state_id(), before_state_id);
+            }
+        }
     }
 
     #[tokio::test]

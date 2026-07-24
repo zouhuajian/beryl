@@ -843,6 +843,13 @@ observe.metrics.prometheus.path: "/metrics"
         )
     }
 
+    fn load_test_config(config: impl AsRef<str>) -> Result<WorkerConfig, CommonError> {
+        let temp_dir = TempDir::new().expect("temp config dir");
+        let config_path = temp_dir.path().join("worker.yaml");
+        fs::write(&config_path, with_test_observe_yaml(config)).expect("write worker config");
+        WorkerConfig::load(&config_path)
+    }
+
     #[test]
     fn test_load_real_worker_config() {
         let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1000,39 +1007,6 @@ worker.metadata.register_retry_max_backoff_ms: 250
     }
 
     #[test]
-    fn loads_id_keyed_store_dirs_from_dotted_keys() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("worker.yaml");
-        fs::write(
-            &config_path,
-            with_test_observe_yaml(
-                r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.store.dirs.hdd0.path: "/tmp/beryl-worker/hdd0"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.store.reserve_space: "1GB"
-worker.store.selection_policy: "round_robin"
-worker.store.check_interval_ms: 30000
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-"#,
-            ),
-        )
-        .unwrap();
-
-        let config = WorkerConfig::load(&config_path).unwrap();
-
-        let hdd0 = config.store.dirs.get("hdd0").unwrap();
-        assert_eq!(config.store.dirs.len(), 1);
-        assert_eq!(hdd0.path, PathBuf::from("/tmp/beryl-worker/hdd0"));
-        assert_eq!(hdd0.tier, beryl_types::Tier::Hdd);
-        assert_eq!(hdd0.capacity_bytes, 10 * 1024 * 1024 * 1024);
-        assert_eq!(config.store.reserve_space_bytes, 1024 * 1024 * 1024);
-        assert_eq!(config.store.selection_policy, "round_robin");
-        assert_eq!(config.store.check_interval_ms, 30_000);
-    }
-
-    #[test]
     fn rejects_empty_worker_net_listeners() {
         let mut config = test_worker_config();
         config.net.listeners.clear();
@@ -1111,30 +1085,10 @@ worker.metadata.endpoints: "http://127.0.0.1:18080"
     }
 
     #[test]
-    fn rejects_missing_or_empty_store_dirs() {
-        for store_config in ["", "worker.store.dirs: []\n"] {
-            let temp_dir = TempDir::new().unwrap();
-            let config_path = temp_dir.path().join("worker.yaml");
-            fs::write(
-                &config_path,
-                with_test_observe_yaml(format!(
-                    r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-{store_config}worker.metadata.endpoints: "http://127.0.0.1:18080"
-"#
-                )),
-            )
-            .unwrap();
-
-            let err = WorkerConfig::load(&config_path).expect_err("missing or empty store dirs must fail");
-
-            assert!(err.message.contains("worker.store.dirs"), "{}", err.message);
-        }
-    }
-
-    #[test]
-    fn rejects_invalid_store_dir_entries() {
-        for (name, dirs_config, expected) in [
+    fn rejects_invalid_store_configurations() {
+        let cases = [
+            ("missing dirs", "", "worker.store.dirs"),
+            ("empty dirs", "worker.store.dirs: []", "worker.store.dirs"),
             (
                 "missing path",
                 r#"worker.store.dirs.hdd0.tier: "HDD"
@@ -1175,112 +1129,58 @@ worker.store.dirs.hdd0.tier: "TAPE"
 worker.store.dirs.hdd0.capacity: "10GB""#,
                 "tier",
             ),
-        ] {
-            let temp_dir = TempDir::new().unwrap();
-            let config_path = temp_dir.path().join("worker.yaml");
-            fs::write(
-                &config_path,
-                with_test_observe_yaml(format!(
-                    r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-{dirs_config}
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-"#
-                )),
-            )
-            .unwrap();
-
-            let err = WorkerConfig::load(&config_path).unwrap_err();
-
-            assert!(
-                err.message.contains(expected),
-                "{name} expected {expected:?}, got {}",
-                err.message
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_duplicate_store_dir_path() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("worker.yaml");
-        fs::write(
-            &config_path,
-            with_test_observe_yaml(
-                r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.store.dirs.hdd0.path: "/tmp/a"
+            (
+                "duplicate path",
+                r#"worker.store.dirs.hdd0.path: "/tmp/a"
 worker.store.dirs.hdd0.tier: "HDD"
 worker.store.dirs.hdd0.capacity: "10GB"
 worker.store.dirs.hdd1.path: "/tmp/a"
 worker.store.dirs.hdd1.tier: "HDD"
-worker.store.dirs.hdd1.capacity: "10GB"
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-"#,
+worker.store.dirs.hdd1.capacity: "10GB""#,
+                "duplicate path",
             ),
-        )
-        .unwrap();
-
-        let err = WorkerConfig::load(&config_path).unwrap_err();
-
-        assert!(err.message.contains("duplicate path"), "{}", err.message);
-    }
-
-    #[test]
-    fn rejects_empty_store_dir_id_segment() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("worker.yaml");
-        fs::write(
-            &config_path,
-            with_test_observe_yaml(
-                r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.store.dirs..path: "/tmp/a"
-worker.store.dirs..tier: "HDD"
-worker.store.dirs..capacity: "10GB"
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-"#,
-            ),
-        )
-        .unwrap();
-
-        let err = WorkerConfig::load(&config_path).unwrap_err();
-
-        assert!(err.message.contains("invalid store dir id"), "{}", err.message);
-    }
-
-    #[test]
-    fn rejects_unsupported_store_selection_policy_or_zero_check_interval() {
-        for (store_tail, expected) in [
             (
-                "worker.store.selection_policy: \"balanced\"\nworker.store.check_interval_ms: 30000",
+                "empty id",
+                r#"worker.store.dirs..path: "/tmp/a"
+worker.store.dirs..tier: "HDD"
+worker.store.dirs..capacity: "10GB""#,
+                "invalid store dir id",
+            ),
+            (
+                "unsupported selection policy",
+                r#"worker.store.dirs.hdd0.path: "/tmp/a"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.store.selection_policy: "balanced"
+worker.store.check_interval_ms: 30000"#,
                 "worker.store.selection_policy",
             ),
             (
-                "worker.store.selection_policy: \"round_robin\"\nworker.store.check_interval_ms: 0",
-                "worker.store.check_interval_ms",
-            ),
-        ] {
-            let temp_dir = TempDir::new().unwrap();
-            let config_path = temp_dir.path().join("worker.yaml");
-            fs::write(
-                &config_path,
-                with_test_observe_yaml(format!(
-                    r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.store.dirs.hdd0.path: "/tmp/a"
+                "zero check interval",
+                r#"worker.store.dirs.hdd0.path: "/tmp/a"
 worker.store.dirs.hdd0.tier: "HDD"
 worker.store.dirs.hdd0.capacity: "10GB"
-{store_tail}
+worker.store.selection_policy: "round_robin"
+worker.store.check_interval_ms: 0"#,
+                "worker.store.check_interval_ms",
+            ),
+        ];
+
+        for (case, store_config, expected) in cases {
+            let error = load_test_config(format!(
+                r#"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+{store_config}
 worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#
-                )),
-            )
-            .unwrap();
+            ))
+            .expect_err("invalid store config must fail");
 
-            let err = WorkerConfig::load(&config_path).unwrap_err();
-
-            assert!(err.message.contains(expected), "{}", err.message);
+            assert!(
+                error.message.contains(expected),
+                "{case} expected {expected:?}, got {}",
+                error.message
+            );
         }
     }
 
@@ -1308,160 +1208,89 @@ worker.store.dirs.hdd0.capacity: "10GB"
     }
 
     #[test]
-    fn rejects_empty_worker_metadata_endpoints() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("worker.yaml");
-        fs::write(
-            &config_path,
-            with_test_observe_yaml(
-                r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.store.dirs.hdd0.path: "/tmp/beryl-worker/hdd0"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.metadata.endpoints: " , "
-"#,
-            ),
-        )
-        .unwrap();
-
-        let error = WorkerConfig::load(&config_path).unwrap_err();
-
-        assert!(error.message.contains("worker.metadata.endpoints"));
-    }
-
-    #[test]
     fn rejects_invalid_worker_metadata_endpoints() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("worker.yaml");
-        fs::write(
-            &config_path,
-            with_test_observe_yaml(
+        for endpoints in [" , ", "127.0.0.1:18080"] {
+            let error = load_test_config(format!(
                 r#"
 worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
 worker.store.dirs.hdd0.path: "/tmp/beryl-worker/hdd0"
 worker.store.dirs.hdd0.tier: "HDD"
 worker.store.dirs.hdd0.capacity: "10GB"
-worker.metadata.endpoints: "127.0.0.1:18080"
-"#,
-            ),
-        )
-        .unwrap();
+worker.metadata.endpoints: "{endpoints}"
+"#
+            ))
+            .expect_err("empty or non-URL metadata endpoint must fail");
 
-        let error = WorkerConfig::load(&config_path).unwrap_err();
-
-        assert!(error.message.contains("worker.metadata.endpoints"));
+            assert!(error.message.contains("worker.metadata.endpoints"));
+        }
     }
 
     #[test]
-    fn rejects_missing_worker_rpc_advertised_endpoint() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("worker.yaml");
-        fs::write(
-            &config_path,
-            with_test_observe_yaml(
+    fn rejects_missing_or_wildcard_worker_rpc_advertised_endpoint() {
+        for (case, advertised_config, expected) in [
+            ("missing", "", "worker.rpc.advertised_endpoint"),
+            (
+                "IPv4 wildcard",
+                r#"worker.rpc.advertised_endpoint: "http://0.0.0.0:9090""#,
+                "wildcard",
+            ),
+            (
+                "IPv6 wildcard",
+                r#"worker.rpc.advertised_endpoint: "http://[::]:9090""#,
+                "wildcard",
+            ),
+        ] {
+            let error = load_test_config(format!(
                 r#"
 worker.rpc.bind: "0.0.0.0:9090"
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-"#,
-            ),
-        )
-        .unwrap();
-
-        let error = WorkerConfig::load(&config_path).unwrap_err();
-
-        assert!(error.message.contains("worker.rpc.advertised_endpoint"));
-    }
-
-    #[test]
-    fn rejects_wildcard_worker_rpc_advertised_endpoint() {
-        for advertised_endpoint in ["http://0.0.0.0:9090", "http://[::]:9090"] {
-            let temp_dir = TempDir::new().unwrap();
-            let config_path = temp_dir.path().join("worker.yaml");
-            fs::write(
-                &config_path,
-                with_test_observe_yaml(format!(
-                    r#"
-worker.rpc.bind: "0.0.0.0:9090"
-worker.rpc.advertised_endpoint: "{advertised_endpoint}"
+{advertised_config}
 worker.store.dirs.hdd0.path: "/tmp/beryl-worker/hdd0"
 worker.store.dirs.hdd0.tier: "HDD"
 worker.store.dirs.hdd0.capacity: "10GB"
 worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#
-                )),
-            )
-            .unwrap();
+            ))
+            .expect_err("missing or wildcard advertised endpoint must fail");
 
-            let error = WorkerConfig::load(&config_path).unwrap_err();
-
-            assert!(error.message.contains("worker.rpc.advertised_endpoint"));
-            assert!(error.message.contains("wildcard"));
+            assert!(
+                error.message.contains("worker.rpc.advertised_endpoint"),
+                "case {case}: {}",
+                error.message
+            );
+            assert!(error.message.contains(expected), "case {case}: {}", error.message);
         }
     }
 
     #[test]
     fn rejects_invalid_worker_metadata_register_timing() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("worker.yaml");
-        fs::write(
-            &config_path,
-            with_test_observe_yaml(
+        for (timing_config, expected) in [
+            (
+                "worker.metadata.register_timeout_ms: 0",
+                "worker.metadata.register_timeout_ms",
+            ),
+            (
+                "worker.metadata.register_retry_initial_backoff_ms: 0",
+                "worker.metadata.register_retry_initial_backoff_ms",
+            ),
+            (
+                "worker.metadata.register_retry_initial_backoff_ms: 500\n\
+                 worker.metadata.register_retry_max_backoff_ms: 100",
+                "worker.metadata.register_retry_max_backoff_ms",
+            ),
+        ] {
+            let error = load_test_config(format!(
                 r#"
 worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
 worker.store.dirs.hdd0.path: "/tmp/beryl-worker/hdd0"
 worker.store.dirs.hdd0.tier: "HDD"
 worker.store.dirs.hdd0.capacity: "10GB"
 worker.metadata.endpoints: "http://127.0.0.1:18080"
-worker.metadata.register_timeout_ms: 0
-"#,
-            ),
-        )
-        .unwrap();
+{timing_config}
+"#
+            ))
+            .expect_err("invalid registration timing must fail");
 
-        let error = WorkerConfig::load(&config_path).unwrap_err();
-
-        assert!(error.message.contains("worker.metadata.register_timeout_ms"));
-
-        fs::write(
-            &config_path,
-            with_test_observe_yaml(
-                r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.store.dirs.hdd0.path: "/tmp/beryl-worker/hdd0"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-worker.metadata.register_retry_initial_backoff_ms: 0
-"#,
-            ),
-        )
-        .unwrap();
-
-        let error = WorkerConfig::load(&config_path).unwrap_err();
-
-        assert!(error
-            .message
-            .contains("worker.metadata.register_retry_initial_backoff_ms"));
-
-        fs::write(
-            &config_path,
-            with_test_observe_yaml(
-                r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.store.dirs.hdd0.path: "/tmp/beryl-worker/hdd0"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-worker.metadata.register_retry_initial_backoff_ms: 500
-worker.metadata.register_retry_max_backoff_ms: 100
-"#,
-            ),
-        )
-        .unwrap();
-
-        let error = WorkerConfig::load(&config_path).unwrap_err();
-
-        assert!(error.message.contains("worker.metadata.register_retry_max_backoff_ms"));
+            assert!(error.message.contains(expected), "{}", error.message);
+        }
     }
 }

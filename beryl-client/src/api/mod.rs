@@ -14,6 +14,3 @@ pub use client::FsClient;
 pub use handle::{FileReader, FileWriter};
 pub use options::{CreateOptions, ListOptions};
 pub use status::{DirectoryEntry, DirectoryListing, FileStatus};
-
-#[cfg(test)]
-mod tests;

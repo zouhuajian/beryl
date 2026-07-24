@@ -369,7 +369,7 @@ impl AppRaftStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::state_machine::tests::*;
+    use crate::raft::state_machine::test_support::*;
 
     fn expect_block_allocated(result: CommandResult) -> BlockId {
         match result {

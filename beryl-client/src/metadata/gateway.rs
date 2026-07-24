@@ -147,15 +147,6 @@ impl GrpcMetadataGateway {
         )
     }
 
-    #[cfg(test)]
-    fn new_lazy_with_pool(
-        channel_pool_enabled: bool,
-        max_channels_per_group: usize,
-        metrics: Arc<dyn ClientMetrics>,
-    ) -> ClientResult<Self> {
-        Self::new_lazy_with_pool_options(channel_pool_enabled, max_channels_per_group, metrics)
-    }
-
     fn new_lazy_with_pool_options(
         channel_pool_enabled: bool,
         max_channels_per_group: usize,
@@ -657,7 +648,7 @@ mod tests {
     #[tokio::test]
     async fn metadata_channel_pool_reuses_channel_for_same_group_endpoint() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let gateway = GrpcMetadataGateway::new_lazy_with_pool(true, 1, metrics.clone()).expect("gateway");
+        let gateway = GrpcMetadataGateway::new_lazy_with_pool_options(true, 1, metrics.clone()).expect("gateway");
         let ctx = metadata_attempt("root", Some("127.0.0.1:18080"));
 
         let _first = gateway.client(&ctx, "read").await.expect("first client");
@@ -672,7 +663,8 @@ mod tests {
     #[tokio::test]
     async fn concurrent_metadata_channel_requests_same_key_reuse_inserted_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let gateway = Arc::new(GrpcMetadataGateway::new_lazy_with_pool(true, 8, metrics.clone()).expect("gateway"));
+        let gateway =
+            Arc::new(GrpcMetadataGateway::new_lazy_with_pool_options(true, 8, metrics.clone()).expect("gateway"));
         let ctx = metadata_attempt("root", Some("127.0.0.1:18080"));
 
         let mut tasks = Vec::with_capacity(8);
@@ -693,7 +685,8 @@ mod tests {
     #[tokio::test]
     async fn failed_metadata_channel_creation_does_not_insert() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let gateway = Arc::new(GrpcMetadataGateway::new_lazy_with_pool(true, 8, metrics.clone()).expect("gateway"));
+        let gateway =
+            Arc::new(GrpcMetadataGateway::new_lazy_with_pool_options(true, 8, metrics.clone()).expect("gateway"));
         let ctx = metadata_attempt("root", Some("http://[invalid"));
 
         let mut tasks = Vec::with_capacity(4);
@@ -716,7 +709,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_metadata_channel_pool_does_not_reuse_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let gateway = GrpcMetadataGateway::new_lazy_with_pool(false, 1, metrics.clone()).expect("gateway");
+        let gateway = GrpcMetadataGateway::new_lazy_with_pool_options(false, 1, metrics.clone()).expect("gateway");
         let ctx = metadata_attempt("root", Some("127.0.0.1:18080"));
 
         let _first = gateway.client(&ctx, "read").await.expect("first client");
@@ -775,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_metadata_response_header_is_invalid_header_action() {
+    fn invalid_metadata_response_headers_are_typed_failures() {
         let ctx = metadata_attempt("root", None);
         let err = parse_metadata_response_header(&ctx, None).expect_err("missing response header must fail");
 
@@ -788,10 +781,14 @@ mod tests {
             }
             other => panic!("expected invalid header Fail action, got {other:?}"),
         }
+
+        assert_malformed_metadata_response_header_is_invalid();
+        assert_wrong_metadata_response_call_id_is_invalid();
+        assert_wrong_metadata_response_client_id_is_invalid();
+        assert_wrong_metadata_response_group_name_is_invalid();
     }
 
-    #[test]
-    fn malformed_metadata_response_header_is_invalid_header_action() {
+    fn assert_malformed_metadata_response_header_is_invalid() {
         let ctx = metadata_attempt("root", None);
         let malformed = beryl_proto::common::ResponseHeaderProto::default();
 
@@ -809,8 +806,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn metadata_response_header_with_wrong_call_id_is_invalid_header_action() {
+    fn assert_wrong_metadata_response_call_id_is_invalid() {
         let ctx = metadata_attempt("root", None);
         let mut header = ok_metadata_header(&ctx);
         header.client.as_mut().expect("client").call_id = beryl_types::CallId::new().to_string();
@@ -820,19 +816,18 @@ mod tests {
         assert_invalid_metadata_header(&err, "call_id");
     }
 
-    #[test]
-    fn metadata_response_header_with_wrong_client_id_is_invalid_header_action() {
+    fn assert_wrong_metadata_response_client_id_is_invalid() {
         let ctx = metadata_attempt("root", None);
         let mut header = ok_metadata_header(&ctx);
-        header.client.as_mut().expect("client").client_id = Some(ClientId::new(ctx.client_id().as_raw() + 1).into());
+        header.client.as_mut().expect("client").client_id =
+            Some(ClientId::new(ctx.header_identity().client_id.as_raw() + 1).into());
 
         let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("wrong client_id must fail");
 
         assert_invalid_metadata_header(&err, "client_id");
     }
 
-    #[test]
-    fn metadata_response_header_with_wrong_group_name_is_invalid_header_action() {
+    fn assert_wrong_metadata_response_group_name_is_invalid() {
         let ctx = metadata_attempt("root", None);
         let mut header = ok_metadata_header(&ctx);
         header.group_name = "analytics".to_string();

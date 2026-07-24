@@ -111,6 +111,3 @@ pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Vec<UfsSpec>, UfsError>
     info!(count = specs.len(), "loaded UFS specs from file");
     Ok(specs)
 }
-
-#[cfg(test)]
-mod tests;

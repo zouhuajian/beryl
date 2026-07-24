@@ -325,103 +325,75 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_missing_header_rejects() {
-        let error = RequestHeaderCodec::decode_from_headers(std::iter::empty()).expect_err("missing header must fail");
+    fn invalid_identity_headers_are_rejected() {
+        let valid_call_id = CallId::new().to_string();
+        let valid_client_id = ClientId::new(99).as_raw().to_string();
+        let cases = vec![
+            ("missing header", Vec::new(), "RequestHeader"),
+            (
+                "missing client info",
+                vec![(HEADER_DEADLINE_MS.to_string(), "123".to_string())],
+                "client info",
+            ),
+            (
+                "missing client id",
+                vec![(HEADER_CALL_ID.to_string(), valid_call_id.clone())],
+                "client_id",
+            ),
+            (
+                "zero client id",
+                vec![
+                    (HEADER_CALL_ID.to_string(), valid_call_id.clone()),
+                    (HEADER_CLIENT_ID.to_string(), "0".to_string()),
+                ],
+                "client_id",
+            ),
+            (
+                "malformed client id",
+                vec![
+                    (HEADER_CALL_ID.to_string(), valid_call_id),
+                    (HEADER_CLIENT_ID.to_string(), "not-a-client-id".to_string()),
+                ],
+                "client_id",
+            ),
+            (
+                "missing call id",
+                vec![(HEADER_CLIENT_ID.to_string(), valid_client_id.clone())],
+                "call_id",
+            ),
+            (
+                "invalid call id",
+                vec![
+                    (HEADER_CALL_ID.to_string(), "not-a-call-id".to_string()),
+                    (HEADER_CLIENT_ID.to_string(), valid_client_id.clone()),
+                ],
+                "call_id",
+            ),
+            (
+                "zero call id",
+                vec![
+                    (
+                        HEADER_CALL_ID.to_string(),
+                        "00000000-0000-0000-0000-000000000000".to_string(),
+                    ),
+                    (HEADER_CLIENT_ID.to_string(), valid_client_id),
+                ],
+                "call_id",
+            ),
+        ];
 
-        assert!(error.contains("RequestHeader"));
+        for (case, headers, expected) in cases {
+            let error =
+                RequestHeaderCodec::decode_from_headers(headers.into_iter()).expect_err("invalid identity must fail");
+            assert!(
+                error.contains(expected),
+                "case {case} should mention {expected:?}, got {error:?}"
+            );
+        }
     }
 
     #[test]
-    fn test_decode_missing_client_info_rejects() {
-        let error = RequestHeaderCodec::decode_from_headers(
-            vec![(HEADER_DEADLINE_MS.to_string(), "123".to_string())].into_iter(),
-        )
-        .expect_err("missing client info must fail");
-
-        assert!(error.contains("client info"));
-    }
-
-    #[test]
-    fn test_decode_missing_client_id_rejects() {
-        let error = RequestHeaderCodec::decode_from_headers(
-            vec![(HEADER_CALL_ID.to_string(), CallId::new().to_string())].into_iter(),
-        )
-        .expect_err("missing client_id must fail");
-
-        assert!(error.contains("client_id"));
-    }
-
-    #[test]
-    fn test_decode_zero_client_id_rejects() {
-        let error = RequestHeaderCodec::decode_from_headers(
-            vec![
-                (HEADER_CALL_ID.to_string(), CallId::new().to_string()),
-                (HEADER_CLIENT_ID.to_string(), "0".to_string()),
-            ]
-            .into_iter(),
-        )
-        .expect_err("zero client_id must fail");
-
-        assert!(error.contains("client_id"));
-    }
-
-    #[test]
-    fn test_decode_malformed_client_id_rejects_without_generation() {
-        let error = RequestHeaderCodec::decode_from_headers(
-            vec![
-                (HEADER_CALL_ID.to_string(), CallId::new().to_string()),
-                (HEADER_CLIENT_ID.to_string(), "not-a-client-id".to_string()),
-            ]
-            .into_iter(),
-        )
-        .expect_err("malformed client_id must fail");
-
-        assert!(error.contains("client_id"));
-    }
-
-    #[test]
-    fn test_decode_missing_call_id_rejects() {
-        let error = RequestHeaderCodec::decode_from_headers(
-            vec![(HEADER_CLIENT_ID.to_string(), ClientId::new(99).as_raw().to_string())].into_iter(),
-        )
-        .expect_err("missing call_id must fail");
-
-        assert!(error.contains("call_id"));
-    }
-
-    #[test]
-    fn test_decode_invalid_call_id_rejects() {
-        let error = RequestHeaderCodec::decode_from_headers(
-            vec![
-                (HEADER_CALL_ID.to_string(), "not-a-call-id".to_string()),
-                (HEADER_CLIENT_ID.to_string(), ClientId::new(99).as_raw().to_string()),
-            ]
-            .into_iter(),
-        )
-        .expect_err("invalid call_id must fail");
-
-        assert!(error.contains("call_id"));
-    }
-
-    #[test]
-    fn test_decode_zero_call_id_rejects() {
-        let error = RequestHeaderCodec::decode_from_headers(
-            vec![
-                (
-                    HEADER_CALL_ID.to_string(),
-                    "00000000-0000-0000-0000-000000000000".to_string(),
-                ),
-                (HEADER_CLIENT_ID.to_string(), ClientId::new(99).as_raw().to_string()),
-            ]
-            .into_iter(),
-        )
-        .expect_err("zero call_id must fail");
-
-        assert!(error.contains("call_id"));
-    }
-
-    #[test]
-    fn test_decode_only_grpc_timeout() {
+    fn deadline_sources_and_precedence_are_decoded() {
         let before_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -439,10 +411,7 @@ mod tests {
         let deadline_ms = decoded.deadline.as_unix_ms();
         assert!(deadline_ms >= before_ms + 5_000);
         assert!(deadline_ms <= after_ms + 5_000);
-    }
 
-    #[test]
-    fn test_decode_only_deadline_ms() {
         let deadline_ms = 123_456_789i64;
         let decoded = RequestHeaderCodec::decode_from_headers(
             valid_identity_headers()
@@ -451,10 +420,7 @@ mod tests {
         )
         .expect("decode deadline");
         assert_eq!(decoded.deadline.as_unix_ms(), deadline_ms);
-    }
 
-    #[test]
-    fn test_decode_deadline_precedence() {
         let deadline_ms = 987_654_321i64;
         let headers = valid_identity_headers().into_iter().chain(vec![
             (HEADER_GRPC_TIMEOUT.to_string(), "1S".to_string()),

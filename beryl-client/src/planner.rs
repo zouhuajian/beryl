@@ -296,53 +296,35 @@ mod tests {
     }
 
     #[test]
-    fn planner_rejects_missing_coverage() {
-        let requested_range = requested_range(0, 12, 20)
-            .expect("range planning succeeds")
-            .expect("non-empty requested range");
-        let locations = vec![location(10, 0, 0, 4, 101), location(10, 1, 8, 8, 202)];
+    fn planner_rejects_invalid_location_coverage_and_shape() {
+        let cases = vec![
+            (
+                "gap",
+                12,
+                vec![location(10, 0, 0, 4, 101), location(10, 1, 8, 8, 202)],
+                "layout gap",
+            ),
+            (
+                "overlap",
+                12,
+                vec![location(10, 0, 0, 8, 101), location(10, 1, 4, 8, 202)],
+                "layout overlap",
+            ),
+            ("zero length", 4, vec![location(10, 0, 0, 0, 101)], "zero-length"),
+            ("zero block stamp", 4, vec![location(10, 0, 0, 4, 0)], "block_stamp"),
+        ];
 
-        let err = plan_block_reads(DataHandleId::new(10), requested_range, &locations).expect_err("gap must fail");
-
-        assert!(format!("{err}").contains("layout gap"));
-    }
-
-    #[test]
-    fn planner_rejects_overlapping_coverage() {
-        let requested_range = requested_range(0, 12, 20)
-            .expect("range planning succeeds")
-            .expect("non-empty requested range");
-        let locations = vec![location(10, 0, 0, 8, 101), location(10, 1, 4, 8, 202)];
-
-        let err = plan_block_reads(DataHandleId::new(10), requested_range, &locations).expect_err("overlap must fail");
-
-        assert!(format!("{err}").contains("layout overlap"));
-    }
-
-    #[test]
-    fn planner_rejects_zero_length_block_locations() {
-        let requested_range = requested_range(0, 4, 20)
-            .expect("range planning succeeds")
-            .expect("non-empty requested range");
-        let locations = vec![location(10, 0, 0, 0, 101)];
-
-        let err = plan_block_reads(DataHandleId::new(10), requested_range, &locations)
-            .expect_err("zero-length location must fail");
-
-        assert!(format!("{err}").contains("zero-length"));
-    }
-
-    #[test]
-    fn planner_rejects_zero_block_stamp() {
-        let requested_range = requested_range(0, 4, 20)
-            .expect("range planning succeeds")
-            .expect("non-empty requested range");
-        let locations = vec![location(10, 0, 0, 4, 0)];
-
-        let err = plan_block_reads(DataHandleId::new(10), requested_range, &locations)
-            .expect_err("zero block stamp must fail");
-
-        assert!(format!("{err}").contains("block_stamp"));
+        for (case, len, locations, expected) in cases {
+            let requested_range = requested_range(0, len, 20)
+                .expect("range planning succeeds")
+                .expect("non-empty requested range");
+            let err =
+                plan_block_reads(DataHandleId::new(10), requested_range, &locations).expect_err("layout must fail");
+            assert!(
+                format!("{err}").contains(expected),
+                "case {case} should mention {expected:?}, got {err}"
+            );
+        }
     }
 
     #[test]

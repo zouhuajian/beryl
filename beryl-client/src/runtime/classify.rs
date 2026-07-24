@@ -199,33 +199,21 @@ mod tests {
     }
 
     #[test]
-    fn fatal_fencing_kind_is_typed_and_not_transport_retryable() {
-        let err = ClientError::from(ClientAction::Fail {
-            rpc_error: Box::new(RpcErrorDetail::fail(
-                ErrorKind::Metadata(MetadataErrorKind::Fencing),
-                "fencing mismatch",
-            )),
-        });
-
-        let classified = classify_error(&err);
-
-        assert_eq!(classified, ErrorClass::Fencing);
-        assert_ne!(classified, ErrorClass::RetryableTransport);
-    }
-
-    #[test]
-    fn invalid_header_kind_is_typed_and_not_transport_retryable() {
-        let err = ClientError::from(ClientAction::Fail {
-            rpc_error: Box::new(RpcErrorDetail::fail(
+    fn fatal_typed_failures_are_not_transport_retryable() {
+        for (kind, expected) in [
+            (ErrorKind::Metadata(MetadataErrorKind::Fencing), ErrorClass::Fencing),
+            (
                 ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader),
-                "malformed OK response",
-            )),
-        });
-
-        let classified = classify_error(&err);
-
-        assert_eq!(classified, ErrorClass::InvalidHeader);
-        assert_ne!(classified, ErrorClass::RetryableTransport);
+                ErrorClass::InvalidHeader,
+            ),
+        ] {
+            let err = ClientError::from(ClientAction::Fail {
+                rpc_error: Box::new(RpcErrorDetail::fail(kind, "typed failure")),
+            });
+            let classified = classify_error(&err);
+            assert_eq!(classified, expected);
+            assert_ne!(classified, ErrorClass::RetryableTransport);
+        }
     }
 
     #[test]

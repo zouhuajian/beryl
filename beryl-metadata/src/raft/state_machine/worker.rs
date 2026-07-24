@@ -32,7 +32,7 @@ impl AppRaftStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::state_machine::tests::*;
+    use crate::raft::state_machine::test_support::*;
 
     #[test]
     fn worker_descriptor_reapply_returns_original_result_and_replay_result() {

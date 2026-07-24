@@ -506,6 +506,8 @@ impl RocksDBStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beryl_types::fs::FileAttrs;
+    use tempfile::TempDir;
 
     impl RocksDBStorage {
         /// Get mount entry.
@@ -553,5 +555,105 @@ mod tests {
                 Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
             }
         }
+    }
+
+    #[test]
+    fn validate_data_handle_owner_checks_presence_and_expected_inode() {
+        let dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
+        let data_handle_id = DataHandleId::new(1);
+        let inode_id = InodeId::new(10);
+        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+        assert_eq!(
+            storage.validate_data_handle_owner(data_handle_id, None).unwrap(),
+            inode_id
+        );
+
+        let missing = storage
+            .validate_data_handle_owner(DataHandleId::new(99), None)
+            .expect_err("missing owner must be stale");
+        assert!(matches!(missing, MetadataError::StaleState(_)));
+
+        let mismatch = storage
+            .validate_data_handle_owner(data_handle_id, Some(InodeId::new(11)))
+            .expect_err("owner mismatch must be rejected");
+        assert!(matches!(mismatch, MetadataError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn get_layout_rejects_invalid_persisted_value() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
+        let inode_id = InodeId::new(14);
+
+        storage.put_layout(inode_id, FileLayout::new(4096, 0, 1)).unwrap();
+
+        let error = storage
+            .get_layout(inode_id)
+            .expect_err("invalid persisted layout must fail closed");
+        assert!(error.to_string().contains("Invalid file layout"));
+    }
+
+    fn setup_dir_with_entries(parent_inode_id: InodeId, entries: &[(&str, InodeId)]) -> (TempDir, RocksDBStorage) {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_db_dentries");
+        let storage = RocksDBStorage::create_for_format(&db_path).unwrap();
+
+        // Create parent dir and some child nodes.
+        let parent_inode = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        storage.put_inode(&parent_inode).unwrap();
+
+        for (name, child) in entries {
+            storage.put_dentry(parent_inode_id, name, *child).unwrap();
+        }
+
+        (temp_dir, storage)
+    }
+
+    #[test]
+    fn test_list_dentries_with_cursor_pagination() {
+        let entries = [("a", InodeId::new(2)), ("b", InodeId::new(3)), ("c", InodeId::new(4))];
+        let (_tmp_dir, storage) = setup_dir_with_entries(InodeId::new(1), &entries);
+
+        let (page1, cursor1, eof1) = storage
+            .list_dentries_with_cursor(InodeId::new(1), None, Some(2))
+            .unwrap();
+        assert_eq!(
+            page1,
+            vec![("a".to_string(), InodeId::new(2)), ("b".to_string(), InodeId::new(3))]
+        );
+        assert!(cursor1.is_some());
+        assert!(!eof1);
+
+        // When continuing iteration using the returned cursor,
+        // you should skip the last record that has already been returned.
+        let (page2, cursor2, eof2) = storage
+            .list_dentries_with_cursor(InodeId::new(1), cursor1.as_deref(), Some(10))
+            .unwrap();
+        assert_eq!(page2, vec![("c".to_string(), InodeId::new(4))]);
+        assert!(eof2);
+        assert!(cursor2.is_none());
+    }
+
+    #[test]
+    fn test_list_dentries_with_cursor_ignores_off_prefix_cursor() {
+        let entries = [("x", InodeId::new(11)), ("y", InodeId::new(12))];
+        let (_tmp_dir, storage) = setup_dir_with_entries(InodeId::new(10), &entries);
+
+        // The cursor lands under another directory prefix,
+        // the expectation is to start from that directory prefix without skipping the first entry.
+        let mut other_cursor = b"dentry/".to_vec();
+        other_cursor.extend_from_slice(&InodeId::new(99).to_be_bytes());
+        other_cursor.extend_from_slice(b"zzz");
+
+        let (page, _cursor, eof) = storage
+            .list_dentries_with_cursor(InodeId::new(10), Some(&other_cursor), Some(10))
+            .unwrap();
+        assert_eq!(
+            page,
+            vec![("x".to_string(), InodeId::new(11)), ("y".to_string(), InodeId::new(12))]
+        );
+        assert!(eof);
     }
 }

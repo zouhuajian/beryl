@@ -33,182 +33,6 @@ fn meta_err_to_fs_errno(err: &MetadataError) -> Option<FsErrorCode> {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
-    pub(crate) use super::*;
-    pub(crate) use beryl_types::fs::{FileAttrs, Inode};
-    pub(crate) use beryl_types::ids::{BlockId, DataHandleId, MountId, WorkerId};
-    pub(crate) use beryl_types::layout::FileLayout;
-    pub(crate) use tempfile::TempDir;
-
-    impl AppRaftStateMachine {
-        pub(crate) fn apply(&self, command: Command) -> MetadataResult<CommandResult> {
-            match self.apply_committed(command, &AppMetadataRaftState::default()) {
-                Ok(CommittedApply {
-                    response: CommandResult::Rejected(rejection),
-                    ..
-                }) => Err(rejection.into_metadata_error()),
-                Ok(applied) => Ok(applied.response),
-                Err(fatal) => Err(fatal.into_inner()),
-            }
-        }
-    }
-
-    pub(crate) fn group_name(raw: &str) -> GroupName {
-        GroupName::parse(raw).unwrap()
-    }
-
-    pub(crate) fn bootstrap_command(group_name: &str, proposed_at_ms: u64) -> Command {
-        Command::BootstrapNamespace {
-            proposed_at_ms,
-            group_name: GroupName::parse(group_name).unwrap(),
-        }
-    }
-
-    pub(crate) fn expect_fs_ok(raw: CommandResult) -> FsOkResult {
-        match raw {
-            CommandResult::Fs(FsCommandResult::Ok(ok)) => ok,
-            other => panic!("unexpected apply response: {other:?}"),
-        }
-    }
-
-    pub(crate) fn expect_fs_errno(raw: CommandResult, errno: FsErrorCode) {
-        match raw {
-            CommandResult::Fs(FsCommandResult::Err(err)) => assert_eq!(err.errno, errno),
-            other => panic!("unexpected apply response: {other:?}"),
-        }
-    }
-
-    pub(crate) fn expect_mount_upserted(raw: CommandResult) -> crate::mount::MountEntry {
-        match raw {
-            CommandResult::MountUpserted(entry) => entry,
-            other => panic!("unexpected apply response: {other:?}"),
-        }
-    }
-
-    pub(crate) fn expect_worker_upserted(raw: CommandResult) -> WorkerId {
-        match raw {
-            CommandResult::WorkerUpserted(worker_id) => worker_id,
-            other => panic!("unexpected apply response: {other:?}"),
-        }
-    }
-
-    pub(crate) fn extent(block_id: BlockId, file_offset: u64, len: u64) -> Extent {
-        Extent {
-            file_offset,
-            block_id,
-            block_offset: 0,
-            len,
-            content_revision: None,
-            block_stamp: None,
-        }
-    }
-
-    pub(crate) fn install_file_with_extents(
-        storage: &RocksDBStorage,
-        parent_inode_id: InodeId,
-        name: &str,
-        inode_id: InodeId,
-        data_handle_id: DataHandleId,
-        extents: Vec<Extent>,
-        size: u64,
-    ) -> Inode {
-        let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
-        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), parent.mount_id, data_handle_id);
-        inode.attrs.size = size;
-        let next_block_index = extents
-            .iter()
-            .map(|extent| u64::from(extent.block_id.index.as_raw()) + 1)
-            .max()
-            .unwrap_or(0);
-        let InodeData::File {
-            extents: stored_extents,
-            lease_epoch,
-            next_block_index: stored_next_block_index,
-            ..
-        } = &mut inode.data
-        else {
-            unreachable!("new file must carry file data");
-        };
-        *stored_extents = extents;
-        *lease_epoch = Some(1);
-        *stored_next_block_index = next_block_index;
-        storage.put_inode(&parent).unwrap();
-        storage.put_inode(&inode).unwrap();
-        storage.put_dentry(parent_inode_id, name, inode_id).unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
-        inode
-    }
-
-    #[test]
-    fn bootstrap_namespace_is_convergent_and_creates_one_root() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let sm = AppRaftStateMachine::new(Arc::clone(&storage));
-
-        let first = expect_mount_upserted(sm.apply(bootstrap_command("root", 10)).unwrap());
-        let second = expect_mount_upserted(sm.apply(bootstrap_command("root", 20)).unwrap());
-
-        assert_eq!(first.mount_id, second.mount_id);
-        assert_eq!(first.root_inode_id, second.root_inode_id);
-        assert_eq!(storage.list_mounts().unwrap().len(), 1);
-        assert_eq!(storage.max_inode_id().unwrap(), Some(crate::mount::ROOT_INODE_ID));
-    }
-
-    #[test]
-    fn bootstrap_namespace_rejects_partial_authority_state() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        storage
-            .put_inode(&Inode::new_dir(
-                crate::mount::ROOT_INODE_ID,
-                FileAttrs::new(),
-                MountId::new(1),
-            ))
-            .unwrap();
-        let sm = AppRaftStateMachine::new(Arc::clone(&storage));
-
-        let error = sm.apply(bootstrap_command("root", 10)).unwrap_err();
-
-        assert!(error.to_string().contains("partially initialized"));
-        assert!(storage.list_mounts().unwrap().is_empty());
-    }
-
-    #[test]
-    fn command_timestamp_does_not_regress_parent_time() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let sm = AppRaftStateMachine::new(Arc::clone(&storage));
-        expect_mount_upserted(sm.apply(bootstrap_command("root", 10)).unwrap());
-        let mut root = storage.get_inode(crate::mount::ROOT_INODE_ID).unwrap().unwrap();
-        root.attrs.update_timestamps(5_000);
-        storage.put_inode(&root).unwrap();
-
-        let response = sm
-            .apply(Command::CreateDirectory {
-                proposed_at_ms: 1_000,
-                root_inode_id: crate::mount::ROOT_INODE_ID,
-                components: vec!["child".to_string()],
-                attrs: FileAttrs::new(),
-                recursive: false,
-            })
-            .unwrap();
-        let child_id = expect_fs_ok(response).inode_id.unwrap();
-
-        assert_eq!(storage.get_inode(child_id).unwrap().unwrap().attrs.mtime_ms, 1_000);
-        assert_eq!(
-            storage
-                .get_inode(crate::mount::ROOT_INODE_ID)
-                .unwrap()
-                .unwrap()
-                .attrs
-                .mtime_ms,
-            5_000
-        );
-    }
-}
-
 /// Raft state machine.
 pub(crate) struct AppRaftStateMachine {
     storage: Arc<RocksDBStorage>,
@@ -627,5 +451,186 @@ impl AppRaftStateMachine {
                 inode_id, current_content_revision
             ))
         })
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) use super::*;
+    pub(crate) use beryl_types::fs::{FileAttrs, Inode};
+    pub(crate) use beryl_types::ids::{BlockId, DataHandleId, MountId, WorkerId};
+    pub(crate) use beryl_types::layout::FileLayout;
+    pub(crate) use tempfile::TempDir;
+
+    impl AppRaftStateMachine {
+        pub(crate) fn apply(&self, command: Command) -> MetadataResult<CommandResult> {
+            match self.apply_committed(command, &AppMetadataRaftState::default()) {
+                Ok(CommittedApply {
+                    response: CommandResult::Rejected(rejection),
+                    ..
+                }) => Err(rejection.into_metadata_error()),
+                Ok(applied) => Ok(applied.response),
+                Err(fatal) => Err(fatal.into_inner()),
+            }
+        }
+    }
+
+    pub(crate) fn group_name(raw: &str) -> GroupName {
+        GroupName::parse(raw).unwrap()
+    }
+
+    pub(crate) fn bootstrap_command(group_name: &str, proposed_at_ms: u64) -> Command {
+        Command::BootstrapNamespace {
+            proposed_at_ms,
+            group_name: GroupName::parse(group_name).unwrap(),
+        }
+    }
+
+    pub(crate) fn expect_fs_ok(raw: CommandResult) -> FsOkResult {
+        match raw {
+            CommandResult::Fs(FsCommandResult::Ok(ok)) => ok,
+            other => panic!("unexpected apply response: {other:?}"),
+        }
+    }
+
+    pub(crate) fn expect_fs_errno(raw: CommandResult, errno: FsErrorCode) {
+        match raw {
+            CommandResult::Fs(FsCommandResult::Err(err)) => assert_eq!(err.errno, errno),
+            other => panic!("unexpected apply response: {other:?}"),
+        }
+    }
+
+    pub(crate) fn expect_mount_upserted(raw: CommandResult) -> crate::mount::MountEntry {
+        match raw {
+            CommandResult::MountUpserted(entry) => entry,
+            other => panic!("unexpected apply response: {other:?}"),
+        }
+    }
+
+    pub(crate) fn expect_worker_upserted(raw: CommandResult) -> WorkerId {
+        match raw {
+            CommandResult::WorkerUpserted(worker_id) => worker_id,
+            other => panic!("unexpected apply response: {other:?}"),
+        }
+    }
+
+    pub(crate) fn extent(block_id: BlockId, file_offset: u64, len: u64) -> Extent {
+        Extent {
+            file_offset,
+            block_id,
+            block_offset: 0,
+            len,
+            content_revision: None,
+            block_stamp: None,
+        }
+    }
+
+    pub(crate) fn install_file_with_extents(
+        storage: &RocksDBStorage,
+        parent_inode_id: InodeId,
+        name: &str,
+        inode_id: InodeId,
+        data_handle_id: DataHandleId,
+        extents: Vec<Extent>,
+        size: u64,
+    ) -> Inode {
+        let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), parent.mount_id, data_handle_id);
+        inode.attrs.size = size;
+        let next_block_index = extents
+            .iter()
+            .map(|extent| u64::from(extent.block_id.index.as_raw()) + 1)
+            .max()
+            .unwrap_or(0);
+        let InodeData::File {
+            extents: stored_extents,
+            lease_epoch,
+            next_block_index: stored_next_block_index,
+            ..
+        } = &mut inode.data
+        else {
+            unreachable!("new file must carry file data");
+        };
+        *stored_extents = extents;
+        *lease_epoch = Some(1);
+        *stored_next_block_index = next_block_index;
+        storage.put_inode(&parent).unwrap();
+        storage.put_inode(&inode).unwrap();
+        storage.put_dentry(parent_inode_id, name, inode_id).unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+        inode
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+
+    #[test]
+    fn bootstrap_namespace_is_convergent_and_creates_one_root() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage));
+
+        let first = expect_mount_upserted(sm.apply(bootstrap_command("root", 10)).unwrap());
+        let second = expect_mount_upserted(sm.apply(bootstrap_command("root", 20)).unwrap());
+
+        assert_eq!(first.mount_id, second.mount_id);
+        assert_eq!(first.root_inode_id, second.root_inode_id);
+        assert_eq!(storage.list_mounts().unwrap().len(), 1);
+        assert_eq!(storage.max_inode_id().unwrap(), Some(crate::mount::ROOT_INODE_ID));
+    }
+
+    #[test]
+    fn bootstrap_namespace_rejects_partial_authority_state() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        storage
+            .put_inode(&Inode::new_dir(
+                crate::mount::ROOT_INODE_ID,
+                FileAttrs::new(),
+                MountId::new(1),
+            ))
+            .unwrap();
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage));
+
+        let error = sm.apply(bootstrap_command("root", 10)).unwrap_err();
+
+        assert!(error.to_string().contains("partially initialized"));
+        assert!(storage.list_mounts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn command_timestamp_does_not_regress_parent_time() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage));
+        expect_mount_upserted(sm.apply(bootstrap_command("root", 10)).unwrap());
+        let mut root = storage.get_inode(crate::mount::ROOT_INODE_ID).unwrap().unwrap();
+        root.attrs.update_timestamps(5_000);
+        storage.put_inode(&root).unwrap();
+
+        let response = sm
+            .apply(Command::CreateDirectory {
+                proposed_at_ms: 1_000,
+                root_inode_id: crate::mount::ROOT_INODE_ID,
+                components: vec!["child".to_string()],
+                attrs: FileAttrs::new(),
+                recursive: false,
+            })
+            .unwrap();
+        let child_id = expect_fs_ok(response).inode_id.unwrap();
+
+        assert_eq!(storage.get_inode(child_id).unwrap().unwrap().attrs.mtime_ms, 1_000);
+        assert_eq!(
+            storage
+                .get_inode(crate::mount::ROOT_INODE_ID)
+                .unwrap()
+                .unwrap()
+                .attrs
+                .mtime_ms,
+            5_000
+        );
     }
 }

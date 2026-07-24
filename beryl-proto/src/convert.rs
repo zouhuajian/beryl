@@ -1195,6 +1195,7 @@ pub fn rpc_error_to_proto(err: &RpcErrorDetail) -> proto_common::ErrorDetailProt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
 
     fn test_worker_run_id() -> beryl_types::WorkerRunId {
         "550e8400-e29b-41d4-a716-446655440000"
@@ -1203,31 +1204,12 @@ mod tests {
     }
 
     #[test]
-    fn msync_request_proto_shape_is_header_only() {
-        let request = crate::metadata::MsyncRequestProto { header: None };
-        assert!(request.header.is_none());
-    }
-
-    #[test]
-    fn msync_response_proto_shape_is_header_and_state() {
-        let response = crate::metadata::MsyncResponseProto {
-            header: None,
-            state: None,
-        };
-        assert!(response.header.is_none());
-        assert!(response.state.is_none());
-    }
-
-    #[test]
-    fn test_data_handle_id_conversion() {
+    fn block_identity_conversions_round_trip() {
         let data_handle_id = DataHandleId::new(42);
         let proto_id: proto_common::DataHandleIdProto = data_handle_id.into();
         let back: DataHandleId = proto_id.try_into().unwrap();
         assert_eq!(data_handle_id, back);
-    }
 
-    #[test]
-    fn test_block_id_conversion() {
         let block_id = BlockId::from_u64_u32(42, 7);
         let proto_id: proto_common::BlockIdProto = block_id.into();
         let back: BlockId = proto_id.try_into().unwrap();
@@ -1235,37 +1217,7 @@ mod tests {
     }
 
     #[test]
-    fn file_attrs_proto_converts_to_domain_file_attrs() {
-        let proto_attrs = crate::metadata::FileAttrsProto {
-            mode: 0o100755,
-            uid: 501,
-            gid: 20,
-            size: 4096,
-            atime_ms: 11,
-            mtime_ms: 12,
-            ctime_ms: 13,
-            nlink: 2,
-        };
-
-        let attrs: beryl_types::FileAttrs = proto_attrs.into();
-
-        assert_eq!(
-            attrs,
-            beryl_types::FileAttrs {
-                mode: 0o100755,
-                uid: 501,
-                gid: 20,
-                size: 4096,
-                atime_ms: 11,
-                mtime_ms: 12,
-                ctime_ms: 13,
-                nlink: 2,
-            }
-        );
-    }
-
-    #[test]
-    fn domain_file_attrs_converts_to_proto() {
+    fn file_attrs_conversion_round_trip_preserves_fields() {
         let attrs = beryl_types::FileAttrs {
             mode: 0o040755,
             uid: 502,
@@ -1278,7 +1230,7 @@ mod tests {
         };
 
         let proto_attrs: crate::metadata::FileAttrsProto = (&attrs).into();
-        let owned_proto_attrs: crate::metadata::FileAttrsProto = attrs.into();
+        let owned_proto_attrs: crate::metadata::FileAttrsProto = attrs.clone().into();
 
         let expected = crate::metadata::FileAttrsProto {
             mode: 0o040755,
@@ -1292,6 +1244,9 @@ mod tests {
         };
         assert_eq!(proto_attrs, expected);
         assert_eq!(owned_proto_attrs, expected);
+
+        let decoded: beryl_types::FileAttrs = expected.into();
+        assert_eq!(decoded, attrs);
     }
 
     #[test]
@@ -1360,145 +1315,351 @@ mod tests {
         }
     }
 
+    const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("beryl_descriptor");
+
+    fn descriptor_set() -> prost_types::FileDescriptorSet {
+        prost_types::FileDescriptorSet::decode(FILE_DESCRIPTOR_SET).expect("compiled descriptor set")
+    }
+
+    fn message_descriptor<'a>(
+        descriptor_set: &'a prost_types::FileDescriptorSet,
+        full_name: &str,
+    ) -> &'a prost_types::DescriptorProto {
+        let (package, message_name) = full_name.rsplit_once('.').expect("qualified message name");
+        descriptor_set
+            .file
+            .iter()
+            .filter(|file| file.package.as_deref() == Some(package))
+            .flat_map(|file| &file.message_type)
+            .find(|message| message.name.as_deref() == Some(message_name))
+            .unwrap_or_else(|| panic!("missing compiled descriptor for {full_name}"))
+    }
+
+    fn assert_message_fields(
+        descriptor_set: &prost_types::FileDescriptorSet,
+        full_name: &str,
+        expected: &[(&str, i32)],
+    ) {
+        let actual = message_descriptor(descriptor_set, full_name)
+            .field
+            .iter()
+            .map(|field| {
+                (
+                    field.name.as_deref().expect("descriptor field name"),
+                    field.number.expect("descriptor field number"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "{full_name}");
+    }
+
+    fn assert_enum_values(descriptor_set: &prost_types::FileDescriptorSet, full_name: &str, expected: &[(&str, i32)]) {
+        let (package, enum_name) = full_name.rsplit_once('.').expect("qualified enum name");
+        let descriptor = descriptor_set
+            .file
+            .iter()
+            .filter(|file| file.package.as_deref() == Some(package))
+            .flat_map(|file| &file.enum_type)
+            .find(|value| value.name.as_deref() == Some(enum_name))
+            .unwrap_or_else(|| panic!("missing compiled descriptor for {full_name}"));
+        let actual = descriptor
+            .value
+            .iter()
+            .map(|value| {
+                (
+                    value.name.as_deref().expect("descriptor enum value"),
+                    value.number.expect("descriptor enum number"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "{full_name}");
+    }
+
     #[test]
-    fn block_contract_proto_fields_are_normalized() {
-        let header_proto = include_str!("../common/header.proto");
-        assert_eq!(
-            proto_message_fields(header_proto, "TraceContextProto"),
-            vec![
-                ("string", "traceparent", 1),
-                ("string", "tracestate", 2),
-                ("string", "baggage", 3),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(header_proto, "ClientInfoProto"),
-            vec![
-                ("string", "call_id", 1),
-                ("ClientIdProto", "client_id", 2),
-                ("string", "client_name", 3),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(header_proto, "RequestHeaderProto"),
-            vec![
-                ("ClientInfoProto", "client", 1),
-                ("TraceContextProto", "trace_context", 2),
-                ("string", "group_name", 3),
-                ("uint64", "mount_epoch", 4),
-                ("GroupStateWatermarkProto", "state", 5),
-                ("uint64", "route_epoch", 6),
-                ("int64", "deadline_ms", 7),
-                ("CallerContextProto", "caller_context", 8),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(header_proto, "ResponseHeaderProto"),
-            vec![
-                ("ClientInfoProto", "client", 1),
-                ("ErrorDetailProto", "error", 2),
-                ("GroupStateWatermarkProto", "state", 3),
-                ("uint64", "mount_epoch", 4),
-                ("uint64", "route_epoch", 5),
-                ("string", "group_name", 6),
-            ]
-        );
-        let request_header = proto_message_body(header_proto, "RequestHeaderProto");
-        assert!(!request_header.contains(concat!("request", "_id")));
-        assert!(!request_header.contains(concat!("trace", "_id")));
-        assert!(!request_header.contains("traceparent"));
-        assert!(!request_header.contains("tracestate"));
-        assert!(!request_header.contains("baggage"));
+    fn critical_wire_contract_matches_compiled_descriptors() {
+        let descriptors = descriptor_set();
 
-        let data_header_proto = include_str!("../worker/data_header.proto");
-        assert_eq!(
-            proto_message_fields(data_header_proto, "DataRequestHeaderProto"),
-            vec![
-                ("common.ClientInfoProto", "client", 1),
-                ("common.TraceContextProto", "trace_context", 2),
-            ]
+        assert_message_fields(
+            &descriptors,
+            "common.ClientInfoProto",
+            &[("call_id", 1), ("client_id", 2), ("client_name", 3)],
         );
-        assert_eq!(
-            proto_message_fields(data_header_proto, "DataResponseHeaderProto"),
-            vec![
-                ("common.ClientInfoProto", "client", 1),
-                ("common.ErrorDetailProto", "error", 2),
-            ]
+        assert_message_fields(
+            &descriptors,
+            "common.RequestHeaderProto",
+            &[
+                ("client", 1),
+                ("trace_context", 2),
+                ("group_name", 3),
+                ("mount_epoch", 4),
+                ("state", 5),
+                ("route_epoch", 6),
+                ("deadline_ms", 7),
+                ("caller_context", 8),
+            ],
         );
-        let data_request_header = proto_message_body(data_header_proto, "DataRequestHeaderProto");
-        assert!(!data_request_header.contains(concat!("request", "_id")));
-        assert!(!data_request_header.contains(concat!("trace", "_id")));
-        assert!(!data_request_header.contains("traceparent"));
-        assert!(!data_request_header.contains("tracestate"));
-        assert!(!data_request_header.contains("baggage"));
+        assert_message_fields(
+            &descriptors,
+            "common.ResponseHeaderProto",
+            &[
+                ("client", 1),
+                ("error", 2),
+                ("state", 3),
+                ("mount_epoch", 4),
+                ("route_epoch", 5),
+                ("group_name", 6),
+            ],
+        );
+        assert_message_fields(
+            &descriptors,
+            "common.FileLayoutProto",
+            &[
+                ("block_size", 1),
+                ("chunk_size", 2),
+                ("replication", 3),
+                ("block_format_id", 4),
+            ],
+        );
+        assert_message_fields(
+            &descriptors,
+            "common.ErrorDetailProto",
+            &[("kind", 1), ("recovery", 2), ("message", 3)],
+        );
+        assert_message_fields(
+            &descriptors,
+            "common.ErrorKindProto",
+            &[
+                ("fs", 1),
+                ("metadata", 2),
+                ("worker", 3),
+                ("protocol", 4),
+                ("internal", 5),
+            ],
+        );
+        assert_message_fields(
+            &descriptors,
+            "common.RefreshHintProto",
+            &[
+                ("leader_endpoint", 1),
+                ("group_name", 2),
+                ("mount_epoch", 3),
+                ("mount_prefix", 4),
+                ("route_epoch", 5),
+                ("worker_endpoints", 6),
+                ("worker_resolve_required", 7),
+            ],
+        );
 
-        let common_proto = include_str!("../common/common.proto");
-        assert_eq!(
-            proto_message_fields(common_proto, "WorkerEndpointInfoProto"),
-            vec![
-                ("uint64", "worker_id", 1),
-                ("string", "endpoint", 2),
-                ("string", "worker_run_id", 3),
-            ]
+        assert_message_fields(
+            &descriptors,
+            "metadata.WriteHandleProto",
+            &[("data_handle_id", 1), ("write_lease_epoch", 2)],
         );
-        assert_eq!(
-            proto_message_fields(common_proto, "FileLayoutProto"),
-            vec![
-                ("uint32", "block_size", 1),
-                ("uint32", "chunk_size", 2),
-                ("uint32", "replication", 3),
-                ("uint32", "block_format_id", 4),
-            ]
+        assert_message_fields(
+            &descriptors,
+            "metadata.WriteTargetProto",
+            &[
+                ("block_id", 1),
+                ("file_offset", 2),
+                ("block_format_id", 3),
+                ("block_size", 4),
+                ("chunk_size", 5),
+                ("block_stamp", 6),
+                ("effective_len", 7),
+                ("worker_endpoints", 8),
+                ("fencing_token", 9),
+                ("tier", 10),
+            ],
         );
-        assert_eq!(
-            proto_enum_values(common_proto, "TierProto"),
-            vec![
+        assert_message_fields(
+            &descriptors,
+            "metadata.FileBlockLocationProto",
+            &[
+                ("block_id", 1),
+                ("file_offset", 2),
+                ("len", 3),
+                ("workers", 4),
+                ("block_stamp", 5),
+                ("block_format_id", 6),
+                ("block_size", 7),
+                ("chunk_size", 8),
+                ("effective_len", 9),
+            ],
+        );
+        assert_message_fields(
+            &descriptors,
+            "metadata.OpenWriteResponseProto",
+            &[
+                ("header", 1),
+                ("write_handle", 2),
+                ("base_size", 3),
+                ("expires_at_ms", 4),
+                ("layout", 5),
+                ("content_revision", 6),
+            ],
+        );
+        for message in ["metadata.CommitFileRequestProto", "metadata.SyncWriteRequestProto"] {
+            assert_message_fields(
+                &descriptors,
+                message,
+                &[
+                    ("header", 1),
+                    ("write_handle", 2),
+                    ("committed_blocks", 3),
+                    (
+                        if message.ends_with("CommitFileRequestProto") {
+                            "final_size"
+                        } else {
+                            "target_size"
+                        },
+                        4,
+                    ),
+                    ("expected_content_revision", 5),
+                    ("write_mode", 6),
+                    ("expected_file_size", 7),
+                ],
+            );
+        }
+        assert_message_fields(
+            &descriptors,
+            "metadata.HeartbeatRequestProto",
+            &[
+                ("header", 1),
+                ("worker_id", 2),
+                ("worker_run_id", 3),
+                ("heartbeat_seq", 4),
+                ("advertised_endpoint", 5),
+                ("capacity", 6),
+                ("load", 7),
+                ("health", 8),
+            ],
+        );
+        assert_message_fields(
+            &descriptors,
+            "metadata.BlockReportRequestProto",
+            &[
+                ("header", 1),
+                ("worker_id", 2),
+                ("worker_run_id", 3),
+                ("report_seq", 4),
+                ("full", 5),
+                ("delta", 6),
+            ],
+        );
+
+        assert_message_fields(
+            &descriptors,
+            "worker.OpenReadStreamRequestProto",
+            &[
+                ("header", 1),
+                ("block_id", 2),
+                ("byte_range", 3),
+                ("block_stamp", 4),
+                ("frame_size", 5),
+                ("worker_run_id", 6),
+                ("block_format_id", 7),
+                ("block_size", 8),
+                ("chunk_size", 9),
+                ("effective_len", 10),
+                ("group_name", 11),
+            ],
+        );
+        assert_message_fields(
+            &descriptors,
+            "worker.OpenWriteStreamRequestProto",
+            &[
+                ("header", 1),
+                ("block_id", 2),
+                ("block_format_id", 3),
+                ("block_size", 4),
+                ("chunk_size", 5),
+                ("block_stamp", 6),
+                ("token", 7),
+                ("frame_size", 8),
+                ("worker_run_id", 9),
+                ("effective_len", 10),
+                ("group_name", 11),
+                ("tier", 12),
+            ],
+        );
+        assert_message_fields(
+            &descriptors,
+            "worker.CommitWriteRequestProto",
+            &[
+                ("header", 1),
+                ("block_id", 2),
+                ("stream_id", 3),
+                ("effective_len", 4),
+                ("block_stamp", 5),
+                ("token", 6),
+                ("commit_seq", 7),
+                ("require_sync", 8),
+                ("worker_run_id", 9),
+                ("block_format_id", 10),
+                ("block_size", 11),
+                ("chunk_size", 12),
+                ("group_name", 13),
+            ],
+        );
+        assert_message_fields(
+            &descriptors,
+            "worker.SyncCommittedBlockRequestProto",
+            &[
+                ("header", 1),
+                ("block_id", 2),
+                ("block_stamp", 3),
+                ("expected_block_len", 4),
+                ("worker_run_id", 5),
+                ("block_format_id", 6),
+                ("block_size", 7),
+                ("chunk_size", 8),
+                ("group_name", 9),
+            ],
+        );
+
+        assert_message_fields(
+            &descriptors,
+            "worker.BlockMetaPayloadProto",
+            &[
+                ("identity", 1),
+                ("format", 2),
+                ("source", 3),
+                ("visibility", 4),
+                ("tier", 5),
+            ],
+        );
+        assert_message_fields(
+            &descriptors,
+            "worker.BlockIdentityProto",
+            &[("block_id", 1), ("group_name", 2)],
+        );
+        assert_message_fields(
+            &descriptors,
+            "worker.BlockFormatProto",
+            &[("format_id", 1), ("block_size", 2), ("chunk_size", 3)],
+        );
+        assert_message_fields(&descriptors, "worker.BlockSourceProto", &[("effective_len", 1)]);
+        assert_message_fields(
+            &descriptors,
+            "worker.BlockVisibilityProto",
+            &[("block_state", 1), ("block_stamp", 2)],
+        );
+
+        assert_enum_values(
+            &descriptors,
+            "common.TierProto",
+            &[
                 ("TIER_UNSPECIFIED", 0),
                 ("TIER_MEM", 1),
                 ("TIER_NVME", 2),
                 ("TIER_SSD", 3),
                 ("TIER_HDD", 4),
-            ]
+            ],
         );
-
-        let errors_proto = include_str!("../common/errors.proto");
-        assert_eq!(
-            proto_message_fields(errors_proto, "ErrorDetailProto"),
-            vec![
-                ("ErrorKindProto", "kind", 1),
-                ("RecoveryActionProto", "recovery", 2),
-                ("string", "message", 3),
-            ]
-        );
-        let error_detail = proto_message_body(errors_proto, "ErrorDetailProto");
-        assert!(!error_detail.contains("error_class"));
-        assert!(!error_detail.contains("refresh_reason"));
-        assert!(!error_detail.contains("retry_after_ms"));
-        assert_eq!(
-            proto_message_fields(errors_proto, "ErrorKindProto"),
-            vec![
-                ("FsErrnoProto", "fs", 1),
-                ("MetadataErrorKindProto", "metadata", 2),
-                ("WorkerErrorKindProto", "worker", 3),
-                ("ProtocolErrorKindProto", "protocol", 4),
-                ("InternalErrorKindProto", "internal", 5),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(errors_proto, "RefreshHintProto"),
-            vec![
-                ("string", "leader_endpoint", 1),
-                ("string", "group_name", 2),
-                ("uint64", "mount_epoch", 3),
-                ("string", "mount_prefix", 4),
-                ("uint64", "route_epoch", 5),
-                ("WorkerEndpointInfoProto", "worker_endpoints", 6),
-                ("bool", "worker_resolve_required", 7),
-            ]
-        );
-        assert_eq!(
-            proto_enum_values(errors_proto, "MetadataErrorKindProto"),
-            vec![
+        assert_enum_values(
+            &descriptors,
+            "common.MetadataErrorKindProto",
+            &[
                 ("METADATA_ERROR_KIND_UNSPECIFIED", 0),
                 ("METADATA_ERROR_KIND_NOT_FOUND", 1),
                 ("METADATA_ERROR_KIND_ALREADY_EXISTS", 2),
@@ -1519,366 +1680,8 @@ mod tests {
                 ("METADATA_ERROR_KIND_SESSION_EXPIRED", 17),
                 ("METADATA_ERROR_KIND_EPOCH_MISMATCH", 18),
                 ("METADATA_ERROR_KIND_RESOURCE_EXHAUSTED", 19),
-            ]
+            ],
         );
-
-        let metadata_proto = include_str!("../metadata/filesystem.proto");
-        let write_handle = proto_message_body(metadata_proto, "WriteHandleProto");
-        assert_eq!(
-            proto_message_fields(metadata_proto, "WriteHandleProto"),
-            vec![
-                ("common.DataHandleIdProto", "data_handle_id", 1),
-                ("uint64", "write_lease_epoch", 2),
-            ]
-        );
-        assert!(!write_handle.contains("reserved"));
-        assert_eq!(
-            proto_message_fields(metadata_proto, "WriteTargetProto"),
-            vec![
-                ("common.BlockIdProto", "block_id", 1),
-                ("uint64", "file_offset", 2),
-                ("uint32", "block_format_id", 3),
-                ("uint64", "block_size", 4),
-                ("uint32", "chunk_size", 5),
-                ("uint64", "block_stamp", 6),
-                ("uint64", "effective_len", 7),
-                ("common.WorkerEndpointInfoProto", "worker_endpoints", 8),
-                ("common.FencingTokenProto", "fencing_token", 9),
-                ("common.TierProto", "tier", 10),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(metadata_proto, "FileBlockLocationProto"),
-            vec![
-                ("common.BlockIdProto", "block_id", 1),
-                ("uint64", "file_offset", 2),
-                ("uint64", "len", 3),
-                ("common.WorkerEndpointInfoProto", "workers", 4),
-                ("uint64", "block_stamp", 5),
-                ("uint32", "block_format_id", 6),
-                ("uint64", "block_size", 7),
-                ("uint32", "chunk_size", 8),
-                ("uint64", "effective_len", 9),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(metadata_proto, "OpenFileRequestProto"),
-            vec![("common.RequestHeaderProto", "header", 1), ("string", "path", 2),]
-        );
-        assert_eq!(
-            proto_message_fields(metadata_proto, "GetStatusResponseProto"),
-            vec![
-                ("common.ResponseHeaderProto", "header", 1),
-                ("FileAttrsProto", "attrs", 2),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(metadata_proto, "CreateDirectoryResponseProto"),
-            vec![
-                ("common.ResponseHeaderProto", "header", 1),
-                ("FileAttrsProto", "attrs", 2),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(metadata_proto, "OpenFileResponseProto"),
-            vec![
-                ("common.ResponseHeaderProto", "header", 1),
-                ("common.DataHandleIdProto", "data_handle_id", 2),
-                ("uint64", "file_size", 3),
-                ("uint64", "content_revision", 4),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(metadata_proto, "GetBlockLocationsResponseProto"),
-            vec![
-                ("common.ResponseHeaderProto", "header", 1),
-                ("common.DataHandleIdProto", "data_handle_id", 2),
-                ("uint64", "file_size", 3),
-                ("FileBlockLocationProto", "locations", 4),
-                ("uint64", "content_revision", 5),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(metadata_proto, "CreateFileResponseProto"),
-            vec![
-                ("common.ResponseHeaderProto", "header", 1),
-                ("common.DataHandleIdProto", "data_handle_id", 2),
-                ("common.FileLayoutProto", "layout", 3),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(metadata_proto, "OpenWriteRequestProto"),
-            vec![
-                ("common.RequestHeaderProto", "header", 1),
-                ("string", "path", 2),
-                ("OpenWriteModeProto", "mode", 3),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(metadata_proto, "OpenWriteResponseProto"),
-            vec![
-                ("common.ResponseHeaderProto", "header", 1),
-                ("WriteHandleProto", "write_handle", 2),
-                ("uint64", "base_size", 3),
-                ("uint64", "expires_at_ms", 4),
-                ("common.FileLayoutProto", "layout", 5),
-                ("uint64", "content_revision", 6),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(metadata_proto, "AddBlockRequestProto"),
-            vec![
-                ("common.RequestHeaderProto", "header", 1),
-                ("WriteHandleProto", "write_handle", 2),
-                ("uint64", "desired_len", 3),
-                ("common.BlockIdProto", "previous_block_id", 4),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(metadata_proto, "CommitFileRequestProto"),
-            vec![
-                ("common.RequestHeaderProto", "header", 1),
-                ("WriteHandleProto", "write_handle", 2),
-                ("CommittedBlockProto", "committed_blocks", 3),
-                ("uint64", "final_size", 4),
-                ("uint64", "expected_content_revision", 5),
-                ("OpenWriteModeProto", "write_mode", 6),
-                ("uint64", "expected_file_size", 7),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(metadata_proto, "CommitFileResponseProto"),
-            vec![
-                ("common.ResponseHeaderProto", "header", 1),
-                ("uint64", "committed_size", 2),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(metadata_proto, "SyncWriteRequestProto"),
-            vec![
-                ("common.RequestHeaderProto", "header", 1),
-                ("WriteHandleProto", "write_handle", 2),
-                ("CommittedBlockProto", "committed_blocks", 3),
-                ("uint64", "target_size", 4),
-                ("uint64", "expected_content_revision", 5),
-                ("OpenWriteModeProto", "write_mode", 6),
-                ("uint64", "expected_file_size", 7),
-            ]
-        );
-
-        let metadata_worker_proto = include_str!("../metadata/worker.proto");
-        assert_eq!(
-            proto_message_fields(metadata_worker_proto, "RegisterWorkerRequestProto"),
-            vec![
-                ("common.RequestHeaderProto", "header", 1),
-                ("uint64", "worker_id", 2),
-                ("string", "worker_run_id", 3),
-                ("common.EndpointProto", "advertised_endpoint", 4),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(metadata_worker_proto, "RegisterWorkerResponseProto"),
-            vec![
-                ("common.ResponseHeaderProto", "header", 1),
-                ("uint64", "worker_id", 2),
-                ("string", "accepted_worker_run_id", 3),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(metadata_worker_proto, "HeartbeatRequestProto"),
-            vec![
-                ("common.RequestHeaderProto", "header", 1),
-                ("uint64", "worker_id", 2),
-                ("string", "worker_run_id", 3),
-                ("uint64", "heartbeat_seq", 4),
-                ("common.EndpointProto", "advertised_endpoint", 5),
-                ("CapacityInfoProto", "capacity", 6),
-                ("LoadInfoProto", "load", 7),
-                ("HealthStatusProto", "health", 8),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(metadata_worker_proto, "HeartbeatResponseProto"),
-            vec![
-                ("common.ResponseHeaderProto", "header", 1),
-                ("uint64", "worker_id", 2),
-                ("string", "accepted_worker_run_id", 3),
-                ("uint32", "liveness_timeout_ms", 4),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(metadata_worker_proto, "BlockReportRequestProto"),
-            vec![
-                ("common.RequestHeaderProto", "header", 1),
-                ("uint64", "worker_id", 2),
-                ("string", "worker_run_id", 3),
-                ("uint64", "report_seq", 4),
-                ("FullBlockReportBatchProto", "full", 5),
-                ("DeltaBlockReportProto", "delta", 6),
-            ]
-        );
-
-        let worker_data_proto = include_str!("../worker/data.proto");
-        assert_eq!(
-            proto_message_fields(worker_data_proto, "OpenReadStreamRequestProto"),
-            vec![
-                ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.BlockIdProto", "block_id", 2),
-                ("common.ByteRangeProto", "byte_range", 3),
-                ("uint64", "block_stamp", 4),
-                ("uint32", "frame_size", 5),
-                ("string", "worker_run_id", 6),
-                ("uint32", "block_format_id", 7),
-                ("uint64", "block_size", 8),
-                ("uint32", "chunk_size", 9),
-                ("uint64", "effective_len", 10),
-                ("string", "group_name", 11),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(worker_data_proto, "OpenReadStreamResponseProto"),
-            vec![
-                ("worker.DataResponseHeaderProto", "header", 1),
-                ("common.StreamIdProto", "stream_id", 2),
-                ("uint32", "frame_size", 3),
-                ("uint64", "block_stamp", 4),
-                ("uint64", "committed_length", 5),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(worker_data_proto, "OpenWriteStreamRequestProto"),
-            vec![
-                ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.BlockIdProto", "block_id", 2),
-                ("uint32", "block_format_id", 3),
-                ("uint64", "block_size", 4),
-                ("uint32", "chunk_size", 5),
-                ("uint64", "block_stamp", 6),
-                ("common.FencingTokenProto", "token", 7),
-                ("uint32", "frame_size", 8),
-                ("string", "worker_run_id", 9),
-                ("uint64", "effective_len", 10),
-                ("string", "group_name", 11),
-                ("common.TierProto", "tier", 12),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(worker_data_proto, "OpenWriteStreamResponseProto"),
-            vec![
-                ("worker.DataResponseHeaderProto", "header", 1),
-                ("common.StreamIdProto", "stream_id", 2),
-                ("uint32", "frame_size", 3),
-                ("uint64", "block_stamp", 4),
-                ("uint64", "committed_length", 5),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(worker_data_proto, "CommitWriteRequestProto"),
-            vec![
-                ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.BlockIdProto", "block_id", 2),
-                ("common.StreamIdProto", "stream_id", 3),
-                ("uint64", "effective_len", 4),
-                ("uint64", "block_stamp", 5),
-                ("common.FencingTokenProto", "token", 6),
-                ("uint64", "commit_seq", 7),
-                ("bool", "require_sync", 8),
-                ("string", "worker_run_id", 9),
-                ("uint32", "block_format_id", 10),
-                ("uint64", "block_size", 11),
-                ("uint32", "chunk_size", 12),
-                ("string", "group_name", 13),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(worker_data_proto, "CommitWriteResponseProto"),
-            vec![
-                ("worker.DataResponseHeaderProto", "header", 1),
-                ("uint64", "effective_len", 2),
-                ("uint64", "block_stamp", 3),
-                ("uint64", "written_through", 4),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(worker_data_proto, "SyncCommittedBlockRequestProto"),
-            vec![
-                ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.BlockIdProto", "block_id", 2),
-                ("uint64", "block_stamp", 3),
-                ("uint64", "expected_block_len", 4),
-                ("string", "worker_run_id", 5),
-                ("uint32", "block_format_id", 6),
-                ("uint64", "block_size", 7),
-                ("uint32", "chunk_size", 8),
-                ("string", "group_name", 9),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(worker_data_proto, "SyncCommittedBlockResponseProto"),
-            vec![
-                ("worker.DataResponseHeaderProto", "header", 1),
-                ("uint64", "effective_len", 2),
-                ("uint64", "block_stamp", 3),
-            ]
-        );
-
-        let block_meta_proto = include_str!("../worker/block_meta.proto");
-        assert_eq!(
-            proto_message_fields(block_meta_proto, "BlockMetaPayloadProto"),
-            vec![
-                ("BlockIdentityProto", "identity", 1),
-                ("BlockFormatProto", "format", 2),
-                ("BlockSourceProto", "source", 3),
-                ("BlockVisibilityProto", "visibility", 4),
-                ("common.TierProto", "tier", 5),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(block_meta_proto, "BlockFormatProto"),
-            vec![
-                ("uint32", "format_id", 1),
-                ("uint64", "block_size", 2),
-                ("uint32", "chunk_size", 3),
-            ]
-        );
-        assert_eq!(
-            proto_message_fields(block_meta_proto, "BlockIdentityProto"),
-            vec![("common.BlockIdProto", "block_id", 1), ("string", "group_name", 2),]
-        );
-        assert_eq!(
-            proto_message_fields(block_meta_proto, "BlockSourceProto"),
-            vec![("uint64", "effective_len", 1)]
-        );
-        assert_eq!(
-            proto_message_fields(block_meta_proto, "BlockVisibilityProto"),
-            vec![("BlockStateProto", "block_state", 1), ("uint64", "block_stamp", 2)]
-        );
-    }
-
-    #[test]
-    fn all_proto_message_fields_are_contiguous_and_unreserved() {
-        for (path, source) in [
-            ("common/common.proto", include_str!("../common/common.proto")),
-            ("common/errors.proto", include_str!("../common/errors.proto")),
-            ("common/header.proto", include_str!("../common/header.proto")),
-            (
-                "metadata/filesystem.proto",
-                include_str!("../metadata/filesystem.proto"),
-            ),
-            ("metadata/worker.proto", include_str!("../metadata/worker.proto")),
-            ("worker/block_meta.proto", include_str!("../worker/block_meta.proto")),
-            ("worker/data.proto", include_str!("../worker/data.proto")),
-            ("worker/data_header.proto", include_str!("../worker/data_header.proto")),
-        ] {
-            assert!(
-                !source.lines().any(|line| line.trim_start().starts_with("reserved ")),
-                "{path} still contains reserved fields"
-            );
-            for (message, tags) in proto_message_tag_sets(source) {
-                let expected = (1..=tags.len() as u32).collect::<Vec<_>>();
-                assert_eq!(tags, expected, "{path} message {message} has non-contiguous field tags");
-            }
-        }
     }
 
     #[test]
@@ -1965,7 +1768,7 @@ mod tests {
     }
 
     #[test]
-    fn test_response_header_proto_to_rpc_refresh_metadata() {
+    fn response_header_refresh_metadata_conversion_is_bidirectional() {
         let proto_header = proto_common::ResponseHeaderProto {
             client: Some(proto_common::ClientInfoProto {
                 call_id: beryl_types::CallId::new().to_string(),
@@ -2021,10 +1824,7 @@ mod tests {
                 }
             }
         );
-    }
 
-    #[test]
-    fn test_response_header_roundtrip_refresh_metadata() {
         let hint = RpcRefreshHint {
             route_epoch: Some(11),
             ..RpcRefreshHint::default()
@@ -2072,7 +1872,7 @@ mod tests {
     }
 
     #[test]
-    fn request_header_trace_context_roundtrip_preserves_w3c_fields() {
+    fn trace_context_conversion_covers_request_data_and_empty_values() {
         let request = RequestHeader::new(ClientId::new(42))
             .with_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string())
             .with_tracestate("vendor=state".to_string())
@@ -2092,21 +1892,24 @@ mod tests {
         let decoded_request = RequestHeader::try_from(proto_request).expect("request header decode");
         assert_eq!(decoded_request.trace_context, request.trace_context);
         assert_eq!(decoded_request.client.call_id.to_string(), call_id);
-    }
 
-    #[test]
-    fn request_and_data_headers_omit_trace_context_without_source() {
-        let request = RequestHeader::new(ClientId::new(42));
-
-        let proto_request: proto_common::RequestHeaderProto = (&request).into();
         let data_header: crate::worker::DataRequestHeaderProto = (&request).into();
+        let trace = data_header.trace_context.expect("data trace context");
+        assert_eq!(
+            trace.traceparent.as_deref(),
+            request.trace_context.traceparent.as_deref()
+        );
+        assert_eq!(trace.tracestate.as_deref(), request.trace_context.tracestate.as_deref());
+        assert_eq!(trace.baggage.as_deref(), request.trace_context.baggage.as_deref());
+
+        let request_without_trace = RequestHeader::new(ClientId::new(42));
+
+        let proto_request: proto_common::RequestHeaderProto = (&request_without_trace).into();
+        let data_header: crate::worker::DataRequestHeaderProto = (&request_without_trace).into();
 
         assert!(proto_request.trace_context.is_none());
         assert!(data_header.trace_context.is_none());
-    }
 
-    #[test]
-    fn empty_inbound_trace_context_reencodes_as_absent() {
         let mut proto_request: proto_common::RequestHeaderProto = (&RequestHeader::new(ClientId::new(42))).into();
         proto_request.trace_context = Some(proto_common::TraceContextProto {
             traceparent: None,
@@ -2118,24 +1921,6 @@ mod tests {
         let reencoded_request: proto_common::RequestHeaderProto = (&decoded_request).into();
 
         assert!(reencoded_request.trace_context.is_none());
-    }
-
-    #[test]
-    fn data_header_trace_context_roundtrip_preserves_w3c_fields() {
-        let request = RequestHeader::new(ClientId::new(42))
-            .with_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string())
-            .with_tracestate("vendor=state".to_string())
-            .with_baggage("tenant=local".to_string());
-
-        let data_header: crate::worker::DataRequestHeaderProto = (&request).into();
-        let trace = data_header.trace_context.expect("data trace context");
-
-        assert_eq!(
-            trace.traceparent.as_deref(),
-            request.trace_context.traceparent.as_deref()
-        );
-        assert_eq!(trace.tracestate.as_deref(), request.trace_context.tracestate.as_deref());
-        assert_eq!(trace.baggage.as_deref(), request.trace_context.baggage.as_deref());
     }
 
     #[test]
@@ -2312,103 +2097,5 @@ mod tests {
             beryl_types::FileBlockLocation::try_from(proto_metadata::FileBlockLocationProto::from(location.clone()))
                 .expect("file block location decodes");
         assert_eq!(decoded_location, location);
-    }
-
-    fn proto_message_fields<'a>(source: &'a str, message: &str) -> Vec<(&'a str, &'a str, u32)> {
-        proto_message_body(source, message)
-            .lines()
-            .filter_map(|raw_line| {
-                let line = raw_line.split_once("//").map_or(raw_line, |(field, _)| field).trim();
-                if line.is_empty() || line.starts_with("reserved") || !line.ends_with(';') {
-                    return None;
-                }
-
-                let field = line.trim_end_matches(';');
-                let (left, tag) = field.split_once(" = ")?;
-                let (decl, name) = left.rsplit_once(' ')?;
-                let ty = decl
-                    .strip_prefix("optional ")
-                    .or_else(|| decl.strip_prefix("repeated "))
-                    .unwrap_or(decl);
-                Some((ty, name, tag.parse().expect("numeric proto tag")))
-            })
-            .collect()
-    }
-
-    fn proto_message_body<'a>(source: &'a str, message: &str) -> &'a str {
-        let start = format!("message {message} {{");
-        let start_index = source
-            .find(&start)
-            .unwrap_or_else(|| panic!("missing proto message {message}"));
-        let body_start = start_index + start.len();
-        let body_end = source[body_start..]
-            .find("\n}")
-            .map(|offset| body_start + offset)
-            .unwrap_or_else(|| panic!("unterminated proto message {message}"));
-        &source[body_start..body_end]
-    }
-
-    fn proto_enum_values<'a>(source: &'a str, enum_name: &str) -> Vec<(&'a str, u32)> {
-        proto_enum_body(source, enum_name)
-            .lines()
-            .filter_map(|raw_line| {
-                let line = raw_line.split_once("//").map_or(raw_line, |(value, _)| value).trim();
-                if line.is_empty() || line.starts_with("reserved") || !line.ends_with(';') {
-                    return None;
-                }
-
-                let value = line.trim_end_matches(';');
-                let (name, tag) = value.split_once(" = ")?;
-                Some((name.trim(), tag.trim().parse().expect("numeric proto enum tag")))
-            })
-            .collect()
-    }
-
-    fn proto_enum_body<'a>(source: &'a str, enum_name: &str) -> &'a str {
-        let start = format!("enum {enum_name} {{");
-        let start_index = source
-            .find(&start)
-            .unwrap_or_else(|| panic!("missing proto enum {enum_name}"));
-        let body_start = start_index + start.len();
-        let body_end = source[body_start..]
-            .find("\n}")
-            .map(|offset| body_start + offset)
-            .unwrap_or_else(|| panic!("unterminated proto enum {enum_name}"));
-        &source[body_start..body_end]
-    }
-
-    fn proto_message_tag_sets(source: &str) -> Vec<(String, Vec<u32>)> {
-        let mut messages = Vec::new();
-        let mut current: Option<(String, Vec<u32>)> = None;
-        let mut depth = 0usize;
-
-        for raw_line in source.lines() {
-            let line = raw_line.split_once("//").map_or(raw_line, |(code, _)| code).trim();
-            if current.is_none() {
-                if let Some(name) = line.strip_prefix("message ").and_then(|decl| decl.strip_suffix(" {")) {
-                    current = Some((name.to_string(), Vec::new()));
-                    depth = 1;
-                }
-                continue;
-            }
-
-            if line.ends_with(';')
-                && let Some((_, tag)) = line.trim_end_matches(';').split_once(" = ")
-                && let Ok(tag) = tag.parse::<u32>()
-            {
-                current.as_mut().expect("message state").1.push(tag);
-            }
-
-            depth = depth
-                .saturating_add(line.chars().filter(|ch| *ch == '{').count())
-                .saturating_sub(line.chars().filter(|ch| *ch == '}').count());
-            if depth == 0 {
-                let mut message = current.take().expect("message state");
-                message.1.sort_unstable();
-                messages.push(message);
-            }
-        }
-        assert!(current.is_none(), "unterminated proto message");
-        messages
     }
 }

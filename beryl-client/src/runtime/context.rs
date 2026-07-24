@@ -23,11 +23,6 @@ impl ClientIdentity {
         Self::new_checked(ClientId::generate(), client_name)
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_parts(client_id: ClientId, client_name: impl Into<String>) -> ClientResult<Self> {
-        Self::new_checked(client_id, client_name)
-    }
-
     fn new_checked(client_id: ClientId, client_name: impl Into<String>) -> ClientResult<Self> {
         if client_id.is_zero() {
             return Err(ClientError::InvalidArgument(
@@ -233,18 +228,6 @@ impl AttemptContext {
         self
     }
 
-    /// Return the stable logical call id.
-    #[cfg(test)]
-    pub(crate) fn call_id(&self) -> &str {
-        &self.call_id_text
-    }
-
-    /// Return the stable client identity for this attempt.
-    #[cfg(test)]
-    pub(crate) fn client_id(&self) -> ClientId {
-        self.operation.client_id
-    }
-
     /// Return the metadata group name carried by this attempt, when present.
     pub(crate) fn group_name(&self) -> Option<&GroupName> {
         self.group_name.as_ref()
@@ -377,7 +360,7 @@ mod tests {
 
     #[test]
     fn metadata_header_carries_runtime_client_identity() {
-        let identity = ClientIdentity::from_parts(ClientId::new(7), "prod_ns01").expect("client identity");
+        let identity = ClientIdentity::generate("prod_ns01").expect("client identity");
         let operation = OperationContext::new_with_identity(
             &identity,
             "OpenFile",
@@ -423,9 +406,14 @@ mod tests {
         let replay = AttemptContext::for_metadata(&operation, GroupName::parse("analytics").unwrap(), 1)
             .expect("replay attempt");
 
-        assert_eq!(first.call_id(), replay.call_id());
-        assert_eq!(first.metadata_header().expect("first header").group_name, "root");
-        assert_eq!(replay.metadata_header().expect("replay header").group_name, "analytics");
+        let first_header = first.metadata_header().expect("first header");
+        let replay_header = replay.metadata_header().expect("replay header");
+        assert_eq!(
+            first_header.client.expect("first client").call_id,
+            replay_header.client.expect("replay client").call_id
+        );
+        assert_eq!(first_header.group_name, "root");
+        assert_eq!(replay_header.group_name, "analytics");
     }
 
     #[test]
@@ -436,12 +424,15 @@ mod tests {
 
         let metadata_header = ctx.metadata_header().expect("metadata header");
         let data_header = ctx.data_header();
+        let metadata_call_id = metadata_header
+            .client
+            .as_ref()
+            .expect("metadata client")
+            .call_id
+            .as_str();
+        let data_call_id = data_header.client.as_ref().expect("data client").call_id.as_str();
 
-        assert_eq!(
-            metadata_header.client.as_ref().expect("metadata client").call_id,
-            ctx.call_id()
-        );
-        assert_eq!(data_header.client.as_ref().expect("data client").call_id, ctx.call_id());
+        assert_eq!(metadata_call_id, data_call_id);
         assert!(metadata_header.trace_context.is_none());
         assert!(data_header.trace_context.is_none());
     }
@@ -450,11 +441,22 @@ mod tests {
     fn shared_deadline_is_preserved_across_attempts() {
         let operation = metadata_operation();
         let base = AttemptContext::for_metadata(&operation, GroupName::parse("root").unwrap(), 0).expect("attempt");
-        let call_id = base.call_id().to_string();
+        let call_id = base
+            .metadata_header()
+            .expect("base header")
+            .client
+            .expect("base client")
+            .call_id;
         let replay = AttemptContext::for_metadata(&operation, GroupName::parse("root").unwrap(), 1).expect("replay");
         let deadline_ms = base.deadline_ms();
+        let replay_call_id = replay
+            .metadata_header()
+            .expect("replay header")
+            .client
+            .expect("replay client")
+            .call_id;
         assert!(deadline_ms > 0);
-        assert_eq!(replay.call_id(), call_id);
+        assert_eq!(replay_call_id, call_id);
         assert_eq!(replay.deadline_ms(), deadline_ms);
     }
 }

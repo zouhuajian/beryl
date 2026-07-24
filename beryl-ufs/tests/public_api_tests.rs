@@ -3,10 +3,10 @@
 
 //! Tests for UFS module.
 
-use crate::registry::UfsRegistry;
-use crate::spec::{BackendConfig, BackendKind, CapabilityOverrides, FsConfig};
 use beryl_common::header::RequestHeader;
 use beryl_types::ClientId;
+use beryl_ufs::registry::UfsRegistry;
+use beryl_ufs::spec::{BackendConfig, BackendKind, CapabilityOverrides, FsConfig};
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -14,12 +14,12 @@ async fn test_fs_backend_basic_ops() {
     let temp_dir = TempDir::new().unwrap();
     let root = temp_dir.path().to_string_lossy().to_string();
 
-    let spec = crate::UfsSpec::new("test-fs", BackendKind::Fs, BackendConfig::Fs(FsConfig { root }));
+    let spec = beryl_ufs::UfsSpec::new("test-fs", BackendKind::Fs, BackendConfig::Fs(FsConfig { root }));
 
     let registry = UfsRegistry::new();
     registry.upsert(spec).unwrap();
 
-    let ufs = registry.get(&crate::UfsId::new("test-fs")).unwrap();
+    let ufs = registry.get(&beryl_ufs::UfsId::new("test-fs")).unwrap();
     let ctx = RequestHeader::new(ClientId::new(1));
 
     // Test write_all
@@ -75,7 +75,7 @@ async fn test_registry_operations() {
     let registry = UfsRegistry::new();
 
     // Test upsert
-    let spec1 = crate::UfsSpec::new(
+    let spec1 = beryl_ufs::UfsSpec::new(
         "fs1",
         BackendKind::Fs,
         BackendConfig::Fs(FsConfig { root: root.clone() }),
@@ -84,18 +84,18 @@ async fn test_registry_operations() {
     assert_eq!(registry.len(), 1);
 
     // Test get
-    let ufs1 = registry.get(&crate::UfsId::new("fs1"));
+    let ufs1 = registry.get(&beryl_ufs::UfsId::new("fs1"));
     assert!(ufs1.is_some());
 
     // Test upsert update
-    let spec1_updated = crate::UfsSpec::new("fs1", BackendKind::Fs, BackendConfig::Fs(FsConfig { root }));
+    let spec1_updated = beryl_ufs::UfsSpec::new("fs1", BackendKind::Fs, BackendConfig::Fs(FsConfig { root }));
     assert!(registry.upsert(spec1_updated).unwrap());
     assert_eq!(registry.len(), 1);
 
     // Test remove
-    assert!(registry.remove(&crate::UfsId::new("fs1")));
+    assert!(registry.remove(&beryl_ufs::UfsId::new("fs1")));
     assert_eq!(registry.len(), 0);
-    assert!(registry.get(&crate::UfsId::new("fs1")).is_none());
+    assert!(registry.get(&beryl_ufs::UfsId::new("fs1")).is_none());
 }
 
 #[tokio::test]
@@ -108,7 +108,7 @@ async fn test_registry_apply() {
     let registry = UfsRegistry::new();
 
     // Add initial instance
-    let spec1 = crate::UfsSpec::new(
+    let spec1 = beryl_ufs::UfsSpec::new(
         "fs1",
         BackendKind::Fs,
         BackendConfig::Fs(FsConfig { root: root1.clone() }),
@@ -117,11 +117,11 @@ async fn test_registry_apply() {
     assert_eq!(registry.len(), 1);
 
     // Apply new set (replaces all)
-    let spec2 = crate::UfsSpec::new("fs2", BackendKind::Fs, BackendConfig::Fs(FsConfig { root: root2 }));
+    let spec2 = beryl_ufs::UfsSpec::new("fs2", BackendKind::Fs, BackendConfig::Fs(FsConfig { root: root2 }));
     registry.apply(vec![spec2]).unwrap();
     assert_eq!(registry.len(), 1);
-    assert!(registry.get(&crate::UfsId::new("fs1")).is_none());
-    assert!(registry.get(&crate::UfsId::new("fs2")).is_some());
+    assert!(registry.get(&beryl_ufs::UfsId::new("fs1")).is_none());
+    assert!(registry.get(&beryl_ufs::UfsId::new("fs2")).is_some());
 }
 
 #[tokio::test]
@@ -130,7 +130,7 @@ async fn test_rename_fallback() {
     let root = temp_dir.path().to_string_lossy().to_string();
 
     // Create spec with rename fallback enabled
-    let spec = crate::UfsSpec::new("test-fs", BackendKind::Fs, BackendConfig::Fs(FsConfig { root }))
+    let spec = beryl_ufs::UfsSpec::new("test-fs", BackendKind::Fs, BackendConfig::Fs(FsConfig { root }))
         .with_capability_overrides(CapabilityOverrides {
             rename_fallback_enabled: true,
         });
@@ -138,7 +138,7 @@ async fn test_rename_fallback() {
     let registry = UfsRegistry::new();
     registry.upsert(spec).unwrap();
 
-    let ufs = registry.get(&crate::UfsId::new("test-fs")).unwrap();
+    let ufs = registry.get(&beryl_ufs::UfsId::new("test-fs")).unwrap();
     let ctx = RequestHeader::new(ClientId::new(1));
 
     // Write a file
@@ -158,9 +158,9 @@ async fn test_rename_fallback() {
 
 #[test]
 fn test_ufs_id() {
-    let id1 = crate::UfsId::new("test-id");
-    let id2 = crate::UfsId::from("test-id");
-    let id3 = crate::UfsId::from(String::from("test-id"));
+    let id1 = beryl_ufs::UfsId::new("test-id");
+    let id2 = beryl_ufs::UfsId::from("test-id");
+    let id3 = beryl_ufs::UfsId::from(String::from("test-id"));
 
     assert_eq!(id1, id2);
     assert_eq!(id1, id3);
@@ -169,17 +169,17 @@ fn test_ufs_id() {
 
 #[test]
 fn test_capability() {
-    let fs_cap = crate::Capability::for_filesystem();
+    let fs_cap = beryl_ufs::Capability::for_filesystem();
     assert!(fs_cap.supports_rename);
     assert!(fs_cap.supports_recursive_delete);
     assert!(fs_cap.supports_dir);
 
-    let obj_cap = crate::Capability::for_object_storage();
+    let obj_cap = beryl_ufs::Capability::for_object_storage();
     assert!(!obj_cap.supports_rename);
     assert!(!obj_cap.supports_recursive_delete);
     assert!(!obj_cap.supports_dir);
 
-    let hdfs_cap = crate::Capability::for_hdfs();
+    let hdfs_cap = beryl_ufs::Capability::for_hdfs();
     assert!(hdfs_cap.supports_rename);
     assert!(hdfs_cap.supports_recursive_delete);
     assert!(hdfs_cap.supports_dir);
