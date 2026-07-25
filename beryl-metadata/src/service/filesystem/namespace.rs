@@ -458,319 +458,6 @@ impl MetadataFileSystem {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::service::filesystem::test_support::*;
-
-    #[tokio::test]
-    async fn rename_rejects_active_write_target() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_id = MountId::new(56);
-        let group_name_value = group_name("g14");
-        let parent_inode_id = InodeId::new(560);
-        let source_inode_id = InodeId::new(561);
-        let target_inode_id = InodeId::new(562);
-        let source_handle = DataHandleId::new(563);
-        let target_handle = DataHandleId::new(564);
-        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
-        let mount_table = builder.mount_table();
-        let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
-        let filesystem = builder
-            .with_storage(Arc::clone(&storage))
-            .with_raft_node(raft_node)
-            .build();
-
-        storage
-            .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
-            .unwrap();
-        storage
-            .put_inode(&Inode::new_file(
-                source_inode_id,
-                FileAttrs::new(),
-                mount_id,
-                source_handle,
-            ))
-            .unwrap();
-        storage
-            .put_inode(&Inode::new_file(
-                target_inode_id,
-                FileAttrs::new(),
-                mount_id,
-                target_handle,
-            ))
-            .unwrap();
-        storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
-        storage.put_dentry(parent_inode_id, "target", target_inode_id).unwrap();
-        storage
-            .put_layout(source_inode_id, FileLayout::new(4096, 4096, 1))
-            .unwrap();
-        storage
-            .put_layout(target_inode_id, FileLayout::new(4096, 4096, 1))
-            .unwrap();
-        storage.put_data_handle_owner(source_handle, source_inode_id).unwrap();
-        storage.put_data_handle_owner(target_handle, target_inode_id).unwrap();
-        let file_handle = install_write_session(&filesystem, target_inode_id, mount_id);
-
-        let failure = filesystem
-            .execute_rename(
-                &request_context(),
-                Command::Rename {
-                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
-                    src_parent_inode_id: parent_inode_id,
-                    src_name: "source".to_string(),
-                    expected_src_inode_id: source_inode_id,
-                    dst_parent_inode_id: parent_inode_id,
-                    dst_name: "target".to_string(),
-                    expected_dst_inode_id: Some(target_inode_id),
-                    expected_dst_lease_epoch: Some(0),
-                    flags: 0,
-                },
-                Freshness::default(),
-            )
-            .await
-            .unwrap_err();
-
-        assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EBusy));
-        assert!(filesystem.write_session_for_handle(file_handle).is_some());
-        assert_eq!(
-            storage.get_dentry(parent_inode_id, "source").unwrap(),
-            Some(source_inode_id)
-        );
-        assert_eq!(
-            storage.get_dentry(parent_inode_id, "target").unwrap(),
-            Some(target_inode_id)
-        );
-        assert!(storage.get_inode(target_inode_id).unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn expired_target_write_lease_does_not_leave_rename_permanently_busy() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_id = MountId::new(66);
-        let group_name_value = group_name("g18");
-        let parent_inode_id = InodeId::new(660);
-        let source_inode_id = InodeId::new(661);
-        let target_inode_id = InodeId::new(662);
-        let source_handle = DataHandleId::new(663);
-        let target_handle = DataHandleId::new(664);
-        let lease_manager = Arc::new(crate::inode_lease::LeaseManager::new(0, 1_000));
-        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
-            .with_lease_manager(Arc::clone(&lease_manager));
-        let mount_table = builder.mount_table();
-        let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
-        let filesystem = builder
-            .with_storage(Arc::clone(&storage))
-            .with_raft_node(raft_node)
-            .build();
-
-        storage
-            .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
-            .unwrap();
-        storage
-            .put_inode(&Inode::new_file(
-                source_inode_id,
-                FileAttrs::new(),
-                mount_id,
-                source_handle,
-            ))
-            .unwrap();
-        storage
-            .put_inode(&Inode::new_file(
-                target_inode_id,
-                FileAttrs::new(),
-                mount_id,
-                target_handle,
-            ))
-            .unwrap();
-        storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
-        storage.put_dentry(parent_inode_id, "target", target_inode_id).unwrap();
-        storage
-            .put_layout(source_inode_id, FileLayout::new(4096, 4096, 1))
-            .unwrap();
-        storage
-            .put_layout(target_inode_id, FileLayout::new(4096, 4096, 1))
-            .unwrap();
-        storage.put_data_handle_owner(source_handle, source_inode_id).unwrap();
-        storage.put_data_handle_owner(target_handle, target_inode_id).unwrap();
-        let file_handle = install_write_session(&filesystem, target_inode_id, mount_id);
-
-        assert!(!lease_manager.has_active_lease(target_inode_id));
-        assert!(filesystem.write_session_for_handle(file_handle).is_some());
-
-        filesystem
-            .execute_rename(
-                &request_context(),
-                Command::Rename {
-                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
-                    src_parent_inode_id: parent_inode_id,
-                    src_name: "source".to_string(),
-                    expected_src_inode_id: source_inode_id,
-                    dst_parent_inode_id: parent_inode_id,
-                    dst_name: "target".to_string(),
-                    expected_dst_inode_id: Some(target_inode_id),
-                    expected_dst_lease_epoch: Some(0),
-                    flags: 0,
-                },
-                Freshness::default(),
-            )
-            .await
-            .expect("expired target lease must not leave rename permanently busy");
-
-        assert_eq!(storage.get_dentry(parent_inode_id, "source").unwrap(), None);
-        assert_eq!(
-            storage.get_dentry(parent_inode_id, "target").unwrap(),
-            Some(source_inode_id)
-        );
-        assert!(storage.get_inode(target_inode_id).unwrap().is_none());
-        assert!(filesystem.write_session_for_handle(file_handle).is_none());
-    }
-
-    #[tokio::test]
-    async fn rename_keeps_content_revision() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_id = MountId::new(59);
-        let group_name_value = group_name("g16");
-        let parent_inode_id = InodeId::new(590);
-        let source_inode_id = InodeId::new(591);
-        let target_inode_id = InodeId::new(592);
-        let source_handle = DataHandleId::new(593);
-        let target_handle = DataHandleId::new(594);
-        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
-        let mount_table = builder.mount_table();
-        let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
-        let filesystem = builder
-            .with_storage(Arc::clone(&storage))
-            .with_raft_node(raft_node)
-            .build();
-
-        storage
-            .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
-            .unwrap();
-        let mut source = Inode::new_file(source_inode_id, FileAttrs::new(), mount_id, source_handle);
-        if let beryl_types::fs::InodeData::File {
-            content_revision,
-            lease_epoch,
-            ..
-        } = &mut source.data
-        {
-            *content_revision = Some(77);
-            *lease_epoch = Some(900);
-        }
-        let mut target = Inode::new_file(target_inode_id, FileAttrs::new(), mount_id, target_handle);
-        if let beryl_types::fs::InodeData::File {
-            content_revision,
-            lease_epoch,
-            ..
-        } = &mut target.data
-        {
-            *content_revision = Some(12);
-            *lease_epoch = Some(12);
-        }
-        storage.put_inode(&source).unwrap();
-        storage.put_inode(&target).unwrap();
-        storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
-        storage.put_dentry(parent_inode_id, "target", target_inode_id).unwrap();
-        storage
-            .put_layout(source_inode_id, FileLayout::new(4096, 4096, 1))
-            .unwrap();
-        storage
-            .put_layout(target_inode_id, FileLayout::new(4096, 4096, 1))
-            .unwrap();
-        storage.put_data_handle_owner(source_handle, source_inode_id).unwrap();
-        storage.put_data_handle_owner(target_handle, target_inode_id).unwrap();
-
-        filesystem
-            .execute_rename(
-                &request_context(),
-                Command::Rename {
-                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
-                    src_parent_inode_id: parent_inode_id,
-                    src_name: "source".to_string(),
-                    expected_src_inode_id: source_inode_id,
-                    dst_parent_inode_id: parent_inode_id,
-                    dst_name: "target".to_string(),
-                    expected_dst_inode_id: Some(target_inode_id),
-                    expected_dst_lease_epoch: Some(12),
-                    flags: 0,
-                },
-                Freshness::default(),
-            )
-            .await
-            .expect("same-mount overwrite rename should succeed");
-
-        assert_eq!(storage.get_dentry(parent_inode_id, "source").unwrap(), None);
-        assert_eq!(
-            storage.get_dentry(parent_inode_id, "target").unwrap(),
-            Some(source_inode_id)
-        );
-        assert_eq!(stored_content_revision(&storage, source_inode_id), Some(77));
-        assert!(storage.get_inode(target_inode_id).unwrap().is_none());
-        assert_eq!(storage.get_inode_by_data_handle(target_handle).unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn rename_rejects_cross_mount() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let src_mount_id = MountId::new(57);
-        let dst_mount_id = MountId::new(58);
-        let src_parent_inode_id = InodeId::new(570);
-        let dst_parent_inode_id = InodeId::new(580);
-        let source_inode_id = InodeId::new(571);
-        let filesystem = filesystem_builder_with_mount(src_mount_id, 9, &group_name("g15"))
-            .with_storage(Arc::clone(&storage))
-            .build();
-
-        storage
-            .put_inode(&Inode::new_dir(src_parent_inode_id, FileAttrs::new(), src_mount_id))
-            .unwrap();
-        storage
-            .put_inode(&Inode::new_dir(dst_parent_inode_id, FileAttrs::new(), dst_mount_id))
-            .unwrap();
-        storage
-            .put_inode(&Inode::new_file(
-                source_inode_id,
-                FileAttrs::new(),
-                src_mount_id,
-                DataHandleId::new(571),
-            ))
-            .unwrap();
-        storage
-            .put_dentry(src_parent_inode_id, "source", source_inode_id)
-            .unwrap();
-
-        let failure = filesystem
-            .execute_rename(
-                &request_context(),
-                Command::Rename {
-                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
-                    src_parent_inode_id,
-                    src_name: "source".to_string(),
-                    expected_src_inode_id: source_inode_id,
-                    dst_parent_inode_id,
-                    dst_name: "target".to_string(),
-                    expected_dst_inode_id: None,
-                    expected_dst_lease_epoch: None,
-                    flags: 0,
-                },
-                Freshness::default(),
-            )
-            .await
-            .unwrap_err();
-
-        assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EXDev));
-        assert_eq!(
-            storage.get_dentry(src_parent_inode_id, "source").unwrap(),
-            Some(source_inode_id)
-        );
-        assert_eq!(storage.get_dentry(dst_parent_inode_id, "target").unwrap(), None);
-    }
-}
-
 pub(crate) struct CreateFileArgs {
     pub(crate) path: String,
     // Deferring wire conversion errors until after write admission preserves failure precedence.
@@ -1159,9 +846,316 @@ impl MetadataFileSystem {
 }
 
 #[cfg(test)]
-mod delete_tests {
+mod tests {
     use super::*;
     use crate::service::filesystem::test_support::*;
+
+    #[tokio::test]
+    async fn rename_rejects_active_write_target() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_id = MountId::new(56);
+        let group_name_value = group_name("g14");
+        let parent_inode_id = InodeId::new(560);
+        let source_inode_id = InodeId::new(561);
+        let target_inode_id = InodeId::new(562);
+        let source_handle = DataHandleId::new(563);
+        let target_handle = DataHandleId::new(564);
+        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
+        let mount_table = builder.mount_table();
+        let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
+        let filesystem = builder
+            .with_storage(Arc::clone(&storage))
+            .with_raft_node(raft_node)
+            .build();
+
+        storage
+            .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
+            .unwrap();
+        storage
+            .put_inode(&Inode::new_file(
+                source_inode_id,
+                FileAttrs::new(),
+                mount_id,
+                source_handle,
+            ))
+            .unwrap();
+        storage
+            .put_inode(&Inode::new_file(
+                target_inode_id,
+                FileAttrs::new(),
+                mount_id,
+                target_handle,
+            ))
+            .unwrap();
+        storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
+        storage.put_dentry(parent_inode_id, "target", target_inode_id).unwrap();
+        storage
+            .put_layout(source_inode_id, FileLayout::new(4096, 4096, 1))
+            .unwrap();
+        storage
+            .put_layout(target_inode_id, FileLayout::new(4096, 4096, 1))
+            .unwrap();
+        storage.put_data_handle_owner(source_handle, source_inode_id).unwrap();
+        storage.put_data_handle_owner(target_handle, target_inode_id).unwrap();
+        let file_handle = install_write_session(&filesystem, target_inode_id, mount_id);
+
+        let failure = filesystem
+            .execute_rename(
+                &request_context(),
+                Command::Rename {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    src_parent_inode_id: parent_inode_id,
+                    src_name: "source".to_string(),
+                    expected_src_inode_id: source_inode_id,
+                    dst_parent_inode_id: parent_inode_id,
+                    dst_name: "target".to_string(),
+                    expected_dst_inode_id: Some(target_inode_id),
+                    expected_dst_lease_epoch: Some(0),
+                    flags: 0,
+                },
+                Freshness::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EBusy));
+        assert!(filesystem.write_session_for_handle(file_handle).is_some());
+        assert_eq!(
+            storage.get_dentry(parent_inode_id, "source").unwrap(),
+            Some(source_inode_id)
+        );
+        assert_eq!(
+            storage.get_dentry(parent_inode_id, "target").unwrap(),
+            Some(target_inode_id)
+        );
+        assert!(storage.get_inode(target_inode_id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn expired_target_write_lease_does_not_leave_rename_permanently_busy() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_id = MountId::new(66);
+        let group_name_value = group_name("g18");
+        let parent_inode_id = InodeId::new(660);
+        let source_inode_id = InodeId::new(661);
+        let target_inode_id = InodeId::new(662);
+        let source_handle = DataHandleId::new(663);
+        let target_handle = DataHandleId::new(664);
+        let lease_manager = Arc::new(crate::inode_lease::LeaseManager::new(0, 1_000));
+        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
+            .with_lease_manager(Arc::clone(&lease_manager));
+        let mount_table = builder.mount_table();
+        let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
+        let filesystem = builder
+            .with_storage(Arc::clone(&storage))
+            .with_raft_node(raft_node)
+            .build();
+
+        storage
+            .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
+            .unwrap();
+        storage
+            .put_inode(&Inode::new_file(
+                source_inode_id,
+                FileAttrs::new(),
+                mount_id,
+                source_handle,
+            ))
+            .unwrap();
+        storage
+            .put_inode(&Inode::new_file(
+                target_inode_id,
+                FileAttrs::new(),
+                mount_id,
+                target_handle,
+            ))
+            .unwrap();
+        storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
+        storage.put_dentry(parent_inode_id, "target", target_inode_id).unwrap();
+        storage
+            .put_layout(source_inode_id, FileLayout::new(4096, 4096, 1))
+            .unwrap();
+        storage
+            .put_layout(target_inode_id, FileLayout::new(4096, 4096, 1))
+            .unwrap();
+        storage.put_data_handle_owner(source_handle, source_inode_id).unwrap();
+        storage.put_data_handle_owner(target_handle, target_inode_id).unwrap();
+        let file_handle = install_write_session(&filesystem, target_inode_id, mount_id);
+
+        assert!(!lease_manager.has_active_lease(target_inode_id));
+        assert!(filesystem.write_session_for_handle(file_handle).is_some());
+
+        filesystem
+            .execute_rename(
+                &request_context(),
+                Command::Rename {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    src_parent_inode_id: parent_inode_id,
+                    src_name: "source".to_string(),
+                    expected_src_inode_id: source_inode_id,
+                    dst_parent_inode_id: parent_inode_id,
+                    dst_name: "target".to_string(),
+                    expected_dst_inode_id: Some(target_inode_id),
+                    expected_dst_lease_epoch: Some(0),
+                    flags: 0,
+                },
+                Freshness::default(),
+            )
+            .await
+            .expect("expired target lease must not leave rename permanently busy");
+
+        assert_eq!(storage.get_dentry(parent_inode_id, "source").unwrap(), None);
+        assert_eq!(
+            storage.get_dentry(parent_inode_id, "target").unwrap(),
+            Some(source_inode_id)
+        );
+        assert!(storage.get_inode(target_inode_id).unwrap().is_none());
+        assert!(filesystem.write_session_for_handle(file_handle).is_none());
+    }
+
+    #[tokio::test]
+    async fn rename_keeps_content_revision() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_id = MountId::new(59);
+        let group_name_value = group_name("g16");
+        let parent_inode_id = InodeId::new(590);
+        let source_inode_id = InodeId::new(591);
+        let target_inode_id = InodeId::new(592);
+        let source_handle = DataHandleId::new(593);
+        let target_handle = DataHandleId::new(594);
+        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
+        let mount_table = builder.mount_table();
+        let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
+        let filesystem = builder
+            .with_storage(Arc::clone(&storage))
+            .with_raft_node(raft_node)
+            .build();
+
+        storage
+            .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
+            .unwrap();
+        let mut source = Inode::new_file(source_inode_id, FileAttrs::new(), mount_id, source_handle);
+        if let beryl_types::fs::InodeData::File {
+            content_revision,
+            lease_epoch,
+            ..
+        } = &mut source.data
+        {
+            *content_revision = Some(77);
+            *lease_epoch = Some(900);
+        }
+        let mut target = Inode::new_file(target_inode_id, FileAttrs::new(), mount_id, target_handle);
+        if let beryl_types::fs::InodeData::File {
+            content_revision,
+            lease_epoch,
+            ..
+        } = &mut target.data
+        {
+            *content_revision = Some(12);
+            *lease_epoch = Some(12);
+        }
+        storage.put_inode(&source).unwrap();
+        storage.put_inode(&target).unwrap();
+        storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
+        storage.put_dentry(parent_inode_id, "target", target_inode_id).unwrap();
+        storage
+            .put_layout(source_inode_id, FileLayout::new(4096, 4096, 1))
+            .unwrap();
+        storage
+            .put_layout(target_inode_id, FileLayout::new(4096, 4096, 1))
+            .unwrap();
+        storage.put_data_handle_owner(source_handle, source_inode_id).unwrap();
+        storage.put_data_handle_owner(target_handle, target_inode_id).unwrap();
+
+        filesystem
+            .execute_rename(
+                &request_context(),
+                Command::Rename {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    src_parent_inode_id: parent_inode_id,
+                    src_name: "source".to_string(),
+                    expected_src_inode_id: source_inode_id,
+                    dst_parent_inode_id: parent_inode_id,
+                    dst_name: "target".to_string(),
+                    expected_dst_inode_id: Some(target_inode_id),
+                    expected_dst_lease_epoch: Some(12),
+                    flags: 0,
+                },
+                Freshness::default(),
+            )
+            .await
+            .expect("same-mount overwrite rename should succeed");
+
+        assert_eq!(storage.get_dentry(parent_inode_id, "source").unwrap(), None);
+        assert_eq!(
+            storage.get_dentry(parent_inode_id, "target").unwrap(),
+            Some(source_inode_id)
+        );
+        assert_eq!(stored_content_revision(&storage, source_inode_id), Some(77));
+        assert!(storage.get_inode(target_inode_id).unwrap().is_none());
+        assert_eq!(storage.get_inode_by_data_handle(target_handle).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn rename_rejects_cross_mount() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let src_mount_id = MountId::new(57);
+        let dst_mount_id = MountId::new(58);
+        let src_parent_inode_id = InodeId::new(570);
+        let dst_parent_inode_id = InodeId::new(580);
+        let source_inode_id = InodeId::new(571);
+        let filesystem = filesystem_builder_with_mount(src_mount_id, 9, &group_name("g15"))
+            .with_storage(Arc::clone(&storage))
+            .build();
+
+        storage
+            .put_inode(&Inode::new_dir(src_parent_inode_id, FileAttrs::new(), src_mount_id))
+            .unwrap();
+        storage
+            .put_inode(&Inode::new_dir(dst_parent_inode_id, FileAttrs::new(), dst_mount_id))
+            .unwrap();
+        storage
+            .put_inode(&Inode::new_file(
+                source_inode_id,
+                FileAttrs::new(),
+                src_mount_id,
+                DataHandleId::new(571),
+            ))
+            .unwrap();
+        storage
+            .put_dentry(src_parent_inode_id, "source", source_inode_id)
+            .unwrap();
+
+        let failure = filesystem
+            .execute_rename(
+                &request_context(),
+                Command::Rename {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    src_parent_inode_id,
+                    src_name: "source".to_string(),
+                    expected_src_inode_id: source_inode_id,
+                    dst_parent_inode_id,
+                    dst_name: "target".to_string(),
+                    expected_dst_inode_id: None,
+                    expected_dst_lease_epoch: None,
+                    flags: 0,
+                },
+                Freshness::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EXDev));
+        assert_eq!(
+            storage.get_dentry(src_parent_inode_id, "source").unwrap(),
+            Some(source_inode_id)
+        );
+        assert_eq!(storage.get_dentry(dst_parent_inode_id, "target").unwrap(), None);
+    }
 
     #[tokio::test]
     async fn delete_file_with_active_write_session_returns_busy_without_namespace_mutation() {
@@ -1258,12 +1252,6 @@ mod delete_tests {
         assert!(storage.get_inode(inode_id).unwrap().is_none());
         assert!(filesystem.write_session_for_handle(file_handle).is_none());
     }
-}
-
-#[cfg(test)]
-mod create_file_tests {
-    use super::*;
-    use crate::service::filesystem::test_support::*;
 
     #[tokio::test]
     async fn create_file_persists_valid_client_layout_shape() {
