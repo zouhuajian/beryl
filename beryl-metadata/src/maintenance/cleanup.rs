@@ -1,0 +1,783 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Beryl Contributors
+
+//! Observe-only detection of reported block replicas no longer referenced by metadata.
+
+use crate::config::CleanupConfig;
+use crate::error::MetadataResult;
+use crate::observe;
+use crate::raft::{AppRaftNode, RocksDBStorage};
+use crate::session_registry::SessionRegistry;
+use crate::worker::{ReplicaKey, WorkerManager};
+use beryl_types::fs::InodeData;
+use beryl_types::GroupName;
+use openraft::ServerState;
+use parking_lot::Mutex;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tracing::warn;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupDecision {
+    Keep,
+    Wait,
+    Reclaimable,
+}
+
+#[derive(Clone, Debug)]
+struct CleanupEntry {
+    first_seen: Instant,
+    not_before: Instant,
+    verified_term: u64,
+}
+
+/// Detects reclaimable replicas without dispatching deletion commands.
+pub(crate) struct BlockCleanupScanner {
+    raft_node: Arc<AppRaftNode>,
+    storage: Arc<RocksDBStorage>,
+    worker_manager: Arc<WorkerManager>,
+    session_registry: Arc<SessionRegistry>,
+    group_name: GroupName,
+    reclaim_grace: Duration,
+    max_replicas_per_scan: usize,
+    max_candidates: usize,
+    entries: Mutex<HashMap<ReplicaKey, CleanupEntry>>,
+}
+
+impl BlockCleanupScanner {
+    /// Creates an observe-only scanner with process-local candidate state.
+    ///
+    /// Candidates are intentionally rebuilt from worker full reports after
+    /// restart; this scanner never persists tasks or dispatches deletion.
+    pub(crate) fn new(
+        raft_node: Arc<AppRaftNode>,
+        storage: Arc<RocksDBStorage>,
+        worker_manager: Arc<WorkerManager>,
+        session_registry: Arc<SessionRegistry>,
+        group_name: GroupName,
+        config: &CleanupConfig,
+    ) -> Self {
+        Self {
+            raft_node,
+            storage,
+            worker_manager,
+            session_registry,
+            group_name,
+            reclaim_grace: Duration::from_millis(config.reclaim_grace_ms),
+            max_replicas_per_scan: config.max_replicas_per_scan,
+            max_candidates: config.max_candidates,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Executes one bounded cleanup observation on the current Raft leader.
+    ///
+    /// Authority reads are ordered by a linearizable barrier, and classified
+    /// results are committed only while the same leader term remains current.
+    /// Incomplete replica listings and authority failures fail closed.
+    pub(crate) async fn run_once(&self) -> MetadataResult<()> {
+        let Some(scan_term) = self.current_leader_term() else {
+            observe::record_cleanup_scan("not_leader");
+            self.record_candidate_metrics(self.raft_node.metrics().current_term, Instant::now(), false);
+            return Ok(());
+        };
+
+        // A read barrier orders authority reads but does not freeze leadership.
+        if let Err(error) = self.raft_node.read(true, |_| Ok(())).await {
+            self.entries.lock().clear();
+            observe::record_cleanup_scan("authority_unavailable");
+            observe::set_cleanup_candidates(0, 0, 0.0);
+            return Err(error);
+        }
+
+        if self.current_leader_term() != Some(scan_term) {
+            observe::record_cleanup_scan("leadership_changed");
+            observe::record_cleanup_anomaly("leadership_changed");
+            self.record_candidate_metrics(scan_term, Instant::now(), false);
+            return Ok(());
+        }
+
+        let listing = self
+            .worker_manager
+            .list_ready_replicas(&self.group_name, self.max_replicas_per_scan);
+        if !listing.complete {
+            self.entries.lock().clear();
+            observe::record_cleanup_scan("replica_limit");
+            observe::record_cleanup_anomaly("replica_limit");
+            observe::set_cleanup_candidates(0, 0, 0.0);
+            warn!(
+                group_name = %self.group_name,
+                max_replicas_per_scan = self.max_replicas_per_scan,
+                "Skipping cleanup detection because the ready replica listing exceeded its limit"
+            );
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        let classified = self.classify_replicas(listing.replicas);
+        if !self.apply_scan_if_current_leader(classified, scan_term, now) {
+            observe::record_cleanup_scan("leadership_changed");
+            observe::record_cleanup_anomaly("leadership_changed");
+            self.record_candidate_metrics(scan_term, now, false);
+            return Ok(());
+        }
+        observe::record_cleanup_scan("complete");
+        self.record_candidate_metrics(scan_term, now, true);
+        Ok(())
+    }
+
+    /// Returns the current term only when this node is presently the leader.
+    fn current_leader_term(&self) -> Option<u64> {
+        let metrics = self.raft_node.metrics();
+        (metrics.state == ServerState::Leader).then_some(metrics.current_term)
+    }
+
+    /// Classifies a complete replica listing without mutating candidate state.
+    ///
+    /// Authority read failures become `Wait`, ensuring an unreadable replica
+    /// cannot remain or become reclaimable in the committed scan result.
+    fn classify_replicas(&self, replicas: Vec<ReplicaKey>) -> Vec<(ReplicaKey, CleanupDecision)> {
+        replicas
+            .into_iter()
+            .map(|replica| {
+                let decision = match self.classify(&replica) {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        observe::record_cleanup_anomaly("authority_read");
+                        warn!(
+                            group_name = %replica.group_name,
+                            worker_id = replica.worker_id.as_raw(),
+                            worker_run_id = %replica.worker_run_id,
+                            block_id = %replica.block_id,
+                            error = %error,
+                            "Waiting to classify a reported replica because metadata authority could not be read"
+                        );
+                        CleanupDecision::Wait
+                    }
+                };
+                (replica, decision)
+            })
+            .collect()
+    }
+
+    /// Commits classifications only if the captured leader term is still current.
+    ///
+    /// The second fence clears the in-memory commit if leadership changes while
+    /// classifications are being applied.
+    fn apply_scan_if_current_leader(
+        &self,
+        classified: Vec<(ReplicaKey, CleanupDecision)>,
+        scan_term: u64,
+        now: Instant,
+    ) -> bool {
+        if self.current_leader_term() != Some(scan_term) {
+            return false;
+        }
+        self.apply_classifications(classified, scan_term, now);
+        if self.current_leader_term() != Some(scan_term) {
+            self.entries.lock().clear();
+            return false;
+        }
+        true
+    }
+
+    /// Rebuilds candidate state from one complete classified replica listing.
+    ///
+    /// Missing, kept, and waiting replicas are removed; only reclaimable
+    /// replicas retain or create grace-tracked entries.
+    fn apply_classifications(&self, classified: Vec<(ReplicaKey, CleanupDecision)>, term: u64, now: Instant) {
+        let reported: HashSet<_> = classified.iter().map(|(replica, _)| replica.clone()).collect();
+        let mut entries = self.entries.lock();
+        entries.retain(|key, _| reported.contains(key));
+
+        for (replica, decision) in classified {
+            match decision {
+                CleanupDecision::Keep => {
+                    entries.remove(&replica);
+                    observe::record_cleanup_decision("keep");
+                }
+                CleanupDecision::Wait => {
+                    entries.remove(&replica);
+                    observe::record_cleanup_decision("wait");
+                }
+                CleanupDecision::Reclaimable => {
+                    observe::record_cleanup_decision("reclaimable");
+                    self.observe_candidate(&mut entries, replica, term, now);
+                }
+            }
+        }
+    }
+
+    /// Classifies one replica and revalidates every potentially reclaimable result.
+    ///
+    /// The second phase prevents a mixed authority/session view from producing
+    /// a false reclaimable observation during write publication.
+    fn classify(&self, replica: &ReplicaKey) -> MetadataResult<CleanupDecision> {
+        let (decision, owner_present) = self.classify_authority(replica)?;
+        if decision != CleanupDecision::Reclaimable {
+            return Ok(decision);
+        }
+        self.revalidate_reclaimable(replica, owner_present)
+    }
+
+    /// Rechecks session and durable authority before accepting `Reclaimable`.
+    ///
+    /// File publication persists visible extents before removing its session.
+    /// Reading the session first and authority second therefore cannot combine
+    /// a pre-publish inode with that publication's already-removed session.
+    fn revalidate_reclaimable(&self, replica: &ReplicaKey, owner_present: bool) -> MetadataResult<CleanupDecision> {
+        if !owner_present {
+            return Ok(CleanupDecision::Reclaimable);
+        }
+        if self
+            .session_registry
+            .get_session(replica.block_id.data_handle_id)
+            .is_some()
+        {
+            return Ok(CleanupDecision::Wait);
+        }
+        self.classify_authority(replica).map(|(decision, _)| decision)
+    }
+
+    /// Classifies one replica from durable owner and inode authority.
+    ///
+    /// Missing owners are reclaimable, any visible matching block id is kept,
+    /// and inconsistent owners or never-allocated block indexes wait. The
+    /// returned boolean records whether an owner mapping was present.
+    fn classify_authority(&self, replica: &ReplicaKey) -> MetadataResult<(CleanupDecision, bool)> {
+        let data_handle_id = replica.block_id.data_handle_id;
+        let Some(inode_id) = self.storage.get_inode_by_data_handle(data_handle_id)? else {
+            return Ok((CleanupDecision::Reclaimable, false));
+        };
+        let Some(inode) = self.storage.get_inode(inode_id)? else {
+            observe::record_cleanup_anomaly("owner_inode_missing");
+            warn!(
+                group_name = %replica.group_name,
+                block_id = %replica.block_id,
+                inode_id = inode_id.as_raw(),
+                "Waiting to classify a reported replica because its owner inode is missing"
+            );
+            return Ok((CleanupDecision::Wait, true));
+        };
+        if inode.data_handle_id != data_handle_id {
+            observe::record_cleanup_anomaly("owner_handle_mismatch");
+            warn!(
+                group_name = %replica.group_name,
+                block_id = %replica.block_id,
+                inode_id = inode_id.as_raw(),
+                inode_data_handle_id = inode.data_handle_id.as_raw(),
+                "Waiting to classify a reported replica because its owner mapping is inconsistent"
+            );
+            return Ok((CleanupDecision::Wait, true));
+        }
+
+        let InodeData::File {
+            extents,
+            next_block_index,
+            ..
+        } = &inode.data
+        else {
+            observe::record_cleanup_anomaly("owner_not_file");
+            warn!(
+                group_name = %replica.group_name,
+                block_id = %replica.block_id,
+                inode_id = inode_id.as_raw(),
+                "Waiting to classify a reported replica because its owner is not a file"
+            );
+            return Ok((CleanupDecision::Wait, true));
+        };
+
+        if let Some(extent) = extents.iter().find(|extent| extent.block_id == replica.block_id) {
+            if extent.block_stamp != Some(replica.block_stamp) {
+                observe::record_cleanup_anomaly("visible_stamp_conflict");
+                warn!(
+                    group_name = %replica.group_name,
+                    worker_id = replica.worker_id.as_raw(),
+                    block_id = %replica.block_id,
+                    reported_block_stamp = replica.block_stamp,
+                    visible_block_stamp = ?extent.block_stamp,
+                    "Keeping a visible block with a conflicting reported stamp"
+                );
+            }
+            return Ok((CleanupDecision::Keep, true));
+        }
+
+        if u64::from(replica.block_id.index.as_raw()) >= *next_block_index {
+            observe::record_cleanup_anomaly("unexpected_block_index");
+            warn!(
+                group_name = %replica.group_name,
+                block_id = %replica.block_id,
+                next_block_index,
+                "Waiting to classify a reported replica whose block index was not durably allocated"
+            );
+            return Ok((CleanupDecision::Wait, true));
+        }
+
+        Ok((CleanupDecision::Reclaimable, true))
+    }
+
+    /// Creates or renews a bounded candidate without resetting its grace period.
+    ///
+    /// Existing candidates retain their first observation time, but their
+    /// verified term advances only after a complete scan in that term.
+    fn observe_candidate(
+        &self,
+        entries: &mut HashMap<ReplicaKey, CleanupEntry>,
+        replica: ReplicaKey,
+        term: u64,
+        now: Instant,
+    ) {
+        if let Some(entry) = entries.get_mut(&replica) {
+            entry.verified_term = term;
+            return;
+        }
+        if entries.len() >= self.max_candidates {
+            observe::record_cleanup_anomaly("candidate_limit");
+            return;
+        }
+        entries.insert(
+            replica,
+            CleanupEntry {
+                first_seen: now,
+                not_before: now + self.reclaim_grace,
+                verified_term: term,
+            },
+        );
+    }
+
+    /// Returns total, ready, and oldest-age metrics for candidate observations.
+    ///
+    /// A candidate is ready only after its grace period and a complete scan in
+    /// the supplied current term; stale or partial observations report zero ready.
+    fn candidate_metrics(&self, term: u64, now: Instant, current_scan_complete: bool) -> (usize, usize, f64) {
+        let entries = self.entries.lock();
+        let ready = if current_scan_complete {
+            entries
+                .values()
+                .filter(|entry| entry.verified_term == term && now >= entry.not_before)
+                .count()
+        } else {
+            0
+        };
+        let oldest_age_seconds = entries
+            .values()
+            .map(|entry| now.saturating_duration_since(entry.first_seen).as_secs_f64())
+            .fold(0.0, f64::max);
+        (entries.len(), ready, oldest_age_seconds)
+    }
+
+    /// Publishes the current bounded candidate gauges.
+    fn record_candidate_metrics(&self, term: u64, now: Instant, current_scan_complete: bool) {
+        let (total, ready, oldest_age_seconds) = self.candidate_metrics(term, now, current_scan_complete);
+        observe::set_cleanup_candidates(total, ready, oldest_age_seconds);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inode_lease::WriteMode;
+    use crate::raft::{AppMetadataRaftState, AppRaftStateMachine};
+    use crate::session_registry::CreateSessionInput;
+    use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus};
+    use crate::MountTable;
+    use beryl_types::fs::{Extent, FileAttrs, Inode, InodeData, InodeId};
+    use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, MountId, WorkerId};
+    use beryl_types::{ClientId, FileLayout, WorkerRunId};
+    use tempfile::TempDir;
+
+    fn group_name() -> GroupName {
+        GroupName::parse("root").unwrap()
+    }
+
+    fn cleanup_config() -> CleanupConfig {
+        CleanupConfig {
+            scan_interval_ms: 1_000,
+            reclaim_grace_ms: 100,
+            max_replicas_per_scan: 100,
+            max_candidates: 100,
+        }
+    }
+
+    async fn test_raft(storage: Arc<RocksDBStorage>, leader: bool) -> Arc<AppRaftNode> {
+        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
+        let raft_node = Arc::new(
+            AppRaftNode::new(
+                1,
+                storage,
+                state_machine,
+                Arc::new(MountTable::new()),
+                &crate::config::RaftConfig::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        if leader {
+            raft_node
+                .initialize_single_node("127.0.0.1:0".to_string())
+                .await
+                .unwrap();
+            for _ in 0..100 {
+                if raft_node.is_leader() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(raft_node.is_leader());
+        }
+        raft_node
+    }
+
+    fn replica(data_handle_id: u64, index: u32, stamp: u64) -> ReplicaKey {
+        ReplicaKey {
+            group_name: group_name(),
+            worker_id: WorkerId::new(1),
+            worker_run_id: "550e8400-e29b-41d4-a716-446655440301".parse().unwrap(),
+            block_id: BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(index)),
+            block_stamp: stamp,
+        }
+    }
+
+    fn persist_file(
+        storage: &RocksDBStorage,
+        data_handle_id: DataHandleId,
+        extents: Vec<Extent>,
+        next_block_index: u64,
+    ) -> InodeId {
+        let inode_id = InodeId::new(data_handle_id.as_raw() + 1_000);
+        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
+        inode.data = InodeData::File {
+            extents,
+            content_revision: Some(1),
+            lease_epoch: Some(1),
+            next_block_index,
+        };
+        storage.put_inode(&inode).unwrap();
+        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+        inode_id
+    }
+
+    fn create_session(registry: &SessionRegistry, data_handle_id: DataHandleId, inode_id: InodeId) {
+        registry
+            .create_session(CreateSessionInput {
+                inode_id,
+                mount_id: MountId::new(1),
+                data_handle_id,
+                lease_epoch: 1,
+                base_size: 0,
+                content_revision: 0,
+                mode: WriteMode::Write,
+                open_client_id: ClientId::new(1),
+                layout: FileLayout::new(64, 64, 1),
+                expires_at_ms: u64::MAX,
+            })
+            .unwrap();
+    }
+
+    fn publish_report(manager: &WorkerManager, replicas: &[ReplicaKey]) {
+        let group_name = group_name();
+        let worker_id = WorkerId::new(1);
+        let run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440301".parse().unwrap();
+        let address = "127.0.0.1:19001".to_string();
+        manager
+            .register_worker_run(&group_name, worker_id, address.clone(), 1, run_id, None)
+            .unwrap();
+        manager
+            .record_heartbeat(
+                &group_name,
+                worker_id,
+                run_id,
+                1,
+                &address,
+                1,
+                1_000,
+                100,
+                900,
+                0,
+                0,
+                HealthStatus::Healthy,
+            )
+            .unwrap();
+        manager
+            .receive_full_block_report(
+                &group_name,
+                worker_id,
+                run_id,
+                1,
+                0,
+                true,
+                replicas
+                    .iter()
+                    .map(|replica| BlockReportBlock {
+                        block_id: replica.block_id,
+                        block_stamp: replica.block_stamp,
+                        block_state: BlockReportBlockState::Ready,
+                    })
+                    .collect(),
+            )
+            .unwrap();
+    }
+
+    async fn scanner(
+        dir: &TempDir,
+        config: CleanupConfig,
+        leader: bool,
+    ) -> (
+        BlockCleanupScanner,
+        Arc<RocksDBStorage>,
+        Arc<WorkerManager>,
+        Arc<SessionRegistry>,
+    ) {
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let raft_node = test_raft(Arc::clone(&storage), leader).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let session_registry = Arc::new(SessionRegistry::default());
+        let scanner = BlockCleanupScanner::new(
+            raft_node,
+            Arc::clone(&storage),
+            Arc::clone(&worker_manager),
+            Arc::clone(&session_registry),
+            group_name(),
+            &config,
+        );
+        (scanner, storage, worker_manager, session_registry)
+    }
+
+    #[tokio::test]
+    async fn classification_keeps_visible_blocks_and_waits_for_unsafe_states() {
+        let dir = TempDir::new().unwrap();
+        let (scanner, storage, _worker_manager, sessions) = scanner(&dir, cleanup_config(), false).await;
+
+        let detached = replica(10, 0, 1);
+        assert_eq!(scanner.classify(&detached).unwrap(), CleanupDecision::Reclaimable);
+
+        let missing_inode = replica(11, 0, 1);
+        storage
+            .put_data_handle_owner(missing_inode.block_id.data_handle_id, InodeId::new(999))
+            .unwrap();
+        assert_eq!(scanner.classify(&missing_inode).unwrap(), CleanupDecision::Wait);
+
+        let visible = replica(12, 0, 2);
+        persist_file(
+            &storage,
+            visible.block_id.data_handle_id,
+            vec![Extent {
+                file_offset: 0,
+                block_id: visible.block_id,
+                block_offset: 0,
+                len: 64,
+                content_revision: Some(1),
+                block_stamp: Some(1),
+            }],
+            1,
+        );
+        assert_eq!(scanner.classify(&visible).unwrap(), CleanupDecision::Keep);
+
+        let active = replica(13, 0, 1);
+        let active_inode = persist_file(&storage, active.block_id.data_handle_id, Vec::new(), 1);
+        create_session(&sessions, active.block_id.data_handle_id, active_inode);
+        assert_eq!(scanner.classify(&active).unwrap(), CleanupDecision::Wait);
+        sessions.remove_session_if_epoch(active.block_id.data_handle_id, 1);
+        assert_eq!(scanner.classify(&active).unwrap(), CleanupDecision::Reclaimable);
+
+        let unallocated = replica(14, 1, 1);
+        persist_file(&storage, unallocated.block_id.data_handle_id, Vec::new(), 1);
+        assert_eq!(scanner.classify(&unallocated).unwrap(), CleanupDecision::Wait);
+    }
+
+    #[tokio::test]
+    async fn grace_requires_current_term_revalidation_and_drops_reachable_replica() {
+        let dir = TempDir::new().unwrap();
+        let config = cleanup_config();
+        let grace = Duration::from_millis(config.reclaim_grace_ms);
+        let (scanner, storage, _worker_manager, _sessions) = scanner(&dir, config, false).await;
+        let becomes_visible = replica(20, 0, 1);
+        let remains_detached = replica(21, 0, 1);
+        let first_seen = Instant::now();
+
+        let classified = scanner.classify_replicas(vec![becomes_visible.clone(), remains_detached.clone()]);
+        scanner.apply_classifications(classified, 7, first_seen);
+        {
+            let entries = scanner.entries.lock();
+            assert_eq!(entries.len(), 2);
+            assert!(entries
+                .values()
+                .all(|entry| entry.verified_term == 7 && first_seen < entry.not_before));
+            assert!(entries.values().all(|entry| entry.verified_term != 8));
+        }
+        let after_grace = first_seen + grace;
+        assert_eq!(scanner.candidate_metrics(8, after_grace, true).1, 0);
+
+        persist_file(
+            &storage,
+            becomes_visible.block_id.data_handle_id,
+            vec![Extent {
+                file_offset: 0,
+                block_id: becomes_visible.block_id,
+                block_offset: 0,
+                len: 64,
+                content_revision: Some(1),
+                block_stamp: Some(becomes_visible.block_stamp),
+            }],
+            1,
+        );
+        let classified = scanner.classify_replicas(vec![becomes_visible.clone(), remains_detached.clone()]);
+        scanner.apply_classifications(classified, 8, after_grace);
+
+        let entries = scanner.entries.lock();
+        assert!(!entries.contains_key(&becomes_visible));
+        let entry = entries.get(&remains_detached).expect("detached candidate remains");
+        assert_eq!(entry.first_seen, first_seen);
+        assert_eq!(entry.verified_term, 8);
+        assert!(after_grace >= entry.not_before);
+        drop(entries);
+        assert_eq!(scanner.candidate_metrics(8, after_grace, true).1, 1);
+    }
+
+    #[tokio::test]
+    async fn candidate_table_is_bounded_and_incomplete_replica_listing_clears_it() {
+        let dir = TempDir::new().unwrap();
+        let mut config = cleanup_config();
+        config.max_candidates = 1;
+        config.max_replicas_per_scan = 1;
+        let (scanner, _storage, worker_manager, _sessions) = scanner(&dir, config, true).await;
+        let first = replica(30, 0, 1);
+        let second = replica(31, 0, 1);
+
+        let classified = scanner.classify_replicas(vec![first.clone(), second.clone()]);
+        scanner.apply_classifications(classified, 1, Instant::now());
+        assert_eq!(scanner.entries.lock().len(), 1);
+
+        publish_report(&worker_manager, &[first, second]);
+        scanner.run_once().await.unwrap();
+        assert!(scanner.entries.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_once_observes_only_on_the_current_leader() {
+        let follower_dir = TempDir::new().unwrap();
+        let (follower, _storage, follower_workers, _sessions) = scanner(&follower_dir, cleanup_config(), false).await;
+        let detached = replica(40, 0, 1);
+        publish_report(&follower_workers, std::slice::from_ref(&detached));
+        follower.run_once().await.unwrap();
+        assert!(follower.entries.lock().is_empty());
+
+        let leader_dir = TempDir::new().unwrap();
+        let (leader, _storage, leader_workers, _sessions) = scanner(&leader_dir, cleanup_config(), true).await;
+        publish_report(&leader_workers, std::slice::from_ref(&detached));
+        leader.run_once().await.unwrap();
+        let entries = leader.entries.lock();
+        assert_eq!(entries.len(), 1);
+        assert!(entries.contains_key(&detached));
+    }
+
+    #[tokio::test]
+    async fn candidate_state_is_rebuilt_only_after_a_new_full_report() {
+        let dir = TempDir::new().unwrap();
+        let config = cleanup_config();
+        let (scanner, storage, worker_manager, sessions) = scanner(&dir, config.clone(), true).await;
+        let detached = replica(50, 0, 1);
+        publish_report(&worker_manager, std::slice::from_ref(&detached));
+        scanner.run_once().await.unwrap();
+        assert!(scanner.entries.lock().contains_key(&detached));
+
+        worker_manager.reset_worker_soft_state();
+        let rebuilt = BlockCleanupScanner::new(
+            Arc::clone(&scanner.raft_node),
+            storage,
+            Arc::clone(&worker_manager),
+            sessions,
+            group_name(),
+            &config,
+        );
+        rebuilt.run_once().await.unwrap();
+        assert!(rebuilt.entries.lock().is_empty());
+
+        publish_report(&worker_manager, std::slice::from_ref(&detached));
+        rebuilt.run_once().await.unwrap();
+        assert!(rebuilt.entries.lock().contains_key(&detached));
+    }
+
+    #[tokio::test]
+    async fn final_authority_revalidation_catches_publish_after_initial_read() {
+        let dir = TempDir::new().unwrap();
+        let (scanner, storage, _worker_manager, sessions) = scanner(&dir, cleanup_config(), false).await;
+        let published = replica(60, 0, 1);
+        let inode_id = persist_file(&storage, published.block_id.data_handle_id, Vec::new(), 1);
+        create_session(&sessions, published.block_id.data_handle_id, inode_id);
+
+        let (initial, owner_present) = scanner.classify_authority(&published).unwrap();
+        assert_eq!(initial, CleanupDecision::Reclaimable);
+        assert!(owner_present);
+
+        let mut inode = storage.get_inode(inode_id).unwrap().unwrap();
+        let InodeData::File { extents, .. } = &mut inode.data else {
+            panic!("test inode must be a file");
+        };
+        extents.push(Extent {
+            file_offset: 0,
+            block_id: published.block_id,
+            block_offset: 0,
+            len: 64,
+            content_revision: Some(1),
+            block_stamp: Some(published.block_stamp),
+        });
+        storage
+            .publish_file_atomic(&inode, FileLayout::new(64, 64, 1), &AppMetadataRaftState::default())
+            .unwrap();
+        sessions.remove_session_if_epoch(published.block_id.data_handle_id, 1);
+
+        let decision = scanner.revalidate_reclaimable(&published, owner_present).unwrap();
+        assert_eq!(decision, CleanupDecision::Keep);
+        scanner.apply_classifications(vec![(published.clone(), decision)], 1, Instant::now());
+        assert!(!scanner.entries.lock().contains_key(&published));
+    }
+
+    #[tokio::test]
+    async fn authority_read_error_removes_existing_candidate() {
+        let dir = TempDir::new().unwrap();
+        let (scanner, storage, _worker_manager, _sessions) = scanner(&dir, cleanup_config(), false).await;
+        let candidate = replica(61, 0, 1);
+        let classified = scanner.classify_replicas(vec![candidate.clone()]);
+        scanner.apply_classifications(classified, 1, Instant::now());
+        assert!(scanner.entries.lock().contains_key(&candidate));
+
+        let inode_id = persist_file(&storage, candidate.block_id.data_handle_id, Vec::new(), 1);
+        storage
+            .with_pinned_db(|db| {
+                let cf = db.cf_handle("inodes").unwrap();
+                let mut key = b"inode/".to_vec();
+                key.extend_from_slice(&inode_id.to_be_bytes());
+                db.put_cf(cf, key, b"corrupt-inode").unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        let classified = scanner.classify_replicas(vec![candidate.clone()]);
+        assert_eq!(classified[0].1, CleanupDecision::Wait);
+        scanner.apply_classifications(classified, 1, Instant::now());
+        assert!(!scanner.entries.lock().contains_key(&candidate));
+    }
+
+    #[tokio::test]
+    async fn stale_scan_term_cannot_commit_current_term_verification() {
+        let dir = TempDir::new().unwrap();
+        let config = cleanup_config();
+        let grace = Duration::from_millis(config.reclaim_grace_ms);
+        let (scanner, _storage, _worker_manager, _sessions) = scanner(&dir, config, true).await;
+        let current_term = scanner.current_leader_term().unwrap();
+        let candidate = replica(62, 0, 1);
+        let first_seen = Instant::now();
+        let classified = scanner.classify_replicas(vec![candidate.clone()]);
+        scanner.apply_classifications(classified, current_term, first_seen);
+
+        let stale_scan_term = current_term + 1;
+        let after_grace = first_seen + grace;
+        let classified = scanner.classify_replicas(vec![candidate.clone()]);
+        assert!(!scanner.apply_scan_if_current_leader(classified, stale_scan_term, after_grace,));
+        let entry = scanner.entries.lock().get(&candidate).cloned().unwrap();
+        assert_eq!(entry.verified_term, current_term);
+        assert_eq!(scanner.candidate_metrics(stale_scan_term, after_grace, true).1, 0);
+    }
+}

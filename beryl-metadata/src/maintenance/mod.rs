@@ -3,12 +3,14 @@
 
 //! Background worker-state convergence and repair scheduling.
 //!
-//! Physical block reclamation is not part of the current runtime. Namespace
-//! reachability remains authoritative in file layouts; worker block reports are
-//! soft state used by the remaining repair paths.
+//! Physical block reclamation is not part of the current runtime. Cleanup
+//! detection is observe-only; namespace reachability remains authoritative and
+//! worker block reports remain reconstructable soft state.
 
+mod cleanup;
 mod lost_worker;
 pub mod repair;
 mod service;
 
+pub(crate) use cleanup::BlockCleanupScanner;
 pub use service::{MaintenanceHandle, MaintenanceService};

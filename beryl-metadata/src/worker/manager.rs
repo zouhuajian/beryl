@@ -111,6 +111,23 @@ impl WorkerRegistrationKey {
     }
 }
 
+/// Exact identity of one ready physical replica reported by a worker run.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ReplicaKey {
+    pub group_name: GroupName,
+    pub worker_id: WorkerId,
+    pub worker_run_id: WorkerRunId,
+    pub block_id: BlockId,
+    pub block_stamp: u64,
+}
+
+/// Bounded copy of current ready replica reports for one metadata group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadyReplicaListing {
+    pub replicas: Vec<ReplicaKey>,
+    pub complete: bool,
+}
+
 fn ready_block_ids<'a>(blocks: impl Iterator<Item = &'a BlockReportBlock>) -> HashSet<BlockId> {
     blocks
         .filter(|block| block.block_state == BlockReportBlockState::Ready)
@@ -1068,6 +1085,75 @@ impl WorkerManager {
         locations.keys().cloned().collect()
     }
 
+    /// Copy at most `limit` ready replicas from complete full-report baselines.
+    ///
+    /// A replica is returned only when the report belongs to the currently
+    /// registered worker run. Callers must discard the listing when
+    /// `complete` is false.
+    ///
+    /// Registration and report read guards remain held together while copying,
+    /// preventing a new worker run from being paired with an old run's report.
+    pub fn list_ready_replicas(&self, group_name: &GroupName, limit: usize) -> ReadyReplicaListing {
+        if limit == 0 {
+            return ReadyReplicaListing {
+                replicas: Vec::new(),
+                complete: false,
+            };
+        }
+
+        let registrations = self.registrations.read();
+        let reports = self.block_reports.read();
+        let mut replicas = Vec::new();
+
+        for (worker_key, report) in reports.iter() {
+            if &worker_key.group_name != group_name || report.state != BlockReportState::Ready {
+                continue;
+            }
+            let Some(report_run_id) = report.worker_run_id else {
+                continue;
+            };
+            let Some(registration) = registrations.get(worker_key) else {
+                continue;
+            };
+            if !registration.worker_run_id.matches(report_run_id) {
+                continue;
+            }
+
+            for block in report
+                .published_blocks
+                .values()
+                .filter(|block| block.block_state == BlockReportBlockState::Ready)
+            {
+                if replicas.len() == limit {
+                    return ReadyReplicaListing {
+                        replicas,
+                        complete: false,
+                    };
+                }
+                replicas.push(ReplicaKey {
+                    group_name: group_name.clone(),
+                    worker_id: worker_key.worker_id,
+                    worker_run_id: report_run_id,
+                    block_id: block.block_id,
+                    block_stamp: block.block_stamp,
+                });
+            }
+        }
+
+        replicas.sort_by_key(|replica| {
+            (
+                replica.worker_id.as_raw(),
+                replica.block_id.data_handle_id.as_raw(),
+                replica.block_id.index.as_raw(),
+                replica.block_stamp,
+            )
+        });
+        ReadyReplicaListing {
+            replicas,
+            complete: true,
+        }
+    }
+
     /// Get block locations for one metadata group (only live workers in that group).
     pub fn get_block_locations(&self, group_name: &GroupName, block_id: BlockId) -> Vec<WorkerId> {
         let locations = self.locations.read();
@@ -1349,7 +1435,7 @@ mod tests {
 
     use super::{
         BlockLocationKey, BlockReportBlock, BlockReportBlockState, BlockReportDeltaEntry, BlockReportDeltaOp,
-        HealthStatus, WorkerInfo, WorkerManager, WorkerRegistrationKey,
+        HealthStatus, ReplicaKey, WorkerInfo, WorkerManager, WorkerRegistrationKey,
     };
     use crate::error::MetadataError;
     use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
@@ -1434,6 +1520,94 @@ mod tests {
             manager.get_block_locations(&group_name_value, report_block(1).block_id),
             vec![worker_id]
         );
+    }
+
+    #[test]
+    fn ready_replica_listing_requires_complete_current_run_and_respects_limit() {
+        let manager = WorkerManager::new(60);
+        let local_group = group_name("g-ready");
+        let other_group = group_name("g-other");
+        let worker_id = WorkerId::new(15);
+        let other_worker_id = WorkerId::new(16);
+        let run_id = report_run_id();
+        let other_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440116".parse().unwrap();
+        register_live_report_worker(&manager, &local_group, worker_id, run_id);
+        register_live_report_worker(&manager, &other_group, other_worker_id, other_run_id);
+
+        manager
+            .receive_full_block_report(&local_group, worker_id, run_id, 1, 0, false, vec![report_block(0)])
+            .unwrap();
+        assert_eq!(
+            manager.list_ready_replicas(&local_group, 10),
+            super::ReadyReplicaListing {
+                replicas: Vec::new(),
+                complete: true,
+            }
+        );
+
+        let mut partial = report_block(2);
+        partial.block_state = BlockReportBlockState::Partial;
+        manager
+            .receive_full_block_report(
+                &local_group,
+                worker_id,
+                run_id,
+                1,
+                1,
+                true,
+                vec![report_block(1), partial],
+            )
+            .unwrap();
+        manager
+            .receive_full_block_report(
+                &other_group,
+                other_worker_id,
+                other_run_id,
+                1,
+                0,
+                true,
+                vec![report_block(3)],
+            )
+            .unwrap();
+
+        let listing = manager.list_ready_replicas(&local_group, 10);
+        assert!(listing.complete);
+        assert_eq!(
+            listing.replicas,
+            vec![
+                ReplicaKey {
+                    group_name: local_group.clone(),
+                    worker_id,
+                    worker_run_id: run_id,
+                    block_id: report_block(0).block_id,
+                    block_stamp: report_block(0).block_stamp,
+                },
+                ReplicaKey {
+                    group_name: local_group.clone(),
+                    worker_id,
+                    worker_run_id: run_id,
+                    block_id: report_block(1).block_id,
+                    block_stamp: report_block(1).block_stamp,
+                },
+            ]
+        );
+
+        let limited = manager.list_ready_replicas(&local_group, 1);
+        assert!(!limited.complete);
+        assert_eq!(limited.replicas.len(), 1);
+
+        let replacement_run: WorkerRunId = "550e8400-e29b-41d4-a716-446655440117".parse().unwrap();
+        manager
+            .register_worker_run(
+                &local_group,
+                worker_id,
+                "127.0.0.1:9090".to_string(),
+                1,
+                replacement_run,
+                None,
+            )
+            .unwrap();
+        assert!(manager.list_ready_replicas(&local_group, 10).replicas.is_empty());
     }
 
     #[test]

@@ -43,6 +43,12 @@ pub(crate) const METADATA_WORKER_HEARTBEAT_LAG_SECONDS: &str = "metadata_worker_
 pub(crate) const METADATA_WORKER_BLOCK_REPORT_TOTAL: &str = "metadata_worker_block_report_total";
 pub(crate) const METADATA_WORKER_BLOCK_REPORT_DURATION_SECONDS: &str = "metadata_worker_block_report_duration_seconds";
 pub(crate) const METADATA_WORKER_BLOCK_REPORT_BLOCKS_TOTAL: &str = "metadata_worker_block_report_blocks_total";
+pub(crate) const METADATA_CLEANUP_SCANS_TOTAL: &str = "metadata_cleanup_scans_total";
+pub(crate) const METADATA_CLEANUP_DECISIONS_TOTAL: &str = "metadata_cleanup_decisions_total";
+pub(crate) const METADATA_CLEANUP_CANDIDATES: &str = "metadata_cleanup_candidates";
+pub(crate) const METADATA_CLEANUP_READY_CANDIDATES: &str = "metadata_cleanup_ready_candidates";
+pub(crate) const METADATA_CLEANUP_OLDEST_CANDIDATE_AGE_SECONDS: &str = "metadata_cleanup_oldest_candidate_age_seconds";
+pub(crate) const METADATA_CLEANUP_ANOMALIES_TOTAL: &str = "metadata_cleanup_anomalies_total";
 pub(crate) const METADATA_REPAIR_QUEUE_DEPTH: &str = "metadata_repair_queue_depth";
 pub(crate) const METADATA_REPAIR_ATTEMPTS_TOTAL: &str = "metadata_repair_attempts_total";
 
@@ -252,6 +258,24 @@ pub(crate) fn record_worker_block_report_blocks(change: &str, count: usize) {
         .increment(count as u64);
 }
 
+pub(crate) fn record_cleanup_scan(result: &'static str) {
+    metrics::counter!(METADATA_CLEANUP_SCANS_TOTAL, "result" => result).increment(1);
+}
+
+pub(crate) fn record_cleanup_decision(decision: &'static str) {
+    metrics::counter!(METADATA_CLEANUP_DECISIONS_TOTAL, "decision" => decision).increment(1);
+}
+
+pub(crate) fn set_cleanup_candidates(total: usize, ready: usize, oldest_age_seconds: f64) {
+    metrics::gauge!(METADATA_CLEANUP_CANDIDATES).set(total as f64);
+    metrics::gauge!(METADATA_CLEANUP_READY_CANDIDATES).set(ready as f64);
+    metrics::gauge!(METADATA_CLEANUP_OLDEST_CANDIDATE_AGE_SECONDS).set(oldest_age_seconds);
+}
+
+pub(crate) fn record_cleanup_anomaly(kind: &'static str) {
+    metrics::counter!(METADATA_CLEANUP_ANOMALIES_TOTAL, "kind" => kind).increment(1);
+}
+
 pub(crate) fn set_repair_queue_depth(depth: usize) {
     metrics::gauge!(METADATA_REPAIR_QUEUE_DEPTH).set(depth as f64);
 }
@@ -400,7 +424,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn metadata_metric_contract_names() -> [&'static str; 34] {
+    fn metadata_metric_contract_names() -> [&'static str; 40] {
         [
             METADATA_UP,
             METADATA_BUILD_INFO,
@@ -434,12 +458,18 @@ mod tests {
             METADATA_WORKER_BLOCK_REPORT_TOTAL,
             METADATA_WORKER_BLOCK_REPORT_DURATION_SECONDS,
             METADATA_WORKER_BLOCK_REPORT_BLOCKS_TOTAL,
+            METADATA_CLEANUP_SCANS_TOTAL,
+            METADATA_CLEANUP_DECISIONS_TOTAL,
+            METADATA_CLEANUP_CANDIDATES,
+            METADATA_CLEANUP_READY_CANDIDATES,
+            METADATA_CLEANUP_OLDEST_CANDIDATE_AGE_SECONDS,
+            METADATA_CLEANUP_ANOMALIES_TOTAL,
             METADATA_REPAIR_QUEUE_DEPTH,
             METADATA_REPAIR_ATTEMPTS_TOTAL,
         ]
     }
 
-    fn metadata_metric_label_contract_names() -> [&'static str; 10] {
+    fn metadata_metric_label_contract_names() -> [&'static str; 12] {
         [
             "service",
             "version",
@@ -451,6 +481,8 @@ mod tests {
             "stage",
             "kind",
             "change",
+            "result",
+            "decision",
         ]
     }
 
@@ -490,6 +522,12 @@ mod tests {
             "metadata_worker_block_report_total",
             "metadata_worker_block_report_duration_seconds",
             "metadata_worker_block_report_blocks_total",
+            "metadata_cleanup_scans_total",
+            "metadata_cleanup_decisions_total",
+            "metadata_cleanup_candidates",
+            "metadata_cleanup_ready_candidates",
+            "metadata_cleanup_oldest_candidate_age_seconds",
+            "metadata_cleanup_anomalies_total",
             "metadata_repair_queue_depth",
             "metadata_repair_attempts_total",
         ];
@@ -536,6 +574,9 @@ mod tests {
             METADATA_RAFT_COMMITTED_INDEX,
             METADATA_WORKER_LIVE,
             METADATA_WORKER_HEARTBEAT_LAG_SECONDS,
+            METADATA_CLEANUP_CANDIDATES,
+            METADATA_CLEANUP_READY_CANDIDATES,
+            METADATA_CLEANUP_OLDEST_CANDIDATE_AGE_SECONDS,
             METADATA_REPAIR_QUEUE_DEPTH,
         ] {
             assert!(
@@ -569,6 +610,10 @@ mod tests {
         record_worker_heartbeat_lag(0.0);
         record_worker_block_report("full", "ok", "none", 0.007);
         record_worker_block_report_blocks("added", 1);
+        record_cleanup_scan("complete");
+        record_cleanup_decision("keep");
+        set_cleanup_candidates(1, 0, 0.5);
+        record_cleanup_anomaly("leadership_changed");
         set_repair_queue_depth(0);
         record_repair_attempt("ok", "none");
     }
