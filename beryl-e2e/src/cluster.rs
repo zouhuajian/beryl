@@ -10,7 +10,9 @@ use std::time::Duration;
 use beryl_client::{ClientConfig, FsClient};
 use beryl_common::observe::ObservabilityConfig;
 use beryl_common::FlatConfig;
-use beryl_metadata::config::{BootstrapConfig, MetadataAuthorityConfig, MetadataConfig, RaftConfig, WorkerConfig};
+use beryl_metadata::config::{
+    BootstrapConfig, CleanupConfig, MetadataAuthorityConfig, MetadataConfig, RaftConfig, WorkerConfig,
+};
 use beryl_metadata::lifecycle::format_metadata_storage;
 use beryl_metadata::lifecycle::prepare_metadata_start;
 use beryl_metadata::runtime::{build_authority, build_filesystem_service, build_readiness};
@@ -529,6 +531,7 @@ fn metadata_config(
         storage_dir,
         raft: RaftConfig::default(),
         authority: MetadataAuthorityConfig { group_name },
+        cleanup: CleanupConfig::default(),
         worker: WorkerConfig::default(),
         bootstrap: BootstrapConfig {
             root_readiness: beryl_metadata::RootReadinessConfig {

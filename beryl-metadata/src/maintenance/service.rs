@@ -5,6 +5,7 @@
 
 use super::lost_worker::{LostWorkerCleanupDeps, LostWorkerCleanupService};
 use super::repair::{RepairPlanner, RepairPolicy, RepairQueue};
+use super::BlockCleanupScanner;
 use crate::raft::AppRaftNode;
 use crate::worker::WorkerManager;
 use std::sync::Arc;
@@ -30,6 +31,8 @@ pub struct MaintenanceService {
     repair_queue: Arc<RepairQueue>,
     repair_planner: Arc<RepairPlanner>,
     repair_policy: RepairPolicy,
+    cleanup_scanner: Arc<BlockCleanupScanner>,
+    cleanup_scan_interval_ms: u64,
     lost_worker_cleanup_interval_sec: u64,
     rebalance_interval_sec: u64,
     timeout_check_interval_sec: u64,
@@ -42,6 +45,8 @@ impl MaintenanceService {
         repair_queue: Arc<RepairQueue>,
         repair_planner: Arc<RepairPlanner>,
         repair_policy: RepairPolicy,
+        cleanup_scanner: Arc<BlockCleanupScanner>,
+        cleanup_scan_interval_ms: u64,
     ) -> Self {
         Self {
             raft_node,
@@ -49,15 +54,29 @@ impl MaintenanceService {
             repair_queue,
             repair_planner,
             repair_policy,
+            cleanup_scanner,
+            cleanup_scan_interval_ms,
             lost_worker_cleanup_interval_sec: 30,
             rebalance_interval_sec: 300,
             timeout_check_interval_sec: 10,
         }
     }
 
-    /// Starts lost-worker cleanup, rebalance scanning, and repair timeout requeue.
+    /// Starts cleanup observation, lost-worker cleanup, rebalance scanning, and repair timeout requeue.
     pub(crate) fn start(&self) -> MaintenanceHandle {
-        let mut tasks = Vec::with_capacity(3);
+        let mut tasks = Vec::with_capacity(4);
+
+        let cleanup_scanner = Arc::clone(&self.cleanup_scanner);
+        let interval_ms = self.cleanup_scan_interval_ms;
+        tasks.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+            loop {
+                interval.tick().await;
+                if let Err(error) = cleanup_scanner.run_once().await {
+                    error!(task = "block_cleanup_observation", %error, "Block cleanup observation failed");
+                }
+            }
+        }));
 
         let lost_worker = Arc::new(LostWorkerCleanupService::new(LostWorkerCleanupDeps {
             raft_node: Arc::clone(&self.raft_node),

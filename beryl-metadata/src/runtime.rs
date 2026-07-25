@@ -5,7 +5,7 @@
 
 use crate::inflight_registry::InflightRegistry;
 use crate::maintenance::repair::{RepairPlanner, RepairPolicy, RepairQueue};
-use crate::maintenance::{MaintenanceHandle, MaintenanceService};
+use crate::maintenance::{BlockCleanupScanner, MaintenanceHandle, MaintenanceService};
 use crate::metrics::MetadataMetrics;
 use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
 use crate::readiness::{wait_for_root_ready_with_inputs, RootReadinessGate, RootReadinessLogFields, RootReadyInputs};
@@ -184,15 +184,33 @@ pub struct MetadataServer {
 
 impl MetadataServer {
     /// Builds long-lived metadata runtime objects in startup dependency order.
+    ///
+    /// Filesystem writes and cleanup observation share one session registry so
+    /// the scanner sees the same active-write authority as the RPC path.
     pub async fn build(config: Arc<MetadataConfig>) -> Result<Self, DynError> {
         crate::lifecycle::prepare_metadata_start(config.as_ref()).await?;
         let authority = build_authority(config.as_ref()).await?;
         let maintenance_repair = build_maintenance_repair_state(config.as_ref());
         let (worker, mut worker_service) = build_worker_runtime(&authority, &maintenance_repair)?;
         let readiness = build_readiness(config.as_ref(), &authority).await;
-        let filesystem =
-            build_filesystem_service(config.as_ref(), &authority, Arc::clone(&worker.manager), &readiness).await?;
-        let maintenance = build_maintenance(&authority, &worker, &readiness, maintenance_repair).await;
+        let session_registry = Arc::new(crate::session_registry::SessionRegistry::default());
+        let filesystem = build_filesystem_service_with_sessions(
+            config.as_ref(),
+            &authority,
+            Arc::clone(&worker.manager),
+            Arc::clone(&session_registry),
+            &readiness,
+        )
+        .await?;
+        let maintenance = build_maintenance(
+            config.as_ref(),
+            &authority,
+            &worker,
+            &readiness,
+            maintenance_repair,
+            session_registry,
+        )
+        .await;
         let worker_background = build_worker_background(&worker, &mut worker_service, &maintenance);
         let (services, handles) =
             compose_services(filesystem, worker_service, readiness, worker_background, maintenance);
@@ -316,19 +334,34 @@ pub(crate) fn build_worker_runtime(
     Ok((worker, service))
 }
 
-/// Starts metadata maintenance side effects after authority and worker state exist.
+/// Starts metadata maintenance after authority and worker state exist.
+///
+/// `session_registry` must be the same registry owned by the filesystem service;
+/// cleanup classification would otherwise miss active writes.
 pub(crate) async fn build_maintenance(
+    config: &MetadataConfig,
     authority: &MetadataAuthority,
     worker: &WorkerRuntime,
     _readiness: &Readiness,
     repair: MaintenanceRepairState,
+    session_registry: Arc<crate::session_registry::SessionRegistry>,
 ) -> Maintenance {
+    let cleanup_scanner = Arc::new(BlockCleanupScanner::new(
+        Arc::clone(&authority.raft_node),
+        Arc::clone(&authority.storage),
+        Arc::clone(&worker.manager),
+        session_registry,
+        authority.group_name.clone(),
+        &config.cleanup,
+    ));
     let maintenance_service = Arc::new(MaintenanceService::new(
         Arc::clone(&authority.raft_node),
         Arc::clone(&worker.manager),
         Arc::clone(&repair.repair_queue),
         Arc::clone(&repair.repair_planner),
         repair.repair_policy,
+        cleanup_scanner,
+        config.cleanup.scan_interval_ms,
     ));
     let maintenance_handle = maintenance_service.start();
 
@@ -417,12 +450,32 @@ impl Readiness {
 
 /// Constructs the filesystem RPC service without owning readiness lifecycle.
 pub async fn build_filesystem_service(
-    _config: &MetadataConfig,
+    config: &MetadataConfig,
     authority: &MetadataAuthority,
     worker_manager: Arc<WorkerManager>,
     readiness: &Readiness,
 ) -> Result<MetadataFileSystemServiceImpl, DynError> {
-    let session_registry = Arc::new(crate::session_registry::SessionRegistry::default());
+    build_filesystem_service_with_sessions(
+        config,
+        authority,
+        worker_manager,
+        Arc::new(crate::session_registry::SessionRegistry::default()),
+        readiness,
+    )
+    .await
+}
+
+/// Constructs the filesystem service with a caller-owned session registry.
+///
+/// Production startup uses this path to share active-write authority with
+/// maintenance cleanup observation.
+async fn build_filesystem_service_with_sessions(
+    _config: &MetadataConfig,
+    authority: &MetadataAuthority,
+    worker_manager: Arc<WorkerManager>,
+    session_registry: Arc<crate::session_registry::SessionRegistry>,
+    readiness: &Readiness,
+) -> Result<MetadataFileSystemServiceImpl, DynError> {
     let lease_manager = Arc::new(crate::inode_lease::LeaseManager::default());
     let filesystem = Arc::new(MetadataFileSystem::new(MetadataFileSystemDeps {
         state_store: Arc::clone(&authority.state_store),
@@ -511,7 +564,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BootstrapConfig, MetadataAuthorityConfig, RaftConfig, WorkerConfig};
+    use crate::config::{BootstrapConfig, CleanupConfig, MetadataAuthorityConfig, RaftConfig, WorkerConfig};
     use crate::raft::Command;
     use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction};
     use beryl_common::header::{RequestHeader, ResponseHeader};
@@ -642,6 +695,7 @@ mod tests {
             authority: MetadataAuthorityConfig {
                 group_name: GroupName::parse("root").unwrap(),
             },
+            cleanup: CleanupConfig::default(),
             worker: WorkerConfig::default(),
             bootstrap: BootstrapConfig {
                 root_readiness: crate::readiness::RootReadinessConfig::default(),
@@ -708,9 +762,15 @@ mod tests {
         let readiness = build_readiness(&config, &authority).await;
         let maintenance_repair = build_maintenance_repair_state(&config);
         let (worker_runtime, _worker_service) = build_worker_runtime(&authority, &maintenance_repair).unwrap();
-        let service = build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
-            .await
-            .unwrap();
+        let service = build_filesystem_service_with_sessions(
+            &config,
+            &authority,
+            Arc::clone(&worker_runtime.manager),
+            Arc::new(crate::session_registry::SessionRegistry::default()),
+            &readiness,
+        )
+        .await
+        .unwrap();
         let group_name = GroupName::parse("root").unwrap();
 
         let response = call_msync(
@@ -738,9 +798,15 @@ mod tests {
         let readiness = build_readiness(&config, &authority).await;
         let maintenance_repair = build_maintenance_repair_state(&config);
         let (worker_runtime, _worker_service) = build_worker_runtime(&authority, &maintenance_repair).unwrap();
-        let service = build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
-            .await
-            .unwrap();
+        let service = build_filesystem_service_with_sessions(
+            &config,
+            &authority,
+            Arc::clone(&worker_runtime.manager),
+            Arc::new(crate::session_registry::SessionRegistry::default()),
+            &readiness,
+        )
+        .await
+        .unwrap();
         let group_name = GroupName::parse("root").unwrap();
         let mut header = RequestHeader::new(ClientId::new(7)).with_group_name(group_name.clone());
         header.state = vec![GroupStateWatermark::new(
@@ -767,9 +833,15 @@ mod tests {
         let readiness = build_readiness(&config, &authority).await;
         let maintenance_repair = build_maintenance_repair_state(&config);
         let (worker_runtime, _worker_service) = build_worker_runtime(&authority, &maintenance_repair).unwrap();
-        let service = build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
-            .await
-            .unwrap();
+        let service = build_filesystem_service_with_sessions(
+            &config,
+            &authority,
+            Arc::clone(&worker_runtime.manager),
+            Arc::new(crate::session_registry::SessionRegistry::default()),
+            &readiness,
+        )
+        .await
+        .unwrap();
 
         let response = call_msync(&service, RequestHeader::new(ClientId::new(7))).await;
         let header = parse_msync_header(&response);
@@ -790,9 +862,15 @@ mod tests {
         let readiness = build_readiness(&config, &authority).await;
         let maintenance_repair = build_maintenance_repair_state(&config);
         let (worker_runtime, _worker_service) = build_worker_runtime(&authority, &maintenance_repair).unwrap();
-        let service = build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
-            .await
-            .unwrap();
+        let service = build_filesystem_service_with_sessions(
+            &config,
+            &authority,
+            Arc::clone(&worker_runtime.manager),
+            Arc::new(crate::session_registry::SessionRegistry::default()),
+            &readiness,
+        )
+        .await
+        .unwrap();
         let group_name = GroupName::parse("other").unwrap();
 
         let response = call_msync(

@@ -20,6 +20,10 @@ const METADATA_GROUP_NAME: &str = "metadata.group.name";
 const METADATA_STORAGE_DIR: &str = "metadata.storage.dir";
 const METADATA_RAFT_MODE: &str = "metadata.raft.mode";
 const METADATA_RAFT_NODE_ID: &str = "metadata.raft.node_id";
+const METADATA_CLEANUP_SCAN_INTERVAL_MS: &str = "metadata.cleanup.scan_interval_ms";
+const METADATA_CLEANUP_RECLAIM_GRACE_MS: &str = "metadata.cleanup.reclaim_grace_ms";
+const METADATA_CLEANUP_MAX_REPLICAS_PER_SCAN: &str = "metadata.cleanup.max_replicas_per_scan";
+const METADATA_CLEANUP_MAX_CANDIDATES: &str = "metadata.cleanup.max_candidates";
 const METADATA_REPAIR_MAX_QUEUE_SIZE: &str = "metadata.repair.max_queue_size";
 const METADATA_REPAIR_MAX_ATTEMPTS: &str = "metadata.repair.max_attempts";
 const METADATA_REPAIR_INFLIGHT_TIMEOUT_MS: &str = "metadata.repair.inflight_timeout_ms";
@@ -46,6 +50,8 @@ pub struct MetadataConfig {
     pub raft: RaftConfig,
     /// Metadata authority configuration.
     pub authority: MetadataAuthorityConfig,
+    /// Observe-only block cleanup detection configuration.
+    pub cleanup: CleanupConfig,
     /// Worker/Repair configuration.
     pub worker: WorkerConfig,
     /// Readiness configuration.
@@ -58,6 +64,19 @@ pub struct MetadataConfig {
 #[derive(Clone, Debug)]
 pub struct BootstrapConfig {
     pub root_readiness: RootReadinessConfig,
+}
+
+/// Observe-only block cleanup detection configuration.
+#[derive(Clone, Debug)]
+pub struct CleanupConfig {
+    /// Interval between scans.
+    pub scan_interval_ms: u64,
+    /// Time a replica must remain reclaimable before it is reported as ready.
+    pub reclaim_grace_ms: u64,
+    /// Maximum number of ready replicas copied into one complete scan.
+    pub max_replicas_per_scan: usize,
+    /// Maximum number of in-memory cleanup candidates.
+    pub max_candidates: usize,
 }
 
 /// Worker and repair configuration.
@@ -146,6 +165,17 @@ impl Default for RepairConfig {
     }
 }
 
+impl Default for CleanupConfig {
+    fn default() -> Self {
+        Self {
+            scan_interval_ms: 30_000,
+            reclaim_grace_ms: 300_000,
+            max_replicas_per_scan: 10_000,
+            max_candidates: 10_000,
+        }
+    }
+}
+
 impl MetadataConfig {
     /// Load metadata configuration from a YAML file.
     pub fn load<P: AsRef<Path>>(config_path: P) -> Result<Self, CommonError> {
@@ -179,6 +209,13 @@ impl MetadataConfig {
             group_name: parse_group_name(METADATA_GROUP_NAME, group_name_raw)?,
         };
 
+        let cleanup = CleanupConfig {
+            scan_interval_ms: get_positive_u64_or(flat, METADATA_CLEANUP_SCAN_INTERVAL_MS, 30_000)?,
+            reclaim_grace_ms: get_positive_u64_or(flat, METADATA_CLEANUP_RECLAIM_GRACE_MS, 300_000)?,
+            max_replicas_per_scan: get_positive_usize_or(flat, METADATA_CLEANUP_MAX_REPLICAS_PER_SCAN, 10_000)?,
+            max_candidates: get_positive_usize_or(flat, METADATA_CLEANUP_MAX_CANDIDATES, 10_000)?,
+        };
+
         let repair = RepairConfig {
             max_queue_size: get_positive_usize_or(flat, METADATA_REPAIR_MAX_QUEUE_SIZE, 10000)?,
             max_attempts: get_positive_u32_or(flat, METADATA_REPAIR_MAX_ATTEMPTS, 3)?,
@@ -210,6 +247,7 @@ impl MetadataConfig {
             storage_dir,
             raft,
             authority,
+            cleanup,
             worker,
             bootstrap,
             observability,
@@ -357,6 +395,7 @@ mod tests {
                 storage_dir: PathBuf::from("data/metadata"),
                 raft: RaftConfig::default(),
                 authority: MetadataAuthorityConfig::default(),
+                cleanup: CleanupConfig::default(),
                 worker: WorkerConfig::default(),
                 bootstrap: BootstrapConfig {
                     root_readiness: RootReadinessConfig::default(),
@@ -467,6 +506,10 @@ mod tests {
         let config = MetadataConfig::from_server_config(ServerConfig::from_flat(test_flat())).unwrap();
 
         assert_eq!(config.raft.node_id, 1);
+        assert_eq!(config.cleanup.scan_interval_ms, 30_000);
+        assert_eq!(config.cleanup.reclaim_grace_ms, 300_000);
+        assert_eq!(config.cleanup.max_replicas_per_scan, 10_000);
+        assert_eq!(config.cleanup.max_candidates, 10_000);
         assert_eq!(config.worker.repair.max_queue_size, 10000);
         assert_eq!(config.worker.repair.max_attempts, 3);
         assert_eq!(config.worker.repair.inflight_timeout_ms, 300_000);
@@ -494,6 +537,10 @@ mod tests {
 
         let positive_keys = [
             METADATA_RAFT_NODE_ID,
+            METADATA_CLEANUP_SCAN_INTERVAL_MS,
+            METADATA_CLEANUP_RECLAIM_GRACE_MS,
+            METADATA_CLEANUP_MAX_REPLICAS_PER_SCAN,
+            METADATA_CLEANUP_MAX_CANDIDATES,
             METADATA_REPAIR_MAX_QUEUE_SIZE,
             METADATA_REPAIR_MAX_ATTEMPTS,
             METADATA_REPAIR_INFLIGHT_TIMEOUT_MS,
