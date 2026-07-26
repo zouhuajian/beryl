@@ -7,10 +7,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use beryl_common::error::rpc::{ErrorKind, WorkerErrorKind};
 use beryl_types::ids::BlockId;
 use beryl_types::layout::{BlockFormatId, BlockShape};
 use beryl_types::{GroupName, Tier};
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 
 use super::meta_codec::{
     decode_meta_payload, decode_staging_meta_payload, encode_meta_payload, encode_staging_meta_payload,
@@ -25,6 +27,7 @@ const BLOCK_META_MAGIC: [u8; 4] = *b"BRYL";
 const BLOCK_META_HEADER_LEN: usize = 20;
 const BLOCK_META_VERSION: u32 = 3;
 const MAX_META_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
+const DELETING_MARKER_VERSION: u32 = 1;
 
 /// Fixed little-endian header for a block metadata file.
 /// The header identifies the format and bounds the serialized payload.
@@ -238,6 +241,29 @@ pub struct SyncReadyBlockRequest {
     pub block_id: BlockId,
 }
 
+/// Exact local Ready block version authorized for physical reclamation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimBlockRequest {
+    pub group_name: GroupName,
+    pub block_id: BlockId,
+    pub expected_block_stamp: u64,
+}
+
+/// Durable local state observed before a reclaim operation starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReclaimBlockState {
+    Ready,
+    Deleting,
+    Absent,
+}
+
+/// Result of one idempotent local reclaim attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReclaimBlockResult {
+    Deleted { effective_len: u64 },
+    AlreadyAbsent,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockPaths {
     pub data_path: PathBuf,
@@ -245,11 +271,22 @@ pub struct BlockPaths {
     pub temp_meta_path: PathBuf,
     pub staging_data_path: PathBuf,
     pub staging_meta_path: PathBuf,
+    pub deleting_marker_path: PathBuf,
+    pub temp_deleting_marker_path: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoveredBlock {
     pub meta: BlockMetaPayload,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DeletingMarker {
+    version: u32,
+    group_name: String,
+    block_id: BlockId,
+    block_stamp: u64,
+    effective_len: u64,
 }
 
 /// FullBlockFileStore is the current default LocalBlockStore implementation.
@@ -501,7 +538,11 @@ impl FullBlockFileStore {
                     if meta.visibility.block_state != BlockState::Ready {
                         continue;
                     }
-                    validate_ready_data_file(&self.paths(group_name, block_id), &meta)?;
+                    let paths = self.paths(group_name, block_id);
+                    if paths.deleting_marker_path.exists() {
+                        continue;
+                    }
+                    validate_ready_data_file(&paths, &meta)?;
                     blocks.push(meta);
                 }
             }
@@ -515,24 +556,154 @@ impl FullBlockFileStore {
         Ok(blocks)
     }
 
-    pub fn delete_block(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<()> {
-        let paths = self.paths(group_name, block_id);
-        remove_file_if_exists(&paths.meta_path)?;
-        remove_file_if_exists(&paths.data_path)?;
-        remove_file_if_exists(&paths.temp_meta_path)?;
-        remove_file_if_exists(&paths.staging_data_path)?;
-        remove_file_if_exists(&paths.staging_meta_path)?;
-        if let Some(parent) = paths.data_path.parent() {
-            if parent.exists() {
-                sync_parent_dir(parent)?;
+    /// Validates the exact Ready block version before reader exclusion begins.
+    ///
+    /// A persisted marker is sufficient to resume an interrupted deletion. A
+    /// fully absent Ready block is idempotent success, while unmarked final data
+    /// without metadata is left untouched because its stamp cannot be proven.
+    pub fn inspect_reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockState> {
+        validate_reclaim_request(req)?;
+        let paths = self.paths(&req.group_name, req.block_id);
+        if paths.deleting_marker_path.exists() {
+            let marker = read_deleting_marker(&paths.deleting_marker_path)?;
+            validate_deleting_marker(&marker, req, &paths.deleting_marker_path)?;
+            validate_deleting_marker_against_final_meta(&paths, &marker)?;
+            return Ok(ReclaimBlockState::Deleting);
+        }
+
+        match self.load_meta(&req.group_name, req.block_id) {
+            Ok(meta) => {
+                ensure_readable(&meta)?;
+                validate_reclaim_stamp(req, meta.visibility.block_stamp)?;
+                Ok(ReclaimBlockState::Ready)
+            }
+            Err(WorkerError::NotFound(_)) => {
+                if paths.data_path.exists()
+                    || paths.temp_meta_path.exists()
+                    || paths.staging_data_path.exists()
+                    || paths.staging_meta_path.exists()
+                    || paths.temp_deleting_marker_path.exists()
+                {
+                    return Err(corrupt(format!(
+                        "unmarked block artifacts exist without final metadata: group_name={}, block_id={}",
+                        req.group_name, req.block_id
+                    )));
+                }
+                Ok(ReclaimBlockState::Absent)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Durably reclaims one exact Ready block version.
+    ///
+    /// The caller must hold the block's exclusive reclaim permit. Once the
+    /// marker is durable, every error leaves it in place so startup recovery or
+    /// a later retry can finish all unlinks before the block is reported Ready.
+    pub fn reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockResult> {
+        match self.inspect_reclaim_block(req)? {
+            ReclaimBlockState::Absent => return Ok(ReclaimBlockResult::AlreadyAbsent),
+            ReclaimBlockState::Deleting => {
+                let paths = self.paths(&req.group_name, req.block_id);
+                let marker = read_deleting_marker(&paths.deleting_marker_path)?;
+                validate_deleting_marker(&marker, req, &paths.deleting_marker_path)?;
+                complete_deleting_marker(&paths, &marker)?;
+                return Ok(ReclaimBlockResult::Deleted {
+                    effective_len: marker.effective_len,
+                });
+            }
+            ReclaimBlockState::Ready => {}
+        }
+
+        let meta = self.load_meta(&req.group_name, req.block_id)?;
+        ensure_readable(&meta)?;
+        validate_reclaim_stamp(req, meta.visibility.block_stamp)?;
+        let paths = self.paths(&req.group_name, req.block_id);
+        let marker = DeletingMarker {
+            version: DELETING_MARKER_VERSION,
+            group_name: req.group_name.as_str().to_string(),
+            block_id: req.block_id,
+            block_stamp: req.expected_block_stamp,
+            effective_len: meta.source.effective_len,
+        };
+        write_deleting_marker(&paths, &marker)?;
+        complete_deleting_marker(&paths, &marker)?;
+        Ok(ReclaimBlockResult::Deleted {
+            effective_len: marker.effective_len,
+        })
+    }
+
+    /// Completes every durable deletion marker before local Ready discovery.
+    pub fn recover_deleting_markers(&self) -> StoreResult<usize> {
+        let groups_dir = self.config.data_root.join("groups");
+        if !groups_dir.exists() {
+            return Ok(0);
+        }
+
+        let mut recovered = 0usize;
+        for group_entry in fs::read_dir(groups_dir)? {
+            let group_entry = group_entry?;
+            if !group_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(group_raw) = group_entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(group_name) = GroupName::parse(&group_raw) else {
+                continue;
+            };
+            let gc_dir = group_entry.path().join("gc");
+            if !gc_dir.exists() {
+                continue;
+            }
+            let mut temp_markers = Vec::new();
+            for marker_entry in fs::read_dir(&gc_dir)? {
+                let marker_entry = marker_entry?;
+                let file_type = match marker_entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(WorkerError::from(error)),
+                };
+                if !file_type.is_file() {
+                    continue;
+                }
+                let marker_path = marker_entry.path();
+                if marker_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".deleting.tmp"))
+                {
+                    temp_markers.push(marker_path);
+                    continue;
+                }
+                if marker_path.extension().and_then(|ext| ext.to_str()) != Some("deleting") {
+                    continue;
+                }
+                let marker = read_deleting_marker(&marker_path)?;
+                let req = ReclaimBlockRequest {
+                    group_name: group_name.clone(),
+                    block_id: marker.block_id,
+                    expected_block_stamp: marker.block_stamp,
+                };
+                let paths = self.paths(&group_name, marker.block_id);
+                validate_deleting_marker(&marker, &req, &marker_path)?;
+                if paths.deleting_marker_path != marker_path {
+                    return Err(corrupt(format!(
+                        "deleting marker path does not match block identity: path={}",
+                        marker_path.display()
+                    )));
+                }
+                complete_deleting_marker(&paths, &marker)?;
+                recovered = recovered.saturating_add(1);
+            }
+            if !temp_markers.is_empty() {
+                for temp_marker in temp_markers {
+                    remove_file_if_exists(&temp_marker)?;
+                }
+                sync_parent_dir(&gc_dir)?;
             }
         }
-        if let Some(parent) = paths.staging_data_path.parent() {
-            if parent.exists() {
-                sync_parent_dir(parent)?;
-            }
-        }
-        Ok(())
+        Ok(recovered)
     }
 
     /// Removes unpublished staging files for an aborted write.
@@ -562,6 +733,7 @@ impl FullBlockFileStore {
             .join(format!("{hash_a:02x}"))
             .join(format!("{hash_b:02x}"));
         let tmp_dir = self.group_dir(group_name).join("tmp");
+        let gc_dir = self.group_dir(group_name).join("gc");
 
         BlockPaths {
             data_path: dir.join(format!("{stem}.blk")),
@@ -569,6 +741,8 @@ impl FullBlockFileStore {
             temp_meta_path: dir.join(format!("{stem}.meta.tmp")),
             staging_data_path: tmp_dir.join(format!("{stem}.blk.tmp")),
             staging_meta_path: tmp_dir.join(format!("{stem}.meta.tmp")),
+            deleting_marker_path: gc_dir.join(format!("{stem}.deleting")),
+            temp_deleting_marker_path: gc_dir.join(format!("{stem}.deleting.tmp")),
         }
     }
 
@@ -625,7 +799,9 @@ pub trait LocalBlockStore {
 
     fn recover_block(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<RecoveredBlock>;
 
-    fn delete_block(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<()>;
+    fn inspect_reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockState>;
+
+    fn reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockResult>;
 
     fn abort_staging_block(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<()>;
 }
@@ -659,13 +835,210 @@ impl LocalBlockStore for FullBlockFileStore {
         FullBlockFileStore::recover_block(self, group_name, block_id)
     }
 
-    fn delete_block(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<()> {
-        FullBlockFileStore::delete_block(self, group_name, block_id)
+    fn inspect_reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockState> {
+        FullBlockFileStore::inspect_reclaim_block(self, req)
+    }
+
+    fn reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockResult> {
+        FullBlockFileStore::reclaim_block(self, req)
     }
 
     fn abort_staging_block(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<()> {
         FullBlockFileStore::abort_staging_block(self, group_name, block_id)
     }
+}
+
+fn validate_reclaim_request(req: &ReclaimBlockRequest) -> StoreResult<()> {
+    if req.expected_block_stamp == 0 {
+        return Err(invalid_argument(
+            "expected_block_stamp must be metadata-assigned and non-zero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reclaim_stamp(req: &ReclaimBlockRequest, actual_block_stamp: u64) -> StoreResult<()> {
+    if req.expected_block_stamp != actual_block_stamp {
+        return Err(WorkerError::RefreshMetadata {
+            kind: ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
+            message: format!(
+                "block stamp mismatch during local reclamation: group_name={}, block_id={}, expected={}, local={}",
+                req.group_name, req.block_id, req.expected_block_stamp, actual_block_stamp
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn write_deleting_marker(paths: &BlockPaths, marker: &DeletingMarker) -> StoreResult<()> {
+    let parent = paths
+        .deleting_marker_path
+        .parent()
+        .ok_or_else(|| invalid_argument("deleting marker path has no parent directory"))?;
+    let parent_existed = parent.exists();
+    fs::create_dir_all(parent)?;
+    if !parent_existed {
+        let group_dir = parent
+            .parent()
+            .ok_or_else(|| invalid_argument("deleting marker directory has no parent directory"))?;
+        sync_parent_dir(group_dir)?;
+    }
+
+    if paths.deleting_marker_path.exists() {
+        let persisted = read_deleting_marker(&paths.deleting_marker_path)?;
+        let group_name =
+            GroupName::parse(&marker.group_name).map_err(|err| corrupt(format!("invalid marker group name: {err}")))?;
+        let req = ReclaimBlockRequest {
+            group_name,
+            block_id: marker.block_id,
+            expected_block_stamp: marker.block_stamp,
+        };
+        validate_deleting_marker(&persisted, &req, &paths.deleting_marker_path)?;
+        return Ok(());
+    }
+
+    remove_file_if_exists(&paths.temp_deleting_marker_path)?;
+    let encoded =
+        serde_json::to_vec(marker).map_err(|err| WorkerError::Internal(format!("encode deleting marker: {err}")))?;
+    {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&paths.temp_deleting_marker_path)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+    }
+    if let Err(err) = fs::hard_link(&paths.temp_deleting_marker_path, &paths.deleting_marker_path) {
+        let _ = remove_file_if_exists(&paths.temp_deleting_marker_path);
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            let persisted = read_deleting_marker(&paths.deleting_marker_path)?;
+            let group_name = GroupName::parse(&marker.group_name)
+                .map_err(|parse_err| corrupt(format!("invalid marker group name: {parse_err}")))?;
+            let req = ReclaimBlockRequest {
+                group_name,
+                block_id: marker.block_id,
+                expected_block_stamp: marker.block_stamp,
+            };
+            validate_deleting_marker(&persisted, &req, &paths.deleting_marker_path)?;
+            return Ok(());
+        }
+        return Err(WorkerError::from(err));
+    }
+    sync_parent_dir(parent)?;
+    remove_file_if_exists(&paths.temp_deleting_marker_path)?;
+    sync_parent_dir(parent)?;
+    Ok(())
+}
+
+fn read_deleting_marker(path: &Path) -> StoreResult<DeletingMarker> {
+    let encoded = fs::read(path)?;
+    serde_json::from_slice(&encoded)
+        .map_err(|err| corrupt(format!("invalid deleting marker {}: {err}", path.display())))
+}
+
+fn validate_deleting_marker(marker: &DeletingMarker, req: &ReclaimBlockRequest, marker_path: &Path) -> StoreResult<()> {
+    if marker.version != DELETING_MARKER_VERSION {
+        return Err(corrupt(format!(
+            "unsupported deleting marker version {}: path={}",
+            marker.version,
+            marker_path.display()
+        )));
+    }
+    if marker.group_name != req.group_name.as_str() || marker.block_id != req.block_id {
+        return Err(corrupt(format!(
+            "deleting marker identity does not match reclaim request: path={}",
+            marker_path.display()
+        )));
+    }
+    if marker.block_stamp == 0 {
+        return Err(corrupt(format!(
+            "deleting marker block stamp must be non-zero: path={}",
+            marker_path.display()
+        )));
+    }
+    validate_reclaim_stamp(req, marker.block_stamp)?;
+    Ok(())
+}
+
+fn validate_deleting_marker_against_final_meta(paths: &BlockPaths, marker: &DeletingMarker) -> StoreResult<()> {
+    let meta = match read_meta_file(&paths.meta_path) {
+        Ok(meta) => meta,
+        Err(WorkerError::NotFound(_)) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let group_name =
+        GroupName::parse(&marker.group_name).map_err(|err| corrupt(format!("invalid marker group name: {err}")))?;
+    validate_final_meta_payload(&meta, &group_name, marker.block_id)?;
+    ensure_readable(&meta)?;
+    if meta.visibility.block_stamp != marker.block_stamp || meta.source.effective_len != marker.effective_len {
+        return Err(corrupt(format!(
+            "deleting marker does not match final metadata: group_name={}, block_id={}, marker_stamp={}, meta_stamp={}, marker_effective_len={}, meta_effective_len={}",
+            marker.group_name,
+            marker.block_id,
+            marker.block_stamp,
+            meta.visibility.block_stamp,
+            marker.effective_len,
+            meta.source.effective_len
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_deleting_marker_durable(paths: &BlockPaths) -> StoreResult<()> {
+    File::open(&paths.deleting_marker_path)?.sync_all()?;
+    let parent = paths
+        .deleting_marker_path
+        .parent()
+        .ok_or_else(|| invalid_argument("deleting marker path has no parent directory"))?;
+    sync_parent_dir(parent)
+}
+
+fn complete_deleting_marker(paths: &BlockPaths, marker: &DeletingMarker) -> StoreResult<()> {
+    let marker_group =
+        GroupName::parse(&marker.group_name).map_err(|err| corrupt(format!("invalid marker group name: {err}")))?;
+    let req = ReclaimBlockRequest {
+        group_name: marker_group,
+        block_id: marker.block_id,
+        expected_block_stamp: marker.block_stamp,
+    };
+    validate_deleting_marker(marker, &req, &paths.deleting_marker_path)?;
+    ensure_deleting_marker_durable(paths)?;
+    validate_deleting_marker_against_final_meta(paths, marker)?;
+
+    remove_file_if_exists(&paths.meta_path)?;
+    remove_file_if_exists(&paths.data_path)?;
+    remove_file_if_exists(&paths.temp_meta_path)?;
+    remove_file_if_exists(&paths.staging_data_path)?;
+    remove_file_if_exists(&paths.staging_meta_path)?;
+    if let Some(parent) = paths.data_path.parent() {
+        if parent.exists() {
+            sync_parent_dir(parent)?;
+        }
+    }
+    if let Some(parent) = paths.staging_data_path.parent() {
+        if parent.exists() {
+            sync_parent_dir(parent)?;
+        }
+    }
+
+    remove_file_if_exists(&paths.temp_deleting_marker_path)?;
+    remove_file_if_exists(&paths.deleting_marker_path)?;
+    if let Some(parent) = paths.deleting_marker_path.parent() {
+        if let Err(error) = sync_parent_dir(parent) {
+            // The block directories were already synced, so the physical
+            // deletion is durable. A crash may resurrect only the marker,
+            // which startup recovery can retire idempotently.
+            tracing::warn!(
+                target: "worker.block",
+                op = "RetireDeletingMarker",
+                group_name = %marker.group_name,
+                block_id = %marker.block_id,
+                error = %error,
+                "block deletion completed but deleting marker retirement was not synced"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn write_meta_new(paths: &BlockPaths, meta: &BlockMetaPayload) -> StoreResult<()> {
@@ -1058,6 +1431,7 @@ fn corrupt(message: impl Into<String>) -> WorkerError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs::{self, OpenOptions};
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::OnceLock;
@@ -1067,6 +1441,8 @@ mod tests {
     use bytes::Bytes;
     use tempfile::TempDir;
 
+    use crate::config::StoreDirConfig;
+    use crate::store::dirs::StoreDirs;
     use crate::store::meta_codec::{decode_meta_payload, encode_meta_payload, encode_staging_meta_payload};
 
     use super::*;
@@ -1140,6 +1516,44 @@ mod tests {
         store
             .publish_ready(publish_request(group_name, block_id, 4096, 1))
             .expect("publish default block")
+    }
+
+    fn reclaim_request(group_name: &GroupName, block_id: BlockId, block_stamp: u64) -> ReclaimBlockRequest {
+        ReclaimBlockRequest {
+            group_name: group_name.clone(),
+            block_id,
+            expected_block_stamp: block_stamp,
+        }
+    }
+
+    fn persist_deleting_marker(store: &FullBlockFileStore, group_name: &GroupName, block_id: BlockId) -> BlockPaths {
+        let meta = store.load_meta(group_name, block_id).expect("ready meta");
+        let paths = store.paths(group_name, block_id);
+        write_deleting_marker(
+            &paths,
+            &DeletingMarker {
+                version: DELETING_MARKER_VERSION,
+                group_name: group_name.as_str().to_string(),
+                block_id,
+                block_stamp: meta.visibility.block_stamp,
+                effective_len: meta.source.effective_len,
+            },
+        )
+        .expect("persist deleting marker");
+        paths
+    }
+
+    fn assert_reclaimed(paths: &BlockPaths) {
+        assert!(!paths.data_path.exists(), "data file must be removed");
+        assert!(!paths.meta_path.exists(), "meta file must be removed");
+        assert!(!paths.temp_meta_path.exists(), "temp meta file must be removed");
+        assert!(!paths.staging_data_path.exists(), "staging data must be removed");
+        assert!(!paths.staging_meta_path.exists(), "staging meta must be removed");
+        assert!(!paths.deleting_marker_path.exists(), "deleting marker must be removed");
+        assert!(
+            !paths.temp_deleting_marker_path.exists(),
+            "temporary deleting marker must be removed"
+        );
     }
 
     fn assert_corrupt<T: std::fmt::Debug>(result: Result<T, WorkerError>) {
@@ -2308,19 +2722,241 @@ mod tests {
     }
 
     #[test]
-    fn delete_block_ignores_missing_files() {
+    fn reclaim_block_is_stamp_checked_and_idempotent() {
         let (_temp, store) = store();
         let (group_name_value, block_id) = ids();
-        create_default_block(&store, group_name_value, block_id);
-
-        store.delete_block(group_name_value, block_id).expect("delete block");
-        store.delete_block(group_name_value, block_id).expect("delete again");
-
+        publish_default_block(&store, group_name_value, block_id);
         let paths = store.paths(group_name_value, block_id);
-        assert!(!paths.data_path.exists());
-        assert!(!paths.meta_path.exists());
-        assert!(!paths.staging_data_path.exists());
-        assert!(!paths.staging_meta_path.exists());
+
+        let mismatch = store
+            .reclaim_block(&reclaim_request(group_name_value, block_id, 2))
+            .expect_err("stale stamp must not reclaim");
+        assert!(matches!(
+            mismatch,
+            WorkerError::RefreshMetadata {
+                kind: ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
+                ..
+            }
+        ));
+        assert!(paths.data_path.exists());
+        assert!(paths.meta_path.exists());
+
+        assert_eq!(
+            store
+                .reclaim_block(&reclaim_request(group_name_value, block_id, 1))
+                .expect("reclaim block"),
+            ReclaimBlockResult::Deleted { effective_len: 4096 }
+        );
+        assert_reclaimed(&paths);
+        assert_eq!(
+            store
+                .reclaim_block(&reclaim_request(group_name_value, block_id, 1))
+                .expect("repeat reclaim"),
+            ReclaimBlockResult::AlreadyAbsent
+        );
+    }
+
+    #[test]
+    fn reclaim_does_not_delete_unmarked_data_without_stamp_evidence() {
+        let (_temp, store) = store();
+        let (group_name_value, block_id) = ids();
+        publish_default_block(&store, group_name_value, block_id);
+        let paths = store.paths(group_name_value, block_id);
+        fs::remove_file(&paths.meta_path).expect("remove meta");
+
+        assert_corrupt(store.reclaim_block(&reclaim_request(group_name_value, block_id, 1)));
+        assert!(paths.data_path.exists(), "unverified data must remain");
+        assert!(!paths.deleting_marker_path.exists());
+    }
+
+    #[test]
+    fn reclaim_fails_closed_on_unmarked_staging_or_temp_marker_artifacts() {
+        for artifact in ["staging-data", "staging-meta", "temp-marker"] {
+            let (_temp, store) = store();
+            let (group_name_value, block_id) = ids();
+            let paths = store.paths(group_name_value, block_id);
+            match artifact {
+                "staging-data" => {
+                    fs::create_dir_all(paths.staging_data_path.parent().expect("staging parent"))
+                        .expect("create staging parent");
+                    fs::write(&paths.staging_data_path, b"staging").expect("write staging data");
+                }
+                "staging-meta" => {
+                    fs::create_dir_all(paths.staging_meta_path.parent().expect("staging parent"))
+                        .expect("create staging parent");
+                    fs::write(&paths.staging_meta_path, b"staging").expect("write staging meta");
+                }
+                "temp-marker" => {
+                    fs::create_dir_all(paths.temp_deleting_marker_path.parent().expect("marker parent"))
+                        .expect("create marker parent");
+                    fs::write(&paths.temp_deleting_marker_path, b"temporary").expect("write temp marker");
+                }
+                _ => unreachable!(),
+            }
+
+            assert_corrupt(store.reclaim_block(&reclaim_request(group_name_value, block_id, 1)));
+            assert!(
+                paths.staging_data_path.exists()
+                    || paths.staging_meta_path.exists()
+                    || paths.temp_deleting_marker_path.exists(),
+                "unverified artifact must remain"
+            );
+            assert!(!paths.deleting_marker_path.exists());
+        }
+    }
+
+    #[test]
+    fn deleting_marker_must_match_remaining_final_metadata() {
+        for tamper in ["stamp", "effective-len"] {
+            let (_temp, store) = store();
+            let (group_name_value, block_id) = ids();
+            publish_default_block(&store, group_name_value, block_id);
+            let paths = persist_deleting_marker(&store, group_name_value, block_id);
+            let mut marker = read_deleting_marker(&paths.deleting_marker_path).expect("read marker");
+            match tamper {
+                "stamp" => marker.block_stamp = marker.block_stamp.saturating_add(1),
+                "effective-len" => marker.effective_len = marker.effective_len.saturating_sub(1),
+                _ => unreachable!(),
+            }
+            fs::write(
+                &paths.deleting_marker_path,
+                serde_json::to_vec(&marker).expect("encode marker"),
+            )
+            .expect("tamper marker");
+
+            assert_corrupt(store.recover_deleting_markers());
+            assert!(paths.data_path.exists(), "mismatched marker must not delete data");
+            assert!(paths.meta_path.exists(), "mismatched marker must not delete metadata");
+            assert!(paths.deleting_marker_path.exists(), "mismatched marker must remain");
+        }
+    }
+
+    #[test]
+    fn startup_recovery_completes_all_partial_deletion_shapes() {
+        #[derive(Clone, Copy)]
+        enum Shape {
+            MarkerOnly,
+            MetaAndData,
+            DataOnly,
+            MetaOnly,
+            WithStaging,
+        }
+
+        for shape in [
+            Shape::MarkerOnly,
+            Shape::MetaAndData,
+            Shape::DataOnly,
+            Shape::MetaOnly,
+            Shape::WithStaging,
+        ] {
+            let (_temp, store) = store();
+            let (group_name_value, block_id) = ids();
+            publish_default_block(&store, group_name_value, block_id);
+            let paths = persist_deleting_marker(&store, group_name_value, block_id);
+            fs::copy(&paths.deleting_marker_path, &paths.temp_deleting_marker_path)
+                .expect("simulate leftover marker temp");
+
+            match shape {
+                Shape::MarkerOnly => {
+                    fs::remove_file(&paths.meta_path).expect("remove meta");
+                    fs::remove_file(&paths.data_path).expect("remove data");
+                }
+                Shape::MetaAndData => {}
+                Shape::DataOnly => {
+                    fs::remove_file(&paths.meta_path).expect("remove meta");
+                }
+                Shape::MetaOnly => {
+                    fs::remove_file(&paths.data_path).expect("remove data");
+                }
+                Shape::WithStaging => {
+                    fs::write(&paths.staging_data_path, b"staging data").expect("write staging data");
+                    fs::write(&paths.staging_meta_path, b"staging meta").expect("write staging meta");
+                }
+            }
+
+            assert_eq!(store.recover_deleting_markers().expect("recover marker"), 1);
+            assert_reclaimed(&paths);
+            assert!(store
+                .scan_group_blocks(group_name_value)
+                .expect("scan after recovery")
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn startup_recovery_removes_unpublished_temp_marker() {
+        let (_temp, store) = store();
+        let (group_name_value, block_id) = ids();
+        let paths = store.paths(group_name_value, block_id);
+        fs::create_dir_all(paths.temp_deleting_marker_path.parent().expect("marker parent"))
+            .expect("create marker parent");
+        fs::write(&paths.temp_deleting_marker_path, b"interrupted marker write").expect("write temp marker");
+
+        assert_eq!(store.recover_deleting_markers().expect("recover temp marker"), 0);
+        assert!(!paths.temp_deleting_marker_path.exists());
+    }
+
+    #[test]
+    fn deleting_marker_hides_ready_block_until_recovery() {
+        let (_temp, store) = store();
+        let (group_name_value, block_id) = ids();
+        publish_default_block(&store, group_name_value, block_id);
+        let paths = persist_deleting_marker(&store, group_name_value, block_id);
+
+        assert!(store
+            .scan_group_blocks(group_name_value)
+            .expect("scan with marker")
+            .is_empty());
+        assert!(paths.data_path.exists());
+        assert!(paths.meta_path.exists());
+    }
+
+    #[test]
+    fn store_dirs_open_recovers_markers_before_ready_discovery() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_root = temp.path().join("hdd0");
+        let raw_store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(data_root.clone()));
+        let (group_name_value, block_id) = ids();
+        publish_default_block(&raw_store, group_name_value, block_id);
+        let paths = persist_deleting_marker(&raw_store, group_name_value, block_id);
+        drop(raw_store);
+
+        let store_dirs = StoreDirs::open(
+            BTreeMap::from([(
+                "hdd0".to_string(),
+                StoreDirConfig {
+                    path: data_root,
+                    tier: Tier::Hdd,
+                    capacity_bytes: 32 * 1024,
+                },
+            )]),
+            0,
+            30_000,
+        )
+        .expect("open store dirs");
+
+        assert_reclaimed(&paths);
+        assert!(store_dirs
+            .scan_group_blocks(group_name_value)
+            .expect("scan group")
+            .is_empty());
+        let report = store_dirs.report().expect("store report");
+        assert_eq!(report.used_bytes, 0);
+        assert_eq!(report.dirs[0].block_count, 0);
+    }
+
+    #[test]
+    fn startup_recovery_fails_closed_on_corrupt_marker() {
+        let (_temp, store) = store();
+        let (group_name_value, block_id) = ids();
+        publish_default_block(&store, group_name_value, block_id);
+        let paths = store.paths(group_name_value, block_id);
+        fs::create_dir_all(paths.deleting_marker_path.parent().expect("marker parent")).expect("create gc");
+        fs::write(&paths.deleting_marker_path, b"not-json").expect("write corrupt marker");
+
+        assert_corrupt(store.recover_deleting_markers());
+        assert!(paths.data_path.exists());
+        assert!(paths.meta_path.exists());
     }
 
     #[test]

@@ -22,7 +22,7 @@ use crate::runtime::block::BlockManager;
 use crate::runtime::stream::{StreamManager, StreamState};
 use crate::store::block::{
     BlockState, ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
-    PublishReadyRequest, SyncReadyBlockRequest,
+    PublishReadyRequest, ReclaimBlockRequest, ReclaimBlockResult, SyncReadyBlockRequest,
 };
 
 pub type WorkerCoreResult<T> = Result<T, WorkerError>;
@@ -340,6 +340,7 @@ impl WorkerCore {
 
     pub async fn open_read(&self, req: ReadOpenRequest) -> WorkerCoreResult<ReadOpenResult> {
         let frame_size = self.negotiate_frame_size(req.frame_size)?;
+        let read_pin = self.block_manager.pin_read(&req.group_name, req.block_id)?;
         let snapshot = self.block_manager.validate_read(self.block_store.as_ref(), &req)?;
         let stream_id = self.next_stream_id()?;
         let end_offset = req
@@ -365,7 +366,9 @@ impl WorkerCore {
             effective_len: snapshot.effective_len,
             fencing_token: None,
         };
-        self.stream_manager.register(StreamState::new(context)).await;
+        self.stream_manager
+            .register_read(StreamState::new(context), read_pin)
+            .await;
 
         Ok(ReadOpenResult {
             stream_id,
@@ -373,6 +376,32 @@ impl WorkerCore {
             block_stamp: snapshot.block_stamp,
             committed_length: snapshot.effective_len,
         })
+    }
+
+    /// Reclaims one metadata-authorized Ready block version from local storage.
+    ///
+    /// The exact stamp is checked before reader exclusion and again before the
+    /// durable marker is published. New readers are rejected once reclaiming
+    /// starts, existing read streams drain through RAII pins, and any filesystem
+    /// error leaves the block reclaiming for an idempotent retry.
+    pub async fn reclaim_block(&self, req: ReclaimBlockRequest) -> WorkerCoreResult<ReclaimBlockResult> {
+        self.block_store.inspect_reclaim_block(&req)?;
+        let wait_timeout = self.stream_manager.idle_timeout().max(Duration::from_millis(1));
+        let permit = loop {
+            self.stream_manager.cleanup_idle_read_streams().await;
+            match tokio::time::timeout(
+                wait_timeout,
+                self.block_manager.begin_reclaim(&req.group_name, req.block_id),
+            )
+            .await
+            {
+                Ok(result) => break result?,
+                Err(_) => continue,
+            }
+        };
+        let result = self.block_store.reclaim_block(&req)?;
+        permit.complete();
+        Ok(result)
     }
 
     pub async fn open_write(&self, req: WriteOpenRequest) -> WorkerCoreResult<WriteOpenResult> {
@@ -442,7 +471,7 @@ impl WorkerCore {
                 effective_len: req.effective_len,
                 fencing_token: Some(req.token),
             };
-            self.stream_manager.register(StreamState::new(context)).await;
+            self.stream_manager.register_write(StreamState::new(context)).await;
 
             Ok(WriteOpenResult {
                 stream_id,
@@ -631,9 +660,9 @@ impl WorkerCore {
     }
 
     pub async fn read_stream(&self, stream_id: StreamId, max_bytes: u32) -> WorkerCoreResult<Vec<ReadFrame>> {
-        let state = self
+        let (state, _read_pin) = self
             .stream_manager
-            .get(stream_id)
+            .get_for_read(stream_id)
             .await
             .ok_or_else(|| WorkerError::NotFound(format!("read stream not found: stream_id={stream_id}")))?;
         if state.context.mode != StreamMode::Read {
@@ -641,6 +670,8 @@ impl WorkerCore {
                 "stream is not a read stream: stream_id={stream_id}"
             )));
         }
+        debug_assert!(_read_pin.is_some(), "registered read stream must retain a block pin");
+        self.stream_manager.touch(stream_id).await;
         if state.cursor >= state.context.end_offset {
             self.stream_manager.remove(stream_id).await;
             return Ok(Vec::new());
@@ -1100,6 +1131,7 @@ mod tests {
     use crate::runtime::stream::StreamState;
     use crate::store::block::{
         ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, PublishReadyRequest,
+        ReclaimBlockRequest, ReclaimBlockResult,
     };
 
     const BLOCK_SIZE: u64 = 4096;
@@ -2096,6 +2128,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reclaim_waits_for_whole_read_stream_before_deleting() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+        let core = Arc::new(core);
+        let open = core
+            .open_read(read_open_request_for(0, BLOCK_SIZE as u32, BLOCK_STAMP, 512))
+            .await
+            .expect("open pinned read");
+        let reclaim_core = Arc::clone(&core);
+        let reclaim = tokio::spawn(async move {
+            reclaim_core
+                .reclaim_block(ReclaimBlockRequest {
+                    group_name: group_name(),
+                    block_id: block_id(),
+                    expected_block_stamp: BLOCK_STAMP,
+                })
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match core.open_read(read_open_request_for(0, 1, BLOCK_STAMP, 512)).await {
+                    Err(WorkerError::RefreshMetadata {
+                        kind: ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
+                        ..
+                    }) => break,
+                    Ok(extra) => {
+                        core.stream_manager().remove(extra.stream_id).await;
+                    }
+                    Err(other) => panic!("unexpected read-open result while reclaim starts: {other:?}"),
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reclaim should reject new readers");
+        assert!(!reclaim.is_finished(), "reclaim must wait for the active stream");
+
+        assert_eq!(collect_core_read(&core, open.stream_id, 257).await, payload());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), reclaim)
+                .await
+                .expect("reclaim should finish after EOS")
+                .expect("reclaim task")
+                .expect("reclaim result"),
+            ReclaimBlockResult::Deleted {
+                effective_len: BLOCK_SIZE
+            }
+        );
+        let paths = store.paths(&group_name(), block_id());
+        assert!(!paths.data_path.exists());
+        assert!(!paths.meta_path.exists());
+        assert!(!paths.deleting_marker_path.exists());
+    }
+
+    #[tokio::test]
+    async fn reclaim_expires_abandoned_read_stream_before_deleting() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
+            temp.path().to_path_buf(),
+        )));
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+        let core = WorkerCore::with_local_store(512, 2048, Duration::from_millis(10), store.clone());
+        let open = core
+            .open_read(read_open_request_for(0, BLOCK_SIZE as u32, BLOCK_STAMP, 512))
+            .await
+            .expect("open abandoned read");
+
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                core.reclaim_block(ReclaimBlockRequest {
+                    group_name: group_name(),
+                    block_id: block_id(),
+                    expected_block_stamp: BLOCK_STAMP,
+                }),
+            )
+            .await
+            .expect("idle stream must not stall reclaim")
+            .expect("reclaim block"),
+            ReclaimBlockResult::Deleted {
+                effective_len: BLOCK_SIZE
+            }
+        );
+        assert!(core.stream_manager().get(open.stream_id).await.is_none());
+        let paths = store.paths(&group_name(), block_id());
+        assert!(!paths.data_path.exists());
+        assert!(!paths.meta_path.exists());
+    }
+
+    #[tokio::test]
+    async fn reclaim_stamp_mismatch_keeps_ready_block_readable() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+
+        assert_refresh_metadata(
+            core.reclaim_block(ReclaimBlockRequest {
+                group_name: group_name(),
+                block_id: block_id(),
+                expected_block_stamp: BLOCK_STAMP + 1,
+            })
+            .await,
+            ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
+        );
+        let open = core
+            .open_read(read_open_request_for(0, 8, BLOCK_STAMP, 512))
+            .await
+            .expect("stamp mismatch must not fence valid reads");
+        assert_eq!(collect_core_read(&core, open.stream_id, 8).await, payload().slice(0..8));
+    }
+
+    #[tokio::test]
     async fn worker_core_uses_configured_store_dir() {
         let custom_dir = TempDir::new().expect("custom store dir");
         let other_dir = TempDir::new().expect("other store dir");
@@ -2321,7 +2465,7 @@ mod tests {
 
         assert_not_found(core.read_stream(stream_id(), 1024).await);
         let state = StreamState::new(write_stream_context());
-        core.stream_manager().register(state).await;
+        core.stream_manager().register_write(state).await;
 
         match core
             .read_stream(stream_id(), 1024)

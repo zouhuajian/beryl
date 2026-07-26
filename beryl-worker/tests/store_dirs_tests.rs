@@ -4,8 +4,12 @@
 use beryl_types::ids::{BlockId, BlockIndex, DataHandleId};
 use beryl_types::{BlockFormatId, GroupName, Tier, TierFree};
 use beryl_worker::config::StoreDirConfig;
-use beryl_worker::store::block::{ChecksumKind, CreateStagingBlockRequest, LocalBlockStore, PublishReadyRequest};
+use beryl_worker::store::block::{
+    ChecksumKind, CreateStagingBlockRequest, LocalBlockStore, PublishReadyRequest, ReclaimBlockRequest,
+    ReclaimBlockResult,
+};
 use beryl_worker::store::dirs::StoreDirs;
+use beryl_worker::WorkerError;
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -191,6 +195,71 @@ fn publish_and_abort_release_pending_reservations() {
     assert_eq!(after_abort.pending_bytes, 0);
     assert_eq!(after_abort.used_bytes, BLOCK_SIZE);
     assert_eq!(after_abort.dirs[0].block_count, 1);
+}
+
+#[test]
+fn reclaim_updates_capacity_once_and_is_idempotent() {
+    let temp = TempDir::new().unwrap();
+    let store = StoreDirs::open(
+        store_dirs(vec![dir_config(temp.path().join("hdd0"), 32 * 1024)]),
+        0,
+        30_000,
+    )
+    .unwrap();
+    store.create_staging_block(staging_req(0)).unwrap();
+    store
+        .write_at(&group_name(), block_id(0), 0, Bytes::from(vec![1; BLOCK_SIZE as usize]))
+        .unwrap();
+    store.publish_ready(publish_req(0)).unwrap();
+    let req = ReclaimBlockRequest {
+        group_name: group_name(),
+        block_id: block_id(0),
+        expected_block_stamp: 7,
+    };
+
+    assert_eq!(
+        store.reclaim_block(&req).unwrap(),
+        ReclaimBlockResult::Deleted {
+            effective_len: BLOCK_SIZE
+        }
+    );
+    let after = store.report().unwrap();
+    assert_eq!(after.used_bytes, 0);
+    assert_eq!(after.dirs[0].block_count, 0);
+    assert_eq!(store.reclaim_block(&req).unwrap(), ReclaimBlockResult::AlreadyAbsent);
+    let repeated = store.report().unwrap();
+    assert_eq!(repeated.used_bytes, 0);
+    assert_eq!(repeated.dirs[0].block_count, 0);
+}
+
+#[test]
+fn reclaim_fails_closed_on_staging_artifact_in_any_store_dir() {
+    let temp = TempDir::new().unwrap();
+    let hdd0 = temp.path().join("hdd0");
+    let hdd1 = temp.path().join("hdd1");
+    let store = StoreDirs::open(
+        store_dirs(vec![
+            dir_config_with("hdd0", Tier::Hdd, hdd0, 32 * 1024),
+            dir_config_with("hdd1", Tier::Hdd, hdd1.clone(), 32 * 1024),
+        ]),
+        0,
+        30_000,
+    )
+    .unwrap();
+    let raw_store = beryl_worker::store::block::FullBlockFileStore::new(
+        beryl_worker::store::block::FullBlockFileStoreConfig::new(hdd1),
+    );
+    raw_store.create_staging_block(staging_req(0)).unwrap();
+    let req = ReclaimBlockRequest {
+        group_name: group_name(),
+        block_id: block_id(0),
+        expected_block_stamp: 7,
+    };
+
+    assert!(matches!(store.reclaim_block(&req), Err(WorkerError::Corrupt(_))));
+    let paths = raw_store.paths(&group_name(), block_id(0));
+    assert!(paths.staging_data_path.exists());
+    assert!(paths.staging_meta_path.exists());
 }
 
 #[test]

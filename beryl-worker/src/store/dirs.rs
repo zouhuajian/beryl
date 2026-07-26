@@ -20,7 +20,8 @@ use crate::config::StoreDirConfig;
 use crate::error::WorkerError;
 use crate::store::block::{
     BlockMetaPayload, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
-    PublishReadyRequest, RecoveredBlock, StoreResult, SyncReadyBlockRequest,
+    PublishReadyRequest, ReclaimBlockRequest, ReclaimBlockResult, ReclaimBlockState, RecoveredBlock, StoreResult,
+    SyncReadyBlockRequest,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,6 +105,7 @@ impl StoreDirs {
             let (fs_total_bytes, fs_free_bytes) = fs_stats(&config.path)?;
             let mount_key = mount_key(&config.path)?;
             let store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(config.path.clone()));
+            store.recover_deleting_markers()?;
             let (used_bytes, block_count) = scan_store_usage(&store, &config.path)?;
             dirs.push(StoreDirState {
                 id,
@@ -258,6 +260,49 @@ impl StoreDirs {
             (paths.meta_path.exists() || paths.data_path.exists()).then(|| (idx, dir.store.clone()))
         })
     }
+
+    fn find_reclaim_store(
+        &self,
+        group_name: &GroupName,
+        block_id: BlockId,
+    ) -> StoreResult<Option<(usize, FullBlockFileStore)>> {
+        let inner = self.inner.lock().expect("store dir state poisoned");
+        let mut found = None;
+        for (idx, dir) in inner.dirs.iter().enumerate() {
+            let paths = dir.store.paths(group_name, block_id);
+            if !paths.deleting_marker_path.exists()
+                && !paths.temp_deleting_marker_path.exists()
+                && !paths.meta_path.exists()
+                && !paths.data_path.exists()
+                && !paths.temp_meta_path.exists()
+                && !paths.staging_data_path.exists()
+                && !paths.staging_meta_path.exists()
+            {
+                continue;
+            }
+            if found.is_some() {
+                return Err(WorkerError::Corrupt(format!(
+                    "block exists in multiple worker store dirs: group_name={}, block_id={}",
+                    group_name, block_id
+                )));
+            }
+            found = Some((idx, dir.store.clone()));
+        }
+        Ok(found)
+    }
+
+    fn inspect_absent_reclaim(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockState> {
+        let store = self
+            .inner
+            .lock()
+            .expect("store dir state poisoned")
+            .dirs
+            .first()
+            .expect("store dirs validated non-empty")
+            .store
+            .clone();
+        store.inspect_reclaim_block(req)
+    }
 }
 
 impl LocalBlockStore for StoreDirs {
@@ -346,42 +391,25 @@ impl LocalBlockStore for StoreDirs {
         store.recover_block(group_name, block_id)
     }
 
-    fn delete_block(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<()> {
-        let stores: Vec<_> = self
-            .inner
-            .lock()
-            .expect("store dir state poisoned")
-            .dirs
-            .iter()
-            .enumerate()
-            .map(|(idx, dir)| (idx, dir.store.clone()))
-            .collect();
-        for (idx, store) in stores {
-            let paths = store.paths(group_name, block_id);
-            let ready_exists = paths.meta_path.exists();
-            let used_len = if ready_exists {
-                store
-                    .load_meta(group_name, block_id)
-                    .map(|meta| meta.source.effective_len)
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            if paths.meta_path.exists()
-                || paths.data_path.exists()
-                || paths.staging_meta_path.exists()
-                || paths.staging_data_path.exists()
-            {
-                store.delete_block(group_name, block_id)?;
-                let mut inner = self.inner.lock().expect("store dir state poisoned");
-                release_pending_locked(&mut inner.dirs[idx], group_name, block_id);
-                inner.dirs[idx].used_bytes = inner.dirs[idx].used_bytes.saturating_sub(used_len);
-                if ready_exists {
-                    inner.dirs[idx].block_count = inner.dirs[idx].block_count.saturating_sub(1);
-                }
-            }
+    fn inspect_reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockState> {
+        let Some((_, store)) = self.find_reclaim_store(&req.group_name, req.block_id)? else {
+            return self.inspect_absent_reclaim(req);
+        };
+        store.inspect_reclaim_block(req)
+    }
+
+    fn reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockResult> {
+        let Some((dir_index, store)) = self.find_reclaim_store(&req.group_name, req.block_id)? else {
+            return Ok(ReclaimBlockResult::AlreadyAbsent);
+        };
+        let result = store.reclaim_block(req)?;
+        if let ReclaimBlockResult::Deleted { effective_len } = result {
+            let mut inner = self.inner.lock().expect("store dir state poisoned");
+            release_pending_locked(&mut inner.dirs[dir_index], &req.group_name, req.block_id);
+            inner.dirs[dir_index].used_bytes = inner.dirs[dir_index].used_bytes.saturating_sub(effective_len);
+            inner.dirs[dir_index].block_count = inner.dirs[dir_index].block_count.saturating_sub(1);
         }
-        Ok(())
+        Ok(result)
     }
 
     fn abort_staging_block(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<()> {

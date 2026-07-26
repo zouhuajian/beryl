@@ -12,6 +12,7 @@ use tokio::sync::RwLock;
 use crate::data::core::StreamContext;
 use crate::data::core::StreamMode;
 use crate::observe;
+use crate::runtime::block::ReadPin;
 
 /// Mutable state for an active stream.
 #[derive(Clone, Debug)]
@@ -53,14 +54,16 @@ pub struct StreamManager {
 
 struct ActiveStream {
     state: StreamState,
+    _read_pin: Option<ReadPin>,
     _inflight: StreamInflightGuard,
 }
 
 impl ActiveStream {
-    fn new(state: StreamState) -> Self {
+    fn new(state: StreamState, read_pin: Option<ReadPin>) -> Self {
         let mode = state.context.mode;
         Self {
             state,
+            _read_pin: read_pin,
             _inflight: StreamInflightGuard::new(mode),
         }
     }
@@ -100,11 +103,30 @@ impl StreamManager {
         Self::new(Duration::from_secs(60))
     }
 
-    pub async fn register(&self, state: StreamState) -> Option<StreamState> {
+    pub(crate) async fn register_write(&self, state: StreamState) -> Option<StreamState> {
+        assert_eq!(
+            state.context.mode,
+            StreamMode::Write,
+            "write stream registration requires write mode"
+        );
         self.streams
             .write()
             .await
-            .insert(state.context.stream_id, ActiveStream::new(state))
+            .insert(state.context.stream_id, ActiveStream::new(state, None))
+            .map(|active| active.state)
+    }
+
+    /// Registers a read stream while retaining its block pin until stream removal.
+    pub(crate) async fn register_read(&self, state: StreamState, read_pin: ReadPin) -> Option<StreamState> {
+        assert_eq!(
+            state.context.mode,
+            StreamMode::Read,
+            "read stream registration requires read mode"
+        );
+        self.streams
+            .write()
+            .await
+            .insert(state.context.stream_id, ActiveStream::new(state, Some(read_pin)))
             .map(|active| active.state)
     }
 
@@ -114,6 +136,15 @@ impl StreamManager {
             .await
             .get(&stream_id)
             .map(|active| active.state.clone())
+    }
+
+    /// Snapshots stream state while retaining a read pin for the current call.
+    pub(crate) async fn get_for_read(&self, stream_id: StreamId) -> Option<(StreamState, Option<ReadPin>)> {
+        self.streams
+            .read()
+            .await
+            .get(&stream_id)
+            .map(|active| (active.state.clone(), active._read_pin.clone()))
     }
 
     pub async fn touch(&self, stream_id: StreamId) -> bool {
@@ -178,6 +209,22 @@ impl StreamManager {
 
     pub async fn active_count(&self) -> usize {
         self.streams.read().await.len()
+    }
+
+    pub(crate) const fn idle_timeout(&self) -> Duration {
+        self.idle_timeout
+    }
+
+    /// Drops only abandoned read streams so their block pins cannot stall
+    /// reclamation forever. In-progress reads retain a cloned pin until return.
+    pub(crate) async fn cleanup_idle_read_streams(&self) -> usize {
+        let now = Instant::now();
+        let mut streams = self.streams.write().await;
+        let before = streams.len();
+        streams.retain(|_, active| {
+            active.state.context.mode != StreamMode::Read || !active.state.is_idle(self.idle_timeout, now)
+        });
+        before - streams.len()
     }
 
     pub async fn cleanup_idle_streams(&self) -> usize {
