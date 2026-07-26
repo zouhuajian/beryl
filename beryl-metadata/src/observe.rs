@@ -49,6 +49,8 @@ pub(crate) const METADATA_CLEANUP_CANDIDATES: &str = "metadata_cleanup_candidate
 pub(crate) const METADATA_CLEANUP_READY_CANDIDATES: &str = "metadata_cleanup_ready_candidates";
 pub(crate) const METADATA_CLEANUP_OLDEST_CANDIDATE_AGE_SECONDS: &str = "metadata_cleanup_oldest_candidate_age_seconds";
 pub(crate) const METADATA_CLEANUP_ANOMALIES_TOTAL: &str = "metadata_cleanup_anomalies_total";
+pub(crate) const METADATA_CLEANUP_COMMANDS_TOTAL: &str = "metadata_cleanup_commands_total";
+pub(crate) const METADATA_CLEANUP_RETRIES_TOTAL: &str = "metadata_cleanup_retries_total";
 pub(crate) const METADATA_REPAIR_QUEUE_DEPTH: &str = "metadata_repair_queue_depth";
 pub(crate) const METADATA_REPAIR_ATTEMPTS_TOTAL: &str = "metadata_repair_attempts_total";
 
@@ -276,6 +278,14 @@ pub(crate) fn record_cleanup_anomaly(kind: &'static str) {
     metrics::counter!(METADATA_CLEANUP_ANOMALIES_TOTAL, "kind" => kind).increment(1);
 }
 
+pub(crate) fn record_cleanup_command() {
+    metrics::counter!(METADATA_CLEANUP_COMMANDS_TOTAL).increment(1);
+}
+
+pub(crate) fn record_cleanup_retry() {
+    metrics::counter!(METADATA_CLEANUP_RETRIES_TOTAL).increment(1);
+}
+
 pub(crate) fn set_repair_queue_depth(depth: usize) {
     metrics::gauge!(METADATA_REPAIR_QUEUE_DEPTH).set(depth as f64);
 }
@@ -424,7 +434,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn metadata_metric_contract_names() -> [&'static str; 40] {
+    fn metadata_metric_contract_names() -> [&'static str; 42] {
         [
             METADATA_UP,
             METADATA_BUILD_INFO,
@@ -464,6 +474,8 @@ mod tests {
             METADATA_CLEANUP_READY_CANDIDATES,
             METADATA_CLEANUP_OLDEST_CANDIDATE_AGE_SECONDS,
             METADATA_CLEANUP_ANOMALIES_TOTAL,
+            METADATA_CLEANUP_COMMANDS_TOTAL,
+            METADATA_CLEANUP_RETRIES_TOTAL,
             METADATA_REPAIR_QUEUE_DEPTH,
             METADATA_REPAIR_ATTEMPTS_TOTAL,
         ]
@@ -528,6 +540,8 @@ mod tests {
             "metadata_cleanup_ready_candidates",
             "metadata_cleanup_oldest_candidate_age_seconds",
             "metadata_cleanup_anomalies_total",
+            "metadata_cleanup_commands_total",
+            "metadata_cleanup_retries_total",
             "metadata_repair_queue_depth",
             "metadata_repair_attempts_total",
         ];
@@ -614,6 +628,8 @@ mod tests {
         record_cleanup_decision("keep");
         set_cleanup_candidates(1, 0, 0.5);
         record_cleanup_anomaly("leadership_changed");
+        record_cleanup_command();
+        record_cleanup_retry();
         set_repair_queue_depth(0);
         record_repair_attempt("ok", "none");
     }

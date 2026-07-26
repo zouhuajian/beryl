@@ -1154,6 +1154,38 @@ impl WorkerManager {
         }
     }
 
+    /// Returns whether an exact replica is still Ready in the current worker run.
+    ///
+    /// Registration and report guards are held together so a replacement run
+    /// cannot be paired with the previous run's report.
+    pub(crate) fn is_current_ready_replica(&self, replica: &ReplicaKey) -> bool {
+        let worker_key = WorkerRegistrationKey::new(&replica.group_name, replica.worker_id);
+        let registrations = self.registrations.read();
+        let reports = self.block_reports.read();
+
+        let Some(registration) = registrations.get(&worker_key) else {
+            return false;
+        };
+        if !registration.worker_run_id.matches(replica.worker_run_id) {
+            return false;
+        }
+
+        let Some(report) = reports.get(&worker_key) else {
+            return false;
+        };
+        if report.state != BlockReportState::Ready
+            || !report
+                .worker_run_id
+                .is_some_and(|report_run_id| report_run_id.matches(replica.worker_run_id))
+        {
+            return false;
+        }
+
+        report.published_blocks.get(&replica.block_id).is_some_and(|block| {
+            block.block_state == BlockReportBlockState::Ready && block.block_stamp == replica.block_stamp
+        })
+    }
+
     /// Get block locations for one metadata group (only live workers in that group).
     pub fn get_block_locations(&self, group_name: &GroupName, block_id: BlockId) -> Vec<WorkerId> {
         let locations = self.locations.read();
@@ -1608,6 +1640,100 @@ mod tests {
             )
             .unwrap();
         assert!(manager.list_ready_replicas(&local_group, 10).replicas.is_empty());
+    }
+
+    #[test]
+    fn exact_ready_replica_check_tracks_report_and_run_changes() {
+        let manager = WorkerManager::new(60);
+        let local_group = group_name("g-cleanup-ready");
+        let worker_id = WorkerId::new(17);
+        let run_id = report_run_id();
+        let block = report_block(0);
+        let replica = ReplicaKey {
+            group_name: local_group.clone(),
+            worker_id,
+            worker_run_id: run_id,
+            block_id: block.block_id,
+            block_stamp: block.block_stamp,
+        };
+        register_live_report_worker(&manager, &local_group, worker_id, run_id);
+        manager
+            .receive_full_block_report(&local_group, worker_id, run_id, 1, 0, true, vec![block.clone()])
+            .unwrap();
+
+        assert!(manager.is_current_ready_replica(&replica));
+        let mut wrong_stamp = replica.clone();
+        wrong_stamp.block_stamp += 1;
+        assert!(!manager.is_current_ready_replica(&wrong_stamp));
+
+        let mut deleting = block.clone();
+        deleting.block_state = BlockReportBlockState::Deleting;
+        manager
+            .apply_delta_block_report(
+                &local_group,
+                worker_id,
+                run_id,
+                1,
+                0,
+                vec![BlockReportDeltaEntry {
+                    op: BlockReportDeltaOp::AddUpdate,
+                    block: deleting,
+                }],
+            )
+            .unwrap();
+        assert!(!manager.is_current_ready_replica(&replica));
+
+        manager
+            .apply_delta_block_report(
+                &local_group,
+                worker_id,
+                run_id,
+                1,
+                1,
+                vec![BlockReportDeltaEntry {
+                    op: BlockReportDeltaOp::AddUpdate,
+                    block: block.clone(),
+                }],
+            )
+            .unwrap();
+        assert!(manager.is_current_ready_replica(&replica));
+
+        manager
+            .apply_delta_block_report(
+                &local_group,
+                worker_id,
+                run_id,
+                1,
+                2,
+                vec![BlockReportDeltaEntry {
+                    op: BlockReportDeltaOp::Remove,
+                    block: block.clone(),
+                }],
+            )
+            .unwrap();
+        assert!(!manager.is_current_ready_replica(&replica));
+
+        manager
+            .receive_full_block_report(&local_group, worker_id, run_id, 2, 0, true, vec![block])
+            .unwrap();
+        assert!(manager.is_current_ready_replica(&replica));
+        manager
+            .receive_full_block_report(&local_group, worker_id, run_id, 3, 0, true, Vec::new())
+            .unwrap();
+        assert!(!manager.is_current_ready_replica(&replica));
+
+        let replacement_run: WorkerRunId = "550e8400-e29b-41d4-a716-446655440118".parse().unwrap();
+        manager
+            .register_worker_run(
+                &local_group,
+                worker_id,
+                "127.0.0.1:9090".to_string(),
+                1,
+                replacement_run,
+                None,
+            )
+            .unwrap();
+        assert!(!manager.is_current_ready_replica(&replica));
     }
 
     #[test]

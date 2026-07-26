@@ -9,6 +9,7 @@ use super::manager::{
 };
 use super::metrics::WorkerMetrics;
 use crate::error::{to_rpc_error, MetadataError, MetadataResult};
+use crate::maintenance::BlockCleanupCoordinator;
 use crate::observe;
 use crate::raft::Command;
 use crate::raft::{AppRaftNode, CommandResult};
@@ -90,6 +91,7 @@ pub struct MetadataWorkerServiceImpl {
     /// Mount table used to compute mount_epoch for lease gating.
     _mount_table: Arc<crate::mount::MountTable>,
     served_group_name: GroupName,
+    cleanup: Option<Arc<BlockCleanupCoordinator>>,
     registration_serial: tokio::sync::Mutex<()>,
 }
 
@@ -100,6 +102,26 @@ impl MetadataWorkerServiceImpl {
         mount_table: Arc<crate::mount::MountTable>,
         served_group_name: GroupName,
     ) -> Self {
+        Self::build(raft_node, worker_manager, mount_table, served_group_name, None)
+    }
+
+    pub(crate) fn new_with_cleanup(
+        raft_node: Arc<AppRaftNode>,
+        worker_manager: Arc<WorkerManager>,
+        mount_table: Arc<crate::mount::MountTable>,
+        served_group_name: GroupName,
+        cleanup: Arc<BlockCleanupCoordinator>,
+    ) -> Self {
+        Self::build(raft_node, worker_manager, mount_table, served_group_name, Some(cleanup))
+    }
+
+    fn build(
+        raft_node: Arc<AppRaftNode>,
+        worker_manager: Arc<WorkerManager>,
+        mount_table: Arc<crate::mount::MountTable>,
+        served_group_name: GroupName,
+        cleanup: Option<Arc<BlockCleanupCoordinator>>,
+    ) -> Self {
         let metrics = Arc::new(WorkerMetrics::new());
 
         Self {
@@ -109,6 +131,7 @@ impl MetadataWorkerServiceImpl {
             slot_metrics: None, // Will be set via set_slot_metrics
             _mount_table: mount_table,
             served_group_name,
+            cleanup,
             registration_serial: tokio::sync::Mutex::new(()),
         }
     }
@@ -870,11 +893,31 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 .unwrap_or(live_state.last_seen_ms);
             observe::record_worker_heartbeat_lag(now_ms.saturating_sub(live_state.last_seen_ms) as f64 / 1000.0);
 
+            let cleanup_commands = self
+                .cleanup
+                .as_ref()
+                .map(|cleanup| {
+                    cleanup.commands_for_heartbeat(
+                        &group_name,
+                        live_state.worker_id,
+                        live_state.worker_run_id,
+                        Instant::now(),
+                    )
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .map(|command| BlockCleanupCommandProto {
+                    block_id: Some(command.block_id.into()),
+                    expected_block_stamp: command.expected_block_stamp,
+                })
+                .collect();
+
             Ok(Response::new(HeartbeatResponseProto {
                 header: Some(self.create_response_header_from_request(&req.header, Some(&group_name))),
                 worker_id: live_state.worker_id.as_raw(),
                 accepted_worker_run_id: live_state.worker_run_id.to_string(),
                 liveness_timeout_ms: self.liveness_timeout_ms(),
+                cleanup_commands,
             }))
         }
         .await;
@@ -1209,7 +1252,9 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CleanupConfig;
     use crate::raft::{AppRaftStateMachine, RocksDBStorage};
+    use crate::session_registry::SessionRegistry;
     use crate::worker::HealthStatus;
     use crate::MountTable;
     use ::beryl_common::error::rpc::{InternalErrorKind, ProtocolErrorKind, RecoveryAction};
@@ -1221,6 +1266,7 @@ mod tests {
     };
     use std::io;
     use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
     use tempfile::TempDir;
     use tracing::instrument::WithSubscriber;
     use tracing_subscriber::{filter::LevelFilter, fmt, layer::SubscriberExt, Layer, Registry};
@@ -1349,12 +1395,16 @@ mod tests {
     }
 
     async fn leader_raft(dir: &TempDir) -> Arc<AppRaftNode> {
+        leader_raft_with_storage(dir).await.0
+    }
+
+    async fn leader_raft_with_storage(dir: &TempDir) -> (Arc<AppRaftNode>, Arc<RocksDBStorage>) {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
         let raft_config = crate::config::RaftConfig::default();
         let raft_node = Arc::new(
-            AppRaftNode::new(1, storage, state_machine, mount_table, &raft_config)
+            AppRaftNode::new(1, Arc::clone(&storage), state_machine, mount_table, &raft_config)
                 .await
                 .unwrap(),
         );
@@ -1369,7 +1419,7 @@ mod tests {
             tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
         }
         assert!(raft_node.is_leader());
-        raft_node
+        (raft_node, storage)
     }
 
     async fn nonleader_raft(dir: &TempDir) -> Arc<AppRaftNode> {
@@ -2580,6 +2630,81 @@ mod tests {
                 assert_eq!(raft_node.get_last_applied_state_id(), before_state_id);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_returns_due_cleanup_command_for_the_accepted_ready_replica() {
+        let dir = TempDir::new().unwrap();
+        let (raft_node, storage) = leader_raft_with_storage(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let group = group_name("root");
+        let worker_id = WorkerId::new(21);
+        let worker_run_id = test_worker_run_id();
+        worker_manager
+            .register_worker_run(&group, worker_id, "127.0.0.1:9090".to_string(), 1, worker_run_id, None)
+            .unwrap();
+
+        let cleanup_config = CleanupConfig {
+            dispatch_enabled: true,
+            reclaim_grace_ms: 1,
+            ..CleanupConfig::default()
+        };
+        let cleanup = Arc::new(BlockCleanupCoordinator::new(
+            Arc::clone(&raft_node),
+            storage,
+            Arc::clone(&worker_manager),
+            Arc::new(SessionRegistry::default()),
+            group.clone(),
+            &cleanup_config,
+        ));
+        let service = MetadataWorkerServiceImpl::new_with_cleanup(
+            raft_node,
+            Arc::clone(&worker_manager),
+            Arc::new(MountTable::new()),
+            group.clone(),
+            Arc::clone(&cleanup),
+        );
+
+        <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+            &service,
+            Request::new(heartbeat_request(group.clone(), worker_id, worker_run_id, 1, 9090)),
+        )
+        .await
+        .expect("initial heartbeat succeeds");
+
+        let block_id = BlockId::new(beryl_types::DataHandleId::new(700), beryl_types::BlockIndex::new(0));
+        let block_stamp = 991;
+        worker_manager
+            .receive_full_block_report(
+                &group,
+                worker_id,
+                worker_run_id,
+                1,
+                0,
+                true,
+                vec![BlockReportBlock {
+                    block_id,
+                    block_stamp,
+                    block_state: BlockReportBlockState::Ready,
+                }],
+            )
+            .unwrap();
+        cleanup.scan_once().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        cleanup.scan_once().await.unwrap();
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+            &service,
+            Request::new(heartbeat_request(group, worker_id, worker_run_id, 2, 9090)),
+        )
+        .await
+        .expect("heartbeat succeeds")
+        .into_inner();
+
+        assert_eq!(response.cleanup_commands.len(), 1);
+        let command = &response.cleanup_commands[0];
+        assert_eq!(command.block_id, Some(block_id.into()));
+        assert_eq!(command.expected_block_stamp, block_stamp);
     }
 
     #[tokio::test]

@@ -21,7 +21,7 @@
 
 The current runtime uses one metadata group with one leader. The metadata service handles format/start lifecycle, filesystem RPCs, worker control RPCs, worker registration/heartbeat/full reports, freshness checks, and Raft/RocksDB-backed state for the current worker-authorized read/write path.
 
-Namespace delete is active. Recursive delete removes namespace/layout state and creates delete-intent state for resident blocks, but complete physical worker-side block reclamation is future/partial. The current runtime does not wire an active worker delete RPC path or worker-side delete ack consumer.
+Namespace delete is active. Recursive delete removes namespace/layout/owner state; remaining Ready replicas are rediscovered from worker reports instead of persisted delete intents. Metadata cleanup-command dispatch is disabled by default, and the current Worker does not yet execute those commands.
 
 Recursive listing is not supported. Metadata rejects recursive list requests with a structured unsupported error.
 
