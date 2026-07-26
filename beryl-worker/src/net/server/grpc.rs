@@ -1755,9 +1755,10 @@ mod tests {
     async fn stream_manager_register_get_touch_remove_and_cleanup() {
         let manager = StreamManager::new(Duration::from_millis(50));
         let mut state = StreamState::new(stream_context());
+        state.context.mode = StreamMode::Write;
         state.last_activity = Instant::now() - Duration::from_secs(10);
 
-        manager.register(state.clone()).await;
+        manager.register_write(state.clone()).await;
         assert_eq!(manager.active_count().await, 1);
         assert_eq!(manager.get(stream_id()).await.unwrap().context.stream_id, stream_id());
 
@@ -1769,11 +1770,20 @@ mod tests {
         assert_eq!(manager.active_count().await, 0);
 
         let mut idle = StreamState::new(stream_context());
+        idle.context.mode = StreamMode::Write;
         idle.last_activity = Instant::now() - Duration::from_secs(10);
-        manager.register(idle).await;
+        manager.register_write(idle).await;
         assert_eq!(manager.cleanup_idle_streams().await, 1);
         assert_eq!(manager.active_count().await, 0);
     }
+
+    #[tokio::test]
+    #[should_panic(expected = "write stream registration requires write mode")]
+    async fn stream_manager_rejects_unpinned_read_registration() {
+        let manager = StreamManager::with_default_timeout();
+        manager.register_write(StreamState::new(stream_context())).await;
+    }
+
     #[derive(Default)]
     struct StreamGaugeRecorder {
         stream_values: Arc<Mutex<Vec<(String, f64)>>>,

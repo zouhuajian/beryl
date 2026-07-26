@@ -20,3 +20,4 @@ pub use data::core::{
 pub use error::{ErrorMetadata, WorkerError};
 pub use runtime::block::BlockManager;
 pub use runtime::stream::{StreamManager, StreamState};
+pub use store::block::{ReclaimBlockRequest, ReclaimBlockResult};
