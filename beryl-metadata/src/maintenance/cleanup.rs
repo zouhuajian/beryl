@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Observe-only detection of reported block replicas no longer referenced by metadata.
+//! Detection and scheduling of reported block replicas no longer referenced by metadata.
 
 use crate::config::CleanupConfig;
 use crate::error::MetadataResult;
@@ -10,7 +10,7 @@ use crate::raft::{AppRaftNode, RocksDBStorage};
 use crate::session_registry::SessionRegistry;
 use crate::worker::{ReplicaKey, WorkerManager};
 use beryl_types::fs::InodeData;
-use beryl_types::GroupName;
+use beryl_types::{BlockId, GroupName, WorkerId, WorkerRunId};
 use openraft::ServerState;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -29,11 +29,35 @@ enum CleanupDecision {
 struct CleanupEntry {
     first_seen: Instant,
     not_before: Instant,
+    next_attempt_at: Instant,
+    attempts: u32,
     verified_term: u64,
 }
 
-/// Detects reclaimable replicas without dispatching deletion commands.
-pub(crate) struct BlockCleanupScanner {
+impl CleanupEntry {
+    fn is_due(&self, term: u64, now: Instant) -> bool {
+        self.verified_term == term && now >= self.not_before && now >= self.next_attempt_at
+    }
+}
+
+/// One exact worker-local block replica selected for cleanup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BlockCleanupCommand {
+    pub block_id: BlockId,
+    pub expected_block_stamp: u64,
+}
+
+fn replica_sort_key(replica: &ReplicaKey) -> (u64, u64, u32, u64) {
+    (
+        replica.worker_id.as_raw(),
+        replica.block_id.data_handle_id.as_raw(),
+        replica.block_id.index.as_raw(),
+        replica.block_stamp,
+    )
+}
+
+/// Coordinates reclaimable-replica detection and heartbeat dispatch.
+pub(crate) struct BlockCleanupCoordinator {
     raft_node: Arc<AppRaftNode>,
     storage: Arc<RocksDBStorage>,
     worker_manager: Arc<WorkerManager>,
@@ -42,14 +66,18 @@ pub(crate) struct BlockCleanupScanner {
     reclaim_grace: Duration,
     max_replicas_per_scan: usize,
     max_candidates: usize,
+    dispatch_enabled: bool,
+    max_commands_per_heartbeat: usize,
+    retry_initial_backoff: Duration,
+    retry_max_backoff: Duration,
     entries: Mutex<HashMap<ReplicaKey, CleanupEntry>>,
 }
 
-impl BlockCleanupScanner {
-    /// Creates an observe-only scanner with process-local candidate state.
+impl BlockCleanupCoordinator {
+    /// Creates a coordinator with process-local candidate and retry state.
     ///
-    /// Candidates are intentionally rebuilt from worker full reports after
-    /// restart; this scanner never persists tasks or dispatches deletion.
+    /// All state is intentionally rebuilt from complete worker reports after
+    /// restart; no cleanup task or acknowledgement is persisted.
     pub(crate) fn new(
         raft_node: Arc<AppRaftNode>,
         storage: Arc<RocksDBStorage>,
@@ -67,8 +95,87 @@ impl BlockCleanupScanner {
             reclaim_grace: Duration::from_millis(config.reclaim_grace_ms),
             max_replicas_per_scan: config.max_replicas_per_scan,
             max_candidates: config.max_candidates,
+            dispatch_enabled: config.dispatch_enabled,
+            max_commands_per_heartbeat: config.max_commands_per_heartbeat,
+            retry_initial_backoff: Duration::from_millis(config.retry_initial_backoff_ms),
+            retry_max_backoff: Duration::from_millis(config.retry_max_backoff_ms),
             entries: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Selects due cleanup commands for one accepted worker heartbeat.
+    ///
+    /// Selection is fenced by the current leader term and exact report identity.
+    /// A report change observed before selection removes the stale candidate.
+    /// A later report change can only produce an idempotent, stamp-checked late
+    /// command, which is an allowed consequence of the report/heartbeat race.
+    pub(crate) fn commands_for_heartbeat(
+        &self,
+        group_name: &GroupName,
+        worker_id: WorkerId,
+        worker_run_id: WorkerRunId,
+        now: Instant,
+    ) -> Vec<BlockCleanupCommand> {
+        if !self.dispatch_enabled || group_name != &self.group_name {
+            return Vec::new();
+        }
+        let Some(term) = self.current_leader_term() else {
+            return Vec::new();
+        };
+
+        let mut due: Vec<_> = self
+            .entries
+            .lock()
+            .iter()
+            .filter(|(key, entry)| {
+                &key.group_name == group_name
+                    && key.worker_id == worker_id
+                    && key.worker_run_id.matches(worker_run_id)
+                    && entry.is_due(term, now)
+            })
+            .map(|(key, entry)| (entry.attempts, key.clone()))
+            .collect();
+        due.sort_by_key(|(attempts, key)| (*attempts, replica_sort_key(key)));
+
+        let mut commands = Vec::with_capacity(due.len().min(self.max_commands_per_heartbeat));
+        for (_, key) in due {
+            if commands.len() == self.max_commands_per_heartbeat {
+                break;
+            }
+            if !self.worker_manager.is_current_ready_replica(&key) {
+                self.entries.lock().remove(&key);
+                continue;
+            }
+
+            let mut entries = self.entries.lock();
+            let Some(entry) = entries.get_mut(&key) else {
+                continue;
+            };
+            if !entry.is_due(term, now) {
+                continue;
+            }
+
+            let retry = entry.attempts > 0;
+            entry.attempts = entry.attempts.saturating_add(1);
+            entry.next_attempt_at = now + self.retry_backoff(entry.attempts);
+            commands.push(BlockCleanupCommand {
+                block_id: key.block_id,
+                expected_block_stamp: key.block_stamp,
+            });
+            drop(entries);
+
+            observe::record_cleanup_command();
+            if retry {
+                observe::record_cleanup_retry();
+            }
+        }
+        commands
+    }
+
+    fn retry_backoff(&self, attempts: u32) -> Duration {
+        let multiplier = 1_u128 << attempts.saturating_sub(1).min(63);
+        let delay = self.retry_initial_backoff.as_millis().saturating_mul(multiplier);
+        Duration::from_millis(delay.min(self.retry_max_backoff.as_millis()) as u64)
     }
 
     /// Executes one bounded cleanup observation on the current Raft leader.
@@ -76,7 +183,7 @@ impl BlockCleanupScanner {
     /// Authority reads are ordered by a linearizable barrier, and classified
     /// results are committed only while the same leader term remains current.
     /// Incomplete replica listings and authority failures fail closed.
-    pub(crate) async fn run_once(&self) -> MetadataResult<()> {
+    pub(crate) async fn scan_once(&self) -> MetadataResult<()> {
         let Some(scan_term) = self.current_leader_term() else {
             observe::record_cleanup_scan("not_leader");
             self.record_candidate_metrics(self.raft_node.metrics().current_term, Instant::now(), false);
@@ -341,6 +448,8 @@ impl BlockCleanupScanner {
             CleanupEntry {
                 first_seen: now,
                 not_before: now + self.reclaim_grace,
+                next_attempt_at: now,
+                attempts: 0,
                 verified_term: term,
             },
         );
@@ -397,6 +506,10 @@ mod tests {
             reclaim_grace_ms: 100,
             max_replicas_per_scan: 100,
             max_candidates: 100,
+            dispatch_enabled: false,
+            max_commands_per_heartbeat: 2,
+            retry_initial_backoff_ms: 10,
+            retry_max_backoff_ms: 40,
         }
     }
 
@@ -519,12 +632,12 @@ mod tests {
             .unwrap();
     }
 
-    async fn scanner(
+    async fn coordinator(
         dir: &TempDir,
         config: CleanupConfig,
         leader: bool,
     ) -> (
-        BlockCleanupScanner,
+        BlockCleanupCoordinator,
         Arc<RocksDBStorage>,
         Arc<WorkerManager>,
         Arc<SessionRegistry>,
@@ -533,7 +646,7 @@ mod tests {
         let raft_node = test_raft(Arc::clone(&storage), leader).await;
         let worker_manager = Arc::new(WorkerManager::new(60));
         let session_registry = Arc::new(SessionRegistry::default());
-        let scanner = BlockCleanupScanner::new(
+        let coordinator = BlockCleanupCoordinator::new(
             raft_node,
             Arc::clone(&storage),
             Arc::clone(&worker_manager),
@@ -541,22 +654,22 @@ mod tests {
             group_name(),
             &config,
         );
-        (scanner, storage, worker_manager, session_registry)
+        (coordinator, storage, worker_manager, session_registry)
     }
 
     #[tokio::test]
     async fn classification_keeps_visible_blocks_and_waits_for_unsafe_states() {
         let dir = TempDir::new().unwrap();
-        let (scanner, storage, _worker_manager, sessions) = scanner(&dir, cleanup_config(), false).await;
+        let (coordinator, storage, _worker_manager, sessions) = coordinator(&dir, cleanup_config(), false).await;
 
         let detached = replica(10, 0, 1);
-        assert_eq!(scanner.classify(&detached).unwrap(), CleanupDecision::Reclaimable);
+        assert_eq!(coordinator.classify(&detached).unwrap(), CleanupDecision::Reclaimable);
 
         let missing_inode = replica(11, 0, 1);
         storage
             .put_data_handle_owner(missing_inode.block_id.data_handle_id, InodeId::new(999))
             .unwrap();
-        assert_eq!(scanner.classify(&missing_inode).unwrap(), CleanupDecision::Wait);
+        assert_eq!(coordinator.classify(&missing_inode).unwrap(), CleanupDecision::Wait);
 
         let visible = replica(12, 0, 2);
         persist_file(
@@ -572,18 +685,18 @@ mod tests {
             }],
             1,
         );
-        assert_eq!(scanner.classify(&visible).unwrap(), CleanupDecision::Keep);
+        assert_eq!(coordinator.classify(&visible).unwrap(), CleanupDecision::Keep);
 
         let active = replica(13, 0, 1);
         let active_inode = persist_file(&storage, active.block_id.data_handle_id, Vec::new(), 1);
         create_session(&sessions, active.block_id.data_handle_id, active_inode);
-        assert_eq!(scanner.classify(&active).unwrap(), CleanupDecision::Wait);
+        assert_eq!(coordinator.classify(&active).unwrap(), CleanupDecision::Wait);
         sessions.remove_session_if_epoch(active.block_id.data_handle_id, 1);
-        assert_eq!(scanner.classify(&active).unwrap(), CleanupDecision::Reclaimable);
+        assert_eq!(coordinator.classify(&active).unwrap(), CleanupDecision::Reclaimable);
 
         let unallocated = replica(14, 1, 1);
         persist_file(&storage, unallocated.block_id.data_handle_id, Vec::new(), 1);
-        assert_eq!(scanner.classify(&unallocated).unwrap(), CleanupDecision::Wait);
+        assert_eq!(coordinator.classify(&unallocated).unwrap(), CleanupDecision::Wait);
     }
 
     #[tokio::test]
@@ -591,15 +704,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = cleanup_config();
         let grace = Duration::from_millis(config.reclaim_grace_ms);
-        let (scanner, storage, _worker_manager, _sessions) = scanner(&dir, config, false).await;
+        let (coordinator, storage, _worker_manager, _sessions) = coordinator(&dir, config, false).await;
         let becomes_visible = replica(20, 0, 1);
         let remains_detached = replica(21, 0, 1);
         let first_seen = Instant::now();
 
-        let classified = scanner.classify_replicas(vec![becomes_visible.clone(), remains_detached.clone()]);
-        scanner.apply_classifications(classified, 7, first_seen);
+        let classified = coordinator.classify_replicas(vec![becomes_visible.clone(), remains_detached.clone()]);
+        coordinator.apply_classifications(classified, 7, first_seen);
         {
-            let entries = scanner.entries.lock();
+            let entries = coordinator.entries.lock();
             assert_eq!(entries.len(), 2);
             assert!(entries
                 .values()
@@ -607,7 +720,7 @@ mod tests {
             assert!(entries.values().all(|entry| entry.verified_term != 8));
         }
         let after_grace = first_seen + grace;
-        assert_eq!(scanner.candidate_metrics(8, after_grace, true).1, 0);
+        assert_eq!(coordinator.candidate_metrics(8, after_grace, true).1, 0);
 
         persist_file(
             &storage,
@@ -622,17 +735,17 @@ mod tests {
             }],
             1,
         );
-        let classified = scanner.classify_replicas(vec![becomes_visible.clone(), remains_detached.clone()]);
-        scanner.apply_classifications(classified, 8, after_grace);
+        let classified = coordinator.classify_replicas(vec![becomes_visible.clone(), remains_detached.clone()]);
+        coordinator.apply_classifications(classified, 8, after_grace);
 
-        let entries = scanner.entries.lock();
+        let entries = coordinator.entries.lock();
         assert!(!entries.contains_key(&becomes_visible));
         let entry = entries.get(&remains_detached).expect("detached candidate remains");
         assert_eq!(entry.first_seen, first_seen);
         assert_eq!(entry.verified_term, 8);
         assert!(after_grace >= entry.not_before);
         drop(entries);
-        assert_eq!(scanner.candidate_metrics(8, after_grace, true).1, 1);
+        assert_eq!(coordinator.candidate_metrics(8, after_grace, true).1, 1);
     }
 
     #[tokio::test]
@@ -641,32 +754,33 @@ mod tests {
         let mut config = cleanup_config();
         config.max_candidates = 1;
         config.max_replicas_per_scan = 1;
-        let (scanner, _storage, worker_manager, _sessions) = scanner(&dir, config, true).await;
+        let (coordinator, _storage, worker_manager, _sessions) = coordinator(&dir, config, true).await;
         let first = replica(30, 0, 1);
         let second = replica(31, 0, 1);
 
-        let classified = scanner.classify_replicas(vec![first.clone(), second.clone()]);
-        scanner.apply_classifications(classified, 1, Instant::now());
-        assert_eq!(scanner.entries.lock().len(), 1);
+        let classified = coordinator.classify_replicas(vec![first.clone(), second.clone()]);
+        coordinator.apply_classifications(classified, 1, Instant::now());
+        assert_eq!(coordinator.entries.lock().len(), 1);
 
         publish_report(&worker_manager, &[first, second]);
-        scanner.run_once().await.unwrap();
-        assert!(scanner.entries.lock().is_empty());
+        coordinator.scan_once().await.unwrap();
+        assert!(coordinator.entries.lock().is_empty());
     }
 
     #[tokio::test]
-    async fn run_once_observes_only_on_the_current_leader() {
+    async fn scan_once_observes_only_on_the_current_leader() {
         let follower_dir = TempDir::new().unwrap();
-        let (follower, _storage, follower_workers, _sessions) = scanner(&follower_dir, cleanup_config(), false).await;
+        let (follower, _storage, follower_workers, _sessions) =
+            coordinator(&follower_dir, cleanup_config(), false).await;
         let detached = replica(40, 0, 1);
         publish_report(&follower_workers, std::slice::from_ref(&detached));
-        follower.run_once().await.unwrap();
+        follower.scan_once().await.unwrap();
         assert!(follower.entries.lock().is_empty());
 
         let leader_dir = TempDir::new().unwrap();
-        let (leader, _storage, leader_workers, _sessions) = scanner(&leader_dir, cleanup_config(), true).await;
+        let (leader, _storage, leader_workers, _sessions) = coordinator(&leader_dir, cleanup_config(), true).await;
         publish_report(&leader_workers, std::slice::from_ref(&detached));
-        leader.run_once().await.unwrap();
+        leader.scan_once().await.unwrap();
         let entries = leader.entries.lock();
         assert_eq!(entries.len(), 1);
         assert!(entries.contains_key(&detached));
@@ -676,38 +790,38 @@ mod tests {
     async fn candidate_state_is_rebuilt_only_after_a_new_full_report() {
         let dir = TempDir::new().unwrap();
         let config = cleanup_config();
-        let (scanner, storage, worker_manager, sessions) = scanner(&dir, config.clone(), true).await;
+        let (coordinator, storage, worker_manager, sessions) = coordinator(&dir, config.clone(), true).await;
         let detached = replica(50, 0, 1);
         publish_report(&worker_manager, std::slice::from_ref(&detached));
-        scanner.run_once().await.unwrap();
-        assert!(scanner.entries.lock().contains_key(&detached));
+        coordinator.scan_once().await.unwrap();
+        assert!(coordinator.entries.lock().contains_key(&detached));
 
         worker_manager.reset_worker_soft_state();
-        let rebuilt = BlockCleanupScanner::new(
-            Arc::clone(&scanner.raft_node),
+        let rebuilt = BlockCleanupCoordinator::new(
+            Arc::clone(&coordinator.raft_node),
             storage,
             Arc::clone(&worker_manager),
             sessions,
             group_name(),
             &config,
         );
-        rebuilt.run_once().await.unwrap();
+        rebuilt.scan_once().await.unwrap();
         assert!(rebuilt.entries.lock().is_empty());
 
         publish_report(&worker_manager, std::slice::from_ref(&detached));
-        rebuilt.run_once().await.unwrap();
+        rebuilt.scan_once().await.unwrap();
         assert!(rebuilt.entries.lock().contains_key(&detached));
     }
 
     #[tokio::test]
     async fn final_authority_revalidation_catches_publish_after_initial_read() {
         let dir = TempDir::new().unwrap();
-        let (scanner, storage, _worker_manager, sessions) = scanner(&dir, cleanup_config(), false).await;
+        let (coordinator, storage, _worker_manager, sessions) = coordinator(&dir, cleanup_config(), false).await;
         let published = replica(60, 0, 1);
         let inode_id = persist_file(&storage, published.block_id.data_handle_id, Vec::new(), 1);
         create_session(&sessions, published.block_id.data_handle_id, inode_id);
 
-        let (initial, owner_present) = scanner.classify_authority(&published).unwrap();
+        let (initial, owner_present) = coordinator.classify_authority(&published).unwrap();
         assert_eq!(initial, CleanupDecision::Reclaimable);
         assert!(owner_present);
 
@@ -728,20 +842,20 @@ mod tests {
             .unwrap();
         sessions.remove_session_if_epoch(published.block_id.data_handle_id, 1);
 
-        let decision = scanner.revalidate_reclaimable(&published, owner_present).unwrap();
+        let decision = coordinator.revalidate_reclaimable(&published, owner_present).unwrap();
         assert_eq!(decision, CleanupDecision::Keep);
-        scanner.apply_classifications(vec![(published.clone(), decision)], 1, Instant::now());
-        assert!(!scanner.entries.lock().contains_key(&published));
+        coordinator.apply_classifications(vec![(published.clone(), decision)], 1, Instant::now());
+        assert!(!coordinator.entries.lock().contains_key(&published));
     }
 
     #[tokio::test]
     async fn authority_read_error_removes_existing_candidate() {
         let dir = TempDir::new().unwrap();
-        let (scanner, storage, _worker_manager, _sessions) = scanner(&dir, cleanup_config(), false).await;
+        let (coordinator, storage, _worker_manager, _sessions) = coordinator(&dir, cleanup_config(), false).await;
         let candidate = replica(61, 0, 1);
-        let classified = scanner.classify_replicas(vec![candidate.clone()]);
-        scanner.apply_classifications(classified, 1, Instant::now());
-        assert!(scanner.entries.lock().contains_key(&candidate));
+        let classified = coordinator.classify_replicas(vec![candidate.clone()]);
+        coordinator.apply_classifications(classified, 1, Instant::now());
+        assert!(coordinator.entries.lock().contains_key(&candidate));
 
         let inode_id = persist_file(&storage, candidate.block_id.data_handle_id, Vec::new(), 1);
         storage
@@ -754,10 +868,10 @@ mod tests {
             })
             .unwrap();
 
-        let classified = scanner.classify_replicas(vec![candidate.clone()]);
+        let classified = coordinator.classify_replicas(vec![candidate.clone()]);
         assert_eq!(classified[0].1, CleanupDecision::Wait);
-        scanner.apply_classifications(classified, 1, Instant::now());
-        assert!(!scanner.entries.lock().contains_key(&candidate));
+        coordinator.apply_classifications(classified, 1, Instant::now());
+        assert!(!coordinator.entries.lock().contains_key(&candidate));
     }
 
     #[tokio::test]
@@ -765,19 +879,233 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = cleanup_config();
         let grace = Duration::from_millis(config.reclaim_grace_ms);
-        let (scanner, _storage, _worker_manager, _sessions) = scanner(&dir, config, true).await;
-        let current_term = scanner.current_leader_term().unwrap();
+        let (coordinator, _storage, _worker_manager, _sessions) = coordinator(&dir, config, true).await;
+        let current_term = coordinator.current_leader_term().unwrap();
         let candidate = replica(62, 0, 1);
         let first_seen = Instant::now();
-        let classified = scanner.classify_replicas(vec![candidate.clone()]);
-        scanner.apply_classifications(classified, current_term, first_seen);
+        let classified = coordinator.classify_replicas(vec![candidate.clone()]);
+        coordinator.apply_classifications(classified, current_term, first_seen);
 
         let stale_scan_term = current_term + 1;
         let after_grace = first_seen + grace;
-        let classified = scanner.classify_replicas(vec![candidate.clone()]);
-        assert!(!scanner.apply_scan_if_current_leader(classified, stale_scan_term, after_grace,));
-        let entry = scanner.entries.lock().get(&candidate).cloned().unwrap();
+        let classified = coordinator.classify_replicas(vec![candidate.clone()]);
+        assert!(!coordinator.apply_scan_if_current_leader(classified, stale_scan_term, after_grace,));
+        let entry = coordinator.entries.lock().get(&candidate).cloned().unwrap();
         assert_eq!(entry.verified_term, current_term);
-        assert_eq!(scanner.candidate_metrics(stale_scan_term, after_grace, true).1, 0);
+        assert_eq!(coordinator.candidate_metrics(stale_scan_term, after_grace, true).1, 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_dispatch_requires_enablement_current_term_grace_and_retry_deadline() {
+        let dir = TempDir::new().unwrap();
+        let mut config = cleanup_config();
+        config.dispatch_enabled = true;
+        config.reclaim_grace_ms = 1;
+        let retry_initial = Duration::from_millis(config.retry_initial_backoff_ms);
+        let (coordinator, _storage, worker_manager, _sessions) = coordinator(&dir, config, true).await;
+        let candidate = replica(70, 0, 17);
+        publish_report(&worker_manager, std::slice::from_ref(&candidate));
+        coordinator.scan_once().await.unwrap();
+
+        assert!(coordinator
+            .commands_for_heartbeat(
+                &candidate.group_name,
+                candidate.worker_id,
+                candidate.worker_run_id,
+                Instant::now(),
+            )
+            .is_empty());
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        coordinator.scan_once().await.unwrap();
+        let now = Instant::now();
+        let other_run: WorkerRunId = "550e8400-e29b-41d4-a716-446655440398".parse().unwrap();
+        assert!(coordinator
+            .commands_for_heartbeat(&candidate.group_name, candidate.worker_id, other_run, now)
+            .is_empty());
+        assert!(coordinator
+            .commands_for_heartbeat(
+                &GroupName::parse("other").unwrap(),
+                candidate.worker_id,
+                candidate.worker_run_id,
+                now,
+            )
+            .is_empty());
+        let commands = coordinator.commands_for_heartbeat(
+            &candidate.group_name,
+            candidate.worker_id,
+            candidate.worker_run_id,
+            now,
+        );
+        assert_eq!(
+            commands,
+            vec![BlockCleanupCommand {
+                block_id: candidate.block_id,
+                expected_block_stamp: candidate.block_stamp,
+            }]
+        );
+        assert!(coordinator
+            .commands_for_heartbeat(&candidate.group_name, candidate.worker_id, candidate.worker_run_id, now,)
+            .is_empty());
+        assert_eq!(
+            coordinator.commands_for_heartbeat(
+                &candidate.group_name,
+                candidate.worker_id,
+                candidate.worker_run_id,
+                now + retry_initial,
+            ),
+            commands
+        );
+
+        let term = coordinator.current_leader_term().unwrap();
+        coordinator.entries.lock().get_mut(&candidate).unwrap().verified_term = term + 1;
+        assert!(coordinator
+            .commands_for_heartbeat(
+                &candidate.group_name,
+                candidate.worker_id,
+                candidate.worker_run_id,
+                now + Duration::from_secs(1),
+            )
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_dispatch_is_disabled_by_default_and_requires_a_leader() {
+        let dir = TempDir::new().unwrap();
+        let (disabled, _storage, workers, _sessions) = coordinator(&dir, cleanup_config(), true).await;
+        let candidate = replica(71, 0, 19);
+        publish_report(&workers, std::slice::from_ref(&candidate));
+        let now = Instant::now();
+        let term = disabled.current_leader_term().unwrap();
+        disabled.entries.lock().insert(
+            candidate.clone(),
+            CleanupEntry {
+                first_seen: now,
+                not_before: now,
+                next_attempt_at: now,
+                attempts: 0,
+                verified_term: term,
+            },
+        );
+        assert!(disabled
+            .commands_for_heartbeat(&candidate.group_name, candidate.worker_id, candidate.worker_run_id, now,)
+            .is_empty());
+
+        let follower_dir = TempDir::new().unwrap();
+        let mut enabled = cleanup_config();
+        enabled.dispatch_enabled = true;
+        let (follower, _storage, workers, _sessions) = coordinator(&follower_dir, enabled, false).await;
+        publish_report(&workers, std::slice::from_ref(&candidate));
+        follower.entries.lock().insert(
+            candidate.clone(),
+            CleanupEntry {
+                first_seen: now,
+                not_before: now,
+                next_attempt_at: now,
+                attempts: 0,
+                verified_term: 0,
+            },
+        );
+        assert!(follower
+            .commands_for_heartbeat(&candidate.group_name, candidate.worker_id, candidate.worker_run_id, now,)
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_dispatch_is_bounded_fair_and_drops_candidates_after_report_or_run_change() {
+        let dir = TempDir::new().unwrap();
+        let mut config = cleanup_config();
+        config.dispatch_enabled = true;
+        config.reclaim_grace_ms = 1;
+        config.max_commands_per_heartbeat = 2;
+        config.retry_max_backoff_ms = config.retry_initial_backoff_ms;
+        let (coordinator, _storage, workers, _sessions) = coordinator(&dir, config, true).await;
+        let candidates = vec![replica(74, 0, 3), replica(72, 0, 1), replica(73, 0, 2)];
+        publish_report(&workers, &candidates);
+        coordinator.scan_once().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        coordinator.scan_once().await.unwrap();
+        let now = Instant::now();
+
+        let first = coordinator.commands_for_heartbeat(
+            &group_name(),
+            candidates[0].worker_id,
+            candidates[0].worker_run_id,
+            now,
+        );
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].block_id, candidates[1].block_id);
+        assert_eq!(first[1].block_id, candidates[2].block_id);
+
+        let second = coordinator.commands_for_heartbeat(
+            &group_name(),
+            candidates[0].worker_id,
+            candidates[0].worker_run_id,
+            now + coordinator.retry_initial_backoff,
+        );
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[0].block_id, candidates[0].block_id);
+
+        workers
+            .receive_full_block_report(
+                &group_name(),
+                candidates[0].worker_id,
+                candidates[0].worker_run_id,
+                2,
+                0,
+                true,
+                Vec::new(),
+            )
+            .unwrap();
+        let later = now + Duration::from_secs(1);
+        assert!(coordinator
+            .commands_for_heartbeat(
+                &group_name(),
+                candidates[0].worker_id,
+                candidates[0].worker_run_id,
+                later,
+            )
+            .is_empty());
+        assert!(coordinator.entries.lock().is_empty());
+
+        workers
+            .receive_full_block_report(
+                &group_name(),
+                candidates[0].worker_id,
+                candidates[0].worker_run_id,
+                3,
+                0,
+                true,
+                vec![BlockReportBlock {
+                    block_id: candidates[0].block_id,
+                    block_stamp: candidates[0].block_stamp,
+                    block_state: BlockReportBlockState::Ready,
+                }],
+            )
+            .unwrap();
+        coordinator.scan_once().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        coordinator.scan_once().await.unwrap();
+
+        let replacement_run: WorkerRunId = "550e8400-e29b-41d4-a716-446655440399".parse().unwrap();
+        workers
+            .register_worker_run(
+                &group_name(),
+                candidates[0].worker_id,
+                "127.0.0.1:19001".to_string(),
+                1,
+                replacement_run,
+                None,
+            )
+            .unwrap();
+        assert!(coordinator
+            .commands_for_heartbeat(
+                &group_name(),
+                candidates[0].worker_id,
+                candidates[0].worker_run_id,
+                later,
+            )
+            .is_empty());
+        assert!(!coordinator.entries.lock().contains_key(&candidates[0]));
     }
 }

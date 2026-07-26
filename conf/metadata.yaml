@@ -23,6 +23,12 @@ metadata.group.name: "root"
 metadata.raft.node_id: 1
 metadata.raft.mode: "single"
 
+# Cleanup command dispatch stays disabled until worker-side safe deletion lands.
+metadata.cleanup.dispatch_enabled: false
+metadata.cleanup.max_commands_per_heartbeat: 32
+metadata.cleanup.retry_initial_backoff_ms: 1000
+metadata.cleanup.retry_max_backoff_ms: 60000
+
 # Root mount readiness backoff.
 metadata.bootstrap.root_ready_initial_backoff_ms: 200
 metadata.bootstrap.root_ready_max_backoff_ms: 5000

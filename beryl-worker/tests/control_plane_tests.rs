@@ -189,6 +189,7 @@ impl MetadataWorkerServiceProto for MockMetadataWorkerService {
                 worker_id,
                 accepted_worker_run_id: worker_run_id.to_string(),
                 liveness_timeout_ms: 5_000,
+                cleanup_commands: Vec::new(),
             })),
             MockHeartbeatReply::HeaderError(error) => Ok(Response::new(HeartbeatResponseProto {
                 header: Some(response_header_from_heartbeat_request(&request, Some(error))),

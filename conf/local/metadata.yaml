@@ -17,6 +17,12 @@ metadata.bootstrap.ready.timeout_ms: 10000
 metadata.bootstrap.ready.warn_after_ms: 1000
 metadata.bootstrap.ready.fail_fast: true
 
+# Worker cleanup execution is not part of the current local runtime.
+metadata.cleanup.dispatch_enabled: false
+metadata.cleanup.max_commands_per_heartbeat: 32
+metadata.cleanup.retry_initial_backoff_ms: 1000
+metadata.cleanup.retry_max_backoff_ms: 60000
+
 metadata.repair.max_queue_size: 10000
 metadata.repair.max_attempts: 3
 metadata.repair.inflight_timeout_ms: 300000

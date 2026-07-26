@@ -24,6 +24,10 @@ const METADATA_CLEANUP_SCAN_INTERVAL_MS: &str = "metadata.cleanup.scan_interval_
 const METADATA_CLEANUP_RECLAIM_GRACE_MS: &str = "metadata.cleanup.reclaim_grace_ms";
 const METADATA_CLEANUP_MAX_REPLICAS_PER_SCAN: &str = "metadata.cleanup.max_replicas_per_scan";
 const METADATA_CLEANUP_MAX_CANDIDATES: &str = "metadata.cleanup.max_candidates";
+const METADATA_CLEANUP_DISPATCH_ENABLED: &str = "metadata.cleanup.dispatch_enabled";
+const METADATA_CLEANUP_MAX_COMMANDS_PER_HEARTBEAT: &str = "metadata.cleanup.max_commands_per_heartbeat";
+const METADATA_CLEANUP_RETRY_INITIAL_BACKOFF_MS: &str = "metadata.cleanup.retry_initial_backoff_ms";
+const METADATA_CLEANUP_RETRY_MAX_BACKOFF_MS: &str = "metadata.cleanup.retry_max_backoff_ms";
 const METADATA_REPAIR_MAX_QUEUE_SIZE: &str = "metadata.repair.max_queue_size";
 const METADATA_REPAIR_MAX_ATTEMPTS: &str = "metadata.repair.max_attempts";
 const METADATA_REPAIR_INFLIGHT_TIMEOUT_MS: &str = "metadata.repair.inflight_timeout_ms";
@@ -50,7 +54,7 @@ pub struct MetadataConfig {
     pub raft: RaftConfig,
     /// Metadata authority configuration.
     pub authority: MetadataAuthorityConfig,
-    /// Observe-only block cleanup detection configuration.
+    /// Block cleanup detection and dispatch configuration.
     pub cleanup: CleanupConfig,
     /// Worker/Repair configuration.
     pub worker: WorkerConfig,
@@ -66,7 +70,7 @@ pub struct BootstrapConfig {
     pub root_readiness: RootReadinessConfig,
 }
 
-/// Observe-only block cleanup detection configuration.
+/// Block cleanup detection and dispatch configuration.
 #[derive(Clone, Debug)]
 pub struct CleanupConfig {
     /// Interval between scans.
@@ -77,6 +81,14 @@ pub struct CleanupConfig {
     pub max_replicas_per_scan: usize,
     /// Maximum number of in-memory cleanup candidates.
     pub max_candidates: usize,
+    /// Whether heartbeats may return cleanup commands.
+    pub dispatch_enabled: bool,
+    /// Maximum cleanup commands returned by one heartbeat.
+    pub max_commands_per_heartbeat: usize,
+    /// Initial retry delay after returning a cleanup command.
+    pub retry_initial_backoff_ms: u64,
+    /// Maximum retry delay after repeated cleanup commands.
+    pub retry_max_backoff_ms: u64,
 }
 
 /// Worker and repair configuration.
@@ -172,6 +184,10 @@ impl Default for CleanupConfig {
             reclaim_grace_ms: 300_000,
             max_replicas_per_scan: 10_000,
             max_candidates: 10_000,
+            dispatch_enabled: false,
+            max_commands_per_heartbeat: 32,
+            retry_initial_backoff_ms: 1_000,
+            retry_max_backoff_ms: 60_000,
         }
     }
 }
@@ -214,7 +230,17 @@ impl MetadataConfig {
             reclaim_grace_ms: get_positive_u64_or(flat, METADATA_CLEANUP_RECLAIM_GRACE_MS, 300_000)?,
             max_replicas_per_scan: get_positive_usize_or(flat, METADATA_CLEANUP_MAX_REPLICAS_PER_SCAN, 10_000)?,
             max_candidates: get_positive_usize_or(flat, METADATA_CLEANUP_MAX_CANDIDATES, 10_000)?,
+            dispatch_enabled: get_bool_or(flat, METADATA_CLEANUP_DISPATCH_ENABLED, false)?,
+            max_commands_per_heartbeat: get_positive_usize_or(flat, METADATA_CLEANUP_MAX_COMMANDS_PER_HEARTBEAT, 32)?,
+            retry_initial_backoff_ms: get_positive_u64_or(flat, METADATA_CLEANUP_RETRY_INITIAL_BACKOFF_MS, 1_000)?,
+            retry_max_backoff_ms: get_positive_u64_or(flat, METADATA_CLEANUP_RETRY_MAX_BACKOFF_MS, 60_000)?,
         };
+        if cleanup.retry_max_backoff_ms < cleanup.retry_initial_backoff_ms {
+            return Err(invalid_config(
+                METADATA_CLEANUP_RETRY_MAX_BACKOFF_MS,
+                "must be greater than or equal to metadata.cleanup.retry_initial_backoff_ms",
+            ));
+        }
 
         let repair = RepairConfig {
             max_queue_size: get_positive_usize_or(flat, METADATA_REPAIR_MAX_QUEUE_SIZE, 10000)?,
@@ -510,6 +536,10 @@ mod tests {
         assert_eq!(config.cleanup.reclaim_grace_ms, 300_000);
         assert_eq!(config.cleanup.max_replicas_per_scan, 10_000);
         assert_eq!(config.cleanup.max_candidates, 10_000);
+        assert!(!config.cleanup.dispatch_enabled);
+        assert_eq!(config.cleanup.max_commands_per_heartbeat, 32);
+        assert_eq!(config.cleanup.retry_initial_backoff_ms, 1_000);
+        assert_eq!(config.cleanup.retry_max_backoff_ms, 60_000);
         assert_eq!(config.worker.repair.max_queue_size, 10000);
         assert_eq!(config.worker.repair.max_attempts, 3);
         assert_eq!(config.worker.repair.inflight_timeout_ms, 300_000);
@@ -541,6 +571,9 @@ mod tests {
             METADATA_CLEANUP_RECLAIM_GRACE_MS,
             METADATA_CLEANUP_MAX_REPLICAS_PER_SCAN,
             METADATA_CLEANUP_MAX_CANDIDATES,
+            METADATA_CLEANUP_MAX_COMMANDS_PER_HEARTBEAT,
+            METADATA_CLEANUP_RETRY_INITIAL_BACKOFF_MS,
+            METADATA_CLEANUP_RETRY_MAX_BACKOFF_MS,
             METADATA_REPAIR_MAX_QUEUE_SIZE,
             METADATA_REPAIR_MAX_ATTEMPTS,
             METADATA_REPAIR_INFLIGHT_TIMEOUT_MS,
@@ -568,5 +601,11 @@ mod tests {
         flat.set(METADATA_REPAIR_MAX_ATTEMPTS, i64::from(u32::MAX) + 1);
         let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
         assert!(err.message.contains(METADATA_REPAIR_MAX_ATTEMPTS));
+
+        let mut flat = test_flat();
+        flat.set(METADATA_CLEANUP_RETRY_INITIAL_BACKOFF_MS, 100_i64);
+        flat.set(METADATA_CLEANUP_RETRY_MAX_BACKOFF_MS, 99_i64);
+        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
+        assert!(err.message.contains(METADATA_CLEANUP_RETRY_MAX_BACKOFF_MS));
     }
 }

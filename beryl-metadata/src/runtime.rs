@@ -5,7 +5,7 @@
 
 use crate::inflight_registry::InflightRegistry;
 use crate::maintenance::repair::{RepairPlanner, RepairPolicy, RepairQueue};
-use crate::maintenance::{BlockCleanupScanner, MaintenanceHandle, MaintenanceService};
+use crate::maintenance::{BlockCleanupCoordinator, MaintenanceHandle, MaintenanceService};
 use crate::metrics::MetadataMetrics;
 use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
 use crate::readiness::{wait_for_root_ready_with_inputs, RootReadinessGate, RootReadinessLogFields, RootReadyInputs};
@@ -87,6 +87,7 @@ pub struct WorkerBackground {
 /// Metadata maintenance lifecycle independent of worker RPC serving.
 pub struct Maintenance {
     _repair_state: MaintenanceRepairState,
+    cleanup: Arc<BlockCleanupCoordinator>,
     _maintenance_service: Arc<MaintenanceService>,
     _maintenance_handle: MaintenanceHandle,
 }
@@ -155,12 +156,17 @@ impl WorkerRuntime {
     }
 
     /// Builds the worker RPC service from required runtime state.
-    fn service(&self, authority: &MetadataAuthority) -> MetadataWorkerServiceImpl {
-        let mut service = MetadataWorkerServiceImpl::new(
+    fn service(
+        &self,
+        authority: &MetadataAuthority,
+        cleanup: Arc<BlockCleanupCoordinator>,
+    ) -> MetadataWorkerServiceImpl {
+        let mut service = MetadataWorkerServiceImpl::new_with_cleanup(
             Arc::clone(&authority.raft_node),
             Arc::clone(&self.manager),
             Arc::clone(&authority.mount_table),
             authority.group_name.clone(),
+            cleanup,
         );
         service.set_slot_metrics(Arc::clone(&authority.metadata_metrics));
 
@@ -186,12 +192,12 @@ impl MetadataServer {
     /// Builds long-lived metadata runtime objects in startup dependency order.
     ///
     /// Filesystem writes and cleanup observation share one session registry so
-    /// the scanner sees the same active-write authority as the RPC path.
+    /// the coordinator sees the same active-write authority as the RPC path.
     pub async fn build(config: Arc<MetadataConfig>) -> Result<Self, DynError> {
         crate::lifecycle::prepare_metadata_start(config.as_ref()).await?;
         let authority = build_authority(config.as_ref()).await?;
         let maintenance_repair = build_maintenance_repair_state(config.as_ref());
-        let (worker, mut worker_service) = build_worker_runtime(&authority, &maintenance_repair)?;
+        let worker = build_worker_runtime(&authority, &maintenance_repair)?;
         let readiness = build_readiness(config.as_ref(), &authority).await;
         let session_registry = Arc::new(crate::session_registry::SessionRegistry::default());
         let filesystem = build_filesystem_service_with_sessions(
@@ -211,7 +217,8 @@ impl MetadataServer {
             session_registry,
         )
         .await;
-        let worker_background = build_worker_background(&worker, &mut worker_service, &maintenance);
+        let worker_service = worker.service(&authority, Arc::clone(&maintenance.cleanup));
+        let worker_background = build_worker_background(&worker, &worker_service);
         let (services, handles) =
             compose_services(filesystem, worker_service, readiness, worker_background, maintenance);
 
@@ -325,13 +332,12 @@ pub(crate) fn build_maintenance_repair_state(config: &MetadataConfig) -> Mainten
 pub(crate) fn build_worker_runtime(
     authority: &MetadataAuthority,
     _repair: &MaintenanceRepairState,
-) -> Result<(WorkerRuntime, MetadataWorkerServiceImpl), DynError> {
+) -> Result<WorkerRuntime, DynError> {
     let worker = WorkerRuntime::new();
     worker
         .manager
         .load_registered_workers(authority.storage.list_workers()?)?;
-    let service = worker.service(authority);
-    Ok((worker, service))
+    Ok(worker)
 }
 
 /// Starts metadata maintenance after authority and worker state exist.
@@ -346,7 +352,7 @@ pub(crate) async fn build_maintenance(
     repair: MaintenanceRepairState,
     session_registry: Arc<crate::session_registry::SessionRegistry>,
 ) -> Maintenance {
-    let cleanup_scanner = Arc::new(BlockCleanupScanner::new(
+    let cleanup = Arc::new(BlockCleanupCoordinator::new(
         Arc::clone(&authority.raft_node),
         Arc::clone(&authority.storage),
         Arc::clone(&worker.manager),
@@ -360,24 +366,21 @@ pub(crate) async fn build_maintenance(
         Arc::clone(&repair.repair_queue),
         Arc::clone(&repair.repair_planner),
         repair.repair_policy,
-        cleanup_scanner,
+        Arc::clone(&cleanup),
         config.cleanup.scan_interval_ms,
     ));
     let maintenance_handle = maintenance_service.start();
 
     Maintenance {
         _repair_state: repair,
+        cleanup,
         _maintenance_service: maintenance_service,
         _maintenance_handle: maintenance_handle,
     }
 }
 
 /// Starts worker-owned background work after authority and maintenance are available.
-pub fn build_worker_background(
-    worker: &WorkerRuntime,
-    service: &mut MetadataWorkerServiceImpl,
-    _maintenance: &Maintenance,
-) -> WorkerBackground {
+pub fn build_worker_background(worker: &WorkerRuntime, service: &MetadataWorkerServiceImpl) -> WorkerBackground {
     let handle = worker.start_background(service);
 
     WorkerBackground { _handle: handle }
@@ -741,7 +744,7 @@ mod tests {
             .unwrap();
 
         let repair = build_maintenance_repair_state(&config);
-        let (worker, _service) = build_worker_runtime(&authority, &repair).unwrap();
+        let worker = build_worker_runtime(&authority, &repair).unwrap();
 
         let descriptor = worker
             .manager
@@ -761,7 +764,7 @@ mod tests {
         let config = test_config();
         let readiness = build_readiness(&config, &authority).await;
         let maintenance_repair = build_maintenance_repair_state(&config);
-        let (worker_runtime, _worker_service) = build_worker_runtime(&authority, &maintenance_repair).unwrap();
+        let worker_runtime = build_worker_runtime(&authority, &maintenance_repair).unwrap();
         let service = build_filesystem_service_with_sessions(
             &config,
             &authority,
@@ -797,7 +800,7 @@ mod tests {
         let config = test_config();
         let readiness = build_readiness(&config, &authority).await;
         let maintenance_repair = build_maintenance_repair_state(&config);
-        let (worker_runtime, _worker_service) = build_worker_runtime(&authority, &maintenance_repair).unwrap();
+        let worker_runtime = build_worker_runtime(&authority, &maintenance_repair).unwrap();
         let service = build_filesystem_service_with_sessions(
             &config,
             &authority,
@@ -832,7 +835,7 @@ mod tests {
         let config = test_config();
         let readiness = build_readiness(&config, &authority).await;
         let maintenance_repair = build_maintenance_repair_state(&config);
-        let (worker_runtime, _worker_service) = build_worker_runtime(&authority, &maintenance_repair).unwrap();
+        let worker_runtime = build_worker_runtime(&authority, &maintenance_repair).unwrap();
         let service = build_filesystem_service_with_sessions(
             &config,
             &authority,
@@ -861,7 +864,7 @@ mod tests {
         let config = test_config();
         let readiness = build_readiness(&config, &authority).await;
         let maintenance_repair = build_maintenance_repair_state(&config);
-        let (worker_runtime, _worker_service) = build_worker_runtime(&authority, &maintenance_repair).unwrap();
+        let worker_runtime = build_worker_runtime(&authority, &maintenance_repair).unwrap();
         let service = build_filesystem_service_with_sessions(
             &config,
             &authority,

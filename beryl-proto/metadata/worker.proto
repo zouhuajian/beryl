@@ -85,6 +85,14 @@ message HeartbeatResponseProto {
   string accepted_worker_run_id = 3;
   /// Local liveness timeout used by metadata for this worker run.
   uint32 liveness_timeout_ms = 4;
+  /// Bounded, retryable cleanup commands for this accepted worker run.
+  repeated BlockCleanupCommandProto cleanup_commands = 5;
+}
+
+/// Requests deletion of one exact worker-local Ready block.
+message BlockCleanupCommandProto {
+  common.BlockIdProto block_id = 1;
+  uint64 expected_block_stamp = 2;
 }
 
 // ============================================================================
