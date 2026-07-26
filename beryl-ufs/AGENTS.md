@@ -1,31 +1,41 @@
 # beryl-ufs Agent Instructions
 
+Follow the repository root `AGENTS.md`. This file adds crate-specific
+constraints.
+
 ## Crate Boundary
 
-`beryl-ufs` owns the external backend and adapter boundary. Current Beryl file IO does not use UFS for reads or writes.
+`beryl-ufs` owns external backend specifications, capability description,
+configuration, construction, and adapter mechanics. It does not own active
+metadata, worker, or client policy.
 
 ## Allowed Changes
 
-- Improve backend specs, backend-specific config, defaults, validation, and construction.
-- Improve OpenDAL adapter setup and backend capability mapping.
-- Clarify unsupported backend behavior explicitly.
-- Prepare future integration only when it preserves unified Beryl resident data semantics.
+- Improve backend specs, configuration, validation, and construction required
+  by current callers.
+- Improve adapter behavior and explicit capability mapping.
+- Surface backend limitations and operational failures precisely.
 
-## Do Not Do
+## Prohibited Changes
 
-- Do not document UFS read-through or write-through as implemented unless code proves it.
-- Do not own metadata authority, namespace policy, worker runtime behavior, or client retry/replay/cache policy.
+- Do not claim read-through, write-through, fallback, or cache behavior that is
+  not active in the supported runtime.
+- Do not own metadata authority, namespace policy, worker lifecycle, or client
+  retry/cache policy.
 - Do not depend on `beryl-metadata`, `beryl-worker`, or `beryl-client`.
-- Do not silently fake unsupported backend semantics such as rename, append, truncate, consistency, or directory behavior.
-- Do not introduce separate cache-mode semantics in current docs.
+- Do not emulate unsupported backend semantics silently.
+- Do not add speculative integration layers without a current caller.
 
 ## Cross-Crate Rules
 
-- Keep backend-specific policy isolated behind adapter boundaries.
-- Surface backend limitations through explicit capability and error contracts.
-- Future UFS integration must preserve metadata-owned visibility and unified Beryl resident data semantics.
+- Keep backend-specific mechanics isolated at the adapter boundary.
+- Expose capabilities and failures explicitly rather than selecting product
+  policy.
+- Any active integration must preserve metadata-owned visibility and the
+  supported data model.
 
-## Validation Notes
+## Focused Validation
 
-- Root workspace validation applies.
-- For focused checks, use `cargo test -p beryl-ufs`.
+```bash
+cargo test -p beryl-ufs
+```
