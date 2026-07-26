@@ -1,31 +1,40 @@
 # beryl-common Agent Instructions
 
+Follow the repository root `AGENTS.md`. This file adds crate-specific
+constraints.
+
 ## Crate Boundary
 
-`beryl-common` owns shared infrastructure: RPC error details, headers, config mechanics, retry/time helpers, observability utilities, and small crate-independent helpers.
+`beryl-common` owns crate-independent infrastructure shared by current runtime
+crates: structured errors, headers, config mechanics, retry/time helpers, and
+observability utilities.
 
 ## Allowed Changes
 
-- Improve RPC error detail and header structures without losing machine-readable detail.
-- Add config, retry, time, or observability helpers that are genuinely crate-independent.
-- Tighten validation mechanics that do not choose service policy.
-- Keep operational failures explicit and structured.
+- Improve shared error and header structures while preserving machine-readable
+  detail.
+- Add config, retry, time, or observability mechanics that are independent of
+  service policy.
+- Tighten validation and operational failure reporting at shared boundaries.
 
-## Do Not Do
+## Prohibited Changes
 
-- Do not put service-specific metadata, worker, client, or UFS behavior here.
-- Do not hide operational failures behind generic string-only errors.
-- Do not move product config semantics into common config mechanics.
-- Do not create a second error vocabulary that competes with RPC error details.
-- Do not use `beryl-common` as a dumping ground for unrelated helpers.
+- Do not put metadata, worker, client, proto, or UFS policy here.
+- Do not hide structured operational failures behind string-only errors.
+- Do not create competing error, header, config, or retry vocabularies.
+- Do not use this crate as a dumping ground for unrelated helpers.
+- Do not add a shared helper until its ownership and reuse are concrete.
 
 ## Cross-Crate Rules
 
-- Owning crates keep policy; `beryl-common` supplies mechanics.
-- Shared errors and headers must remain usable by metadata, worker, client, proto, and UFS paths.
-- Avoid dependencies that would pull runtime crates into `beryl-common`.
+- Owning crates retain policy; `beryl-common` supplies mechanics.
+- Shared values must not create dependency cycles or pull runtime crates into
+  `beryl-common`.
+- Changes to shared error or header semantics require validation in affected
+  producers and consumers.
 
-## Validation Notes
+## Focused Validation
 
-- Root workspace validation applies.
-- For focused checks, use `cargo test -p beryl-common`.
+```bash
+cargo test -p beryl-common
+```

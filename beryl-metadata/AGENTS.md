@@ -1,33 +1,60 @@
 # beryl-metadata Agent Instructions
 
+Follow the repository root `AGENTS.md`. This file adds crate-specific
+constraints.
+
 ## Crate Boundary
 
-`beryl-metadata` owns namespace, layout, visibility, leases/write sessions, worker registry, block locations, freshness, and Raft-backed metadata state.
+`beryl-metadata` owns namespace, layout, visibility, leases/write sessions,
+durable worker descriptors, worker observations, block locations, freshness,
+and Raft/RocksDB-backed metadata authority.
 
 ## Allowed Changes
 
-- Fix authority behavior for namespace, layout, visibility, lease, freshness, worker registry, or block-location paths.
-- Improve Raft/RocksDB apply, replay, snapshot, and persistence handling.
-- Tighten structured errors for consistency, availability, and storage failures.
-- Add focused coverage for authority, replay, persistence, freshness, and error contracts when code changes require it.
+- Correct authority behavior for namespace, layout, visibility, leases,
+  freshness, worker state, and block locations.
+- Improve Raft/RocksDB proposal, apply, replay, snapshot, persistence, and
+  recovery behavior.
+- Tighten structured consistency, availability, and storage failures.
+- Add focused authority, replay, persistence, freshness, concurrency, and
+  failure-recovery coverage.
 
-## Do Not Do
+## Prohibited Changes
 
-- Do not implement or claim production-ready multi-group metadata casually.
-- Do not bypass Raft-backed mutation paths for namespace, layout, visibility, lease, or worker-registration authority.
-- Do not silently swallow consistency, storage, replay, or snapshot errors.
-- Do not put worker data execution, client retry/cache policy, UFS backend behavior, or proto schema ownership here.
-- Do not infer a metadata group from `WorkerId` or fall back to a hard-coded group in production code.
-- Do not describe replication, repair, or rebalancing as complete user-facing behavior.
+- Do not mutate durable authority outside its ordered mutation path.
+- Do not treat process-local observation as durable authority.
+- Do not persist derived work without defined replay, recovery, fencing, and
+  retirement semantics.
+- Do not swallow consistency, storage, replay, or snapshot failures.
+- Do not infer authority scope from unrelated identifiers or fall back to a
+  hard-coded scope.
+- Do not put worker data execution, client retry/cache policy, UFS backend
+  behavior, or proto schema ownership here.
+- Do not expose internal maintenance mechanisms as completed product behavior.
+
+## Consistency Rules
+
+- Separate durable state, leader-local state, and worker-reported observation
+  explicitly.
+- State publication must happen before a waiting caller can observe completion.
+- Reads that require current authority must be fenced to the same leadership
+  and state assumptions used by the decision.
+- Restart and replay must either reconstruct required soft state or remain
+  unavailable until the required evidence returns.
+- Incomplete, stale, or ambiguous evidence must not authorize destructive or
+  visibility-changing decisions.
 
 ## Cross-Crate Rules
 
 - Use `beryl-types`, `beryl-common`, and `beryl-proto` for shared contracts.
-- `beryl-metadata` may depend on `beryl-ufs` only as an adapter boundary; do not document UFS as the current read/write path.
-- `beryl-worker` and `beryl-client` must not be production dependencies of `beryl-metadata`.
-- Preserve `route_epoch`, `mount_epoch`, and `GroupStateWatermark` as separate freshness domains.
+- `beryl-worker` and `beryl-client` must not be production dependencies.
+- `beryl-ufs` may be used only as an adapter boundary; metadata remains the
+  authority for namespace and visibility.
+- Keep independent freshness domains separate unless a replacement invariant is
+  designed and tested.
 
-## Validation Notes
+## Focused Validation
 
-- Root workspace validation applies.
-- For focused checks, use `cargo test -p beryl-metadata`.
+```bash
+cargo test -p beryl-metadata
+```
