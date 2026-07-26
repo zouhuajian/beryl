@@ -1,84 +1,182 @@
 # Beryl Agent Instructions
 
-`AGENTS.md` files are operational instructions for AI coding agents. Follow this file first, then the local `AGENTS.md` for every touched subtree.
+`AGENTS.md` files are operational instructions for AI coding agents. Read this
+file first, then the local `AGENTS.md` for every touched subtree. Local files
+may narrow these rules for their crate, but must not weaken them.
 
-## Project Boundary
+## Decision Order
 
-- The runtime currently focuses on one metadata group.
-- The current metadata runtime has one leader.
-- The Rust native client is the supported client interface today.
-- Reads and writes currently go through metadata-authorized worker storage.
-- UFS is not used for current reads or writes.
-- Namespace delete is active; complete physical resident-block reclamation is not productized unless explicitly implemented and tested.
-- `route_epoch`, `mount_epoch`, and `GroupStateWatermark` are active correctness mechanisms, not future-only noise.
-- Multi-group metadata is future work.
-- The internal writable namespace is rooted at `/`; `/local` has no special namespace semantics.
+Resolve engineering trade-offs in this order:
 
-## Core Rules
+1. Functional correctness.
+2. Safety and invariant preservation.
+3. Simplicity.
+4. Readability.
+5. Abstraction.
 
-- Do not claim unsupported features are implemented.
-- Do not expand scope casually.
-- Do not add placeholder abstractions to the current runtime.
-- Do not implement or document multi-group metadata, UFS read/write paths, replication, repair, FUSE, POSIX, Hadoop compatibility, or alternate transports unless explicitly requested.
-- Preserve crate ownership boundaries.
-- Prefer small correctness-preserving changes.
-- Do not perform broad refactors before behavior is covered by tests.
-- Keep docs factual and concise.
-- Keep Rust comments in English.
+Do not make implicit trade-offs between these priorities.
 
-## Architecture Ownership
+## Work Contract
+
+- Follow the user's requested mode: review, diagnose, plan, or change.
+- A read-only request does not authorize edits, formatting, staging, commits,
+  pushes, or commands that materially modify the workspace.
+- Before editing, inspect the relevant code path, local instructions, current
+  worktree state, and existing tests.
+- Preserve unrelated user changes and keep the diff limited to the requested
+  behavior.
+- State assumptions when behavior, authority, failure handling, or scope is
+  uncertain. Do not silently guess in correctness-sensitive paths.
+- Do not claim unsupported behavior, unperformed validation, or incomplete
+  lifecycle work as finished.
+
+## Scope and Design
+
+- Prefer direct, concrete implementations with clear local control flow.
+- Add an abstraction only when it enforces a real invariant or boundary,
+  isolates an external dependency, removes stable duplication, or materially
+  improves testing of critical behavior.
+- Do not add speculative traits, managers, wrappers, compatibility layers,
+  fallback paths, or parallel implementations.
+- Preserve external contracts unless the task explicitly authorizes a breaking
+  change.
+- Keep refactoring local to the behavior being changed. Do not use a focused
+  change as authorization for cross-module reorganization.
+- Remove obsolete code when replacing behavior; do not retain dead compatibility
+  paths without a current requirement.
+
+## Product Boundary
+
+- The supported runtime currently uses one metadata group and one metadata
+  leader.
+- The Rust native client is the supported client interface.
+- Reads and writes go through metadata-authorized worker storage.
+- UFS is an adapter boundary, not the active read or write path.
+- The internal writable namespace is rooted at `/`; `/local` has no special
+  namespace semantics.
+- Multi-group metadata, multiple metadata leaders, metadata peer RPC, admin
+  APIs, replication, repair, rebalancing, alternate transports, POSIX, FUSE,
+  Hadoop compatibility, and UFS-backed IO are outside the supported product
+  boundary unless explicitly requested and completed end to end.
+
+Do not add placeholder surfaces or documentation claims for unsupported
+capabilities.
+
+## Crate Ownership
 
 - `beryl-types`: stable domain and value types.
-- `beryl-common`: shared errors, headers, config mechanics, retry/time helpers, and observability utilities.
-- `beryl-proto`: protobuf/gRPC schema, generated bindings, and structural conversions.
-- `beryl-metadata`: namespace, layout, visibility, leases/write sessions, worker registry, block locations, freshness, and Raft/RocksDB-backed metadata state.
-- `beryl-worker`: local block storage, stream execution, block commit/abort/sync, registration, heartbeat, and block reports.
+- `beryl-common`: shared errors, headers, config mechanics, retry/time helpers,
+  and observability utilities.
+- `beryl-proto`: protobuf/gRPC schema, generated bindings, and structural
+  conversions.
+- `beryl-metadata`: namespace, layout, visibility, leases/write sessions,
+  worker registry, block locations, freshness, and Raft/RocksDB-backed metadata
+  authority.
+- `beryl-worker`: local block storage, stream execution, block lifecycle,
+  registration, heartbeat, and block reports.
 - `beryl-client`: Rust native API and metadata/worker RPC orchestration.
 - `beryl-ufs`: external backend and adapter boundary.
+- `beryl-e2e`: black-box coverage of the supported runtime path.
 
-Production dependency direction must stay clean:
+Production dependency direction must remain clean:
 
-- `beryl-client` must not production-depend on `beryl-metadata` or `beryl-worker`.
-- `beryl-worker` must not production-depend on `beryl-metadata` or `beryl-client`.
-- `beryl-metadata`, `beryl-worker`, and `beryl-client` should use `beryl-types`, `beryl-common`, and `beryl-proto` for shared contracts as appropriate.
-- `beryl-ufs` must not depend on `beryl-metadata`, `beryl-worker`, or `beryl-client`.
+- `beryl-client` must not production-depend on `beryl-metadata` or
+  `beryl-worker`.
+- `beryl-worker` must not production-depend on `beryl-metadata` or
+  `beryl-client`.
+- `beryl-ufs` must not depend on `beryl-metadata`, `beryl-worker`, or
+  `beryl-client`.
+- Shared contracts belong in `beryl-types`, `beryl-common`, or `beryl-proto`
+  according to their ownership.
+- Test-only dependency direction must not leak into production dependency
+  graphs.
 
-## Current Priorities
+## Correctness and Failure Handling
 
-- Keep non-ignored current-path E2E coverage green.
-- Preserve worker stream/session, Ready publish/recovery, restart/full-report convergence, and precise unavailable-block semantics.
-- Preserve metadata restart fail-closed behavior for active writes.
-- Keep freshness and owner-group routing fields intact unless replacement invariants are designed and tested.
-- Keep maintenance internals separate from productized repair/rebalance behavior.
-- Keep unsupported config and runtime surfaces fail-closed.
+- Identify the source of truth before changing distributed or persistent
+  behavior.
+- Preserve ordering, fencing, identity, freshness, visibility, and ownership
+  checks across RPC, concurrency, and restart boundaries.
+- Treat timeout, cancellation, partial IO, process restart, replay, duplicate
+  delivery, and stale state as normal failure modes.
+- Fail closed when authority, persisted state, or destructive-operation
+  preconditions cannot be verified.
+- Destructive operations must resolve an exact target, be safe under retries,
+  and have explicit crash-recovery behavior.
+- Do not treat an in-memory lock as protection for a resource whose lifetime
+  extends beyond that lock.
+- Keep IO, retries, queues, batches, and background work bounded.
+- Do not silently convert consistency failures into fallback or stale success.
+
+## Rust Code
+
+- Keep production code straightforward and use the narrowest necessary
+  visibility.
+- Do not widen visibility or add production APIs solely for tests.
+- Keep Rust comments and documentation in English.
+- Comments should explain stable responsibilities, preconditions, invariants,
+  or failure behavior. Do not record task history, review history, or temporary
+  implementation phases in production comments.
+- Avoid unnecessary `allow` attributes. Fix warnings in touched code instead of
+  suppressing them without justification.
+
+## Test Organization
+
+- Production items must appear before unit-test code.
+- New or moved inline unit tests must be contained in one
+  `#[cfg(test)] mod tests` at the end of the file.
+- When tests are split into separate files, keep the `#[cfg(test)] mod tests;`
+  declaration at the end of the production module.
+- Keep test helpers, fixtures, helper implementations, and test-only types
+  inside test modules or dedicated test files.
+- Do not add test-only re-exports, visibility widening, getters, injection
+  points, force methods, or fake APIs to production modules.
+- Test private behavior in its owning module. Test cross-module behavior through
+  existing production boundaries.
+- Prefer a small number of strong behavior and invariant tests over broad
+  implementation-detail coverage.
+- Do not test source text, item ordering, directory layout, or the absence of
+  obsolete names.
+- Preserve coverage for edge cases, concurrency, failure recovery, replay,
+  restart, wire contracts, and public behavior when relevant.
+- Existing nonconforming test layout is not authorization for unrelated
+  reorganization. Consolidate it only when the file is already in scope.
 
 ## Validation
 
-```bash
-cargo fmt --all -- --check
-cargo check --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p beryl-e2e
-cargo test --workspace
-```
+Run validation in proportion to the change and report every command not run.
 
-For documentation-only edits, also run:
+For every change:
 
 ```bash
 git diff --check
 ```
 
-## Non-goals
+For Rust code changes:
 
-- Alluxio full feature parity.
-- Production-ready multi-group metadata.
-- Multiple metadata leaders.
-- Metadata peer RPC.
-- Admin API.
-- POSIX compatibility.
-- FUSE.
-- UFS-backed read/write data path.
-- Replication, repair, or rebalancing as completed user-facing behavior.
-- Alternate transports such as QUIC or RDMA.
-- Worker peer transfer.
-- io_uring or SPDK worker runtime support.
+```bash
+cargo fmt --all --check
+cargo test -p <affected-crate>
+cargo check --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Run `cargo test -p beryl-e2e` explicitly for changes to public behavior,
+cross-crate orchestration, RPC contracts, persistence, restart, or lifecycle
+semantics. Documentation-only changes do not require Cargo validation unless
+they change generated artifacts, executable examples, or validation tooling.
+
+## Review and Handoff
+
+- Classify findings as `Blocking`, `Non-blocking`, or `Notes`.
+- For each actionable finding, identify the affected symbol or boundary,
+  impact, smallest safe correction, and required test.
+- Passing tests are regression evidence, not proof that unsupported behavior is
+  complete.
+- Commit subjects must use `<type>(<scope>): <outcome>` with `feat`, `fix`,
+  `refactor`, `test`, `docs`, or `chore` as the type.
+- Keep commit messages concise and describe the behavioral or structural
+  outcome.
+- Do not stage, commit, push, or open a pull request unless the task requests
+  that Git operation.
