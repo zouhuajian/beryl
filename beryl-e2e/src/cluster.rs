@@ -62,15 +62,15 @@ pub struct TestCluster {
 
 impl TestCluster {
     pub async fn start() -> TestResult<Self> {
-        Self::start_with_cleanup_dispatch(false).await
+        Self::start_with_cleanup_grace(None).await
     }
 
-    /// Starts a cluster with metadata cleanup dispatch enabled for lifecycle tests.
+    /// Starts a cluster with short cleanup timing for lifecycle tests.
     pub async fn start_with_cleanup() -> TestResult<Self> {
-        Self::start_with_cleanup_dispatch(true).await
+        Self::start_with_cleanup_grace(Some(1)).await
     }
 
-    async fn start_with_cleanup_dispatch(cleanup_dispatch_enabled: bool) -> TestResult<Self> {
+    async fn start_with_cleanup_grace(reclaim_grace_ms: Option<u64>) -> TestResult<Self> {
         let temp_state = TempState::new()?;
         let group_name = GroupName::parse(GROUP_NAME)?;
         let metadata_port = PortReservation::reserve_localhost().await?;
@@ -79,10 +79,9 @@ impl TestCluster {
         let worker_addr = worker_port.addr();
 
         let mut metadata_config = metadata_config(temp_state.metadata_dir(), metadata_addr, group_name.clone())?;
-        if cleanup_dispatch_enabled {
+        if let Some(reclaim_grace_ms) = reclaim_grace_ms {
             metadata_config.cleanup.scan_interval_ms = 20;
-            metadata_config.cleanup.reclaim_grace_ms = 1;
-            metadata_config.cleanup.dispatch_enabled = true;
+            metadata_config.cleanup.reclaim_grace_ms = reclaim_grace_ms;
             metadata_config.cleanup.retry_initial_backoff_ms = 20;
             metadata_config.cleanup.retry_max_backoff_ms = 100;
         }

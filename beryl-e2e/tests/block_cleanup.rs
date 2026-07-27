@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use beryl_client::CreateOptions;
+use beryl_client::{CreateOptions, DeleteOptions};
 use beryl_e2e::{data::deterministic_bytes, TestCluster};
 use bytes::Bytes;
 
@@ -29,7 +29,7 @@ async fn metadata_cleanup_commands_remove_only_deleted_file_blocks() {
     assert_eq!(cluster.physical_block_count().expect("physical block count"), 2);
 
     client
-        .delete("/cleanup/first", false)
+        .delete("/cleanup/first", DeleteOptions::default())
         .await
         .expect("delete first namespace entry");
     cluster
@@ -48,7 +48,7 @@ async fn metadata_cleanup_commands_remove_only_deleted_file_blocks() {
     assert_eq!(remaining, second);
 
     client
-        .delete("/cleanup", true)
+        .delete("/cleanup", DeleteOptions { recursive: true })
         .await
         .expect("recursively delete remaining namespace");
     cluster

@@ -230,17 +230,30 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         }
     }
 
+    /// Decodes the required breaking delete options and preserves async cleanup semantics.
+    ///
+    /// Missing options fail closed instead of falling back to the removed
+    /// legacy top-level `recursive` field.
     #[instrument(skip_all)]
     async fn delete(&self, request: Request<DeleteRequestProto>) -> Result<Response<DeleteResponseProto>, Status> {
         let req = request.into_inner();
         let req_ctx = request_context_or_error!(req, DeleteResponseProto);
+        let Some(options) = req.options else {
+            return error_response!(
+                DeleteResponseProto,
+                Self::header_from_conversion_error(
+                    &req.header,
+                    MetadataError::InvalidArgument("delete options are required".to_string()),
+                )
+            );
+        };
         match self
             .filesystem
             .delete(
                 &req_ctx,
                 DeleteArgs {
                     path: req.path,
-                    recursive: req.recursive,
+                    recursive: options.recursive,
                     freshness: Self::freshness_from_header(&req.header),
                 },
             )
@@ -784,9 +797,9 @@ mod tests {
     use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
     use beryl_proto::metadata::{
         get_block_locations_request_proto, AddBlockRequestProto, CommitFileRequestProto, CommittedBlockProto,
-        CreateDirectoryRequestProto, CreateFileRequestProto, DeleteRequestProto, GetBlockLocationsRequestProto,
-        GetStatusRequestProto, ListStatusRequestProto, OpenWriteModeProto, OpenWriteRequestProto,
-        SyncWriteRequestProto, WriteHandleProto,
+        CreateDirectoryRequestProto, CreateFileRequestProto, DeleteOptionsProto, DeleteRequestProto,
+        GetBlockLocationsRequestProto, GetStatusRequestProto, ListStatusRequestProto, OpenWriteModeProto,
+        OpenWriteRequestProto, SyncWriteRequestProto, WriteHandleProto,
     };
     use beryl_types::fs::{Extent, FileAttrs, FsErrorCode, Inode, InodeId};
     use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, MountId, WorkerId};
@@ -831,6 +844,10 @@ mod tests {
 
     fn header(client_id: u128) -> Option<RequestHeaderProto> {
         Some((&RequestHeader::new(ClientId::new(client_id))).into())
+    }
+
+    fn delete_options(recursive: bool) -> Option<DeleteOptionsProto> {
+        Some(DeleteOptionsProto { recursive })
     }
 
     fn header_with_freshness(
@@ -2307,7 +2324,7 @@ mod tests {
             Request::new(DeleteRequestProto {
                 header: header(13),
                 path: "/mnt/test/missing".to_string(),
-                recursive: false,
+                options: delete_options(false),
             }),
         )
         .await
@@ -2316,6 +2333,25 @@ mod tests {
 
         let err = header_error(response.header);
         assert_fs_errno(&err, FsErrnoProto::FsErrnoEnoent);
+    }
+
+    #[tokio::test]
+    async fn delete_requires_explicit_options() {
+        let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
+        let response = FileSystemServiceProto::delete(
+            &env.service,
+            Request::new(DeleteRequestProto {
+                header: header(130),
+                path: "/mnt/test/missing".to_string(),
+                options: None,
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+
+        let err = header_error(response.header);
+        assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
     }
 
     #[tokio::test]
@@ -2334,7 +2370,7 @@ mod tests {
             Request::new(DeleteRequestProto {
                 header: header(142),
                 path: "/mnt/test/parent/dir".to_string(),
-                recursive: true,
+                options: delete_options(true),
             }),
         )
         .await
@@ -2416,7 +2452,7 @@ mod tests {
             Request::new(DeleteRequestProto {
                 header: header(145),
                 path: "/mnt/test/dir".to_string(),
-                recursive: true,
+                options: delete_options(true),
             }),
         )
         .await
@@ -2448,7 +2484,7 @@ mod tests {
             Request::new(DeleteRequestProto {
                 header: header(145),
                 path: "/mnt/test".to_string(),
-                recursive: true,
+                options: delete_options(true),
             }),
         )
         .await
@@ -2465,7 +2501,7 @@ mod tests {
             Request::new(DeleteRequestProto {
                 header: header(148),
                 path: "/".to_string(),
-                recursive: true,
+                options: delete_options(true),
             }),
         )
         .await
@@ -2512,7 +2548,7 @@ mod tests {
             Request::new(DeleteRequestProto {
                 header: header(146),
                 path: "/mnt/test/dir".to_string(),
-                recursive: true,
+                options: delete_options(true),
             }),
         )
         .await
@@ -2555,7 +2591,7 @@ mod tests {
             Request::new(DeleteRequestProto {
                 header: header(17),
                 path: "/mnt/test/dir".to_string(),
-                recursive: false,
+                options: delete_options(false),
             }),
         )
         .await

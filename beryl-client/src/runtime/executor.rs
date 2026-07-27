@@ -14,7 +14,7 @@ use beryl_types::{BlockId, CommittedBlock, DataHandleId, FileLayout};
 use crate::api::handle::{ReadHandle, WriteHandle};
 use crate::api::options::DEFAULT_REPLICATION;
 use crate::api::path::NamespacePathBuf;
-use crate::api::{CreateOptions, DirectoryEntry, DirectoryListing, FileStatus, ListOptions};
+use crate::api::{CreateOptions, DeleteOptions, DirectoryEntry, DirectoryListing, FileStatus, ListOptions};
 use crate::config::{ClientConfig, RetryConfig};
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::{AddBlockResult, MetadataGateway, ReadLayout};
@@ -127,7 +127,13 @@ impl MetadataExecutor {
         directory_status_from_response(path, response)
     }
 
-    pub(crate) async fn delete(&self, path: NamespacePathBuf, recursive: bool) -> ClientResult<()> {
+    /// Encodes the explicit delete contract and submits it without transport replay.
+    ///
+    /// Namespace deletion is side-effecting, so an ambiguous transport outcome
+    /// is surfaced to the caller instead of replaying the mutation. Physical
+    /// block reclamation remains asynchronous after Metadata commits the
+    /// namespace change.
+    pub(crate) async fn delete(&self, path: NamespacePathBuf, options: DeleteOptions) -> ClientResult<()> {
         let path = path.into_string();
         let operation = self.operation("Delete", Some(path.clone()), self.operation_deadline())?;
         self.execute_without_transport_retry(
@@ -135,7 +141,9 @@ impl MetadataExecutor {
             beryl_proto::metadata::DeleteRequestProto {
                 header: None,
                 path,
-                recursive,
+                options: Some(beryl_proto::metadata::DeleteOptionsProto {
+                    recursive: options.recursive,
+                }),
             },
             |gateway, ctx, req| async move { gateway.delete(ctx, req).await },
         )

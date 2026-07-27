@@ -23,8 +23,8 @@ metadata.group.name: "root"
 metadata.raft.node_id: 1
 metadata.raft.mode: "single"
 
-# Worker execution is available; dispatch stays off pending controlled enablement.
-metadata.cleanup.dispatch_enabled: false
+# Worker cleanup execution is enabled; set false only as an operational kill switch.
+metadata.cleanup.dispatch_enabled: true
 metadata.cleanup.max_commands_per_heartbeat: 32
 metadata.cleanup.retry_initial_backoff_ms: 1000
 metadata.cleanup.retry_max_backoff_ms: 60000

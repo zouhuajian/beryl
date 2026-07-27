@@ -12,5 +12,5 @@ mod status;
 pub use beryl_types::{BlockFormatId, FileAttrs, InodeKind};
 pub use client::FsClient;
 pub use handle::{FileReader, FileWriter};
-pub use options::{CreateOptions, ListOptions};
+pub use options::{CreateOptions, DeleteOptions, ListOptions};
 pub use status::{DirectoryEntry, DirectoryListing, FileStatus};

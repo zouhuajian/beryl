@@ -6,7 +6,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use super::{CreateOptions, DirectoryListing, FileReader, FileStatus, FileWriter, ListOptions};
+use super::{CreateOptions, DeleteOptions, DirectoryListing, FileReader, FileStatus, FileWriter, ListOptions};
 use crate::api::path::NamespacePathBuf;
 use crate::config::ClientConfig;
 use crate::data::WorkerDataPlane;
@@ -90,9 +90,12 @@ impl FsClient {
     }
 
     /// Delete a file, symlink, or directory through the metadata runtime.
-    pub async fn delete(&self, path: &str, recursive: bool) -> ClientResult<()> {
+    ///
+    /// Namespace visibility changes atomically at metadata. Physical block
+    /// reclamation follows the configured metadata grace period asynchronously.
+    pub async fn delete(&self, path: &str, options: DeleteOptions) -> ClientResult<()> {
         let path = NamespacePathBuf::parse(path)?;
-        self.runtime.executor.delete(path, recursive).await
+        self.runtime.executor.delete(path, options).await
     }
 
     /// Rename a namespace entry through the metadata runtime.
@@ -270,7 +273,7 @@ mod tests {
                     .await
                     .expect_err("non-recursive CreateDirectory ambiguity must fail closed"),
                 "delete" => client
-                    .delete("/alpha", false)
+                    .delete("/alpha", DeleteOptions::default())
                     .await
                     .expect_err("Delete ambiguity must fail closed"),
                 "rename" => client
@@ -544,7 +547,10 @@ mod tests {
             )
             .await
             .expect("list with options");
-        client.delete("/alpha", false).await.expect("delete");
+        client
+            .delete("/alpha", DeleteOptions { recursive: true })
+            .await
+            .expect("delete");
         client.rename("/alpha", "/beta").await.expect("rename");
 
         assert_eq!(reader.path(), "/alpha");
@@ -565,6 +571,10 @@ mod tests {
         assert!(list_requests[1].recursive);
         assert_eq!(list_requests[1].cursor, vec![1, 2, 3]);
         assert_eq!(list_requests[1].limit, 50);
+        let delete_requests = gateway.delete_requests();
+        assert_eq!(delete_requests.len(), 1);
+        let delete_options = delete_requests[0].options.as_ref().expect("delete options");
+        assert!(delete_options.recursive);
         assert_eq!(
             methods(&gateway.calls()),
             vec![
@@ -1404,6 +1414,7 @@ mod tests {
         calls: Mutex<Vec<RecordedCall>>,
         layouts: Mutex<VecDeque<ReadLayout>>,
         list_requests: Mutex<Vec<beryl_proto::metadata::ListStatusRequestProto>>,
+        delete_requests: Mutex<Vec<beryl_proto::metadata::DeleteRequestProto>>,
         create_directory_requests: Mutex<Vec<(String, bool)>>,
         next_offsets: Mutex<HashMap<u64, u64>>,
         next_block_indexes: Mutex<HashMap<u64, u32>>,
@@ -1428,6 +1439,10 @@ mod tests {
 
         fn list_requests(&self) -> Vec<beryl_proto::metadata::ListStatusRequestProto> {
             self.list_requests.lock().expect("list requests").clone()
+        }
+
+        fn delete_requests(&self) -> Vec<beryl_proto::metadata::DeleteRequestProto> {
+            self.delete_requests.lock().expect("delete requests").clone()
         }
 
         fn create_directory_requests(&self) -> Vec<(String, bool)> {
@@ -1757,9 +1772,10 @@ mod tests {
         async fn delete(
             &self,
             ctx: AttemptContext,
-            _req: beryl_proto::metadata::DeleteRequestProto,
+            req: beryl_proto::metadata::DeleteRequestProto,
         ) -> ClientResult<DeleteResponseProto> {
             self.record("delete", &ctx);
+            self.delete_requests.lock().expect("delete requests").push(req);
             Self::apply_metadata_outcome(self.next_mutation_outcome(), "Delete")?;
             Ok(DeleteResponseProto::default())
         }

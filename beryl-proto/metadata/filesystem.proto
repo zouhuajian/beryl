@@ -163,10 +163,14 @@ message CreateDirectoryResponseProto {
   FileAttrsProto attrs = 2;
 }
 
+message DeleteOptionsProto {
+  bool recursive = 1;
+}
+
 message DeleteRequestProto {
   common.RequestHeaderProto header = 1;
   string path = 2;
-  bool recursive = 3;
+  DeleteOptionsProto options = 3;
 }
 
 message DeleteResponseProto {
