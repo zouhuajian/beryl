@@ -21,7 +21,10 @@ use beryl_types::{GroupName, Tier, WorkerId, WorkerRunId};
 use beryl_worker::config::{
     StoreDirConfig, WorkerConfig as WorkerServiceConfig, WorkerRegistrationConfig, WorkerStoreConfig,
 };
-use beryl_worker::control::{prepare_worker_start, MetadataBlockReportLoop, MetadataHeartbeatLoop, MetadataRegistrar};
+use beryl_worker::control::{
+    prepare_worker_start, BlockCleanupExecutor, BlockCleanupOptions, MetadataBlockReportLoop, MetadataHeartbeatLoop,
+    MetadataRegistrar,
+};
 use beryl_worker::net::config::WorkerNetConfig;
 use beryl_worker::store::dirs::StoreDirs;
 use beryl_worker::WorkerCore;
@@ -59,6 +62,15 @@ pub struct TestCluster {
 
 impl TestCluster {
     pub async fn start() -> TestResult<Self> {
+        Self::start_with_cleanup_dispatch(false).await
+    }
+
+    /// Starts a cluster with metadata cleanup dispatch enabled for lifecycle tests.
+    pub async fn start_with_cleanup() -> TestResult<Self> {
+        Self::start_with_cleanup_dispatch(true).await
+    }
+
+    async fn start_with_cleanup_dispatch(cleanup_dispatch_enabled: bool) -> TestResult<Self> {
         let temp_state = TempState::new()?;
         let group_name = GroupName::parse(GROUP_NAME)?;
         let metadata_port = PortReservation::reserve_localhost().await?;
@@ -66,7 +78,14 @@ impl TestCluster {
         let worker_port = PortReservation::reserve_localhost().await?;
         let worker_addr = worker_port.addr();
 
-        let metadata_config = metadata_config(temp_state.metadata_dir(), metadata_addr, group_name.clone())?;
+        let mut metadata_config = metadata_config(temp_state.metadata_dir(), metadata_addr, group_name.clone())?;
+        if cleanup_dispatch_enabled {
+            metadata_config.cleanup.scan_interval_ms = 20;
+            metadata_config.cleanup.reclaim_grace_ms = 1;
+            metadata_config.cleanup.dispatch_enabled = true;
+            metadata_config.cleanup.retry_initial_backoff_ms = 20;
+            metadata_config.cleanup.retry_max_backoff_ms = 100;
+        }
         format_metadata_storage(&metadata_config).await?;
         let (metadata_server, worker_manager) =
             start_metadata_instance(&metadata_config, metadata_port.into_listener()).await?;
@@ -131,6 +150,14 @@ impl TestCluster {
         let primary = self.block_store.scan_group_blocks(&self.group_name)?.len();
         self.additional_workers.iter().try_fold(primary, |count, worker| {
             Ok(count + worker.block_store.scan_group_blocks(&self.group_name)?.len())
+        })
+    }
+
+    /// Returns blocks whose local reclamation has fully updated store accounting.
+    pub fn physical_block_count(&self) -> TestResult<usize> {
+        let primary = store_report_block_count(&self.block_store)?;
+        self.additional_workers.iter().try_fold(primary, |count, worker| {
+            Ok(count + store_report_block_count(&worker.block_store)?)
         })
     }
 
@@ -311,6 +338,19 @@ impl TestCluster {
     }
 
     pub async fn converge_block_reports(&self) -> TestResult<()> {
+        if self.metadata_process.is_some() {
+            send_full_block_report_to_external_metadata(&self.heartbeat, &self.block_report, &self.block_store).await?;
+            for worker in &self.additional_workers {
+                send_full_block_report_to_external_metadata(
+                    &worker.heartbeat,
+                    &worker.block_report,
+                    &worker.block_store,
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+
         readiness::converge_block_reports(
             &self.heartbeat,
             &self.block_report,
@@ -334,6 +374,66 @@ impl TestCluster {
             .await?;
         }
         Ok(())
+    }
+
+    /// Drives cleanup until physical deletion and metadata absence both converge.
+    ///
+    /// Heartbeats deliver cleanup commands and delta reports publish completion.
+    /// In-process metadata is also checked for location removal; external
+    /// metadata receives a final full report because its location state is not
+    /// directly observable from this test harness.
+    pub async fn converge_cleanup(&self, expected_physical_blocks: usize) -> TestResult<()> {
+        let external_metadata = self.metadata_process.is_some();
+        readiness::ReadinessCheck::startup("block cleanup convergence")
+            .wait_for_async(|| async {
+                if readiness::send_heartbeat(&self.heartbeat, &self.block_store)
+                    .await
+                    .is_err()
+                {
+                    return false;
+                }
+                let Ok(_round) = self.block_report.send_delta_once().await else {
+                    return false;
+                };
+                for worker in &self.additional_workers {
+                    if readiness::send_heartbeat(&worker.heartbeat, &worker.block_store)
+                        .await
+                        .is_err()
+                    {
+                        return false;
+                    }
+                    let Ok(_round) = worker.block_report.send_delta_once().await else {
+                        return false;
+                    };
+                }
+                if self.physical_block_count().ok() != Some(expected_physical_blocks) {
+                    return false;
+                }
+                if !external_metadata {
+                    return self.worker_manager.get_all_locations_count() == expected_physical_blocks;
+                }
+
+                if send_full_block_report_to_external_metadata(&self.heartbeat, &self.block_report, &self.block_store)
+                    .await
+                    .is_err()
+                {
+                    return false;
+                }
+                for worker in &self.additional_workers {
+                    if send_full_block_report_to_external_metadata(
+                        &worker.heartbeat,
+                        &worker.block_report,
+                        &worker.block_store,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return false;
+                    }
+                }
+                true
+            })
+            .await
     }
 
     pub async fn shutdown(&mut self) -> TestResult<()> {
@@ -384,6 +484,14 @@ metadata.rpc.addr: {rpc_addr:?}
 metadata.rpc.port: {rpc_port}
 metadata.raft.mode: "single"
 metadata.raft.node_id: 1
+metadata.cleanup.scan_interval_ms: {cleanup_scan_interval_ms}
+metadata.cleanup.reclaim_grace_ms: {cleanup_reclaim_grace_ms}
+metadata.cleanup.max_replicas_per_scan: {cleanup_max_replicas_per_scan}
+metadata.cleanup.max_candidates: {cleanup_max_candidates}
+metadata.cleanup.dispatch_enabled: {cleanup_dispatch_enabled}
+metadata.cleanup.max_commands_per_heartbeat: {cleanup_max_commands_per_heartbeat}
+metadata.cleanup.retry_initial_backoff_ms: {cleanup_retry_initial_backoff_ms}
+metadata.cleanup.retry_max_backoff_ms: {cleanup_retry_max_backoff_ms}
 metadata.bootstrap.ready.timeout_ms: 10000
 metadata.bootstrap.ready.warn_after_ms: 1000
 metadata.bootstrap.ready.fail_fast: false
@@ -398,11 +506,28 @@ observe.metrics.prometheus.path: "/metrics"
             storage_dir = storage_dir,
             rpc_addr = self.metadata_addr.ip().to_string(),
             rpc_port = self.metadata_addr.port(),
+            cleanup_scan_interval_ms = self.metadata_config.cleanup.scan_interval_ms,
+            cleanup_reclaim_grace_ms = self.metadata_config.cleanup.reclaim_grace_ms,
+            cleanup_max_replicas_per_scan = self.metadata_config.cleanup.max_replicas_per_scan,
+            cleanup_max_candidates = self.metadata_config.cleanup.max_candidates,
+            cleanup_dispatch_enabled = self.metadata_config.cleanup.dispatch_enabled,
+            cleanup_max_commands_per_heartbeat = self.metadata_config.cleanup.max_commands_per_heartbeat,
+            cleanup_retry_initial_backoff_ms = self.metadata_config.cleanup.retry_initial_backoff_ms,
+            cleanup_retry_max_backoff_ms = self.metadata_config.cleanup.retry_max_backoff_ms,
             metrics_addr = metrics_addr.to_string(),
         );
         std::fs::write(&config_path, config)?;
         Ok(config_path)
     }
+}
+
+fn store_report_block_count(store: &StoreDirs) -> TestResult<usize> {
+    store.report()?.dirs.iter().try_fold(0usize, |count, dir| {
+        usize::try_from(dir.block_count)
+            .ok()
+            .and_then(|dir_count| count.checked_add(dir_count))
+            .ok_or_else(|| "worker physical block count overflow".into())
+    })
 }
 
 impl Drop for TestCluster {
@@ -432,6 +557,19 @@ async fn register_worker_with_external_metadata(
     let report = block_report.send_full_once().await?;
     if report.accepted_peers == 0 || report.needs_register || report.worker_run_mismatch {
         return Err(format!("external metadata rejected full block report: {report:?}").into());
+    }
+    Ok(())
+}
+
+async fn send_full_block_report_to_external_metadata(
+    heartbeat: &MetadataHeartbeatLoop,
+    block_report: &MetadataBlockReportLoop,
+    block_store: &StoreDirs,
+) -> TestResult<()> {
+    readiness::send_heartbeat(heartbeat, block_store).await?;
+    let round = block_report.send_full_once().await?;
+    if round.accepted_peers == 0 || round.needs_register || round.worker_run_mismatch {
+        return Err(format!("external metadata rejected full block report: {round:?}").into());
     }
     Ok(())
 }
@@ -486,28 +624,35 @@ fn start_worker_instance(
         descriptor.clone(),
         Arc::clone(&registration_state),
     )?;
-    let heartbeat = MetadataHeartbeatLoop::new(
-        worker_config.metadata.clone(),
-        descriptor.clone(),
-        Arc::clone(&registration_state),
-    )?;
     let block_store = Arc::new(StoreDirs::open(
         worker_config.store.dirs.clone(),
         worker_config.store.reserve_space_bytes,
         worker_config.store.check_interval_ms,
     )?);
-    let block_report = MetadataBlockReportLoop::new(
-        worker_config.metadata.clone(),
-        descriptor,
-        Arc::clone(&registration_state),
-        Arc::clone(&block_store),
-    )?;
     let worker_core = Arc::new(WorkerCore::with_local_store(
         worker_config.default_frame_size,
         worker_config.max_frame_size,
         Duration::from_millis(worker_config.stream_idle_timeout_ms),
         Arc::clone(&block_store) as Arc<dyn beryl_worker::store::block::LocalBlockStore + Send + Sync>,
     ));
+    let cleanup = BlockCleanupExecutor::start(
+        Arc::clone(&worker_core),
+        Arc::clone(&registration_state),
+        BlockCleanupOptions::default(),
+    )?;
+    let heartbeat = MetadataHeartbeatLoop::new(
+        worker_config.metadata.clone(),
+        descriptor.clone(),
+        Arc::clone(&registration_state),
+        cleanup,
+    )?;
+    let block_report = MetadataBlockReportLoop::new(
+        worker_config.metadata.clone(),
+        descriptor,
+        Arc::clone(&registration_state),
+        Arc::clone(&block_store),
+        Arc::clone(&worker_core),
+    )?;
     let worker_server = WorkerServiceInstance::start(listener, worker_core, Arc::clone(&registration_state));
     Ok(StartedWorkerService {
         worker_id,

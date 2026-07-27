@@ -35,14 +35,27 @@ struct BlockAccessKey {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlockAccessState {
-    Available { pins: usize },
-    Reclaiming { pins: usize, operation_active: bool },
+    Available {
+        pins: usize,
+    },
+    Reclaiming {
+        pins: usize,
+        operation_active: bool,
+        block_stamp: u64,
+    },
 }
 
 #[derive(Debug, Default)]
 struct BlockAccessRegistry {
     states: Mutex<HashMap<BlockAccessKey, BlockAccessState>>,
     changed: Notify,
+}
+
+/// Exact block version currently excluded from new readers for reclamation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReclaimingBlock {
+    pub block_id: BlockId,
+    pub block_stamp: u64,
 }
 
 /// RAII guard that keeps a Ready block available for one complete read stream.
@@ -125,7 +138,11 @@ impl BlockAccessRegistry {
     }
 
     /// Starts or resumes reclamation and waits for all previously pinned readers.
-    async fn begin_reclaim(self: &Arc<Self>, key: BlockAccessKey) -> WorkerCoreResult<ReclaimPermit> {
+    async fn begin_reclaim(
+        self: &Arc<Self>,
+        key: BlockAccessKey,
+        expected_block_stamp: u64,
+    ) -> WorkerCoreResult<ReclaimPermit> {
         {
             let mut states = self.states.lock().expect("block access state poisoned");
             match states.get_mut(&key) {
@@ -136,18 +153,43 @@ impl BlockAccessRegistry {
                         BlockAccessState::Reclaiming {
                             pins,
                             operation_active: true,
+                            block_stamp: expected_block_stamp,
                         },
                     );
                 }
                 Some(BlockAccessState::Reclaiming {
-                    operation_active: true, ..
+                    operation_active: true,
+                    block_stamp,
+                    ..
                 }) => {
+                    if *block_stamp != expected_block_stamp {
+                        return Err(WorkerError::RefreshMetadata {
+                            kind: ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
+                            message: format!(
+                                "local block reclamation already targets a different stamp: group_name={}, block_id={}, requested={}, active={}",
+                                key.group_name, key.block_id, expected_block_stamp, block_stamp
+                            ),
+                        });
+                    }
                     return Err(WorkerError::Unavailable(format!(
                         "local block reclamation is already running: group_name={}, block_id={}",
                         key.group_name, key.block_id
                     )));
                 }
-                Some(BlockAccessState::Reclaiming { operation_active, .. }) => {
+                Some(BlockAccessState::Reclaiming {
+                    operation_active,
+                    block_stamp,
+                    ..
+                }) => {
+                    if *block_stamp != expected_block_stamp {
+                        return Err(WorkerError::RefreshMetadata {
+                            kind: ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
+                            message: format!(
+                                "local block reclamation is fenced by a different stamp: group_name={}, block_id={}, requested={}, reclaiming={}",
+                                key.group_name, key.block_id, expected_block_stamp, block_stamp
+                            ),
+                        });
+                    }
                     *operation_active = true;
                 }
                 None => {
@@ -156,6 +198,7 @@ impl BlockAccessRegistry {
                         BlockAccessState::Reclaiming {
                             pins: 0,
                             operation_active: true,
+                            block_stamp: expected_block_stamp,
                         },
                     );
                 }
@@ -227,6 +270,25 @@ impl BlockAccessRegistry {
         drop(states);
         self.changed.notify_waiters();
     }
+
+    /// Snapshots exact versions currently fenced from new readers for reporting.
+    fn reclaiming_blocks(&self, group_name: &GroupName) -> Vec<ReclaimingBlock> {
+        let states = self.states.lock().expect("block access state poisoned");
+        let mut blocks = states
+            .iter()
+            .filter_map(|(key, state)| match state {
+                BlockAccessState::Reclaiming { block_stamp, .. } if &key.group_name == group_name => {
+                    Some(ReclaimingBlock {
+                        block_id: key.block_id,
+                        block_stamp: *block_stamp,
+                    })
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        blocks.sort_by_key(|block| (block.block_id.data_handle_id.as_raw(), block.block_id.index.as_raw()));
+        blocks
+    }
 }
 
 /// Block-level facade for open and commit decisions.
@@ -279,13 +341,22 @@ impl BlockManager {
         &self,
         group_name: &GroupName,
         block_id: BlockId,
+        expected_block_stamp: u64,
     ) -> WorkerCoreResult<ReclaimPermit> {
         self.access
-            .begin_reclaim(BlockAccessKey {
-                group_name: group_name.clone(),
-                block_id,
-            })
+            .begin_reclaim(
+                BlockAccessKey {
+                    group_name: group_name.clone(),
+                    block_id,
+                },
+                expected_block_stamp,
+            )
             .await
+    }
+
+    /// Lists exact block versions currently fenced from new readers.
+    pub(crate) fn reclaiming_blocks(&self, group_name: &GroupName) -> Vec<ReclaimingBlock> {
+        self.access.reclaiming_blocks(group_name)
     }
 
     pub fn validate_read(
@@ -413,7 +484,7 @@ mod tests {
         let reclaim_manager = manager.clone();
         let reclaim = tokio::spawn(async move {
             reclaim_manager
-                .begin_reclaim(&group_name(), block_id())
+                .begin_reclaim(&group_name(), block_id(), 41)
                 .await
                 .expect("reclaim permit")
         });
@@ -450,7 +521,7 @@ mod tests {
     async fn failed_reclaim_remains_fenced_and_can_resume() {
         let manager = BlockManager::default();
         let permit = manager
-            .begin_reclaim(&group_name(), block_id())
+            .begin_reclaim(&group_name(), block_id(), 41)
             .await
             .expect("first reclaim permit");
         drop(permit);
@@ -460,7 +531,7 @@ mod tests {
             Err(WorkerError::RefreshMetadata { .. })
         ));
         manager
-            .begin_reclaim(&group_name(), block_id())
+            .begin_reclaim(&group_name(), block_id(), 41)
             .await
             .expect("resumed reclaim permit")
             .complete();

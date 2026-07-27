@@ -1,0 +1,725 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Beryl Contributors
+
+//! Bounded execution of metadata-authorized block cleanup commands.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use beryl_common::error::rpc::{ErrorKind, WorkerErrorKind};
+use beryl_types::{BlockId, GroupName, WorkerId, WorkerRunId};
+use tokio::sync::{mpsc, Semaphore};
+use tokio::task::JoinSet;
+use tracing::{info, warn};
+
+use crate::control::{Registration, RegistrationSet};
+use crate::error::WorkerError;
+use crate::observe;
+use crate::{ReclaimBlockRequest, ReclaimBlockResult, WorkerCore};
+
+/// One exact block version received from an authenticated heartbeat response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockCleanupCommand {
+    /// Logical identity of the block selected by metadata.
+    pub block_id: BlockId,
+    /// Exact immutable local version that the worker is authorized to remove.
+    pub expected_block_stamp: u64,
+}
+
+/// Bounds process-local cleanup work and retry pressure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockCleanupOptions {
+    /// Maximum number of distinct queued and active cleanup commands.
+    pub max_pending: usize,
+    /// Maximum number of local reclamation attempts that may run concurrently.
+    pub max_concurrent: usize,
+    /// Delay before retrying the first transient local failure.
+    pub retry_initial_backoff: Duration,
+    /// Upper bound for exponential retry backoff.
+    pub retry_max_backoff: Duration,
+}
+
+impl Default for BlockCleanupOptions {
+    fn default() -> Self {
+        Self {
+            max_pending: 1_024,
+            max_concurrent: 4,
+            retry_initial_backoff: Duration::from_millis(100),
+            retry_max_backoff: Duration::from_secs(30),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CleanupReplicaKey {
+    group_name: GroupName,
+    worker_id: WorkerId,
+    worker_run_id: WorkerRunId,
+    block_id: BlockId,
+    block_stamp: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupPhase {
+    Queued,
+    Reclaiming,
+}
+
+struct BlockCleanupInner {
+    core: Arc<WorkerCore>,
+    registrations: Arc<RegistrationSet>,
+    options: BlockCleanupOptions,
+    pending: Mutex<HashMap<CleanupReplicaKey, CleanupPhase>>,
+    concurrency: Arc<Semaphore>,
+}
+
+/// Process-run-local executor for exact, idempotent block cleanup commands.
+///
+/// Accepted work is bounded across queued and active tasks. Exact duplicates
+/// are coalesced, transient local failures retry with capped backoff, and a
+/// block-stamp mismatch is dropped so a later report can authorize the actual
+/// local version.
+#[derive(Clone)]
+pub struct BlockCleanupExecutor {
+    inner: Arc<BlockCleanupInner>,
+    sender: mpsc::Sender<CleanupReplicaKey>,
+}
+
+impl BlockCleanupExecutor {
+    /// Starts the process-local cleanup executor on the current Tokio runtime.
+    ///
+    /// The executor deliberately has no durable queue: metadata rediscovers
+    /// remaining Ready replicas from block reports after worker restart. This
+    /// method fails only when the configured queue or retry bounds are invalid.
+    pub fn start(
+        core: Arc<WorkerCore>,
+        registrations: Arc<RegistrationSet>,
+        options: BlockCleanupOptions,
+    ) -> Result<Self, WorkerError> {
+        validate_options(&options)?;
+        let (sender, receiver) = mpsc::channel(options.max_pending);
+        let inner = Arc::new(BlockCleanupInner {
+            core,
+            registrations,
+            concurrency: Arc::new(Semaphore::new(options.max_concurrent)),
+            options,
+            pending: Mutex::new(HashMap::new()),
+        });
+        tokio::spawn(run_executor(Arc::clone(&inner), receiver));
+        Ok(Self { inner, sender })
+    }
+
+    /// Enqueues authenticated commands bound to one accepted worker run.
+    ///
+    /// Exact duplicates are coalesced. Queue saturation drops only the local
+    /// work item; metadata will redispatch the still-reported Ready replica
+    /// after its retry backoff.
+    pub fn enqueue(&self, registration: &Registration, commands: impl IntoIterator<Item = BlockCleanupCommand>) {
+        for command in commands {
+            let key = CleanupReplicaKey {
+                group_name: registration.group_name.clone(),
+                worker_id: registration.worker_id,
+                worker_run_id: registration.worker_run_id,
+                block_id: command.block_id,
+                block_stamp: command.expected_block_stamp,
+            };
+
+            let mut pending = self.inner.pending.lock().expect("cleanup state poisoned");
+            if pending.contains_key(&key) {
+                observe::record_cleanup_enqueue("duplicate");
+                continue;
+            }
+            if pending.len() >= self.inner.options.max_pending {
+                observe::record_cleanup_enqueue("full");
+                warn!(
+                    group_name = %key.group_name,
+                    worker_id = key.worker_id.as_raw(),
+                    worker_run_id = %key.worker_run_id,
+                    block_id = %key.block_id,
+                    "Worker cleanup queue is full; metadata must retry the command"
+                );
+                continue;
+            }
+            pending.insert(key.clone(), CleanupPhase::Queued);
+            observe::set_cleanup_queue_depth(pending.len());
+            drop(pending);
+
+            if self.sender.try_send(key.clone()).is_err() {
+                let mut pending = self.inner.pending.lock().expect("cleanup state poisoned");
+                pending.remove(&key);
+                observe::set_cleanup_queue_depth(pending.len());
+                observe::record_cleanup_enqueue("unavailable");
+            } else {
+                observe::record_cleanup_enqueue("accepted");
+            }
+        }
+    }
+}
+
+/// Drains the bounded command channel and owns all process-local cleanup tasks.
+///
+/// Closing the channel aborts active tasks and clears transient bookkeeping;
+/// any undeleted replica remains discoverable through a later block report.
+async fn run_executor(inner: Arc<BlockCleanupInner>, mut receiver: mpsc::Receiver<CleanupReplicaKey>) {
+    let mut tasks = JoinSet::new();
+    loop {
+        tokio::select! {
+            command = receiver.recv() => {
+                let Some(key) = command else {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    inner.pending.lock().expect("cleanup state poisoned").clear();
+                    observe::set_cleanup_queue_depth(0);
+                    observe::set_cleanup_reclaiming(0);
+                    return;
+                };
+                tasks.spawn(run_cleanup_task(Arc::clone(&inner), key));
+            }
+            completed = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    warn!(%error, "Worker cleanup task terminated unexpectedly");
+                }
+            }
+        }
+    }
+}
+
+/// Reclaims one exact replica while its worker registration remains current.
+///
+/// Registration is rechecked after waiting for the concurrency permit so work
+/// queued for an obsolete worker run cannot reach local storage. Stamp mismatch
+/// is terminal for this command; other local failures retry indefinitely with
+/// capped backoff because metadata has already authorized this exact version.
+async fn run_cleanup_task(inner: Arc<BlockCleanupInner>, key: CleanupReplicaKey) {
+    let mut attempts = 0u32;
+    loop {
+        if !registration_matches(&inner.registrations, &key) {
+            finish_task(&inner, &key);
+            observe::record_cleanup_result("stale_run");
+            return;
+        }
+        let Ok(concurrency) = Arc::clone(&inner.concurrency).acquire_owned().await else {
+            finish_task(&inner, &key);
+            return;
+        };
+        if !registration_matches(&inner.registrations, &key) {
+            drop(concurrency);
+            finish_task(&inner, &key);
+            observe::record_cleanup_result("stale_run");
+            return;
+        }
+        mark_reclaiming(&inner, &key);
+
+        let request = ReclaimBlockRequest {
+            group_name: key.group_name.clone(),
+            block_id: key.block_id,
+            expected_block_stamp: key.block_stamp,
+        };
+        match inner.core.reclaim_block(request).await {
+            Ok(ReclaimBlockResult::Deleted { .. }) => {
+                finish_task(&inner, &key);
+                observe::record_cleanup_result("deleted");
+                info!(
+                    group_name = %key.group_name,
+                    worker_id = key.worker_id.as_raw(),
+                    worker_run_id = %key.worker_run_id,
+                    block_id = %key.block_id,
+                    block_stamp = key.block_stamp,
+                    "Worker reclaimed metadata-authorized block"
+                );
+                return;
+            }
+            Ok(ReclaimBlockResult::AlreadyAbsent) => {
+                finish_task(&inner, &key);
+                observe::record_cleanup_result("already_absent");
+                return;
+            }
+            Err(error) if is_block_stamp_mismatch(&error) => {
+                finish_task(&inner, &key);
+                observe::record_cleanup_result("stamp_mismatch");
+                warn!(
+                    group_name = %key.group_name,
+                    worker_id = key.worker_id.as_raw(),
+                    worker_run_id = %key.worker_run_id,
+                    block_id = %key.block_id,
+                    expected_block_stamp = key.block_stamp,
+                    %error,
+                    "Worker rejected stale block cleanup command"
+                );
+                return;
+            }
+            Err(error) => {
+                attempts = attempts.saturating_add(1);
+                observe::record_cleanup_result("retry");
+                warn!(
+                    group_name = %key.group_name,
+                    worker_id = key.worker_id.as_raw(),
+                    worker_run_id = %key.worker_run_id,
+                    block_id = %key.block_id,
+                    block_stamp = key.block_stamp,
+                    attempts,
+                    %error,
+                    "Worker block cleanup failed; retrying locally"
+                );
+            }
+        }
+
+        drop(concurrency);
+        tokio::time::sleep(retry_backoff(&inner.options, attempts)).await;
+    }
+}
+
+/// Returns whether a cleanup key still belongs to the active registration.
+fn registration_matches(registrations: &RegistrationSet, key: &CleanupReplicaKey) -> bool {
+    registrations.registration(&key.group_name).is_some_and(|registration| {
+        registration.worker_id == key.worker_id && registration.worker_run_id.matches(key.worker_run_id)
+    })
+}
+
+fn mark_reclaiming(inner: &BlockCleanupInner, key: &CleanupReplicaKey) {
+    let mut pending = inner.pending.lock().expect("cleanup state poisoned");
+    if let Some(phase) = pending.get_mut(key) {
+        *phase = CleanupPhase::Reclaiming;
+    }
+    let reclaiming = pending
+        .values()
+        .filter(|phase| matches!(phase, CleanupPhase::Reclaiming))
+        .count();
+    observe::set_cleanup_reclaiming(reclaiming);
+}
+
+fn finish_task(inner: &BlockCleanupInner, key: &CleanupReplicaKey) {
+    let mut pending = inner.pending.lock().expect("cleanup state poisoned");
+    pending.remove(key);
+    let reclaiming = pending
+        .values()
+        .filter(|phase| matches!(phase, CleanupPhase::Reclaiming))
+        .count();
+    observe::set_cleanup_queue_depth(pending.len());
+    observe::set_cleanup_reclaiming(reclaiming);
+}
+
+/// Computes capped exponential backoff without overflowing long-running tasks.
+fn retry_backoff(options: &BlockCleanupOptions, attempts: u32) -> Duration {
+    let multiplier = 1_u128 << attempts.saturating_sub(1).min(63);
+    let delay = options.retry_initial_backoff.as_millis().saturating_mul(multiplier);
+    Duration::from_millis(delay.min(options.retry_max_backoff.as_millis()) as u64)
+}
+
+fn is_block_stamp_mismatch(error: &WorkerError) -> bool {
+    matches!(
+        error,
+        WorkerError::RefreshMetadata {
+            kind: ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
+            ..
+        }
+    )
+}
+
+/// Validates bounds that are required for bounded, live cleanup execution.
+fn validate_options(options: &BlockCleanupOptions) -> Result<(), WorkerError> {
+    if options.max_pending == 0 {
+        return Err(WorkerError::InvalidArgument(
+            "cleanup max_pending must be greater than zero".to_string(),
+        ));
+    }
+    if options.max_concurrent == 0 {
+        return Err(WorkerError::InvalidArgument(
+            "cleanup max_concurrent must be greater than zero".to_string(),
+        ));
+    }
+    if options.retry_initial_backoff.is_zero() {
+        return Err(WorkerError::InvalidArgument(
+            "cleanup retry_initial_backoff must be greater than zero".to_string(),
+        ));
+    }
+    if options.retry_initial_backoff > options.retry_max_backoff {
+        return Err(WorkerError::InvalidArgument(
+            "cleanup retry_initial_backoff must not exceed retry_max_backoff".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::store::block::{
+        BlockMetaPayload, CreateStagingBlockRequest, LocalBlockStore, PublishReadyRequest, ReclaimBlockState,
+        RecoveredBlock, StoreResult, SyncReadyBlockRequest,
+    };
+    use beryl_types::{BlockIndex, DataHandleId};
+
+    #[derive(Clone, Copy)]
+    enum ReclaimBehavior {
+        Succeed,
+        Fail,
+    }
+
+    struct ControlledStore {
+        behavior: Mutex<ReclaimBehavior>,
+        delay: Duration,
+        local_stamp: u64,
+        calls: AtomicUsize,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        reclaimed: Mutex<Vec<BlockId>>,
+    }
+
+    impl ControlledStore {
+        fn new(behavior: ReclaimBehavior, delay: Duration, local_stamp: u64) -> Self {
+            Self {
+                behavior: Mutex::new(behavior),
+                delay,
+                local_stamp,
+                calls: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+                reclaimed: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn set_behavior(&self, behavior: ReclaimBehavior) {
+            *self.behavior.lock().expect("controlled store poisoned") = behavior;
+        }
+    }
+
+    impl LocalBlockStore for ControlledStore {
+        fn create_staging_block(&self, _req: CreateStagingBlockRequest) -> StoreResult<BlockMetaPayload> {
+            panic!("unused test operation")
+        }
+
+        fn write_at(&self, _group_name: &GroupName, _block_id: BlockId, _offset: u64, _data: Bytes) -> StoreResult<()> {
+            panic!("unused test operation")
+        }
+
+        fn publish_ready(&self, _req: PublishReadyRequest) -> StoreResult<BlockMetaPayload> {
+            panic!("unused test operation")
+        }
+
+        fn read_at(&self, _group_name: &GroupName, _block_id: BlockId, _offset: u64, _len: u64) -> StoreResult<Bytes> {
+            panic!("unused test operation")
+        }
+
+        fn load_meta(&self, _group_name: &GroupName, _block_id: BlockId) -> StoreResult<BlockMetaPayload> {
+            panic!("unused test operation")
+        }
+
+        fn sync_ready_block(&self, _req: SyncReadyBlockRequest) -> StoreResult<BlockMetaPayload> {
+            panic!("unused test operation")
+        }
+
+        fn recover_block(&self, _group_name: &GroupName, _block_id: BlockId) -> StoreResult<RecoveredBlock> {
+            panic!("unused test operation")
+        }
+
+        fn inspect_reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockState> {
+            if req.expected_block_stamp != self.local_stamp {
+                return Err(WorkerError::RefreshMetadata {
+                    kind: ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
+                    message: "controlled store stamp mismatch".to_string(),
+                });
+            }
+            Ok(ReclaimBlockState::Ready)
+        }
+
+        fn reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+            let behavior = *self.behavior.lock().expect("controlled store poisoned");
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            match behavior {
+                ReclaimBehavior::Succeed => {
+                    self.reclaimed
+                        .lock()
+                        .expect("controlled store poisoned")
+                        .push(req.block_id);
+                    Ok(ReclaimBlockResult::Deleted { effective_len: 1 })
+                }
+                ReclaimBehavior::Fail => Err(WorkerError::DiskError("injected cleanup failure".to_string())),
+            }
+        }
+
+        fn abort_staging_block(&self, _group_name: &GroupName, _block_id: BlockId) -> StoreResult<()> {
+            panic!("unused test operation")
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_full_drops_work_until_metadata_redispatches() {
+        let run_id = WorkerRunId::new();
+        let registrations = registered(run_id);
+        let store = Arc::new(ControlledStore::new(ReclaimBehavior::Fail, Duration::ZERO, 101));
+        let executor = executor(
+            Arc::clone(&store),
+            Arc::clone(&registrations),
+            BlockCleanupOptions {
+                max_pending: 1,
+                max_concurrent: 1,
+                retry_initial_backoff: Duration::from_millis(20),
+                retry_max_backoff: Duration::from_millis(20),
+            },
+        );
+        let first = test_block_id(1);
+        let second = test_block_id(2);
+
+        executor.enqueue(&registration(run_id), [command(first, 101)]);
+        wait_for(|| store.calls.load(Ordering::SeqCst) > 0).await;
+        executor.enqueue(&registration(run_id), [command(second, 101)]);
+        assert_eq!(executor.inner.pending.lock().expect("cleanup state poisoned").len(), 1);
+
+        store.set_behavior(ReclaimBehavior::Succeed);
+        wait_for(|| {
+            executor
+                .inner
+                .pending
+                .lock()
+                .expect("cleanup state poisoned")
+                .is_empty()
+        })
+        .await;
+        assert_eq!(*store.reclaimed.lock().expect("controlled store poisoned"), vec![first]);
+
+        executor.enqueue(&registration(run_id), [command(second, 101)]);
+        wait_for(|| {
+            executor
+                .inner
+                .pending
+                .lock()
+                .expect("cleanup state poisoned")
+                .is_empty()
+        })
+        .await;
+        assert_eq!(
+            *store.reclaimed.lock().expect("controlled store poisoned"),
+            vec![first, second]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn max_concurrent_bounds_active_reclaims() {
+        let run_id = WorkerRunId::new();
+        let registrations = registered(run_id);
+        let store = Arc::new(ControlledStore::new(
+            ReclaimBehavior::Succeed,
+            Duration::from_millis(50),
+            101,
+        ));
+        let executor = executor(
+            Arc::clone(&store),
+            registrations,
+            BlockCleanupOptions {
+                max_pending: 4,
+                max_concurrent: 2,
+                retry_initial_backoff: Duration::from_millis(10),
+                retry_max_backoff: Duration::from_millis(10),
+            },
+        );
+
+        executor.enqueue(
+            &registration(run_id),
+            (1..=4).map(|index| command(test_block_id(index), 101)),
+        );
+        wait_for(|| {
+            executor
+                .inner
+                .pending
+                .lock()
+                .expect("cleanup state poisoned")
+                .is_empty()
+        })
+        .await;
+
+        assert_eq!(store.calls.load(Ordering::SeqCst), 4);
+        assert_eq!(store.max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn permanent_failure_retries_with_backoff_and_recovers() {
+        let run_id = WorkerRunId::new();
+        let registrations = registered(run_id);
+        let store = Arc::new(ControlledStore::new(ReclaimBehavior::Fail, Duration::ZERO, 101));
+        let executor = executor(
+            Arc::clone(&store),
+            registrations,
+            BlockCleanupOptions {
+                max_pending: 2,
+                max_concurrent: 1,
+                retry_initial_backoff: Duration::from_millis(20),
+                retry_max_backoff: Duration::from_millis(20),
+            },
+        );
+        let block_id = test_block_id(1);
+
+        executor.enqueue(&registration(run_id), [command(block_id, 101)]);
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let failed_calls = store.calls.load(Ordering::SeqCst);
+        assert!(
+            (2..=5).contains(&failed_calls),
+            "unexpected retry count: {failed_calls}"
+        );
+        assert_eq!(executor.inner.pending.lock().expect("cleanup state poisoned").len(), 1);
+
+        store.set_behavior(ReclaimBehavior::Succeed);
+        wait_for(|| {
+            executor
+                .inner
+                .pending
+                .lock()
+                .expect("cleanup state poisoned")
+                .is_empty()
+        })
+        .await;
+        assert_eq!(
+            *store.reclaimed.lock().expect("controlled store poisoned"),
+            vec![block_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn stamp_mismatch_drops_command_without_reclaiming() {
+        let run_id = WorkerRunId::new();
+        let registrations = registered(run_id);
+        let store = Arc::new(ControlledStore::new(ReclaimBehavior::Succeed, Duration::ZERO, 101));
+        let executor = executor(
+            Arc::clone(&store),
+            registrations,
+            BlockCleanupOptions {
+                max_pending: 2,
+                max_concurrent: 1,
+                retry_initial_backoff: Duration::from_millis(10),
+                retry_max_backoff: Duration::from_millis(10),
+            },
+        );
+        let block_id = test_block_id(1);
+
+        executor.enqueue(&registration(run_id), [command(block_id, 202)]);
+        wait_for(|| {
+            executor
+                .inner
+                .pending
+                .lock()
+                .expect("cleanup state poisoned")
+                .is_empty()
+        })
+        .await;
+        assert_eq!(store.calls.load(Ordering::SeqCst), 0);
+        assert!(store.reclaimed.lock().expect("controlled store poisoned").is_empty());
+
+        executor.enqueue(&registration(run_id), [command(block_id, 101)]);
+        wait_for(|| {
+            executor
+                .inner
+                .pending
+                .lock()
+                .expect("cleanup state poisoned")
+                .is_empty()
+        })
+        .await;
+        assert_eq!(
+            *store.reclaimed.lock().expect("controlled store poisoned"),
+            vec![block_id]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_command_is_dropped_after_worker_run_changes() {
+        let old_run = WorkerRunId::new();
+        let new_run = WorkerRunId::new();
+        let registrations = registered(old_run);
+        let store = Arc::new(ControlledStore::new(
+            ReclaimBehavior::Succeed,
+            Duration::from_millis(100),
+            101,
+        ));
+        let executor = executor(
+            Arc::clone(&store),
+            Arc::clone(&registrations),
+            BlockCleanupOptions {
+                max_pending: 2,
+                max_concurrent: 1,
+                retry_initial_backoff: Duration::from_millis(10),
+                retry_max_backoff: Duration::from_millis(10),
+            },
+        );
+        let started = test_block_id(1);
+        let queued = test_block_id(2);
+
+        executor.enqueue(&registration(old_run), [command(started, 101)]);
+        wait_for(|| store.active.load(Ordering::SeqCst) == 1).await;
+        executor.enqueue(&registration(old_run), [command(queued, 101)]);
+        registrations.record_registered(registration(new_run));
+        wait_for(|| {
+            executor
+                .inner
+                .pending
+                .lock()
+                .expect("cleanup state poisoned")
+                .is_empty()
+        })
+        .await;
+
+        assert_eq!(store.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *store.reclaimed.lock().expect("controlled store poisoned"),
+            vec![started]
+        );
+    }
+
+    fn executor(
+        store: Arc<ControlledStore>,
+        registrations: Arc<RegistrationSet>,
+        options: BlockCleanupOptions,
+    ) -> BlockCleanupExecutor {
+        let core = Arc::new(WorkerCore::with_local_store(
+            1_024,
+            1_024,
+            Duration::from_secs(60),
+            store,
+        ));
+        BlockCleanupExecutor::start(core, registrations, options).expect("start cleanup executor")
+    }
+
+    fn registered(run_id: WorkerRunId) -> Arc<RegistrationSet> {
+        let registrations = Arc::new(RegistrationSet::new());
+        registrations.record_registered(registration(run_id));
+        registrations
+    }
+
+    fn registration(run_id: WorkerRunId) -> Registration {
+        Registration {
+            group_name: GroupName::parse("root").expect("group name"),
+            worker_id: WorkerId::new(42),
+            worker_run_id: run_id,
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        }
+    }
+
+    fn command(block_id: BlockId, expected_block_stamp: u64) -> BlockCleanupCommand {
+        BlockCleanupCommand {
+            block_id,
+            expected_block_stamp,
+        }
+    }
+
+    fn test_block_id(index: u32) -> BlockId {
+        BlockId::new(DataHandleId::new(7), BlockIndex::new(index))
+    }
+
+    async fn wait_for(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("condition must become true");
+    }
+}

@@ -17,7 +17,7 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
 - Workers store and serve blocks authorized by metadata.
 - Data made visible by metadata is Beryl resident data.
 - Namespace delete removes the metadata namespace entry and visible layout.
-- Physical resident-block reclamation is future/partial: delete intents exist, but no active worker delete RPC path is wired today.
+- Metadata can dispatch report-derived cleanup commands through worker heartbeats; workers fence readers, validate block stamps, and reclaim exact local block versions with crash recovery.
 - External storage integration is adapter-only today, not the active read/write path.
 
 ## Architecture
@@ -64,7 +64,7 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
 ## Current Boundaries and Gaps
 
 - Recursive listing is not supported; metadata rejects recursive list requests.
-- Namespace delete is active, but complete worker-side physical block free is not complete; no active worker delete RPC path is wired today.
+- Namespace delete is active and worker-side physical reclamation is implemented, but cleanup dispatch remains disabled by default pending recovery soak and controlled enablement.
 - UFS remains an adapter boundary; active UFS read-through/write-through is future work.
 - Admin and metadata-peer schemas are not active runtime services.
 - Multi-group metadata, multiple metadata leaders, and metadata peer RPC are future work.
@@ -75,7 +75,7 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
 ## Roadmap
 
 - Keep the supported Rust client -> metadata -> worker path stable under default validation.
-- Finish resident-block reclamation and worker delete lifecycle only with explicit design and tests.
+- Complete recovery soak and controlled default enablement for resident-block reclamation.
 - Design UFS read-through/write-through integration without changing metadata-owned visibility.
 - Design multi-group metadata, metadata peer RPC, admin APIs, and ecosystem compatibility as future product work.
 - Treat complete replication, repair, and rebalancing as future lifecycle features, separate from current maintenance internals.

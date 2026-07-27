@@ -23,7 +23,7 @@ metadata.group.name: "root"
 metadata.raft.node_id: 1
 metadata.raft.mode: "single"
 
-# Cleanup command dispatch stays disabled until worker-side safe deletion lands.
+# Worker execution is available; dispatch stays off pending controlled enablement.
 metadata.cleanup.dispatch_enabled: false
 metadata.cleanup.max_commands_per_heartbeat: 32
 metadata.cleanup.retry_initial_backoff_ms: 1000

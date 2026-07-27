@@ -12,9 +12,11 @@ use beryl_proto::metadata::metadata_worker_service_proto_server::{
     MetadataWorkerServiceProto, MetadataWorkerServiceProtoServer,
 };
 use beryl_proto::metadata::{
+    block_report_request_proto, BlockCleanupCommandProto, BlockReportBlockStateProto, BlockReportDeltaOpProto,
     BlockReportRequestProto, BlockReportResponseProto, HeartbeatRequestProto, HeartbeatResponseProto,
     RegisterWorkerRequestProto, RegisterWorkerResponseProto,
 };
+use beryl_types::chunk::ByteRange;
 use beryl_types::fs::FsErrorCode;
 use beryl_types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, WorkerId};
 use beryl_types::layout::BlockFormatId;
@@ -26,8 +28,9 @@ use tonic::{Request, Response, Status};
 
 use beryl_worker::config::{StoreDirConfig, WorkerConfig, WorkerRegistrationConfig};
 use beryl_worker::control::{
-    BlockReportError, BlockReportOptions, HeartbeatError, HeartbeatSnapshot, MetadataBlockReportLoop,
-    MetadataHeartbeatLoop, MetadataRegistrar, Registration, RegistrationDescriptor, RegistrationSet,
+    BlockCleanupExecutor, BlockCleanupOptions, BlockReportError, BlockReportOptions, HeartbeatError, HeartbeatSnapshot,
+    MetadataBlockReportLoop, MetadataHeartbeatLoop, MetadataRegistrar, Registration, RegistrationDescriptor,
+    RegistrationSet,
 };
 use beryl_worker::net::config::WorkerNetConfig;
 use beryl_worker::net::protocol::WorkerNetProtocol;
@@ -36,6 +39,7 @@ use beryl_worker::store::block::{
     PublishReadyRequest,
 };
 use beryl_worker::store::dirs::{StoreDirs, StoreReport};
+use beryl_worker::{ReadOpenRequest, WorkerCore};
 
 const BLOCK_SIZE: u64 = 4096;
 const CHUNK_SIZE: u32 = 1024;
@@ -88,7 +92,15 @@ enum MockRegisterReply {
 
 #[derive(Clone)]
 enum MockHeartbeatReply {
-    Ok { worker_id: u64, worker_run_id: WorkerRunId },
+    Ok {
+        worker_id: u64,
+        worker_run_id: WorkerRunId,
+    },
+    OkWithCleanup {
+        worker_id: u64,
+        worker_run_id: WorkerRunId,
+        cleanup_commands: Vec<BlockCleanupCommandProto>,
+    },
     HeaderError(RpcErrorDetail),
     Status(Status),
 }
@@ -190,6 +202,17 @@ impl MetadataWorkerServiceProto for MockMetadataWorkerService {
                 accepted_worker_run_id: worker_run_id.to_string(),
                 liveness_timeout_ms: 5_000,
                 cleanup_commands: Vec::new(),
+            })),
+            MockHeartbeatReply::OkWithCleanup {
+                worker_id,
+                worker_run_id,
+                cleanup_commands,
+            } => Ok(Response::new(HeartbeatResponseProto {
+                header: Some(response_header_from_heartbeat_request(&request, None)),
+                worker_id,
+                accepted_worker_run_id: worker_run_id.to_string(),
+                liveness_timeout_ms: 5_000,
+                cleanup_commands,
             })),
             MockHeartbeatReply::HeaderError(error) => Ok(Response::new(HeartbeatResponseProto {
                 header: Some(response_header_from_heartbeat_request(&request, Some(error))),
@@ -393,6 +416,20 @@ fn report_store(temp: &TempDir) -> Arc<StoreDirs> {
         )
         .expect("open report store"),
     )
+}
+
+fn test_worker_core(store: Arc<StoreDirs>) -> Arc<WorkerCore> {
+    Arc::new(WorkerCore::with_local_store(1024, 1024, Duration::from_secs(60), store))
+}
+
+fn test_cleanup_executor(state: Arc<RegistrationSet>) -> BlockCleanupExecutor {
+    let core = Arc::new(WorkerCore::with_options(
+        1024,
+        1024,
+        Duration::from_secs(60),
+        std::env::temp_dir().join(format!("beryl-cleanup-test-{}", uuid::Uuid::new_v4())),
+    ));
+    BlockCleanupExecutor::start(core, state, BlockCleanupOptions::default()).expect("cleanup executor")
 }
 
 fn publish_ready_block_for(
@@ -674,6 +711,7 @@ async fn heartbeat_sends_registered_identity_to_all_configured_peers() {
         },
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
+        test_cleanup_executor(Arc::clone(&state)),
     )
     .expect("heartbeat loop");
 
@@ -746,6 +784,7 @@ async fn heartbeat_sends_zero_capacity_when_store_report_has_failed_dir() {
         test_registration_config(endpoint),
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
+        test_cleanup_executor(Arc::clone(&state)),
     )
     .expect("heartbeat loop");
     let temp = TempDir::new().expect("tempdir");
@@ -794,6 +833,7 @@ async fn heartbeat_ticks_reuse_runtime_client_id_with_new_call_id() {
         test_registration_config(endpoint),
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
+        test_cleanup_executor(Arc::clone(&state)),
     )
     .expect("heartbeat loop");
 
@@ -818,6 +858,159 @@ async fn heartbeat_ticks_reuse_runtime_client_id_with_new_call_id() {
 }
 
 #[tokio::test]
+async fn heartbeat_cleanup_command_reports_deleting_then_delta_remove() {
+    let worker_run_id = test_worker_run_id();
+    let (endpoint, mock, shutdown) = start_mock_metadata(Vec::new()).await;
+    *mock.heartbeat_replies.lock().unwrap() = VecDeque::from([MockHeartbeatReply::OkWithCleanup {
+        worker_id: 42,
+        worker_run_id,
+        cleanup_commands: vec![
+            BlockCleanupCommandProto {
+                block_id: Some(block_id().into()),
+                expected_block_stamp: 101,
+            },
+            BlockCleanupCommandProto {
+                block_id: Some(block_id().into()),
+                expected_block_stamp: 101,
+            },
+        ],
+    }]);
+    let state = Arc::new(RegistrationSet::new());
+    state.record_registered(Registration {
+        group_name: group_name(),
+        worker_id: WorkerId::new(42),
+        worker_run_id,
+        advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+    });
+    state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
+
+    let temp = TempDir::new().expect("tempdir");
+    let store = report_store(&temp);
+    publish_ready_block_for(store.as_ref(), group_name(), block_id(), payload(), 101);
+    let core = test_worker_core(Arc::clone(&store));
+    let cleanup = BlockCleanupExecutor::start(
+        Arc::clone(&core),
+        Arc::clone(&state),
+        BlockCleanupOptions {
+            max_pending: 4,
+            max_concurrent: 1,
+            retry_initial_backoff: Duration::from_millis(10),
+            retry_max_backoff: Duration::from_millis(10),
+        },
+    )
+    .expect("cleanup executor");
+    let heartbeat = MetadataHeartbeatLoop::new(
+        test_registration_config(endpoint.clone()),
+        test_registration_descriptor(worker_run_id),
+        Arc::clone(&state),
+        cleanup,
+    )
+    .expect("heartbeat loop");
+    let reporter = MetadataBlockReportLoop::new(
+        test_registration_config(endpoint),
+        test_registration_descriptor(worker_run_id),
+        Arc::clone(&state),
+        Arc::clone(&store),
+        Arc::clone(&core),
+    )
+    .expect("block reporter");
+
+    let read = core
+        .open_read(ReadOpenRequest {
+            group_name: group_name(),
+            block_id: block_id(),
+            worker_run_id,
+            byte_range: ByteRange { offset: 0, len: 1 },
+            block_stamp: 101,
+            block_format_id: BlockFormatId::FULL_EFFECTIVE,
+            block_size: BLOCK_SIZE,
+            chunk_size: CHUNK_SIZE,
+            effective_len: BLOCK_SIZE,
+            frame_size: 1024,
+        })
+        .await
+        .expect("open pinned read");
+    reporter.send_full_once().await.expect("publish Ready baseline");
+    heartbeat
+        .send_once(HeartbeatSnapshot::default())
+        .await
+        .expect("accept cleanup heartbeat");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let round = reporter.send_delta_once().await.expect("send Deleting delta");
+            if round.accepted_peers > 0
+                && latest_delta_has(
+                    &mock,
+                    BlockReportDeltaOpProto::BlockReportDeltaOpAddUpdate,
+                    BlockReportBlockStateProto::BlockReportBlockStateDeleting,
+                )
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cleanup must become Deleting while the read pin is active");
+
+    core.stream_manager()
+        .remove(read.stream_id)
+        .await
+        .expect("remove pinned read");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if store.report().expect("store report").dirs[0].block_count == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cleanup must delete the local block after the reader exits");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let round = reporter.send_delta_once().await.expect("send REMOVE delta");
+            if round.accepted_peers > 0
+                && latest_delta_has(
+                    &mock,
+                    BlockReportDeltaOpProto::BlockReportDeltaOpRemove,
+                    BlockReportBlockStateProto::BlockReportBlockStateDeleting,
+                )
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cleanup must publish REMOVE after physical deletion completes");
+    shutdown.send(()).ok();
+}
+
+fn latest_delta_has(
+    mock: &MockMetadataState,
+    expected_op: BlockReportDeltaOpProto,
+    expected_state: BlockReportBlockStateProto,
+) -> bool {
+    let requests = mock.block_report_requests.lock().unwrap();
+    let Some(request) = requests.last() else {
+        return false;
+    };
+    let Some(block_report_request_proto::Report::Delta(delta)) = request.report.as_ref() else {
+        return false;
+    };
+    delta.deltas.iter().any(|entry| {
+        entry.op() == expected_op
+            && entry
+                .block
+                .as_ref()
+                .is_some_and(|block| block.block_state() == expected_state)
+    })
+}
+
+#[tokio::test]
 async fn heartbeat_without_registration_sends_no_requests() {
     let (endpoint, mock, shutdown) = start_mock_metadata_with_heartbeat(Vec::new()).await;
     let state = Arc::new(RegistrationSet::new());
@@ -825,6 +1018,7 @@ async fn heartbeat_without_registration_sends_no_requests() {
         test_registration_config(endpoint),
         test_registration_descriptor(test_worker_run_id()),
         Arc::clone(&state),
+        test_cleanup_executor(Arc::clone(&state)),
     )
     .expect("heartbeat loop");
 
@@ -862,6 +1056,7 @@ async fn single_heartbeat_peer_failure_does_not_clear_ready_lease() {
         },
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
+        test_cleanup_executor(Arc::clone(&state)),
     )
     .expect("heartbeat loop");
 
@@ -899,6 +1094,7 @@ async fn need_register_heartbeat_responses_clear_registration() {
             test_registration_config(endpoint),
             test_registration_descriptor(worker_run_id),
             Arc::clone(&state),
+            test_cleanup_executor(Arc::clone(&state)),
         )
         .expect("heartbeat loop");
 
@@ -936,6 +1132,7 @@ async fn heartbeat_refresh_metadata_recovery_does_not_clear_registration() {
         test_registration_config(endpoint),
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
+        test_cleanup_executor(Arc::clone(&state)),
     )
     .expect("heartbeat loop");
 
@@ -973,6 +1170,7 @@ async fn worker_run_mismatch_heartbeat_response_clears_registration_for_recovery
         test_registration_config(endpoint.clone()),
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
+        test_cleanup_executor(Arc::clone(&state)),
     )
     .expect("heartbeat loop");
     let registrar = MetadataRegistrar::new(
@@ -989,6 +1187,7 @@ async fn worker_run_mismatch_heartbeat_response_clears_registration_for_recovery
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
         Arc::clone(&store),
+        test_worker_core(Arc::clone(&store)),
     )
     .expect("block reporter");
 
@@ -1031,7 +1230,8 @@ async fn heartbeat_header_error_is_rejected() {
     let heartbeat = MetadataHeartbeatLoop::new(
         test_registration_config(endpoint),
         test_registration_descriptor(worker_run_id),
-        state,
+        Arc::clone(&state),
+        test_cleanup_executor(state),
     )
     .expect("heartbeat loop");
 
@@ -1041,6 +1241,41 @@ async fn heartbeat_header_error_is_rejected() {
         .expect_err("header error must fail heartbeat");
 
     assert!(error.to_string().contains("malformed success header"));
+    shutdown.send(()).ok();
+}
+
+#[tokio::test]
+async fn heartbeat_rejects_malformed_cleanup_command() {
+    let worker_run_id = test_worker_run_id();
+    let (endpoint, _mock, shutdown) = start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::OkWithCleanup {
+        worker_id: 42,
+        worker_run_id,
+        cleanup_commands: vec![BlockCleanupCommandProto {
+            block_id: None,
+            expected_block_stamp: 101,
+        }],
+    }])
+    .await;
+    let state = Arc::new(RegistrationSet::new());
+    state.record_registered(Registration {
+        group_name: group_name(),
+        worker_id: WorkerId::new(42),
+        worker_run_id,
+        advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+    });
+    let heartbeat = MetadataHeartbeatLoop::new(
+        test_registration_config(endpoint),
+        test_registration_descriptor(worker_run_id),
+        Arc::clone(&state),
+        test_cleanup_executor(state),
+    )
+    .expect("heartbeat loop");
+
+    let error = heartbeat
+        .send_once(HeartbeatSnapshot::default())
+        .await
+        .expect_err("missing cleanup block id must reject the response");
+    assert!(matches!(error, HeartbeatError::Fatal(message) if message.contains("cleanup_commands.block_id")));
     shutdown.send(()).ok();
 }
 
@@ -1147,6 +1382,7 @@ async fn invalid_local_ready_state_is_not_submitted_in_full_block_report() {
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
         Arc::clone(&store),
+        test_worker_core(Arc::clone(&store)),
     )
     .expect("block reporter");
 
@@ -1157,6 +1393,65 @@ async fn invalid_local_ready_state_is_not_submitted_in_full_block_report() {
 
     assert!(matches!(error, BlockReportError::Retryable(_)));
     assert!(mock.block_report_requests.lock().unwrap().is_empty());
+    shutdown.send(()).ok();
+}
+
+#[tokio::test]
+async fn startup_marker_recovery_precedes_first_full_block_report() {
+    let worker_run_id = test_worker_run_id();
+    let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(Vec::new()).await;
+    let state = Arc::new(RegistrationSet::new());
+    state.record_registered(Registration {
+        group_name: group_name(),
+        worker_id: WorkerId::new(42),
+        worker_run_id,
+        advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+    });
+    state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
+
+    let temp = TempDir::new().expect("tempdir");
+    let data_root = temp.path().join("hdd0");
+    let raw_store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(data_root));
+    publish_ready_block_for(&raw_store, group_name(), block_id(), payload(), 101);
+    let paths = raw_store.paths(&group_name(), block_id());
+    std::fs::create_dir_all(paths.deleting_marker_path.parent().expect("marker parent")).expect("create marker parent");
+    std::fs::write(
+        &paths.deleting_marker_path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "group_name": group_name().as_str(),
+            "block_id": block_id(),
+            "block_stamp": 101,
+            "effective_len": BLOCK_SIZE,
+        }))
+        .expect("encode deleting marker"),
+    )
+    .expect("write deleting marker");
+    drop(raw_store);
+
+    let store = report_store(&temp);
+    assert_eq!(store.report().expect("store report").dirs[0].block_count, 0);
+    assert!(!paths.data_path.exists());
+    assert!(!paths.meta_path.exists());
+    assert!(!paths.deleting_marker_path.exists());
+
+    let reporter = MetadataBlockReportLoop::new(
+        test_registration_config(endpoint),
+        test_registration_descriptor(worker_run_id),
+        Arc::clone(&state),
+        Arc::clone(&store),
+        test_worker_core(Arc::clone(&store)),
+    )
+    .expect("block reporter");
+    let round = reporter.send_full_once().await.expect("first full report");
+
+    assert_eq!(round.accepted_peers, 1);
+    let requests = mock.block_report_requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let block_report_request_proto::Report::Full(full) = requests[0].report.as_ref().expect("full report") else {
+        panic!("expected full block report");
+    };
+    assert!(full.blocks.is_empty(), "recovered block must not reappear as Ready");
     shutdown.send(()).ok();
 }
 
@@ -1173,6 +1468,7 @@ async fn block_report_waits_for_registration_and_heartbeat_readiness() {
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
         Arc::clone(&store),
+        test_worker_core(Arc::clone(&store)),
     )
     .expect("block reporter");
 
@@ -1224,6 +1520,7 @@ async fn full_block_report_batches_by_configured_limit() {
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
         Arc::clone(&store),
+        test_worker_core(Arc::clone(&store)),
         BlockReportOptions {
             full_max_blocks_per_batch: 1,
             ..BlockReportOptions::default()
@@ -1317,6 +1614,7 @@ async fn full_block_report_stops_peer_batches_after_hard_report_errors() {
             test_registration_descriptor(worker_run_id),
             Arc::clone(&state),
             Arc::clone(&store),
+            test_worker_core(Arc::clone(&store)),
             BlockReportOptions {
                 full_max_blocks_per_batch: 1,
                 ..BlockReportOptions::default()
@@ -1367,6 +1665,7 @@ async fn block_report_refresh_metadata_recovery_does_not_set_control_outcome() {
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
         Arc::clone(&store),
+        test_worker_core(Arc::clone(&store)),
     )
     .expect("block reporter");
 
@@ -1421,6 +1720,7 @@ async fn full_report_required_from_one_peer_does_not_stop_other_peers() {
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
         Arc::clone(&store),
+        test_worker_core(Arc::clone(&store)),
         BlockReportOptions {
             full_max_blocks_per_batch: 1,
             ..BlockReportOptions::default()
@@ -1461,6 +1761,7 @@ async fn block_report_worker_run_mismatch_clears_registration() {
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
         Arc::clone(&store),
+        test_worker_core(Arc::clone(&store)),
     )
     .expect("block reporter");
 
@@ -1501,6 +1802,7 @@ async fn full_block_report_peer_failure_does_not_skip_other_peers() {
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
         Arc::clone(&store),
+        test_worker_core(Arc::clone(&store)),
     )
     .expect("block reporter");
 
@@ -1544,6 +1846,7 @@ async fn delta_report_starts_after_full_and_full_required_resets_baseline() {
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
         Arc::clone(&store),
+        test_worker_core(Arc::clone(&store)),
     )
     .expect("block reporter");
 
