@@ -4,8 +4,8 @@
 //! Background worker-state convergence and repair scheduling.
 //!
 //! Cleanup commands are derived from namespace authority and reconstructable
-//! worker reports. Dispatch remains disabled by default until end-to-end
-//! recovery validation authorizes production enablement.
+//! worker reports. Dispatch is enabled by default and remains guarded by exact
+//! report identity, authority revalidation, and worker-local stamp checks.
 
 mod cleanup;
 mod lost_worker;

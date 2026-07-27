@@ -23,6 +23,8 @@ The Rust native API is the client interface used today. It supports core operati
 
 `ListOptions::recursive` is part of the Rust API shape, but recursive listing is not supported by the current metadata service. Requests with that flag are rejected instead of silently falling back to non-recursive listing.
 
+`FsClient::delete` requires `DeleteOptions`, which currently controls recursive namespace deletion. Physical reclamation remains asynchronous and uses the Metadata cleanup grace period.
+
 ## Not in Current Scope
 
 - POSIX API.

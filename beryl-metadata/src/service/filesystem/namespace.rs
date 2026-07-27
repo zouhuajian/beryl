@@ -948,6 +948,10 @@ pub(crate) struct DeleteArgs {
 }
 
 impl MetadataFileSystem {
+    /// Resolves and submits a namespace delete under metadata write admission.
+    ///
+    /// A successful result means the namespace mutation committed. Physical
+    /// block reclamation follows the configured cleanup grace asynchronously.
     pub(crate) async fn delete(&self, ctx: &RequestContext, args: DeleteArgs) -> FsResult<()> {
         if let Err(failure) = self.admission.check_meta_write(ctx).await {
             return self.failure_from_admission(failure);
@@ -1016,6 +1020,11 @@ impl MetadataFileSystem {
         result
     }
 
+    /// Commits one resolved delete with exact inode and lease preconditions.
+    ///
+    /// Physical cleanup is deliberately decoupled from this mutation. Worker
+    /// reports later rediscover unreachable replicas, wait for the configured
+    /// grace, and revalidate authority before dispatch.
     async fn delete_resolved(
         &self,
         request_ctx: &RequestContext,
@@ -1089,6 +1098,7 @@ impl MetadataFileSystem {
         self.delete_result(request_ctx, &ctx, result)
     }
 
+    /// Reads the durable file lease epoch used by delete apply preconditions.
     fn file_lease_epoch(inode: &beryl_types::fs::Inode) -> u64 {
         match &inode.data {
             beryl_types::fs::InodeData::File { lease_epoch, .. } => lease_epoch.unwrap_or(0),

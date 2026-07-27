@@ -184,7 +184,7 @@ impl Default for CleanupConfig {
             reclaim_grace_ms: 300_000,
             max_replicas_per_scan: 10_000,
             max_candidates: 10_000,
-            dispatch_enabled: false,
+            dispatch_enabled: true,
             max_commands_per_heartbeat: 32,
             retry_initial_backoff_ms: 1_000,
             retry_max_backoff_ms: 60_000,
@@ -230,7 +230,7 @@ impl MetadataConfig {
             reclaim_grace_ms: get_positive_u64_or(flat, METADATA_CLEANUP_RECLAIM_GRACE_MS, 300_000)?,
             max_replicas_per_scan: get_positive_usize_or(flat, METADATA_CLEANUP_MAX_REPLICAS_PER_SCAN, 10_000)?,
             max_candidates: get_positive_usize_or(flat, METADATA_CLEANUP_MAX_CANDIDATES, 10_000)?,
-            dispatch_enabled: get_bool_or(flat, METADATA_CLEANUP_DISPATCH_ENABLED, false)?,
+            dispatch_enabled: get_bool_or(flat, METADATA_CLEANUP_DISPATCH_ENABLED, true)?,
             max_commands_per_heartbeat: get_positive_usize_or(flat, METADATA_CLEANUP_MAX_COMMANDS_PER_HEARTBEAT, 32)?,
             retry_initial_backoff_ms: get_positive_u64_or(flat, METADATA_CLEANUP_RETRY_INITIAL_BACKOFF_MS, 1_000)?,
             retry_max_backoff_ms: get_positive_u64_or(flat, METADATA_CLEANUP_RETRY_MAX_BACKOFF_MS, 60_000)?,
@@ -536,7 +536,7 @@ mod tests {
         assert_eq!(config.cleanup.reclaim_grace_ms, 300_000);
         assert_eq!(config.cleanup.max_replicas_per_scan, 10_000);
         assert_eq!(config.cleanup.max_candidates, 10_000);
-        assert!(!config.cleanup.dispatch_enabled);
+        assert!(config.cleanup.dispatch_enabled);
         assert_eq!(config.cleanup.max_commands_per_heartbeat, 32);
         assert_eq!(config.cleanup.retry_initial_backoff_ms, 1_000);
         assert_eq!(config.cleanup.retry_max_backoff_ms, 60_000);
@@ -549,6 +549,16 @@ mod tests {
         assert_eq!(config.bootstrap.root_readiness.initial_backoff_ms, 200);
         assert_eq!(config.bootstrap.root_readiness.max_backoff_ms, 5_000);
         assert_eq!(config.bootstrap.root_readiness.warn_after_ms, 60_000);
+    }
+
+    #[test]
+    fn cleanup_dispatch_can_be_explicitly_disabled() {
+        let mut flat = test_flat();
+        flat.set(METADATA_CLEANUP_DISPATCH_ENABLED, false);
+
+        let config = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap();
+
+        assert!(!config.cleanup.dispatch_enabled);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use beryl_client::{ClientResult, CreateOptions, InodeKind, ListOptions};
+use beryl_client::{ClientResult, CreateOptions, DeleteOptions, InodeKind, ListOptions};
 use beryl_e2e::{data::deterministic_bytes, TestCluster};
 use bytes::Bytes;
 
@@ -100,7 +100,7 @@ async fn local_client_crud_roundtrip() {
     assert_eq!(renamed_read.as_ref(), expected.as_slice());
 
     client
-        .delete(renamed_path, false)
+        .delete(renamed_path, DeleteOptions::default())
         .await
         .expect("namespace delete renamed file");
     assert_not_found(client.stat(renamed_path).await, "deleted path status");

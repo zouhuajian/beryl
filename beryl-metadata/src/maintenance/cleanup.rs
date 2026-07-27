@@ -35,6 +35,10 @@ struct CleanupEntry {
 }
 
 impl CleanupEntry {
+    /// Returns whether the candidate may be dispatched in this leader term.
+    ///
+    /// A candidate must have passed a complete scan in the current term, its
+    /// grace deadline, and its retry deadline.
     fn is_due(&self, term: u64, now: Instant) -> bool {
         self.verified_term == term && now >= self.not_before && now >= self.next_attempt_at
     }
@@ -47,6 +51,10 @@ pub(crate) struct BlockCleanupCommand {
     pub expected_block_stamp: u64,
 }
 
+/// Produces a stable order for equally attempted cleanup candidates.
+///
+/// Dispatch sorts by attempt count before this key so retries cannot
+/// permanently monopolize a bounded heartbeat batch.
 fn replica_sort_key(replica: &ReplicaKey) -> (u64, u64, u32, u64) {
     (
         replica.worker_id.as_raw(),
@@ -172,6 +180,10 @@ impl BlockCleanupCoordinator {
         commands
     }
 
+    /// Computes capped exponential redispatch delay without a terminal attempt limit.
+    ///
+    /// Cleanup completion is report-derived, so a replica that remains Ready
+    /// continues to be retried at the configured maximum interval.
     fn retry_backoff(&self, attempts: u32) -> Duration {
         let multiplier = 1_u128 << attempts.saturating_sub(1).min(63);
         let delay = self.retry_initial_backoff.as_millis().saturating_mul(multiplier);
@@ -970,7 +982,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_dispatch_is_disabled_by_default_and_requires_a_leader() {
+    async fn cleanup_dispatch_explicit_disablement_and_follower_state_return_no_commands() {
         let dir = TempDir::new().unwrap();
         let (disabled, _storage, workers, _sessions) = coordinator(&dir, cleanup_config(), true).await;
         let candidate = replica(71, 0, 19);

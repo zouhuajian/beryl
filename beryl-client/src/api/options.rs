@@ -60,6 +60,13 @@ impl CreateOptions {
     }
 }
 
+/// Options for deleting a namespace entry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeleteOptions {
+    /// Whether a directory delete should recursively remove descendants.
+    pub recursive: bool,
+}
+
 /// Options for listing a directory through [`FsClient::list`](crate::FsClient::list).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ListOptions {

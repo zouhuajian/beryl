@@ -21,7 +21,7 @@
 
 The current runtime starts a gRPC worker data service, registers with metadata, sends heartbeats and block reports, stores Ready blocks locally through the filesystem I/O engine, and serves metadata-authorized read/write streams.
 
-The worker consumes metadata cleanup commands from accepted heartbeat responses. Execution is bounded and idempotent, rejects stale block stamps, drains active readers, uses durable local deleting markers, and converges through `Deleting` and remove block reports. Metadata dispatch remains disabled by default pending controlled enablement.
+The worker consumes metadata cleanup commands from accepted heartbeat responses. Execution is bounded and idempotent, rejects stale block stamps, drains active readers, uses durable local deleting markers, and converges through `Deleting` and remove block reports. Metadata dispatch is enabled by default and retains an explicit configuration kill switch.
 
 ## Not in Current Scope
 

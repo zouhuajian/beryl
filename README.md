@@ -16,8 +16,8 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
 - Metadata is the authority for namespace, file layout, and data visibility.
 - Workers store and serve blocks authorized by metadata.
 - Data made visible by metadata is Beryl resident data.
-- Namespace delete removes the metadata namespace entry and visible layout.
-- Metadata can dispatch report-derived cleanup commands through worker heartbeats; workers fence readers, validate block stamps, and reclaim exact local block versions with crash recovery.
+- Namespace delete removes the metadata namespace entry and visible layout; physical blocks are reclaimed asynchronously after the configured cleanup grace.
+- Metadata dispatches report-derived cleanup commands through worker heartbeats by default; workers fence readers, validate block stamps, and reclaim exact local block versions with crash recovery.
 - External storage integration is adapter-only today, not the active read/write path.
 
 ## Architecture
@@ -64,7 +64,7 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
 ## Current Boundaries and Gaps
 
 - Recursive listing is not supported; metadata rejects recursive list requests.
-- Namespace delete is active and worker-side physical reclamation is implemented, but cleanup dispatch remains disabled by default pending recovery soak and controlled enablement.
+- Namespace delete and worker-side physical reclamation are active. Cleanup dispatch is enabled by default and can be disabled through metadata configuration.
 - UFS remains an adapter boundary; active UFS read-through/write-through is future work.
 - Admin and metadata-peer schemas are not active runtime services.
 - Multi-group metadata, multiple metadata leaders, and metadata peer RPC are future work.

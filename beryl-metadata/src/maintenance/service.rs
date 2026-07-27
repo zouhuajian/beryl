@@ -19,6 +19,7 @@ pub struct MaintenanceHandle {
 }
 
 impl MaintenanceHandle {
+    /// Returns the number of background maintenance loops owned by this handle.
     pub fn task_count(&self) -> usize {
         self.tasks.len()
     }
@@ -39,6 +40,10 @@ pub struct MaintenanceService {
 }
 
 impl MaintenanceService {
+    /// Constructs maintenance around the report-derived cleanup coordinator.
+    ///
+    /// The coordinator must be the same instance used by Worker heartbeats so
+    /// scan and dispatch share one bounded candidate table.
     pub(crate) fn new(
         raft_node: Arc<AppRaftNode>,
         worker_manager: Arc<WorkerManager>,
