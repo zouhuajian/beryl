@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use beryl_common::error::rpc::{ErrorKind, RecoveryAction, RpcErrorDetail, WorkerErrorKind};
 use beryl_common::header::RequestHeader;
 use beryl_proto::common::{EndpointProto, RequestHeaderProto};
-use beryl_proto::convert::{require_worker_run_id, rpc_error_from_proto};
+use beryl_proto::convert::{require_worker_run_id, required_block_id, rpc_error_from_proto};
 use beryl_proto::metadata::metadata_worker_service_proto_client::MetadataWorkerServiceProtoClient;
 use beryl_proto::metadata::{
     CapacityInfoProto, HealthStatusProto, HeartbeatRequestProto, HeartbeatResponseProto, LoadInfoProto, TierFreeProto,
@@ -25,8 +25,8 @@ use tracing::{debug, info, warn};
 
 use crate::config::WorkerRegistrationConfig;
 use crate::control::{
-    metadata_tonic_request, ControlIdentity, ControlOp, MetadataRegistrar, Registration, RegistrationDescriptor,
-    RegistrationSet,
+    metadata_tonic_request, BlockCleanupCommand, BlockCleanupExecutor, ControlIdentity, ControlOp, MetadataRegistrar,
+    Registration, RegistrationDescriptor, RegistrationSet,
 };
 use crate::observe;
 use crate::store::dirs::{StoreDirs, StoreReport};
@@ -68,13 +68,19 @@ pub struct MetadataHeartbeatLoop {
     endpoints: Vec<Endpoint>,
     control_identity: ControlIdentity,
     heartbeat_seq: Mutex<HashMap<(GroupName, WorkerRunId), u64>>,
+    cleanup: BlockCleanupExecutor,
 }
 
 impl MetadataHeartbeatLoop {
+    /// Builds a heartbeat loop whose accepted cleanup commands use `cleanup`.
+    ///
+    /// Endpoint and registration configuration is validated before any
+    /// background task or RPC is started.
     pub fn new(
         config: WorkerRegistrationConfig,
         descriptor: RegistrationDescriptor,
         state: Arc<RegistrationSet>,
+        cleanup: BlockCleanupExecutor,
     ) -> Result<Self, HeartbeatError> {
         config
             .validate()
@@ -93,6 +99,7 @@ impl MetadataHeartbeatLoop {
             endpoints,
             control_identity: ControlIdentity::new_local(),
             heartbeat_seq: Mutex::new(HashMap::new()),
+            cleanup,
         })
     }
 
@@ -108,6 +115,11 @@ impl MetadataHeartbeatLoop {
         tokio::spawn(async move { self.run(registrar, Some(store)).await })
     }
 
+    /// Sends one heartbeat round and enqueues commands from accepted responses.
+    ///
+    /// A response must confirm the requested group, worker, and worker run.
+    /// Cleanup commands are parsed as one batch, so a malformed command rejects
+    /// that peer response without partially enqueueing destructive work.
     pub async fn send_once(&self, snapshot: HeartbeatSnapshot) -> Result<HeartbeatRound, HeartbeatError> {
         let Some(registration) = self.state.registration(&self.config.group_name) else {
             return Ok(HeartbeatRound::default());
@@ -124,13 +136,17 @@ impl MetadataHeartbeatLoop {
         for endpoint in &self.endpoints {
             let started = Instant::now();
             match self.send_to_peer(endpoint.clone(), request.clone()).await {
-                Ok(HeartbeatPeerOutcome::Accepted { liveness_timeout }) => {
+                Ok(HeartbeatPeerOutcome::Accepted {
+                    liveness_timeout,
+                    cleanup_commands,
+                }) => {
                     let duration = started.elapsed().as_secs_f64();
                     observe::record_metadata_rpc("heartbeat", "ok", "none", duration);
                     observe::record_heartbeat_sent("ok", "none");
                     round.accepted_peers += 1;
                     self.state
                         .record_heartbeat_success(&registration.group_name, liveness_timeout);
+                    self.cleanup.enqueue(&registration, cleanup_commands);
                 }
                 Ok(HeartbeatPeerOutcome::NeedRegister) => {
                     observe::record_metadata_rpc(
@@ -301,7 +317,10 @@ impl From<StoreReport> for HeartbeatSnapshot {
 }
 
 enum HeartbeatPeerOutcome {
-    Accepted { liveness_timeout: Duration },
+    Accepted {
+        liveness_timeout: Duration,
+        cleanup_commands: Vec<BlockCleanupCommand>,
+    },
     NeedRegister,
     WorkerRunMismatch,
 }
@@ -314,6 +333,10 @@ fn heartbeat_error_kind(error: &HeartbeatError) -> &'static str {
     }
 }
 
+/// Authenticates heartbeat response identity and decodes its command batch.
+///
+/// All commands are validated before an accepted outcome is returned. Callers
+/// therefore never execute a valid prefix from an otherwise malformed batch.
 fn classify_heartbeat_response(
     request: &HeartbeatRequestProto,
     response: HeartbeatResponseProto,
@@ -353,8 +376,33 @@ fn classify_heartbeat_response(
             "metadata heartbeat response did not confirm worker_run_id".to_string(),
         ));
     }
+    let cleanup_commands = response
+        .cleanup_commands
+        .into_iter()
+        .map(|command| {
+            let block_id = required_block_id(command.block_id, "HeartbeatResponse.cleanup_commands.block_id")
+                .map_err(HeartbeatError::Fatal)?;
+            if block_id.data_handle_id.as_raw() == 0 {
+                return Err(HeartbeatError::Fatal(
+                    "HeartbeatResponse.cleanup_commands.block_id.data_handle_id must be non-zero".to_string(),
+                ));
+            }
+            if command.expected_block_stamp == 0 {
+                return Err(HeartbeatError::Fatal(
+                    "HeartbeatResponse.cleanup_commands.expected_block_stamp must be non-zero".to_string(),
+                ));
+            }
+            Ok(BlockCleanupCommand {
+                block_id,
+                expected_block_stamp: command.expected_block_stamp,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let liveness_timeout = Duration::from_millis(u64::from(response.liveness_timeout_ms.max(1)));
-    Ok(HeartbeatPeerOutcome::Accepted { liveness_timeout })
+    Ok(HeartbeatPeerOutcome::Accepted {
+        liveness_timeout,
+        cleanup_commands,
+    })
 }
 
 fn classify_header(

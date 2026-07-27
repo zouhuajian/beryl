@@ -18,7 +18,7 @@ use bytes::Bytes;
 
 use crate::error::WorkerError;
 use crate::observe;
-use crate::runtime::block::BlockManager;
+use crate::runtime::block::{BlockManager, ReclaimingBlock};
 use crate::runtime::stream::{StreamManager, StreamState};
 use crate::store::block::{
     BlockState, ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
@@ -391,7 +391,8 @@ impl WorkerCore {
             self.stream_manager.cleanup_idle_read_streams().await;
             match tokio::time::timeout(
                 wait_timeout,
-                self.block_manager.begin_reclaim(&req.group_name, req.block_id),
+                self.block_manager
+                    .begin_reclaim(&req.group_name, req.block_id, req.expected_block_stamp),
             )
             .await
             {
@@ -402,6 +403,11 @@ impl WorkerCore {
         let result = self.block_store.reclaim_block(&req)?;
         permit.complete();
         Ok(result)
+    }
+
+    /// Lists exact block versions currently excluded from new readers.
+    pub(crate) fn reclaiming_blocks(&self, group_name: &GroupName) -> Vec<ReclaimingBlock> {
+        self.block_manager.reclaiming_blocks(group_name)
     }
 
     pub async fn open_write(&self, req: WriteOpenRequest) -> WorkerCoreResult<WriteOpenResult> {

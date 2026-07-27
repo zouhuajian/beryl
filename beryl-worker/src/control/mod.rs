@@ -8,6 +8,7 @@ use beryl_proto::common::RequestHeaderProto;
 use beryl_types::{CallId, ClientId};
 
 mod block_report;
+mod cleanup;
 mod heartbeat;
 pub(crate) mod identity;
 mod registrar;
@@ -15,6 +16,7 @@ mod registration;
 mod storage;
 
 pub use block_report::{BlockReportError, BlockReportOptions, BlockReportRound, MetadataBlockReportLoop};
+pub use cleanup::{BlockCleanupCommand, BlockCleanupExecutor, BlockCleanupOptions};
 pub use heartbeat::{HeartbeatError, HeartbeatRound, HeartbeatSnapshot, MetadataHeartbeatLoop};
 pub use registrar::{MetadataRegistrar, RegistrationDescriptor, RegistrationError};
 pub use registration::{Registration, RegistrationSet};

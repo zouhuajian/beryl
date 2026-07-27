@@ -28,6 +28,10 @@ pub(crate) const WORKER_STREAM_FRAME_BYTES: &str = "worker_stream_frame_bytes";
 pub(crate) const WORKER_STREAM_FRAMES_TOTAL: &str = "worker_stream_frames_total";
 pub(crate) const WORKER_STREAM_COMMIT_TOTAL: &str = "worker_stream_commit_total";
 pub(crate) const WORKER_STREAM_ABORT_TOTAL: &str = "worker_stream_abort_total";
+pub(crate) const WORKER_CLEANUP_QUEUE_DEPTH: &str = "worker_cleanup_queue_depth";
+pub(crate) const WORKER_CLEANUP_RECLAIMING_COUNT: &str = "worker_cleanup_reclaiming_count";
+pub(crate) const WORKER_CLEANUP_ENQUEUE_TOTAL: &str = "worker_cleanup_enqueue_total";
+pub(crate) const WORKER_CLEANUP_RESULT_TOTAL: &str = "worker_cleanup_result_total";
 
 pub fn record_worker_started(service: &str, version: &str) {
     metrics::gauge!(WORKER_UP).set(1.0);
@@ -84,6 +88,22 @@ pub(crate) fn record_block_report_sent(kind: &str, status: &str, error_kind: &st
         "error_kind" => error_kind.to_string()
     )
     .record(duration_seconds);
+}
+
+pub(crate) fn set_cleanup_queue_depth(count: usize) {
+    metrics::gauge!(WORKER_CLEANUP_QUEUE_DEPTH).set(count as f64);
+}
+
+pub(crate) fn set_cleanup_reclaiming(count: usize) {
+    metrics::gauge!(WORKER_CLEANUP_RECLAIMING_COUNT).set(count as f64);
+}
+
+pub(crate) fn record_cleanup_enqueue(result: &str) {
+    metrics::counter!(WORKER_CLEANUP_ENQUEUE_TOTAL, "result" => result.to_string()).increment(1);
+}
+
+pub(crate) fn record_cleanup_result(result: &str) {
+    metrics::counter!(WORKER_CLEANUP_RESULT_TOTAL, "result" => result.to_string()).increment(1);
 }
 
 pub(crate) fn record_store_capacity(dir_id: &str, kind: &str, bytes: u64) {

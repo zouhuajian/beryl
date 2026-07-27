@@ -31,6 +31,7 @@ use crate::control::{
 use crate::observe;
 use crate::store::block::{BlockMetaPayload, BlockState};
 use crate::store::dirs::StoreDirs;
+use crate::WorkerCore;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockReportOptions {
@@ -81,6 +82,7 @@ pub struct MetadataBlockReportLoop {
     state: Arc<RegistrationSet>,
     endpoints: Vec<Endpoint>,
     store: Arc<StoreDirs>,
+    core: Arc<WorkerCore>,
     options: BlockReportOptions,
     control_identity: ControlIdentity,
     baselines: Mutex<HashMap<GroupName, ReportBaseline>>,
@@ -92,8 +94,9 @@ impl MetadataBlockReportLoop {
         descriptor: RegistrationDescriptor,
         state: Arc<RegistrationSet>,
         store: Arc<StoreDirs>,
+        core: Arc<WorkerCore>,
     ) -> Result<Self, BlockReportError> {
-        Self::with_options(config, descriptor, state, store, BlockReportOptions::default())
+        Self::with_options(config, descriptor, state, store, core, BlockReportOptions::default())
     }
 
     pub fn with_options(
@@ -101,6 +104,7 @@ impl MetadataBlockReportLoop {
         descriptor: RegistrationDescriptor,
         state: Arc<RegistrationSet>,
         store: Arc<StoreDirs>,
+        core: Arc<WorkerCore>,
         options: BlockReportOptions,
     ) -> Result<Self, BlockReportError> {
         config
@@ -131,6 +135,7 @@ impl MetadataBlockReportLoop {
             state,
             endpoints,
             store,
+            core,
             options,
             control_identity: ControlIdentity::new_local(),
             baselines: Mutex::new(HashMap::new()),
@@ -336,15 +341,37 @@ impl MetadataBlockReportLoop {
         self.state.is_ready(&registration.group_name).then_some(registration)
     }
 
+    /// Builds the local block view used by both full and delta reports.
+    ///
+    /// Runtime `Reclaiming` entries override the filesystem scan as `Deleting`.
+    /// This keeps a block observable after its Ready metadata is removed but
+    /// before crash-safe reclamation and lifecycle cleanup have completed.
     fn scan_report_blocks(&self) -> Result<Vec<BlockReportBlockProto>, BlockReportError> {
         let metas = self
             .store
             .scan_group_blocks(&self.config.group_name)
             .map_err(|err| BlockReportError::Retryable(format!("scan local block report group failed: {err}")))?;
-        let mut blocks = Vec::with_capacity(metas.len());
+        let mut blocks = HashMap::with_capacity(metas.len());
         for meta in metas {
-            blocks.push(meta_to_report_block(meta)?);
+            let block = meta_to_report_block(meta)?;
+            let id = block_id(&block).expect("local block report entry has an id");
+            blocks.insert(id, block);
         }
+        for reclaiming in self.core.reclaiming_blocks(&self.config.group_name) {
+            blocks.insert(
+                reclaiming.block_id,
+                BlockReportBlockProto {
+                    block_id: Some(reclaiming.block_id.into()),
+                    block_stamp: reclaiming.block_stamp,
+                    block_state: BlockReportBlockStateProto::BlockReportBlockStateDeleting as i32,
+                },
+            );
+        }
+        let mut blocks = blocks.into_values().collect::<Vec<_>>();
+        blocks.sort_by_key(|block| {
+            let id = block_id(block).expect("local block report entry has an id");
+            (id.data_handle_id.as_raw(), id.index.as_raw())
+        });
         Ok(blocks)
     }
 

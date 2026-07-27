@@ -11,7 +11,8 @@ use beryl_common::observe::{init_observability, ServiceInfo};
 use beryl_worker::{
     config::WorkerConfig,
     control::{
-        prepare_worker_start, MetadataBlockReportLoop, MetadataHeartbeatLoop, MetadataRegistrar, RegistrationSet,
+        prepare_worker_start, BlockCleanupExecutor, BlockCleanupOptions, MetadataBlockReportLoop,
+        MetadataHeartbeatLoop, MetadataRegistrar, RegistrationSet,
     },
     net, observe,
     store::dirs::StoreDirs,
@@ -73,12 +74,6 @@ async fn main() -> Result<()> {
     let descriptor = MetadataRegistrar::descriptor_from_config(&config, worker_id)
         .context("Failed to build worker registration descriptor")?;
     let block_report_descriptor = descriptor.clone();
-    let heartbeat = MetadataHeartbeatLoop::new(
-        config.metadata.clone(),
-        descriptor.clone(),
-        Arc::clone(&registration_state),
-    )
-    .context("Failed to create worker metadata heartbeat loop")?;
     let registrar = Arc::new(
         MetadataRegistrar::new(config.metadata.clone(), descriptor, Arc::clone(&registration_state))
             .context("Failed to create worker metadata registrar")?,
@@ -98,6 +93,19 @@ async fn main() -> Result<()> {
         Duration::from_millis(config.stream_idle_timeout_ms),
         block_store.clone(),
     ));
+    let cleanup = BlockCleanupExecutor::start(
+        Arc::clone(&core),
+        Arc::clone(&registration_state),
+        BlockCleanupOptions::default(),
+    )
+    .context("Failed to create worker block cleanup executor")?;
+    let heartbeat = MetadataHeartbeatLoop::new(
+        config.metadata.clone(),
+        block_report_descriptor.clone(),
+        Arc::clone(&registration_state),
+        cleanup,
+    )
+    .context("Failed to create worker metadata heartbeat loop")?;
 
     registrar
         .register_with_retry(async {
@@ -111,6 +119,7 @@ async fn main() -> Result<()> {
         block_report_descriptor,
         Arc::clone(&registration_state),
         block_store,
+        Arc::clone(&core),
     )
     .context("Failed to create worker block report loop")?;
     let _block_report_handle = block_report.spawn();

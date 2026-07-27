@@ -3,9 +3,9 @@
 
 //! Background worker-state convergence and repair scheduling.
 //!
-//! Physical block reclamation is not yet executed by workers. Cleanup commands
-//! are derived from namespace authority and reconstructable worker reports, and
-//! dispatch remains disabled by default until worker-side safety is available.
+//! Cleanup commands are derived from namespace authority and reconstructable
+//! worker reports. Dispatch remains disabled by default until end-to-end
+//! recovery validation authorizes production enablement.
 
 mod cleanup;
 mod lost_worker;
