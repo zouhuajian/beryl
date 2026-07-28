@@ -36,7 +36,7 @@ use beryl_worker::net::config::WorkerNetConfig;
 use beryl_worker::net::protocol::WorkerNetProtocol;
 use beryl_worker::store::block::{
     ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
-    PublishReadyRequest,
+    PublishReadyRequest, ReclaimBlockRequest,
 };
 use beryl_worker::store::dirs::{StoreDirs, StoreReport};
 use beryl_worker::{ReadOpenRequest, WorkerCore};
@@ -461,6 +461,50 @@ fn publish_ready_block_for(
             block_stamp,
         })
         .expect("publish ready block");
+}
+
+async fn wait_for_block_report_requests(mock: &MockMetadataState, expected: usize, timeout: Duration) {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if mock.block_report_requests.lock().unwrap().len() >= expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {expected} block report requests"));
+}
+
+async fn wait_for_block_report_delta(
+    mock: &MockMetadataState,
+    expected_op: BlockReportDeltaOpProto,
+    expected_block_id: BlockId,
+    timeout: Duration,
+) {
+    tokio::time::timeout(timeout, async {
+        loop {
+            let found = mock.block_report_requests.lock().unwrap().iter().any(|request| {
+                let Some(block_report_request_proto::Report::Delta(delta)) = request.report.as_ref() else {
+                    return false;
+                };
+                delta.deltas.iter().any(|entry| {
+                    entry.op() == expected_op
+                        && entry
+                            .block
+                            .as_ref()
+                            .and_then(|block| block.block_id)
+                            .is_some_and(|block_id| BlockId::try_from(block_id) == Ok(expected_block_id))
+                })
+            });
+            if found {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {expected_op:?} delta for {expected_block_id}"));
 }
 
 #[tokio::test]
@@ -1357,6 +1401,388 @@ fn block_report_scans_local_blocks_by_group_directory() {
     assert_eq!(scanned.len(), 1);
     assert_eq!(scanned[0].identity.group_name, report_group);
     assert_eq!(scanned[0].identity.block_id, report_block);
+}
+
+#[tokio::test]
+async fn block_report_loop_sends_coalesced_ready_and_remove_deltas_on_store_changes() {
+    let worker_run_id = test_worker_run_id();
+    let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(Vec::new()).await;
+    let state = Arc::new(RegistrationSet::new());
+    state.record_registered(Registration {
+        group_name: group_name(),
+        worker_id: WorkerId::new(42),
+        worker_run_id,
+        advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+    });
+    state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
+    let temp = TempDir::new().expect("tempdir");
+    let store = report_store(&temp);
+    let first = BlockId::new(DataHandleId::new(7), BlockIndex::new(0));
+    let second = BlockId::new(DataHandleId::new(7), BlockIndex::new(1));
+    let core = test_worker_core(Arc::clone(&store));
+    let reporter = MetadataBlockReportLoop::new(
+        test_registration_config(endpoint),
+        test_registration_descriptor(worker_run_id),
+        Arc::clone(&state),
+        Arc::clone(&store),
+        Arc::clone(&core),
+    )
+    .expect("block reporter");
+    let reporter_handle = reporter.spawn();
+    wait_for_block_report_requests(&mock, 1, Duration::from_millis(500)).await;
+
+    publish_ready_block_for(store.as_ref(), group_name(), first, payload(), 101);
+    publish_ready_block_for(store.as_ref(), group_name(), second, payload(), 102);
+    wait_for_block_report_requests(&mock, 2, Duration::from_millis(500)).await;
+
+    {
+        let requests = mock.block_report_requests.lock().unwrap();
+        assert!(matches!(
+            requests[0].report.as_ref(),
+            Some(block_report_request_proto::Report::Full(_))
+        ));
+        let Some(block_report_request_proto::Report::Delta(delta)) = requests[1].report.as_ref() else {
+            panic!("expected event-driven delta report");
+        };
+        assert_eq!(delta.deltas.len(), 2);
+        assert!(delta
+            .deltas
+            .iter()
+            .all(|entry| entry.op() == BlockReportDeltaOpProto::BlockReportDeltaOpAddUpdate));
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        mock.block_report_requests.lock().unwrap().len(),
+        2,
+        "rapid Ready changes should be coalesced before the periodic tick"
+    );
+
+    assert_eq!(
+        core.reclaim_block(ReclaimBlockRequest {
+            group_name: group_name(),
+            block_id: first,
+            expected_block_stamp: 101,
+        })
+        .await
+        .expect("reclaim Ready block"),
+        beryl_worker::ReclaimBlockResult::Deleted {
+            effective_len: BLOCK_SIZE
+        }
+    );
+    wait_for_block_report_delta(
+        &mock,
+        BlockReportDeltaOpProto::BlockReportDeltaOpRemove,
+        first,
+        Duration::from_millis(500),
+    )
+    .await;
+    {
+        let requests = mock.block_report_requests.lock().unwrap();
+        assert!(requests.iter().any(|request| {
+            let Some(block_report_request_proto::Report::Delta(delta)) = request.report.as_ref() else {
+                return false;
+            };
+            delta.deltas.iter().any(|entry| {
+                entry.op() == BlockReportDeltaOpProto::BlockReportDeltaOpRemove
+                    && entry
+                        .block
+                        .as_ref()
+                        .and_then(|block| block.block_id)
+                        .is_some_and(|block_id| BlockId::try_from(block_id) == Ok(first))
+            })
+        }));
+    }
+
+    reporter_handle.abort();
+    shutdown.send(()).ok();
+}
+
+#[tokio::test]
+async fn failed_publish_does_not_trigger_block_report() {
+    let worker_run_id = test_worker_run_id();
+    let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(Vec::new()).await;
+    let state = Arc::new(RegistrationSet::new());
+    state.record_registered(Registration {
+        group_name: group_name(),
+        worker_id: WorkerId::new(42),
+        worker_run_id,
+        advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+    });
+    state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
+    let temp = TempDir::new().expect("tempdir");
+    let store = report_store(&temp);
+    let reporter = MetadataBlockReportLoop::new(
+        test_registration_config(endpoint),
+        test_registration_descriptor(worker_run_id),
+        Arc::clone(&state),
+        Arc::clone(&store),
+        test_worker_core(Arc::clone(&store)),
+    )
+    .expect("block reporter");
+    let reporter_handle = reporter.spawn();
+    wait_for_block_report_requests(&mock, 1, Duration::from_millis(500)).await;
+
+    store
+        .create_staging_block(CreateStagingBlockRequest {
+            group_name: group_name(),
+            block_id: block_id(),
+            block_size: BLOCK_SIZE,
+            block_format_id: BlockFormatId::FULL_EFFECTIVE,
+            chunk_size: CHUNK_SIZE,
+            checksum_kind: ChecksumKind::None,
+            tier: Tier::Hdd,
+        })
+        .expect("create staging block");
+    store
+        .write_at(&group_name(), block_id(), 0, Bytes::from_static(b"incomplete"))
+        .expect("write partial staging block");
+    assert!(store
+        .publish_ready(PublishReadyRequest {
+            group_name: group_name(),
+            block_id: block_id(),
+            effective_len: BLOCK_SIZE,
+            block_stamp: 101,
+        })
+        .is_err());
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        mock.block_report_requests.lock().unwrap().len(),
+        1,
+        "failed publication must not wake the block report loop"
+    );
+
+    reporter_handle.abort();
+    shutdown.send(()).ok();
+}
+
+#[tokio::test]
+async fn event_driven_delta_failure_is_retried_by_periodic_reporting() {
+    let worker_run_id = test_worker_run_id();
+    let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(vec![
+        MockBlockReportReply::Ok,
+        MockBlockReportReply::Status(Status::unavailable("delta unavailable")),
+        MockBlockReportReply::Ok,
+    ])
+    .await;
+    let state = Arc::new(RegistrationSet::new());
+    state.record_registered(Registration {
+        group_name: group_name(),
+        worker_id: WorkerId::new(42),
+        worker_run_id,
+        advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+    });
+    state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
+    let temp = TempDir::new().expect("tempdir");
+    let store = report_store(&temp);
+    let reporter = MetadataBlockReportLoop::new(
+        test_registration_config(endpoint),
+        test_registration_descriptor(worker_run_id),
+        Arc::clone(&state),
+        Arc::clone(&store),
+        test_worker_core(Arc::clone(&store)),
+    )
+    .expect("block reporter");
+    let reporter_handle = reporter.spawn();
+    wait_for_block_report_requests(&mock, 1, Duration::from_millis(500)).await;
+
+    publish_ready_block_for(store.as_ref(), group_name(), block_id(), payload(), 101);
+    wait_for_block_report_requests(&mock, 2, Duration::from_millis(500)).await;
+    wait_for_block_report_requests(&mock, 3, Duration::from_millis(1_500)).await;
+
+    {
+        let requests = mock.block_report_requests.lock().unwrap();
+        assert!(matches!(
+            requests[1].report.as_ref(),
+            Some(block_report_request_proto::Report::Delta(_))
+        ));
+        assert!(matches!(
+            requests[2].report.as_ref(),
+            Some(block_report_request_proto::Report::Delta(_))
+        ));
+    }
+
+    reporter_handle.abort();
+    shutdown.send(()).ok();
+}
+
+#[tokio::test]
+async fn failed_full_report_recovery_is_retried_by_periodic_reporting() {
+    let worker_run_id = test_worker_run_id();
+    let full_required = RpcErrorDetail::send_full_block_report(
+        ErrorKind::Worker(WorkerErrorKind::FullReportRequired),
+        "send full report",
+    );
+    let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(vec![
+        MockBlockReportReply::Ok,
+        MockBlockReportReply::HeaderError(full_required),
+        MockBlockReportReply::Status(Status::unavailable("full report unavailable")),
+        MockBlockReportReply::Ok,
+    ])
+    .await;
+    let state = Arc::new(RegistrationSet::new());
+    state.record_registered(Registration {
+        group_name: group_name(),
+        worker_id: WorkerId::new(42),
+        worker_run_id,
+        advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+    });
+    state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
+    let temp = TempDir::new().expect("tempdir");
+    let store = report_store(&temp);
+    let reporter = MetadataBlockReportLoop::new(
+        test_registration_config(endpoint),
+        test_registration_descriptor(worker_run_id),
+        Arc::clone(&state),
+        Arc::clone(&store),
+        test_worker_core(Arc::clone(&store)),
+    )
+    .expect("block reporter");
+    let reporter_handle = reporter.spawn();
+    wait_for_block_report_requests(&mock, 1, Duration::from_millis(500)).await;
+
+    publish_ready_block_for(store.as_ref(), group_name(), block_id(), payload(), 101);
+    wait_for_block_report_requests(&mock, 3, Duration::from_millis(500)).await;
+    wait_for_block_report_requests(&mock, 4, Duration::from_millis(1_500)).await;
+
+    {
+        let requests = mock.block_report_requests.lock().unwrap();
+        assert!(matches!(
+            requests[0].report.as_ref(),
+            Some(block_report_request_proto::Report::Full(_))
+        ));
+        assert!(matches!(
+            requests[1].report.as_ref(),
+            Some(block_report_request_proto::Report::Delta(_))
+        ));
+        assert!(matches!(
+            requests[2].report.as_ref(),
+            Some(block_report_request_proto::Report::Full(_))
+        ));
+        assert!(matches!(
+            requests[3].report.as_ref(),
+            Some(block_report_request_proto::Report::Full(_))
+        ));
+    }
+
+    reporter_handle.abort();
+    shutdown.send(()).ok();
+}
+
+#[tokio::test]
+async fn re_registration_rebuilds_full_report_after_block_report_registration_errors() {
+    for error in [
+        RpcErrorDetail::register_worker(ErrorKind::Worker(WorkerErrorKind::NotRegistered), "register worker"),
+        RpcErrorDetail::register_worker(ErrorKind::Worker(WorkerErrorKind::RunMismatch), "worker run mismatch"),
+    ] {
+        let worker_run_id = test_worker_run_id();
+        let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(vec![
+            MockBlockReportReply::Ok,
+            MockBlockReportReply::HeaderError(error),
+            MockBlockReportReply::Ok,
+        ])
+        .await;
+        let state = Arc::new(RegistrationSet::new());
+        let registration = Registration {
+            group_name: group_name(),
+            worker_id: WorkerId::new(42),
+            worker_run_id,
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        };
+        state.record_registered(registration.clone());
+        state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
+        let temp = TempDir::new().expect("tempdir");
+        let store = report_store(&temp);
+        let reporter = MetadataBlockReportLoop::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+            Arc::clone(&store),
+            test_worker_core(Arc::clone(&store)),
+        )
+        .expect("block reporter");
+        let reporter_handle = reporter.spawn();
+        wait_for_block_report_requests(&mock, 1, Duration::from_millis(500)).await;
+
+        publish_ready_block_for(store.as_ref(), group_name(), block_id(), payload(), 101);
+        wait_for_block_report_requests(&mock, 2, Duration::from_millis(500)).await;
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while state.registration(&group_name()).is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("block report registration error should clear the registration");
+
+        state.record_registered(registration);
+        state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
+        wait_for_block_report_requests(&mock, 3, Duration::from_millis(1_500)).await;
+
+        {
+            let requests = mock.block_report_requests.lock().unwrap();
+            assert!(matches!(
+                requests[0].report.as_ref(),
+                Some(block_report_request_proto::Report::Full(_))
+            ));
+            assert!(matches!(
+                requests[1].report.as_ref(),
+                Some(block_report_request_proto::Report::Delta(_))
+            ));
+            assert!(matches!(
+                requests[2].report.as_ref(),
+                Some(block_report_request_proto::Report::Full(_))
+            ));
+        }
+
+        reporter_handle.abort();
+        shutdown.send(()).ok();
+    }
+}
+
+#[tokio::test]
+async fn registration_epoch_change_rebuilds_full_report_without_store_changes() {
+    let worker_run_id = test_worker_run_id();
+    let (endpoint, mock, shutdown) =
+        start_mock_metadata_with_block_reports(vec![MockBlockReportReply::Ok, MockBlockReportReply::Ok]).await;
+    let state = Arc::new(RegistrationSet::new());
+    let registration = Registration {
+        group_name: group_name(),
+        worker_id: WorkerId::new(42),
+        worker_run_id,
+        advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+    };
+    state.record_registered(registration.clone());
+    state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
+    let temp = TempDir::new().expect("tempdir");
+    let store = report_store(&temp);
+    let reporter = MetadataBlockReportLoop::new(
+        test_registration_config(endpoint),
+        test_registration_descriptor(worker_run_id),
+        Arc::clone(&state),
+        Arc::clone(&store),
+        test_worker_core(Arc::clone(&store)),
+    )
+    .expect("block reporter");
+    let reporter_handle = reporter.spawn();
+    wait_for_block_report_requests(&mock, 1, Duration::from_millis(500)).await;
+
+    state.mark_needs_register(&group_name());
+    state.record_registered(registration);
+    state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
+    wait_for_block_report_requests(&mock, 2, Duration::from_millis(1_500)).await;
+
+    {
+        let requests = mock.block_report_requests.lock().unwrap();
+        assert!(requests.iter().all(|request| {
+            matches!(
+                request.report.as_ref(),
+                Some(block_report_request_proto::Report::Full(_))
+            )
+        }));
+    }
+
+    reporter_handle.abort();
+    shutdown.send(()).ok();
 }
 
 #[tokio::test]

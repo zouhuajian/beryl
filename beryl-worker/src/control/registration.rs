@@ -4,6 +4,7 @@
 //! Worker metadata registration state.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -21,14 +22,21 @@ pub struct Registration {
 }
 
 /// Worker-local readiness set for metadata group registration.
+///
+/// Every accepted registration receives a new process-local epoch. Block report
+/// baselines bind to that epoch so a re-registration cannot reuse an observation
+/// established by an earlier registration lifecycle.
 #[derive(Debug, Default)]
 pub struct RegistrationSet {
     registrations: RwLock<HashMap<GroupName, RegistrationLease>>,
+    next_registration_epoch: AtomicU64,
 }
 
+/// Registration identity, lifecycle epoch, and current heartbeat lease.
 #[derive(Clone, Debug)]
 struct RegistrationLease {
     registration: Registration,
+    registration_epoch: u64,
     heartbeat_deadline: Option<Instant>,
 }
 
@@ -37,11 +45,19 @@ impl RegistrationSet {
         Self::default()
     }
 
+    /// Records a registration as a new lifecycle that still requires a heartbeat.
+    ///
+    /// The epoch changes even when worker identity and run are unchanged.
     pub fn record_registered(&self, registration: Registration) {
+        let previous_epoch = self
+            .next_registration_epoch
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |epoch| epoch.checked_add(1))
+            .expect("worker registration epoch exhausted");
         self.registrations.write().expect("registration state poisoned").insert(
             registration.group_name.clone(),
             RegistrationLease {
                 registration,
+                registration_epoch: previous_epoch + 1,
                 heartbeat_deadline: None,
             },
         );
@@ -84,6 +100,22 @@ impl RegistrationSet {
             .expect("registration state poisoned")
             .get(group_name)
             .map(|entry| entry.registration.clone())
+    }
+
+    /// Returns one consistent snapshot of a live registration and its epoch.
+    ///
+    /// An expired or absent heartbeat lease is not report-ready.
+    pub(crate) fn ready_registration(&self, group_name: &GroupName) -> Option<(Registration, u64)> {
+        self.registrations
+            .read()
+            .expect("registration state poisoned")
+            .get(group_name)
+            .filter(|entry| {
+                entry
+                    .heartbeat_deadline
+                    .is_some_and(|deadline| deadline > Instant::now())
+            })
+            .map(|entry| (entry.registration.clone(), entry.registration_epoch))
     }
 
     pub fn is_registered(&self, group_name: &GroupName) -> bool {

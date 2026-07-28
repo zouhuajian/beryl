@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use beryl_types::{BlockId, GroupName, Tier, TierFree};
 use bytes::Bytes;
+use tokio::sync::Notify;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -50,11 +51,16 @@ pub struct StoreReport {
     pub dirs: Vec<StoreDirReport>,
 }
 
+/// Aggregates local block stores and signals changes to their reportable view.
+///
+/// `block_report_changed` is a coalescing wake-up signal, not an event log.
+/// Block reporting must rescan the stores after every wake-up.
 #[derive(Debug)]
 pub struct StoreDirs {
     inner: Mutex<StoreDirsState>,
     reserve_bytes: u64,
     check_interval: Duration,
+    block_report_changed: Notify,
 }
 
 #[derive(Debug)]
@@ -133,6 +139,7 @@ impl StoreDirs {
             }),
             reserve_bytes: reserve_space_bytes,
             check_interval: Duration::from_millis(check_interval_ms),
+            block_report_changed: Notify::new(),
         })
     }
 
@@ -162,6 +169,15 @@ impl StoreDirs {
             )
         });
         Ok(blocks)
+    }
+
+    /// Waits until a successful local publication or deletion may change a
+    /// block report.
+    ///
+    /// Multiple changes may share one notification because the consumer derives
+    /// the authoritative state by scanning the stores.
+    pub(crate) async fn wait_for_block_report_change(&self) {
+        self.block_report_changed.notified().await;
     }
 
     fn refresh_due(&self, inner: &mut StoreDirsState) -> StoreResult<()> {
@@ -348,6 +364,8 @@ impl LocalBlockStore for StoreDirs {
             .used_bytes
             .saturating_add(meta.source.effective_len);
         inner.dirs[dir_index].block_count = inner.dirs[dir_index].block_count.saturating_add(1);
+        drop(inner);
+        self.block_report_changed.notify_one();
         Ok(meta)
     }
 
@@ -408,6 +426,8 @@ impl LocalBlockStore for StoreDirs {
             release_pending_locked(&mut inner.dirs[dir_index], &req.group_name, req.block_id);
             inner.dirs[dir_index].used_bytes = inner.dirs[dir_index].used_bytes.saturating_sub(effective_len);
             inner.dirs[dir_index].block_count = inner.dirs[dir_index].block_count.saturating_sub(1);
+            drop(inner);
+            self.block_report_changed.notify_one();
         }
         Ok(result)
     }

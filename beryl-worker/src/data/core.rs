@@ -410,6 +410,11 @@ impl WorkerCore {
         self.block_manager.reclaiming_blocks(group_name)
     }
 
+    /// Waits until runtime reclamation completion may change a block report.
+    pub(crate) async fn wait_for_block_report_change(&self) {
+        self.block_manager.wait_for_block_report_change().await;
+    }
+
     pub async fn open_write(&self, req: WriteOpenRequest) -> WorkerCoreResult<WriteOpenResult> {
         let group_name = req.group_name.clone();
         let block_id = req.block_id;

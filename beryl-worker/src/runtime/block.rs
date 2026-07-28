@@ -45,10 +45,15 @@ enum BlockAccessState {
     },
 }
 
+/// Coordinates reader pins and destructive block lifecycle transitions.
+///
+/// `changed` wakes lifecycle waiters. `block_report_changed` is emitted only
+/// after final reclaim state is cleared so reporting can observe removal.
 #[derive(Debug, Default)]
 struct BlockAccessRegistry {
     states: Mutex<HashMap<BlockAccessKey, BlockAccessState>>,
     changed: Notify,
+    block_report_changed: Notify,
 }
 
 /// Exact block version currently excluded from new readers for reclamation.
@@ -93,6 +98,9 @@ pub(crate) struct ReclaimPermit {
 
 impl ReclaimPermit {
     /// Completes reclamation and removes the transient lifecycle entry.
+    ///
+    /// Removing the entry also wakes block reporting after `Reclaiming` can no
+    /// longer override a missing filesystem block as `Deleting`.
     pub(crate) fn complete(mut self) {
         self.registry.complete_reclaim(&self.key);
         self.completed = true;
@@ -256,6 +264,7 @@ impl BlockAccessRegistry {
         self.changed.notify_waiters();
     }
 
+    /// Clears a completed reclaim fence before advertising the lifecycle change.
     fn complete_reclaim(&self, key: &BlockAccessKey) {
         let mut states = self.states.lock().expect("block access state poisoned");
         match states.get(key) {
@@ -269,6 +278,7 @@ impl BlockAccessRegistry {
         }
         drop(states);
         self.changed.notify_waiters();
+        self.block_report_changed.notify_one();
     }
 
     /// Snapshots exact versions currently fenced from new readers for reporting.
@@ -288,6 +298,11 @@ impl BlockAccessRegistry {
             .collect::<Vec<_>>();
         blocks.sort_by_key(|block| (block.block_id.data_handle_id.as_raw(), block.block_id.index.as_raw()));
         blocks
+    }
+
+    /// Waits until completed reclamation may change the reportable block view.
+    async fn wait_for_block_report_change(&self) {
+        self.block_report_changed.notified().await;
     }
 }
 
@@ -316,6 +331,7 @@ impl BlockManager {
             access: Arc::new(BlockAccessRegistry {
                 states: Mutex::new(HashMap::new()),
                 changed: Notify::new(),
+                block_report_changed: Notify::new(),
             }),
         }
     }
@@ -357,6 +373,11 @@ impl BlockManager {
     /// Lists exact block versions currently fenced from new readers.
     pub(crate) fn reclaiming_blocks(&self, group_name: &GroupName) -> Vec<ReclaimingBlock> {
         self.access.reclaiming_blocks(group_name)
+    }
+
+    /// Waits for a completed reclaim lifecycle transition.
+    pub(crate) async fn wait_for_block_report_change(&self) {
+        self.access.wait_for_block_report_change().await;
     }
 
     pub fn validate_read(

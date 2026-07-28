@@ -67,15 +67,22 @@ pub struct BlockReportRound {
     pub worker_run_mismatch: bool,
 }
 
+/// Last Metadata-accepted block view used to derive ordered delta reports.
+///
+/// A baseline is usable only by the registration epoch that established it.
 #[derive(Clone, Debug, Default)]
 struct ReportBaseline {
     report_seq: u64,
     next_delta_seq: u64,
+    registration_epoch: u64,
     blocks: HashMap<BlockId, BlockReportBlockProto>,
     ready: bool,
 }
 
 /// Sends full and delta block reports for one registered metadata group.
+///
+/// Local block changes wake the loop promptly, while the periodic tick remains
+/// the bounded recovery path for coalesced notifications and failed RPCs.
 pub struct MetadataBlockReportLoop {
     config: WorkerRegistrationConfig,
     _descriptor: RegistrationDescriptor,
@@ -146,17 +153,24 @@ impl MetadataBlockReportLoop {
         tokio::spawn(async move { self.run().await })
     }
 
+    /// Returns whether the current live registration has an accepted
+    /// full-report baseline.
     pub fn has_delta_baseline(&self, group_name: &GroupName) -> bool {
+        let Some((_, registration_epoch)) = self.state.ready_registration(group_name) else {
+            return false;
+        };
         self.baselines
             .lock()
             .expect("block report baseline state poisoned")
             .get(group_name)
-            .map(|baseline| baseline.ready)
+            .map(|baseline| baseline.ready && baseline.registration_epoch == registration_epoch)
             .unwrap_or(false)
     }
 
+    /// Sends one full-report round and binds any accepted baseline to the
+    /// captured registration epoch.
     pub async fn send_full_once(&self) -> Result<BlockReportRound, BlockReportError> {
-        let Some(registration) = self.ready_registration() else {
+        let Some((registration, registration_epoch)) = self.ready_registration() else {
             return Ok(BlockReportRound::default());
         };
         let blocks = self.scan_report_blocks()?;
@@ -228,7 +242,13 @@ impl MetadataBlockReportLoop {
         }
 
         if round.accepted_peers > 0 && !round.needs_register && !round.worker_run_mismatch {
-            self.publish_baseline(&registration.group_name, report_seq, accepted_next_delta_seq, blocks);
+            self.publish_baseline(
+                &registration.group_name,
+                registration_epoch,
+                report_seq,
+                accepted_next_delta_seq,
+                blocks,
+            );
         } else if round.attempted_peers > 0
             && !round.full_report_required
             && !round.needs_register
@@ -242,11 +262,15 @@ impl MetadataBlockReportLoop {
         Ok(round)
     }
 
+    /// Sends one delta round only when the current registration owns the
+    /// baseline.
     pub async fn send_delta_once(&self) -> Result<BlockReportRound, BlockReportError> {
-        let Some(registration) = self.ready_registration() else {
+        let Some((registration, registration_epoch)) = self.ready_registration() else {
             return Ok(BlockReportRound::default());
         };
-        let Some((report_seq, delta_seq, deltas)) = self.build_delta_batch(&registration.group_name)? else {
+        let Some((report_seq, delta_seq, deltas)) =
+            self.build_delta_batch(&registration.group_name, registration_epoch)?
+        else {
             return Ok(BlockReportRound::default());
         };
 
@@ -336,9 +360,8 @@ impl MetadataBlockReportLoop {
         Ok(round)
     }
 
-    fn ready_registration(&self) -> Option<Registration> {
-        let registration = self.state.registration(&self.config.group_name)?;
-        self.state.is_ready(&registration.group_name).then_some(registration)
+    fn ready_registration(&self) -> Option<(Registration, u64)> {
+        self.state.ready_registration(&self.config.group_name)
     }
 
     /// Builds the local block view used by both full and delta reports.
@@ -383,9 +406,11 @@ impl MetadataBlockReportLoop {
         baseline.report_seq
     }
 
+    /// Replaces the delta baseline with a Metadata-accepted full-report view.
     fn publish_baseline(
         &self,
         group_name: &GroupName,
+        registration_epoch: u64,
         report_seq: u64,
         next_delta_seq: u64,
         blocks: Vec<BlockReportBlockProto>,
@@ -396,6 +421,7 @@ impl MetadataBlockReportLoop {
             ReportBaseline {
                 report_seq,
                 next_delta_seq,
+                registration_epoch,
                 blocks: blocks
                     .into_iter()
                     .filter_map(|block| block_id(&block).map(|id| (id, block)))
@@ -405,9 +431,14 @@ impl MetadataBlockReportLoop {
         );
     }
 
+    /// Diffs the current local view against a baseline from the same
+    /// registration lifecycle.
+    ///
+    /// Returning `None` makes the caller rebuild state with a full report.
     fn build_delta_batch(
         &self,
         group_name: &GroupName,
+        registration_epoch: u64,
     ) -> Result<Option<(u64, u64, Vec<BlockReportDeltaProto>)>, BlockReportError> {
         let current = self.scan_report_blocks()?;
         let current: HashMap<BlockId, BlockReportBlockProto> = current
@@ -415,7 +446,10 @@ impl MetadataBlockReportLoop {
             .filter_map(|block| block_id(&block).map(|id| (id, block)))
             .collect();
         let baselines = self.baselines.lock().expect("block report baseline state poisoned");
-        let Some(baseline) = baselines.get(group_name).filter(|baseline| baseline.ready) else {
+        let Some(baseline) = baselines
+            .get(group_name)
+            .filter(|baseline| baseline.ready && baseline.registration_epoch == registration_epoch)
+        else {
             return Ok(None);
         };
 
@@ -567,27 +601,33 @@ impl MetadataBlockReportLoop {
         classify_block_report_response(&request, response)
     }
 
+    /// Runs the event-driven reporter with periodic retry and full-report recovery.
+    ///
+    /// Every wake-up re-evaluates baseline validity; an invalid or missing
+    /// baseline always selects a full report instead of silently skipping work.
     async fn run(self) {
         let mut interval = time::interval(Duration::from_millis(1_000));
         loop {
-            interval.tick().await;
-            match self.send_full_once().await {
-                Ok(round) if round.accepted_peers > 0 => break,
-                Ok(_) => {}
-                Err(error) => warn!(%error, "Worker full block report round failed"),
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = self.store.wait_for_block_report_change() => {}
+                _ = self.core.wait_for_block_report_change() => {}
             }
-        }
-
-        loop {
-            interval.tick().await;
-            match self.send_delta_once().await {
-                Ok(round) if round.full_report_required => {
-                    if let Err(error) = self.send_full_once().await {
-                        warn!(%error, "Worker full block report recovery failed");
+            if self.has_delta_baseline(&self.config.group_name) {
+                match self.send_delta_once().await {
+                    Ok(round) if round.full_report_required => {
+                        if let Err(error) = self.send_full_once().await {
+                            warn!(%error, "Worker full block report recovery failed");
+                        }
                     }
+                    Ok(_) => {}
+                    Err(error) => warn!(%error, "Worker delta block report round failed"),
                 }
-                Ok(_) => {}
-                Err(error) => warn!(%error, "Worker delta block report round failed"),
+            } else {
+                match self.send_full_once().await {
+                    Ok(_) => {}
+                    Err(error) => warn!(%error, "Worker full block report round failed"),
+                }
             }
         }
     }
