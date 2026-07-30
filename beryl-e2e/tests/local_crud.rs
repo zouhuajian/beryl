@@ -27,10 +27,6 @@ async fn local_client_crud_roundtrip() {
         .expect("create through metadata");
     writer.write_all(first.clone()).await.expect("write through worker");
     writer.close().await.expect("close through metadata");
-    cluster
-        .converge_block_reports()
-        .await
-        .expect("block report convergence after create");
 
     let status = client.stat(path).await.expect("status after close");
     assert_eq!(status.path(), path);
@@ -51,10 +47,6 @@ async fn local_client_crud_roundtrip() {
         .await
         .expect("append write through worker");
     appender.close().await.expect("append close through metadata");
-    cluster
-        .converge_block_reports()
-        .await
-        .expect("block report convergence after append");
 
     let read = client
         .open(path)
@@ -138,15 +130,20 @@ async fn visibility_sync_then_continue_write_roundtrip() {
         .sync_write_visibility()
         .await
         .expect("publish first block while keeping session open");
+    let visible_prefix = client
+        .open(path)
+        .await
+        .expect("open immediately after visibility sync")
+        .read_all()
+        .await
+        .expect("read published prefix while writer remains open");
+    assert_eq!(visible_prefix, first);
+
     writer
         .write_all(second.clone())
         .await
         .expect("write after visibility sync");
     writer.close().await.expect("close after second block");
-    cluster
-        .converge_block_reports()
-        .await
-        .expect("converge both published block reports");
 
     let actual = client
         .open(path)
@@ -180,7 +177,6 @@ async fn write_more_than_ten_blocks_roundtrip() {
         .await
         .expect("write more than ten blocks");
     writer.close().await.expect("close file");
-    cluster.converge_block_reports().await.expect("converge block reports");
 
     let actual = client
         .open(path)

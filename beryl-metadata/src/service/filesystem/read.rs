@@ -1797,6 +1797,7 @@ mod tests {
             .expect("open write should succeed");
         let key = open.payload;
         let target = add_block_for_key(&env.filesystem, &key, 64).await;
+        publish_env_write_target(&env, &target, 1);
         commit_for_key(
             &env.filesystem,
             &key,
@@ -1861,6 +1862,7 @@ mod tests {
             .expect("open write should succeed");
         let key = open.payload;
         let target = add_block_for_key(&env.filesystem, &key, 64).await;
+        publish_env_write_target(&env, &target, 1);
         commit_for_key(
             &env.filesystem,
             &key,

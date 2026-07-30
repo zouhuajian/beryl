@@ -21,7 +21,7 @@ async fn committed_file_is_readable_after_worker_restart_full_report_convergence
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let client = cluster.client().clone();
     let path = "/worker-restart/committed";
-    let payload = write_closed_file(&cluster, path, 1_537, 1024)
+    let payload = write_closed_file(&mut cluster, path, 1_537, 1024)
         .await
         .expect("write committed file");
 
@@ -56,7 +56,7 @@ async fn read_locations_before_full_report_convergence_are_unavailable_then_reco
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let client = cluster.client().clone();
     let path = "/worker-restart/pre-convergence";
-    let payload = write_closed_file(&cluster, path, 1_537, 1024)
+    let payload = write_closed_file(&mut cluster, path, 1_537, 1024)
         .await
         .expect("write committed file");
 
@@ -83,7 +83,7 @@ async fn read_locations_before_full_report_convergence_are_unavailable_then_reco
 async fn stale_old_worker_run_is_rejected_after_restart() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let path = "/worker-restart/stale-run";
-    let payload = write_closed_file(&cluster, path, 1_537, 1024)
+    let payload = write_closed_file(&mut cluster, path, 1_537, 1024)
         .await
         .expect("write committed file");
     let before_locations = metadata_locations(&cluster, path, payload.len() as u32)
@@ -116,7 +116,7 @@ async fn multi_block_file_is_readable_after_worker_restart_full_report_convergen
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let client = cluster.client().clone();
     let path = "/worker-restart/multi-block";
-    let payload = write_closed_file(&cluster, path, 5_123, 1024)
+    let payload = write_closed_file(&mut cluster, path, 5_123, 1024)
         .await
         .expect("write multi-block file");
     let before_locations = metadata_locations(&cluster, path, payload.len() as u32)
@@ -139,7 +139,7 @@ async fn multi_block_file_is_readable_after_worker_restart_full_report_convergen
 }
 
 async fn write_closed_file(
-    cluster: &TestCluster,
+    cluster: &mut TestCluster,
     path: &str,
     payload_len: usize,
     block_size: u32,

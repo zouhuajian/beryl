@@ -231,6 +231,31 @@ mod tests {
         assert_eq!(second.block_stamp, 2);
         assert_eq!(second.file_offset, 32);
     }
+
+    #[test]
+    fn add_block_completion_cannot_install_a_target_from_an_old_revision() {
+        let registry = SessionRegistry::default();
+        let data_handle_id = DataHandleId::new(16);
+        registry.create_session(create_input(data_handle_id)).unwrap();
+        let first = issue_target(&registry, data_handle_id, None, 32, 0, 0, 1);
+        registry
+            .update_published_state(data_handle_id, 7, 1, 32)
+            .expect("advance published state while AddBlock is in flight");
+        let mut stale = write_target(data_handle_id, 1);
+        stale.file_offset = 32;
+        stale.effective_len = 32;
+        stale.block_stamp = 1;
+
+        let error = registry
+            .install_issued_target(data_handle_id, 7, Some(first.block_id), Some(32), stale)
+            .expect_err("an AddBlock result from the previous revision must be rejected");
+
+        assert!(error.contains("block stamp changed: expected 2, got 1"));
+        assert_eq!(
+            registry.get_session(data_handle_id).unwrap().issued_targets,
+            vec![first]
+        );
+    }
 }
 
 /// Inputs needed to create a runtime write session.

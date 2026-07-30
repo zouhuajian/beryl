@@ -799,7 +799,7 @@ mod tests {
         get_block_locations_request_proto, AddBlockRequestProto, CommitFileRequestProto, CommittedBlockProto,
         CreateDirectoryRequestProto, CreateFileRequestProto, DeleteOptionsProto, DeleteRequestProto,
         GetBlockLocationsRequestProto, GetStatusRequestProto, ListStatusRequestProto, OpenWriteModeProto,
-        OpenWriteRequestProto, SyncWriteRequestProto, WriteHandleProto,
+        OpenWriteRequestProto, SyncWriteRequestProto, WriteHandleProto, WriteTargetProto,
     };
     use beryl_types::fs::{Extent, FileAttrs, FsErrorCode, Inode, InodeId};
     use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, MountId, WorkerId};
@@ -1192,9 +1192,18 @@ mod tests {
         manager
     }
 
-    fn publish_reported_location(env: &PathTestEnv, block_id: BlockId, block_stamp: u64, _effective_len: u64) {
+    fn publish_reported_location(
+        env: &PathTestEnv,
+        worker_id: WorkerId,
+        block_id: BlockId,
+        block_stamp: u64,
+        _effective_len: u64,
+    ) {
+        publish_reported_locations(env, worker_id, vec![(block_id, block_stamp)]);
+    }
+
+    fn publish_reported_locations(env: &PathTestEnv, worker_id: WorkerId, blocks: Vec<(BlockId, u64)>) {
         let worker_manager = env.worker_manager.as_ref().expect("worker manager");
-        let worker_id = WorkerId::new(1);
         let worker_run_id = worker_manager
             .get_registration(&group_name("root"), worker_id)
             .expect("worker registration")
@@ -1207,13 +1216,40 @@ mod tests {
                 1,
                 0,
                 true,
-                vec![BlockReportBlock {
-                    block_id,
-                    block_stamp,
-                    block_state: BlockReportBlockState::Ready,
-                }],
+                blocks
+                    .into_iter()
+                    .map(|(block_id, block_stamp)| BlockReportBlock {
+                        block_id,
+                        block_stamp,
+                        block_state: BlockReportBlockState::Ready,
+                    })
+                    .collect(),
             )
             .expect("full block report should publish location");
+    }
+
+    fn publish_target_reports(env: &PathTestEnv, targets: &[&WriteTargetProto]) {
+        let mut by_worker = std::collections::HashMap::<WorkerId, Vec<(BlockId, u64)>>::new();
+        for target in targets {
+            let worker_id = WorkerId::new(
+                target
+                    .worker_endpoints
+                    .first()
+                    .expect("target worker endpoint")
+                    .worker_id,
+            );
+            let block_id = target.block_id.as_ref().expect("target block id");
+            by_worker.entry(worker_id).or_default().push((
+                BlockId::new(
+                    DataHandleId::new(block_id.data_handle_id),
+                    BlockIndex::new(block_id.block_index),
+                ),
+                target.block_stamp,
+            ));
+        }
+        for (worker_id, blocks) in by_worker {
+            publish_reported_locations(env, worker_id, blocks);
+        }
     }
 
     async fn open_write_session_with_committed_block(
@@ -1274,6 +1310,24 @@ mod tests {
         .into_inner()
         .target
         .expect("write target");
+        let reported_block_id = target.block_id.as_ref().expect("target block id");
+        let reported_worker_id = WorkerId::new(
+            target
+                .worker_endpoints
+                .first()
+                .expect("target worker endpoint")
+                .worker_id,
+        );
+        publish_reported_location(
+            env,
+            reported_worker_id,
+            BlockId::new(
+                DataHandleId::new(reported_block_id.data_handle_id),
+                BlockIndex::new(reported_block_id.block_index),
+            ),
+            target.block_stamp,
+            target.effective_len,
+        );
         let committed = CommittedBlockProto {
             block_id: target.block_id,
             file_offset: target.file_offset,
@@ -1968,6 +2022,7 @@ mod tests {
             file_offset: second_target.file_offset,
             len: second_target.effective_len,
         };
+        publish_target_reports(&env, &[&first_target, &second_target]);
 
         let published = FileSystemServiceProto::commit_file(
             &env.service,
@@ -2190,6 +2245,24 @@ mod tests {
             file_offset: target.file_offset,
             len: target.effective_len,
         }];
+        let typed_block_id = BlockId::new(
+            DataHandleId::new(block_id.data_handle_id),
+            BlockIndex::new(block_id.block_index),
+        );
+        let reported_worker_id = WorkerId::new(
+            target
+                .worker_endpoints
+                .first()
+                .expect("target worker endpoint")
+                .worker_id,
+        );
+        publish_reported_location(
+            &env,
+            reported_worker_id,
+            typed_block_id,
+            target.block_stamp,
+            target.effective_len,
+        );
 
         let commit_header = header(30);
         let first = FileSystemServiceProto::commit_file(
@@ -2224,11 +2297,7 @@ mod tests {
         };
         assert_ne!(first_content_revision, 0);
         assert!(env.session_registry.get_session(session_data_handle).is_none());
-        let typed_block_id = BlockId::new(
-            DataHandleId::new(block_id.data_handle_id),
-            BlockIndex::new(block_id.block_index),
-        );
-        publish_reported_location(&env, typed_block_id, first_content_revision, target.effective_len);
+        assert_eq!(first_content_revision, target.block_stamp);
 
         let locations = FileSystemServiceProto::get_block_locations(
             &env.service,
@@ -2248,6 +2317,10 @@ mod tests {
         assert_eq!(locations.locations.len(), 1);
         assert_eq!(locations.locations[0].block_stamp, Some(first_content_revision));
 
+        env.worker_manager
+            .as_ref()
+            .expect("worker manager")
+            .reset_worker_soft_state();
         let second = FileSystemServiceProto::commit_file(
             &env.service,
             Request::new(CommitFileRequestProto {

@@ -51,7 +51,8 @@ pub struct TestCluster {
     worker_manager: Arc<WorkerManager>,
     registrar: MetadataRegistrar,
     registration_state: Arc<beryl_worker::control::RegistrationSet>,
-    block_report: MetadataBlockReportLoop,
+    block_report: Arc<MetadataBlockReportLoop>,
+    background_block_report: Option<tokio::task::JoinHandle<()>>,
     heartbeat: MetadataHeartbeatLoop,
     block_store: Arc<StoreDirs>,
     metadata_server: MetadataServiceInstance,
@@ -113,7 +114,7 @@ impl TestCluster {
         )
         .await?;
 
-        let cluster = Self {
+        let mut cluster = Self {
             _temp_state: temp_state,
             client,
             group_name,
@@ -126,6 +127,7 @@ impl TestCluster {
             registrar: worker.registrar,
             registration_state: worker.registration_state,
             block_report: worker.block_report,
+            background_block_report: None,
             heartbeat: worker.heartbeat,
             block_store: worker.block_store,
             metadata_server,
@@ -134,11 +136,47 @@ impl TestCluster {
             additional_workers: Vec::new(),
         };
         cluster.converge_block_reports().await?;
+        cluster.start_background_block_reports();
         Ok(cluster)
     }
 
     pub fn client(&self) -> &FsClient {
         &self.client
+    }
+
+    /// Start a bounded E2E reporter so write RPCs exercise the asynchronous
+    /// Worker-to-Metadata report path without manual convergence.
+    pub fn start_background_block_reports(&mut self) {
+        if self.background_block_report.is_some() {
+            return;
+        }
+        let mut block_reports = vec![Arc::clone(&self.block_report)];
+        block_reports.extend(
+            self.additional_workers
+                .iter()
+                .map(|worker| Arc::clone(&worker.block_report)),
+        );
+        let group_name = self.group_name.clone();
+        self.background_block_report = Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                interval.tick().await;
+                for block_report in &block_reports {
+                    if block_report.has_delta_baseline(&group_name) {
+                        let _ = block_report.send_delta_once().await;
+                    } else {
+                        let _ = block_report.send_full_once().await;
+                    }
+                }
+            }
+        }));
+    }
+
+    pub async fn stop_background_block_reports(&mut self) {
+        if let Some(task) = self.background_block_report.take() {
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     pub fn metadata_endpoint(&self) -> String {
@@ -217,15 +255,25 @@ impl TestCluster {
         .await?;
         let worker_id = worker.worker_id;
         self.additional_workers.push(worker);
+        if self.background_block_report.is_some() {
+            self.stop_background_block_reports().await;
+            self.start_background_block_reports();
+        }
         Ok(worker_id)
     }
 
     pub async fn restart_worker(&mut self) -> TestResult<()> {
+        let restart_background = self.background_block_report.is_some();
         self.restart_worker_until_heartbeat().await?;
-        self.converge_block_reports().await
+        let result = self.converge_block_reports().await;
+        if restart_background {
+            self.start_background_block_reports();
+        }
+        result
     }
 
     pub async fn restart_worker_until_heartbeat(&mut self) -> TestResult<()> {
+        self.stop_background_block_reports().await;
         self.worker_server.shutdown().await?;
         let listener = TcpListener::bind(self.worker_addr).await?;
         let worker = start_worker_instance(&self.worker_config, listener)?;
@@ -258,14 +306,22 @@ impl TestCluster {
     }
 
     pub async fn restart_metadata(&mut self) -> TestResult<()> {
+        let restart_background = self.background_block_report.is_some();
+        self.stop_background_block_reports().await;
         self.metadata_server.shutdown().await?;
-        self.start_metadata_from_disk().await
+        let result = self.start_metadata_from_disk().await;
+        if restart_background && result.is_ok() {
+            self.start_background_block_reports();
+        }
+        result
     }
 
     pub async fn start_metadata_process(&mut self, executable: &std::path::Path) -> TestResult<()> {
         if self.metadata_process.is_some() {
             return Err("metadata child process is already running".into());
         }
+        let restart_background = self.background_block_report.is_some();
+        self.stop_background_block_reports().await;
         self.metadata_server.shutdown().await?;
         let metrics_port = PortReservation::reserve_localhost().await?;
         let metrics_addr = metrics_port.addr();
@@ -278,16 +334,26 @@ impl TestCluster {
             }
             return Err(error);
         }
-        self.register_workers_with_external_metadata().await
+        let result = self.register_workers_with_external_metadata().await;
+        if restart_background && result.is_ok() {
+            self.start_background_block_reports();
+        }
+        result
     }
 
     pub async fn kill_metadata_process_and_restart(&mut self) -> TestResult<()> {
+        let restart_background = self.background_block_report.is_some();
+        self.stop_background_block_reports().await;
         let process = self
             .metadata_process
             .take()
             .ok_or("metadata child process is not running")?;
         process.kill().await?;
-        self.start_metadata_from_disk().await
+        let result = self.start_metadata_from_disk().await;
+        if restart_background && result.is_ok() {
+            self.start_background_block_reports();
+        }
+        result
     }
 
     async fn start_metadata_from_disk(&mut self) -> TestResult<()> {
@@ -336,43 +402,53 @@ impl TestCluster {
         self.converge_block_reports().await
     }
 
-    pub async fn converge_block_reports(&self) -> TestResult<()> {
-        if self.metadata_process.is_some() {
-            send_full_block_report_to_external_metadata(&self.heartbeat, &self.block_report, &self.block_store).await?;
+    pub async fn converge_block_reports(&mut self) -> TestResult<()> {
+        let restart_background = self.background_block_report.is_some();
+        self.stop_background_block_reports().await;
+        let result = async {
+            if self.metadata_process.is_some() {
+                send_full_block_report_to_external_metadata(&self.heartbeat, &self.block_report, &self.block_store)
+                    .await?;
+                for worker in &self.additional_workers {
+                    send_full_block_report_to_external_metadata(
+                        &worker.heartbeat,
+                        &worker.block_report,
+                        &worker.block_store,
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
+
+            readiness::converge_block_reports(
+                &self.heartbeat,
+                &self.block_report,
+                &self.block_store,
+                &self.registration_state,
+                &self.worker_manager,
+                &self.group_name,
+                self.worker_id,
+            )
+            .await?;
             for worker in &self.additional_workers {
-                send_full_block_report_to_external_metadata(
+                readiness::converge_block_reports(
                     &worker.heartbeat,
                     &worker.block_report,
                     &worker.block_store,
+                    &worker.registration_state,
+                    &self.worker_manager,
+                    &self.group_name,
+                    worker.worker_id,
                 )
                 .await?;
             }
-            return Ok(());
+            Ok(())
         }
-
-        readiness::converge_block_reports(
-            &self.heartbeat,
-            &self.block_report,
-            &self.block_store,
-            &self.registration_state,
-            &self.worker_manager,
-            &self.group_name,
-            self.worker_id,
-        )
-        .await?;
-        for worker in &self.additional_workers {
-            readiness::converge_block_reports(
-                &worker.heartbeat,
-                &worker.block_report,
-                &worker.block_store,
-                &worker.registration_state,
-                &self.worker_manager,
-                &self.group_name,
-                worker.worker_id,
-            )
-            .await?;
+        .await;
+        if restart_background {
+            self.start_background_block_reports();
         }
-        Ok(())
+        result
     }
 
     /// Drives cleanup until physical deletion and metadata absence both converge.
@@ -436,6 +512,7 @@ impl TestCluster {
     }
 
     pub async fn shutdown(&mut self) -> TestResult<()> {
+        self.stop_background_block_reports().await;
         for worker in &mut self.additional_workers {
             worker.worker_server.shutdown().await?;
         }
@@ -531,6 +608,9 @@ fn store_report_block_count(store: &StoreDirs) -> TestResult<usize> {
 
 impl Drop for TestCluster {
     fn drop(&mut self) {
+        if let Some(task) = self.background_block_report.take() {
+            task.abort();
+        }
         for worker in &mut self.additional_workers {
             worker.worker_server.abort();
         }
@@ -604,7 +684,7 @@ struct StartedWorkerService {
     worker_id: WorkerId,
     registrar: MetadataRegistrar,
     registration_state: Arc<beryl_worker::control::RegistrationSet>,
-    block_report: MetadataBlockReportLoop,
+    block_report: Arc<MetadataBlockReportLoop>,
     heartbeat: MetadataHeartbeatLoop,
     block_store: Arc<StoreDirs>,
     worker_server: WorkerServiceInstance,
@@ -645,13 +725,13 @@ fn start_worker_instance(
         Arc::clone(&registration_state),
         cleanup,
     )?;
-    let block_report = MetadataBlockReportLoop::new(
+    let block_report = Arc::new(MetadataBlockReportLoop::new(
         worker_config.metadata.clone(),
         descriptor,
         Arc::clone(&registration_state),
         Arc::clone(&block_store),
         Arc::clone(&worker_core),
-    )?;
+    )?);
     let worker_server = WorkerServiceInstance::start(listener, worker_core, Arc::clone(&registration_state));
     Ok(StartedWorkerService {
         worker_id,

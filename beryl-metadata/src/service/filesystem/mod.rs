@@ -405,10 +405,6 @@ impl MetadataFileSystem {
         ))
     }
 
-    fn replay_hint(intent: &str) -> String {
-        format!("refresh metadata and reopen write handle, then replay {}", intent)
-    }
-
     fn read_inode(&self, inode_id: InodeId) -> MetadataResult<Option<beryl_types::fs::Inode>> {
         self.storage.get_inode(inode_id)
     }
@@ -453,18 +449,29 @@ mod test_support {
     pub(super) use std::time::Duration;
     pub(super) use tempfile::TempDir;
 
-    pub(super) struct MemoryStateStore;
+    pub(super) struct MemoryStateStore {
+        route_epoch: std::sync::atomic::AtomicU64,
+    }
 
     impl MemoryStateStore {
         pub(super) fn new() -> Self {
-            Self
+            Self {
+                route_epoch: std::sync::atomic::AtomicU64::new(1),
+            }
+        }
+
+        pub(super) fn set_route_epoch(&self, route_epoch: u64) {
+            self.route_epoch
+                .store(route_epoch, std::sync::atomic::Ordering::Release);
         }
     }
 
     #[async_trait::async_trait]
     impl StateStore for MemoryStateStore {
         async fn get_route_epoch(&self) -> MetadataResult<crate::state::RouteEpoch> {
-            Ok(crate::state::RouteEpoch::new(1))
+            Ok(crate::state::RouteEpoch::new(
+                self.route_epoch.load(std::sync::atomic::Ordering::Acquire),
+            ))
         }
     }
 
@@ -498,6 +505,14 @@ mod test_support {
         pub(super) fn lease_manager(&self) -> Arc<LeaseManager> {
             Arc::clone(&self.lease_manager)
         }
+
+        pub(super) fn mount_table(&self) -> Arc<MountTable> {
+            Arc::clone(&self.filesystem.mount_table)
+        }
+
+        pub(super) fn raft_node(&self) -> Arc<AppRaftNode> {
+            Arc::clone(self.filesystem.raft_node.as_ref().expect("test filesystem Raft node"))
+        }
     }
 
     pub(super) struct TestFilesystemBuilder {
@@ -506,6 +521,7 @@ mod test_support {
         raft_node: Option<Arc<AppRaftNode>>,
         lease_manager: Option<Arc<LeaseManager>>,
         worker_manager: Option<Arc<WorkerManager>>,
+        state_store: Option<Arc<dyn StateStore>>,
     }
 
     impl TestFilesystemBuilder {
@@ -516,6 +532,7 @@ mod test_support {
                 raft_node: None,
                 lease_manager: None,
                 worker_manager: None,
+                state_store: None,
             }
         }
 
@@ -543,6 +560,11 @@ mod test_support {
             self
         }
 
+        pub(super) fn with_state_store(mut self, state_store: Arc<dyn StateStore>) -> Self {
+            self.state_store = Some(state_store);
+            self
+        }
+
         pub(super) fn build(self) -> TestFilesystem {
             let (storage, storage_dir) = match self.storage {
                 Some(storage) => (storage, None),
@@ -555,7 +577,7 @@ mod test_support {
             let session_registry = Arc::new(SessionRegistry::default());
             let lease_manager = self.lease_manager.unwrap_or_else(|| Arc::new(LeaseManager::default()));
             let filesystem = MetadataFileSystem::new(MetadataFileSystemDeps {
-                state_store: Arc::new(MemoryStateStore::new()),
+                state_store: self.state_store.unwrap_or_else(|| Arc::new(MemoryStateStore::new())),
                 mount_table: self.mount_table,
                 storage,
                 raft_node: self.raft_node,
@@ -959,6 +981,7 @@ mod test_support {
         pub(super) inode_id: InodeId,
         pub(super) data_handle_id: DataHandleId,
         pub(super) group_name: GroupName,
+        pub(super) state_store: Arc<MemoryStateStore>,
     }
 
     pub(super) async fn write_flow_env(base_size: u64) -> WriteFlowEnv {
@@ -975,7 +998,9 @@ mod test_support {
         let group_name = group_name(&format!("g{}", 15 + base_size));
         let inode_id = InodeId::new(570 + base_size);
         let data_handle_id = DataHandleId::new(9570 + base_size);
-        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name);
+        let state_store = Arc::new(MemoryStateStore::new());
+        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name)
+            .with_state_store(Arc::clone(&state_store) as Arc<dyn StateStore>);
         let mount_table = builder.mount_table();
         let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
         let filesystem = builder
@@ -999,6 +1024,7 @@ mod test_support {
             inode_id,
             data_handle_id,
             group_name,
+            state_store,
         }
     }
 
@@ -1043,6 +1069,19 @@ mod test_support {
             report_seq,
             Some(block_stamp),
             vec![block_id],
+        );
+    }
+
+    pub(super) fn publish_env_write_target(env: &WriteFlowEnv, target: &WriteTarget, report_seq: u64) {
+        let worker = target.worker_endpoints.first().expect("write target worker");
+        let worker_manager = env.filesystem.worker_manager.as_ref().expect("worker manager");
+        publish_report_locations_with_stamp(
+            worker_manager,
+            &env.group_name,
+            worker.worker_id,
+            report_seq,
+            Some(target.block_stamp),
+            vec![target.block_id],
         );
     }
 
