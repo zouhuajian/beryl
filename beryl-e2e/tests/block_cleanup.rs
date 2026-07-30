@@ -14,13 +14,14 @@ async fn metadata_cleanup_commands_remove_only_deleted_file_blocks() {
         .start_metadata_process(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
         .await
         .expect("start full metadata runtime with maintenance");
-    let client = cluster.client();
+    let client: beryl_client::FsClient = cluster.client().clone();
     client.mkdirs("/cleanup", true).await.expect("create cleanup directory");
 
     let first = Bytes::from(deterministic_bytes(513));
     let second = Bytes::from(deterministic_bytes(777));
-    write_file(client, "/cleanup/first", first.clone()).await;
-    write_file(client, "/cleanup/second", second.clone()).await;
+    write_file(&client, "/cleanup/first", first.clone()).await;
+    write_file(&client, "/cleanup/second", second.clone()).await;
+    cluster.stop_background_block_reports().await;
     cluster
         .converge_block_reports()
         .await

@@ -7,12 +7,23 @@ use crate::error::{MetadataError, MetadataResult};
 use crate::placement::{ReportedBlockLocation, WorkerPlacementView};
 use beryl_types::ids::{BlockId, WorkerId};
 use beryl_types::layout::BlockFormatId;
-use beryl_types::{GroupName, TierFree, WorkerRunId};
+use beryl_types::{GroupName, TierFree, WorkerNetProtocol, WorkerRunId, WriteTarget};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::watch;
+
+pub(super) const WORKER_NET_PROTOCOL_GRPC: i32 = 1;
+
+pub(super) fn worker_net_protocol_label(worker_net_protocol: i32) -> &'static str {
+    if worker_net_protocol == WORKER_NET_PROTOCOL_GRPC {
+        "grpc"
+    } else {
+        "unknown"
+    }
+}
 
 /// Worker descriptor (low-frequency, authoritative, persisted in Raft).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,45 +139,6 @@ pub struct ReadyReplicaListing {
     pub complete: bool,
 }
 
-fn ready_block_ids<'a>(blocks: impl Iterator<Item = &'a BlockReportBlock>) -> HashSet<BlockId> {
-    blocks
-        .filter(|block| block.block_state == BlockReportBlockState::Ready)
-        .map(|block| block.block_id)
-        .collect()
-}
-
-pub(super) const WORKER_NET_PROTOCOL_GRPC: i32 = 1;
-
-pub(super) fn worker_net_protocol_label(worker_net_protocol: i32) -> &'static str {
-    if worker_net_protocol == WORKER_NET_PROTOCOL_GRPC {
-        "grpc"
-    } else {
-        "unknown"
-    }
-}
-
-fn validate_same_run_descriptor(
-    group_name: &GroupName,
-    worker_id: WorkerId,
-    existing: &WorkerRegistrationState,
-    address: &str,
-    worker_net_protocol: i32,
-) -> MetadataResult<()> {
-    if existing.address == address && existing.worker_net_protocol == worker_net_protocol {
-        return Ok(());
-    }
-    Err(MetadataError::InvalidArgument(format!(
-        "worker descriptor mismatch for group_name={}, worker_id={}, worker_run_id={}: registered endpoint {} protocol {}, requested endpoint {} protocol {}",
-        group_name,
-        worker_id.as_raw(),
-        existing.worker_run_id,
-        existing.address,
-        worker_net_protocol_label(existing.worker_net_protocol),
-        address,
-        worker_net_protocol_label(worker_net_protocol)
-    )))
-}
-
 /// Live startup registration state for the current metadata process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkerRegistrationState {
@@ -264,6 +236,47 @@ struct WorkerBlockReportRuntime {
     delta_seq: u64,
 }
 
+/// Result of checking whether one publication batch has readable worker evidence.
+///
+/// `Pending` is reserved for observations that may still converge without
+/// replacing the active write session. Deterministic identity or local block
+/// state conflicts are returned separately so publication can fail closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PublishReadyStatus {
+    Ready,
+    Pending { block_id: BlockId },
+    Conflict(PublishReadyConflict),
+}
+
+/// Deterministic worker evidence that cannot authorize file publication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PublishReadyConflict {
+    MissingWriteEndpoint {
+        block_id: BlockId,
+    },
+    WorkerRunMismatch {
+        block_id: BlockId,
+        worker_id: WorkerId,
+        expected: WorkerRunId,
+        current: Option<WorkerRunId>,
+    },
+    EndpointMismatch {
+        block_id: BlockId,
+        worker_id: WorkerId,
+    },
+    BlockStampMismatch {
+        block_id: BlockId,
+        worker_id: WorkerId,
+        expected: u64,
+        reported: u64,
+    },
+    UnreadableBlock {
+        block_id: BlockId,
+        worker_id: WorkerId,
+        state: BlockReportBlockState,
+    },
+}
+
 /// Block report convergence snapshot for maintenance safety gate.
 #[derive(Debug, Clone)]
 pub struct BlockReportConvergenceSnapshot {
@@ -271,6 +284,54 @@ pub struct BlockReportConvergenceSnapshot {
     pub full_reported_workers: usize,
     pub ratio: f64,
     pub converged: bool,
+}
+
+#[derive(Debug)]
+pub struct WorkerManagerStats {
+    pub total_workers: usize,
+    pub live_workers: usize,
+    pub total_blocks: usize,
+    pub total_locations: usize,
+}
+
+fn ready_block_ids<'a>(blocks: impl Iterator<Item = &'a BlockReportBlock>) -> HashSet<BlockId> {
+    blocks
+        .filter(|block| block.block_state == BlockReportBlockState::Ready)
+        .map(|block| block.block_id)
+        .collect()
+}
+
+fn validate_same_run_descriptor(
+    group_name: &GroupName,
+    worker_id: WorkerId,
+    existing: &WorkerRegistrationState,
+    address: &str,
+    worker_net_protocol: i32,
+) -> MetadataResult<()> {
+    if existing.address == address && existing.worker_net_protocol == worker_net_protocol {
+        return Ok(());
+    }
+    Err(MetadataError::InvalidArgument(format!(
+        "worker descriptor mismatch for group_name={}, worker_id={}, worker_run_id={}: registered endpoint {} protocol {}, requested endpoint {} protocol {}",
+        group_name,
+        worker_id.as_raw(),
+        existing.worker_run_id,
+        existing.address,
+        worker_net_protocol_label(existing.worker_net_protocol),
+        address,
+        worker_net_protocol_label(worker_net_protocol)
+    )))
+}
+
+fn endpoint_host(endpoint: &str) -> Option<String> {
+    let without_scheme = endpoint.rsplit_once("://").map(|(_, rest)| rest).unwrap_or(endpoint);
+    let host = without_scheme
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(without_scheme)
+        .trim_matches(['[', ']'])
+        .trim();
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 /// Worker manager.
@@ -289,12 +350,18 @@ pub struct WorkerManager {
     worker_blocks: Arc<RwLock<HashMap<WorkerRegistrationKey, Vec<BlockId>>>>,
     /// Full/delta block report runtime keyed by (group_name, worker_id).
     block_reports: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerBlockReportRuntime>>>,
+    /// Coalesced revision for publication-relevant worker observations.
+    ///
+    /// Ready evidence is leader-local and reconstructable. The revision only
+    /// wakes waiters so they can rebuild and revalidate a complete snapshot.
+    publication_observation: watch::Sender<u64>,
     /// Heartbeat timeout in seconds.
     heartbeat_timeout_sec: u64,
 }
 
 impl WorkerManager {
     pub fn new(heartbeat_timeout_sec: u64) -> Self {
+        let (publication_observation, _) = watch::channel(0);
         Self {
             descriptors: Arc::new(RwLock::new(HashMap::new())),
             registrations: Arc::new(RwLock::new(HashMap::new())),
@@ -303,8 +370,14 @@ impl WorkerManager {
             locations: Arc::new(RwLock::new(HashMap::new())),
             worker_blocks: Arc::new(RwLock::new(HashMap::new())),
             block_reports: Arc::new(RwLock::new(HashMap::new())),
+            publication_observation,
             heartbeat_timeout_sec,
         }
+    }
+
+    fn notify_publication_observation_changed(&self) {
+        self.publication_observation
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
     /// Get heartbeat timeout in seconds.
@@ -322,6 +395,7 @@ impl WorkerManager {
         self.runtime.write().clear();
         self.heartbeat_rejections.write().clear();
         self.clear_all_block_reports();
+        self.notify_publication_observation_changed();
     }
 
     /// Upsert worker descriptor (called from Raft apply).
@@ -331,6 +405,8 @@ impl WorkerManager {
             WorkerRegistrationKey::new(&descriptor.group_name, descriptor.worker_id),
             descriptor,
         );
+        drop(descriptors);
+        self.notify_publication_observation_changed();
         Ok(())
     }
 
@@ -367,6 +443,14 @@ impl WorkerManager {
                 descriptor,
             );
         }
+        drop(block_reports);
+        drop(worker_blocks);
+        drop(locations);
+        drop(heartbeat_rejections);
+        drop(runtime);
+        drop(registrations);
+        drop(descriptors);
+        self.notify_publication_observation_changed();
         Ok(())
     }
 
@@ -528,6 +612,7 @@ impl WorkerManager {
             self.runtime.write().remove(&key);
             self.clear_block_report_for_worker(key);
         }
+        self.notify_publication_observation_changed();
         Ok(())
     }
 
@@ -615,6 +700,7 @@ impl WorkerManager {
         drop(reports);
 
         self.rebuild_location_index_for_worker(key, &published_for_index);
+        self.notify_publication_observation_changed();
         tracing::debug!(
             group_name = %group_name,
             worker_id = worker_id.as_raw(),
@@ -704,6 +790,7 @@ impl WorkerManager {
         drop(reports);
 
         self.rebuild_location_index_for_worker(key, &published_for_index);
+        self.notify_publication_observation_changed();
         Ok(BlockReportApplyResult {
             added_blocks: new_ready.difference(&old_ready).copied().collect(),
             removed_blocks: old_ready.difference(&new_ready).copied().collect(),
@@ -993,8 +1080,76 @@ impl WorkerManager {
         };
         drop(runtime);
         self.clear_heartbeat_rejection(&key);
+        self.notify_publication_observation_changed();
 
         Ok(live_state)
+    }
+
+    /// Expire heartbeat liveness.
+    pub fn expire_liveness(&self) -> Vec<(GroupName, WorkerId)> {
+        let now = Instant::now();
+        let timeout = self.heartbeat_timeout();
+        let mut expired = Vec::new();
+
+        {
+            let mut runtime = self.runtime.write();
+            runtime.retain(|key, runtime| {
+                let is_live = now.duration_since(runtime.last_seen_at) < timeout;
+                if !is_live {
+                    expired.push((key.group_name.clone(), key.worker_id));
+                }
+                is_live
+            });
+        }
+
+        if !expired.is_empty() {
+            self.notify_publication_observation_changed();
+        }
+        expired
+    }
+
+    /// Remove dead-worker runtime state and keep the persisted descriptor.
+    pub fn remove_dead_worker(&self, group_name: &GroupName, worker_id: WorkerId) -> (bool, Vec<BlockId>) {
+        let key = WorkerRegistrationKey::new(group_name, worker_id);
+        let mut removed = false;
+        let mut affected_blocks = HashSet::new();
+
+        if self.registrations.write().remove(&key).is_some() {
+            removed = true;
+        }
+        if self.runtime.write().remove(&key).is_some() {
+            removed = true;
+        }
+
+        if let Some(report) = self.block_reports.write().remove(&key) {
+            removed = true;
+            affected_blocks.extend(ready_block_ids(report.published_blocks.values()));
+        }
+
+        if let Some(blocks) = self.worker_blocks.write().remove(&key) {
+            removed = true;
+            affected_blocks.extend(blocks);
+        }
+
+        {
+            let mut locations = self.locations.write();
+            for (location_key, workers) in locations.iter_mut() {
+                let before = workers.len();
+                workers.retain(|worker_key| worker_key != &key);
+                if workers.len() != before {
+                    removed = true;
+                    affected_blocks.insert(location_key.block_id);
+                }
+            }
+            locations.retain(|_, workers| !workers.is_empty());
+        }
+
+        let mut affected_blocks: Vec<_> = affected_blocks.into_iter().collect();
+        affected_blocks.sort_by_key(|block_id| (block_id.data_handle_id.as_raw(), block_id.index.as_raw()));
+        if removed {
+            self.notify_publication_observation_changed();
+        }
+        (removed, affected_blocks)
     }
 
     /// Get worker info by combining persisted descriptor and current runtime state.
@@ -1073,6 +1228,45 @@ impl WorkerManager {
         descriptors.keys().cloned().collect()
     }
 
+    /// Build the placement worker view from group-scoped registration and heartbeat state.
+    pub fn collect_worker_placement_views(&self, group_name: &GroupName) -> Vec<WorkerPlacementView> {
+        let descriptors = self.descriptors.read();
+        let registrations = self.registrations.read();
+        let runtime = self.runtime.read();
+        let now = Instant::now();
+        let timeout = self.heartbeat_timeout();
+
+        let mut views = Vec::new();
+        for (key, descriptor) in descriptors.iter().filter(|(key, _)| &key.group_name == group_name) {
+            let registration = registrations.get(key);
+            let live = runtime.get(key);
+            let registered = registration.is_some();
+            let lease_valid = registered
+                && live
+                    .map(|runtime| now.duration_since(runtime.last_seen_at) < timeout)
+                    .unwrap_or(false);
+            views.push(WorkerPlacementView {
+                group_name: key.group_name.clone(),
+                worker_id: key.worker_id,
+                worker_run_id: registration.map(|registration| registration.worker_run_id),
+                endpoint: descriptor.address.clone(),
+                worker_net_protocol: descriptor.worker_net_protocol,
+                registered,
+                lease_valid,
+                ip: endpoint_host(&descriptor.address),
+                host: endpoint_host(&descriptor.address),
+                az: None,
+                rack: descriptor.fault_domain.clone(),
+                region: None,
+                free_bytes: live.map(|runtime| runtime.capacity_available),
+                tier_free: live.map(|runtime| runtime.tier_free.clone()).unwrap_or_default(),
+                supported_block_formats: vec![BlockFormatId::CURRENT_FOR_NEW_FILE],
+            });
+        }
+        views.sort_by_key(|view| view.worker_id.as_raw());
+        views
+    }
+
     /// Get total number of block locations (for metrics).
     pub fn get_all_locations_count(&self) -> usize {
         let locations = self.locations.read();
@@ -1083,6 +1277,73 @@ impl WorkerManager {
     pub fn list_reported_blocks(&self) -> Vec<BlockLocationKey> {
         let locations = self.locations.read();
         locations.keys().cloned().collect()
+    }
+
+    /// Get block locations for one metadata group (only live workers in that group).
+    pub fn get_block_locations(&self, group_name: &GroupName, block_id: BlockId) -> Vec<WorkerId> {
+        let locations = self.locations.read();
+        let live_workers = self.list_live_workers_in_group(group_name);
+        let live_set: std::collections::HashSet<WorkerId> = live_workers.into_iter().collect();
+
+        locations
+            .get(&BlockLocationKey::new(group_name, block_id))
+            .map(|workers| {
+                workers
+                    .iter()
+                    .filter(|key| &key.group_name == group_name && live_set.contains(&key.worker_id))
+                    .map(|key| key.worker_id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Return ready block-report locations with the report's worker run id.
+    pub fn reported_block_locations(&self, group_name: &GroupName, block_id: BlockId) -> Vec<ReportedBlockLocation> {
+        let locations = self.locations.read();
+        let reports = self.block_reports.read();
+        let Some(worker_keys) = locations.get(&BlockLocationKey::new(group_name, block_id)) else {
+            return Vec::new();
+        };
+
+        let mut reported = Vec::with_capacity(worker_keys.len());
+        for key in worker_keys {
+            if &key.group_name != group_name {
+                continue;
+            }
+            let Some(report) = reports.get(key) else {
+                continue;
+            };
+            if report.state != BlockReportState::Ready {
+                continue;
+            }
+            let Some(worker_run_id) = report.worker_run_id else {
+                continue;
+            };
+            let Some(block) = report.published_blocks.get(&block_id) else {
+                continue;
+            };
+            if block.block_state != BlockReportBlockState::Ready {
+                continue;
+            }
+            reported.push(ReportedBlockLocation {
+                group_name: group_name.clone(),
+                block_id,
+                block_stamp: block.block_stamp,
+                worker_id: key.worker_id,
+                worker_run_id,
+            });
+        }
+        reported.sort_by_key(|location| location.worker_id.as_raw());
+        reported
+    }
+
+    /// Get all blocks for a worker.
+    pub fn get_worker_blocks(&self, group_name: &GroupName, worker_id: WorkerId) -> Vec<BlockId> {
+        let worker_blocks = self.worker_blocks.read();
+        worker_blocks
+            .get(&WorkerRegistrationKey::new(group_name, worker_id))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Copy at most `limit` ready replicas from complete full-report baselines.
@@ -1186,151 +1447,128 @@ impl WorkerManager {
         })
     }
 
-    /// Get block locations for one metadata group (only live workers in that group).
-    pub fn get_block_locations(&self, group_name: &GroupName, block_id: BlockId) -> Vec<WorkerId> {
-        let locations = self.locations.read();
-        let live_workers = self.list_live_workers_in_group(group_name);
-        let live_set: std::collections::HashSet<WorkerId> = live_workers.into_iter().collect();
-
-        locations
-            .get(&BlockLocationKey::new(group_name, block_id))
-            .map(|workers| {
-                workers
-                    .iter()
-                    .filter(|key| &key.group_name == group_name && live_set.contains(&key.worker_id))
-                    .map(|key| key.worker_id)
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// Subscribe before checking Ready evidence so a concurrent report cannot
+    /// be lost between the snapshot check and the asynchronous wait.
+    pub(crate) fn subscribe_publication_observations(&self) -> watch::Receiver<u64> {
+        self.publication_observation.subscribe()
     }
 
-    /// Build the placement worker view from group-scoped registration and heartbeat state.
-    pub fn collect_worker_placement_views(&self, group_name: &GroupName) -> Vec<WorkerPlacementView> {
+    /// Check all newly visible write targets against one current worker view.
+    ///
+    /// This observation never becomes durable authority. Registration,
+    /// heartbeat, descriptor, and full-report guards remain held together while
+    /// every target is checked, and callers must recheck after every wakeup and
+    /// immediately before proposing the visibility-changing Raft command.
+    pub(crate) fn check_publish_ready(&self, group_name: &GroupName, targets: &[WriteTarget]) -> PublishReadyStatus {
         let descriptors = self.descriptors.read();
         let registrations = self.registrations.read();
         let runtime = self.runtime.read();
+        let reports = self.block_reports.read();
         let now = Instant::now();
         let timeout = self.heartbeat_timeout();
 
-        let mut views = Vec::new();
-        for (key, descriptor) in descriptors.iter().filter(|(key, _)| &key.group_name == group_name) {
-            let registration = registrations.get(key);
-            let live = runtime.get(key);
-            let registered = registration.is_some();
-            let lease_valid = registered
-                && live
-                    .map(|runtime| now.duration_since(runtime.last_seen_at) < timeout)
-                    .unwrap_or(false);
-            views.push(WorkerPlacementView {
-                group_name: key.group_name.clone(),
-                worker_id: key.worker_id,
-                worker_run_id: registration.map(|registration| registration.worker_run_id),
-                endpoint: descriptor.address.clone(),
-                worker_net_protocol: descriptor.worker_net_protocol,
-                registered,
-                lease_valid,
-                ip: endpoint_host(&descriptor.address),
-                host: endpoint_host(&descriptor.address),
-                az: None,
-                rack: descriptor.fault_domain.clone(),
-                region: None,
-                free_bytes: live.map(|runtime| runtime.capacity_available),
-                tier_free: live.map(|runtime| runtime.tier_free.clone()).unwrap_or_default(),
-                supported_block_formats: vec![BlockFormatId::CURRENT_FOR_NEW_FILE],
-            });
-        }
-        views.sort_by_key(|view| view.worker_id.as_raw());
-        views
-    }
-
-    /// Return ready block-report locations with the report's worker run id.
-    pub fn reported_block_locations(&self, group_name: &GroupName, block_id: BlockId) -> Vec<ReportedBlockLocation> {
-        let locations = self.locations.read();
-        let reports = self.block_reports.read();
-        let Some(worker_keys) = locations.get(&BlockLocationKey::new(group_name, block_id)) else {
-            return Vec::new();
-        };
-
-        let mut reported = Vec::with_capacity(worker_keys.len());
-        for key in worker_keys {
-            if &key.group_name != group_name {
-                continue;
+        for target in targets {
+            if target.worker_endpoints.is_empty() {
+                return PublishReadyStatus::Conflict(PublishReadyConflict::MissingWriteEndpoint {
+                    block_id: target.block_id,
+                });
             }
-            let Some(report) = reports.get(key) else {
-                continue;
-            };
-            if report.state != BlockReportState::Ready {
-                continue;
-            }
-            let Some(worker_run_id) = report.worker_run_id else {
-                continue;
-            };
-            let Some(block) = report.published_blocks.get(&block_id) else {
-                continue;
-            };
-            if block.block_state != BlockReportBlockState::Ready {
-                continue;
-            }
-            reported.push(ReportedBlockLocation {
-                group_name: group_name.clone(),
-                block_id,
-                block_stamp: block.block_stamp,
-                worker_id: key.worker_id,
-                worker_run_id,
-            });
-        }
-        reported.sort_by_key(|location| location.worker_id.as_raw());
-        reported
-    }
 
-    /// Remove dead-worker runtime state and keep the persisted descriptor.
-    pub fn remove_dead_worker(&self, group_name: &GroupName, worker_id: WorkerId) -> (bool, Vec<BlockId>) {
-        let key = WorkerRegistrationKey::new(group_name, worker_id);
-        let mut removed = false;
-        let mut affected_blocks = HashSet::new();
+            let mut conflict = None;
+            let mut ready = false;
+            for endpoint in &target.worker_endpoints {
+                let key = WorkerRegistrationKey::new(group_name, endpoint.worker_id);
+                let Some(registration) = registrations.get(&key) else {
+                    conflict = Some(PublishReadyConflict::WorkerRunMismatch {
+                        block_id: target.block_id,
+                        worker_id: endpoint.worker_id,
+                        expected: endpoint.worker_run_id,
+                        current: None,
+                    });
+                    continue;
+                };
+                if !registration.worker_run_id.matches(endpoint.worker_run_id) {
+                    conflict = Some(PublishReadyConflict::WorkerRunMismatch {
+                        block_id: target.block_id,
+                        worker_id: endpoint.worker_id,
+                        expected: endpoint.worker_run_id,
+                        current: Some(registration.worker_run_id),
+                    });
+                    continue;
+                }
 
-        if self.registrations.write().remove(&key).is_some() {
-            removed = true;
-        }
-        if self.runtime.write().remove(&key).is_some() {
-            removed = true;
-        }
+                let endpoint_matches = descriptors.get(&key).is_some_and(|descriptor| {
+                    descriptor.address == endpoint.endpoint
+                        && descriptor.worker_net_protocol == WORKER_NET_PROTOCOL_GRPC
+                        && endpoint.worker_net_protocol == WorkerNetProtocol::Grpc
+                }) && registration.address == endpoint.endpoint
+                    && registration.worker_net_protocol == WORKER_NET_PROTOCOL_GRPC;
+                if !endpoint_matches {
+                    conflict = Some(PublishReadyConflict::EndpointMismatch {
+                        block_id: target.block_id,
+                        worker_id: endpoint.worker_id,
+                    });
+                    continue;
+                }
 
-        if let Some(report) = self.block_reports.write().remove(&key) {
-            removed = true;
-            affected_blocks.extend(ready_block_ids(report.published_blocks.values()));
-        }
+                let Some(worker_runtime) = runtime.get(&key) else {
+                    continue;
+                };
+                if !worker_runtime.worker_run_id.matches(endpoint.worker_run_id)
+                    || now.duration_since(worker_runtime.last_seen_at) >= timeout
+                {
+                    continue;
+                }
 
-        if let Some(blocks) = self.worker_blocks.write().remove(&key) {
-            removed = true;
-            affected_blocks.extend(blocks);
-        }
-
-        {
-            let mut locations = self.locations.write();
-            for (location_key, workers) in locations.iter_mut() {
-                let before = workers.len();
-                workers.retain(|worker_key| worker_key != &key);
-                if workers.len() != before {
-                    removed = true;
-                    affected_blocks.insert(location_key.block_id);
+                let Some(report) = reports.get(&key) else {
+                    continue;
+                };
+                if report.state != BlockReportState::Ready
+                    || !report
+                        .worker_run_id
+                        .is_some_and(|report_run_id| report_run_id.matches(endpoint.worker_run_id))
+                {
+                    continue;
+                }
+                let Some(block) = report.published_blocks.get(&target.block_id) else {
+                    continue;
+                };
+                if block.block_stamp != target.block_stamp {
+                    conflict = Some(PublishReadyConflict::BlockStampMismatch {
+                        block_id: target.block_id,
+                        worker_id: endpoint.worker_id,
+                        expected: target.block_stamp,
+                        reported: block.block_stamp,
+                    });
+                    continue;
+                }
+                match block.block_state {
+                    BlockReportBlockState::Ready => {
+                        ready = true;
+                        break;
+                    }
+                    BlockReportBlockState::Partial => {}
+                    BlockReportBlockState::Corrupt | BlockReportBlockState::Deleting => {
+                        conflict = Some(PublishReadyConflict::UnreadableBlock {
+                            block_id: target.block_id,
+                            worker_id: endpoint.worker_id,
+                            state: block.block_state,
+                        });
+                    }
                 }
             }
-            locations.retain(|_, workers| !workers.is_empty());
+
+            if !ready {
+                return conflict.map_or(
+                    PublishReadyStatus::Pending {
+                        block_id: target.block_id,
+                    },
+                    PublishReadyStatus::Conflict,
+                );
+            }
         }
 
-        let mut affected_blocks: Vec<_> = affected_blocks.into_iter().collect();
-        affected_blocks.sort_by_key(|block_id| (block_id.data_handle_id.as_raw(), block_id.index.as_raw()));
-        (removed, affected_blocks)
-    }
-
-    /// Get all blocks for a worker.
-    pub fn get_worker_blocks(&self, group_name: &GroupName, worker_id: WorkerId) -> Vec<BlockId> {
-        let worker_blocks = self.worker_blocks.read();
-        worker_blocks
-            .get(&WorkerRegistrationKey::new(group_name, worker_id))
-            .cloned()
-            .unwrap_or_default()
+        PublishReadyStatus::Ready
     }
 
     /// Get statistics.
@@ -1353,26 +1591,6 @@ impl WorkerManager {
             total_blocks: locations.len(),
             total_locations: locations.values().map(|v| v.len()).sum(),
         }
-    }
-
-    /// Expire heartbeat liveness.
-    pub fn expire_liveness(&self) -> Vec<(GroupName, WorkerId)> {
-        let now = Instant::now();
-        let timeout = self.heartbeat_timeout();
-        let mut expired = Vec::new();
-
-        {
-            let mut runtime = self.runtime.write();
-            runtime.retain(|key, runtime| {
-                let is_live = now.duration_since(runtime.last_seen_at) < timeout;
-                if !is_live {
-                    expired.push((key.group_name.clone(), key.worker_id));
-                }
-                is_live
-            });
-        }
-
-        expired
     }
 
     /// Get block report convergence snapshot for maintenance safety gate.
@@ -1442,37 +1660,22 @@ impl WorkerManager {
     }
 }
 
-fn endpoint_host(endpoint: &str) -> Option<String> {
-    let without_scheme = endpoint.rsplit_once("://").map(|(_, rest)| rest).unwrap_or(endpoint);
-    let host = without_scheme
-        .rsplit_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or(without_scheme)
-        .trim_matches(['[', ']'])
-        .trim();
-    (!host.is_empty()).then(|| host.to_string())
-}
-
-#[derive(Debug)]
-pub struct WorkerManagerStats {
-    pub total_workers: usize,
-    pub live_workers: usize,
-    pub total_blocks: usize,
-    pub total_locations: usize,
-}
-
 #[cfg(test)]
 mod tests {
     //! Tests for worker manager and registration.
 
     use super::{
         BlockLocationKey, BlockReportBlock, BlockReportBlockState, BlockReportDeltaEntry, BlockReportDeltaOp,
-        HealthStatus, ReplicaKey, WorkerInfo, WorkerManager, WorkerRegistrationKey,
+        HealthStatus, PublishReadyConflict, PublishReadyStatus, ReplicaKey, WorkerInfo, WorkerManager,
+        WorkerRegistrationKey,
     };
     use crate::error::MetadataError;
     use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
-    use beryl_types::{GroupName, WorkerRunId};
-    use std::time::Duration;
+    use beryl_types::lease::FencingToken;
+    use beryl_types::{
+        BlockFormatId, ClientId, GroupName, Tier, WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId, WriteTarget,
+    };
+    use std::time::{Duration, Instant};
 
     fn group_name(raw: &str) -> GroupName {
         GroupName::parse(raw).unwrap()
@@ -1520,6 +1723,197 @@ mod tests {
                 HealthStatus::Healthy,
             )
             .unwrap();
+    }
+
+    fn publication_target(
+        worker_id: WorkerId,
+        run_id: WorkerRunId,
+        block_id: BlockId,
+        block_stamp: u64,
+    ) -> WriteTarget {
+        WriteTarget {
+            block_id,
+            file_offset: 0,
+            block_size: 64,
+            effective_len: 64,
+            worker_endpoints: vec![WorkerEndpointInfo {
+                worker_id,
+                endpoint: "127.0.0.1:9090".to_string(),
+                worker_net_protocol: WorkerNetProtocol::Grpc,
+                worker_run_id: run_id,
+            }],
+            fencing_token: FencingToken {
+                block_id,
+                owner: ClientId::new(7),
+                epoch: 1,
+            },
+            block_stamp,
+            chunk_size: 64,
+            block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
+            tier: Tier::Hdd,
+        }
+    }
+
+    #[test]
+    fn publication_ready_check_requires_current_live_exact_worker_evidence() {
+        let manager = WorkerManager::new(60);
+        let group_name_value = group_name("g-publish");
+        let worker_id = WorkerId::new(5);
+        let run_id = report_run_id();
+        let block_id = BlockId::new(DataHandleId::new(91), BlockIndex::new(0));
+        let target = publication_target(worker_id, run_id, block_id, 7);
+        register_live_report_worker(&manager, &group_name_value, worker_id, run_id);
+
+        assert_eq!(
+            manager.check_publish_ready(&group_name_value, std::slice::from_ref(&target)),
+            PublishReadyStatus::Pending { block_id }
+        );
+
+        manager
+            .receive_full_block_report(
+                &group_name_value,
+                worker_id,
+                run_id,
+                1,
+                0,
+                true,
+                vec![BlockReportBlock {
+                    block_id,
+                    block_stamp: 7,
+                    block_state: BlockReportBlockState::Ready,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            manager.check_publish_ready(&group_name_value, std::slice::from_ref(&target)),
+            PublishReadyStatus::Ready
+        );
+
+        manager
+            .runtime
+            .write()
+            .get_mut(&WorkerRegistrationKey::new(&group_name_value, worker_id))
+            .unwrap()
+            .last_seen_at = Instant::now() - Duration::from_secs(61);
+        assert_eq!(
+            manager.check_publish_ready(&group_name_value, std::slice::from_ref(&target)),
+            PublishReadyStatus::Pending { block_id }
+        );
+    }
+
+    #[test]
+    fn publication_ready_check_rejects_run_stamp_endpoint_and_unreadable_conflicts() {
+        let manager = WorkerManager::new(60);
+        let group_name_value = group_name("g-conflict");
+        let worker_id = WorkerId::new(5);
+        let run_id = report_run_id();
+        let block_id = BlockId::new(DataHandleId::new(92), BlockIndex::new(0));
+        let target = publication_target(worker_id, run_id, block_id, 7);
+        register_live_report_worker(&manager, &group_name_value, worker_id, run_id);
+
+        manager
+            .receive_full_block_report(
+                &group_name_value,
+                worker_id,
+                run_id,
+                1,
+                0,
+                true,
+                vec![BlockReportBlock {
+                    block_id,
+                    block_stamp: 8,
+                    block_state: BlockReportBlockState::Ready,
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.check_publish_ready(&group_name_value, std::slice::from_ref(&target)),
+            PublishReadyStatus::Conflict(PublishReadyConflict::BlockStampMismatch { .. })
+        ));
+
+        manager
+            .receive_full_block_report(
+                &group_name_value,
+                worker_id,
+                run_id,
+                2,
+                0,
+                true,
+                vec![BlockReportBlock {
+                    block_id,
+                    block_stamp: 7,
+                    block_state: BlockReportBlockState::Corrupt,
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.check_publish_ready(&group_name_value, std::slice::from_ref(&target)),
+            PublishReadyStatus::Conflict(PublishReadyConflict::UnreadableBlock { .. })
+        ));
+
+        let mut wrong_endpoint = target.clone();
+        wrong_endpoint.worker_endpoints[0].endpoint = "127.0.0.1:9191".to_string();
+        assert!(matches!(
+            manager.check_publish_ready(&group_name_value, std::slice::from_ref(&wrong_endpoint)),
+            PublishReadyStatus::Conflict(PublishReadyConflict::EndpointMismatch { .. })
+        ));
+
+        let replacement_run: WorkerRunId = "550e8400-e29b-41d4-a716-446655440101".parse().unwrap();
+        manager
+            .register_worker_run(
+                &group_name_value,
+                worker_id,
+                "127.0.0.1:9090".to_string(),
+                1,
+                replacement_run,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.check_publish_ready(&group_name_value, std::slice::from_ref(&target)),
+            PublishReadyStatus::Conflict(PublishReadyConflict::WorkerRunMismatch { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn publication_observation_does_not_lose_report_before_wait() {
+        let manager = WorkerManager::new(60);
+        let group_name_value = group_name("g-watch");
+        let worker_id = WorkerId::new(5);
+        let run_id = report_run_id();
+        let block_id = BlockId::new(DataHandleId::new(93), BlockIndex::new(0));
+        let target = publication_target(worker_id, run_id, block_id, 7);
+        register_live_report_worker(&manager, &group_name_value, worker_id, run_id);
+        let mut observations = manager.subscribe_publication_observations();
+
+        assert_eq!(
+            manager.check_publish_ready(&group_name_value, std::slice::from_ref(&target)),
+            PublishReadyStatus::Pending { block_id }
+        );
+        manager
+            .receive_full_block_report(
+                &group_name_value,
+                worker_id,
+                run_id,
+                1,
+                0,
+                true,
+                vec![BlockReportBlock {
+                    block_id,
+                    block_stamp: 7,
+                    block_state: BlockReportBlockState::Ready,
+                }],
+            )
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_millis(100), observations.changed())
+            .await
+            .expect("observation should wake")
+            .expect("sender remains open");
+        assert_eq!(
+            manager.check_publish_ready(&group_name_value, std::slice::from_ref(&target)),
+            PublishReadyStatus::Ready
+        );
     }
 
     #[test]
