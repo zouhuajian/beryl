@@ -17,6 +17,8 @@ use tracing::debug;
 #[derive(Clone, Debug)]
 pub(super) struct RoutedFsWriteCtx {
     pub(super) mount_id: MountId,
+    /// Durable path anchor copied into path-addressed Raft commands.
+    pub(super) mount_root_inode_id: InodeId,
     /// Namespace owner group selected from the resolved mount.
     pub(super) group_name: GroupName,
     pub(super) mount_epoch: u64,
@@ -107,6 +109,7 @@ impl MetadataFileSystem {
 
         Ok(RoutedFsWriteCtx {
             mount_id,
+            mount_root_inode_id: mount_entry.root_inode_id,
             group_name: mount_entry.namespace_owner_group_name,
             mount_epoch: mount_entry.mount_epoch,
         })

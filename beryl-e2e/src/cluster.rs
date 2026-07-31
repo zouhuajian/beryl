@@ -324,6 +324,30 @@ impl TestCluster {
         let restart_background = self.background_block_report.is_some();
         self.stop_background_block_reports().await;
         self.metadata_server.shutdown().await?;
+        let result = self.start_metadata_child(executable).await;
+        if restart_background && result.is_ok() {
+            self.start_background_block_reports();
+        }
+        result
+    }
+
+    /// Restarts the full metadata process while preserving its durable storage.
+    pub async fn restart_metadata_process(&mut self, executable: &std::path::Path) -> TestResult<()> {
+        let restart_background = self.background_block_report.is_some();
+        self.stop_background_block_reports().await;
+        let process = self
+            .metadata_process
+            .take()
+            .ok_or("metadata child process is not running")?;
+        process.kill().await?;
+        let result = self.start_metadata_child(executable).await;
+        if restart_background && result.is_ok() {
+            self.start_background_block_reports();
+        }
+        result
+    }
+
+    async fn start_metadata_child(&mut self, executable: &std::path::Path) -> TestResult<()> {
         let metrics_port = PortReservation::reserve_localhost().await?;
         let metrics_addr = metrics_port.addr();
         let config_path = self.write_metadata_process_config(metrics_addr)?;
@@ -335,11 +359,7 @@ impl TestCluster {
             }
             return Err(error);
         }
-        let result = self.register_workers_with_external_metadata().await;
-        if restart_background && result.is_ok() {
-            self.start_background_block_reports();
-        }
-        result
+        self.register_workers_with_external_metadata().await
     }
 
     pub async fn kill_metadata_process_and_restart(&mut self) -> TestResult<()> {

@@ -200,21 +200,6 @@ pub(crate) struct RenameAtomicUpdate<'a> {
     pub updated_src_inode: &'a Inode,
 }
 
-/// One namespace entry removed by a post-order recursive delete plan.
-pub(crate) struct DeleteTreeEntry {
-    pub parent_inode_id: InodeId,
-    pub name: String,
-    pub inode_id: InodeId,
-    pub data_handle_id: Option<DataHandleId>,
-    pub layout: Option<FileLayout>,
-}
-
-/// Recursive delete writes that must commit as one RocksDB batch.
-pub(crate) struct DeleteTreeAtomicUpdate<'a> {
-    pub entries: &'a [DeleteTreeEntry],
-    pub updated_parent: &'a Inode,
-}
-
 /// One namespace child removed from a detached directory in a bounded apply.
 ///
 /// Directories carry a child marker and retain their inode. Files carry their

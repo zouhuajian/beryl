@@ -372,32 +372,35 @@ impl RocksDBStorage {
         self.commit_authority_batch(batch.into(), raft_state)
     }
 
-    /// Atomically persist a recursive tree delete with apply tracking.
-    pub fn delete_tree_atomic(
+    /// Atomically hide a recursive-delete root and publish its durable marker.
+    ///
+    /// The root inode and all descendants remain intact for bounded background
+    /// reclamation. Namespace visibility and reclaim authority therefore
+    /// change in the same RocksDB commit as Raft apply tracking.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn detach_directory_atomic(
         &self,
-        update: DeleteTreeAtomicUpdate<'_>,
+        parent_inode_id: InodeId,
+        name: &str,
+        root_inode_id: InodeId,
+        updated_parent: &Inode,
+        detached_root: DetachedRoot,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
         let generation = self.pin_generation()?;
         let db = generation.db();
         let cf_inodes = Self::cf(db, CF_INODES)?;
         let cf_dentries = Self::cf(db, CF_DENTRIES)?;
-        let cf_meta = Self::cf(db, CF_META)?;
+        let cf_detached_roots = Self::cf(db, CF_DETACHED_ROOTS)?;
         let mut batch = WriteBatch::default();
 
-        for entry in update.entries {
-            batch.delete_cf(cf_dentries, Self::encode_dentry_key(entry.parent_inode_id, &entry.name));
-            batch.delete_cf(cf_inodes, Self::encode_inode_key(entry.inode_id));
-            if entry.layout.is_some() {
-                let layout_key = format!("layout:{}", entry.inode_id.as_raw());
-                batch.delete_cf(cf_meta, layout_key.as_bytes());
-            }
-            if let Some(data_handle_id) = entry.data_handle_id {
-                let owner_key = format!("data_handle_owner:{}", data_handle_id.as_raw());
-                batch.delete_cf(cf_meta, owner_key.as_bytes());
-            }
-        }
-        Self::batch_put_inode(&mut batch, cf_inodes, update.updated_parent)?;
+        batch.delete_cf(cf_dentries, Self::encode_dentry_key(parent_inode_id, name));
+        Self::batch_put_inode(&mut batch, cf_inodes, updated_parent)?;
+        batch.put_cf(
+            cf_detached_roots,
+            Self::encode_detached_root_key(root_inode_id),
+            Self::encode_detached_root(&detached_root)?,
+        );
 
         self.commit_authority_batch(batch.into(), raft_state)
     }

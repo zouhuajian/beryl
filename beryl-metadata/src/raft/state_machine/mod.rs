@@ -17,9 +17,8 @@ use crate::raft::response::{
     FsOkResult,
 };
 use crate::raft::storage::{
-    BootstrapNamespaceState, DeleteTreeAtomicUpdate, DeleteTreeEntry, DetachedRoot, DetachedRootReclaimEntry,
-    DetachedRootReclaimUpdate, FileAllocation, InodeAllocation, RecursiveMkdirEntry, RenameAtomicUpdate,
-    RenameOverwriteCleanup, RocksDBStorage,
+    BootstrapNamespaceState, DetachedRoot, DetachedRootReclaimEntry, DetachedRootReclaimUpdate, FileAllocation,
+    InodeAllocation, RecursiveMkdirEntry, RenameAtomicUpdate, RenameOverwriteCleanup, RocksDBStorage,
 };
 use crate::raft::types::AppMetadataRaftState;
 use crate::raft::RoutingDelta;
@@ -85,18 +84,6 @@ struct PreparedRename {
     updated_src_parent: Option<Inode>,
     updated_dst_parent: Option<Inode>,
     updated_src_inode: Inode,
-}
-
-struct PreparedDeleteTree {
-    updated_parent: Inode,
-    entries: Vec<DeleteTreeEntry>,
-    file_lease_epochs: Vec<(InodeId, u64)>,
-}
-
-struct DeleteTreePlan {
-    root_mount_id: MountId,
-    entries: Vec<DeleteTreeEntry>,
-    file_lease_epochs: Vec<(InodeId, u64)>,
 }
 
 type PreparedUnlink = (InodeId, Option<DataHandleId>, Inode, FsOkResult);
@@ -177,17 +164,21 @@ impl AppRaftStateMachine {
             }
             Command::Delete {
                 proposed_at_ms,
-                parent_inode_id,
-                name,
+                mount_id,
+                expected_mount_epoch,
+                mount_root_inode_id,
+                relative_components,
                 expected_inode_id,
-                expected_file_lease_epochs,
+                expected_file_lease_epoch,
                 recursive,
             } => {
                 let result = self.apply_delete(
-                    parent_inode_id,
-                    name,
+                    mount_id,
+                    expected_mount_epoch,
+                    mount_root_inode_id,
+                    relative_components,
                     expected_inode_id,
-                    expected_file_lease_epochs,
+                    expected_file_lease_epoch,
                     recursive,
                     proposed_at_ms,
                     raft_state,
