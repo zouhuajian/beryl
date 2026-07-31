@@ -683,6 +683,25 @@ mod tests {
             Ok(())
         }
 
+        /// Seed a semantically corrupt key/value identity pair for state-machine tests.
+        pub(crate) fn put_inode_at_storage_key(
+            &self,
+            storage_key_inode_id: InodeId,
+            inode: &Inode,
+        ) -> MetadataResult<()> {
+            let generation = self.pin_generation()?;
+            let db = generation.db();
+            let cf = db
+                .cf_handle(CF_INODES)
+                .ok_or_else(|| MetadataError::Internal("Inodes CF not found".to_string()))?;
+            let key = Self::encode_inode_key(storage_key_inode_id);
+            let value = serde_json::to_vec(inode)
+                .map_err(|error| MetadataError::Internal(format!("Failed to serialize Inode: {error}")))?;
+
+            db.put_cf(cf, key, value)
+                .map_err(|error| MetadataError::Internal(format!("RocksDB error: {error}")))
+        }
+
         /// Atomically persist a create-file namespace mutation.
         pub fn put_test_file_atomic(
             &self,
