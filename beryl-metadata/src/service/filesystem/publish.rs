@@ -1374,6 +1374,7 @@ mod tests {
             .open_write_inode(
                 &request_context(),
                 env.inode_id,
+                vec![env.inode_id],
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -1404,6 +1405,7 @@ mod tests {
             .open_write_inode(
                 &request_context(),
                 env.inode_id,
+                vec![env.inode_id],
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -1446,6 +1448,7 @@ mod tests {
             .open_write_inode(
                 &request_context(),
                 env.inode_id,
+                vec![env.inode_id],
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -1493,6 +1496,7 @@ mod tests {
             .open_write_inode(
                 &request_context(),
                 env.inode_id,
+                vec![env.inode_id],
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -1548,6 +1552,7 @@ mod tests {
             .open_write_inode(
                 &request_context(),
                 env.inode_id,
+                vec![env.inode_id],
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -1603,6 +1608,7 @@ mod tests {
             .open_write_inode(
                 &request_context(),
                 env.inode_id,
+                vec![env.inode_id],
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -1656,6 +1662,7 @@ mod tests {
             .open_write_inode(
                 &request_context(),
                 env.inode_id,
+                vec![env.inode_id],
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -1946,6 +1953,7 @@ mod tests {
             .open_write_inode(
                 &request_context(),
                 env.inode_id,
+                vec![env.inode_id],
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -2001,6 +2009,7 @@ mod tests {
             .open_write_inode(
                 &request_context(),
                 deleting_env.inode_id,
+                vec![deleting_env.inode_id],
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -2055,6 +2064,7 @@ mod tests {
             .open_write_inode(
                 &request_context(),
                 env.inode_id,
+                vec![env.inode_id],
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )

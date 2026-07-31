@@ -161,6 +161,10 @@ impl MetadataFileSystem {
         result
     }
 
+    /// Renew a write lease while excluding topology-changing Rename/Delete operations.
+    ///
+    /// The shared topology guard keeps the leader-local lease renewal and every
+    /// mirrored session expiry update within one namespace admission interval.
     pub(crate) async fn renew_lease(&self, ctx: &RequestContext, args: RenewLeaseArgs) -> FsResult<RenewLeaseOutput> {
         if let Some(failure) = self
             .session_write_admission_failure(ctx, args.handle.data_handle_id)
@@ -168,6 +172,7 @@ impl MetadataFileSystem {
         {
             return self.failure_from_admission(failure);
         }
+        let _topology_guard = self.namespace_topology.read().await;
         let handle = args.handle;
         let result = self
             .renew_session(ctx, handle.data_handle_id, handle.lease_epoch, args.freshness)
@@ -363,6 +368,19 @@ impl MetadataFileSystem {
                 );
             }
         };
+        if let Err(message) = self
+            .session_registry
+            .update_expiration(data_handle_id, lease_epoch, expires_at_ms)
+        {
+            self.lease_manager.release(session.inode_id, lease_epoch);
+            return self.session_terminal_failure(
+                ctx,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                message,
+                group_name,
+                mount_epoch,
+            );
+        }
 
         let route_epoch = match self.authoritative_route_epoch().await {
             Ok(route_epoch) => Some(route_epoch),
@@ -377,16 +395,26 @@ impl MetadataFileSystem {
         )
     }
 
+    /// Acquire a leader-local lease, persist its next fencing epoch, and install its session.
+    ///
+    /// `ancestor_inode_ids` must be the bounded mount-root-to-file chain
+    /// captured while namespace topology is stable.
     pub(super) async fn open_write_inode(
         &self,
         ctx: &RequestContext,
         inode_id: InodeId,
+        ancestor_inode_ids: Vec<InodeId>,
         mode: crate::inode_lease::WriteMode,
         freshness: Freshness,
     ) -> FsResult<OpenWriteOutput> {
         let caller_ctx = &ctx.caller;
 
         let storage = &self.storage;
+        if let Err(message) =
+            crate::session_registry::SessionRegistry::validate_ancestor_chain(inode_id, &ancestor_inode_ids)
+        {
+            return self.failure_from_error(ctx, MetadataError::Internal(message), None, None);
+        }
 
         let inode = match self.read_inode(inode_id) {
             Ok(Some(inode)) => inode,
@@ -536,6 +564,7 @@ impl MetadataFileSystem {
                 open_client_id: caller_ctx.client.client_id,
                 layout,
                 expires_at_ms,
+                ancestor_inode_ids,
             }) {
             Ok(result) => result,
             Err(message) => {
@@ -837,6 +866,7 @@ pub(crate) struct OpenWriteArgs {
 }
 
 impl MetadataFileSystem {
+    /// Open a path for writing under shared namespace-topology admission.
     pub(crate) async fn open_write(&self, ctx: &RequestContext, args: OpenWriteArgs) -> FsResult<OpenWriteOutput> {
         let path = args.path.clone();
         let result = self.open_write_inner(ctx, args).await;
@@ -873,10 +903,15 @@ impl MetadataFileSystem {
         result
     }
 
+    /// Resolve the path, acquire its local lease and persisted fencing epoch, and index its ancestors.
+    ///
+    /// The shared guard spans resolution, Raft fencing-epoch acquisition, session
+    /// creation, and the final topology safety predicate.
     async fn open_write_inner(&self, ctx: &RequestContext, args: OpenWriteArgs) -> FsResult<OpenWriteOutput> {
         if let Err(failure) = self.admission.check_meta_write(ctx).await {
             return self.failure_from_admission(failure);
         }
+        let _topology_guard = self.namespace_topology.read().await;
         let open_path = match crate::path_resolver::PathResolver::normalize(&args.path) {
             Ok(path) => path,
             Err(err) => return self.failure_from_path_error(ctx, &args.path, err),
@@ -895,13 +930,61 @@ impl MetadataFileSystem {
         if let Err(failure) = self.admission.check_data_write(ctx, resolved.mount_ctx.mount_id).await {
             return self.failure_from_admission(failure);
         }
-        self.open_write_inode(ctx, inode_id, args.mode, args.freshness).await
+        let opened = self
+            .open_write_inode(
+                ctx,
+                inode_id,
+                resolved.ancestor_inode_ids.clone(),
+                args.mode,
+                args.freshness,
+            )
+            .await?;
+
+        self.finish_open_write(ctx, &open_path, &resolved, opened)
+    }
+
+    /// Revalidate the complete path identity before exposing a new write session.
+    ///
+    /// A previously submitted topology mutation may still apply after its RPC
+    /// task is canceled and its guard is dropped. Any mismatch releases the
+    /// local lease, removes only the matching session epoch, and returns
+    /// `EAGAIN`.
+    fn finish_open_write(
+        &self,
+        ctx: &RequestContext,
+        open_path: &str,
+        resolved: &crate::path_resolver::ResolvedPath,
+        opened: super::FsSuccess<OpenWriteOutput>,
+    ) -> FsResult<OpenWriteOutput> {
+        let inode_id = opened.payload.inode_id;
+        let topology_unchanged = self.path_resolver.resolve_path(open_path).is_ok_and(|current| {
+            current.mount_ctx.mount_id == resolved.mount_ctx.mount_id
+                && current.mount_ctx.mount_epoch == resolved.mount_ctx.mount_epoch
+                && current.mount_ctx.owner_group_name == resolved.mount_ctx.owner_group_name
+                && current.mount_ctx.root_inode_id == resolved.mount_ctx.root_inode_id
+                && current.inode_id == Some(inode_id)
+                && current.ancestor_inode_ids == resolved.ancestor_inode_ids
+        });
+        if !topology_unchanged {
+            self.lease_manager.release(inode_id, opened.payload.lease_epoch);
+            self.session_registry
+                .remove_session_if_epoch(opened.payload.data_handle_id, opened.payload.lease_epoch);
+            return self.failure_from_error(
+                ctx,
+                MetadataError::Again("namespace topology changed during OpenWrite".to_string()),
+                opened.group_name,
+                opened.mount_epoch,
+            );
+        }
+
+        Ok(opened)
     }
 }
 
 #[cfg(test)]
 mod open_write_tests {
     use super::*;
+    use crate::raft::Command;
     use crate::service::filesystem::test_support::*;
 
     #[tokio::test]
@@ -926,6 +1009,7 @@ mod open_write_tests {
             .open_write_inode(
                 &request_context(),
                 inode_id,
+                vec![inode_id],
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -936,6 +1020,91 @@ mod open_write_tests {
             .write_session_for_handle(success.payload.data_handle_id)
             .expect("write session");
         assert!(session.issued_targets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_write_rejects_a_path_moved_by_an_already_admitted_rename() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_id = MountId::new(68);
+        let old_parent_inode_id = InodeId::new(680);
+        let new_parent_inode_id = InodeId::new(681);
+        let file_inode_id = InodeId::new(682);
+        let data_handle_id = DataHandleId::new(9_682);
+        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name("g20"));
+        let mount_table = builder.mount_table();
+        let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
+        let filesystem = builder
+            .with_storage(Arc::clone(&storage))
+            .with_raft_node(raft_node)
+            .build();
+
+        for inode_id in [ROOT_INODE_ID, old_parent_inode_id, new_parent_inode_id] {
+            storage
+                .put_inode(&Inode::new_dir(inode_id, FileAttrs::new(), mount_id))
+                .unwrap();
+        }
+        storage
+            .put_inode(&Inode::new_file(
+                file_inode_id,
+                FileAttrs::new(),
+                mount_id,
+                data_handle_id,
+            ))
+            .unwrap();
+        storage.put_dentry(ROOT_INODE_ID, "old", old_parent_inode_id).unwrap();
+        storage.put_dentry(ROOT_INODE_ID, "new", new_parent_inode_id).unwrap();
+        storage.put_dentry(old_parent_inode_id, "file", file_inode_id).unwrap();
+        storage.put_layout(file_inode_id, FileLayout::new(64, 64, 1)).unwrap();
+        storage.put_data_handle_owner(data_handle_id, file_inode_id).unwrap();
+
+        let open_path = "/old/file";
+        let resolved = filesystem.path_resolver.resolve_path(open_path).unwrap();
+        let opened = filesystem
+            .open_write_inode(
+                &request_context(),
+                file_inode_id,
+                resolved.ancestor_inode_ids.clone(),
+                WriteMode::Write,
+                Freshness::default(),
+            )
+            .await
+            .expect("AcquireWriteLease");
+        let lease_epoch = opened.payload.lease_epoch;
+
+        let rename_result = filesystem
+            .raft_node()
+            .propose(Command::Rename {
+                proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                src_parent_inode_id: old_parent_inode_id,
+                src_name: "file".to_string(),
+                expected_src_inode_id: file_inode_id,
+                dst_parent_inode_id: new_parent_inode_id,
+                dst_name: "file".to_string(),
+                expected_dst_inode_id: None,
+                expected_dst_lease_epoch: None,
+                flags: 0,
+            })
+            .await
+            .expect("already admitted Rename must apply");
+        assert!(matches!(
+            rename_result,
+            crate::raft::CommandResult::Fs(FsCommandResult::Ok(_))
+        ));
+
+        let failure = filesystem
+            .finish_open_write(&request_context(), open_path, &resolved, opened)
+            .expect_err("OpenWrite must not publish a stale ancestor chain");
+
+        assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EAgain));
+        assert!(filesystem.write_session_for_handle(data_handle_id).is_none());
+        assert!(!filesystem.lease_manager().is_active_lease(file_inode_id, lease_epoch));
+        let moved = filesystem.path_resolver.resolve_path("/new/file").unwrap();
+        assert_eq!(moved.inode_id, Some(file_inode_id));
+        assert_eq!(
+            moved.ancestor_inode_ids,
+            vec![ROOT_INODE_ID, new_parent_inode_id, file_inode_id]
+        );
     }
 
     #[tokio::test]
@@ -965,6 +1134,7 @@ mod open_write_tests {
             .open_write_inode(
                 &request_context(),
                 inode_id,
+                vec![inode_id],
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -991,6 +1161,7 @@ mod open_write_tests {
             .open_write_inode(
                 &request_context(),
                 inode_id,
+                vec![inode_id],
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -1029,6 +1200,7 @@ mod open_write_tests {
             .open_write_inode(
                 &request_context(),
                 inode_id,
+                vec![inode_id],
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -1061,6 +1233,7 @@ mod open_write_tests {
             .open_write_inode(
                 &request_context(),
                 inode_id,
+                vec![inode_id],
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -1104,6 +1277,7 @@ mod open_write_tests {
             .open_write_inode(
                 &request_context(),
                 inode_id,
+                vec![inode_id],
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )
@@ -1172,6 +1346,7 @@ mod open_write_tests {
             .open_write_inode(
                 &request_context(),
                 env.inode_id,
+                vec![env.inode_id],
                 crate::inode_lease::WriteMode::Write,
                 Freshness::default(),
             )

@@ -33,6 +33,7 @@ pub(crate) struct RenameArgs {
 }
 
 impl MetadataFileSystem {
+    /// Create a directory while excluding concurrent Rename/Delete topology changes.
     pub(crate) async fn create_directory(
         &self,
         ctx: &RequestContext,
@@ -41,6 +42,7 @@ impl MetadataFileSystem {
         if let Err(failure) = self.admission.check_meta_write(ctx).await {
             return self.failure_from_admission(failure);
         }
+        let _topology_guard = self.namespace_topology.read().await;
 
         let CreateDirectoryArgs {
             path,
@@ -218,10 +220,15 @@ impl MetadataFileSystem {
         }
     }
 
+    /// Resolve and commit a rename under exclusive namespace-topology admission.
+    ///
+    /// The exclusive guard prevents new path-bound sessions or creates from
+    /// crossing the subtree writer checks and the Raft proposal.
     pub(crate) async fn rename(&self, ctx: &RequestContext, args: RenameArgs) -> FsResult<()> {
         if let Err(failure) = self.admission.check_meta_write(ctx).await {
             return self.failure_from_admission(failure);
         }
+        let _topology_guard = self.namespace_topology.write().await;
         let src_path = match crate::path_resolver::PathResolver::normalize(&args.src_path) {
             Ok(path) => path,
             Err(err) => return self.failure_from_path_error(ctx, &args.src_path, err),
@@ -318,6 +325,11 @@ impl MetadataFileSystem {
         result
     }
 
+    /// Validate subtree writer preconditions and propose one resolved rename.
+    ///
+    /// An active writer in the source subtree or overwritten target subtree
+    /// fails closed with `EBUSY`; persisted inode identity and fencing-epoch
+    /// preconditions are still revalidated by Raft apply.
     async fn execute_rename(
         &self,
         request_ctx: &RequestContext,
@@ -327,7 +339,7 @@ impl MetadataFileSystem {
         let Command::Rename {
             src_parent_inode_id,
             src_name: _,
-            expected_src_inode_id: _,
+            expected_src_inode_id,
             dst_parent_inode_id,
             ref dst_name,
             expected_dst_inode_id: _,
@@ -398,14 +410,29 @@ impl MetadataFileSystem {
             Err(err) => return Err(err),
         };
 
+        if self.has_active_write_under(expected_src_inode_id) {
+            return self.fatal_fs_failure(
+                request_ctx,
+                beryl_types::fs::FsErrorCode::EBusy,
+                format!("Rename source contains an active write lease: {expected_src_inode_id}"),
+                Some(ctx.group_name.clone()),
+                Some(ctx.mount_epoch),
+            );
+        }
+
         match self.read_dentry(dst_parent_inode_id, dst_name) {
             Ok(Some(dst_inode_id)) => match self.read_inode(dst_inode_id) {
-                Ok(Some(inode)) if inode.kind.is_file() => {
-                    if self.has_active_write(dst_inode_id) {
+                Ok(Some(inode)) => {
+                    let has_active_write = if inode.kind.is_file() {
+                        self.has_active_write(dst_inode_id)
+                    } else {
+                        self.has_active_write_under(dst_inode_id)
+                    };
+                    if has_active_write {
                         return self.fatal_fs_failure(
                             request_ctx,
                             beryl_types::fs::FsErrorCode::EBusy,
-                            format!("Rename target has an active write lease: {}", dst_inode_id),
+                            format!("Rename target contains an active write lease: {}", dst_inode_id),
                             Some(ctx.group_name.clone()),
                             Some(ctx.mount_epoch),
                         );
@@ -546,6 +573,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rename_rejects_source_directory_with_active_descendant_writer() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_id = MountId::new(67);
+        let group_name_value = group_name("g19");
+        let parent_inode_id = InodeId::new(670);
+        let source_inode_id = InodeId::new(671);
+        let nested_inode_id = InodeId::new(672);
+        let file_inode_id = InodeId::new(673);
+        let data_handle_id = DataHandleId::new(424_242);
+        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
+        let mount_table = builder.mount_table();
+        let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
+        let filesystem = builder
+            .with_storage(Arc::clone(&storage))
+            .with_raft_node(raft_node)
+            .build();
+
+        for inode_id in [parent_inode_id, source_inode_id, nested_inode_id] {
+            storage
+                .put_inode(&Inode::new_dir(inode_id, FileAttrs::new(), mount_id))
+                .unwrap();
+        }
+        storage
+            .put_inode(&Inode::new_file(
+                file_inode_id,
+                FileAttrs::new(),
+                mount_id,
+                data_handle_id,
+            ))
+            .unwrap();
+        storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
+        storage.put_dentry(source_inode_id, "nested", nested_inode_id).unwrap();
+        storage.put_dentry(nested_inode_id, "file", file_inode_id).unwrap();
+        storage.put_layout(file_inode_id, FileLayout::new(64, 64, 1)).unwrap();
+        storage.put_data_handle_owner(data_handle_id, file_inode_id).unwrap();
+        install_write_session_with_ancestors(
+            &filesystem,
+            file_inode_id,
+            mount_id,
+            vec![source_inode_id, nested_inode_id, file_inode_id],
+        );
+
+        let failure = filesystem
+            .execute_rename(
+                &request_context(),
+                Command::Rename {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    src_parent_inode_id: parent_inode_id,
+                    src_name: "source".to_string(),
+                    expected_src_inode_id: source_inode_id,
+                    dst_parent_inode_id: parent_inode_id,
+                    dst_name: "renamed".to_string(),
+                    expected_dst_inode_id: None,
+                    expected_dst_lease_epoch: None,
+                    flags: 0,
+                },
+                Freshness::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EBusy));
+        assert_eq!(
+            storage.get_dentry(parent_inode_id, "source").unwrap(),
+            Some(source_inode_id)
+        );
+        assert_eq!(storage.get_dentry(parent_inode_id, "renamed").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn rename_rejects_target_directory_with_active_descendant_writer() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_id = MountId::new(69);
+        let group_name_value = group_name("g21");
+        let parent_inode_id = InodeId::new(690);
+        let source_inode_id = InodeId::new(691);
+        let target_inode_id = InodeId::new(692);
+        let nested_inode_id = InodeId::new(693);
+        let file_inode_id = InodeId::new(694);
+        let data_handle_id = DataHandleId::new(424_243);
+        let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
+            .with_storage(Arc::clone(&storage))
+            .build();
+
+        for inode_id in [parent_inode_id, source_inode_id, target_inode_id, nested_inode_id] {
+            storage
+                .put_inode(&Inode::new_dir(inode_id, FileAttrs::new(), mount_id))
+                .unwrap();
+        }
+        storage
+            .put_inode(&Inode::new_file(
+                file_inode_id,
+                FileAttrs::new(),
+                mount_id,
+                data_handle_id,
+            ))
+            .unwrap();
+        storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
+        storage.put_dentry(parent_inode_id, "target", target_inode_id).unwrap();
+        storage.put_dentry(target_inode_id, "nested", nested_inode_id).unwrap();
+        storage.put_dentry(nested_inode_id, "file", file_inode_id).unwrap();
+        storage.put_layout(file_inode_id, FileLayout::new(64, 64, 1)).unwrap();
+        storage.put_data_handle_owner(data_handle_id, file_inode_id).unwrap();
+        install_write_session_with_ancestors(
+            &filesystem,
+            file_inode_id,
+            mount_id,
+            vec![target_inode_id, nested_inode_id, file_inode_id],
+        );
+
+        let failure = filesystem
+            .execute_rename(
+                &request_context(),
+                Command::Rename {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    src_parent_inode_id: parent_inode_id,
+                    src_name: "source".to_string(),
+                    expected_src_inode_id: source_inode_id,
+                    dst_parent_inode_id: parent_inode_id,
+                    dst_name: "target".to_string(),
+                    expected_dst_inode_id: Some(target_inode_id),
+                    expected_dst_lease_epoch: None,
+                    flags: 0,
+                },
+                Freshness::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EBusy));
+        assert_eq!(
+            storage.get_dentry(parent_inode_id, "source").unwrap(),
+            Some(source_inode_id)
+        );
+        assert_eq!(
+            storage.get_dentry(parent_inode_id, "target").unwrap(),
+            Some(target_inode_id)
+        );
+    }
+
+    #[tokio::test]
     async fn expired_target_write_lease_does_not_leave_rename_permanently_busy() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
@@ -598,7 +768,7 @@ mod tests {
         let file_handle = install_write_session(&filesystem, target_inode_id, mount_id);
 
         assert!(!lease_manager.has_active_lease(target_inode_id));
-        assert!(filesystem.write_session_for_handle(file_handle).is_some());
+        assert!(filesystem.write_session_for_handle(file_handle).is_none());
 
         filesystem
             .execute_rename(
@@ -787,6 +957,7 @@ pub(crate) struct CreatedFileOutput {
 }
 
 impl MetadataFileSystem {
+    /// Create a file while excluding concurrent Rename/Delete topology changes.
     pub(crate) async fn create_file(&self, ctx: &RequestContext, args: CreateFileArgs) -> FsResult<CreatedFileOutput> {
         let path = args.path.clone();
         let result = self.create_file_inner(ctx, args).await;
@@ -829,6 +1000,7 @@ impl MetadataFileSystem {
         if let Err(failure) = self.admission.check_meta_write(ctx).await {
             return self.failure_from_admission(failure);
         }
+        let _topology_guard = self.namespace_topology.read().await;
 
         let CreateFileArgs {
             path,
@@ -950,12 +1122,16 @@ pub(crate) struct DeleteArgs {
 impl MetadataFileSystem {
     /// Resolves and submits a namespace delete under metadata write admission.
     ///
+    /// The exclusive topology guard prevents new path-bound writes and creates
+    /// from crossing the subtree activity check and the Raft proposal.
+    ///
     /// A successful result means the namespace mutation committed. Physical
     /// block reclamation follows the configured cleanup grace asynchronously.
     pub(crate) async fn delete(&self, ctx: &RequestContext, args: DeleteArgs) -> FsResult<()> {
         if let Err(failure) = self.admission.check_meta_write(ctx).await {
             return self.failure_from_admission(failure);
         }
+        let _topology_guard = self.namespace_topology.write().await;
 
         let path = match crate::path_resolver::PathResolver::normalize(&args.path) {
             Ok(path) => path,
@@ -1022,6 +1198,9 @@ impl MetadataFileSystem {
 
     /// Commits one resolved delete with exact inode and lease preconditions.
     ///
+    /// A bounded ancestor index rejects an active writer anywhere below the
+    /// target before the existing recursive durability preflight runs.
+    ///
     /// Physical cleanup is deliberately decoupled from this mutation. Worker
     /// reports later rediscover unreachable replicas, wait for the configured
     /// grace, and revalidate authority before dispatch.
@@ -1038,6 +1217,15 @@ impl MetadataFileSystem {
             Ok(ctx) => ctx,
             Err(err) => return Err(err),
         };
+        if self.has_active_write_under(expected_inode_id) {
+            return self.fatal_fs_failure(
+                request_ctx,
+                beryl_types::fs::FsErrorCode::EBusy,
+                format!("Delete target contains an active write lease: {expected_inode_id}"),
+                Some(ctx.group_name.clone()),
+                Some(ctx.mount_epoch),
+            );
+        }
         let expected_file_lease_epochs = match self.read_dentry(parent_inode_id, &name) {
             Ok(Some(inode_id)) => match self.read_inode(inode_id) {
                 Ok(Some(inode)) if inode.kind.is_file() && self.has_active_write(inode_id) => {
@@ -1098,7 +1286,7 @@ impl MetadataFileSystem {
         self.delete_result(request_ctx, &ctx, result)
     }
 
-    /// Reads the durable file lease epoch used by delete apply preconditions.
+    /// Read the persisted file fencing epoch used by delete apply preconditions.
     fn file_lease_epoch(inode: &beryl_types::fs::Inode) -> u64 {
         match &inode.data {
             beryl_types::fs::InodeData::File { lease_epoch, .. } => lease_epoch.unwrap_or(0),
@@ -1220,6 +1408,141 @@ mod delete_tests {
     }
 
     #[tokio::test]
+    async fn recursive_delete_rejects_active_writer_at_any_descendant_depth() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_id = MountId::new(68);
+        let group_name_value = group_name("g20");
+        let parent_inode_id = InodeId::new(680);
+        let root_inode_id = InodeId::new(681);
+        let nested_inode_id = InodeId::new(682);
+        let file_inode_id = InodeId::new(683);
+        let data_handle_id = DataHandleId::new(424_242);
+        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
+        let mount_table = builder.mount_table();
+        let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
+        let filesystem = builder
+            .with_storage(Arc::clone(&storage))
+            .with_raft_node(raft_node)
+            .build();
+
+        for inode_id in [parent_inode_id, root_inode_id, nested_inode_id] {
+            storage
+                .put_inode(&Inode::new_dir(inode_id, FileAttrs::new(), mount_id))
+                .unwrap();
+        }
+        storage
+            .put_inode(&Inode::new_file(
+                file_inode_id,
+                FileAttrs::new(),
+                mount_id,
+                data_handle_id,
+            ))
+            .unwrap();
+        storage.put_dentry(parent_inode_id, "root", root_inode_id).unwrap();
+        storage.put_dentry(root_inode_id, "nested", nested_inode_id).unwrap();
+        storage.put_dentry(nested_inode_id, "file", file_inode_id).unwrap();
+        storage.put_layout(file_inode_id, FileLayout::new(64, 64, 1)).unwrap();
+        storage.put_data_handle_owner(data_handle_id, file_inode_id).unwrap();
+        install_write_session_with_ancestors(
+            &filesystem,
+            file_inode_id,
+            mount_id,
+            vec![root_inode_id, nested_inode_id, file_inode_id],
+        );
+
+        let failure = filesystem
+            .delete_resolved(
+                &request_context(),
+                parent_inode_id,
+                "root".to_string(),
+                root_inode_id,
+                true,
+                Freshness::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EBusy));
+        assert_eq!(
+            storage.get_dentry(parent_inode_id, "root").unwrap(),
+            Some(root_inode_id)
+        );
+        assert!(storage.get_inode(file_inode_id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn concurrent_open_write_and_delete_have_one_linearized_outcome() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_id = MountId::new(69);
+        let group_name_value = group_name("g21");
+        let file_inode_id = InodeId::new(690);
+        let data_handle_id = DataHandleId::new(691);
+        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
+        let mount_table = builder.mount_table();
+        let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
+        let filesystem = builder
+            .with_storage(Arc::clone(&storage))
+            .with_raft_node(raft_node)
+            .build();
+
+        storage
+            .put_inode(&Inode::new_dir(ROOT_INODE_ID, FileAttrs::new(), mount_id))
+            .unwrap();
+        storage
+            .put_inode(&Inode::new_file(
+                file_inode_id,
+                FileAttrs::new(),
+                mount_id,
+                data_handle_id,
+            ))
+            .unwrap();
+        storage.put_dentry(ROOT_INODE_ID, "file", file_inode_id).unwrap();
+        storage.put_layout(file_inode_id, FileLayout::new(64, 64, 1)).unwrap();
+        storage.put_data_handle_owner(data_handle_id, file_inode_id).unwrap();
+
+        let open_ctx = request_context();
+        let delete_ctx = request_context();
+        let (open_result, delete_result) = tokio::join!(
+            filesystem.open_write(
+                &open_ctx,
+                crate::service::filesystem::OpenWriteArgs {
+                    path: "/file".to_string(),
+                    mode: crate::inode_lease::WriteMode::Write,
+                    freshness: Freshness::default(),
+                },
+            ),
+            filesystem.delete(
+                &delete_ctx,
+                DeleteArgs {
+                    path: "/file".to_string(),
+                    recursive: false,
+                    freshness: Freshness::default(),
+                },
+            ),
+        );
+
+        match (open_result, delete_result) {
+            (Ok(_), Err(failure)) => {
+                assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EBusy));
+                assert_eq!(storage.get_dentry(ROOT_INODE_ID, "file").unwrap(), Some(file_inode_id));
+            }
+            (Err(_), Ok(_)) => {
+                assert_eq!(storage.get_dentry(ROOT_INODE_ID, "file").unwrap(), None);
+                assert!(storage.get_inode(file_inode_id).unwrap().is_none());
+            }
+            (open_result, delete_result) => {
+                panic!(
+                    "OpenWrite/Delete must linearize to one success and one rejection: open={:?}, delete={:?}",
+                    open_result.is_ok(),
+                    delete_result.is_ok()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn expired_write_lease_does_not_leave_delete_permanently_busy() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
@@ -1250,7 +1573,7 @@ mod delete_tests {
         let file_handle = install_write_session(&filesystem, inode_id, mount_id);
 
         assert!(!lease_manager.has_active_lease(inode_id));
-        assert!(filesystem.write_session_for_handle(file_handle).is_some());
+        assert!(filesystem.write_session_for_handle(file_handle).is_none());
 
         filesystem
             .delete_resolved(

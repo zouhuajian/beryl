@@ -596,6 +596,7 @@ mod tests {
                 open_client_id: ClientId::new(1),
                 layout: FileLayout::new(64, 64, 1),
                 expires_at_ms: u64::MAX,
+                ancestor_inode_ids: vec![inode_id],
             })
             .unwrap();
     }
