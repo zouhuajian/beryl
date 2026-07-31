@@ -5,6 +5,7 @@
 //!
 //! Applies commands to the state machine and maintains consistency.
 
+mod detached_root;
 mod namespace;
 mod worker;
 mod write;
@@ -12,11 +13,13 @@ mod write;
 use crate::error::{to_fs_error_detail, MetadataError, MetadataResult};
 use crate::raft::command::{Command, PublishMode};
 use crate::raft::response::{
-    ApplyRejection, CommandResult, FatalApplyError, FsCommandResult, FsErrnoResult, FsOkResult,
+    ApplyRejection, CommandResult, DetachedRootReclaimResult, FatalApplyError, FsCommandResult, FsErrnoResult,
+    FsOkResult,
 };
 use crate::raft::storage::{
-    BootstrapNamespaceState, DeleteTreeAtomicUpdate, DeleteTreeEntry, FileAllocation, InodeAllocation,
-    RecursiveMkdirEntry, RenameAtomicUpdate, RenameOverwriteCleanup, RocksDBStorage,
+    BootstrapNamespaceState, DeleteTreeAtomicUpdate, DeleteTreeEntry, DetachedRoot, DetachedRootReclaimEntry,
+    DetachedRootReclaimUpdate, FileAllocation, InodeAllocation, RecursiveMkdirEntry, RenameAtomicUpdate,
+    RenameOverwriteCleanup, RocksDBStorage,
 };
 use crate::raft::types::AppMetadataRaftState;
 use crate::raft::RoutingDelta;
@@ -271,6 +274,19 @@ impl AppRaftStateMachine {
                     raft_state,
                 )?;
                 Ok(CommandResult::Fs(result))
+            }
+            Command::ReclaimDetachedRoots {
+                candidate_root_inode_ids,
+                max_entries,
+                max_batch_bytes,
+            } => {
+                let result = self.apply_reclaim_detached_roots(
+                    candidate_root_inode_ids,
+                    max_entries,
+                    max_batch_bytes,
+                    raft_state,
+                )?;
+                Ok(CommandResult::DetachedRootsReclaimed(result))
             }
         })();
 

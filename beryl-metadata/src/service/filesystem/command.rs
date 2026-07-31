@@ -186,7 +186,8 @@ impl MetadataFileSystem {
                 | Command::AcquireWriteLease { .. }
                 | Command::AllocateBlock { .. }
                 | Command::EndWriteLease { .. }
-                | Command::RegisterWorkerDescriptor { .. } => {}
+                | Command::RegisterWorkerDescriptor { .. }
+                | Command::ReclaimDetachedRoots { .. } => {}
             }
         }
 

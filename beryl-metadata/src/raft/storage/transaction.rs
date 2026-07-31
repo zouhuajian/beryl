@@ -14,7 +14,7 @@ impl RocksDBStorage {
         let cf_raft_state = Self::cf(db, CF_RAFT_STATE)?;
         let state_data = serde_json::to_vec(raft_state)
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize Raft state: {e}")))?;
-        batch.put_cf(cf_raft_state, b"raft_state", state_data);
+        batch.put_cf(cf_raft_state, RAFT_STATE_KEY, state_data);
         let started = Instant::now();
         let result = db
             .write(batch.0)
@@ -402,6 +402,45 @@ impl RocksDBStorage {
         self.commit_authority_batch(batch.into(), raft_state)
     }
 
+    /// Atomically publish one validated, bounded detached-root reclamation.
+    pub(crate) fn reclaim_detached_roots_atomic(
+        &self,
+        update: DetachedRootReclaimUpdate,
+        raft_state: &AppMetadataRaftState,
+    ) -> MetadataResult<()> {
+        let generation = self.pin_generation()?;
+        let db = generation.db();
+        let cf_inodes = Self::cf(db, CF_INODES)?;
+        let cf_dentries = Self::cf(db, CF_DENTRIES)?;
+        let cf_detached_roots = Self::cf(db, CF_DETACHED_ROOTS)?;
+        let cf_meta = Self::cf(db, CF_META)?;
+        let mut batch = WriteBatch::default();
+
+        for entry in update.entries {
+            batch.delete_cf(cf_dentries, Self::encode_dentry_key(entry.parent_inode_id, &entry.name));
+            if let Some(detached_root) = entry.child_detached_root {
+                batch.put_cf(
+                    cf_detached_roots,
+                    Self::encode_detached_root_key(entry.inode_id),
+                    Self::encode_detached_root(&detached_root)?,
+                );
+                continue;
+            }
+
+            batch.delete_cf(cf_inodes, Self::encode_inode_key(entry.inode_id));
+            if let Some(data_handle_id) = entry.data_handle_id {
+                batch.delete_cf(cf_meta, Self::encode_layout_key(entry.inode_id));
+                batch.delete_cf(cf_meta, Self::encode_data_handle_owner_key(data_handle_id));
+            }
+        }
+        for root_inode_id in update.completed_root_inode_ids {
+            batch.delete_cf(cf_inodes, Self::encode_inode_key(root_inode_id));
+            batch.delete_cf(cf_detached_roots, Self::encode_detached_root_key(root_inode_id));
+        }
+
+        self.commit_authority_batch(batch.into(), raft_state)
+    }
+
     fn rename_batch(&self, update: RenameAtomicUpdate<'_>) -> MetadataResult<WriteBatch> {
         let generation = self.pin_generation()?;
         let db = generation.db();
@@ -550,6 +589,48 @@ mod tests {
             db.put_cf(cf_meta, key.as_bytes(), value)
                 .map_err(|e| MetadataError::Internal(format!("RocksDB error: {}", e)))?;
             Ok(())
+        }
+
+        /// Seed detached-root authority for state-machine and snapshot tests.
+        pub(crate) fn put_detached_root(&self, inode_id: InodeId, detached_root: DetachedRoot) -> MetadataResult<()> {
+            let generation = self.pin_generation()?;
+            let db = generation.db();
+            let cf = Self::cf(db, CF_DETACHED_ROOTS)?;
+            db.put_cf(
+                cf,
+                Self::encode_detached_root_key(inode_id),
+                Self::encode_detached_root(&detached_root)?,
+            )
+            .map_err(|error| MetadataError::Internal(format!("RocksDB error: {error}")))
+        }
+
+        /// Seed many empty roots in one test-only RocksDB batch.
+        pub(crate) fn put_empty_detached_roots(
+            &self,
+            first_inode_id: u64,
+            count: usize,
+            detached_root: DetachedRoot,
+        ) -> MetadataResult<()> {
+            let generation = self.pin_generation()?;
+            let db = generation.db();
+            let cf_inodes = Self::cf(db, CF_INODES)?;
+            let cf_detached_roots = Self::cf(db, CF_DETACHED_ROOTS)?;
+            let encoded_marker = Self::encode_detached_root(&detached_root)?;
+            let mut batch = WriteBatch::default();
+            for offset in 0..count {
+                let raw = first_inode_id
+                    .checked_add(offset as u64)
+                    .ok_or_else(|| MetadataError::Internal("test inode range overflow".to_string()))?;
+                let inode = Inode::new_dir(InodeId::new(raw), FileAttrs::new(), detached_root.mount_id);
+                Self::batch_put_inode(&mut batch, cf_inodes, &inode)?;
+                batch.put_cf(
+                    cf_detached_roots,
+                    Self::encode_detached_root_key(inode.inode_id),
+                    &encoded_marker,
+                );
+            }
+            db.write(batch)
+                .map_err(|error| MetadataError::Internal(format!("RocksDB error: {error}")))
         }
 
         /// Put mount epoch.

@@ -488,6 +488,7 @@ fn install_snapshot_generation(
     let expected = SnapshotIdentity::current(local_identity.group_name.clone(), Some(from_openraft_log_id(boundary)));
     let staged = storage.create_staged_generation()?;
     decode_into_staged(staged.db(), &mut incoming_file, &expected)?;
+    super::schema::validate_detached_root_records(staged.db())?;
     let routing = load_mount_replacement(staged.db())?;
     let route_epoch = load_route_epoch(staged.db())?;
     drop(incoming_file);
@@ -965,7 +966,9 @@ mod tests {
     use super::*;
     use crate::mount::{DataIoPolicy, MountEntry, MountKind, MountTable};
     use crate::raft::state_machine::AppRaftStateMachine;
-    use crate::raft::Command;
+    use crate::raft::{
+        Command, CommandResult, MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES, MAX_RECLAIM_DETACHED_ROOT_ENTRIES,
+    };
     use crate::state::RouteEpoch;
     use beryl_types::fs::{FileAttrs, Inode, InodeId};
     use beryl_types::ids::{DataHandleId, MountId, WorkerId};
@@ -1249,6 +1252,19 @@ mod tests {
             root_inode_id: InodeId::new(17),
         };
         storage_a.put_mount(&snapshot_mount).unwrap();
+        let detached_inode_id = InodeId::new(71);
+        let detached_root = crate::raft::DetachedRoot {
+            mount_id: snapshot_mount.mount_id,
+            detached_at_ms: 123,
+        };
+        storage_a
+            .put_inode(&Inode::new_dir(
+                detached_inode_id,
+                FileAttrs::new(),
+                snapshot_mount.mount_id,
+            ))
+            .unwrap();
+        storage_a.put_detached_root(detached_inode_id, detached_root).unwrap();
 
         // Persist raft state for meta.
         let raft_state = sample_raft_state();
@@ -1305,6 +1321,30 @@ mod tests {
             storage_b.prepare_inode_allocation().unwrap().inode_id,
             beryl_types::fs::InodeId::new(77)
         );
+        assert_eq!(
+            storage_b.get_detached_root(detached_inode_id).unwrap(),
+            Some(detached_root)
+        );
+        assert!(storage_b.get_inode(detached_inode_id).unwrap().is_some());
+        let reclaim_responses = sm_store_b
+            .apply([normal_entry(
+                6,
+                Command::ReclaimDetachedRoots {
+                    candidate_root_inode_ids: vec![detached_inode_id],
+                    max_entries: MAX_RECLAIM_DETACHED_ROOT_ENTRIES,
+                    max_batch_bytes: MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES,
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(
+            reclaim_responses.as_slice(),
+            [CommandResult::DetachedRootsReclaimed(
+                crate::raft::DetachedRootReclaimResult { completed_roots: 1, .. }
+            )]
+        ));
+        assert!(storage_b.get_detached_root(detached_inode_id).unwrap().is_none());
+        assert!(storage_b.get_inode(detached_inode_id).unwrap().is_none());
         assert_eq!(
             routing_b
                 .get_mount(snapshot_mount.mount_id)
@@ -1506,6 +1546,60 @@ mod tests {
             .begin_receiving_snapshot()
             .await
             .expect("failed install releases incoming token");
+    }
+
+    #[test]
+    fn malformed_detached_root_snapshot_leaves_active_generation_unchanged() {
+        let source_dir = TempDir::new().unwrap();
+        let destination_dir = TempDir::new().unwrap();
+        let source = Arc::new(RocksDBStorage::create_for_format(source_dir.path()).unwrap());
+        let destination = Arc::new(RocksDBStorage::create_for_format(destination_dir.path()).unwrap());
+        source
+            .bind_storage_identity(&test_storage_identity("source", 1))
+            .unwrap();
+        destination
+            .bind_storage_identity(&test_storage_identity("destination", 2))
+            .unwrap();
+        source.put_route_epoch(RouteEpoch::new(7)).unwrap();
+        destination.put_route_epoch(RouteEpoch::new(99)).unwrap();
+        source.persist_raft_state_durable(&sample_raft_state()).unwrap();
+        source
+            .with_pinned_db(|db| {
+                db.put_cf(required_cf(db, "detached_roots")?, b"short", b"invalid")
+                    .map_err(|error| MetadataError::Internal(error.to_string()))
+            })
+            .unwrap();
+
+        let built = build_snapshot_generation(&source).unwrap();
+        let incoming_path = destination.snapshot_dir().join("malformed-detached-root.snap.tmp");
+        fs::copy(&built.path, &incoming_path).unwrap();
+        let incoming_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&incoming_path)
+            .unwrap();
+        let destination_state = Arc::new(RwLock::new(AppMetadataRaftState::default()));
+        let destination_view =
+            MetadataReadView::new(Arc::new(MountTable::new()), destination_state, Arc::clone(&destination)).unwrap();
+
+        let error = match install_snapshot_generation(
+            &destination,
+            &destination_view,
+            &built.meta,
+            incoming_path,
+            incoming_file,
+            None,
+        ) {
+            Ok(_) => panic!("malformed detached-root snapshot must not install"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("invalid detached-root key length"));
+        assert_eq!(destination.get_route_epoch().unwrap(), RouteEpoch::new(99));
+        assert_eq!(
+            fs::read_to_string(destination_dir.path().join("CURRENT")).unwrap(),
+            "gen-000001\n"
+        );
     }
 
     #[tokio::test]

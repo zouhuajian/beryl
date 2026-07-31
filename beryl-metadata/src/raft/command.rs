@@ -10,6 +10,11 @@ use beryl_types::GroupName;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub(crate) const MAX_RECLAIM_DETACHED_ROOT_CANDIDATES: u32 = 64;
+pub(crate) const MAX_RECLAIM_DETACHED_ROOT_ENTRIES: u32 = 256;
+pub(crate) const MIN_RECLAIM_DETACHED_ROOT_BATCH_BYTES: u32 = 4 * 1024;
+pub(crate) const MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES: u32 = 1024 * 1024;
+
 /// File publication precondition and merge behavior.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PublishMode {
@@ -102,6 +107,16 @@ pub(crate) enum Command {
         worker_net_protocol: i32,
         fault_domain: Option<String>,
     },
+    /// Reclaim a bounded amount of namespace authority from detached roots.
+    ///
+    /// Every budget is part of the replicated command. Apply also enforces
+    /// fixed protocol maxima so local configuration cannot make replicas
+    /// execute different state transitions.
+    ReclaimDetachedRoots {
+        candidate_root_inode_ids: Vec<InodeId>,
+        max_entries: u32,
+        max_batch_bytes: u32,
+    },
 }
 
 impl Command {
@@ -119,6 +134,7 @@ impl Command {
             Self::EndWriteLease { .. } => "end_write_lease",
             Self::PublishFile { .. } => "publish_file",
             Self::RegisterWorkerDescriptor { .. } => "register_worker_descriptor",
+            Self::ReclaimDetachedRoots { .. } => "reclaim_detached_roots",
         }
     }
 }

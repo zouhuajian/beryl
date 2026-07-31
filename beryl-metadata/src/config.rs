@@ -5,6 +5,10 @@
 //!
 //! Reads metadata configuration from server YAML files.
 
+use crate::raft::{
+    MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES, MAX_RECLAIM_DETACHED_ROOT_CANDIDATES, MAX_RECLAIM_DETACHED_ROOT_ENTRIES,
+    MIN_RECLAIM_DETACHED_ROOT_BATCH_BYTES,
+};
 use crate::readiness::RootReadinessConfig;
 use beryl_common::config::ServerConfig;
 use beryl_common::error::{CommonError, CommonErrorKind};
@@ -28,6 +32,14 @@ const METADATA_CLEANUP_DISPATCH_ENABLED: &str = "metadata.cleanup.dispatch_enabl
 const METADATA_CLEANUP_MAX_COMMANDS_PER_HEARTBEAT: &str = "metadata.cleanup.max_commands_per_heartbeat";
 const METADATA_CLEANUP_RETRY_INITIAL_BACKOFF_MS: &str = "metadata.cleanup.retry_initial_backoff_ms";
 const METADATA_CLEANUP_RETRY_MAX_BACKOFF_MS: &str = "metadata.cleanup.retry_max_backoff_ms";
+const METADATA_DETACHED_ROOT_RECLAIM_SCAN_INTERVAL_MS: &str = "metadata.detached_root_reclamation.scan_interval_ms";
+const METADATA_DETACHED_ROOT_RECLAIM_MAX_CANDIDATES: &str = "metadata.detached_root_reclamation.max_candidates";
+const METADATA_DETACHED_ROOT_RECLAIM_MAX_ENTRIES: &str = "metadata.detached_root_reclamation.max_entries";
+const METADATA_DETACHED_ROOT_RECLAIM_MAX_BATCH_BYTES: &str = "metadata.detached_root_reclamation.max_batch_bytes";
+const METADATA_DETACHED_ROOT_RECLAIM_RETRY_INITIAL_BACKOFF_MS: &str =
+    "metadata.detached_root_reclamation.retry_initial_backoff_ms";
+const METADATA_DETACHED_ROOT_RECLAIM_RETRY_MAX_BACKOFF_MS: &str =
+    "metadata.detached_root_reclamation.retry_max_backoff_ms";
 const METADATA_REPAIR_MAX_QUEUE_SIZE: &str = "metadata.repair.max_queue_size";
 const METADATA_REPAIR_MAX_ATTEMPTS: &str = "metadata.repair.max_attempts";
 const METADATA_REPAIR_INFLIGHT_TIMEOUT_MS: &str = "metadata.repair.inflight_timeout_ms";
@@ -56,6 +68,8 @@ pub struct MetadataConfig {
     pub authority: MetadataAuthorityConfig,
     /// Block cleanup detection and dispatch configuration.
     pub cleanup: CleanupConfig,
+    /// Bounded detached namespace reclamation configuration.
+    pub detached_root_reclamation: DetachedRootReclamationConfig,
     /// Worker/Repair configuration.
     pub worker: WorkerConfig,
     /// Readiness configuration.
@@ -88,6 +102,23 @@ pub struct CleanupConfig {
     /// Initial retry delay after returning a cleanup command.
     pub retry_initial_backoff_ms: u64,
     /// Maximum retry delay after repeated cleanup commands.
+    pub retry_max_backoff_ms: u64,
+}
+
+/// Leader-only detached-root proposal and retry bounds.
+#[derive(Clone, Debug)]
+pub struct DetachedRootReclamationConfig {
+    /// Delay between successful or idle maintenance passes.
+    pub scan_interval_ms: u64,
+    /// Maximum marker candidates carried by one Raft command.
+    pub max_candidates: u32,
+    /// Maximum namespace children removed by one Raft apply.
+    pub max_entries: u32,
+    /// Maximum deterministic key/value bytes in one authority batch.
+    pub max_batch_bytes: u32,
+    /// Initial delay after a failed proposal or authority read.
+    pub retry_initial_backoff_ms: u64,
+    /// Maximum delay after repeated failures.
     pub retry_max_backoff_ms: u64,
 }
 
@@ -192,6 +223,19 @@ impl Default for CleanupConfig {
     }
 }
 
+impl Default for DetachedRootReclamationConfig {
+    fn default() -> Self {
+        Self {
+            scan_interval_ms: 1_000,
+            max_candidates: MAX_RECLAIM_DETACHED_ROOT_CANDIDATES,
+            max_entries: MAX_RECLAIM_DETACHED_ROOT_ENTRIES,
+            max_batch_bytes: MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES,
+            retry_initial_backoff_ms: 1_000,
+            retry_max_backoff_ms: 60_000,
+        }
+    }
+}
+
 impl MetadataConfig {
     /// Load metadata configuration from a YAML file.
     pub fn load<P: AsRef<Path>>(config_path: P) -> Result<Self, CommonError> {
@@ -242,6 +286,61 @@ impl MetadataConfig {
             ));
         }
 
+        let detached_root_reclamation = DetachedRootReclamationConfig {
+            scan_interval_ms: get_positive_u64_or(flat, METADATA_DETACHED_ROOT_RECLAIM_SCAN_INTERVAL_MS, 1_000)?,
+            max_candidates: get_positive_u32_or(
+                flat,
+                METADATA_DETACHED_ROOT_RECLAIM_MAX_CANDIDATES,
+                MAX_RECLAIM_DETACHED_ROOT_CANDIDATES,
+            )?,
+            max_entries: get_positive_u32_or(
+                flat,
+                METADATA_DETACHED_ROOT_RECLAIM_MAX_ENTRIES,
+                MAX_RECLAIM_DETACHED_ROOT_ENTRIES,
+            )?,
+            max_batch_bytes: get_positive_u32_or(
+                flat,
+                METADATA_DETACHED_ROOT_RECLAIM_MAX_BATCH_BYTES,
+                MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES,
+            )?,
+            retry_initial_backoff_ms: get_positive_u64_or(
+                flat,
+                METADATA_DETACHED_ROOT_RECLAIM_RETRY_INITIAL_BACKOFF_MS,
+                1_000,
+            )?,
+            retry_max_backoff_ms: get_positive_u64_or(
+                flat,
+                METADATA_DETACHED_ROOT_RECLAIM_RETRY_MAX_BACKOFF_MS,
+                60_000,
+            )?,
+        };
+        if detached_root_reclamation.max_candidates > MAX_RECLAIM_DETACHED_ROOT_CANDIDATES {
+            return Err(invalid_config(
+                METADATA_DETACHED_ROOT_RECLAIM_MAX_CANDIDATES,
+                "exceeds the replicated protocol maximum",
+            ));
+        }
+        if detached_root_reclamation.max_entries > MAX_RECLAIM_DETACHED_ROOT_ENTRIES {
+            return Err(invalid_config(
+                METADATA_DETACHED_ROOT_RECLAIM_MAX_ENTRIES,
+                "exceeds the replicated protocol maximum",
+            ));
+        }
+        if !(MIN_RECLAIM_DETACHED_ROOT_BATCH_BYTES..=MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES)
+            .contains(&detached_root_reclamation.max_batch_bytes)
+        {
+            return Err(invalid_config(
+                METADATA_DETACHED_ROOT_RECLAIM_MAX_BATCH_BYTES,
+                "is outside the replicated protocol byte range",
+            ));
+        }
+        if detached_root_reclamation.retry_max_backoff_ms < detached_root_reclamation.retry_initial_backoff_ms {
+            return Err(invalid_config(
+                METADATA_DETACHED_ROOT_RECLAIM_RETRY_MAX_BACKOFF_MS,
+                "must be greater than or equal to metadata.detached_root_reclamation.retry_initial_backoff_ms",
+            ));
+        }
+
         let repair = RepairConfig {
             max_queue_size: get_positive_usize_or(flat, METADATA_REPAIR_MAX_QUEUE_SIZE, 10000)?,
             max_attempts: get_positive_u32_or(flat, METADATA_REPAIR_MAX_ATTEMPTS, 3)?,
@@ -274,6 +373,7 @@ impl MetadataConfig {
             raft,
             authority,
             cleanup,
+            detached_root_reclamation,
             worker,
             bootstrap,
             observability,
@@ -422,6 +522,7 @@ mod tests {
                 raft: RaftConfig::default(),
                 authority: MetadataAuthorityConfig::default(),
                 cleanup: CleanupConfig::default(),
+                detached_root_reclamation: DetachedRootReclamationConfig::default(),
                 worker: WorkerConfig::default(),
                 bootstrap: BootstrapConfig {
                     root_readiness: RootReadinessConfig::default(),
@@ -540,6 +641,21 @@ mod tests {
         assert_eq!(config.cleanup.max_commands_per_heartbeat, 32);
         assert_eq!(config.cleanup.retry_initial_backoff_ms, 1_000);
         assert_eq!(config.cleanup.retry_max_backoff_ms, 60_000);
+        assert_eq!(config.detached_root_reclamation.scan_interval_ms, 1_000);
+        assert_eq!(
+            config.detached_root_reclamation.max_candidates,
+            MAX_RECLAIM_DETACHED_ROOT_CANDIDATES
+        );
+        assert_eq!(
+            config.detached_root_reclamation.max_entries,
+            MAX_RECLAIM_DETACHED_ROOT_ENTRIES
+        );
+        assert_eq!(
+            config.detached_root_reclamation.max_batch_bytes,
+            MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES
+        );
+        assert_eq!(config.detached_root_reclamation.retry_initial_backoff_ms, 1_000);
+        assert_eq!(config.detached_root_reclamation.retry_max_backoff_ms, 60_000);
         assert_eq!(config.worker.repair.max_queue_size, 10000);
         assert_eq!(config.worker.repair.max_attempts, 3);
         assert_eq!(config.worker.repair.inflight_timeout_ms, 300_000);
@@ -584,6 +700,12 @@ mod tests {
             METADATA_CLEANUP_MAX_COMMANDS_PER_HEARTBEAT,
             METADATA_CLEANUP_RETRY_INITIAL_BACKOFF_MS,
             METADATA_CLEANUP_RETRY_MAX_BACKOFF_MS,
+            METADATA_DETACHED_ROOT_RECLAIM_SCAN_INTERVAL_MS,
+            METADATA_DETACHED_ROOT_RECLAIM_MAX_CANDIDATES,
+            METADATA_DETACHED_ROOT_RECLAIM_MAX_ENTRIES,
+            METADATA_DETACHED_ROOT_RECLAIM_MAX_BATCH_BYTES,
+            METADATA_DETACHED_ROOT_RECLAIM_RETRY_INITIAL_BACKOFF_MS,
+            METADATA_DETACHED_ROOT_RECLAIM_RETRY_MAX_BACKOFF_MS,
             METADATA_REPAIR_MAX_QUEUE_SIZE,
             METADATA_REPAIR_MAX_ATTEMPTS,
             METADATA_REPAIR_INFLIGHT_TIMEOUT_MS,
@@ -617,5 +739,37 @@ mod tests {
         flat.set(METADATA_CLEANUP_RETRY_MAX_BACKOFF_MS, 99_i64);
         let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
         assert!(err.message.contains(METADATA_CLEANUP_RETRY_MAX_BACKOFF_MS));
+
+        for (key, value) in [
+            (
+                METADATA_DETACHED_ROOT_RECLAIM_MAX_CANDIDATES,
+                i64::from(MAX_RECLAIM_DETACHED_ROOT_CANDIDATES) + 1,
+            ),
+            (
+                METADATA_DETACHED_ROOT_RECLAIM_MAX_ENTRIES,
+                i64::from(MAX_RECLAIM_DETACHED_ROOT_ENTRIES) + 1,
+            ),
+            (
+                METADATA_DETACHED_ROOT_RECLAIM_MAX_BATCH_BYTES,
+                i64::from(MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES) + 1,
+            ),
+            (
+                METADATA_DETACHED_ROOT_RECLAIM_MAX_BATCH_BYTES,
+                i64::from(MIN_RECLAIM_DETACHED_ROOT_BATCH_BYTES) - 1,
+            ),
+        ] {
+            let mut flat = test_flat();
+            flat.set(key, value);
+            let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
+            assert!(err.message.contains(key));
+        }
+
+        let mut flat = test_flat();
+        flat.set(METADATA_DETACHED_ROOT_RECLAIM_RETRY_INITIAL_BACKOFF_MS, 100_i64);
+        flat.set(METADATA_DETACHED_ROOT_RECLAIM_RETRY_MAX_BACKOFF_MS, 99_i64);
+        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
+        assert!(err
+            .message
+            .contains(METADATA_DETACHED_ROOT_RECLAIM_RETRY_MAX_BACKOFF_MS));
     }
 }
