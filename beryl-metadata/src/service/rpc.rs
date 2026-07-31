@@ -781,7 +781,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
 mod tests {
     use crate::config::RaftConfig;
     use crate::mount::{DataIoPolicy, MountEntry, MountKind, MountTable, ROOT_INODE_ID};
-    use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
+    use crate::raft::{
+        AppRaftNode, AppRaftStateMachine, Command, RocksDBStorage, MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES,
+        MAX_RECLAIM_DETACHED_ROOT_ENTRIES,
+    };
     use crate::readiness::RootReadinessGate;
     use crate::service::{MetadataFileSystem, MetadataFileSystemDeps, MetadataFileSystemServiceImpl, MsyncHandler};
     use crate::state::RouteEpoch;
@@ -1008,6 +1011,7 @@ mod tests {
         storage
             .put_inode(&Inode::new_dir(root_inode_id, root_attrs, mount_entry.mount_id))
             .expect("put root inode");
+        storage.put_mount(&mount_entry).expect("put authoritative mount");
 
         let state_store: Arc<dyn crate::state::StateStore> = Arc::new(TestStateStore::new());
         let session_registry = Arc::new(crate::session_registry::SessionRegistry::default());
@@ -1094,6 +1098,7 @@ mod tests {
         storage
             .put_inode(&Inode::new_dir(root_inode_id, root_attrs, mount_entry.mount_id))
             .expect("put root inode");
+        storage.put_mount(&mount_entry).expect("put authoritative mount");
 
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
         let raft_config = RaftConfig::default();
@@ -2428,7 +2433,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recursive_delete_extent_file_cleans_namespace_layout_and_owner_once() {
+    async fn recursive_delete_detaches_then_reclaims_namespace_layout_and_owner_once() {
         let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
         let parent = InodeId::new(4200);
         let dir = InodeId::new(4201);
@@ -2452,13 +2457,35 @@ mod tests {
 
         assert_success_header(first.header);
         assert_eq!(env.storage.get_dentry(parent, "dir").unwrap(), None);
-        assert!(env.storage.get_inode(file).unwrap().is_none());
-        assert!(env.storage.get_layout(file).is_err());
-        assert_eq!(env.storage.get_inode_by_data_handle(data_handle_id).unwrap(), None);
+        assert!(env.storage.get_inode(dir).unwrap().is_some());
+        assert!(env.storage.get_inode(file).unwrap().is_some());
+        assert!(env.storage.get_layout(file).is_ok());
+        assert_eq!(
+            env.storage.get_inode_by_data_handle(data_handle_id).unwrap(),
+            Some(file)
+        );
+        assert!(env.storage.get_detached_root(dir).unwrap().is_some());
         assert_eq!(
             env.storage.get_dentry(env.root_inode_id, "parent").unwrap(),
             Some(parent)
         );
+
+        env.raft_node
+            .as_ref()
+            .expect("raft node")
+            .propose(Command::ReclaimDetachedRoots {
+                candidate_root_inode_ids: vec![dir],
+                max_entries: MAX_RECLAIM_DETACHED_ROOT_ENTRIES,
+                max_batch_bytes: MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES,
+            })
+            .await
+            .expect("reclaim detached directory");
+
+        assert!(env.storage.get_detached_root(dir).unwrap().is_none());
+        assert!(env.storage.get_inode(dir).unwrap().is_none());
+        assert!(env.storage.get_inode(file).unwrap().is_none());
+        assert!(env.storage.get_layout(file).is_err());
+        assert_eq!(env.storage.get_inode_by_data_handle(data_handle_id).unwrap(), None);
     }
 
     #[tokio::test]
@@ -2605,6 +2632,9 @@ mod tests {
                 root_inode_id: child_mount_root,
             },
         );
+        env.storage
+            .put_mount(&child_mount)
+            .expect("put authoritative child mount");
         env.storage
             .put_inode(&Inode::new_dir(
                 child_mount_root,

@@ -1141,7 +1141,7 @@ impl MetadataFileSystem {
             Ok(resolved) => resolved,
             Err(err) => return self.failure_from_path_error(ctx, &path, err),
         };
-        let (Some(parent_inode_id), Some(name)) = (resolved.parent_inode_id, resolved.name.clone()) else {
+        let (Some(parent_inode_id), Some(_)) = (resolved.parent_inode_id, resolved.name.as_ref()) else {
             return self.failure_from_resolved_path_error(
                 ctx,
                 MetadataError::InvalidArgument("Cannot operate on mount root".to_string()),
@@ -1159,7 +1159,7 @@ impl MetadataFileSystem {
             .delete_resolved(
                 ctx,
                 parent_inode_id,
-                name,
+                resolved.relative_components,
                 target_inode_id,
                 args.recursive,
                 args.freshness,
@@ -1196,10 +1196,11 @@ impl MetadataFileSystem {
         result
     }
 
-    /// Commits one resolved delete with exact inode and lease preconditions.
+    /// Commits one resolved delete with bounded path and exact inode preconditions.
     ///
     /// A bounded ancestor index rejects an active writer anywhere below the
-    /// target before the existing recursive durability preflight runs.
+    /// target. The exclusive topology guard held by the caller keeps that
+    /// leader-local decision ordered with path-bound write admission.
     ///
     /// Physical cleanup is deliberately decoupled from this mutation. Worker
     /// reports later rediscover unreachable replicas, wait for the configured
@@ -1208,7 +1209,7 @@ impl MetadataFileSystem {
         &self,
         request_ctx: &RequestContext,
         parent_inode_id: InodeId,
-        name: String,
+        relative_components: Vec<String>,
         expected_inode_id: InodeId,
         recursive: bool,
         freshness: Freshness,
@@ -1226,54 +1227,29 @@ impl MetadataFileSystem {
                 Some(ctx.mount_epoch),
             );
         }
-        let expected_file_lease_epochs = match self.read_dentry(parent_inode_id, &name) {
-            Ok(Some(inode_id)) => match self.read_inode(inode_id) {
-                Ok(Some(inode)) if inode.kind.is_file() && self.has_active_write(inode_id) => {
-                    return self.fatal_fs_failure(
-                        request_ctx,
-                        beryl_types::fs::FsErrorCode::EBusy,
-                        format!("File has an active write lease: {inode_id}"),
-                        Some(ctx.group_name.clone()),
-                        Some(ctx.mount_epoch),
-                    );
-                }
-                Ok(Some(inode)) if recursive && inode.kind.is_dir() => {
-                    match self.preflight_delete_tree_runtime(&self.storage, parent_inode_id, &name) {
-                        Ok(epochs) => epochs,
-                        Err(err) => {
-                            return self.failure_from_error(
-                                request_ctx,
-                                err,
-                                Some(ctx.group_name.clone()),
-                                Some(ctx.mount_epoch),
-                            );
-                        }
-                    }
-                }
-                Ok(Some(inode)) if inode.kind.is_file() => {
-                    vec![(inode_id, Self::file_lease_epoch(&inode))]
-                }
-                Ok(Some(_)) | Ok(None) => Vec::new(),
-                Err(err) => {
-                    return self.failure_from_error(
-                        request_ctx,
-                        err,
-                        Some(ctx.group_name.clone()),
-                        Some(ctx.mount_epoch),
-                    );
-                }
-            },
-            Ok(None) => Vec::new(),
+        let expected_file_lease_epoch = match self.read_inode(expected_inode_id) {
+            Ok(Some(inode)) if inode.kind.is_file() => Some(Self::file_lease_epoch(&inode)),
+            Ok(Some(_)) => None,
+            Ok(None) => {
+                return self.failure_from_error(
+                    request_ctx,
+                    MetadataError::NotFound(format!("Delete target inode not found: {expected_inode_id}")),
+                    Some(ctx.group_name.clone()),
+                    Some(ctx.mount_epoch),
+                );
+            }
             Err(err) => {
                 return self.failure_from_error(request_ctx, err, Some(ctx.group_name.clone()), Some(ctx.mount_epoch));
             }
         };
         let command = Command::Delete {
             proposed_at_ms: crate::raft::proposal_timestamp_ms(),
-            parent_inode_id,
-            name: name.clone(),
+            mount_id: ctx.mount_id,
+            expected_mount_epoch: ctx.mount_epoch,
+            mount_root_inode_id: ctx.mount_root_inode_id,
+            relative_components,
             expected_inode_id,
-            expected_file_lease_epochs,
+            expected_file_lease_epoch,
             recursive,
         };
 
@@ -1313,47 +1289,6 @@ impl MetadataFileSystem {
             ),
         }
     }
-
-    fn preflight_delete_tree_runtime(
-        &self,
-        storage: &crate::raft::RocksDBStorage,
-        parent_inode_id: beryl_types::fs::InodeId,
-        name: &str,
-    ) -> Result<Vec<(InodeId, u64)>, MetadataError> {
-        let Some(root_inode_id) = self.read_dentry(parent_inode_id, name)? else {
-            return Ok(Vec::new());
-        };
-        let Some(root_inode) = self.read_inode(root_inode_id)? else {
-            return Ok(Vec::new());
-        };
-        let mount_id = root_inode.mount_id;
-        let mut stack = vec![(root_inode_id, root_inode)];
-        let mut file_lease_epochs = Vec::new();
-
-        while let Some((inode_id, inode)) = stack.pop() {
-            if inode.mount_id != mount_id {
-                continue;
-            }
-            if inode.kind.is_file() {
-                if self.has_active_write(inode_id) {
-                    return Err(MetadataError::Busy(format!(
-                        "File has an active write lease: {}",
-                        inode_id
-                    )));
-                }
-                file_lease_epochs.push((inode_id, Self::file_lease_epoch(&inode)));
-            }
-            if inode.kind.is_dir() {
-                for (_, child_inode_id) in storage.list_dentries(inode_id)? {
-                    if let Some(child_inode) = self.read_inode(child_inode_id)? {
-                        stack.push((child_inode_id, child_inode));
-                    }
-                }
-            }
-        }
-        file_lease_epochs.sort_by_key(|(inode_id, _)| inode_id.as_raw());
-        Ok(file_lease_epochs)
-    }
 }
 
 #[cfg(test)]
@@ -1367,7 +1302,7 @@ mod delete_tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_id = MountId::new(55);
         let group_name_value = group_name("g13");
-        let parent_inode_id = InodeId::new(550);
+        let parent_inode_id = ROOT_INODE_ID;
         let inode_id = InodeId::new(551);
         let data_handle_id = DataHandleId::new(552);
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
@@ -1393,7 +1328,7 @@ mod delete_tests {
             .delete_resolved(
                 &request_context(),
                 parent_inode_id,
-                "busy".to_string(),
+                vec!["busy".to_string()],
                 inode_id,
                 false,
                 Freshness::default(),
@@ -1413,7 +1348,7 @@ mod delete_tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_id = MountId::new(68);
         let group_name_value = group_name("g20");
-        let parent_inode_id = InodeId::new(680);
+        let parent_inode_id = ROOT_INODE_ID;
         let root_inode_id = InodeId::new(681);
         let nested_inode_id = InodeId::new(682);
         let file_inode_id = InodeId::new(683);
@@ -1455,7 +1390,7 @@ mod delete_tests {
             .delete_resolved(
                 &request_context(),
                 parent_inode_id,
-                "root".to_string(),
+                vec!["root".to_string()],
                 root_inode_id,
                 true,
                 Freshness::default(),
@@ -1548,7 +1483,7 @@ mod delete_tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_id = MountId::new(65);
         let group_name_value = group_name("g17");
-        let parent_inode_id = InodeId::new(650);
+        let parent_inode_id = ROOT_INODE_ID;
         let inode_id = InodeId::new(651);
         let data_handle_id = DataHandleId::new(652);
         let lease_manager = Arc::new(crate::inode_lease::LeaseManager::new(0, 1_000));
@@ -1579,7 +1514,7 @@ mod delete_tests {
             .delete_resolved(
                 &request_context(),
                 parent_inode_id,
-                "expired".to_string(),
+                vec!["expired".to_string()],
                 inode_id,
                 false,
                 Freshness::default(),

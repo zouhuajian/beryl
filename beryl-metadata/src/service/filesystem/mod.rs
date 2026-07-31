@@ -1127,6 +1127,9 @@ mod test_support {
         storage: Arc<RocksDBStorage>,
         mount_table: Arc<MountTable>,
     ) -> (Arc<AppRaftNode>, Arc<AppRaftStateMachine>) {
+        for mount in mount_table.list_mounts() {
+            storage.put_mount(&mount).unwrap();
+        }
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
         let raft_config = RaftConfig::default();
         let raft_node = Arc::new(

@@ -473,15 +473,6 @@ impl RocksDBStorage {
         }
     }
 
-    /// List dentries for a parent directory (for ReadDir).
-    /// Returns all (name, child_inode_id) pairs for the given parent_inode_id.
-    /// The results are sorted by key (which includes name), suitable for pagination.
-    pub fn list_dentries(&self, parent_inode_id: InodeId) -> MetadataResult<Vec<(String, InodeId)>> {
-        let _generation = self.pin_generation()?;
-        let (entries, _, _) = self.list_dentries_with_cursor(parent_inode_id, None, None)?;
-        Ok(entries)
-    }
-
     /// Read a bounded first page for destructive detached-root reclamation.
     ///
     /// Unlike user-facing directory listing, malformed keys and values are

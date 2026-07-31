@@ -285,77 +285,213 @@ impl AppRaftStateMachine {
         Ok(result)
     }
 
-    /// Apply the stable Delete command by deciding the target kind atomically.
+    /// Revalidate one bounded mount-relative Delete command and apply its target-specific mutation.
+    ///
+    /// Path resolution happens inside Raft apply so a stale leader admission
+    /// cannot mutate a parent that has since become unreachable. Work is
+    /// bounded by the fixed path limits and the number of mount records, never
+    /// by the size of a recursive-delete subtree.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn apply_delete(
         &self,
-        parent_inode_id: InodeId,
-        name: String,
+        mount_id: MountId,
+        expected_mount_epoch: u64,
+        mount_root_inode_id: InodeId,
+        relative_components: Vec<String>,
         expected_inode_id: InodeId,
-        expected_file_lease_epochs: Vec<(InodeId, u64)>,
+        expected_file_lease_epoch: Option<u64>,
         recursive: bool,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<FsCommandResult> {
-        let child_inode_id = match self.storage.get_dentry(parent_inode_id, &name)? {
-            Some(inode_id) => inode_id,
-            None => {
-                return self.persist_fs_error(MetadataError::NotFound(format!("Entry not found: {name}")), raft_state);
-            }
+        let (parent_inode_id, name, child_inode) = match self.resolve_delete_target(
+            mount_id,
+            expected_mount_epoch,
+            mount_root_inode_id,
+            &relative_components,
+        ) {
+            Ok(target) => target,
+            Err(error) => return self.persist_fs_error(error, raft_state),
         };
-        if child_inode_id != expected_inode_id {
+        if child_inode.inode_id != expected_inode_id {
             return self.persist_fs_error(
                 MetadataError::Again(format!(
-                    "delete target changed for {name}: expected {expected_inode_id}, current {child_inode_id}"
+                    "delete target changed for {name}: expected {expected_inode_id}, current {}",
+                    child_inode.inode_id
                 )),
                 raft_state,
             );
         }
-        let child_inode = match self.storage.get_inode(child_inode_id)? {
-            Some(inode) => inode,
-            None => {
+
+        if child_inode.kind.is_dir() {
+            if expected_file_lease_epoch.is_some() {
                 return self.persist_fs_error(
-                    MetadataError::NotFound(format!("Child inode not found: {child_inode_id}")),
+                    MetadataError::Again("delete target lease precondition changed".to_string()),
                     raft_state,
                 );
             }
-        };
-
-        if child_inode.kind.is_dir() {
             if recursive {
-                self.apply_delete_tree(
-                    parent_inode_id,
-                    name,
-                    expected_file_lease_epochs,
-                    proposed_at_ms,
-                    raft_state,
-                )
+                self.apply_detach_directory(parent_inode_id, name, child_inode.inode_id, proposed_at_ms, raft_state)
             } else {
-                if !expected_file_lease_epochs.is_empty() {
-                    return self.persist_fs_error(
-                        MetadataError::Again("delete target lease preconditions changed".to_string()),
-                        raft_state,
-                    );
-                }
                 self.apply_delete_empty_dir(parent_inode_id, name, proposed_at_ms, raft_state)
             }
         } else {
-            let current_file_lease_epochs = match &child_inode.data {
-                InodeData::File { lease_epoch, .. } => {
-                    vec![(child_inode_id, lease_epoch.unwrap_or(0))]
-                }
-                _ => Vec::new(),
+            let current_file_lease_epoch = match &child_inode.data {
+                InodeData::File { lease_epoch, .. } => Some(lease_epoch.unwrap_or(0)),
+                _ => None,
             };
-            if current_file_lease_epochs != expected_file_lease_epochs {
+            if current_file_lease_epoch != expected_file_lease_epoch {
                 return self.persist_fs_error(
                     MetadataError::Again(format!(
-                        "delete target lease preconditions changed: expected {expected_file_lease_epochs:?}, current {current_file_lease_epochs:?}"
+                        "delete target lease precondition changed: expected {expected_file_lease_epoch:?}, current {current_file_lease_epoch:?}"
                     )),
                     raft_state,
                 );
             }
             self.apply_unlink(parent_inode_id, name, proposed_at_ms, raft_state)
         }
+    }
+
+    /// Resolve and validate the exact target named by a replicated Delete command.
+    fn resolve_delete_target(
+        &self,
+        mount_id: MountId,
+        expected_mount_epoch: u64,
+        mount_root_inode_id: InodeId,
+        relative_components: &[String],
+    ) -> MetadataResult<(InodeId, String, Inode)> {
+        Self::validate_delete_components(relative_components)?;
+        let mounts = self.storage.list_mounts()?;
+        let mount = mounts
+            .iter()
+            .find(|entry| entry.mount_id == mount_id)
+            .ok_or_else(|| MetadataError::NotFound(format!("Mount not found: {mount_id:?}")))?;
+        if mount.mount_epoch != expected_mount_epoch || mount.root_inode_id != mount_root_inode_id {
+            return Err(MetadataError::Again(format!(
+                "delete mount precondition changed for {mount_id:?}"
+            )));
+        }
+
+        let relative_path_bytes = relative_components
+            .iter()
+            .try_fold(relative_components.len().saturating_sub(1), |bytes, component| {
+                bytes.checked_add(component.len())
+            })
+            .ok_or_else(|| MetadataError::InvalidArgument("Delete path length overflow".to_string()))?;
+        let target_path_bytes = if mount.mount_prefix == crate::mount::ROOT_MOUNT_PREFIX {
+            1usize.checked_add(relative_path_bytes)
+        } else {
+            mount
+                .mount_prefix
+                .len()
+                .checked_add(1)
+                .and_then(|bytes| bytes.checked_add(relative_path_bytes))
+        }
+        .ok_or_else(|| MetadataError::InvalidArgument("Delete path length overflow".to_string()))?;
+        if target_path_bytes > crate::path_resolver::MAX_PATH_BYTES {
+            return Err(MetadataError::InvalidArgument(format!(
+                "Delete path exceeds {} bytes",
+                crate::path_resolver::MAX_PATH_BYTES
+            )));
+        }
+        let relative_path = relative_components.join("/");
+        let target_path = if mount.mount_prefix == crate::mount::ROOT_MOUNT_PREFIX {
+            format!("/{relative_path}")
+        } else {
+            format!("{}/{relative_path}", mount.mount_prefix)
+        };
+        if mounts.iter().any(|entry| {
+            entry.mount_id != mount_id && crate::mount::mount_prefix_matches_path(&target_path, &entry.mount_prefix)
+        }) {
+            return Err(MetadataError::CrossMountRename(
+                "delete target is a mount root or contains a nested mount".to_string(),
+            ));
+        }
+
+        let mut parent = self
+            .storage
+            .get_inode(mount_root_inode_id)?
+            .ok_or_else(|| MetadataError::NotFound(format!("Mount root inode not found: {mount_root_inode_id}")))?;
+        if parent.kind != parent.data.kind() {
+            return Err(MetadataError::Internal(format!(
+                "mount root inode {mount_root_inode_id} kind and payload disagree"
+            )));
+        }
+        if !parent.kind.is_dir() || !matches!(&parent.data, InodeData::Dir) {
+            return Err(MetadataError::NotDir(format!(
+                "Mount root is not a directory: {mount_root_inode_id}"
+            )));
+        }
+        if parent.mount_id != mount_id {
+            return Err(MetadataError::CrossMountRename(
+                "mount root inode belongs to a different mount".to_string(),
+            ));
+        }
+
+        for (index, component) in relative_components.iter().enumerate() {
+            let child_inode_id = self.storage.get_dentry(parent.inode_id, component)?.ok_or_else(|| {
+                MetadataError::NotFound(format!(
+                    "Entry not found: {component} (parent inode: {})",
+                    parent.inode_id
+                ))
+            })?;
+            let child = self
+                .storage
+                .get_inode(child_inode_id)?
+                .ok_or_else(|| MetadataError::NotFound(format!("Child inode not found: {child_inode_id}")))?;
+            if child.kind != child.data.kind() {
+                return Err(MetadataError::Internal(format!(
+                    "inode {child_inode_id} kind and payload disagree"
+                )));
+            }
+            if child.mount_id != mount_id {
+                return Err(MetadataError::CrossMountRename(
+                    "delete path crosses mount authority".to_string(),
+                ));
+            }
+            if index + 1 == relative_components.len() {
+                if mounts.iter().any(|entry| entry.root_inode_id == child_inode_id) {
+                    return Err(MetadataError::InvalidArgument(format!(
+                        "Cannot delete mount root inode {child_inode_id}"
+                    )));
+                }
+                return Ok((parent.inode_id, component.clone(), child));
+            }
+            if !child.kind.is_dir() || !matches!(&child.data, InodeData::Dir) {
+                return Err(MetadataError::NotDir(format!(
+                    "Path component is not a directory: {component}"
+                )));
+            }
+            parent = child;
+        }
+
+        unreachable!("Delete components are checked as non-empty")
+    }
+
+    fn validate_delete_components(relative_components: &[String]) -> MetadataResult<()> {
+        if relative_components.is_empty() {
+            return Err(MetadataError::InvalidArgument("Cannot delete mount root".to_string()));
+        }
+        if relative_components.len() > crate::path_resolver::MAX_PATH_COMPONENTS {
+            return Err(MetadataError::InvalidArgument(format!(
+                "Delete path exceeds {} components",
+                crate::path_resolver::MAX_PATH_COMPONENTS
+            )));
+        }
+        for component in relative_components {
+            if component.is_empty() || component.contains('/') || component.contains('\0') {
+                return Err(MetadataError::InvalidArgument(
+                    "Delete path contains an invalid component".to_string(),
+                ));
+            }
+            if component.len() > crate::path_resolver::MAX_PATH_COMPONENT_BYTES {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "Delete path component exceeds {} bytes",
+                    crate::path_resolver::MAX_PATH_COMPONENT_BYTES
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Apply Unlink command.
@@ -487,36 +623,50 @@ impl AppRaftStateMachine {
         Ok(result)
     }
 
-    pub(super) fn apply_delete_tree(
+    /// Atomically hide a recursive-delete root and make it reclaimable.
+    pub(super) fn apply_detach_directory(
         &self,
         parent_inode_id: InodeId,
         name: String,
-        expected_file_lease_epochs: Vec<(InodeId, u64)>,
+        root_inode_id: InodeId,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<FsCommandResult> {
-        let prepared: MetadataResult<PreparedDeleteTree> = (|| {
-            let root_inode_id = self
+        let prepared: MetadataResult<(Inode, DetachedRoot)> = (|| {
+            let current_root_inode_id = self
                 .storage
                 .get_dentry(parent_inode_id, &name)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Directory not found: {}", name)))?;
+                .ok_or_else(|| MetadataError::NotFound(format!("Directory not found: {name}")))?;
+            if current_root_inode_id != root_inode_id {
+                return Err(MetadataError::Again(format!(
+                    "delete target changed for {name}: expected {root_inode_id}, current {current_root_inode_id}"
+                )));
+            }
             let root_inode = self
                 .storage
                 .get_inode(root_inode_id)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Root inode not found: {}", root_inode_id)))?;
-            if !root_inode.kind.is_dir() {
-                return Err(MetadataError::NotDir(format!("Not a directory: {}", name)));
+                .ok_or_else(|| MetadataError::NotFound(format!("Root inode not found: {root_inode_id}")))?;
+            if !root_inode.kind.is_dir() || !matches!(&root_inode.data, InodeData::Dir) {
+                return Err(MetadataError::NotDir(format!("Not a directory: {name}")));
             }
-            self.reject_mount_root_delete(root_inode_id)?;
+            if root_inode.data_handle_id.as_raw() != 0 {
+                return Err(MetadataError::Internal(format!(
+                    "directory inode {root_inode_id} carries file authority"
+                )));
+            }
+            if self.storage.get_detached_root(root_inode_id)?.is_some() {
+                return Err(MetadataError::Internal(format!(
+                    "inode {root_inode_id} is both reachable and already detached"
+                )));
+            }
 
             let parent_inode = self
                 .storage
                 .get_inode(parent_inode_id)?
                 .ok_or_else(|| MetadataError::Internal("Parent inode disappeared".to_string()))?;
-            if !parent_inode.kind.is_dir() {
+            if !parent_inode.kind.is_dir() || !matches!(&parent_inode.data, InodeData::Dir) {
                 return Err(MetadataError::NotDir(format!(
-                    "Parent is not a directory: {}",
-                    parent_inode_id
+                    "Parent is not a directory: {parent_inode_id}"
                 )));
             }
             if parent_inode.mount_id != root_inode.mount_id {
@@ -530,120 +680,29 @@ impl AppRaftStateMachine {
             let mut updated_parent = parent_inode;
             updated_parent.attrs = parent_attrs;
 
-            let mut plan = DeleteTreePlan {
-                root_mount_id: updated_parent.mount_id,
-                entries: Vec::new(),
-                file_lease_epochs: Vec::new(),
-            };
-            self.prepare_delete_tree_node(parent_inode_id, name, root_inode_id, root_inode, &mut plan)?;
-
-            Ok(PreparedDeleteTree {
+            Ok((
                 updated_parent,
-                entries: plan.entries,
-                file_lease_epochs: plan.file_lease_epochs,
-            })
+                DetachedRoot {
+                    mount_id: root_inode.mount_id,
+                    detached_at_ms: proposed_at_ms,
+                },
+            ))
         })();
 
-        let prepared = match prepared {
+        let (updated_parent, detached_root) = match prepared {
             Ok(prepared) => prepared,
             Err(err) => return self.persist_fs_error(err, raft_state),
         };
-        let mut current_file_lease_epochs = prepared.file_lease_epochs.clone();
-        current_file_lease_epochs.sort_by_key(|(inode_id, _)| inode_id.as_raw());
-        if current_file_lease_epochs != expected_file_lease_epochs {
-            return self.persist_fs_error(
-                MetadataError::Again(format!(
-                    "recursive delete file lease preconditions changed: expected {expected_file_lease_epochs:?}, current {current_file_lease_epochs:?}"
-                )),
-                raft_state,
-            );
-        }
         let result = FsCommandResult::Ok(FsOkResult::default());
-        self.storage.delete_tree_atomic(
-            DeleteTreeAtomicUpdate {
-                entries: &prepared.entries,
-                updated_parent: &prepared.updated_parent,
-            },
+        self.storage.detach_directory_atomic(
+            parent_inode_id,
+            &name,
+            root_inode_id,
+            &updated_parent,
+            detached_root,
             raft_state,
         )?;
         Ok(result)
-    }
-
-    fn prepare_delete_tree_node(
-        &self,
-        parent_inode_id: InodeId,
-        name: String,
-        inode_id: InodeId,
-        inode: Inode,
-        plan: &mut DeleteTreePlan,
-    ) -> MetadataResult<()> {
-        if inode.mount_id != plan.root_mount_id || self.is_mount_root_inode(inode_id)? {
-            return Err(MetadataError::CrossMountRename(
-                "recursive delete cannot cross mount boundary".to_string(),
-            ));
-        }
-
-        let (data_handle_id, layout) = match &inode.data {
-            InodeData::Dir => {
-                let mut children = self.storage.list_dentries(inode_id)?;
-                children.sort_by(|left, right| left.0.cmp(&right.0));
-                for (child_name, child_inode_id) in children {
-                    let child_inode = self
-                        .storage
-                        .get_inode(child_inode_id)?
-                        .ok_or_else(|| MetadataError::NotFound(format!("Child inode not found: {}", child_inode_id)))?;
-                    self.prepare_delete_tree_node(inode_id, child_name, child_inode_id, child_inode, plan)?;
-                }
-                (None, None)
-            }
-            InodeData::File { lease_epoch, .. } => {
-                plan.file_lease_epochs.push((inode_id, lease_epoch.unwrap_or(0)));
-                let data_handle_id = inode.data_handle_id;
-                if data_handle_id.as_raw() == 0 {
-                    return Err(MetadataError::Internal(format!(
-                        "File inode {} is missing data_handle_id",
-                        inode_id
-                    )));
-                }
-                self.storage
-                    .validate_data_handle_owner(data_handle_id, Some(inode_id))?;
-                let layout = self.storage.get_layout(inode_id).map_err(|err| match err {
-                    MetadataError::NotFound(_) => {
-                        MetadataError::InvalidArgument(format!("Missing layout for file inode {}", inode_id))
-                    }
-                    err => err,
-                })?;
-                (Some(data_handle_id), Some(layout))
-            }
-            InodeData::Symlink { .. } => (None, None),
-        };
-
-        plan.entries.push(DeleteTreeEntry {
-            parent_inode_id,
-            name,
-            inode_id,
-            data_handle_id,
-            layout,
-        });
-        Ok(())
-    }
-
-    fn reject_mount_root_delete(&self, inode_id: InodeId) -> MetadataResult<()> {
-        if inode_id == crate::mount::ROOT_INODE_ID || self.is_mount_root_inode(inode_id)? {
-            return Err(MetadataError::InvalidArgument(format!(
-                "Cannot delete mount root inode {}",
-                inode_id
-            )));
-        }
-        Ok(())
-    }
-
-    fn is_mount_root_inode(&self, inode_id: InodeId) -> MetadataResult<bool> {
-        Ok(self
-            .storage
-            .list_mounts()?
-            .iter()
-            .any(|entry| entry.root_inode_id == inode_id))
     }
 
     /// Apply Rename command (atomic within mount).
@@ -952,8 +1011,42 @@ mod tests {
         storage
             .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1)))
             .unwrap();
+        storage
+            .put_mount(&crate::mount::MountEntry {
+                mount_id: MountId::new(1),
+                mount_prefix: crate::mount::ROOT_MOUNT_PREFIX.to_string(),
+                mount_kind: crate::mount::MountKind::Internal,
+                ufs_uri: None,
+                data_io_policy: crate::mount::DataIoPolicy::Allow,
+                mount_epoch: 1,
+                namespace_owner_group_name: group_name("root"),
+                root_inode_id: parent_inode_id,
+            })
+            .unwrap();
         let sm = AppRaftStateMachine::new(Arc::clone(&storage));
         (dir, storage, sm, parent_inode_id)
+    }
+
+    fn delete_command(name: &str, expected_inode_id: InodeId, lease_epoch: Option<u64>, recursive: bool) -> Command {
+        delete_path_command(vec![name.to_string()], expected_inode_id, lease_epoch, recursive)
+    }
+
+    fn delete_path_command(
+        relative_components: Vec<String>,
+        expected_inode_id: InodeId,
+        lease_epoch: Option<u64>,
+        recursive: bool,
+    ) -> Command {
+        Command::Delete {
+            proposed_at_ms: 2,
+            mount_id: MountId::new(1),
+            expected_mount_epoch: 1,
+            mount_root_inode_id: InodeId::new(10),
+            relative_components,
+            expected_inode_id,
+            expected_file_lease_epoch: lease_epoch,
+            recursive,
+        }
     }
 
     fn create_file(sm: &AppRaftStateMachine, parent_inode_id: InodeId, name: &str) -> FsOkResult {
@@ -967,6 +1060,23 @@ mod tests {
             })
             .unwrap(),
         )
+    }
+
+    fn assert_delete_rejection_preserves_directory(
+        storage: &RocksDBStorage,
+        sm: &AppRaftStateMachine,
+        parent_inode_id: InodeId,
+        directory_inode_id: InodeId,
+        command: Command,
+        expected_errno: FsErrorCode,
+    ) {
+        expect_fs_errno(sm.apply(command).unwrap(), expected_errno);
+        assert_eq!(
+            storage.get_dentry(parent_inode_id, "target").unwrap(),
+            Some(directory_inode_id)
+        );
+        assert!(storage.get_inode(directory_inode_id).unwrap().is_some());
+        assert!(storage.get_detached_root(directory_inode_id).unwrap().is_none());
     }
 
     #[test]
@@ -1024,15 +1134,7 @@ mod tests {
         storage.put_dentry(parent_inode_id, "target", replacement).unwrap();
 
         expect_fs_errno(
-            sm.apply(Command::Delete {
-                proposed_at_ms: 2,
-                parent_inode_id,
-                name: "target".to_string(),
-                expected_inode_id: original,
-                expected_file_lease_epochs: vec![(original, 0)],
-                recursive: false,
-            })
-            .unwrap(),
+            sm.apply(delete_command("target", original, Some(0), false)).unwrap(),
             FsErrorCode::EAgain,
         );
 
@@ -1041,6 +1143,103 @@ mod tests {
             Some(replacement)
         );
         assert!(storage.get_inode(replacement).unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_rejects_stale_mount_and_target_fencing_without_mutation() {
+        let (_dir, storage, sm, parent_inode_id) = test_state();
+        let directory = expect_fs_ok(
+            sm.apply(Command::CreateDirectory {
+                proposed_at_ms: 1,
+                root_inode_id: parent_inode_id,
+                components: vec!["target".to_string()],
+                attrs: FileAttrs::new(),
+                recursive: false,
+            })
+            .unwrap(),
+        )
+        .inode_id
+        .unwrap();
+        let stale_commands = [
+            Command::Delete {
+                proposed_at_ms: 2,
+                mount_id: MountId::new(1),
+                expected_mount_epoch: 2,
+                mount_root_inode_id: parent_inode_id,
+                relative_components: vec!["target".to_string()],
+                expected_inode_id: directory,
+                expected_file_lease_epoch: None,
+                recursive: true,
+            },
+            Command::Delete {
+                proposed_at_ms: 2,
+                mount_id: MountId::new(1),
+                expected_mount_epoch: 1,
+                mount_root_inode_id: InodeId::new(11),
+                relative_components: vec!["target".to_string()],
+                expected_inode_id: directory,
+                expected_file_lease_epoch: None,
+                recursive: true,
+            },
+            delete_command("target", InodeId::new(999), None, true),
+        ];
+
+        for command in stale_commands {
+            assert_delete_rejection_preserves_directory(
+                &storage,
+                &sm,
+                parent_inode_id,
+                directory,
+                command,
+                FsErrorCode::EAgain,
+            );
+        }
+    }
+
+    #[test]
+    fn delete_rejects_invalid_components_without_mutation() {
+        let (_dir, storage, sm, parent_inode_id) = test_state();
+        let directory = expect_fs_ok(
+            sm.apply(Command::CreateDirectory {
+                proposed_at_ms: 1,
+                root_inode_id: parent_inode_id,
+                components: vec!["target".to_string()],
+                attrs: FileAttrs::new(),
+                recursive: false,
+            })
+            .unwrap(),
+        )
+        .inode_id
+        .unwrap();
+        let invalid_components = [
+            Vec::new(),
+            vec![String::new()],
+            vec!["/".to_string()],
+            vec!["nul\0component".to_string()],
+            vec!["x".repeat(crate::path_resolver::MAX_PATH_COMPONENT_BYTES + 1)],
+            vec!["x".to_string(); crate::path_resolver::MAX_PATH_COMPONENTS + 1],
+        ];
+
+        for relative_components in invalid_components {
+            let command = Command::Delete {
+                proposed_at_ms: 2,
+                mount_id: MountId::new(1),
+                expected_mount_epoch: 1,
+                mount_root_inode_id: parent_inode_id,
+                relative_components,
+                expected_inode_id: directory,
+                expected_file_lease_epoch: None,
+                recursive: true,
+            };
+            assert_delete_rejection_preserves_directory(
+                &storage,
+                &sm,
+                parent_inode_id,
+                directory,
+                command,
+                FsErrorCode::EInval,
+            );
+        }
     }
 
     #[test]
@@ -1132,7 +1331,7 @@ mod tests {
     }
 
     #[test]
-    fn recursive_delete_removes_nested_file_authority_atomically() {
+    fn recursive_delete_atomically_detaches_root_without_removing_descendants() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
         let directory = expect_fs_ok(
             sm.apply(Command::CreateDirectory {
@@ -1148,25 +1347,85 @@ mod tests {
         .unwrap();
         let file = create_file(&sm, directory, "file");
 
-        expect_fs_ok(
-            sm.apply(Command::Delete {
-                proposed_at_ms: 2,
-                parent_inode_id,
-                name: "dir".to_string(),
-                expected_inode_id: directory,
-                expected_file_lease_epochs: vec![(file.inode_id.unwrap(), 0)],
+        expect_fs_ok(sm.apply(delete_command("dir", directory, None, true)).unwrap());
+
+        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), None);
+        assert!(storage.get_inode(directory).unwrap().is_some());
+        assert!(storage.get_inode(file.inode_id.unwrap()).unwrap().is_some());
+        assert_eq!(
+            storage.get_inode_by_data_handle(file.data_handle_id.unwrap()).unwrap(),
+            file.inode_id
+        );
+        assert_eq!(
+            storage.get_detached_root(directory).unwrap(),
+            Some(DetachedRoot {
+                mount_id: MountId::new(1),
+                detached_at_ms: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn stale_delete_cannot_mutate_a_parent_after_it_is_detached() {
+        let (_dir, storage, sm, parent_inode_id) = test_state();
+        let inner = expect_fs_ok(
+            sm.apply(Command::CreateDirectory {
+                proposed_at_ms: 1,
+                root_inode_id: parent_inode_id,
+                components: vec!["outer".to_string(), "inner".to_string()],
+                attrs: FileAttrs::new(),
                 recursive: true,
             })
             .unwrap(),
+        )
+        .inode_id
+        .unwrap();
+        let outer = storage.get_dentry(parent_inode_id, "outer").unwrap().unwrap();
+        let stale_inner_delete = delete_path_command(vec!["outer".to_string(), "inner".to_string()], inner, None, true);
+
+        expect_fs_ok(sm.apply(delete_command("outer", outer, None, true)).unwrap());
+        expect_fs_errno(sm.apply(stale_inner_delete).unwrap(), FsErrorCode::ENoEnt);
+
+        assert_eq!(storage.get_dentry(outer, "inner").unwrap(), Some(inner));
+        assert!(storage.get_detached_root(outer).unwrap().is_some());
+        assert!(storage.get_detached_root(inner).unwrap().is_none());
+    }
+
+    #[test]
+    fn recursive_delete_rejects_nested_mount_before_detach() {
+        let (_dir, storage, sm, parent_inode_id) = test_state();
+        let directory = expect_fs_ok(
+            sm.apply(Command::CreateDirectory {
+                proposed_at_ms: 1,
+                root_inode_id: parent_inode_id,
+                components: vec!["dir".to_string()],
+                attrs: FileAttrs::new(),
+                recursive: false,
+            })
+            .unwrap(),
+        )
+        .inode_id
+        .unwrap();
+        storage
+            .put_mount(&crate::mount::MountEntry {
+                mount_id: MountId::new(2),
+                mount_prefix: "/dir/nested".to_string(),
+                mount_kind: crate::mount::MountKind::Internal,
+                ufs_uri: None,
+                data_io_policy: crate::mount::DataIoPolicy::Allow,
+                mount_epoch: 2,
+                namespace_owner_group_name: group_name("root"),
+                root_inode_id: InodeId::new(200),
+            })
+            .unwrap();
+
+        expect_fs_errno(
+            sm.apply(delete_command("dir", directory, None, true)).unwrap(),
+            FsErrorCode::EXDev,
         );
 
-        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), None);
-        assert_eq!(storage.get_inode(directory).unwrap(), None);
-        assert_eq!(storage.get_inode(file.inode_id.unwrap()).unwrap(), None);
-        assert_eq!(
-            storage.get_inode_by_data_handle(file.data_handle_id.unwrap()).unwrap(),
-            None
-        );
+        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), Some(directory));
+        assert!(storage.get_detached_root(directory).unwrap().is_none());
     }
 
     #[test]
@@ -1184,15 +1443,7 @@ mod tests {
             .unwrap(),
         );
         expect_fs_errno(
-            sm.apply(Command::Delete {
-                proposed_at_ms: 3,
-                parent_inode_id,
-                name: "target".to_string(),
-                expected_inode_id: inode_id,
-                expected_file_lease_epochs: vec![(inode_id, 0)],
-                recursive: false,
-            })
-            .unwrap(),
+            sm.apply(delete_command("target", inode_id, Some(0), false)).unwrap(),
             FsErrorCode::EAgain,
         );
 
@@ -1205,17 +1456,7 @@ mod tests {
         let file = create_file(&sm, parent_inode_id, "target");
         let inode_id = file.inode_id.unwrap();
 
-        expect_fs_ok(
-            sm.apply(Command::Delete {
-                proposed_at_ms: 2,
-                parent_inode_id,
-                name: "target".to_string(),
-                expected_inode_id: inode_id,
-                expected_file_lease_epochs: vec![(inode_id, 0)],
-                recursive: false,
-            })
-            .unwrap(),
-        );
+        expect_fs_ok(sm.apply(delete_command("target", inode_id, Some(0), false)).unwrap());
         expect_fs_errno(
             sm.apply(Command::AcquireWriteLease {
                 proposed_at_ms: 3,
@@ -1231,7 +1472,7 @@ mod tests {
     }
 
     #[test]
-    fn recursive_delete_rejects_a_descendant_lease_acquired_after_preflight() {
+    fn recursive_delete_does_not_scan_descendant_lease_epochs() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
         let directory = expect_fs_ok(
             sm.apply(Command::CreateDirectory {
@@ -1255,21 +1496,11 @@ mod tests {
             })
             .unwrap(),
         );
-        expect_fs_errno(
-            sm.apply(Command::Delete {
-                proposed_at_ms: 3,
-                parent_inode_id,
-                name: "dir".to_string(),
-                expected_inode_id: directory,
-                expected_file_lease_epochs: vec![(file_id, 0)],
-                recursive: true,
-            })
-            .unwrap(),
-            FsErrorCode::EAgain,
-        );
+        expect_fs_ok(sm.apply(delete_command("dir", directory, None, true)).unwrap());
 
-        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), Some(directory));
+        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), None);
         assert_eq!(storage.get_dentry(directory, "file").unwrap(), Some(file_id));
+        assert!(storage.get_detached_root(directory).unwrap().is_some());
     }
 
     #[test]

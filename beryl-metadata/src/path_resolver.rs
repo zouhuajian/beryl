@@ -37,6 +37,8 @@ pub struct MountContext {
 #[derive(Clone, Debug)]
 pub struct ResolvedPath {
     pub mount_ctx: MountContext,
+    /// Canonical components below `mount_ctx.root_inode_id`.
+    pub relative_components: Vec<String>,
     pub parent_inode_id: Option<InodeId>,
     pub name: Option<String>,
     pub inode_id: Option<InodeId>,
@@ -210,6 +212,7 @@ impl PathResolver {
                     owner_group_name: mount_entry.namespace_owner_group_name,
                     root_inode_id: mount_entry.root_inode_id,
                 },
+                relative_components: Vec::new(),
                 parent_inode_id: None,
                 name: None,
                 inode_id: Some(mount_entry.root_inode_id),
@@ -256,6 +259,7 @@ impl PathResolver {
                 owner_group_name: mount_entry.namespace_owner_group_name,
                 root_inode_id: mount_entry.root_inode_id,
             },
+            relative_components: components,
             parent_inode_id: Some(parent_inode_id),
             name: Some(name),
             inode_id,
@@ -460,12 +464,14 @@ mod tests {
         assert_eq!(resolved.inode_id, Some(file_c));
         assert_eq!(resolved.parent_inode_id, Some(dir_b));
         assert_eq!(resolved.name.as_deref(), Some("c"));
+        assert_eq!(resolved.relative_components, vec!["a", "b", "c"]);
         assert_eq!(resolved.ancestor_inode_ids, vec![root_inode_id, dir_a, dir_b, file_c]);
 
         let root = resolver.resolve_path("/mnt/test").unwrap();
         assert_eq!(root.inode_id, Some(root_inode_id));
         assert!(root.parent_inode_id.is_none());
         assert!(root.name.is_none());
+        assert!(root.relative_components.is_empty());
         assert_eq!(root.ancestor_inode_ids, vec![root_inode_id]);
     }
 

@@ -612,7 +612,8 @@ mod tests {
         assert!(result.processed_entries < 64);
         assert!(result.logical_batch_bytes <= MIN_RECLAIM_DETACHED_ROOT_BATCH_BYTES);
         assert!(storage.get_detached_root(root_id).unwrap().is_some());
-        assert!(storage.list_dentries(root_id).unwrap().len() < 64);
+        let (remaining, _, _) = storage.list_dentries_with_cursor(root_id, None, None).unwrap();
+        assert!(remaining.len() < 64);
     }
 
     #[test]

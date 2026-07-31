@@ -4,7 +4,7 @@
 //! Metadata authority commands replicated through Raft.
 
 use beryl_types::fs::{Extent, FileAttrs, InodeId};
-use beryl_types::ids::{DataHandleId, WorkerId};
+use beryl_types::ids::{DataHandleId, MountId, WorkerId};
 use beryl_types::layout::FileLayout;
 use beryl_types::GroupName;
 use serde::{Deserialize, Serialize};
@@ -49,12 +49,18 @@ pub(crate) enum Command {
         attrs: FileAttrs,
         layout: FileLayout,
     },
+    /// Delete one exact mount-relative target after revalidating its path.
+    ///
+    /// Recursive directories are detached with a constant-size namespace
+    /// mutation; descendants are reclaimed later by `ReclaimDetachedRoots`.
     Delete {
         proposed_at_ms: u64,
-        parent_inode_id: InodeId,
-        name: String,
+        mount_id: MountId,
+        expected_mount_epoch: u64,
+        mount_root_inode_id: InodeId,
+        relative_components: Vec<String>,
         expected_inode_id: InodeId,
-        expected_file_lease_epochs: Vec<(InodeId, u64)>,
+        expected_file_lease_epoch: Option<u64>,
         recursive: bool,
     },
     Rename {
