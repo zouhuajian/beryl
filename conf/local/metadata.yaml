@@ -23,6 +23,13 @@ metadata.cleanup.max_commands_per_heartbeat: 32
 metadata.cleanup.retry_initial_backoff_ms: 1000
 metadata.cleanup.retry_max_backoff_ms: 60000
 
+metadata.detached_root_reclamation.scan_interval_ms: 1000
+metadata.detached_root_reclamation.max_candidates: 64
+metadata.detached_root_reclamation.max_entries: 256
+metadata.detached_root_reclamation.max_batch_bytes: 1048576
+metadata.detached_root_reclamation.retry_initial_backoff_ms: 1000
+metadata.detached_root_reclamation.retry_max_backoff_ms: 60000
+
 metadata.repair.max_queue_size: 10000
 metadata.repair.max_attempts: 3
 metadata.repair.inflight_timeout_ms: 300000

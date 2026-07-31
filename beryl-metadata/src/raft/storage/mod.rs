@@ -61,7 +61,8 @@ const CF_RAFT_SNAPSHOT: &str = "raft_snapshot"; // Raft snapshots
 
 const ROCKSDB_SCHEMA_VERSION_KEY: &[u8] = b"rocksdb_schema_version";
 const STORAGE_IDENTITY_KEY: &[u8] = b"storage_identity";
-pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 8;
+const RAFT_STATE_KEY: &[u8] = b"raft_state";
+pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 9;
 const NEXT_INODE_ID_KEY: &[u8] = b"next_inode_id";
 const NEXT_DATA_HANDLE_ID_KEY: &[u8] = b"next_data_handle_id";
 
@@ -79,9 +80,29 @@ fn worker_key(group_name: &GroupName, worker_id: WorkerId) -> String {
 // FS column families
 const CF_INODES: &str = "inodes"; // inode/{inode_id_be} -> Inode
 const CF_DENTRIES: &str = "dentries"; // dentry/{parent_inode_id_be}/{name} -> child_inode_id_be
+const CF_DETACHED_ROOTS: &str = "detached_roots"; // root_inode_id_be -> DetachedRoot
+
+const CURRENT_CFS: &[&str] = &[
+    CF_MOUNTS,
+    CF_WORKERS,
+    CF_META,
+    CF_RAFT_LOG,
+    CF_RAFT_STATE,
+    CF_RAFT_SNAPSHOT,
+    CF_INODES,
+    CF_DENTRIES,
+    CF_DETACHED_ROOTS,
+];
 
 /// Column families that hold replicated state to be snapshotted/restored.
-pub const STATE_CFS: &[&str] = &[CF_MOUNTS, CF_WORKERS, CF_META, CF_INODES, CF_DENTRIES];
+pub const STATE_CFS: &[&str] = &[
+    CF_MOUNTS,
+    CF_WORKERS,
+    CF_META,
+    CF_INODES,
+    CF_DENTRIES,
+    CF_DETACHED_ROOTS,
+];
 
 /// Durable identity binding between the lifecycle marker and its RocksDB state.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,6 +114,17 @@ pub(crate) struct StorageIdentity {
     pub bootstrap_client_id: String,
     pub bootstrap_call_id: String,
     pub bootstrap_proposed_at_ms: u64,
+}
+
+/// Durable authority proving that a directory root is no longer reachable.
+///
+/// Descendants remain namespace authority until bounded reclamation removes
+/// them. Child directories inherit `detached_at_ms` when they become separate
+/// detached roots, preserving the original deletion age across restarts.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DetachedRoot {
+    pub(crate) mount_id: MountId,
+    pub(crate) detached_at_ms: u64,
 }
 
 /// One authoritative state-machine commit assembled before RocksDB publication.
@@ -183,6 +215,88 @@ pub(crate) struct DeleteTreeAtomicUpdate<'a> {
     pub updated_parent: &'a Inode,
 }
 
+/// One namespace child removed from a detached directory in a bounded apply.
+///
+/// Directories carry a child marker and retain their inode. Files carry their
+/// data handle so layout and owner authority are removed with the inode.
+pub(crate) struct DetachedRootReclaimEntry {
+    pub(crate) parent_inode_id: InodeId,
+    pub(crate) name: String,
+    pub(crate) inode_id: InodeId,
+    pub(crate) data_handle_id: Option<DataHandleId>,
+    pub(crate) child_detached_root: Option<DetachedRoot>,
+}
+
+impl DetachedRootReclaimEntry {
+    /// Deterministic key/value bytes contributed by this namespace mutation.
+    pub(crate) fn logical_bytes(&self) -> MetadataResult<usize> {
+        let mut bytes = RocksDBStorage::encode_dentry_key(self.parent_inode_id, &self.name).len();
+        if let Some(detached_root) = self.child_detached_root {
+            let encoded = RocksDBStorage::encode_detached_root(&detached_root)?;
+            bytes = bytes
+                .checked_add(RocksDBStorage::encode_detached_root_key(self.inode_id).len())
+                .and_then(|value| value.checked_add(encoded.len()))
+                .ok_or_else(|| MetadataError::Internal("detached-root logical byte count overflow".to_string()))?;
+        } else {
+            bytes = bytes
+                .checked_add(RocksDBStorage::encode_inode_key(self.inode_id).len())
+                .ok_or_else(|| MetadataError::Internal("detached-root logical byte count overflow".to_string()))?;
+            if let Some(data_handle_id) = self.data_handle_id {
+                bytes = bytes
+                    .checked_add(RocksDBStorage::encode_layout_key(self.inode_id).len())
+                    .and_then(|value| {
+                        value.checked_add(RocksDBStorage::encode_data_handle_owner_key(data_handle_id).len())
+                    })
+                    .ok_or_else(|| MetadataError::Internal("detached-root logical byte count overflow".to_string()))?;
+            }
+        }
+        Ok(bytes)
+    }
+}
+
+/// Complete RocksDB mutation prepared for one bounded detached-root apply.
+///
+/// The state machine validates every referenced inode and owner before this
+/// update is committed, so storage never publishes a partially checked batch.
+#[derive(Default)]
+pub(crate) struct DetachedRootReclaimUpdate {
+    pub(crate) entries: Vec<DetachedRootReclaimEntry>,
+    pub(crate) completed_root_inode_ids: Vec<InodeId>,
+}
+
+impl DetachedRootReclaimUpdate {
+    pub(crate) fn completed_root_logical_bytes(inode_id: InodeId) -> MetadataResult<usize> {
+        RocksDBStorage::encode_inode_key(inode_id)
+            .len()
+            .checked_add(RocksDBStorage::encode_detached_root_key(inode_id).len())
+            .ok_or_else(|| MetadataError::Internal("detached-root logical byte count overflow".to_string()))
+    }
+
+    /// Return the replicated batch's deterministic logical key/value byte size.
+    ///
+    /// RocksDB implementation overhead is deliberately excluded because it is
+    /// not a stable protocol value. The Raft apply-state write is included.
+    pub(crate) fn logical_batch_bytes(&self, raft_state: &AppMetadataRaftState) -> MetadataResult<usize> {
+        let encoded_state = serde_json::to_vec(raft_state)
+            .map_err(|error| MetadataError::Internal(format!("Failed to serialize Raft state: {error}")))?;
+        let mut bytes = RAFT_STATE_KEY
+            .len()
+            .checked_add(encoded_state.len())
+            .ok_or_else(|| MetadataError::Internal("detached-root logical byte count overflow".to_string()))?;
+        for entry in &self.entries {
+            bytes = bytes
+                .checked_add(entry.logical_bytes()?)
+                .ok_or_else(|| MetadataError::Internal("detached-root logical byte count overflow".to_string()))?;
+        }
+        for inode_id in &self.completed_root_inode_ids {
+            bytes = bytes
+                .checked_add(Self::completed_root_logical_bytes(*inode_id)?)
+                .ok_or_else(|| MetadataError::Internal("detached-root logical byte count overflow".to_string()))?;
+        }
+        Ok(bytes)
+    }
+}
+
 /// RocksDB storage backend.
 pub(crate) struct RocksDBStorage {
     generations: GenerationHandle,
@@ -202,6 +316,57 @@ impl RocksDBStorage {
         key.extend_from_slice(&parent_inode_id.to_be_bytes());
         key.extend_from_slice(name.as_bytes());
         key
+    }
+
+    fn encode_detached_root_key(inode_id: InodeId) -> [u8; 8] {
+        inode_id.to_be_bytes()
+    }
+
+    fn decode_detached_root_key(key: &[u8]) -> MetadataResult<InodeId> {
+        let raw: [u8; 8] = key
+            .try_into()
+            .map_err(|_| MetadataError::Internal(format!("Invalid detached-root key length: {}", key.len())))?;
+        let inode_id = InodeId::from_be_bytes(raw);
+        if inode_id.as_raw() == 0 {
+            return Err(MetadataError::Internal(
+                "Detached-root inode ID must be non-zero".to_string(),
+            ));
+        }
+        Ok(inode_id)
+    }
+
+    fn encode_detached_root(detached_root: &DetachedRoot) -> MetadataResult<Vec<u8>> {
+        encode_to_vec(detached_root, standard())
+            .map_err(|error| MetadataError::Internal(format!("Failed to serialize DetachedRoot: {error}")))
+    }
+
+    fn decode_detached_root(inode_id: InodeId, value: &[u8]) -> MetadataResult<DetachedRoot> {
+        let (detached_root, consumed): (DetachedRoot, usize) =
+            decode_from_slice(value, standard()).map_err(|error| {
+                MetadataError::Internal(format!(
+                    "Failed to deserialize DetachedRoot for inode {inode_id}: {error}"
+                ))
+            })?;
+        if consumed != value.len() {
+            return Err(MetadataError::Internal(format!(
+                "DetachedRoot for inode {inode_id} has {} trailing bytes",
+                value.len() - consumed
+            )));
+        }
+        if detached_root.mount_id.as_raw() == 0 {
+            return Err(MetadataError::Internal(format!(
+                "DetachedRoot for inode {inode_id} has zero mount ID"
+            )));
+        }
+        Ok(detached_root)
+    }
+
+    fn encode_layout_key(inode_id: InodeId) -> Vec<u8> {
+        format!("layout:{}", inode_id.as_raw()).into_bytes()
+    }
+
+    fn encode_data_handle_owner_key(data_handle_id: DataHandleId) -> Vec<u8> {
+        format!("data_handle_owner:{}", data_handle_id.as_raw()).into_bytes()
     }
 
     fn cf<'a>(db: &'a DB, name: &str) -> MetadataResult<&'a ColumnFamily> {

@@ -71,6 +71,7 @@ pub(crate) struct BlockCleanupCoordinator {
     worker_manager: Arc<WorkerManager>,
     session_registry: Arc<SessionRegistry>,
     group_name: GroupName,
+    scan_interval: Duration,
     reclaim_grace: Duration,
     max_replicas_per_scan: usize,
     max_candidates: usize,
@@ -100,6 +101,7 @@ impl BlockCleanupCoordinator {
             worker_manager,
             session_registry,
             group_name,
+            scan_interval: Duration::from_millis(config.scan_interval_ms),
             reclaim_grace: Duration::from_millis(config.reclaim_grace_ms),
             max_replicas_per_scan: config.max_replicas_per_scan,
             max_candidates: config.max_candidates,
@@ -109,6 +111,11 @@ impl BlockCleanupCoordinator {
             retry_max_backoff: Duration::from_millis(config.retry_max_backoff_ms),
             entries: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Interval owned by this coordinator's cleanup observation loop.
+    pub(crate) fn scan_interval(&self) -> Duration {
+        self.scan_interval
     }
 
     /// Selects due cleanup commands for one accepted worker heartbeat.

@@ -25,6 +25,17 @@ pub(crate) enum CommandResult {
     Rejected(ApplyRejection),
     /// Explicitly empty result.
     None,
+    /// Bounded progress made by one internal detached-root mutation.
+    DetachedRootsReclaimed(DetachedRootReclaimResult),
+}
+
+/// Deterministic progress counters returned to the leader-only reclaimer.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DetachedRootReclaimResult {
+    pub(crate) processed_entries: u32,
+    pub(crate) completed_roots: u32,
+    pub(crate) created_roots: u32,
+    pub(crate) logical_batch_bytes: u32,
 }
 
 /// Recoverable error kinds that may be committed as deterministic apply results.

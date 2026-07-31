@@ -51,6 +51,17 @@ pub(crate) const METADATA_CLEANUP_OLDEST_CANDIDATE_AGE_SECONDS: &str = "metadata
 pub(crate) const METADATA_CLEANUP_ANOMALIES_TOTAL: &str = "metadata_cleanup_anomalies_total";
 pub(crate) const METADATA_CLEANUP_COMMANDS_TOTAL: &str = "metadata_cleanup_commands_total";
 pub(crate) const METADATA_CLEANUP_RETRIES_TOTAL: &str = "metadata_cleanup_retries_total";
+pub(crate) const METADATA_DETACHED_ROOT_RECLAIM_PASSES_TOTAL: &str = "metadata_detached_root_reclaim_passes_total";
+pub(crate) const METADATA_DETACHED_ROOT_RECLAIM_CANDIDATES: &str = "metadata_detached_root_reclaim_candidates";
+pub(crate) const METADATA_DETACHED_ROOT_RECLAIM_BACKLOG_TRUNCATED: &str =
+    "metadata_detached_root_reclaim_backlog_truncated";
+pub(crate) const METADATA_DETACHED_ROOT_RECLAIM_OLDEST_AGE_SECONDS: &str =
+    "metadata_detached_root_reclaim_oldest_age_seconds";
+pub(crate) const METADATA_DETACHED_ROOT_RECLAIM_ENTRIES_TOTAL: &str = "metadata_detached_root_reclaim_entries_total";
+pub(crate) const METADATA_DETACHED_ROOT_RECLAIM_LOGICAL_BYTES_TOTAL: &str =
+    "metadata_detached_root_reclaim_logical_bytes_total";
+pub(crate) const METADATA_DETACHED_ROOT_RECLAIM_DURATION_SECONDS: &str =
+    "metadata_detached_root_reclaim_duration_seconds";
 pub(crate) const METADATA_REPAIR_QUEUE_DEPTH: &str = "metadata_repair_queue_depth";
 pub(crate) const METADATA_REPAIR_ATTEMPTS_TOTAL: &str = "metadata_repair_attempts_total";
 
@@ -286,6 +297,28 @@ pub(crate) fn record_cleanup_retry() {
     metrics::counter!(METADATA_CLEANUP_RETRIES_TOTAL).increment(1);
 }
 
+pub(crate) fn set_detached_root_reclaim_candidates(selected: usize, backlog_truncated: bool, oldest_age_seconds: f64) {
+    metrics::gauge!(METADATA_DETACHED_ROOT_RECLAIM_CANDIDATES).set(selected as f64);
+    metrics::gauge!(METADATA_DETACHED_ROOT_RECLAIM_BACKLOG_TRUNCATED).set(if backlog_truncated { 1.0 } else { 0.0 });
+    metrics::gauge!(METADATA_DETACHED_ROOT_RECLAIM_OLDEST_AGE_SECONDS).set(oldest_age_seconds);
+}
+
+pub(crate) fn record_detached_root_reclaim_pass(
+    result: &'static str,
+    processed_entries: u32,
+    logical_batch_bytes: u32,
+    duration_seconds: f64,
+) {
+    metrics::counter!(METADATA_DETACHED_ROOT_RECLAIM_PASSES_TOTAL, "result" => result).increment(1);
+    metrics::histogram!(METADATA_DETACHED_ROOT_RECLAIM_DURATION_SECONDS, "result" => result).record(duration_seconds);
+    if processed_entries > 0 {
+        metrics::counter!(METADATA_DETACHED_ROOT_RECLAIM_ENTRIES_TOTAL).increment(u64::from(processed_entries));
+    }
+    if logical_batch_bytes > 0 {
+        metrics::counter!(METADATA_DETACHED_ROOT_RECLAIM_LOGICAL_BYTES_TOTAL).increment(u64::from(logical_batch_bytes));
+    }
+}
+
 pub(crate) fn set_repair_queue_depth(depth: usize) {
     metrics::gauge!(METADATA_REPAIR_QUEUE_DEPTH).set(depth as f64);
 }
@@ -434,7 +467,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn metadata_metric_contract_names() -> [&'static str; 42] {
+    fn metadata_metric_contract_names() -> [&'static str; 49] {
         [
             METADATA_UP,
             METADATA_BUILD_INFO,
@@ -476,6 +509,13 @@ mod tests {
             METADATA_CLEANUP_ANOMALIES_TOTAL,
             METADATA_CLEANUP_COMMANDS_TOTAL,
             METADATA_CLEANUP_RETRIES_TOTAL,
+            METADATA_DETACHED_ROOT_RECLAIM_PASSES_TOTAL,
+            METADATA_DETACHED_ROOT_RECLAIM_CANDIDATES,
+            METADATA_DETACHED_ROOT_RECLAIM_BACKLOG_TRUNCATED,
+            METADATA_DETACHED_ROOT_RECLAIM_OLDEST_AGE_SECONDS,
+            METADATA_DETACHED_ROOT_RECLAIM_ENTRIES_TOTAL,
+            METADATA_DETACHED_ROOT_RECLAIM_LOGICAL_BYTES_TOTAL,
+            METADATA_DETACHED_ROOT_RECLAIM_DURATION_SECONDS,
             METADATA_REPAIR_QUEUE_DEPTH,
             METADATA_REPAIR_ATTEMPTS_TOTAL,
         ]
@@ -542,6 +582,13 @@ mod tests {
             "metadata_cleanup_anomalies_total",
             "metadata_cleanup_commands_total",
             "metadata_cleanup_retries_total",
+            "metadata_detached_root_reclaim_passes_total",
+            "metadata_detached_root_reclaim_candidates",
+            "metadata_detached_root_reclaim_backlog_truncated",
+            "metadata_detached_root_reclaim_oldest_age_seconds",
+            "metadata_detached_root_reclaim_entries_total",
+            "metadata_detached_root_reclaim_logical_bytes_total",
+            "metadata_detached_root_reclaim_duration_seconds",
             "metadata_repair_queue_depth",
             "metadata_repair_attempts_total",
         ];
@@ -630,6 +677,8 @@ mod tests {
         record_cleanup_anomaly("leadership_changed");
         record_cleanup_command();
         record_cleanup_retry();
+        set_detached_root_reclaim_candidates(1, true, 0.5);
+        record_detached_root_reclaim_pass("applied", 1, 128, 0.001);
         set_repair_queue_depth(0);
         record_repair_attempt("ok", "none");
     }

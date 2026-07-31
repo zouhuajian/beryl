@@ -141,22 +141,25 @@ fn open_generation_db(path: &Path, create_missing: bool) -> MetadataResult<Arc<D
     let mut options = Options::default();
     options.create_if_missing(create_missing);
     options.create_missing_column_families(create_missing);
-    let mut descriptors = cf_descriptors();
-    let obsolete_column_families = if create_missing {
-        Vec::new()
+    let (descriptors, obsolete_column_families) = if create_missing {
+        (cf_descriptors(), Vec::new())
     } else {
         let names = DB::list_cf(&Options::default(), path).map_err(|error| {
             missing_rocksdb_state_error(path, &format!("RocksDB column-family discovery failed: {error}"))
         })?;
+        let descriptors = names
+            .iter()
+            .filter(|name| name.as_str() != "default")
+            .map(|name| ColumnFamilyDescriptor::new(name.clone(), Options::default()))
+            .collect();
         let mut obsolete = Vec::new();
-        for name in names {
-            if name == "default" || is_current_column_family(&name) {
+        for name in &names {
+            if name == "default" || is_current_column_family(name) {
                 continue;
             }
-            descriptors.push(ColumnFamilyDescriptor::new(name.clone(), Options::default()));
-            obsolete.push(name);
+            obsolete.push(name.clone());
         }
-        obsolete
+        (descriptors, obsolete)
     };
     let db = DB::open_cf_descriptors(&options, path, descriptors).map_err(|error| {
         if create_missing {
@@ -168,9 +171,11 @@ fn open_generation_db(path: &Path, create_missing: bool) -> MetadataResult<Arc<D
             missing_rocksdb_state_error(path, &format!("RocksDB open failed: {error}"))
         }
     })?;
-    let meta = db
-        .cf_handle(CF_META)
-        .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
+    let meta = db.cf_handle(CF_META).ok_or_else(|| {
+        MetadataError::InvalidArgument(format!(
+            "RocksDB column family {CF_META} is missing; reformat metadata storage"
+        ))
+    })?;
     match db.get_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY) {
         Ok(Some(raw)) => {
             let stored: u64 = decode_from_slice(&raw, standard())
@@ -204,20 +209,29 @@ fn open_generation_db(path: &Path, create_missing: bool) -> MetadataResult<Arc<D
             )))
         }
     }
+    let missing_column_families = CURRENT_CFS
+        .iter()
+        .copied()
+        .filter(|name| db.cf_handle(name).is_none())
+        .collect::<Vec<_>>();
+    if !missing_column_families.is_empty() {
+        return Err(MetadataError::InvalidArgument(format!(
+            "missing RocksDB column families {:?}; reformat metadata storage",
+            missing_column_families
+        )));
+    }
     if !obsolete_column_families.is_empty() {
         return Err(MetadataError::InvalidArgument(format!(
             "obsolete RocksDB column families {:?}; reformat metadata storage",
             obsolete_column_families
         )));
     }
+    validate_detached_root_records(&db)?;
     Ok(Arc::new(db))
 }
 
 fn is_current_column_family(name: &str) -> bool {
-    matches!(
-        name,
-        CF_MOUNTS | CF_WORKERS | CF_META | CF_RAFT_LOG | CF_RAFT_STATE | CF_RAFT_SNAPSHOT | CF_INODES | CF_DENTRIES
-    )
+    CURRENT_CFS.contains(&name)
 }
 
 fn can_initialize_missing_schema(db: &DB) -> MetadataResult<bool> {
@@ -239,6 +253,7 @@ fn database_is_pristine(db: &DB, allowed_meta_keys: &[&[u8]]) -> MetadataResult<
         CF_RAFT_SNAPSHOT,
         CF_INODES,
         CF_DENTRIES,
+        CF_DETACHED_ROOTS,
     ] {
         let cf = db
             .cf_handle(name)
@@ -272,16 +287,53 @@ fn storage_identity_matches(actual: &StorageIdentity, expected: &StorageIdentity
 }
 
 pub(super) fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
-    vec![
-        ColumnFamilyDescriptor::new(CF_MOUNTS, Options::default()),
-        ColumnFamilyDescriptor::new(CF_WORKERS, Options::default()),
-        ColumnFamilyDescriptor::new(CF_META, Options::default()),
-        ColumnFamilyDescriptor::new(CF_RAFT_LOG, Options::default()),
-        ColumnFamilyDescriptor::new(CF_RAFT_STATE, Options::default()),
-        ColumnFamilyDescriptor::new(CF_RAFT_SNAPSHOT, Options::default()),
-        ColumnFamilyDescriptor::new(CF_INODES, Options::default()),
-        ColumnFamilyDescriptor::new(CF_DENTRIES, Options::default()),
-    ]
+    CURRENT_CFS
+        .iter()
+        .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
+        .collect()
+}
+
+/// Validate every durable marker before a generation becomes authoritative.
+pub(super) fn validate_detached_root_records(db: &DB) -> MetadataResult<()> {
+    use rocksdb::IteratorMode;
+
+    let cf = db
+        .cf_handle(CF_DETACHED_ROOTS)
+        .ok_or_else(|| MetadataError::Internal("Detached roots CF not found".to_string()))?;
+    for item in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, value) =
+            item.map_err(|error| MetadataError::Internal(format!("failed to inspect detached roots: {error}")))?;
+        if key.len() != 8 {
+            return Err(MetadataError::InvalidArgument(format!(
+                "invalid detached-root key length {}; reformat metadata storage",
+                key.len()
+            )));
+        }
+        let inode_id = InodeId::from_be_bytes(key.as_ref().try_into().expect("detached-root key length was checked"));
+        if inode_id.as_raw() == 0 {
+            return Err(MetadataError::InvalidArgument(
+                "detached-root inode ID must be non-zero; reformat metadata storage".to_string(),
+            ));
+        }
+        let (detached_root, consumed): (DetachedRoot, usize) =
+            decode_from_slice(&value, standard()).map_err(|error| {
+                MetadataError::InvalidArgument(format!(
+                    "invalid detached-root record for inode {inode_id}: {error}; reformat metadata storage"
+                ))
+            })?;
+        if consumed != value.len() {
+            return Err(MetadataError::InvalidArgument(format!(
+                "detached-root inode {inode_id} has {} trailing value bytes; reformat metadata storage",
+                value.len() - consumed
+            )));
+        }
+        if detached_root.mount_id.as_raw() == 0 {
+            return Err(MetadataError::InvalidArgument(format!(
+                "detached-root inode {inode_id} has zero mount ID; reformat metadata storage"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn missing_rocksdb_state_error(path: &Path, detail: &str) -> MetadataError {
@@ -326,27 +378,30 @@ mod tests {
     }
 
     #[test]
-    fn opening_previous_inode_schema_requires_reformat() {
+    fn opening_previous_schema_requires_reformat() {
         let dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
         drop(storage);
 
         let generation_path = dir.path().join("generations/gen-000001");
-        let db = DB::open_cf_descriptors(&Options::default(), &generation_path, cf_descriptors()).unwrap();
+        let mut db = DB::open_cf_descriptors(&Options::default(), &generation_path, cf_descriptors()).unwrap();
         let meta = db.cf_handle(CF_META).unwrap();
-        let previous = bincode::serde::encode_to_vec(7u64, bincode::config::standard()).unwrap();
+        let previous = bincode::serde::encode_to_vec(ROCKSDB_SCHEMA_VERSION - 1, bincode::config::standard()).unwrap();
         db.put_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY, &previous).unwrap();
+        db.drop_cf(CF_DETACHED_ROOTS).unwrap();
         drop(db);
 
         let error = match RocksDBStorage::open_existing_for_start(dir.path()) {
-            Ok(_) => panic!("schema 7 store must not open after the inode format change"),
+            Ok(_) => panic!("previous schema store must not open without the current column families"),
             Err(error) => error,
         };
 
         assert!(
-            error
-                .to_string()
-                .contains("unsupported RocksDB schema version 7; expected 8"),
+            error.to_string().contains(&format!(
+                "unsupported RocksDB schema version {}; expected {}",
+                ROCKSDB_SCHEMA_VERSION - 1,
+                ROCKSDB_SCHEMA_VERSION
+            )),
             "unexpected startup error: {error}"
         );
         assert!(
@@ -354,12 +409,39 @@ mod tests {
             "unexpected startup error: {error}"
         );
 
-        let db = DB::open_cf_descriptors(&Options::default(), generation_path, cf_descriptors()).unwrap();
+        let previous_descriptors = CURRENT_CFS
+            .iter()
+            .filter(|name| **name != CF_DETACHED_ROOTS)
+            .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
+            .collect::<Vec<_>>();
+        let db = DB::open_cf_descriptors(&Options::default(), generation_path, previous_descriptors).unwrap();
         let meta = db.cf_handle(CF_META).unwrap();
         assert_eq!(
             db.get_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY).unwrap().as_deref(),
             Some(previous.as_slice())
         );
+    }
+
+    #[test]
+    fn opening_malformed_detached_root_authority_requires_reformat() {
+        let dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
+        storage
+            .with_pinned_db(|db| {
+                let detached_roots = db.cf_handle(CF_DETACHED_ROOTS).unwrap();
+                db.put_cf(detached_roots, b"short", b"invalid")
+                    .map_err(|error| MetadataError::Internal(error.to_string()))
+            })
+            .unwrap();
+        drop(storage);
+
+        let error = match RocksDBStorage::open_existing_for_start(dir.path()) {
+            Ok(_) => panic!("malformed detached-root authority must not open"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("invalid detached-root key length"));
+        assert!(error.to_string().contains("reformat metadata storage"));
     }
 
     #[test]

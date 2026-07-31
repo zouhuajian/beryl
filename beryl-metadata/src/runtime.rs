@@ -5,7 +5,7 @@
 
 use crate::inflight_registry::InflightRegistry;
 use crate::maintenance::repair::{RepairPlanner, RepairPolicy, RepairQueue};
-use crate::maintenance::{BlockCleanupCoordinator, MaintenanceHandle, MaintenanceService};
+use crate::maintenance::{BlockCleanupCoordinator, DetachedRootReclaimer, MaintenanceHandle, MaintenanceService};
 use crate::metrics::MetadataMetrics;
 use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
 use crate::readiness::{wait_for_root_ready_with_inputs, RootReadinessGate, RootReadinessLogFields, RootReadyInputs};
@@ -360,6 +360,11 @@ pub(crate) async fn build_maintenance(
         authority.group_name.clone(),
         &config.cleanup,
     ));
+    let detached_root_reclaimer = Arc::new(DetachedRootReclaimer::new(
+        Arc::clone(&authority.raft_node),
+        Arc::clone(&authority.storage),
+        config.detached_root_reclamation.clone(),
+    ));
     let maintenance_service = Arc::new(MaintenanceService::new(
         Arc::clone(&authority.raft_node),
         Arc::clone(&worker.manager),
@@ -367,7 +372,7 @@ pub(crate) async fn build_maintenance(
         Arc::clone(&repair.repair_planner),
         repair.repair_policy,
         Arc::clone(&cleanup),
-        config.cleanup.scan_interval_ms,
+        detached_root_reclaimer,
     ));
     let maintenance_handle = maintenance_service.start();
 
@@ -699,6 +704,7 @@ mod tests {
                 group_name: GroupName::parse("root").unwrap(),
             },
             cleanup: CleanupConfig::default(),
+            detached_root_reclamation: crate::config::DetachedRootReclamationConfig::default(),
             worker: WorkerConfig::default(),
             bootstrap: BootstrapConfig {
                 root_readiness: crate::readiness::RootReadinessConfig::default(),

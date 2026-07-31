@@ -235,6 +235,27 @@ impl RocksDBStorage {
         Ok(inode_id)
     }
 
+    /// Get one mount entry by its authority-local mount ID.
+    pub fn get_mount(&self, mount_id: MountId) -> MetadataResult<Option<MountEntry>> {
+        let generation = self.pin_generation()?;
+        let db = generation.db();
+        let cf = db
+            .cf_handle(CF_MOUNTS)
+            .ok_or_else(|| MetadataError::Internal("Mounts CF not found".to_string()))?;
+        let key = mount_id.as_raw().to_string();
+
+        match db.get_cf(cf, key.as_bytes()) {
+            Ok(Some(value)) => {
+                let entry: MountEntry = decode_from_slice(&value, standard())
+                    .map_err(|e| MetadataError::Internal(format!("Failed to deserialize MountEntry: {}", e)))?
+                    .0;
+                Ok(Some(entry))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
+        }
+    }
+
     /// List all mount entries.
     pub fn list_mounts(&self) -> MetadataResult<Vec<MountEntry>> {
         let generation = self.pin_generation()?;
@@ -255,6 +276,52 @@ impl RocksDBStorage {
         }
 
         Ok(mounts)
+    }
+
+    /// Get one detached-root authority marker.
+    pub(crate) fn get_detached_root(&self, inode_id: InodeId) -> MetadataResult<Option<DetachedRoot>> {
+        crate::observe::record_rocksdb_read("detached_root");
+        let generation = self.pin_generation()?;
+        let db = generation.db();
+        let cf = Self::cf(db, CF_DETACHED_ROOTS)?;
+        let key = Self::encode_detached_root_key(inode_id);
+        match db.get_cf(cf, key) {
+            Ok(Some(value)) => Self::decode_detached_root(inode_id, &value).map(Some),
+            Ok(None) => Ok(None),
+            Err(error) => Err(MetadataError::Internal(format!(
+                "RocksDB error reading DetachedRoot for inode {inode_id}: {error}"
+            ))),
+        }
+    }
+
+    /// Select a key-ordered bounded page of detached roots for maintenance.
+    pub(crate) fn list_detached_roots(
+        &self,
+        max_entries: usize,
+    ) -> MetadataResult<(Vec<(InodeId, DetachedRoot)>, bool)> {
+        if max_entries == 0 {
+            return Err(MetadataError::InvalidArgument(
+                "detached-root listing requires a positive entry limit".to_string(),
+            ));
+        }
+        crate::observe::record_rocksdb_read("detached_root_scan");
+        let generation = self.pin_generation()?;
+        let db = generation.db();
+        let cf = Self::cf(db, CF_DETACHED_ROOTS)?;
+        let mut roots = Vec::with_capacity(max_entries);
+        let mut has_more = false;
+        for item in db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
+            let (key, value) =
+                item.map_err(|error| MetadataError::Internal(format!("RocksDB detached-root scan failed: {error}")))?;
+            if roots.len() == max_entries {
+                has_more = true;
+                break;
+            }
+            let inode_id = Self::decode_detached_root_key(&key)?;
+            let detached_root = Self::decode_detached_root(inode_id, &value)?;
+            roots.push((inode_id, detached_root));
+        }
+        Ok((roots, has_more))
     }
 
     pub fn prepare_worker_registration(
@@ -415,6 +482,50 @@ impl RocksDBStorage {
         Ok(entries)
     }
 
+    /// Read a bounded first page for destructive detached-root reclamation.
+    ///
+    /// Unlike user-facing directory listing, malformed keys and values are
+    /// fatal here because skipping one could retire a non-empty root.
+    pub(crate) fn list_dentries_for_reclaim(
+        &self,
+        parent_inode_id: InodeId,
+        max_entries: usize,
+    ) -> MetadataResult<(Vec<(String, InodeId)>, bool)> {
+        if max_entries == 0 {
+            return Err(MetadataError::InvalidArgument(
+                "detached-root dentry scan requires a positive entry limit".to_string(),
+            ));
+        }
+        crate::observe::record_rocksdb_read("detached_root_dentry_scan");
+        let generation = self.pin_generation()?;
+        let db = generation.db();
+        let cf = Self::cf(db, CF_DENTRIES)?;
+        let prefix = Self::encode_dentry_key(parent_inode_id, "");
+        let mut entries = Vec::with_capacity(max_entries);
+        let iter = db.iterator_cf(cf, rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward));
+        for item in iter {
+            let (key, value) =
+                item.map_err(|error| MetadataError::Internal(format!("RocksDB dentry scan failed: {error}")))?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if entries.len() == max_entries {
+                return Ok((entries, false));
+            }
+            let (decoded_parent, name) = Self::decode_dentry_key(&key).ok_or_else(|| {
+                MetadataError::Internal(format!("Malformed dentry key under detached root {parent_inode_id}"))
+            })?;
+            if decoded_parent != parent_inode_id || value.len() != 8 {
+                return Err(MetadataError::Internal(format!(
+                    "Malformed dentry under detached root {parent_inode_id}"
+                )));
+            }
+            let child_raw: [u8; 8] = value.as_ref().try_into().expect("dentry value length was checked");
+            entries.push((name, InodeId::from_be_bytes(child_raw)));
+        }
+        Ok((entries, true))
+    }
+
     /// List dentries with pagination support (for ReadDir).
     ///
     /// Args:
@@ -510,27 +621,6 @@ mod tests {
     use tempfile::TempDir;
 
     impl RocksDBStorage {
-        /// Get mount entry.
-        pub fn get_mount(&self, mount_id: MountId) -> MetadataResult<Option<MountEntry>> {
-            let generation = self.pin_generation()?;
-            let db = generation.db();
-            let cf = db
-                .cf_handle(CF_MOUNTS)
-                .ok_or_else(|| MetadataError::Internal("Mounts CF not found".to_string()))?;
-            let key = format!("{}", mount_id.as_raw());
-
-            match db.get_cf(cf, key.as_bytes()) {
-                Ok(Some(value)) => {
-                    let entry: MountEntry = decode_from_slice(&value, standard())
-                        .map_err(|e| MetadataError::Internal(format!("Failed to deserialize MountEntry: {}", e)))?
-                        .0;
-                    Ok(Some(entry))
-                }
-                Ok(None) => Ok(None),
-                Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
-            }
-        }
-
         /// Get worker info accepted by a metadata group.
         pub fn get_worker_in_group(
             &self,

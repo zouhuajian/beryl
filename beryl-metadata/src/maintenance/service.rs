@@ -5,7 +5,7 @@
 
 use super::lost_worker::{LostWorkerCleanupDeps, LostWorkerCleanupService};
 use super::repair::{RepairPlanner, RepairPolicy, RepairQueue};
-use super::BlockCleanupCoordinator;
+use super::{BlockCleanupCoordinator, DetachedRootReclaimer};
 use crate::raft::AppRaftNode;
 use crate::worker::WorkerManager;
 use std::sync::Arc;
@@ -33,7 +33,7 @@ pub struct MaintenanceService {
     repair_planner: Arc<RepairPlanner>,
     repair_policy: RepairPolicy,
     cleanup: Arc<BlockCleanupCoordinator>,
-    cleanup_scan_interval_ms: u64,
+    detached_root_reclaimer: Arc<DetachedRootReclaimer>,
     lost_worker_cleanup_interval_sec: u64,
     rebalance_interval_sec: u64,
     timeout_check_interval_sec: u64,
@@ -51,7 +51,7 @@ impl MaintenanceService {
         repair_planner: Arc<RepairPlanner>,
         repair_policy: RepairPolicy,
         cleanup: Arc<BlockCleanupCoordinator>,
-        cleanup_scan_interval_ms: u64,
+        detached_root_reclaimer: Arc<DetachedRootReclaimer>,
     ) -> Self {
         Self {
             raft_node,
@@ -60,21 +60,24 @@ impl MaintenanceService {
             repair_planner,
             repair_policy,
             cleanup,
-            cleanup_scan_interval_ms,
+            detached_root_reclaimer,
             lost_worker_cleanup_interval_sec: 30,
             rebalance_interval_sec: 300,
             timeout_check_interval_sec: 10,
         }
     }
 
-    /// Starts cleanup observation, lost-worker cleanup, rebalance scanning, and repair timeout requeue.
+    /// Starts detached namespace cleanup and the worker convergence loops.
     pub(crate) fn start(&self) -> MaintenanceHandle {
-        let mut tasks = Vec::with_capacity(4);
+        let mut tasks = Vec::with_capacity(5);
+
+        let detached_root_reclaimer = Arc::clone(&self.detached_root_reclaimer);
+        tasks.push(tokio::spawn(detached_root_reclaimer.run()));
 
         let cleanup = Arc::clone(&self.cleanup);
-        let interval_ms = self.cleanup_scan_interval_ms;
+        let scan_interval = cleanup.scan_interval();
         tasks.push(tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+            let mut interval = tokio::time::interval(scan_interval);
             loop {
                 interval.tick().await;
                 if let Err(error) = cleanup.scan_once().await {

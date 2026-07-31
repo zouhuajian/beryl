@@ -11,7 +11,8 @@ use beryl_client::{ClientConfig, FsClient};
 use beryl_common::observe::ObservabilityConfig;
 use beryl_common::FlatConfig;
 use beryl_metadata::config::{
-    BootstrapConfig, CleanupConfig, MetadataAuthorityConfig, MetadataConfig, RaftConfig, WorkerConfig,
+    BootstrapConfig, CleanupConfig, DetachedRootReclamationConfig, MetadataAuthorityConfig, MetadataConfig, RaftConfig,
+    WorkerConfig,
 };
 use beryl_metadata::lifecycle::format_metadata_storage;
 use beryl_metadata::lifecycle::prepare_metadata_start;
@@ -756,6 +757,7 @@ fn metadata_config(
         raft: RaftConfig::default(),
         authority: MetadataAuthorityConfig { group_name },
         cleanup: CleanupConfig::default(),
+        detached_root_reclamation: DetachedRootReclamationConfig::default(),
         worker: WorkerConfig::default(),
         bootstrap: BootstrapConfig {
             root_readiness: beryl_metadata::RootReadinessConfig {

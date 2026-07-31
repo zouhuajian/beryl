@@ -16,10 +16,15 @@ mod storage;
 mod types;
 
 pub(crate) use command::proposal_timestamp_ms;
-pub(crate) use command::{Command, PublishMode};
+pub(crate) use command::{
+    Command, PublishMode, MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES, MAX_RECLAIM_DETACHED_ROOT_CANDIDATES,
+    MAX_RECLAIM_DETACHED_ROOT_ENTRIES, MIN_RECLAIM_DETACHED_ROOT_BATCH_BYTES,
+};
 pub(crate) use node::AppRaftNode;
 pub(crate) use read_view::{MetadataReadView, RoutingDelta};
-pub(crate) use response::{CommandResult, FsCommandResult};
+pub(crate) use response::{CommandResult, DetachedRootReclaimResult, FsCommandResult};
 pub(crate) use state_machine::AppRaftStateMachine;
+#[cfg(test)]
+pub(crate) use storage::DetachedRoot;
 pub(crate) use storage::{RocksDBStorage, StorageIdentity};
 pub(crate) use types::AppMetadataRaftState;
