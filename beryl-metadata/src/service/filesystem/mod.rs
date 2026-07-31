@@ -160,10 +160,21 @@ fn missing_resolved_target_error(resolved: &ResolvedPath) -> MetadataError {
 }
 
 impl MetadataFileSystem {
+    /// Return whether one exact file still has the authoritative leader-local lease.
+    ///
+    /// Any session whose mirrored epoch is no longer active is retired before
+    /// consulting the lease manager.
     fn has_active_write(&self, inode_id: InodeId) -> bool {
         self.session_registry
             .remove_inactive_for_inode(inode_id, self.lease_manager.as_ref());
         self.lease_manager.has_active_lease(inode_id)
+    }
+
+    /// Return whether an inode is or contains a non-expired leader-local write session.
+    ///
+    /// The ancestor index makes this check independent of namespace subtree size.
+    fn has_active_write_under(&self, inode_id: InodeId) -> bool {
+        self.session_registry.has_active_write_under(inode_id)
     }
 }
 
@@ -185,8 +196,16 @@ pub(crate) struct PresentedWriteHandle {
     pub(crate) lease_epoch: u64,
 }
 
+/// Metadata service state combining durable Raft authority with leader-local admission state.
 pub(crate) struct MetadataFileSystem {
     path_resolver: PathResolver,
+    /// Serializes path-bound write admission with topology-changing operations.
+    ///
+    /// Create/OpenWrite/RenewLease take a shared guard; Rename/Delete take an
+    /// exclusive guard. This lock is leader-local admission only: Raft apply
+    /// preconditions and persisted fencing epochs provide replay-safe durable
+    /// authority, while OpenWrite revalidates its path before replying.
+    namespace_topology: tokio::sync::RwLock<()>,
     admission: AdmissionGuard,
     mount_table: Arc<MountTable>,
     freshness_validator: FreshnessValidator,
@@ -208,6 +227,7 @@ impl MetadataFileSystem {
 
         Self {
             path_resolver,
+            namespace_topology: tokio::sync::RwLock::new(()),
             admission,
             mount_table: deps.mount_table,
             freshness_validator,
@@ -864,6 +884,15 @@ mod test_support {
         inode_id: InodeId,
         mount_id: MountId,
     ) -> DataHandleId {
+        install_write_session_with_ancestors(filesystem, inode_id, mount_id, vec![inode_id])
+    }
+
+    pub(super) fn install_write_session_with_ancestors(
+        filesystem: &TestFilesystem,
+        inode_id: InodeId,
+        mount_id: MountId,
+        ancestor_inode_ids: Vec<InodeId>,
+    ) -> DataHandleId {
         let writer = ClientId::new(7);
         let data_handle_id = DataHandleId::new(424_242);
         let (lease_epoch, expires_at_ms) = filesystem
@@ -900,6 +929,7 @@ mod test_support {
                 open_client_id: writer,
                 layout: FileLayout::new(64, 64, 1),
                 expires_at_ms,
+                ancestor_inode_ids,
             })
             .expect("session created");
         filesystem
