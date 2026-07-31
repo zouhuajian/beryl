@@ -74,6 +74,8 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
 
 ## Roadmap
 
+- See [ROADMAP.md](ROADMAP.md) for the detailed product, architecture, quality,
+  refactoring, validation, and delivery roadmap.
 - Keep the supported Rust client -> metadata -> worker path stable under default validation.
 - Complete recovery soak and controlled default enablement for resident-block reclamation.
 - Design UFS read-through/write-through integration without changing metadata-owned visibility.
