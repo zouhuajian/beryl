@@ -159,7 +159,18 @@ impl AppRaftStateMachine {
         let root_inode = self.storage.get_inode(root_inode_id)?.ok_or_else(|| {
             MetadataError::Internal(format!("DetachedRoot for inode {root_inode_id} has no directory inode"))
         })?;
-        if !matches!(root_inode.data, InodeData::Dir) {
+        if root_inode.inode_id != root_inode_id {
+            return Err(MetadataError::Internal(format!(
+                "DetachedRoot inode key {root_inode_id} contains inode {}",
+                root_inode.inode_id
+            )));
+        }
+        if root_inode.kind != root_inode.data.kind() {
+            return Err(MetadataError::Internal(format!(
+                "DetachedRoot inode {root_inode_id} kind and payload disagree"
+            )));
+        }
+        if !root_inode.kind.is_dir() {
             return Err(MetadataError::Internal(format!(
                 "DetachedRoot inode {root_inode_id} is not a directory"
             )));
@@ -223,6 +234,17 @@ impl AppRaftStateMachine {
                 "DetachedRoot inode {parent_inode_id} references missing child inode {child_inode_id}"
             ))
         })?;
+        if child_inode.inode_id != child_inode_id {
+            return Err(MetadataError::Internal(format!(
+                "inode key {child_inode_id} under DetachedRoot {parent_inode_id} contains inode {}",
+                child_inode.inode_id
+            )));
+        }
+        if child_inode.kind != child_inode.data.kind() {
+            return Err(MetadataError::Internal(format!(
+                "inode {child_inode_id} under DetachedRoot {parent_inode_id} has kind/payload mismatch"
+            )));
+        }
         if child_inode.mount_id != parent_detached_root.mount_id {
             return Err(MetadataError::Internal(format!(
                 "DetachedRoot inode {parent_inode_id} crosses from mount {} to child inode {child_inode_id} in mount {}",
@@ -299,7 +321,7 @@ impl AppRaftStateMachine {
 mod tests {
     use super::*;
     use crate::raft::state_machine::test_support::*;
-    use beryl_types::fs::InodeData;
+    use beryl_types::fs::{InodeData, InodeKind};
 
     fn new_state_machine() -> (TempDir, Arc<RocksDBStorage>, AppRaftStateMachine) {
         let dir = TempDir::new().unwrap();
@@ -480,6 +502,164 @@ mod tests {
         assert!(owner_error.to_string().contains("not detached file inode"));
         assert!(storage.get_inode(file_id).unwrap().is_some());
         assert_eq!(storage.get_dentry(owner_root_id, "file").unwrap(), Some(file_id));
+    }
+
+    #[test]
+    fn kind_payload_mismatch_keeps_entire_reclaim_batch_unmodified() {
+        let (_dir, storage, state_machine) = new_state_machine();
+        let root_inode_id = InodeId::new(43);
+        let valid_file_inode_id = InodeId::new(44);
+        let corrupt_inode_id = InodeId::new(45);
+        let grandchild_inode_id = InodeId::new(46);
+        let valid_handle_id = DataHandleId::new(44);
+        let corrupt_handle_id = DataHandleId::new(45);
+        let marker = detached_root(MountId::new(1), 101);
+        let layout = FileLayout::new(4096, 4096, 1);
+        seed_directory(&storage, root_inode_id, marker.mount_id);
+        seed_file(
+            &storage,
+            root_inode_id,
+            "a-valid",
+            valid_file_inode_id,
+            valid_handle_id,
+            marker.mount_id,
+        );
+        let mut corrupt_inode = Inode::new_file(corrupt_inode_id, FileAttrs::new(), marker.mount_id, corrupt_handle_id);
+        corrupt_inode.kind = InodeKind::Dir;
+        storage.put_inode(&corrupt_inode).unwrap();
+        storage
+            .put_dentry(root_inode_id, "b-corrupt", corrupt_inode_id)
+            .unwrap();
+        storage.put_layout(corrupt_inode_id, layout).unwrap();
+        storage
+            .put_data_handle_owner(corrupt_handle_id, corrupt_inode_id)
+            .unwrap();
+        seed_directory(&storage, grandchild_inode_id, marker.mount_id);
+        storage
+            .put_dentry(corrupt_inode_id, "grandchild", grandchild_inode_id)
+            .unwrap();
+        storage.put_detached_root(root_inode_id, marker).unwrap();
+        let applied_before = storage.load_raft_state().unwrap();
+        let rejected_applied_state = AppMetadataRaftState {
+            last_applied_log_id: Some(openraft::LogId::new(openraft::LeaderId::new(7, 1), 702)),
+            ..AppMetadataRaftState::default()
+        };
+        assert_ne!(rejected_applied_state, applied_before);
+
+        let error = state_machine
+            .apply_with_raft_state(
+                Command::ReclaimDetachedRoots {
+                    candidate_root_inode_ids: vec![root_inode_id],
+                    max_entries: 10,
+                    max_batch_bytes: MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES,
+                },
+                &rejected_applied_state,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("kind/payload mismatch"));
+        assert_eq!(
+            storage.get_dentry(root_inode_id, "a-valid").unwrap(),
+            Some(valid_file_inode_id)
+        );
+        assert_eq!(
+            storage.get_dentry(root_inode_id, "b-corrupt").unwrap(),
+            Some(corrupt_inode_id)
+        );
+        assert_eq!(
+            storage.get_dentry(corrupt_inode_id, "grandchild").unwrap(),
+            Some(grandchild_inode_id)
+        );
+        assert!(storage.get_inode(root_inode_id).unwrap().is_some());
+        assert!(storage.get_inode(valid_file_inode_id).unwrap().is_some());
+        assert_eq!(storage.get_inode(corrupt_inode_id).unwrap(), Some(corrupt_inode));
+        assert!(storage.get_inode(grandchild_inode_id).unwrap().is_some());
+        assert_eq!(storage.get_layout(valid_file_inode_id).unwrap(), layout);
+        assert_eq!(storage.get_layout(corrupt_inode_id).unwrap(), layout);
+        assert_eq!(
+            storage.get_inode_by_data_handle(valid_handle_id).unwrap(),
+            Some(valid_file_inode_id)
+        );
+        assert_eq!(
+            storage.get_inode_by_data_handle(corrupt_handle_id).unwrap(),
+            Some(corrupt_inode_id)
+        );
+        assert_eq!(storage.get_detached_root(root_inode_id).unwrap(), Some(marker));
+        assert!(storage.get_detached_root(corrupt_inode_id).unwrap().is_none());
+        assert_eq!(storage.load_raft_state().unwrap(), applied_before);
+    }
+
+    #[test]
+    fn root_and_child_identity_or_kind_mismatches_fail_closed() {
+        let (_dir, storage, state_machine) = new_state_machine();
+        let marker = detached_root(MountId::new(1), 102);
+
+        let root_key_inode_id = InodeId::new(47);
+        let embedded_root_inode_id = InodeId::new(48);
+        let corrupt_root = Inode::new_dir(embedded_root_inode_id, FileAttrs::new(), marker.mount_id);
+        storage
+            .put_inode_at_storage_key(root_key_inode_id, &corrupt_root)
+            .unwrap();
+        storage.put_detached_root(root_key_inode_id, marker).unwrap();
+        let identity_applied_before = storage.load_raft_state().unwrap();
+
+        let root_identity_error = reclaim(&state_machine, vec![root_key_inode_id], 10).unwrap_err();
+
+        assert!(root_identity_error.to_string().contains("inode key"));
+        assert_eq!(storage.get_inode(root_key_inode_id).unwrap(), Some(corrupt_root));
+        assert_eq!(storage.get_detached_root(root_key_inode_id).unwrap(), Some(marker));
+        assert_eq!(storage.load_raft_state().unwrap(), identity_applied_before);
+
+        let kind_mismatch_root_inode_id = InodeId::new(49);
+        let mut kind_mismatch_root = Inode::new_dir(kind_mismatch_root_inode_id, FileAttrs::new(), marker.mount_id);
+        kind_mismatch_root.kind = InodeKind::File;
+        storage.put_inode(&kind_mismatch_root).unwrap();
+        storage.put_detached_root(kind_mismatch_root_inode_id, marker).unwrap();
+        let kind_applied_before = storage.load_raft_state().unwrap();
+
+        let root_kind_error = reclaim(&state_machine, vec![kind_mismatch_root_inode_id], 10).unwrap_err();
+
+        assert!(root_kind_error.to_string().contains("kind and payload disagree"));
+        assert_eq!(
+            storage.get_inode(kind_mismatch_root_inode_id).unwrap(),
+            Some(kind_mismatch_root)
+        );
+        assert_eq!(
+            storage.get_detached_root(kind_mismatch_root_inode_id).unwrap(),
+            Some(marker)
+        );
+        assert_eq!(storage.load_raft_state().unwrap(), kind_applied_before);
+
+        let child_root_inode_id = InodeId::new(50);
+        let child_key_inode_id = InodeId::new(51);
+        let embedded_child_inode_id = InodeId::new(52);
+        let corrupt_child = Inode::new_symlink(
+            embedded_child_inode_id,
+            FileAttrs::new(),
+            "target".to_string(),
+            marker.mount_id,
+        );
+        seed_directory(&storage, child_root_inode_id, marker.mount_id);
+        storage
+            .put_inode_at_storage_key(child_key_inode_id, &corrupt_child)
+            .unwrap();
+        storage
+            .put_dentry(child_root_inode_id, "child", child_key_inode_id)
+            .unwrap();
+        storage.put_detached_root(child_root_inode_id, marker).unwrap();
+        let child_applied_before = storage.load_raft_state().unwrap();
+
+        let child_identity_error = reclaim(&state_machine, vec![child_root_inode_id], 10).unwrap_err();
+
+        assert!(child_identity_error.to_string().contains("inode key"));
+        assert_eq!(
+            storage.get_dentry(child_root_inode_id, "child").unwrap(),
+            Some(child_key_inode_id)
+        );
+        assert_eq!(storage.get_inode(child_key_inode_id).unwrap(), Some(corrupt_child));
+        assert_eq!(storage.get_detached_root(child_root_inode_id).unwrap(), Some(marker));
+        assert!(storage.get_detached_root(child_key_inode_id).unwrap().is_none());
+        assert_eq!(storage.load_raft_state().unwrap(), child_applied_before);
     }
 
     #[test]

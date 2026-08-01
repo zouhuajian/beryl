@@ -412,6 +412,12 @@ impl AppRaftStateMachine {
             .storage
             .get_inode(mount_root_inode_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("Mount root inode not found: {mount_root_inode_id}")))?;
+        if parent.inode_id != mount_root_inode_id {
+            return Err(MetadataError::Internal(format!(
+                "mount root inode key {mount_root_inode_id} contains inode {}",
+                parent.inode_id
+            )));
+        }
         if parent.kind != parent.data.kind() {
             return Err(MetadataError::Internal(format!(
                 "mount root inode {mount_root_inode_id} kind and payload disagree"
@@ -439,6 +445,12 @@ impl AppRaftStateMachine {
                 .storage
                 .get_inode(child_inode_id)?
                 .ok_or_else(|| MetadataError::NotFound(format!("Child inode not found: {child_inode_id}")))?;
+            if child.inode_id != child_inode_id {
+                return Err(MetadataError::Internal(format!(
+                    "inode key {child_inode_id} contains inode {}",
+                    child.inode_id
+                )));
+            }
             if child.kind != child.data.kind() {
                 return Err(MetadataError::Internal(format!(
                     "inode {child_inode_id} kind and payload disagree"
@@ -649,7 +661,7 @@ impl AppRaftStateMachine {
             if !root_inode.kind.is_dir() || !matches!(&root_inode.data, InodeData::Dir) {
                 return Err(MetadataError::NotDir(format!("Not a directory: {name}")));
             }
-            if root_inode.data_handle_id.as_raw() != 0 {
+            if root_inode.data_handle_id.as_raw() != 0 || self.storage.get_layout_optional(root_inode_id)?.is_some() {
                 return Err(MetadataError::Internal(format!(
                     "directory inode {root_inode_id} carries file authority"
                 )));
@@ -1146,6 +1158,131 @@ mod tests {
     }
 
     #[test]
+    fn delete_rejects_mount_root_key_identity_mismatch_without_path_deviation() {
+        let (_dir, storage, sm, mount_root_inode_id) = test_state();
+        let visible = create_file(&sm, mount_root_inode_id, "target");
+        let diverted = create_file(&sm, mount_root_inode_id, "diverted");
+        let visible_inode_id = visible.inode_id.unwrap();
+        let diverted_inode_id = diverted.inode_id.unwrap();
+        let diverted_parent_inode_id = InodeId::new(20);
+        storage
+            .put_dentry(diverted_parent_inode_id, "target", diverted_inode_id)
+            .unwrap();
+        storage
+            .put_inode_at_storage_key(
+                mount_root_inode_id,
+                &Inode::new_dir(diverted_parent_inode_id, FileAttrs::new(), MountId::new(1)),
+            )
+            .unwrap();
+        let applied_before = storage.load_raft_state().unwrap();
+
+        let error = sm
+            .apply(delete_command("target", diverted_inode_id, Some(0), false))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("mount root inode key"));
+        assert_eq!(
+            storage.get_dentry(mount_root_inode_id, "target").unwrap(),
+            Some(visible_inode_id)
+        );
+        assert_eq!(
+            storage.get_dentry(diverted_parent_inode_id, "target").unwrap(),
+            Some(diverted_inode_id)
+        );
+        assert!(storage.get_inode(visible_inode_id).unwrap().is_some());
+        assert!(storage.get_inode(diverted_inode_id).unwrap().is_some());
+        assert!(storage.get_layout_optional(visible_inode_id).unwrap().is_some());
+        assert!(storage.get_layout_optional(diverted_inode_id).unwrap().is_some());
+        assert_eq!(
+            storage
+                .get_inode_by_data_handle(visible.data_handle_id.unwrap())
+                .unwrap(),
+            Some(visible_inode_id)
+        );
+        assert_eq!(
+            storage
+                .get_inode_by_data_handle(diverted.data_handle_id.unwrap())
+                .unwrap(),
+            Some(diverted_inode_id)
+        );
+        assert!(storage.get_detached_root(diverted_inode_id).unwrap().is_none());
+        assert_eq!(storage.load_raft_state().unwrap(), applied_before);
+    }
+
+    #[test]
+    fn delete_rejects_intermediate_key_identity_mismatch_without_path_deviation() {
+        let (_dir, storage, sm, mount_root_inode_id) = test_state();
+        let outer_inode_id = expect_fs_ok(
+            sm.apply(Command::CreateDirectory {
+                proposed_at_ms: 1,
+                root_inode_id: mount_root_inode_id,
+                components: vec!["outer".to_string()],
+                attrs: FileAttrs::new(),
+                recursive: false,
+            })
+            .unwrap(),
+        )
+        .inode_id
+        .unwrap();
+        let visible = create_file(&sm, outer_inode_id, "target");
+        let diverted = create_file(&sm, outer_inode_id, "diverted");
+        let visible_inode_id = visible.inode_id.unwrap();
+        let diverted_inode_id = diverted.inode_id.unwrap();
+        let diverted_parent_inode_id = InodeId::new(200);
+        storage
+            .put_dentry(diverted_parent_inode_id, "target", diverted_inode_id)
+            .unwrap();
+        storage
+            .put_inode_at_storage_key(
+                outer_inode_id,
+                &Inode::new_dir(diverted_parent_inode_id, FileAttrs::new(), MountId::new(1)),
+            )
+            .unwrap();
+        let applied_before = storage.load_raft_state().unwrap();
+
+        let error = sm
+            .apply(delete_path_command(
+                vec!["outer".to_string(), "target".to_string()],
+                diverted_inode_id,
+                Some(0),
+                false,
+            ))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("inode key"));
+        assert_eq!(
+            storage.get_dentry(mount_root_inode_id, "outer").unwrap(),
+            Some(outer_inode_id)
+        );
+        assert_eq!(
+            storage.get_dentry(outer_inode_id, "target").unwrap(),
+            Some(visible_inode_id)
+        );
+        assert_eq!(
+            storage.get_dentry(diverted_parent_inode_id, "target").unwrap(),
+            Some(diverted_inode_id)
+        );
+        assert!(storage.get_inode(visible_inode_id).unwrap().is_some());
+        assert!(storage.get_inode(diverted_inode_id).unwrap().is_some());
+        assert!(storage.get_layout_optional(visible_inode_id).unwrap().is_some());
+        assert!(storage.get_layout_optional(diverted_inode_id).unwrap().is_some());
+        assert_eq!(
+            storage
+                .get_inode_by_data_handle(visible.data_handle_id.unwrap())
+                .unwrap(),
+            Some(visible_inode_id)
+        );
+        assert_eq!(
+            storage
+                .get_inode_by_data_handle(diverted.data_handle_id.unwrap())
+                .unwrap(),
+            Some(diverted_inode_id)
+        );
+        assert!(storage.get_detached_root(diverted_inode_id).unwrap().is_none());
+        assert_eq!(storage.load_raft_state().unwrap(), applied_before);
+    }
+
+    #[test]
     fn delete_rejects_stale_mount_and_target_fencing_without_mutation() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
         let directory = expect_fs_ok(
@@ -1363,6 +1500,45 @@ mod tests {
                 detached_at_ms: 2,
             })
         );
+    }
+
+    #[test]
+    fn recursive_delete_rejects_directory_layout_before_detach() {
+        let (_dir, storage, sm, parent_inode_id) = test_state();
+        let directory = expect_fs_ok(
+            sm.apply(Command::CreateDirectory {
+                proposed_at_ms: 1,
+                root_inode_id: parent_inode_id,
+                components: vec!["target".to_string()],
+                attrs: FileAttrs::new(),
+                recursive: false,
+            })
+            .unwrap(),
+        )
+        .inode_id
+        .unwrap();
+        let parent_before = storage.get_inode(parent_inode_id).unwrap().unwrap();
+        let directory_before = storage.get_inode(directory).unwrap().unwrap();
+        let layout = FileLayout::new(4096, 4096, 1);
+        storage.put_layout(directory, layout).unwrap();
+        let applied_before = storage.load_raft_state().unwrap();
+        let rejected_applied_state = AppMetadataRaftState {
+            last_applied_log_id: Some(openraft::LogId::new(openraft::LeaderId::new(7, 1), 701)),
+            ..AppMetadataRaftState::default()
+        };
+        assert_ne!(rejected_applied_state, applied_before);
+
+        let error = sm
+            .apply_with_raft_state(delete_command("target", directory, None, true), &rejected_applied_state)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("carries file authority"));
+        assert_eq!(storage.get_dentry(parent_inode_id, "target").unwrap(), Some(directory));
+        assert_eq!(storage.get_inode(parent_inode_id).unwrap(), Some(parent_before));
+        assert_eq!(storage.get_inode(directory).unwrap(), Some(directory_before));
+        assert_eq!(storage.get_layout(directory).unwrap(), layout);
+        assert!(storage.get_detached_root(directory).unwrap().is_none());
+        assert_eq!(storage.load_raft_state().unwrap(), applied_before);
     }
 
     #[test]

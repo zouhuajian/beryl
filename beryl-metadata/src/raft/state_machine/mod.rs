@@ -471,7 +471,15 @@ pub(crate) mod test_support {
 
     impl AppRaftStateMachine {
         pub(crate) fn apply(&self, command: Command) -> MetadataResult<CommandResult> {
-            match self.apply_committed(command, &AppMetadataRaftState::default()) {
+            self.apply_with_raft_state(command, &AppMetadataRaftState::default())
+        }
+
+        pub(crate) fn apply_with_raft_state(
+            &self,
+            command: Command,
+            raft_state: &AppMetadataRaftState,
+        ) -> MetadataResult<CommandResult> {
+            match self.apply_committed(command, raft_state) {
                 Ok(CommittedApply {
                     response: CommandResult::Rejected(rejection),
                     ..
