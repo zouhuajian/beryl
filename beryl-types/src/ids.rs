@@ -89,9 +89,12 @@ impl fmt::Display for BlockIndex {
 }
 
 /// Data-plane block identity.
-/// Blocks are addressed under a DataHandleId, not under an inode.
-/// This prevents namespace identity (inode) from being conflated with data instances (handles).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Blocks are addressed under a `DataHandleId`, not under an inode. This
+/// prevents namespace identity from being conflated with data instances. The
+/// derived order is lexicographic by data handle and block index, providing a
+/// deterministic traversal order without changing identity semantics.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BlockId {
     /// The data handle this block belongs to (data-plane scope).
     pub data_handle_id: DataHandleId,

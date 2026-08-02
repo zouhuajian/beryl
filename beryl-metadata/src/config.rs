@@ -91,7 +91,7 @@ pub struct CleanupConfig {
     pub scan_interval_ms: u64,
     /// Time a replica must remain reclaimable before it is reported as ready.
     pub reclaim_grace_ms: u64,
-    /// Maximum number of ready replicas copied into one complete scan.
+    /// Maximum number of Ready-replica positions visited in one scan page.
     pub max_replicas_per_scan: usize,
     /// Maximum number of in-memory cleanup candidates.
     pub max_candidates: usize,

@@ -10,7 +10,8 @@ use beryl_types::layout::BlockFormatId;
 use beryl_types::{GroupName, TierFree, WorkerNetProtocol, WorkerRunId, WriteTarget};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
@@ -107,7 +108,7 @@ impl BlockLocationKey {
 }
 
 /// Group-scoped key for worker registration and liveness state.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WorkerRegistrationKey {
     pub group_name: GroupName,
     pub worker_id: WorkerId,
@@ -132,11 +133,29 @@ pub struct ReplicaKey {
     pub block_stamp: u64,
 }
 
-/// Bounded copy of current ready replica reports for one metadata group.
+/// Stable exclusive position after one worker or one Ready block.
+///
+/// `block_id = None` means this worker is fully consumed and the next page
+/// starts from its successor. `Some(block_id)` resumes strictly after that
+/// block and preserves the inclusive block high watermark captured when this
+/// worker was first entered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReadyReplicaCursor {
+    /// Last worker visited in group-scoped worker-key order.
+    pub worker_id: WorkerId,
+    /// Last Ready block visited for that worker, if one was emitted.
+    pub block_id: Option<BlockId>,
+    /// Inclusive block upper bound captured on first entry into this worker.
+    pub worker_end_block_id: Option<BlockId>,
+}
+
+/// One bounded page from the current published Ready reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadyReplicaListing {
+pub(crate) struct ReadyReplicaPage {
+    /// Exact current-run Ready replicas encountered in this page.
     pub replicas: Vec<ReplicaKey>,
-    pub complete: bool,
+    /// Exclusive continuation position, or `None` when the traversal reached EOF.
+    pub next_cursor: Option<ReadyReplicaCursor>,
 }
 
 /// Live startup registration state for the current metadata process.
@@ -232,6 +251,8 @@ struct WorkerBlockReportRuntime {
     full_report_had_baseline: bool,
     staging_blocks: HashMap<BlockId, BlockReportBlock>,
     published_blocks: HashMap<BlockId, BlockReportBlock>,
+    /// Ordered Ready block identities used for bounded cleanup pagination.
+    ready_blocks: BTreeSet<BlockId>,
     /// Next delta sequence expected for the current published full baseline.
     delta_seq: u64,
 }
@@ -346,10 +367,8 @@ pub struct WorkerManager {
     heartbeat_rejections: Arc<RwLock<HashMap<WorkerRegistrationKey, HeartbeatRejectionState>>>,
     /// Block presence keyed by (group_name, block_id), memory-only.
     locations: Arc<RwLock<BlockLocations>>,
-    /// Worker blocks: (group_name, worker_id) -> [block_ids] (soft-state, memory-only).
-    worker_blocks: Arc<RwLock<HashMap<WorkerRegistrationKey, Vec<BlockId>>>>,
-    /// Full/delta block report runtime keyed by (group_name, worker_id).
-    block_reports: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerBlockReportRuntime>>>,
+    /// Full/delta report runtime in stable group/worker pagination order.
+    block_reports: Arc<RwLock<BTreeMap<WorkerRegistrationKey, WorkerBlockReportRuntime>>>,
     /// Coalesced revision for publication-relevant worker observations.
     ///
     /// Ready evidence is leader-local and reconstructable. The revision only
@@ -368,8 +387,7 @@ impl WorkerManager {
             runtime: Arc::new(RwLock::new(HashMap::new())),
             heartbeat_rejections: Arc::new(RwLock::new(HashMap::new())),
             locations: Arc::new(RwLock::new(HashMap::new())),
-            worker_blocks: Arc::new(RwLock::new(HashMap::new())),
-            block_reports: Arc::new(RwLock::new(HashMap::new())),
+            block_reports: Arc::new(RwLock::new(BTreeMap::new())),
             publication_observation,
             heartbeat_timeout_sec,
         }
@@ -389,12 +407,17 @@ impl WorkerManager {
         Duration::from_secs(self.heartbeat_timeout_sec)
     }
 
-    /// Metadata restart drops live registration and reconstructable report state.
+    /// Drops live registration and reconstructable report state on metadata restart.
     pub fn reset_worker_soft_state(&self) {
-        self.registrations.write().clear();
+        let mut registrations = self.registrations.write();
+        let mut block_reports = self.block_reports.write();
+        registrations.clear();
+        block_reports.clear();
+        drop(block_reports);
+        drop(registrations);
         self.runtime.write().clear();
         self.heartbeat_rejections.write().clear();
-        self.clear_all_block_reports();
+        self.locations.write().clear();
         self.notify_publication_observation_changed();
     }
 
@@ -421,15 +444,15 @@ impl WorkerManager {
         let mut runtime = self.runtime.write();
         let mut heartbeat_rejections = self.heartbeat_rejections.write();
         let mut locations = self.locations.write();
-        let mut worker_blocks = self.worker_blocks.write();
+        // Keep report state last to match readers that hold runtime or location
+        // guards while reading reports, preventing lock-order inversion.
         let mut block_reports = self.block_reports.write();
         descriptors.clear();
         registrations.clear();
+        block_reports.clear();
         runtime.clear();
         heartbeat_rejections.clear();
         locations.clear();
-        worker_blocks.clear();
-        block_reports.clear();
         for worker in workers {
             let descriptor = WorkerDescriptor {
                 group_name: worker.group_name,
@@ -444,7 +467,6 @@ impl WorkerManager {
             );
         }
         drop(block_reports);
-        drop(worker_blocks);
         drop(locations);
         drop(heartbeat_rejections);
         drop(runtime);
@@ -576,13 +598,6 @@ impl WorkerManager {
             worker_net_protocol,
         )?;
         let key = WorkerRegistrationKey::new(group_name, worker_id);
-        let same_registered_run = {
-            let registrations = self.registrations.read();
-            registrations
-                .get(&key)
-                .map(|registration| registration.worker_run_id.matches(worker_run_id))
-                .unwrap_or(false)
-        };
         let descriptor_address = address.clone();
         let descriptor_fault_domain = fault_domain.clone();
         let descriptor = WorkerDescriptor {
@@ -595,6 +610,11 @@ impl WorkerManager {
         self.upsert_descriptor(descriptor)?;
 
         let mut registrations = self.registrations.write();
+        let mut block_reports = self.block_reports.write();
+        let same_registered_run = registrations
+            .get(&key)
+            .map(|registration| registration.worker_run_id.matches(worker_run_id))
+            .unwrap_or(false);
         registrations.insert(
             key.clone(),
             WorkerRegistrationState {
@@ -606,11 +626,15 @@ impl WorkerManager {
                 fault_domain,
             },
         );
+        if !same_registered_run {
+            block_reports.remove(&key);
+        }
+        drop(block_reports);
         drop(registrations);
         self.heartbeat_rejections.write().remove(&key);
         if !same_registered_run {
             self.runtime.write().remove(&key);
-            self.clear_block_report_for_worker(key);
+            self.remove_location_index_for_worker(&key);
         }
         self.notify_publication_observation_changed();
         Ok(())
@@ -634,6 +658,17 @@ impl WorkerManager {
         self.validate_report_source(group_name, worker_id, worker_run_id)?;
         let key = WorkerRegistrationKey::new(group_name, worker_id);
 
+        let registrations = self.registrations.read();
+        if !registrations
+            .get(&key)
+            .is_some_and(|registration| registration.worker_run_id.matches(worker_run_id))
+        {
+            return Err(MetadataError::StaleState(format!(
+                "worker_run_id mismatch for group_name={}, worker_id={}",
+                group_name,
+                worker_id.as_raw()
+            )));
+        }
         let mut reports = self.block_reports.write();
         let report = reports.entry(key.clone()).or_default();
         if batch_seq == 0 {
@@ -680,8 +715,9 @@ impl WorkerManager {
         report.next_batch_seq = batch_seq.saturating_add(1);
 
         if !final_batch {
+            let next_delta_seq = report.delta_seq;
             return Ok(BlockReportApplyResult {
-                next_delta_seq: report.delta_seq,
+                next_delta_seq,
                 ..BlockReportApplyResult::default()
             });
         }
@@ -693,11 +729,18 @@ impl WorkerManager {
         let baseline_replaced = report.full_report_had_baseline && old_published_blocks != published_blocks;
         let new_ready = ready_block_ids(published_blocks.values());
         report.published_blocks = published_blocks;
+        report.ready_blocks = report
+            .published_blocks
+            .values()
+            .filter(|block| block.block_state == BlockReportBlockState::Ready)
+            .map(|block| block.block_id)
+            .collect();
         report.state = BlockReportState::Ready;
         report.delta_seq = 0;
         let next_delta_seq = report.delta_seq;
         let published_for_index = report.published_blocks.clone();
         drop(reports);
+        drop(registrations);
 
         self.rebuild_location_index_for_worker(key, &published_for_index);
         self.notify_publication_observation_changed();
@@ -730,6 +773,17 @@ impl WorkerManager {
         self.validate_report_source(group_name, worker_id, worker_run_id)?;
         let key = WorkerRegistrationKey::new(group_name, worker_id);
 
+        let registrations = self.registrations.read();
+        if !registrations
+            .get(&key)
+            .is_some_and(|registration| registration.worker_run_id.matches(worker_run_id))
+        {
+            return Err(MetadataError::StaleState(format!(
+                "worker_run_id mismatch for group_name={}, worker_id={}",
+                group_name,
+                worker_id.as_raw()
+            )));
+        }
         let mut reports = self.block_reports.write();
         let report = reports.get_mut(&key).ok_or_else(|| {
             MetadataError::FullReportRequired(format!(
@@ -774,12 +828,19 @@ impl WorkerManager {
 
         let old_ready = ready_block_ids(report.published_blocks.values());
         for delta in deltas {
+            let block_id = delta.block.block_id;
             match delta.op {
                 BlockReportDeltaOp::AddUpdate => {
-                    report.published_blocks.insert(delta.block.block_id, delta.block);
+                    if delta.block.block_state == BlockReportBlockState::Ready {
+                        report.ready_blocks.insert(block_id);
+                    } else {
+                        report.ready_blocks.remove(&block_id);
+                    }
+                    report.published_blocks.insert(block_id, delta.block);
                 }
                 BlockReportDeltaOp::Remove => {
-                    report.published_blocks.remove(&delta.block.block_id);
+                    report.ready_blocks.remove(&block_id);
+                    report.published_blocks.remove(&block_id);
                 }
             }
         }
@@ -788,6 +849,7 @@ impl WorkerManager {
         let next_delta_seq = report.delta_seq;
         let published_for_index = report.published_blocks.clone();
         drop(reports);
+        drop(registrations);
 
         self.rebuild_location_index_for_worker(key, &published_for_index);
         self.notify_publication_observation_changed();
@@ -845,18 +907,6 @@ impl WorkerManager {
         key: WorkerRegistrationKey,
         published_blocks: &HashMap<BlockId, BlockReportBlock>,
     ) {
-        {
-            let mut worker_blocks = self.worker_blocks.write();
-            worker_blocks.insert(
-                key.clone(),
-                published_blocks
-                    .values()
-                    .filter(|block| block.block_state == BlockReportBlockState::Ready)
-                    .map(|block| block.block_id)
-                    .collect(),
-            );
-        }
-
         let mut locations = self.locations.write();
         for workers in locations.values_mut() {
             workers.retain(|worker_key| worker_key != &key);
@@ -875,20 +925,12 @@ impl WorkerManager {
         }
     }
 
-    fn clear_block_report_for_worker(&self, key: WorkerRegistrationKey) {
-        self.block_reports.write().remove(&key);
-        self.worker_blocks.write().remove(&key);
+    fn remove_location_index_for_worker(&self, key: &WorkerRegistrationKey) {
         let mut locations = self.locations.write();
         for workers in locations.values_mut() {
-            workers.retain(|worker_key| worker_key != &key);
+            workers.retain(|worker_key| worker_key != key);
         }
         locations.retain(|_, workers| !workers.is_empty());
-    }
-
-    fn clear_all_block_reports(&self) {
-        self.block_reports.write().clear();
-        self.worker_blocks.write().clear();
-        self.locations.write().clear();
     }
 
     pub fn mark_heartbeat_need_register_if_changed(
@@ -1114,21 +1156,21 @@ impl WorkerManager {
         let mut removed = false;
         let mut affected_blocks = HashSet::new();
 
-        if self.registrations.write().remove(&key).is_some() {
+        let mut registrations = self.registrations.write();
+        let mut block_reports = self.block_reports.write();
+        let registration_removed = registrations.remove(&key).is_some();
+        let removed_report = block_reports.remove(&key);
+        if registration_removed || removed_report.is_some() {
             removed = true;
         }
+        drop(block_reports);
+        drop(registrations);
         if self.runtime.write().remove(&key).is_some() {
             removed = true;
         }
 
-        if let Some(report) = self.block_reports.write().remove(&key) {
-            removed = true;
+        if let Some(report) = removed_report {
             affected_blocks.extend(ready_block_ids(report.published_blocks.values()));
-        }
-
-        if let Some(blocks) = self.worker_blocks.write().remove(&key) {
-            removed = true;
-            affected_blocks.extend(blocks);
         }
 
         {
@@ -1339,80 +1381,204 @@ impl WorkerManager {
 
     /// Get all blocks for a worker.
     pub fn get_worker_blocks(&self, group_name: &GroupName, worker_id: WorkerId) -> Vec<BlockId> {
-        let worker_blocks = self.worker_blocks.read();
-        worker_blocks
+        self.block_reports
+            .read()
             .get(&WorkerRegistrationKey::new(group_name, worker_id))
-            .cloned()
+            .map(|report| report.ready_blocks.iter().copied().collect())
             .unwrap_or_default()
     }
 
-    /// Copy at most `limit` ready replicas from complete full-report baselines.
+    /// Captures the inclusive Worker end of the group's current report keyspace.
     ///
-    /// A replica is returned only when the report belongs to the currently
-    /// registered worker run. Callers must discard the listing when
-    /// `complete` is false.
+    /// Later workers are deferred to the next scan cycle. The paginator also
+    /// captures an inclusive block end when it first enters each worker, so
+    /// appends cannot indefinitely delay progress to the next worker.
+    pub(crate) fn ready_replica_scan_end(&self, group_name: &GroupName) -> Option<WorkerId> {
+        let reports = self.block_reports.read();
+        let end_key = WorkerRegistrationKey::new(group_name, WorkerId::new(u64::MAX));
+        let (worker_key, _) = reports.range(..=end_key).next_back()?;
+        if &worker_key.group_name != group_name {
+            return None;
+        }
+        Some(worker_key.worker_id)
+    }
+
+    /// Copies one bounded, stably ordered page from published Ready reports.
     ///
-    /// Registration and report read guards remain held together while copying,
-    /// preventing a new worker run from being paired with an old run's report.
-    pub fn list_ready_replicas(&self, group_name: &GroupName, limit: usize) -> ReadyReplicaListing {
+    /// Report changes may defer keys inserted at or before the cursor until the
+    /// next complete cycle. Registration and report guards are held together so
+    /// one page never pairs different Worker runs. The work budget counts each
+    /// emitted block and each visited worker that cannot emit a block, keeping
+    /// scans bounded even when reports are not Ready.
+    pub(crate) fn list_ready_replica_page(
+        &self,
+        group_name: &GroupName,
+        cursor: Option<ReadyReplicaCursor>,
+        scan_end_worker_id: WorkerId,
+        limit: usize,
+    ) -> MetadataResult<ReadyReplicaPage> {
         if limit == 0 {
-            return ReadyReplicaListing {
+            return Err(MetadataError::InvalidArgument(
+                "ready replica page limit must be greater than zero".to_string(),
+            ));
+        }
+
+        if cursor.is_some_and(|cursor| {
+            cursor.worker_id > scan_end_worker_id
+                || (cursor.worker_id == scan_end_worker_id && cursor.block_id.is_none())
+        }) {
+            return Ok(ReadyReplicaPage {
                 replicas: Vec::new(),
-                complete: false,
-            };
+                next_cursor: None,
+            });
+        }
+        if cursor.is_some_and(|cursor| cursor.block_id.is_some() && cursor.worker_end_block_id.is_none()) {
+            return Err(MetadataError::Internal(
+                "ready replica cursor is missing its worker block end".to_string(),
+            ));
         }
 
         let registrations = self.registrations.read();
         let reports = self.block_reports.read();
+        let start_worker_id = cursor
+            .map(|cursor| cursor.worker_id)
+            .unwrap_or_else(|| WorkerId::new(0));
+        let start_key = WorkerRegistrationKey::new(group_name, start_worker_id);
         let mut replicas = Vec::new();
+        let mut visited = 0;
 
-        for (worker_key, report) in reports.iter() {
-            if &worker_key.group_name != group_name || report.state != BlockReportState::Ready {
+        for (worker_key, report) in reports.range(start_key..) {
+            if &worker_key.group_name != group_name {
+                break;
+            }
+            if worker_key.worker_id > scan_end_worker_id {
+                break;
+            }
+            if cursor.is_some_and(|cursor| cursor.worker_id == worker_key.worker_id && cursor.block_id.is_none()) {
                 continue;
             }
-            let Some(report_run_id) = report.worker_run_id else {
-                continue;
-            };
-            let Some(registration) = registrations.get(worker_key) else {
-                continue;
-            };
-            if !registration.worker_run_id.matches(report_run_id) {
-                continue;
-            }
+            let is_end_worker = worker_key.worker_id == scan_end_worker_id;
 
-            for block in report
-                .published_blocks
-                .values()
-                .filter(|block| block.block_state == BlockReportBlockState::Ready)
+            let report_run_id = report.worker_run_id;
+            let current_run = registrations
+                .get(worker_key)
+                .map(|registration| registration.worker_run_id);
+            if report.state != BlockReportState::Ready
+                || report_run_id.is_none()
+                || !current_run
+                    .is_some_and(|run_id| report_run_id.is_some_and(|report_run_id| run_id.matches(report_run_id)))
+                || report.ready_blocks.is_empty()
             {
-                if replicas.len() == limit {
-                    return ReadyReplicaListing {
+                visited += 1;
+                if is_end_worker {
+                    return Ok(ReadyReplicaPage {
                         replicas,
-                        complete: false,
-                    };
+                        next_cursor: None,
+                    });
+                }
+                let next_cursor = ReadyReplicaCursor {
+                    worker_id: worker_key.worker_id,
+                    block_id: None,
+                    worker_end_block_id: None,
+                };
+                if visited == limit {
+                    return Ok(ReadyReplicaPage {
+                        replicas,
+                        next_cursor: Some(next_cursor),
+                    });
+                }
+                continue;
+            }
+            let report_run_id = report_run_id.expect("Ready report run checked above");
+
+            let worker_cursor = cursor.filter(|cursor| cursor.worker_id == worker_key.worker_id);
+            let after_block = worker_cursor.and_then(|cursor| cursor.block_id);
+            let worker_end_block_id = worker_cursor
+                .and_then(|cursor| cursor.worker_end_block_id)
+                .or_else(|| report.ready_blocks.last().copied())
+                .expect("non-empty Ready report has a last block");
+            let lower_bound = after_block.map(Excluded).unwrap_or(Unbounded);
+            let replicas_before_worker = replicas.len();
+            for block_id in report.ready_blocks.range((lower_bound, Included(worker_end_block_id))) {
+                let Some(block) = report.published_blocks.get(block_id) else {
+                    return Err(MetadataError::Internal(format!(
+                        "Ready block index is missing report state for group_name={}, worker_id={}, block_id={}",
+                        group_name,
+                        worker_key.worker_id.as_raw(),
+                        block_id
+                    )));
+                };
+                if block.block_state != BlockReportBlockState::Ready {
+                    return Err(MetadataError::Internal(format!(
+                        "Ready block index contains non-Ready report state for group_name={}, worker_id={}, block_id={}",
+                        group_name,
+                        worker_key.worker_id.as_raw(),
+                        block_id
+                    )));
                 }
                 replicas.push(ReplicaKey {
                     group_name: group_name.clone(),
                     worker_id: worker_key.worker_id,
                     worker_run_id: report_run_id,
-                    block_id: block.block_id,
+                    block_id: *block_id,
                     block_stamp: block.block_stamp,
+                });
+                visited += 1;
+                if *block_id == worker_end_block_id {
+                    if is_end_worker {
+                        return Ok(ReadyReplicaPage {
+                            replicas,
+                            next_cursor: None,
+                        });
+                    }
+                    if visited == limit {
+                        return Ok(ReadyReplicaPage {
+                            replicas,
+                            next_cursor: Some(ReadyReplicaCursor {
+                                worker_id: worker_key.worker_id,
+                                block_id: None,
+                                worker_end_block_id: None,
+                            }),
+                        });
+                    }
+                    break;
+                }
+                if visited == limit {
+                    return Ok(ReadyReplicaPage {
+                        replicas,
+                        next_cursor: Some(ReadyReplicaCursor {
+                            worker_id: worker_key.worker_id,
+                            block_id: Some(*block_id),
+                            worker_end_block_id: Some(worker_end_block_id),
+                        }),
+                    });
+                }
+            }
+            if replicas.len() == replicas_before_worker {
+                visited += 1;
+                if visited == limit && !is_end_worker {
+                    return Ok(ReadyReplicaPage {
+                        replicas,
+                        next_cursor: Some(ReadyReplicaCursor {
+                            worker_id: worker_key.worker_id,
+                            block_id: None,
+                            worker_end_block_id: None,
+                        }),
+                    });
+                }
+            }
+            if is_end_worker {
+                return Ok(ReadyReplicaPage {
+                    replicas,
+                    next_cursor: None,
                 });
             }
         }
 
-        replicas.sort_by_key(|replica| {
-            (
-                replica.worker_id.as_raw(),
-                replica.block_id.data_handle_id.as_raw(),
-                replica.block_id.index.as_raw(),
-                replica.block_stamp,
-            )
-        });
-        ReadyReplicaListing {
+        Ok(ReadyReplicaPage {
             replicas,
-            complete: true,
-        }
+            next_cursor: None,
+        })
     }
 
     /// Returns whether an exact replica is still Ready in the current worker run.
@@ -1666,8 +1832,8 @@ mod tests {
 
     use super::{
         BlockLocationKey, BlockReportBlock, BlockReportBlockState, BlockReportDeltaEntry, BlockReportDeltaOp,
-        HealthStatus, PublishReadyConflict, PublishReadyStatus, ReplicaKey, WorkerInfo, WorkerManager,
-        WorkerRegistrationKey,
+        HealthStatus, PublishReadyConflict, PublishReadyStatus, ReadyReplicaCursor, ReplicaKey, WorkerInfo,
+        WorkerManager, WorkerRegistrationKey,
     };
     use crate::error::MetadataError;
     use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
@@ -1723,6 +1889,12 @@ mod tests {
                 HealthStatus::Healthy,
             )
             .unwrap();
+    }
+
+    fn ready_scan_end(manager: &WorkerManager, group_name: &GroupName) -> WorkerId {
+        manager
+            .ready_replica_scan_end(group_name)
+            .expect("group should have a report scan end")
     }
 
     fn publication_target(
@@ -1949,7 +2121,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_replica_listing_requires_complete_current_run_and_respects_limit() {
+    fn ready_replica_pages_require_current_run_and_reach_eof_in_stable_order() {
         let manager = WorkerManager::new(60);
         let local_group = group_name("g-ready");
         let other_group = group_name("g-other");
@@ -1959,17 +2131,19 @@ mod tests {
         let other_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440116".parse().unwrap();
         register_live_report_worker(&manager, &local_group, worker_id, run_id);
         register_live_report_worker(&manager, &other_group, other_worker_id, other_run_id);
+        assert!(matches!(
+            manager.list_ready_replica_page(&local_group, None, worker_id, 0,),
+            Err(MetadataError::InvalidArgument(_))
+        ));
 
         manager
             .receive_full_block_report(&local_group, worker_id, run_id, 1, 0, false, vec![report_block(0)])
             .unwrap();
-        assert_eq!(
-            manager.list_ready_replicas(&local_group, 10),
-            super::ReadyReplicaListing {
-                replicas: Vec::new(),
-                complete: true,
-            }
-        );
+        let receiving = manager
+            .list_ready_replica_page(&local_group, None, ready_scan_end(&manager, &local_group), 10)
+            .unwrap();
+        assert!(receiving.replicas.is_empty());
+        assert!(receiving.next_cursor.is_none());
 
         let mut partial = report_block(2);
         partial.block_state = BlockReportBlockState::Partial;
@@ -1996,10 +2170,21 @@ mod tests {
             )
             .unwrap();
 
-        let listing = manager.list_ready_replicas(&local_group, 10);
-        assert!(listing.complete);
+        let mut cursor = None;
+        let mut replicas = Vec::new();
+        let scan_end = ready_scan_end(&manager, &local_group);
+        loop {
+            let page = manager
+                .list_ready_replica_page(&local_group, cursor, scan_end, 1)
+                .unwrap();
+            replicas.extend(page.replicas);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
         assert_eq!(
-            listing.replicas,
+            replicas,
             vec![
                 ReplicaKey {
                     group_name: local_group.clone(),
@@ -2018,10 +2203,6 @@ mod tests {
             ]
         );
 
-        let limited = manager.list_ready_replicas(&local_group, 1);
-        assert!(!limited.complete);
-        assert_eq!(limited.replicas.len(), 1);
-
         let replacement_run: WorkerRunId = "550e8400-e29b-41d4-a716-446655440117".parse().unwrap();
         manager
             .register_worker_run(
@@ -2033,7 +2214,177 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(manager.list_ready_replicas(&local_group, 10).replicas.is_empty());
+        assert!(manager.ready_replica_scan_end(&local_group).is_none());
+    }
+
+    #[test]
+    fn ready_replica_pages_follow_full_and_delta_report_state() {
+        let manager = WorkerManager::new(60);
+        let local_group = group_name("g-ready-report-state");
+        let worker_id = WorkerId::new(16);
+        let run_id = report_run_id();
+        register_live_report_worker(&manager, &local_group, worker_id, run_id);
+
+        manager
+            .receive_full_block_report(&local_group, worker_id, run_id, 1, 0, true, vec![report_block(0)])
+            .unwrap();
+        manager
+            .apply_delta_block_report(
+                &local_group,
+                worker_id,
+                run_id,
+                1,
+                0,
+                vec![BlockReportDeltaEntry {
+                    op: BlockReportDeltaOp::AddUpdate,
+                    block: report_block(1),
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .list_ready_replica_page(&local_group, None, ready_scan_end(&manager, &local_group), 10)
+                .unwrap()
+                .replicas
+                .len(),
+            2
+        );
+
+        manager
+            .receive_full_block_report(&local_group, worker_id, run_id, 2, 0, false, vec![report_block(2)])
+            .unwrap();
+        assert_eq!(manager.get_worker_blocks(&local_group, worker_id).len(), 2);
+        assert!(manager
+            .list_ready_replica_page(&local_group, None, ready_scan_end(&manager, &local_group), 10)
+            .unwrap()
+            .replicas
+            .is_empty());
+
+        manager
+            .receive_full_block_report(&local_group, worker_id, run_id, 2, 1, true, vec![report_block(3)])
+            .unwrap();
+        assert_eq!(
+            manager
+                .list_ready_replica_page(&local_group, None, ready_scan_end(&manager, &local_group), 10)
+                .unwrap()
+                .replicas
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn ready_replica_cursor_advances_past_a_nonready_worker() {
+        let manager = WorkerManager::new(60);
+        let local_group = group_name("g-ready-workers");
+        let receiving_worker = WorkerId::new(18);
+        let ready_worker = WorkerId::new(19);
+        let receiving_run = report_run_id();
+        let ready_run: WorkerRunId = "550e8400-e29b-41d4-a716-446655440119".parse().unwrap();
+        register_live_report_worker(&manager, &local_group, receiving_worker, receiving_run);
+        register_live_report_worker(&manager, &local_group, ready_worker, ready_run);
+        manager
+            .receive_full_block_report(
+                &local_group,
+                receiving_worker,
+                receiving_run,
+                1,
+                0,
+                false,
+                vec![report_block(0)],
+            )
+            .unwrap();
+        manager
+            .receive_full_block_report(&local_group, ready_worker, ready_run, 1, 0, true, vec![report_block(1)])
+            .unwrap();
+
+        let scan_end = ready_scan_end(&manager, &local_group);
+        let first = manager
+            .list_ready_replica_page(&local_group, None, scan_end, 1)
+            .unwrap();
+        assert!(first.replicas.is_empty());
+        assert_eq!(
+            first.next_cursor,
+            Some(ReadyReplicaCursor {
+                worker_id: receiving_worker,
+                block_id: None,
+                worker_end_block_id: None,
+            })
+        );
+        let second = manager
+            .list_ready_replica_page(&local_group, first.next_cursor, scan_end, 1)
+            .unwrap();
+        assert_eq!(second.replicas.len(), 1);
+        assert_eq!(second.replicas[0].worker_id, ready_worker);
+    }
+
+    #[test]
+    fn ready_replica_pages_traverse_more_than_ten_thousand_blocks_during_other_worker_full_reports() {
+        const BLOCK_COUNT: usize = 10_001;
+        const PAGE_SIZE: usize = 1_000;
+        let manager = WorkerManager::new(60);
+        let local_group = group_name("g-ready-large");
+        let worker_id = WorkerId::new(17);
+        let run_id = report_run_id();
+        let churn_worker_id = WorkerId::new(18);
+        let churn_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440120".parse().unwrap();
+        let churn_block = report_block(20_000);
+        register_live_report_worker(&manager, &local_group, worker_id, run_id);
+        register_live_report_worker(&manager, &local_group, churn_worker_id, churn_run_id);
+        manager
+            .receive_full_block_report(
+                &local_group,
+                worker_id,
+                run_id,
+                1,
+                0,
+                true,
+                (0..BLOCK_COUNT as u32).map(report_block).collect(),
+            )
+            .unwrap();
+        manager
+            .receive_full_block_report(
+                &local_group,
+                churn_worker_id,
+                churn_run_id,
+                1,
+                0,
+                true,
+                vec![churn_block.clone()],
+            )
+            .unwrap();
+
+        let mut cursor = None;
+        let mut replicas = Vec::new();
+        let mut churn_report_seq = 1;
+        let scan_end = ready_scan_end(&manager, &local_group);
+        loop {
+            let page = manager
+                .list_ready_replica_page(&local_group, cursor, scan_end, PAGE_SIZE)
+                .unwrap();
+            replicas.extend(page.replicas);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+            churn_report_seq += 1;
+            manager
+                .receive_full_block_report(
+                    &local_group,
+                    churn_worker_id,
+                    churn_run_id,
+                    churn_report_seq,
+                    0,
+                    true,
+                    vec![churn_block.clone()],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(replicas.len(), BLOCK_COUNT + 1);
+        assert_eq!(replicas.first().unwrap().block_id, report_block(0).block_id);
+        assert_eq!(replicas.last().unwrap().block_id, churn_block.block_id);
+        assert_eq!(replicas.last().unwrap().worker_id, churn_worker_id);
     }
 
     #[test]
@@ -2054,7 +2405,6 @@ mod tests {
         manager
             .receive_full_block_report(&local_group, worker_id, run_id, 1, 0, true, vec![block.clone()])
             .unwrap();
-
         assert!(manager.is_current_ready_replica(&replica));
         let mut wrong_stamp = replica.clone();
         wrong_stamp.block_stamp += 1;
@@ -2108,7 +2458,7 @@ mod tests {
         assert!(!manager.is_current_ready_replica(&replica));
 
         manager
-            .receive_full_block_report(&local_group, worker_id, run_id, 2, 0, true, vec![block])
+            .receive_full_block_report(&local_group, worker_id, run_id, 2, 0, true, vec![block.clone()])
             .unwrap();
         assert!(manager.is_current_ready_replica(&replica));
         manager
@@ -2327,7 +2677,6 @@ mod tests {
             manager.get_block_locations(&group_name_value, report_block(0).block_id),
             vec![worker_id]
         );
-
         manager
             .load_registered_workers(vec![WorkerInfo {
                 group_name: group_name_value.clone(),
@@ -2344,7 +2693,6 @@ mod tests {
                 fault_domain: None,
             }])
             .unwrap();
-
         assert!(manager
             .get_block_locations(&group_name_value, report_block(0).block_id)
             .is_empty());
@@ -2362,6 +2710,31 @@ mod tests {
             )
             .expect_err("metadata restart must require a new full report");
         assert!(delta.to_string().contains("not registered"));
+    }
+
+    #[test]
+    fn soft_state_reset_clears_ready_report_authority() {
+        let manager = WorkerManager::new(60);
+        let group_name_value = group_name("g-reset-report-state");
+        let worker_id = WorkerId::new(9);
+        let run_id = report_run_id();
+        register_live_report_worker(&manager, &group_name_value, worker_id, run_id);
+        manager
+            .receive_full_block_report(&group_name_value, worker_id, run_id, 1, 0, true, vec![report_block(0)])
+            .unwrap();
+        let replica = ReplicaKey {
+            group_name: group_name_value.clone(),
+            worker_id,
+            worker_run_id: run_id,
+            block_id: report_block(0).block_id,
+            block_stamp: report_block(0).block_stamp,
+        };
+        assert!(manager.is_current_ready_replica(&replica));
+
+        manager.reset_worker_soft_state();
+
+        assert!(manager.ready_replica_scan_end(&group_name_value).is_none());
+        assert!(!manager.is_current_ready_replica(&replica));
     }
 
     #[test]

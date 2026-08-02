@@ -157,10 +157,12 @@ physical reclamation indefinitely.
 The replacement must:
 
 - Scan in stable pages.
-- Bind every page to the same leader term and report generation.
+- Bind every page to the same leader term and cycle-start maximum Worker ID;
+  capture each Worker's block high watermark when first entering that Worker.
 - Commit candidate retirement only after a complete scan cycle.
-- Discard the cycle when leadership, registration, worker run, or full-report
-  generation changes.
+- Allow report churn during a weakly consistent traversal; exact worker run,
+  block, stamp, and Ready-state revalidation fences dispatch.
+- Discard the cycle when the leader term changes.
 - Bound page size, candidate memory, and per-pass work without stopping global
   progress.
 
@@ -357,7 +359,9 @@ in-memory queue has an explicit upper bound while still making progress.
 #### Progress-preserving cleanup
 
 - Stable Ready-replica page cursor.
-- Full scan generation tracking.
+- Cycle-start Worker high watermark and first-entry block high watermark per
+  Worker.
+- Exact replica identity revalidation before dispatch.
 - Candidate retirement only after a complete cycle.
 - Tests above 10,000 Ready replicas.
 
@@ -827,7 +831,7 @@ Before setting production SLOs, expose the measurements needed to define them.
 | --- | --- | --- |
 | UFS version is weak or ambiguous | Stale or wrong data | Pilot immutable data; require strong version identity |
 | Eviction precedes recoverability | Permanent data loss | Evict only verified UFS-backed or replicated blocks |
-| Full report and cleanup scans grow without pagination | Metadata memory or cleanup stall | Generation-bound stable pagination |
+| Full report and cleanup scans grow without pagination | Metadata memory or cleanup stall | Leader-term-bound keyset pagination with positional Worker/block high watermarks and exact dispatch revalidation |
 | Delta report keeps full rebuild behavior | Metadata lock and CPU saturation | Incremental BlockReportIndex |
 | Extents remain inline | Large Raft entries and long apply stalls | Hard cap followed by paged extent revision |
 | Repair placeholder is mistaken for availability | False operational confidence | Remove incomplete production loops |
