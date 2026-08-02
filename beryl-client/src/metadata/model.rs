@@ -4,15 +4,15 @@
 //! Client-domain metadata result types.
 
 use crate::error::{ClientError, ClientResult};
-use beryl_types::{DataHandleId, FileBlockLocation, GroupName, WriteTarget};
+use beryl_types::{FileBlockLocation, GroupName, InodeId, WriteTarget};
 
 /// Validated read layout returned by metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ReadLayout {
     /// Metadata owner group from the validated response header.
     pub group_name: GroupName,
-    /// Data handle identity this layout belongs to.
-    pub data_handle_id: DataHandleId,
+    /// File inode identity this layout belongs to.
+    pub inode_id: InodeId,
     /// Authoritative file size at this layout version.
     pub file_size: u64,
     /// Durable visible file-state version for this read plan.
@@ -27,15 +27,12 @@ impl ReadLayout {
         group_name: GroupName,
         response: beryl_proto::metadata::GetBlockLocationsResponseProto,
     ) -> ClientResult<Self> {
-        let data_handle_id = response
-            .data_handle_id
-            .ok_or_else(|| {
-                ClientError::InvalidLayout("GetBlockLocationsResponseProto.data_handle_id missing".to_string())
-            })?
-            .try_into()
-            .map_err(|_| {
-                ClientError::InvalidLayout("GetBlockLocationsResponseProto.data_handle_id invalid".to_string())
-            })?;
+        if response.inode_id == 0 {
+            return Err(ClientError::InvalidLayout(
+                "GetBlockLocationsResponseProto.inode_id must be non-zero".to_string(),
+            ));
+        }
+        let inode_id = InodeId::new(response.inode_id);
         let locations = response
             .locations
             .into_iter()
@@ -44,7 +41,7 @@ impl ReadLayout {
             .map_err(ClientError::InvalidLayout)?;
         Ok(Self {
             group_name,
-            data_handle_id,
+            inode_id,
             file_size: response.file_size,
             content_revision: response.content_revision,
             locations,

@@ -491,9 +491,9 @@ fn block_stamp_mismatch_error(block_read: &PlannedBlockRead, actual: u64, operat
 
 fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> {
     let block = target.target.block_id;
-    if block.data_handle_id.as_raw() == 0 {
+    if block.inode_id.as_raw() == 0 {
         return Err(ClientError::InvalidLayout(
-            "write target block_id data_handle_id must be non-zero".to_string(),
+            "write target block_id inode_id must be non-zero".to_string(),
         ));
     }
     BlockShape::new(
@@ -559,7 +559,7 @@ mod tests {
     use beryl_common::error::rpc::{ErrorKind, RefreshHint as RpcRefreshHint, RpcErrorDetail};
     use beryl_proto::convert::rpc_error_to_proto;
     use beryl_types::lease::FencingToken;
-    use beryl_types::{BlockId, BlockIndex, ClientId, DataHandleId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol};
+    use beryl_types::{BlockId, BlockIndex, ClientId, InodeId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol};
 
     use crate::rpc_error::ClientAction;
     use crate::runtime::{classify_error, ErrorClass, OperationContext, OperationDeadline};
@@ -734,7 +734,7 @@ mod tests {
         let request = build_open_write_stream_request(&attempt, &target, &worker).expect("open write request");
 
         assert_eq!(request.group_name, "root");
-        assert_eq!(request.block_id.as_ref().map(|block| block.data_handle_id), Some(202));
+        assert_eq!(request.block_id.as_ref().map(|block| block.inode_id), Some(202));
         assert_eq!(request.block_size, 4096);
         assert_eq!(request.block_stamp, 77);
         assert_eq!(request.chunk_size, 4096);
@@ -1013,13 +1013,13 @@ mod tests {
         WorkerWriteTarget {
             group_name: test_group_name(),
             target: WriteTarget {
-                block_id: BlockId::new(DataHandleId::new(202), BlockIndex::new(0)),
+                block_id: BlockId::new(InodeId::new(202), BlockIndex::new(0)),
                 file_offset: 0,
                 block_size: 4096,
                 effective_len: 5,
                 worker_endpoints: vec![worker_endpoint()],
                 fencing_token: FencingToken {
-                    block_id: BlockId::new(DataHandleId::new(202), BlockIndex::new(0)),
+                    block_id: BlockId::new(InodeId::new(202), BlockIndex::new(0)),
                     owner: ClientId::new(7),
                     epoch: 1,
                 },
@@ -1056,7 +1056,7 @@ mod tests {
             file_offset: 0,
             len: 4,
             end_file_offset: 4,
-            block_id: BlockId::new(DataHandleId::new(202), BlockIndex::new(0)),
+            block_id: BlockId::new(InodeId::new(202), BlockIndex::new(0)),
             block_offset: 0,
             workers: vec![worker_endpoint()],
             block_stamp,

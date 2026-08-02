@@ -28,7 +28,7 @@ The worker consumes metadata cleanup commands from accepted heartbeat responses.
 - Namespace visibility or file layout authority.
 - Metadata route ownership.
 - Client retry/cache policy.
-- UFS path derivation from data handles or block IDs.
+- UFS path derivation from inode or block IDs.
 - Worker peer transfer.
 - Production QUIC/RDMA/io_uring/SPDK data paths.
 - Complete autonomous replication, repair, rebalancing, or partial-cache semantics.

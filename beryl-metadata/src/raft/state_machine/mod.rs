@@ -17,13 +17,13 @@ use crate::raft::response::{
     FsOkResult,
 };
 use crate::raft::storage::{
-    BootstrapNamespaceState, DetachedRoot, DetachedRootReclaimEntry, DetachedRootReclaimUpdate, FileAllocation,
-    InodeAllocation, RecursiveMkdirEntry, RenameAtomicUpdate, RenameOverwriteCleanup, RocksDBStorage,
+    BootstrapNamespaceState, DetachedRoot, DetachedRootReclaimEntry, DetachedRootReclaimUpdate, InodeAllocation,
+    RecursiveMkdirEntry, RenameAtomicUpdate, RenameOverwriteCleanup, RocksDBStorage,
 };
 use crate::raft::types::AppMetadataRaftState;
 use crate::raft::RoutingDelta;
 use beryl_types::fs::{Extent, FileAttrs, FsErrorCode, Inode, InodeData, InodeId};
-use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, MountId, WorkerId};
+use beryl_types::ids::{BlockId, BlockIndex, MountId, WorkerId};
 use beryl_types::layout::FileLayout;
 use beryl_types::GroupName;
 use std::sync::Arc;
@@ -75,7 +75,6 @@ impl CommittedApply {
 
 struct PreparedRenameOverwrite {
     inode_id: InodeId,
-    data_handle_id: Option<DataHandleId>,
 }
 
 struct PreparedRename {
@@ -86,7 +85,7 @@ struct PreparedRename {
     updated_src_inode: Inode,
 }
 
-type PreparedUnlink = (InodeId, Option<DataHandleId>, Inode, FsOkResult);
+type PreparedUnlink = (InodeId, Inode, FsOkResult);
 
 impl AppRaftStateMachine {
     pub fn new(storage: Arc<RocksDBStorage>) -> Self {
@@ -227,12 +226,8 @@ impl AppRaftStateMachine {
                 let result = self.apply_acquire_write_lease(inode_id, expected_lease_epoch, raft_state)?;
                 Ok(CommandResult::Fs(result))
             }
-            Command::AllocateBlock {
-                inode_id,
-                data_handle_id,
-                lease_epoch,
-            } => {
-                let block_id = self.apply_allocate_block(inode_id, data_handle_id, lease_epoch, raft_state)?;
+            Command::AllocateBlock { inode_id, lease_epoch } => {
+                let block_id = self.apply_allocate_block(inode_id, lease_epoch, raft_state)?;
                 Ok(CommandResult::BlockAllocated(block_id))
             }
             Command::EndWriteLease {
@@ -465,7 +460,7 @@ impl AppRaftStateMachine {
 pub(crate) mod test_support {
     pub(crate) use super::*;
     pub(crate) use beryl_types::fs::{FileAttrs, Inode};
-    pub(crate) use beryl_types::ids::{BlockId, DataHandleId, MountId, WorkerId};
+    pub(crate) use beryl_types::ids::{BlockId, InodeId, MountId, WorkerId};
     pub(crate) use beryl_types::layout::FileLayout;
     pub(crate) use tempfile::TempDir;
 
@@ -545,12 +540,11 @@ pub(crate) mod test_support {
         parent_inode_id: InodeId,
         name: &str,
         inode_id: InodeId,
-        data_handle_id: DataHandleId,
         extents: Vec<Extent>,
         size: u64,
     ) -> Inode {
         let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
-        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), parent.mount_id, data_handle_id);
+        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), parent.mount_id);
         inode.attrs.size = size;
         let next_block_index = extents
             .iter()
@@ -573,7 +567,6 @@ pub(crate) mod test_support {
         storage.put_inode(&inode).unwrap();
         storage.put_dentry(parent_inode_id, name, inode_id).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
         inode
     }
 }

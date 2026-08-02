@@ -162,11 +162,11 @@ impl InflightRegistry {
 #[cfg(test)]
 mod tests {
     use super::{InflightKind, InflightRegistry};
-    use beryl_types::ids::{BlockId, BlockIndex, DataHandleId};
+    use beryl_types::ids::{BlockId, BlockIndex, InodeId};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn block_id(raw: u64) -> BlockId {
-        BlockId::new(DataHandleId::new(raw), BlockIndex::new(0))
+        BlockId::new(InodeId::new(raw), BlockIndex::new(0))
     }
 
     fn now_ms() -> u64 {

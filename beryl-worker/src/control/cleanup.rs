@@ -353,7 +353,7 @@ mod tests {
         BlockMetaPayload, CreateStagingBlockRequest, LocalBlockStore, PublishReadyRequest, ReclaimBlockState,
         RecoveredBlock, StoreResult, SyncReadyBlockRequest,
     };
-    use beryl_types::{BlockIndex, DataHandleId};
+    use beryl_types::{BlockIndex, InodeId};
 
     #[derive(Clone, Copy)]
     enum ReclaimBehavior {
@@ -710,7 +710,7 @@ mod tests {
     }
 
     fn test_block_id(index: u32) -> BlockId {
-        BlockId::new(DataHandleId::new(7), BlockIndex::new(index))
+        BlockId::new(InodeId::new(7), BlockIndex::new(index))
     }
 
     async fn wait_for(mut condition: impl FnMut() -> bool) {

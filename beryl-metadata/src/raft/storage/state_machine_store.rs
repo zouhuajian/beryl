@@ -971,7 +971,7 @@ mod tests {
     };
     use crate::state::RouteEpoch;
     use beryl_types::fs::{FileAttrs, Inode, InodeId};
-    use beryl_types::ids::{DataHandleId, MountId, WorkerId};
+    use beryl_types::ids::{MountId, WorkerId};
     use beryl_types::layout::FileLayout;
     use beryl_types::GroupName;
     use metrics::{Counter, CounterFn, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
@@ -1142,7 +1142,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_commits_allocators_domain_state_and_applied_state() {
+    async fn create_commits_inode_allocator_domain_state_and_applied_state() {
         let (dir, storage, mut store) = committed_apply_test_store();
         let parent_inode_id = InodeId::new(1);
         storage
@@ -1166,17 +1166,11 @@ mod tests {
             storage.get_dentry(parent_inode_id, "file").unwrap(),
             Some(InodeId::new(2))
         );
-        assert_eq!(
-            storage.get_inode_by_data_handle(DataHandleId::new(1)).unwrap(),
-            Some(InodeId::new(2))
-        );
-
         drop(store);
         drop(storage);
         let reopened = RocksDBStorage::open_existing_for_start(dir.path()).unwrap();
-        let next = reopened.prepare_file_allocation().unwrap();
-        assert_eq!(next.inode.inode_id, InodeId::new(3));
-        assert_eq!(next.data_handle_id, DataHandleId::new(2));
+        let next = reopened.prepare_inode_allocation().unwrap();
+        assert_eq!(next.inode_id, InodeId::new(3));
         assert_eq!(
             reopened.get_dentry(parent_inode_id, "file").unwrap(),
             Some(InodeId::new(2))
@@ -1203,7 +1197,7 @@ mod tests {
             layout: FileLayout::new(4096, 4096, 1),
         };
         store.apply([normal_entry(1, first)]).await.unwrap();
-        let before = storage.prepare_file_allocation().unwrap();
+        let before = storage.prepare_inode_allocation().unwrap();
         let collision = Command::CreateFile {
             proposed_at_ms: crate::raft::proposal_timestamp_ms(),
             parent_inode_id,
@@ -1213,7 +1207,7 @@ mod tests {
         };
 
         let responses = store.apply([normal_entry(2, collision)]).await.unwrap();
-        let after = storage.prepare_file_allocation().unwrap();
+        let after = storage.prepare_inode_allocation().unwrap();
 
         assert!(matches!(
             responses.as_slice(),

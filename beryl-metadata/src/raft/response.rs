@@ -5,7 +5,7 @@
 
 use crate::error::MetadataError;
 use beryl_types::fs::{FileAttrs, FsErrorCode, InodeId};
-use beryl_types::ids::{BlockId, DataHandleId, WorkerId};
+use beryl_types::ids::{BlockId, WorkerId};
 use beryl_types::layout::FileLayout;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -179,7 +179,6 @@ pub(crate) enum FsCommandResult {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub(crate) struct FsOkResult {
     pub inode_id: Option<InodeId>,
-    pub data_handle_id: Option<DataHandleId>,
     pub content_revision: Option<u64>,
     pub attrs: Option<FileAttrs>,
     pub layout: Option<FileLayout>,

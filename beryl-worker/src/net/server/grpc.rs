@@ -716,7 +716,7 @@ mod tests {
         OpenWriteStreamRequestProto, ReadStreamRequestProto, SyncCommittedBlockRequestProto, WriteStreamRequestProto,
     };
     use beryl_types::fs::FsErrorCode;
-    use beryl_types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, StreamId, WorkerId};
+    use beryl_types::ids::{BlockId, BlockIndex, ClientId, InodeId, StreamId, WorkerId};
     use beryl_types::layout::BlockFormatId;
     use beryl_types::lease::FencingToken;
     use beryl_types::{GroupName, Tier, WorkerRunId};
@@ -743,7 +743,7 @@ mod tests {
     const BLOCK_STAMP: u64 = 55;
 
     fn block_id() -> BlockId {
-        BlockId::new(DataHandleId::new(7), BlockIndex::new(3))
+        BlockId::new(InodeId::new(7), BlockIndex::new(3))
     }
 
     fn group_name() -> GroupName {
@@ -760,7 +760,7 @@ mod tests {
 
     fn test_block_id_proto() -> BlockIdProto {
         BlockIdProto {
-            data_handle_id: 7,
+            inode_id: 7,
             block_index: 3,
         }
     }

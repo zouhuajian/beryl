@@ -9,20 +9,10 @@ package common;
 // Identity Types (aligned with types::ids)
 // ============================================================================
 
-/// Data handle identity for the data-plane.
-/// A DataHandleId identifies a concrete data instance bound to an inode at a specific point in time
-/// (e.g., after create, after a committed write handle, or after a version switch).
-/// It is NOT a namespace identity and MUST NOT be used for directory semantics or rename routing.
-message DataHandleIdProto {
-  uint64 value = 1;
-}
-
 /// Data-plane block identity.
-/// Blocks are addressed under a DataHandleId, not under an inode.
-/// This prevents namespace identity (inode) from being conflated with data instances (handles).
-/// Aligns with types::BlockId { data_handle: DataHandleId, index: BlockIndex }.
+/// Aligns with types::BlockId { inode_id: InodeId, index: BlockIndex }.
 message BlockIdProto {
-  uint64 data_handle_id = 1;
+  uint64 inode_id = 1;
   uint32 block_index = 2;
 }
 

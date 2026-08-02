@@ -118,7 +118,7 @@ mod tests {
     use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
     use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerInfo, WorkerManager};
     use crate::MountTable;
-    use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
+    use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
     use beryl_types::{GroupName, WorkerRunId};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -267,7 +267,7 @@ mod tests {
         let target_a = WorkerId::new(2);
         let target_b = WorkerId::new(3);
         let dead = WorkerId::new(4);
-        let block_id = BlockId::new(DataHandleId::new(11), BlockIndex::new(0));
+        let block_id = BlockId::new(InodeId::new(11), BlockIndex::new(0));
         live_worker(&worker_manager, dead);
         publish_report(&worker_manager, dead, 1, vec![block_id]);
         tokio::time::sleep(tokio::time::Duration::from_millis(1_100)).await;
@@ -381,7 +381,7 @@ mod tests {
         let target_a = WorkerId::new(2);
         let target_b = WorkerId::new(3);
         let dead = WorkerId::new(4);
-        let block_id = BlockId::new(DataHandleId::new(13), BlockIndex::new(0));
+        let block_id = BlockId::new(InodeId::new(13), BlockIndex::new(0));
         live_worker(&worker_manager, dead);
         publish_report(&worker_manager, dead, 1, vec![block_id]);
         tokio::time::sleep(tokio::time::Duration::from_millis(1_100)).await;
@@ -423,7 +423,7 @@ mod tests {
         let worker_manager = Arc::new(WorkerManager::new(60));
         let repair_queue = Arc::new(RepairQueue::new(100));
         let dead = WorkerId::new(1);
-        let block_id = BlockId::new(DataHandleId::new(12), BlockIndex::new(0));
+        let block_id = BlockId::new(InodeId::new(12), BlockIndex::new(0));
         live_worker(&worker_manager, dead);
         publish_report(&worker_manager, dead, 1, vec![block_id]);
 

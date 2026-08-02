@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
-use beryl_types::{BlockId, CommittedBlock, DataHandleId, FileLayout};
+use beryl_types::{BlockId, CommittedBlock, FileLayout, InodeId};
 
 use crate::api::handle::{ReadHandle, WriteHandle};
 use crate::api::options::DEFAULT_REPLICATION;
@@ -182,15 +182,17 @@ impl MetadataExecutor {
                 |gateway, ctx, req| async move { gateway.open_file(ctx, req).await },
             )
             .await?;
-        let data_handle_id = response
-            .data_handle_id
-            .ok_or_else(|| ClientError::Metadata("OpenFileResponseProto.data_handle_id missing".to_string()))?;
+        if response.inode_id == 0 {
+            return Err(ClientError::Metadata(
+                "OpenFileResponseProto.inode_id must be non-zero".to_string(),
+            ));
+        }
         let content_revision = response
             .content_revision
             .ok_or_else(|| ClientError::Metadata("OpenFileResponseProto.content_revision missing".to_string()))?;
         Ok(ReadHandle::new(
             path,
-            DataHandleId::new(data_handle_id.value),
+            InodeId::new(response.inode_id),
             content_revision,
             response.file_size,
         ))
@@ -209,10 +211,10 @@ impl MetadataExecutor {
         .await
     }
 
-    pub(crate) async fn read_layout_for_data_handle(
+    pub(crate) async fn read_layout_for_inode(
         &self,
         path: &str,
-        data_handle_id: DataHandleId,
+        inode_id: InodeId,
         offset: u64,
         len: u32,
         deadline: OperationDeadline,
@@ -222,11 +224,7 @@ impl MetadataExecutor {
             beryl_proto::metadata::GetBlockLocationsRequestProto {
                 header: None,
                 target: Some(
-                    beryl_proto::metadata::get_block_locations_request_proto::Target::DataHandleId(
-                        beryl_proto::common::DataHandleIdProto {
-                            value: data_handle_id.as_raw(),
-                        },
-                    ),
+                    beryl_proto::metadata::get_block_locations_request_proto::Target::InodeId(inode_id.as_raw()),
                 ),
                 range: Some(beryl_proto::common::ByteRangeProto { offset, len }),
             },
@@ -254,9 +252,12 @@ impl MetadataExecutor {
                 |gateway, ctx, req| async move { gateway.create_file(ctx, req).await },
             )
             .await?;
-        let created_data_handle = create
-            .data_handle_id
-            .ok_or_else(|| ClientError::Metadata("CreateFileResponseProto.data_handle_id missing".to_string()))?;
+        if create.inode_id == 0 {
+            return Err(ClientError::Metadata(
+                "CreateFileResponseProto.inode_id must be non-zero".to_string(),
+            ));
+        }
+        let created_inode_id = create.inode_id;
         let created_layout = create
             .layout
             .ok_or_else(|| ClientError::Metadata("CreateFileResponseProto.layout missing".to_string()))?;
@@ -269,15 +270,9 @@ impl MetadataExecutor {
                 deadline,
             )
             .await?;
-        if open
-            .write_handle
-            .as_ref()
-            .and_then(|handle| handle.data_handle_id.as_ref())
-            .map(|id| id.value)
-            != Some(created_data_handle.value)
-        {
+        if open.write_handle.as_ref().map(|handle| handle.inode_id) != Some(created_inode_id) {
             return Err(ClientError::Metadata(
-                "OpenWrite returned a different data_handle_id than CreateFile".to_string(),
+                "OpenWrite returned a different inode_id than CreateFile".to_string(),
             ));
         }
         let open_layout = open

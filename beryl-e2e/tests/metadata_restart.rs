@@ -359,6 +359,7 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
         .into_inner();
     assert_metadata_ok(open.header);
     let old_handle = open.write_handle.expect("write handle");
+    assert_eq!(old_handle.inode_id, create.inode_id);
     let mut previous_block_id = None;
     for index in 0..12 {
         let add = metadata
@@ -373,6 +374,7 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
             .into_inner();
         assert_metadata_ok(add.header);
         let block_id = add.target.expect("write target").block_id.expect("block id");
+        assert_eq!(block_id.inode_id, old_handle.inode_id);
         assert_eq!(block_id.block_index, index as u32);
         previous_block_id = Some(block_id);
     }
@@ -395,6 +397,7 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
         .into_inner();
     assert_metadata_ok(reopened.header);
     let new_handle = reopened.write_handle.expect("new write handle");
+    assert_eq!(new_handle.inode_id, old_handle.inode_id);
     let payload = deterministic_bytes(1024);
     let next = metadata
         .add_block(Request::new(AddBlockRequestProto {
@@ -409,6 +412,7 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
     assert_metadata_ok(next.header);
     let target = next.target.expect("write target after restart");
     let block_id = target.block_id.expect("block id after restart");
+    assert_eq!(block_id.inode_id, new_handle.inode_id);
     assert_eq!(block_id.block_index, 12);
     let selected_run_id = &target
         .worker_endpoints

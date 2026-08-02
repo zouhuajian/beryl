@@ -292,7 +292,7 @@ mod tests {
     use crate::mount::{DataIoPolicy, MountEntry, MountKind, MountTable};
     use crate::raft::RocksDBStorage;
     use beryl_types::fs::{FileAttrs, Inode, InodeId};
-    use beryl_types::ids::{DataHandleId, MountId};
+    use beryl_types::ids::MountId;
     use beryl_types::GroupName;
     use tempfile::TempDir;
 
@@ -450,12 +450,7 @@ mod tests {
         let mut file_attrs = FileAttrs::new();
         file_attrs.mode = 0o644;
         storage
-            .put_inode(&Inode::new_file(
-                file_c,
-                file_attrs,
-                mount.mount_id,
-                DataHandleId::new(1),
-            ))
+            .put_inode(&Inode::new_file(file_c, file_attrs, mount.mount_id))
             .unwrap();
         storage.put_dentry(dir_b, "c", file_c).unwrap();
 

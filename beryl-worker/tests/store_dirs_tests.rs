@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use beryl_types::ids::{BlockId, BlockIndex, DataHandleId};
+use beryl_types::ids::{BlockId, BlockIndex, InodeId};
 use beryl_types::{BlockFormatId, GroupName, Tier, TierFree};
 use beryl_worker::config::StoreDirConfig;
 use beryl_worker::store::block::{
@@ -23,7 +23,7 @@ fn group_name() -> GroupName {
 }
 
 fn block_id(index: u32) -> BlockId {
-    BlockId::new(DataHandleId::new(42), BlockIndex::new(index))
+    BlockId::new(InodeId::new(42), BlockIndex::new(index))
 }
 
 fn dir_config(path: std::path::PathBuf, capacity_bytes: u64) -> (String, StoreDirConfig) {

@@ -393,7 +393,7 @@ impl MetadataBlockReportLoop {
         let mut blocks = blocks.into_values().collect::<Vec<_>>();
         blocks.sort_by_key(|block| {
             let id = block_id(block).expect("local block report entry has an id");
-            (id.data_handle_id.as_raw(), id.index.as_raw())
+            (id.inode_id.as_raw(), id.index.as_raw())
         });
         Ok(blocks)
     }
@@ -660,7 +660,7 @@ fn meta_to_report_block(meta: BlockMetaPayload) -> Result<BlockReportBlockProto,
 
 fn block_id(block: &BlockReportBlockProto) -> Option<BlockId> {
     block.block_id.map(|block_id| {
-        BlockId::try_from(block_id).unwrap_or_else(|()| unreachable!("BlockIdProto conversion is infallible"))
+        BlockId::try_from(block_id).unwrap_or_else(|error| panic!("stored BlockId must be valid: {error}"))
     })
 }
 

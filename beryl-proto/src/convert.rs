@@ -19,11 +19,11 @@ use ::beryl_common::{
     header::{CallerContext, ClientInfo, RequestHeader, ResponseHeader, TraceContext},
 };
 use beryl_types::chunk::ByteRange;
-use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, StreamId, WorkerId};
+use beryl_types::ids::{BlockId, BlockIndex, StreamId, WorkerId};
 use beryl_types::layout::{BlockShape, FileLayout};
 use beryl_types::lease::FencingToken;
 use beryl_types::{
-    CallId, ClientId, CommittedBlock, FileAttrs, FileBlockLocation, GroupName, GroupStateWatermark, InodeKind,
+    CallId, ClientId, CommittedBlock, FileAttrs, FileBlockLocation, GroupName, GroupStateWatermark, InodeId, InodeKind,
     RaftLogId, Tier, WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId, WriteTarget,
 };
 
@@ -31,37 +31,23 @@ use beryl_types::{
 // ID Conversions
 // ============================================================================
 
-impl From<DataHandleId> for proto_common::DataHandleIdProto {
-    fn from(id: DataHandleId) -> Self {
-        proto_common::DataHandleIdProto { value: id.as_raw() }
-    }
-}
-
-impl TryFrom<proto_common::DataHandleIdProto> for DataHandleId {
-    type Error = ();
-
-    fn try_from(id: proto_common::DataHandleIdProto) -> Result<Self, Self::Error> {
-        Ok(DataHandleId::new(id.value))
-    }
-}
-
 impl From<BlockId> for proto_common::BlockIdProto {
     fn from(id: BlockId) -> Self {
         proto_common::BlockIdProto {
-            data_handle_id: id.data_handle_id.as_raw(),
+            inode_id: id.inode_id.as_raw(),
             block_index: id.index.as_raw(),
         }
     }
 }
 
 impl TryFrom<proto_common::BlockIdProto> for BlockId {
-    type Error = ();
+    type Error = String;
 
     fn try_from(id: proto_common::BlockIdProto) -> Result<Self, Self::Error> {
-        Ok(BlockId::new(
-            DataHandleId::new(id.data_handle_id),
-            BlockIndex::new(id.block_index),
-        ))
+        if id.inode_id == 0 {
+            return Err("BlockIdProto.inode_id must be non-zero".to_string());
+        }
+        Ok(BlockId::new(InodeId::new(id.inode_id), BlockIndex::new(id.block_index)))
     }
 }
 
@@ -111,7 +97,7 @@ pub fn required_block_id(proto: Option<proto_common::BlockIdProto>, field_name: 
     proto
         .ok_or_else(|| format!("missing {field_name}"))?
         .try_into()
-        .map_err(|_| format!("invalid {field_name}"))
+        .map_err(|error| format!("invalid {field_name}: {error}"))
 }
 
 /// Parse a required stream id field without choosing caller error policy.
@@ -1205,15 +1191,21 @@ mod tests {
 
     #[test]
     fn block_identity_conversions_round_trip() {
-        let data_handle_id = DataHandleId::new(42);
-        let proto_id: proto_common::DataHandleIdProto = data_handle_id.into();
-        let back: DataHandleId = proto_id.try_into().unwrap();
-        assert_eq!(data_handle_id, back);
-
         let block_id = BlockId::from_u64_u32(42, 7);
         let proto_id: proto_common::BlockIdProto = block_id.into();
         let back: BlockId = proto_id.try_into().unwrap();
         assert_eq!(block_id, back);
+    }
+
+    #[test]
+    fn block_identity_rejects_zero_inode_id() {
+        let error = BlockId::try_from(proto_common::BlockIdProto {
+            inode_id: 0,
+            block_index: 7,
+        })
+        .unwrap_err();
+
+        assert!(error.contains("inode_id must be non-zero"));
     }
 
     #[test]
@@ -1453,7 +1445,7 @@ mod tests {
         assert_message_fields(
             &descriptors,
             "metadata.WriteHandleProto",
-            &[("data_handle_id", 1), ("write_lease_epoch", 2)],
+            &[("inode_id", 1), ("write_lease_epoch", 2)],
         );
         assert_message_fields(
             &descriptors,

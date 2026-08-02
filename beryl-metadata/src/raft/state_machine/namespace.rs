@@ -93,7 +93,6 @@ impl AppRaftStateMachine {
 
             Ok(FsOkResult {
                 inode_id: Some(inode_id),
-                data_handle_id: None,
                 content_revision: None,
                 attrs: Some(inode.attrs.clone()),
                 layout: None,
@@ -191,7 +190,6 @@ impl AppRaftStateMachine {
 
         let result = FsCommandResult::Ok(FsOkResult {
             inode_id: Some(parent.inode_id),
-            data_handle_id: None,
             content_revision: None,
             attrs: Some(parent.attrs.clone()),
             layout: None,
@@ -225,7 +223,7 @@ impl AppRaftStateMachine {
             );
         }
 
-        let prepared: MetadataResult<(FileAllocation, Inode, Inode, FsOkResult)> = (|| {
+        let prepared: MetadataResult<(InodeAllocation, Inode, Inode, FsOkResult)> = (|| {
             // Check parent exists and is a directory
             let parent_inode = self
                 .storage
@@ -239,17 +237,16 @@ impl AppRaftStateMachine {
             }
 
             // Generate inode ID
-            let allocation = self.storage.prepare_file_allocation()?;
-            let inode_id = allocation.inode.inode_id;
-            let data_handle_id = allocation.data_handle_id;
+            let allocation = self.storage.prepare_inode_allocation()?;
+            let inode_id = allocation.inode_id;
             let now_ms = proposed_at_ms;
 
             // Initialize attrs
             attrs.update_timestamps(now_ms);
             attrs.nlink = 1;
 
-            // Create file inode (inherit mount_id from parent) with a freshly allocated data handle.
-            let inode = Inode::new_file(inode_id, attrs, parent_inode.mount_id, data_handle_id);
+            // Create the file under its single canonical inode identity.
+            let inode = Inode::new_file(inode_id, attrs, parent_inode.mount_id);
 
             // Update parent directory mtime/ctime
             let mut parent_attrs = parent_inode.attrs.clone();
@@ -259,7 +256,6 @@ impl AppRaftStateMachine {
 
             Ok(FsOkResult {
                 inode_id: Some(inode_id),
-                data_handle_id: Some(data_handle_id),
                 content_revision: None,
                 attrs: Some(inode.attrs.clone()),
                 layout: Some(layout),
@@ -542,39 +538,40 @@ impl AppRaftStateMachine {
             let mut updated_parent = parent_inode.clone();
             updated_parent.attrs = parent_attrs;
 
-            let data_handle_id = match &child_inode.data {
+            match &child_inode.data {
                 InodeData::File { .. } => {
-                    let data_handle_id = child_inode.data_handle_id;
-                    if data_handle_id.as_raw() == 0 {
+                    if child_inode.inode_id != child_inode_id
+                        || self.storage.get_layout_optional(child_inode_id)?.is_none()
+                    {
                         return Err(MetadataError::Internal(format!(
-                            "File inode {} is missing data_handle_id",
+                            "file inode {child_inode_id} has corrupt identity or missing layout: value_id={}",
+                            child_inode.inode_id
+                        )));
+                    }
+                }
+                InodeData::Symlink { .. } => {
+                    if child_inode.inode_id != child_inode_id
+                        || self.storage.get_layout_optional(child_inode_id)?.is_some()
+                    {
+                        return Err(MetadataError::Internal(format!(
+                            "symlink inode {child_inode_id} carries invalid file authority: value_id={}",
                             child_inode_id
                         )));
                     }
-                    self.storage
-                        .validate_data_handle_owner(data_handle_id, Some(child_inode_id))?;
-                    Some(data_handle_id)
                 }
-                InodeData::Symlink { .. } => None,
                 InodeData::Dir => return Err(MetadataError::IsDir(format!("Cannot unlink directory: {}", name))),
-            };
+            }
 
-            Ok(FsOkResult::default()).map(|ok| (child_inode_id, data_handle_id, updated_parent, ok))
+            Ok(FsOkResult::default()).map(|ok| (child_inode_id, updated_parent, ok))
         })();
 
-        let (child_inode_id, data_handle_id, updated_parent, ok) = match prepared {
+        let (child_inode_id, updated_parent, ok) = match prepared {
             Ok(prepared) => prepared,
             Err(err) => return self.persist_fs_error(err, raft_state),
         };
         let result = FsCommandResult::Ok(ok);
-        self.storage.delete_file_atomic(
-            parent_inode_id,
-            &name,
-            child_inode_id,
-            data_handle_id,
-            &updated_parent,
-            raft_state,
-        )?;
+        self.storage
+            .delete_file_atomic(parent_inode_id, &name, child_inode_id, &updated_parent, raft_state)?;
         Ok(result)
     }
 
@@ -661,7 +658,7 @@ impl AppRaftStateMachine {
             if !root_inode.kind.is_dir() || !matches!(&root_inode.data, InodeData::Dir) {
                 return Err(MetadataError::NotDir(format!("Not a directory: {name}")));
             }
-            if root_inode.data_handle_id.as_raw() != 0 || self.storage.get_layout_optional(root_inode_id)?.is_some() {
+            if root_inode.inode_id != root_inode_id || self.storage.get_layout_optional(root_inode_id)?.is_some() {
                 return Err(MetadataError::Internal(format!(
                     "directory inode {root_inode_id} carries file authority"
                 )));
@@ -876,7 +873,6 @@ impl AppRaftStateMachine {
                     .as_ref()
                     .map(|target| RenameOverwriteCleanup {
                         inode_id: target.inode_id,
-                        data_handle_id: target.data_handle_id,
                     }),
                 updated_src_parent: prepared.updated_src_parent.as_ref(),
                 updated_dst_parent: prepared.updated_dst_parent.as_ref(),
@@ -895,19 +891,13 @@ impl AppRaftStateMachine {
     ) -> MetadataResult<PreparedRenameOverwrite> {
         match &dst_inode.data {
             InodeData::File { .. } => {
-                let data_handle_id = dst_inode.data_handle_id;
-                if data_handle_id.as_raw() == 0 {
+                if dst_inode.inode_id != dst_inode_id || self.storage.get_layout_optional(dst_inode_id)?.is_none() {
                     return Err(MetadataError::Internal(format!(
-                        "File inode {} is missing data_handle_id",
-                        dst_inode_id
+                        "file inode {dst_inode_id} has corrupt identity or missing layout: value_id={}",
+                        dst_inode.inode_id
                     )));
                 }
-                self.storage
-                    .validate_data_handle_owner(data_handle_id, Some(dst_inode_id))?;
-                Ok(PreparedRenameOverwrite {
-                    inode_id: dst_inode_id,
-                    data_handle_id: Some(data_handle_id),
-                })
+                Ok(PreparedRenameOverwrite { inode_id: dst_inode_id })
             }
             InodeData::Dir => {
                 if !self.storage.is_directory_empty(dst_inode_id)? {
@@ -915,15 +905,23 @@ impl AppRaftStateMachine {
                         "Cannot overwrite non-empty directory".to_string(),
                     ));
                 }
-                Ok(PreparedRenameOverwrite {
-                    inode_id: dst_inode_id,
-                    data_handle_id: None,
-                })
+                if dst_inode.inode_id != dst_inode_id || self.storage.get_layout_optional(dst_inode_id)?.is_some() {
+                    return Err(MetadataError::Internal(format!(
+                        "directory inode {dst_inode_id} carries invalid file authority: value_id={}",
+                        dst_inode.inode_id
+                    )));
+                }
+                Ok(PreparedRenameOverwrite { inode_id: dst_inode_id })
             }
-            InodeData::Symlink { .. } => Ok(PreparedRenameOverwrite {
-                inode_id: dst_inode_id,
-                data_handle_id: None,
-            }),
+            InodeData::Symlink { .. } => {
+                if dst_inode.inode_id != dst_inode_id || self.storage.get_layout_optional(dst_inode_id)?.is_some() {
+                    return Err(MetadataError::Internal(format!(
+                        "symlink inode {dst_inode_id} carries invalid file authority: value_id={}",
+                        dst_inode.inode_id
+                    )));
+                }
+                Ok(PreparedRenameOverwrite { inode_id: dst_inode_id })
+            }
         }
     }
 
@@ -1023,6 +1021,7 @@ mod tests {
         storage
             .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1)))
             .unwrap();
+        storage.set_next_inode_id(InodeId::new(11)).unwrap();
         storage
             .put_mount(&crate::mount::MountEntry {
                 mount_id: MountId::new(1),
@@ -1092,18 +1091,14 @@ mod tests {
     }
 
     #[test]
-    fn create_file_persists_namespace_layout_and_data_handle_owner() {
+    fn create_file_persists_namespace_inode_and_layout() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
 
         let created = create_file(&sm, parent_inode_id, "file");
         let inode_id = created.inode_id.unwrap();
-        let data_handle_id = created.data_handle_id.unwrap();
 
         assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), Some(inode_id));
-        assert_eq!(
-            storage.get_inode_by_data_handle(data_handle_id).unwrap(),
-            Some(inode_id)
-        );
+        assert_eq!(storage.get_inode(inode_id).unwrap().unwrap().inode_id, inode_id);
         assert_eq!(storage.get_layout(inode_id).unwrap(), FileLayout::new(4096, 4096, 1));
 
         expect_fs_errno(
@@ -1117,6 +1112,64 @@ mod tests {
             .unwrap(),
             FsErrorCode::EExist,
         );
+    }
+
+    fn assert_corrupt_inode_allocator_rejects_create(next_inode_id: Option<u64>, existing_inode_ids: &[u64]) {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let parent_inode_id = InodeId::new(10);
+        let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        storage.put_inode(&parent).unwrap();
+        let existing: Vec<_> = existing_inode_ids
+            .iter()
+            .map(|raw| Inode::new_dir(InodeId::new(*raw), FileAttrs::new(), MountId::new(1)))
+            .collect();
+        for inode in &existing {
+            storage.put_inode(inode).unwrap();
+        }
+        if let Some(next_inode_id) = next_inode_id {
+            storage.set_next_inode_id(InodeId::new(next_inode_id)).unwrap();
+        }
+        let applied_before = storage.load_raft_state().unwrap();
+        let rejected_applied_state = AppMetadataRaftState {
+            last_applied_log_id: Some(openraft::LogId::new(openraft::LeaderId::new(8, 1), 801)),
+            ..AppMetadataRaftState::default()
+        };
+        assert_ne!(rejected_applied_state, applied_before);
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage));
+
+        let error = sm
+            .apply_with_raft_state(
+                Command::CreateFile {
+                    proposed_at_ms: 1,
+                    parent_inode_id,
+                    name: "file".to_string(),
+                    attrs: FileAttrs::new(),
+                    layout: FileLayout::new(4096, 4096, 1),
+                },
+                &rejected_applied_state,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("next_inode_id allocator"));
+        assert_eq!(storage.load_raft_state().unwrap(), applied_before);
+        assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), None);
+        assert_eq!(storage.get_inode(parent_inode_id).unwrap(), Some(parent));
+        for inode in existing {
+            assert_eq!(storage.get_inode(inode.inode_id).unwrap(), Some(inode));
+        }
+        if let Some(next_inode_id) = next_inode_id {
+            assert_eq!(storage.get_layout_optional(InodeId::new(next_inode_id)).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn create_file_rejects_missing_invalid_and_reused_inode_allocator_authority() {
+        assert_corrupt_inode_allocator_rejects_create(None, &[]);
+        assert_corrupt_inode_allocator_rejects_create(Some(0), &[]);
+        assert_corrupt_inode_allocator_rejects_create(Some(1), &[]);
+        assert_corrupt_inode_allocator_rejects_create(Some(11), &[11]);
+        assert_corrupt_inode_allocator_rejects_create(Some(11), &[12]);
     }
 
     #[test]
@@ -1193,18 +1246,6 @@ mod tests {
         assert!(storage.get_inode(diverted_inode_id).unwrap().is_some());
         assert!(storage.get_layout_optional(visible_inode_id).unwrap().is_some());
         assert!(storage.get_layout_optional(diverted_inode_id).unwrap().is_some());
-        assert_eq!(
-            storage
-                .get_inode_by_data_handle(visible.data_handle_id.unwrap())
-                .unwrap(),
-            Some(visible_inode_id)
-        );
-        assert_eq!(
-            storage
-                .get_inode_by_data_handle(diverted.data_handle_id.unwrap())
-                .unwrap(),
-            Some(diverted_inode_id)
-        );
         assert!(storage.get_detached_root(diverted_inode_id).unwrap().is_none());
         assert_eq!(storage.load_raft_state().unwrap(), applied_before);
     }
@@ -1266,18 +1307,6 @@ mod tests {
         assert!(storage.get_inode(diverted_inode_id).unwrap().is_some());
         assert!(storage.get_layout_optional(visible_inode_id).unwrap().is_some());
         assert!(storage.get_layout_optional(diverted_inode_id).unwrap().is_some());
-        assert_eq!(
-            storage
-                .get_inode_by_data_handle(visible.data_handle_id.unwrap())
-                .unwrap(),
-            Some(visible_inode_id)
-        );
-        assert_eq!(
-            storage
-                .get_inode_by_data_handle(diverted.data_handle_id.unwrap())
-                .unwrap(),
-            Some(diverted_inode_id)
-        );
         assert!(storage.get_detached_root(diverted_inode_id).unwrap().is_none());
         assert_eq!(storage.load_raft_state().unwrap(), applied_before);
     }
@@ -1459,12 +1488,10 @@ mod tests {
             source.inode_id
         );
         assert_eq!(storage.get_inode(destination.inode_id.unwrap()).unwrap(), None);
-        assert_eq!(
-            storage
-                .get_inode_by_data_handle(destination.data_handle_id.unwrap())
-                .unwrap(),
-            None
-        );
+        assert!(storage
+            .get_layout_optional(destination.inode_id.unwrap())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1489,10 +1516,7 @@ mod tests {
         assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), None);
         assert!(storage.get_inode(directory).unwrap().is_some());
         assert!(storage.get_inode(file.inode_id.unwrap()).unwrap().is_some());
-        assert_eq!(
-            storage.get_inode_by_data_handle(file.data_handle_id.unwrap()).unwrap(),
-            file.inode_id
-        );
+        assert!(storage.get_layout(file.inode_id.unwrap()).is_ok());
         assert_eq!(
             storage.get_detached_root(directory).unwrap(),
             Some(DetachedRoot {

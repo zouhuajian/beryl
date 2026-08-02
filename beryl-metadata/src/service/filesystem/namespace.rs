@@ -8,7 +8,6 @@ use crate::error::MetadataError;
 use crate::observe;
 use crate::raft::{Command, FsCommandResult};
 use beryl_types::fs::{FileAttrs, InodeId};
-use beryl_types::ids::DataHandleId;
 use beryl_types::layout::FileLayout;
 use std::sync::atomic::Ordering;
 
@@ -499,8 +498,6 @@ mod tests {
         let parent_inode_id = InodeId::new(560);
         let source_inode_id = InodeId::new(561);
         let target_inode_id = InodeId::new(562);
-        let source_handle = DataHandleId::new(563);
-        let target_handle = DataHandleId::new(564);
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
         let mount_table = builder.mount_table();
         let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
@@ -513,20 +510,10 @@ mod tests {
             .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
             .unwrap();
         storage
-            .put_inode(&Inode::new_file(
-                source_inode_id,
-                FileAttrs::new(),
-                mount_id,
-                source_handle,
-            ))
+            .put_inode(&Inode::new_file(source_inode_id, FileAttrs::new(), mount_id))
             .unwrap();
         storage
-            .put_inode(&Inode::new_file(
-                target_inode_id,
-                FileAttrs::new(),
-                mount_id,
-                target_handle,
-            ))
+            .put_inode(&Inode::new_file(target_inode_id, FileAttrs::new(), mount_id))
             .unwrap();
         storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
         storage.put_dentry(parent_inode_id, "target", target_inode_id).unwrap();
@@ -536,9 +523,7 @@ mod tests {
         storage
             .put_layout(target_inode_id, FileLayout::new(4096, 4096, 1))
             .unwrap();
-        storage.put_data_handle_owner(source_handle, source_inode_id).unwrap();
-        storage.put_data_handle_owner(target_handle, target_inode_id).unwrap();
-        let file_handle = install_write_session(&filesystem, target_inode_id, mount_id);
+        install_write_session(&filesystem, target_inode_id, mount_id);
 
         let failure = filesystem
             .execute_rename(
@@ -560,7 +545,7 @@ mod tests {
             .unwrap_err();
 
         assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EBusy));
-        assert!(filesystem.write_session_for_handle(file_handle).is_some());
+        assert!(filesystem.write_session_for_inode(target_inode_id).is_some());
         assert_eq!(
             storage.get_dentry(parent_inode_id, "source").unwrap(),
             Some(source_inode_id)
@@ -582,7 +567,6 @@ mod tests {
         let source_inode_id = InodeId::new(671);
         let nested_inode_id = InodeId::new(672);
         let file_inode_id = InodeId::new(673);
-        let data_handle_id = DataHandleId::new(424_242);
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
         let mount_table = builder.mount_table();
         let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
@@ -597,18 +581,12 @@ mod tests {
                 .unwrap();
         }
         storage
-            .put_inode(&Inode::new_file(
-                file_inode_id,
-                FileAttrs::new(),
-                mount_id,
-                data_handle_id,
-            ))
+            .put_inode(&Inode::new_file(file_inode_id, FileAttrs::new(), mount_id))
             .unwrap();
         storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
         storage.put_dentry(source_inode_id, "nested", nested_inode_id).unwrap();
         storage.put_dentry(nested_inode_id, "file", file_inode_id).unwrap();
         storage.put_layout(file_inode_id, FileLayout::new(64, 64, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, file_inode_id).unwrap();
         install_write_session_with_ancestors(
             &filesystem,
             file_inode_id,
@@ -654,7 +632,6 @@ mod tests {
         let target_inode_id = InodeId::new(692);
         let nested_inode_id = InodeId::new(693);
         let file_inode_id = InodeId::new(694);
-        let data_handle_id = DataHandleId::new(424_243);
         let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
             .with_storage(Arc::clone(&storage))
             .build();
@@ -665,19 +642,13 @@ mod tests {
                 .unwrap();
         }
         storage
-            .put_inode(&Inode::new_file(
-                file_inode_id,
-                FileAttrs::new(),
-                mount_id,
-                data_handle_id,
-            ))
+            .put_inode(&Inode::new_file(file_inode_id, FileAttrs::new(), mount_id))
             .unwrap();
         storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
         storage.put_dentry(parent_inode_id, "target", target_inode_id).unwrap();
         storage.put_dentry(target_inode_id, "nested", nested_inode_id).unwrap();
         storage.put_dentry(nested_inode_id, "file", file_inode_id).unwrap();
         storage.put_layout(file_inode_id, FileLayout::new(64, 64, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, file_inode_id).unwrap();
         install_write_session_with_ancestors(
             &filesystem,
             file_inode_id,
@@ -724,8 +695,6 @@ mod tests {
         let parent_inode_id = InodeId::new(660);
         let source_inode_id = InodeId::new(661);
         let target_inode_id = InodeId::new(662);
-        let source_handle = DataHandleId::new(663);
-        let target_handle = DataHandleId::new(664);
         let lease_manager = Arc::new(crate::inode_lease::LeaseManager::new(0, 1_000));
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
             .with_lease_manager(Arc::clone(&lease_manager));
@@ -740,20 +709,10 @@ mod tests {
             .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
             .unwrap();
         storage
-            .put_inode(&Inode::new_file(
-                source_inode_id,
-                FileAttrs::new(),
-                mount_id,
-                source_handle,
-            ))
+            .put_inode(&Inode::new_file(source_inode_id, FileAttrs::new(), mount_id))
             .unwrap();
         storage
-            .put_inode(&Inode::new_file(
-                target_inode_id,
-                FileAttrs::new(),
-                mount_id,
-                target_handle,
-            ))
+            .put_inode(&Inode::new_file(target_inode_id, FileAttrs::new(), mount_id))
             .unwrap();
         storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
         storage.put_dentry(parent_inode_id, "target", target_inode_id).unwrap();
@@ -763,12 +722,10 @@ mod tests {
         storage
             .put_layout(target_inode_id, FileLayout::new(4096, 4096, 1))
             .unwrap();
-        storage.put_data_handle_owner(source_handle, source_inode_id).unwrap();
-        storage.put_data_handle_owner(target_handle, target_inode_id).unwrap();
-        let file_handle = install_write_session(&filesystem, target_inode_id, mount_id);
+        install_write_session(&filesystem, target_inode_id, mount_id);
 
         assert!(!lease_manager.has_active_lease(target_inode_id));
-        assert!(filesystem.write_session_for_handle(file_handle).is_none());
+        assert!(filesystem.write_session_for_inode(target_inode_id).is_none());
 
         filesystem
             .execute_rename(
@@ -795,7 +752,7 @@ mod tests {
             Some(source_inode_id)
         );
         assert!(storage.get_inode(target_inode_id).unwrap().is_none());
-        assert!(filesystem.write_session_for_handle(file_handle).is_none());
+        assert!(filesystem.write_session_for_inode(target_inode_id).is_none());
     }
 
     #[tokio::test]
@@ -807,8 +764,6 @@ mod tests {
         let parent_inode_id = InodeId::new(590);
         let source_inode_id = InodeId::new(591);
         let target_inode_id = InodeId::new(592);
-        let source_handle = DataHandleId::new(593);
-        let target_handle = DataHandleId::new(594);
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
         let mount_table = builder.mount_table();
         let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
@@ -820,7 +775,7 @@ mod tests {
         storage
             .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
             .unwrap();
-        let mut source = Inode::new_file(source_inode_id, FileAttrs::new(), mount_id, source_handle);
+        let mut source = Inode::new_file(source_inode_id, FileAttrs::new(), mount_id);
         if let beryl_types::fs::InodeData::File {
             content_revision,
             lease_epoch,
@@ -830,7 +785,7 @@ mod tests {
             *content_revision = Some(77);
             *lease_epoch = Some(900);
         }
-        let mut target = Inode::new_file(target_inode_id, FileAttrs::new(), mount_id, target_handle);
+        let mut target = Inode::new_file(target_inode_id, FileAttrs::new(), mount_id);
         if let beryl_types::fs::InodeData::File {
             content_revision,
             lease_epoch,
@@ -850,8 +805,6 @@ mod tests {
         storage
             .put_layout(target_inode_id, FileLayout::new(4096, 4096, 1))
             .unwrap();
-        storage.put_data_handle_owner(source_handle, source_inode_id).unwrap();
-        storage.put_data_handle_owner(target_handle, target_inode_id).unwrap();
 
         filesystem
             .execute_rename(
@@ -879,7 +832,7 @@ mod tests {
         );
         assert_eq!(stored_content_revision(&storage, source_inode_id), Some(77));
         assert!(storage.get_inode(target_inode_id).unwrap().is_none());
-        assert_eq!(storage.get_inode_by_data_handle(target_handle).unwrap(), None);
+        assert!(storage.get_layout_optional(target_inode_id).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -902,12 +855,7 @@ mod tests {
             .put_inode(&Inode::new_dir(dst_parent_inode_id, FileAttrs::new(), dst_mount_id))
             .unwrap();
         storage
-            .put_inode(&Inode::new_file(
-                source_inode_id,
-                FileAttrs::new(),
-                src_mount_id,
-                DataHandleId::new(571),
-            ))
+            .put_inode(&Inode::new_file(source_inode_id, FileAttrs::new(), src_mount_id))
             .unwrap();
         storage
             .put_dentry(src_parent_inode_id, "source", source_inode_id)
@@ -952,7 +900,6 @@ pub(crate) struct CreateFileArgs {
 
 pub(crate) struct CreatedFileOutput {
     pub(crate) inode_id: InodeId,
-    pub(crate) data_handle_id: DataHandleId,
     pub(crate) layout: FileLayout,
 }
 
@@ -973,7 +920,6 @@ impl MetadataFileSystem {
                     call_id = %ctx.caller.client.call_id,
                     path = %path,
                     inode_id = payload.inode_id.as_raw(),
-                    data_handle_id = payload.data_handle_id.as_raw(),
                     layout_block_size = payload.layout.block_size,
                     layout_chunk_size = payload.layout.chunk_size,
                     replication = payload.layout.replication,
@@ -1084,14 +1030,10 @@ impl MetadataFileSystem {
         };
 
         match result {
-            FsCommandResult::Ok(ok) => match (ok.inode_id, ok.data_handle_id, ok.layout) {
-                (Some(inode_id), Some(data_handle_id), Some(layout)) => self.success(
+            FsCommandResult::Ok(ok) => match (ok.inode_id, ok.layout) {
+                (Some(inode_id), Some(layout)) => self.success(
                     request_ctx,
-                    CreatedFileOutput {
-                        inode_id,
-                        data_handle_id,
-                        layout,
-                    },
+                    CreatedFileOutput { inode_id, layout },
                     Some(ctx.group_name.clone()),
                     Some(ctx.mount_epoch),
                 ),
@@ -1304,7 +1246,6 @@ mod delete_tests {
         let group_name_value = group_name("g13");
         let parent_inode_id = ROOT_INODE_ID;
         let inode_id = InodeId::new(551);
-        let data_handle_id = DataHandleId::new(552);
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
         let mount_table = builder.mount_table();
         let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
@@ -1317,12 +1258,11 @@ mod delete_tests {
             .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
             .unwrap();
         storage
-            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id))
             .unwrap();
         storage.put_dentry(parent_inode_id, "busy", inode_id).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
-        let file_handle = install_write_session(&filesystem, inode_id, mount_id);
+        install_write_session(&filesystem, inode_id, mount_id);
 
         let failure = filesystem
             .delete_resolved(
@@ -1337,7 +1277,7 @@ mod delete_tests {
             .unwrap_err();
 
         assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EBusy));
-        assert!(filesystem.write_session_for_handle(file_handle).is_some());
+        assert!(filesystem.write_session_for_inode(inode_id).is_some());
         assert_eq!(storage.get_dentry(parent_inode_id, "busy").unwrap(), Some(inode_id));
         assert!(storage.get_inode(inode_id).unwrap().is_some());
     }
@@ -1352,7 +1292,6 @@ mod delete_tests {
         let root_inode_id = InodeId::new(681);
         let nested_inode_id = InodeId::new(682);
         let file_inode_id = InodeId::new(683);
-        let data_handle_id = DataHandleId::new(424_242);
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
         let mount_table = builder.mount_table();
         let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
@@ -1367,18 +1306,12 @@ mod delete_tests {
                 .unwrap();
         }
         storage
-            .put_inode(&Inode::new_file(
-                file_inode_id,
-                FileAttrs::new(),
-                mount_id,
-                data_handle_id,
-            ))
+            .put_inode(&Inode::new_file(file_inode_id, FileAttrs::new(), mount_id))
             .unwrap();
         storage.put_dentry(parent_inode_id, "root", root_inode_id).unwrap();
         storage.put_dentry(root_inode_id, "nested", nested_inode_id).unwrap();
         storage.put_dentry(nested_inode_id, "file", file_inode_id).unwrap();
         storage.put_layout(file_inode_id, FileLayout::new(64, 64, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, file_inode_id).unwrap();
         install_write_session_with_ancestors(
             &filesystem,
             file_inode_id,
@@ -1413,7 +1346,6 @@ mod delete_tests {
         let mount_id = MountId::new(69);
         let group_name_value = group_name("g21");
         let file_inode_id = InodeId::new(690);
-        let data_handle_id = DataHandleId::new(691);
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
         let mount_table = builder.mount_table();
         let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
@@ -1426,16 +1358,10 @@ mod delete_tests {
             .put_inode(&Inode::new_dir(ROOT_INODE_ID, FileAttrs::new(), mount_id))
             .unwrap();
         storage
-            .put_inode(&Inode::new_file(
-                file_inode_id,
-                FileAttrs::new(),
-                mount_id,
-                data_handle_id,
-            ))
+            .put_inode(&Inode::new_file(file_inode_id, FileAttrs::new(), mount_id))
             .unwrap();
         storage.put_dentry(ROOT_INODE_ID, "file", file_inode_id).unwrap();
         storage.put_layout(file_inode_id, FileLayout::new(64, 64, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, file_inode_id).unwrap();
 
         let open_ctx = request_context();
         let delete_ctx = request_context();
@@ -1485,7 +1411,6 @@ mod delete_tests {
         let group_name_value = group_name("g17");
         let parent_inode_id = ROOT_INODE_ID;
         let inode_id = InodeId::new(651);
-        let data_handle_id = DataHandleId::new(652);
         let lease_manager = Arc::new(crate::inode_lease::LeaseManager::new(0, 1_000));
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
             .with_lease_manager(Arc::clone(&lease_manager));
@@ -1500,15 +1425,14 @@ mod delete_tests {
             .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
             .unwrap();
         storage
-            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id))
             .unwrap();
         storage.put_dentry(parent_inode_id, "expired", inode_id).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
-        let file_handle = install_write_session(&filesystem, inode_id, mount_id);
+        install_write_session(&filesystem, inode_id, mount_id);
 
         assert!(!lease_manager.has_active_lease(inode_id));
-        assert!(filesystem.write_session_for_handle(file_handle).is_none());
+        assert!(filesystem.write_session_for_inode(inode_id).is_none());
 
         filesystem
             .delete_resolved(
@@ -1524,7 +1448,7 @@ mod delete_tests {
 
         assert_eq!(storage.get_dentry(parent_inode_id, "expired").unwrap(), None);
         assert!(storage.get_inode(inode_id).unwrap().is_none());
-        assert!(filesystem.write_session_for_handle(file_handle).is_none());
+        assert!(filesystem.write_session_for_inode(inode_id).is_none());
     }
 }
 
@@ -1543,6 +1467,7 @@ mod create_file_tests {
         storage
             .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
             .unwrap();
+        storage.set_next_inode_id(InodeId::new(591)).unwrap();
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
         let mount_table = builder.mount_table();
         let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;

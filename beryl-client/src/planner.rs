@@ -7,7 +7,7 @@ use beryl_common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail, WorkerErr
 
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::ReadLayout;
-use beryl_types::{BlockId, BlockShape, DataHandleId, FileBlockLocation, GroupName, WorkerEndpointInfo};
+use beryl_types::{BlockId, BlockShape, FileBlockLocation, GroupName, InodeId, WorkerEndpointInfo};
 
 /// File byte range requested by a reader after EOF truncation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,7 +61,7 @@ pub(crate) fn requested_range(offset: u64, len: u32, file_size: u64) -> ClientRe
 }
 
 pub(crate) fn plan_block_reads(
-    expected_data_handle_id: DataHandleId,
+    expected_inode_id: InodeId,
     requested_range: RequestedReadRange,
     locations: &[FileBlockLocation],
 ) -> ClientResult<Vec<PlannedBlockRead>> {
@@ -75,11 +75,11 @@ pub(crate) fn plan_block_reads(
             .checked_add(location.len)
             .ok_or_else(|| ClientError::InvalidLayout("block location range overflow".to_string()))?;
         let block_id = location.block_id;
-        if block_id.data_handle_id != expected_data_handle_id {
+        if block_id.inode_id != expected_inode_id {
             return Err(ClientError::InvalidLayout(format!(
-                "block location data_handle_id {} does not match handle {}",
-                block_id.data_handle_id.as_raw(),
-                expected_data_handle_id.as_raw()
+                "block location inode_id {} does not match handle {}",
+                block_id.inode_id.as_raw(),
+                expected_inode_id.as_raw()
             )));
         }
         let block_stamp = location.block_stamp;
@@ -171,19 +171,19 @@ pub(crate) fn plan_block_reads(
 }
 
 pub(crate) fn plan_block_reads_from_layout(
-    expected_data_handle_id: DataHandleId,
+    expected_inode_id: InodeId,
     expected_content_revision: Option<u64>,
     requested_range: RequestedReadRange,
     response: &ReadLayout,
 ) -> ClientResult<(GroupName, Vec<PlannedBlockRead>)> {
     let group_name = response.group_name.clone();
-    let data_handle_id = response.data_handle_id;
-    if data_handle_id != expected_data_handle_id {
+    let inode_id = response.inode_id;
+    if inode_id != expected_inode_id {
         return Err(ClientError::StaleHandle {
             reason: format!(
-                "layout data_handle_id {} does not match handle {}",
-                data_handle_id.as_raw(),
-                expected_data_handle_id.as_raw()
+                "layout inode_id {} does not match handle {}",
+                inode_id.as_raw(),
+                expected_inode_id.as_raw()
             ),
         });
     }
@@ -200,7 +200,7 @@ pub(crate) fn plan_block_reads_from_layout(
             actual: actual_version,
         });
     }
-    let block_reads = plan_block_reads(expected_data_handle_id, requested_range, &response.locations)?;
+    let block_reads = plan_block_reads(expected_inode_id, requested_range, &response.locations)?;
     Ok((group_name, block_reads))
 }
 
@@ -229,7 +229,7 @@ pub(crate) fn block_location_unavailable_error(message: impl Into<String>) -> Cl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beryl_types::{BlockId, BlockIndex, DataHandleId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol};
+    use beryl_types::{BlockId, BlockIndex, InodeId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol};
 
     #[test]
     fn requested_range_is_truncated_at_eof() {
@@ -249,7 +249,7 @@ mod tests {
         let locations = vec![location(10, 0, 0, 8, 101), location(10, 1, 8, 8, 202)];
 
         let block_reads =
-            plan_block_reads(DataHandleId::new(10), requested_range, &locations).expect("locations cover range");
+            plan_block_reads(InodeId::new(10), requested_range, &locations).expect("locations cover range");
 
         assert_eq!(block_reads.len(), 2);
         assert_eq!(block_reads[0].file_offset, 2);
@@ -276,8 +276,8 @@ mod tests {
             .expect("non-empty requested range");
         let locations = vec![location(10, 1, 8, 8, 202), location(10, 0, 0, 8, 101)];
 
-        let block_reads = plan_block_reads(DataHandleId::new(10), requested_range, &locations)
-            .expect("unordered locations are sorted");
+        let block_reads =
+            plan_block_reads(InodeId::new(10), requested_range, &locations).expect("unordered locations are sorted");
 
         assert_eq!(
             block_reads
@@ -318,8 +318,7 @@ mod tests {
             let requested_range = requested_range(0, len, 20)
                 .expect("range planning succeeds")
                 .expect("non-empty requested range");
-            let err =
-                plan_block_reads(DataHandleId::new(10), requested_range, &locations).expect_err("layout must fail");
+            let err = plan_block_reads(InodeId::new(10), requested_range, &locations).expect_err("layout must fail");
             assert!(
                 format!("{err}").contains(expected),
                 "case {case} should mention {expected:?}, got {err}"
@@ -335,21 +334,15 @@ mod tests {
         let mut location = location(10, 0, 0, 4, 101);
         location.workers.clear();
 
-        let err = plan_block_reads(DataHandleId::new(10), requested_range, &[location])
+        let err = plan_block_reads(InodeId::new(10), requested_range, &[location])
             .expect_err("empty worker candidate list must not produce a read plan");
 
         assert_block_location_unavailable(&err);
     }
 
-    fn location(
-        data_handle_id: u64,
-        block_index: u32,
-        file_offset: u64,
-        len: u64,
-        block_stamp: u64,
-    ) -> FileBlockLocation {
+    fn location(inode_id: u64, block_index: u32, file_offset: u64, len: u64, block_stamp: u64) -> FileBlockLocation {
         FileBlockLocation {
-            block_id: BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(block_index)),
+            block_id: BlockId::new(InodeId::new(inode_id), BlockIndex::new(block_index)),
             file_offset,
             len,
             workers: vec![WorkerEndpointInfo {

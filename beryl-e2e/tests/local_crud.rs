@@ -72,6 +72,7 @@ async fn local_client_crud_roundtrip() {
         Some(expected.len() as u64)
     );
 
+    let reader_opened_before_rename = client.open(path).await.expect("open reader before rename");
     client
         .rename(path, renamed_path)
         .await
@@ -90,6 +91,11 @@ async fn local_client_crud_roundtrip() {
         .await
         .expect("read renamed file");
     assert_eq!(renamed_read.as_ref(), expected.as_slice());
+    let moved_reader_bytes = reader_opened_before_rename
+        .read_all()
+        .await
+        .expect("reader opened before rename remains bound to the inode");
+    assert_eq!(moved_reader_bytes.as_ref(), expected.as_slice());
 
     client
         .delete(renamed_path, DeleteOptions::default())
@@ -97,6 +103,40 @@ async fn local_client_crud_roundtrip() {
         .expect("namespace delete renamed file");
     assert_not_found(client.stat(renamed_path).await, "deleted path status");
     assert_not_found(client.open(renamed_path).await, "deleted path open");
+    assert_not_found(reader_opened_before_rename.read_all().await, "reader for deleted inode");
+
+    let replacement = Bytes::from_static(b"replacement-file");
+    let mut replacement_writer = client
+        .create(
+            renamed_path,
+            CreateOptions::create().with_block_size(1024).with_chunk_size(1024),
+        )
+        .await
+        .expect("recreate deleted path");
+    replacement_writer
+        .write_all(replacement.clone())
+        .await
+        .expect("write replacement file");
+    replacement_writer
+        .close()
+        .await
+        .unwrap_or_else(|err| panic!("close replacement file: {err} ({err:?})"));
+    assert_not_found(
+        reader_opened_before_rename.read_all().await,
+        "old reader must not bind to recreated path",
+    );
+    let replacement_read = client
+        .open(renamed_path)
+        .await
+        .expect("open replacement file")
+        .read_all()
+        .await
+        .expect("read replacement file");
+    assert_eq!(replacement_read, replacement);
+    client
+        .delete(renamed_path, DeleteOptions::default())
+        .await
+        .expect("delete replacement file");
 
     let listing = client
         .list(dir, ListOptions::default())

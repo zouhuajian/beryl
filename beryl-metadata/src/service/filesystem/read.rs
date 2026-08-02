@@ -16,7 +16,7 @@ use crate::placement::{
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint, WorkerErrorKind};
 use beryl_common::header::CallerContextFields;
 use beryl_types::fs::{Extent, FileAttrs, InodeId, InodeKind};
-use beryl_types::ids::{DataHandleId, MountId};
+use beryl_types::ids::MountId;
 use beryl_types::{FileBlockLocation, GroupName};
 use std::time::Instant;
 
@@ -65,7 +65,6 @@ pub(super) struct GetFileLayoutInput {
     pub(super) ctx: RequestContext,
     pub(super) inode_id: InodeId,
     pub(super) range: Option<FileRange>,
-    pub(super) requested_data_handle_id: Option<DataHandleId>,
     pub(super) freshness: Freshness,
 }
 
@@ -105,14 +104,14 @@ pub(crate) struct OpenFileArgs {
 }
 
 pub(crate) struct OpenFileOutput {
-    pub(crate) data_handle_id: DataHandleId,
+    pub(crate) inode_id: InodeId,
     pub(crate) file_size: u64,
     pub(crate) content_revision: Option<u64>,
 }
 
 pub(crate) enum BlockLocationsTarget {
     Path(String),
-    DataHandle(DataHandleId),
+    InodeId(InodeId),
 }
 
 pub(crate) struct GetBlockLocationsArgs {
@@ -122,7 +121,7 @@ pub(crate) struct GetBlockLocationsArgs {
 }
 
 pub(crate) struct GetBlockLocationsOutput {
-    pub(crate) data_handle_id: DataHandleId,
+    pub(crate) inode_id: InodeId,
     pub(crate) file_size: u64,
     pub(crate) content_revision: Option<u64>,
     pub(crate) locations: Vec<FileBlockLocation>,
@@ -224,37 +223,17 @@ impl MetadataFileSystem {
         if let Err(failure) = self.admission.check_data_read(ctx, resolved.mount_ctx.mount_id).await {
             return self.failure_from_admission(failure);
         }
-        let inode = match self.read_inode(inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
-                return self.failure_from_resolved_path_error(
-                    ctx,
-                    MetadataError::NotFound(format!("Inode not found: {}", inode_id)),
-                    Some(&resolved.mount_ctx),
-                );
-            }
-            Err(err) => return self.failure_from_resolved_path_error(ctx, err, Some(&resolved.mount_ctx)),
-        };
-        if !inode.kind.is_file() {
-            return self.failure_from_resolved_path_error(
-                ctx,
-                MetadataError::IsDir(format!("Inode is not a file: {}", inode_id)),
-                Some(&resolved.mount_ctx),
-            );
-        }
-        let data_handle_id = inode.data_handle_id;
 
         self.get_file_layout_resolved(GetFileLayoutInput {
             ctx: ctx.clone(),
             inode_id,
             range: None,
-            requested_data_handle_id: None,
             freshness: args.freshness,
         })
         .await
         .map(|success| FsSuccess {
             payload: OpenFileOutput {
-                data_handle_id,
+                inode_id,
                 file_size: success.payload.file_size,
                 content_revision: success.payload.content_revision,
             },
@@ -274,7 +253,7 @@ impl MetadataFileSystem {
             return self.failure_from_admission(failure);
         }
 
-        let (inode_id, requested_data_handle_id) = match args.target {
+        let inode_id = match args.target {
             BlockLocationsTarget::Path(path) => {
                 let resolved = match self.path_resolver.resolve_path(&path) {
                     Ok(resolved) => resolved,
@@ -290,43 +269,27 @@ impl MetadataFileSystem {
                 if let Err(failure) = self.admission.check_data_read(ctx, resolved.mount_ctx.mount_id).await {
                     return self.failure_from_admission(failure);
                 }
-                (inode_id, None)
+                inode_id
             }
-            BlockLocationsTarget::DataHandle(data_handle_id) => {
-                let inode_id = self.inode_for_data_handle(ctx, data_handle_id).await?.payload;
+            BlockLocationsTarget::InodeId(inode_id) => {
                 let mount_id = self.plan_inode_mount(ctx, inode_id).await?.payload.mount_id;
                 if let Err(failure) = self.admission.check_data_read(ctx, mount_id).await {
                     return self.failure_from_admission(failure);
                 }
-                (inode_id, Some(data_handle_id))
+                inode_id
             }
         };
-
-        let inode = match self.read_inode(inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
-                return self.failure_from_error(
-                    ctx,
-                    MetadataError::NotFound(format!("Inode not found: {}", inode_id)),
-                    None,
-                    None,
-                );
-            }
-            Err(err) => return self.failure_from_error(ctx, err, None, None),
-        };
-        let data_handle_id = inode.data_handle_id;
 
         self.get_file_layout_resolved(GetFileLayoutInput {
             ctx: ctx.clone(),
             inode_id,
             range: args.range,
-            requested_data_handle_id,
             freshness: args.freshness,
         })
         .await
         .map(|success| FsSuccess {
             payload: GetBlockLocationsOutput {
-                data_handle_id,
+                inode_id,
                 file_size: success.payload.file_size,
                 content_revision: success.payload.content_revision,
                 locations: success.payload.locations,
@@ -494,6 +457,27 @@ impl MetadataFileSystem {
             }
             Err(err) => return self.failure_from_error(req_ctx, err, None, None),
         };
+        if inode.inode_id != inode_id || inode.kind != inode.data.kind() {
+            return self.failure_from_error(
+                req_ctx,
+                MetadataError::Internal(format!(
+                    "inode authority is corrupt for GetBlockLocations: key={inode_id}, value_id={}, kind={:?}, payload={:?}",
+                    inode.inode_id,
+                    inode.kind,
+                    inode.data.kind()
+                )),
+                None,
+                None,
+            );
+        }
+        if !inode.kind.is_file() {
+            return self.failure_from_error(
+                req_ctx,
+                MetadataError::IsDir(format!("Inode is not a file: {inode_id}")),
+                None,
+                None,
+            );
+        }
         self.success(
             req_ctx,
             InodeMountGuardInputs {
@@ -536,22 +520,6 @@ impl MetadataFileSystem {
         .await;
         record_fs_read_result("get_status", started, &result);
         result
-    }
-
-    async fn inode_for_data_handle(&self, req_ctx: &RequestContext, data_handle_id: DataHandleId) -> FsResult<InodeId> {
-        let inode_id = match self.storage.get_inode_by_data_handle(data_handle_id) {
-            Ok(Some(inode_id)) => inode_id,
-            Ok(None) => {
-                return self.failure_from_error(
-                    req_ctx,
-                    MetadataError::NotFound(format!("data_handle_id not found: {}", data_handle_id)),
-                    None,
-                    None,
-                );
-            }
-            Err(err) => return self.failure_from_error(req_ctx, err, None, None),
-        };
-        self.success(req_ctx, inode_id, None, None)
     }
 
     async fn read_dir_resolved(&self, req: ReadDirInput) -> FsResult<ReadDirOutput> {
@@ -645,151 +613,162 @@ impl MetadataFileSystem {
     pub(super) async fn get_file_layout_resolved(&self, req: GetFileLayoutInput) -> FsResult<GetFileLayoutOutput> {
         let started = Instant::now();
         let result = async {
-        let inode = match self.read_inode(req.inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
+            let inode = match self.read_inode(req.inode_id) {
+                Ok(Some(inode)) => inode,
+                Ok(None) => {
+                    return self.failure_from_error(
+                        &req.ctx,
+                        MetadataError::NotFound(format!("Inode not found: {}", req.inode_id)),
+                        None,
+                        None,
+                    );
+                }
+                Err(err) => {
+                    return self.failure_from_error(&req.ctx, err, None, None);
+                }
+            };
+
+            if inode.inode_id != req.inode_id || inode.kind != inode.data.kind() {
                 return self.failure_from_error(
                     &req.ctx,
-                    MetadataError::NotFound(format!("Inode not found: {}", req.inode_id)),
-                    None,
-                    None,
-                );
-            }
-            Err(err) => {
-                return self.failure_from_error(&req.ctx, err, None, None);
-            }
-        };
-
-        if !inode.kind.is_file() {
-            return self.failure_from_error(
-                &req.ctx,
-                MetadataError::IsDir(format!("Inode is not a file: {}", req.inode_id)),
-                None,
-                None,
-            );
-        }
-
-        let (group_name, mount_epoch, route_epoch) = self
-            .validate_read_freshness_for_mount(&req.ctx, req.freshness, inode.mount_id, "GetFileLayout")
-            .await?;
-
-        let content_revision = Self::content_revision_for_inode(&inode);
-        let extents = match &inode.data {
-            beryl_types::fs::InodeData::File { extents, .. } => extents.clone(),
-            _ => Vec::new(),
-        };
-        let data_handle_id = inode.data_handle_id;
-        if data_handle_id.as_raw() == 0 {
-            return self.failure_from_error_with_route_epoch(
-                &req.ctx,
-                MetadataError::Internal(format!("File inode {} is missing data_handle_id", req.inode_id)),
-                group_name,
-                mount_epoch,
-                route_epoch,
-            );
-        }
-        if let Some(requested_data_handle_id) = req.requested_data_handle_id {
-            if requested_data_handle_id != data_handle_id {
-                return self.failure_from_error_with_route_epoch(
-                    &req.ctx,
-                    MetadataError::StaleState(format!(
-                        "requested data_handle_id {} is not current data_handle_id {} for inode {}; refresh metadata state",
-                        requested_data_handle_id, data_handle_id, req.inode_id
-                    )),
-                    group_name,
-                    mount_epoch,
-                    route_epoch,
-                );
-            }
-        }
-        let layout = match self.read_layout(req.inode_id) {
-            Ok(layout) => layout,
-            Err(err) => {
-                return self.failure_from_error_with_route_epoch(&req.ctx, err, group_name, mount_epoch, route_epoch)
-            }
-        };
-        for extent in &extents {
-            if extent.block_id.data_handle_id != data_handle_id {
-                return self.failure_from_error_with_route_epoch(
-                    &req.ctx,
                     MetadataError::Internal(format!(
-                        "Extent block data_handle_id {} does not match inode {} data_handle_id {}",
-                        extent.block_id.data_handle_id, req.inode_id, data_handle_id
+                        "inode authority is corrupt for GetFileLayout: key={}, value_id={}, kind={:?}, payload={:?}",
+                        req.inode_id,
+                        inode.inode_id,
+                        inode.kind,
+                        inode.data.kind()
                     )),
-                    group_name,
-                    mount_epoch,
-                    route_epoch,
+                    None,
+                    None,
                 );
             }
-        }
-        let filtered_extents: Vec<Extent> = if let Some(range) = req.range {
-            let range_end = match range.offset.checked_add(range.len) {
-                Some(range_end) => range_end,
-                None => {
+            if !inode.kind.is_file() {
+                return self.failure_from_error(
+                    &req.ctx,
+                    MetadataError::IsDir(format!("Inode is not a file: {}", req.inode_id)),
+                    None,
+                    None,
+                );
+            }
+
+            let (group_name, mount_epoch, route_epoch) = self
+                .validate_read_freshness_for_mount(&req.ctx, req.freshness, inode.mount_id, "GetFileLayout")
+                .await?;
+
+            let content_revision = Self::content_revision_for_inode(&inode);
+            let extents = match &inode.data {
+                beryl_types::fs::InodeData::File { extents, .. } => extents.clone(),
+                _ => Vec::new(),
+            };
+            let inode_id = req.inode_id;
+            let layout = match self.read_layout(req.inode_id) {
+                Ok(layout) => layout,
+                Err(err) => {
                     return self.failure_from_error_with_route_epoch(
                         &req.ctx,
-                        MetadataError::InvalidArgument(format!(
-                            "range end overflows: offset={}, len={}",
-                            range.offset, range.len
+                        err,
+                        group_name,
+                        mount_epoch,
+                        route_epoch,
+                    )
+                }
+            };
+            for extent in &extents {
+                if extent.block_id.inode_id != inode_id {
+                    return self.failure_from_error_with_route_epoch(
+                        &req.ctx,
+                        MetadataError::Internal(format!(
+                            "Extent block inode_id {} does not match inode {} inode_id {}",
+                            extent.block_id.inode_id, req.inode_id, inode_id
                         )),
                         group_name,
                         mount_epoch,
                         route_epoch,
                     );
                 }
-            };
-            if range.len == 0 {
-                Vec::new()
+            }
+            let filtered_extents: Vec<Extent> = if let Some(range) = req.range {
+                let range_end = match range.offset.checked_add(range.len) {
+                    Some(range_end) => range_end,
+                    None => {
+                        return self.failure_from_error_with_route_epoch(
+                            &req.ctx,
+                            MetadataError::InvalidArgument(format!(
+                                "range end overflows: offset={}, len={}",
+                                range.offset, range.len
+                            )),
+                            group_name,
+                            mount_epoch,
+                            route_epoch,
+                        );
+                    }
+                };
+                if range.len == 0 {
+                    Vec::new()
+                } else {
+                    let mut filtered = Vec::with_capacity(extents.len());
+                    for extent in extents {
+                        let extent_end = match extent.file_offset.checked_add(extent.len) {
+                            Some(extent_end) => extent_end,
+                            None => {
+                                return self.failure_from_error_with_route_epoch(
+                                    &req.ctx,
+                                    MetadataError::Internal(format!(
+                                        "extent range overflows: file_offset={}, len={}",
+                                        extent.file_offset, extent.len
+                                    )),
+                                    group_name,
+                                    mount_epoch,
+                                    route_epoch,
+                                );
+                            }
+                        };
+                        if extent.file_offset < range_end && extent_end > range.offset {
+                            filtered.push(extent);
+                        }
+                    }
+                    filtered
+                }
             } else {
-                let mut filtered = Vec::with_capacity(extents.len());
-                for extent in extents {
-                    let extent_end = match extent.file_offset.checked_add(extent.len) {
-                        Some(extent_end) => extent_end,
-                        None => {
+                extents
+            };
+
+            let worker_manager = self.worker_manager.as_ref();
+            let worker_lookup_group_name = if worker_manager.is_some() && !filtered_extents.is_empty() {
+                Some(self.require_worker_lookup_group(
+                    &req.ctx,
+                    group_name.clone(),
+                    mount_epoch,
+                    route_epoch,
+                    "GetFileLayout",
+                )?)
+            } else {
+                None
+            };
+            let caller = Self::caller_context_fields(&req.ctx);
+            let mut locations = Vec::with_capacity(filtered_extents.len());
+            for extent in &filtered_extents {
+                let block_stamp = match extent.block_stamp {
+                    Some(stamp) => {
+                        if stamp == 0 {
                             return self.failure_from_error_with_route_epoch(
                                 &req.ctx,
-                                MetadataError::Internal(format!(
-                                    "extent range overflows: file_offset={}, len={}",
-                                    extent.file_offset, extent.len
+                                MetadataError::InvalidArgument(format!(
+                                    "extent {} at file_offset {} has zero block_stamp",
+                                    extent.block_id, extent.file_offset
                                 )),
                                 group_name,
                                 mount_epoch,
                                 route_epoch,
                             );
                         }
-                    };
-                    if extent.file_offset < range_end && extent_end > range.offset {
-                        filtered.push(extent);
+                        stamp
                     }
-                }
-                filtered
-            }
-        } else {
-            extents
-        };
-
-        let worker_manager = self.worker_manager.as_ref();
-        let worker_lookup_group_name = if worker_manager.is_some() && !filtered_extents.is_empty() {
-            Some(self.require_worker_lookup_group(
-                &req.ctx,
-                group_name.clone(),
-                mount_epoch,
-                route_epoch,
-                "GetFileLayout",
-            )?)
-        } else {
-            None
-        };
-        let caller = Self::caller_context_fields(&req.ctx);
-        let mut locations = Vec::with_capacity(filtered_extents.len());
-        for extent in &filtered_extents {
-            let block_stamp = match extent.block_stamp {
-                Some(stamp) => {
-                    if stamp == 0 {
+                    None => {
                         return self.failure_from_error_with_route_epoch(
                             &req.ctx,
                             MetadataError::InvalidArgument(format!(
-                                "extent {} at file_offset {} has zero block_stamp",
+                                "extent {} at file_offset {} missing block_stamp",
                                 extent.block_id, extent.file_offset
                             )),
                             group_name,
@@ -797,115 +776,101 @@ impl MetadataFileSystem {
                             route_epoch,
                         );
                     }
-                    stamp
-                }
-                None => {
-                    return self.failure_from_error_with_route_epoch(
-                        &req.ctx,
-                        MetadataError::InvalidArgument(format!(
-                            "extent {} at file_offset {} missing block_stamp",
-                            extent.block_id, extent.file_offset
-                        )),
-                        group_name,
-                        mount_epoch,
-                        route_epoch,
-                    );
-                }
-            };
-            let effective_len = match extent.block_offset.checked_add(extent.len) {
-                Some(len) => len,
-                None => {
-                    return self.failure_from_error_with_route_epoch(
-                        &req.ctx,
-                        MetadataError::Internal(format!(
-                            "extent block range overflows: block_offset={}, len={}",
-                            extent.block_offset, extent.len
-                        )),
-                        group_name,
-                        mount_epoch,
-                        route_epoch,
-                    );
-                }
-            };
-            let mut workers = Vec::new();
-            if let (Some(worker_manager), Some(worker_lookup_group_name)) =
-                (worker_manager, worker_lookup_group_name.as_ref())
-            {
-                let reported = worker_manager.reported_block_locations(worker_lookup_group_name, extent.block_id);
-                let views = worker_manager.collect_worker_placement_views(worker_lookup_group_name);
-                let usable_views: Vec<_> = views.into_iter().filter(Self::has_usable_read_endpoint).collect();
-                let plan = PlacementPlanner.plan(
-                    &PlacementRequest {
-                        group_name: worker_lookup_group_name.clone(),
-                        op: PlacementOp::Read,
-                        block_id: extent.block_id,
-                        block_stamp: Some(block_stamp),
-                        layout,
-                        caller: caller.clone(),
-                        existing: reported.clone(),
-                        exclude_workers: Vec::new(),
-                        target_replicas: layout.replication,
-                    },
-                    &usable_views,
-                );
-                if plan.status == PlacementStatus::NoLiveReplica {
-                    let (kind, message) = Self::classify_unavailable_read_location(
-                        &req.ctx,
-                        worker_lookup_group_name,
-                        extent,
-                        block_stamp,
-                        &reported,
+                };
+                let effective_len = match extent.block_offset.checked_add(extent.len) {
+                    Some(len) => len,
+                    None => {
+                        return self.failure_from_error_with_route_epoch(
+                            &req.ctx,
+                            MetadataError::Internal(format!(
+                                "extent block range overflows: block_offset={}, len={}",
+                                extent.block_offset, extent.len
+                            )),
+                            group_name,
+                            mount_epoch,
+                            route_epoch,
+                        );
+                    }
+                };
+                let mut workers = Vec::new();
+                if let (Some(worker_manager), Some(worker_lookup_group_name)) =
+                    (worker_manager, worker_lookup_group_name.as_ref())
+                {
+                    let reported = worker_manager.reported_block_locations(worker_lookup_group_name, extent.block_id);
+                    let views = worker_manager.collect_worker_placement_views(worker_lookup_group_name);
+                    let usable_views: Vec<_> = views.into_iter().filter(Self::has_usable_read_endpoint).collect();
+                    let plan = PlacementPlanner.plan(
+                        &PlacementRequest {
+                            group_name: worker_lookup_group_name.clone(),
+                            op: PlacementOp::Read,
+                            block_id: extent.block_id,
+                            block_stamp: Some(block_stamp),
+                            layout,
+                            caller: caller.clone(),
+                            existing: reported.clone(),
+                            exclude_workers: Vec::new(),
+                            target_replicas: layout.replication,
+                        },
                         &usable_views,
                     );
-                    return self.refresh_metadata_failure_with_hint(
-                        &req.ctx,
-                        kind,
-                        message,
-                        group_name,
-                        mount_epoch,
-                        route_epoch,
-                        Some(RefreshHint {
-                            worker_resolve_required: true,
-                            ..RefreshHint::default()
-                        }),
-                    );
-                }
-                workers.reserve(plan.workers.len());
-                for worker in plan.workers {
-                    if let Ok(endpoint) = worker_endpoint_from_parts(
-                        worker.worker_id,
-                        worker.endpoint,
-                        worker.worker_net_protocol,
-                        worker.worker_run_id,
-                    ) {
-                        workers.push(endpoint);
+                    if plan.status == PlacementStatus::NoLiveReplica {
+                        let (kind, message) = Self::classify_unavailable_read_location(
+                            &req.ctx,
+                            worker_lookup_group_name,
+                            extent,
+                            block_stamp,
+                            &reported,
+                            &usable_views,
+                        );
+                        return self.refresh_metadata_failure_with_hint(
+                            &req.ctx,
+                            kind,
+                            message,
+                            group_name,
+                            mount_epoch,
+                            route_epoch,
+                            Some(RefreshHint {
+                                worker_resolve_required: true,
+                                ..RefreshHint::default()
+                            }),
+                        );
+                    }
+                    workers.reserve(plan.workers.len());
+                    for worker in plan.workers {
+                        if let Ok(endpoint) = worker_endpoint_from_parts(
+                            worker.worker_id,
+                            worker.endpoint,
+                            worker.worker_net_protocol,
+                            worker.worker_run_id,
+                        ) {
+                            workers.push(endpoint);
+                        }
                     }
                 }
+                locations.push(FileBlockLocation {
+                    block_id: extent.block_id,
+                    file_offset: extent.file_offset,
+                    len: extent.len,
+                    block_stamp,
+                    workers,
+                    block_format_id: layout.block_format_id,
+                    block_size: u64::from(layout.block_size),
+                    chunk_size: layout.chunk_size,
+                    effective_len,
+                });
             }
-            locations.push(FileBlockLocation {
-                block_id: extent.block_id,
-                file_offset: extent.file_offset,
-                len: extent.len,
-                block_stamp,
-                workers,
-                block_format_id: layout.block_format_id,
-                block_size: u64::from(layout.block_size),
-                chunk_size: layout.chunk_size,
-                effective_len,
-            });
-        }
 
-        self.success_with_route_epoch(
-            &req.ctx,
-            GetFileLayoutOutput {
-                file_size: inode.attrs.size,
-                content_revision,
-                locations,
-            },
-            group_name,
-            mount_epoch,
-            route_epoch,
-        )
+            self.success_with_route_epoch(
+                &req.ctx,
+                GetFileLayoutOutput {
+                    file_size: inode.attrs.size,
+                    content_revision,
+                    locations,
+                },
+                group_name,
+                mount_epoch,
+                route_epoch,
+            )
         }
         .await;
         record_fs_read_result("get_file_layout", started, &result);
@@ -930,16 +895,10 @@ mod tests {
     use super::*;
     use crate::service::filesystem::test_support::*;
 
-    fn seed_visible_block(
-        storage: &RocksDBStorage,
-        mount_id: MountId,
-        inode_id: InodeId,
-        data_handle_id: DataHandleId,
-        block_id: BlockId,
-    ) {
+    fn seed_visible_block(storage: &RocksDBStorage, mount_id: MountId, inode_id: InodeId, block_id: BlockId) {
         let mut attrs = FileAttrs::new();
         attrs.size = 512;
-        let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
+        let mut inode = Inode::new_file(inode_id, attrs, mount_id);
         inode.data = beryl_types::fs::InodeData::File {
             extents: vec![beryl_types::fs::Extent {
                 file_offset: 0,
@@ -955,18 +914,16 @@ mod tests {
         };
         storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
     }
 
     #[tokio::test]
-    async fn get_file_layout_uses_inode_authority_without_reverse_owner_read() {
+    async fn get_file_layout_uses_inode_authority() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_id = MountId::new(48);
         let group_name_value = group_name("g8");
         let inode_id = InodeId::new(480);
-        let data_handle_id = DataHandleId::new(9480);
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+        let block_id = BlockId::new(inode_id, BlockIndex::new(0));
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
         let worker_manager = Arc::new(WorkerManager::new(60));
         for (raw, endpoint) in [(2, "127.0.0.2:9102"), (1, "127.0.0.1:9101")] {
@@ -1001,7 +958,7 @@ mod tests {
 
         let mut attrs = FileAttrs::new();
         attrs.size = 512;
-        let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
+        let mut inode = Inode::new_file(inode_id, attrs, mount_id);
         inode.data = beryl_types::fs::InodeData::File {
             extents: vec![beryl_types::fs::Extent {
                 file_offset: 0,
@@ -1028,7 +985,6 @@ mod tests {
                 ctx,
                 inode_id,
                 range: None,
-                requested_data_handle_id: None,
                 freshness: Freshness::default(),
             })
             .await
@@ -1061,6 +1017,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_file_layout_rejects_inode_key_identity_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_id = MountId::new(48);
+        let storage_key_inode_id = InodeId::new(481);
+        let stored_inode_id = InodeId::new(482);
+        let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name("g8"))
+            .with_storage(Arc::clone(&storage))
+            .build();
+        storage
+            .put_inode_at_storage_key(
+                storage_key_inode_id,
+                &Inode::new_file(stored_inode_id, FileAttrs::new(), mount_id),
+            )
+            .unwrap();
+        storage
+            .put_layout(storage_key_inode_id, FileLayout::new(4096, 4096, 1))
+            .unwrap();
+
+        let failure = filesystem
+            .get_file_layout_resolved(GetFileLayoutInput {
+                ctx: request_context(),
+                inode_id: storage_key_inode_id,
+                range: None,
+                freshness: Freshness::default(),
+            })
+            .await
+            .expect_err("key/value identity mismatch must fail closed");
+
+        assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EInval));
+        assert!(failure.error.message.contains("inode authority is corrupt"));
+    }
+
+    #[tokio::test]
     async fn get_file_layout_rejects_unavailable_or_stale_reported_locations() {
         #[derive(Clone, Copy, Debug)]
         enum Case {
@@ -1081,8 +1071,7 @@ mod tests {
             let mount_id = MountId::new(53 + offset);
             let group_name_value = group_name("g8");
             let inode_id = InodeId::new(530 + offset);
-            let data_handle_id = DataHandleId::new(9530 + offset);
-            let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+            let block_id = BlockId::new(inode_id, BlockIndex::new(0));
             let worker_id = WorkerId::new(1);
             let worker_manager = Arc::new(WorkerManager::new(if matches!(case, Case::ExpiredWorker) {
                 1
@@ -1144,14 +1133,13 @@ mod tests {
                 .with_storage(Arc::clone(&storage))
                 .with_worker_manager(worker_manager)
                 .build();
-            seed_visible_block(&storage, mount_id, inode_id, data_handle_id, block_id);
+            seed_visible_block(&storage, mount_id, inode_id, block_id);
 
             let failure = match filesystem
                 .get_file_layout_resolved(GetFileLayoutInput {
                     ctx: request_context(),
                     inode_id,
                     range: None,
-                    requested_data_handle_id: None,
                     freshness: Freshness::default(),
                 })
                 .await
@@ -1173,8 +1161,8 @@ mod tests {
     #[test]
     fn unavailable_read_location_classifier_detects_stale_worker_run() {
         let group_name_value = group_name("g8b");
-        let data_handle_id = DataHandleId::new(9561);
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+        let inode_id = InodeId::new(9561);
+        let block_id = BlockId::new(inode_id, BlockIndex::new(0));
         let worker_id = WorkerId::new(1);
         let reported_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440061".parse().unwrap();
         let current_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440062".parse().unwrap();
@@ -1234,8 +1222,7 @@ mod tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_id = MountId::new(52);
         let inode_id = InodeId::new(520);
-        let data_handle_id = DataHandleId::new(9520);
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+        let block_id = BlockId::new(inode_id, BlockIndex::new(0));
         let worker_id = WorkerId::new(1);
         let builder = filesystem_builder_without_mount();
         let worker_manager = Arc::new(WorkerManager::new(60));
@@ -1263,7 +1250,7 @@ mod tests {
 
         let mut attrs = FileAttrs::new();
         attrs.size = 512;
-        let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
+        let mut inode = Inode::new_file(inode_id, attrs, mount_id);
         inode.data = beryl_types::fs::InodeData::File {
             extents: vec![beryl_types::fs::Extent {
                 file_offset: 0,
@@ -1279,14 +1266,12 @@ mod tests {
         };
         storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let failure = filesystem
             .get_file_layout_resolved(GetFileLayoutInput {
                 ctx: request_context(),
                 inode_id,
                 range: None,
-                requested_data_handle_id: None,
                 freshness: Freshness::default(),
             })
             .await
@@ -1311,8 +1296,7 @@ mod tests {
         let served_group = group_name("g9");
         let other_group = group_name("g10");
         let inode_id = InodeId::new(510);
-        let data_handle_id = DataHandleId::new(9510);
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+        let block_id = BlockId::new(inode_id, BlockIndex::new(0));
         let worker_id = WorkerId::new(1);
         let worker_run_id: beryl_types::WorkerRunId = "550e8400-e29b-41d4-a716-446655440052".parse().unwrap();
         let builder = filesystem_builder_with_mount(mount_id, 9, &served_group);
@@ -1352,7 +1336,7 @@ mod tests {
 
         let mut attrs = FileAttrs::new();
         attrs.size = 512;
-        let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
+        let mut inode = Inode::new_file(inode_id, attrs, mount_id);
         inode.data = beryl_types::fs::InodeData::File {
             extents: vec![beryl_types::fs::Extent {
                 file_offset: 0,
@@ -1368,14 +1352,12 @@ mod tests {
         };
         storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let failure = filesystem
             .get_file_layout_resolved(GetFileLayoutInput {
                 ctx: request_context(),
                 inode_id,
                 range: None,
-                requested_data_handle_id: None,
                 freshness: Freshness::default(),
             })
             .await
@@ -1396,11 +1378,10 @@ mod tests {
         for (offset, block_stamp, expected_message) in [(0_u64, None, "block_stamp"), (1, Some(0), "zero block_stamp")]
         {
             let inode_id = InodeId::new(490 + offset);
-            let data_handle_id = DataHandleId::new(9490 + offset);
-            let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+            let block_id = BlockId::new(inode_id, BlockIndex::new(0));
             let mut attrs = FileAttrs::new();
             attrs.size = 512;
-            let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
+            let mut inode = Inode::new_file(inode_id, attrs, mount_id);
             inode.data = beryl_types::fs::InodeData::File {
                 extents: vec![beryl_types::fs::Extent {
                     file_offset: 0,
@@ -1416,14 +1397,12 @@ mod tests {
             };
             storage.put_inode(&inode).unwrap();
             storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-            storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
             let failure = filesystem
                 .get_file_layout_resolved(GetFileLayoutInput {
                     ctx: request_context(),
                     inode_id,
                     range: None,
-                    requested_data_handle_id: None,
                     freshness: Freshness::default(),
                 })
                 .await
@@ -1488,7 +1467,7 @@ mod tests {
         let mut child_attrs = FileAttrs::new();
         child_attrs.size = 128;
         child_attrs.mode = 0o600;
-        let child = Inode::new_file(child_inode_id, child_attrs.clone(), mount_id, DataHandleId::new(7111));
+        let child = Inode::new_file(child_inode_id, child_attrs.clone(), mount_id);
         storage.put_inode(&parent).unwrap();
         storage.put_inode(&child).unwrap();
         storage.put_dentry(parent_inode_id, "child", child_inode_id).unwrap();
@@ -1605,22 +1584,19 @@ mod tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_id = MountId::new(73);
         let inode_id = InodeId::new(730);
-        let data_handle_id = DataHandleId::new(9730);
         let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name("g20"))
             .with_storage(Arc::clone(&storage))
             .build();
         storage
-            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id))
             .unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let failure = filesystem
             .get_file_layout_resolved(GetFileLayoutInput {
                 ctx: request_context(),
                 inode_id,
                 range: None,
-                requested_data_handle_id: Some(data_handle_id),
                 freshness: Freshness {
                     mount_epoch: None,
                     route_epoch: Some(0),
@@ -1646,12 +1622,7 @@ mod tests {
             .with_storage(Arc::clone(&storage))
             .build();
         storage
-            .put_inode(&Inode::new_file(
-                inode_id,
-                FileAttrs::new(),
-                mount_id,
-                DataHandleId::new(9740),
-            ))
+            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id))
             .unwrap();
 
         let success = filesystem
@@ -1674,15 +1645,14 @@ mod tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_id = MountId::new(75);
         let inode_id = InodeId::new(750);
-        let data_handle_id = DataHandleId::new(9750);
         let mut attrs = FileAttrs::new();
         attrs.size = 300;
-        let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
+        let mut inode = Inode::new_file(inode_id, attrs, mount_id);
         inode.data = beryl_types::fs::InodeData::File {
             extents: (0_u32..3)
                 .map(|idx| beryl_types::fs::Extent {
                     file_offset: u64::from(idx) * 100,
-                    block_id: BlockId::new(data_handle_id, BlockIndex::new(idx)),
+                    block_id: BlockId::new(inode_id, BlockIndex::new(idx)),
                     block_offset: 0,
                     len: 100,
                     content_revision: Some(5),
@@ -1698,7 +1668,6 @@ mod tests {
             .build();
         storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let overflow = filesystem
             .get_file_layout_resolved(GetFileLayoutInput {
@@ -1708,7 +1677,6 @@ mod tests {
                     offset: u64::MAX,
                     len: 1,
                 }),
-                requested_data_handle_id: None,
                 freshness: Freshness::default(),
             })
             .await
@@ -1721,7 +1689,6 @@ mod tests {
                 ctx: request_context(),
                 inode_id,
                 range: Some(FileRange { offset: 0, len: 0 }),
-                requested_data_handle_id: None,
                 freshness: Freshness::default(),
             })
             .await
@@ -1735,7 +1702,6 @@ mod tests {
                 ctx: request_context(),
                 inode_id,
                 range: Some(FileRange { offset: 50, len: 150 }),
-                requested_data_handle_id: None,
                 freshness: Freshness::default(),
             })
             .await
@@ -1765,7 +1731,7 @@ mod tests {
     async fn locations_return_content_revision() {
         let env = write_flow_env(64).await;
         seed_committed_content_revision(&env, 41, 900);
-        publish_env_block_location(&env, BlockId::new(env.data_handle_id, BlockIndex::new(0)), 41, 1);
+        publish_env_block_location(&env, BlockId::new(env.inode_id, BlockIndex::new(0)), 41, 1);
 
         let locations = env
             .filesystem
@@ -1773,7 +1739,6 @@ mod tests {
                 ctx: request_context(),
                 inode_id: env.inode_id,
                 range: None,
-                requested_data_handle_id: Some(env.data_handle_id),
                 freshness: Freshness::default(),
             })
             .await
@@ -1838,7 +1803,6 @@ mod tests {
                 ctx: request_context(),
                 inode_id: env.inode_id,
                 range: None,
-                requested_data_handle_id: Some(env.data_handle_id),
                 freshness: Freshness::default(),
             })
             .await
@@ -1900,7 +1864,6 @@ mod tests {
                 ctx,
                 inode_id: env.inode_id,
                 range: None,
-                requested_data_handle_id: Some(env.data_handle_id),
                 freshness: Freshness::default(),
             })
             .await

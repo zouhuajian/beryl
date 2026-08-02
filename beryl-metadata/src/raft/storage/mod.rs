@@ -36,7 +36,7 @@ use crate::raft::AppMetadataRaftState;
 use crate::state::RouteEpoch;
 use crate::worker::WorkerInfo;
 use beryl_types::fs::{Inode, InodeId};
-use beryl_types::ids::{DataHandleId, MountId, WorkerId};
+use beryl_types::ids::{MountId, WorkerId};
 use beryl_types::layout::FileLayout;
 use beryl_types::GroupName;
 use bincode::config::standard;
@@ -62,9 +62,8 @@ const CF_RAFT_SNAPSHOT: &str = "raft_snapshot"; // Raft snapshots
 const ROCKSDB_SCHEMA_VERSION_KEY: &[u8] = b"rocksdb_schema_version";
 const STORAGE_IDENTITY_KEY: &[u8] = b"storage_identity";
 const RAFT_STATE_KEY: &[u8] = b"raft_state";
-pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 9;
+pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 10;
 const NEXT_INODE_ID_KEY: &[u8] = b"next_inode_id";
-const NEXT_DATA_HANDLE_ID_KEY: &[u8] = b"next_data_handle_id";
 
 fn durable_raft_write_options() -> WriteOptions {
     let mut options = WriteOptions::default();
@@ -166,14 +165,6 @@ pub(crate) struct RecursiveMkdirEntry {
     pub(crate) updated_parent: Inode,
 }
 
-/// File identities reserved by a read-only allocator preparation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct FileAllocation {
-    pub(crate) inode: InodeAllocation,
-    pub(crate) data_handle_id: DataHandleId,
-    next_data_handle_id: DataHandleId,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BootstrapNamespaceState {
     Empty,
@@ -184,7 +175,6 @@ pub(crate) enum BootstrapNamespaceState {
 /// Overwritten rename target state that must be removed with the namespace move.
 pub(crate) struct RenameOverwriteCleanup {
     pub inode_id: InodeId,
-    pub data_handle_id: Option<DataHandleId>,
 }
 
 /// Namespace rename writes that must commit as one RocksDB batch.
@@ -202,13 +192,13 @@ pub(crate) struct RenameAtomicUpdate<'a> {
 
 /// One namespace child removed from a detached directory in a bounded apply.
 ///
-/// Directories carry a child marker and retain their inode. Files carry their
-/// data handle so layout and owner authority are removed with the inode.
+/// Directories carry a child marker and retain their inode. File entries mark
+/// that their layout authority must be removed with the inode.
 pub(crate) struct DetachedRootReclaimEntry {
     pub(crate) parent_inode_id: InodeId,
     pub(crate) name: String,
     pub(crate) inode_id: InodeId,
-    pub(crate) data_handle_id: Option<DataHandleId>,
+    pub(crate) remove_file_layout: bool,
     pub(crate) child_detached_root: Option<DetachedRoot>,
 }
 
@@ -226,12 +216,9 @@ impl DetachedRootReclaimEntry {
             bytes = bytes
                 .checked_add(RocksDBStorage::encode_inode_key(self.inode_id).len())
                 .ok_or_else(|| MetadataError::Internal("detached-root logical byte count overflow".to_string()))?;
-            if let Some(data_handle_id) = self.data_handle_id {
+            if self.remove_file_layout {
                 bytes = bytes
                     .checked_add(RocksDBStorage::encode_layout_key(self.inode_id).len())
-                    .and_then(|value| {
-                        value.checked_add(RocksDBStorage::encode_data_handle_owner_key(data_handle_id).len())
-                    })
                     .ok_or_else(|| MetadataError::Internal("detached-root logical byte count overflow".to_string()))?;
             }
         }
@@ -348,10 +335,6 @@ impl RocksDBStorage {
 
     fn encode_layout_key(inode_id: InodeId) -> Vec<u8> {
         format!("layout:{}", inode_id.as_raw()).into_bytes()
-    }
-
-    fn encode_data_handle_owner_key(data_handle_id: DataHandleId) -> Vec<u8> {
-        format!("data_handle_owner:{}", data_handle_id.as_raw()).into_bytes()
     }
 
     fn cf<'a>(db: &'a DB, name: &str) -> MetadataResult<&'a ColumnFamily> {

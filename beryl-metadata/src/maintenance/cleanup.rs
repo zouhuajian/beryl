@@ -120,7 +120,7 @@ pub(crate) struct BlockCleanupCommand {
 fn replica_sort_key(replica: &ReplicaKey) -> (u64, u64, u32, u64) {
     (
         replica.worker_id.as_raw(),
-        replica.block_id.data_handle_id.as_raw(),
+        replica.block_id.inode_id.as_raw(),
         replica.block_id.index.as_raw(),
         replica.block_stamp,
     )
@@ -223,6 +223,36 @@ impl BlockCleanupCoordinator {
             if commands.len() == self.max_commands_per_heartbeat {
                 break;
             }
+            match self.revalidate_reclaimable(&key) {
+                Ok(CleanupDecision::Reclaimable) => {}
+                Ok(CleanupDecision::Keep) => {
+                    observe::record_cleanup_decision("keep");
+                    self.state.lock().entries.remove(&key);
+                    continue;
+                }
+                Ok(CleanupDecision::Wait) => {
+                    observe::record_cleanup_decision("wait");
+                    self.state.lock().entries.remove(&key);
+                    continue;
+                }
+                Err(error) => {
+                    observe::record_cleanup_anomaly("authority_read");
+                    warn!(
+                        group_name = %key.group_name,
+                        worker_id = key.worker_id.as_raw(),
+                        worker_run_id = %key.worker_run_id,
+                        block_id = %key.block_id,
+                        error = %error,
+                        "Dropping a cleanup candidate because final metadata authority could not be read"
+                    );
+                    self.state.lock().entries.remove(&key);
+                    continue;
+                }
+            }
+            if self.current_leader_term() != Some(term) {
+                self.state.lock().entries.clear();
+                return Vec::new();
+            }
             if !self.worker_manager.is_current_ready_replica(&key) {
                 self.state.lock().entries.remove(&key);
                 continue;
@@ -249,6 +279,10 @@ impl BlockCleanupCoordinator {
             if retry {
                 observe::record_cleanup_retry();
             }
+        }
+        if self.current_leader_term() != Some(term) {
+            self.state.lock().entries.clear();
+            return Vec::new();
         }
         commands
     }
@@ -464,11 +498,11 @@ impl BlockCleanupCoordinator {
     /// The second phase prevents a mixed authority/session view from producing
     /// a false reclaimable observation during write publication.
     fn classify(&self, replica: &ReplicaKey) -> MetadataResult<CleanupDecision> {
-        let (decision, owner_present) = self.classify_authority(replica)?;
+        let decision = self.classify_authority(replica)?;
         if decision != CleanupDecision::Reclaimable {
             return Ok(decision);
         }
-        self.revalidate_reclaimable(replica, owner_present)
+        self.revalidate_reclaimable(replica)
     }
 
     /// Rechecks session and durable authority before accepting `Reclaimable`.
@@ -476,50 +510,34 @@ impl BlockCleanupCoordinator {
     /// File publication persists visible extents before removing its session.
     /// Reading the session first and authority second therefore cannot combine
     /// a pre-publish inode with that publication's already-removed session.
-    fn revalidate_reclaimable(&self, replica: &ReplicaKey, owner_present: bool) -> MetadataResult<CleanupDecision> {
-        if !owner_present {
-            return Ok(CleanupDecision::Reclaimable);
-        }
-        if self
-            .session_registry
-            .get_session(replica.block_id.data_handle_id)
-            .is_some()
-        {
+    fn revalidate_reclaimable(&self, replica: &ReplicaKey) -> MetadataResult<CleanupDecision> {
+        if self.session_registry.get_session(replica.block_id.inode_id).is_some() {
             return Ok(CleanupDecision::Wait);
         }
-        self.classify_authority(replica).map(|(decision, _)| decision)
+        self.classify_authority(replica)
     }
 
-    /// Classifies one replica from durable owner and inode authority.
+    /// Classifies one replica from durable inode authority.
     ///
-    /// Missing owners are reclaimable, any visible matching block id is kept,
-    /// and inconsistent owners or never-allocated block indexes wait. The
-    /// returned boolean records whether an owner mapping was present.
-    fn classify_authority(&self, replica: &ReplicaKey) -> MetadataResult<(CleanupDecision, bool)> {
-        let data_handle_id = replica.block_id.data_handle_id;
-        let Some(inode_id) = self.storage.get_inode_by_data_handle(data_handle_id)? else {
-            return Ok((CleanupDecision::Reclaimable, false));
-        };
+    /// A missing inode is reclaimable, any visible matching block id is kept,
+    /// and corrupt inode authority or never-allocated block indexes wait.
+    fn classify_authority(&self, replica: &ReplicaKey) -> MetadataResult<CleanupDecision> {
+        let inode_id = replica.block_id.inode_id;
         let Some(inode) = self.storage.get_inode(inode_id)? else {
-            observe::record_cleanup_anomaly("owner_inode_missing");
-            warn!(
-                group_name = %replica.group_name,
-                block_id = %replica.block_id,
-                inode_id = inode_id.as_raw(),
-                "Waiting to classify a reported replica because its owner inode is missing"
-            );
-            return Ok((CleanupDecision::Wait, true));
+            return Ok(CleanupDecision::Reclaimable);
         };
-        if inode.data_handle_id != data_handle_id {
-            observe::record_cleanup_anomaly("owner_handle_mismatch");
+        if inode.inode_id != inode_id || inode.kind != inode.data.kind() {
+            observe::record_cleanup_anomaly("inode_authority_corrupt");
             warn!(
                 group_name = %replica.group_name,
                 block_id = %replica.block_id,
                 inode_id = inode_id.as_raw(),
-                inode_data_handle_id = inode.data_handle_id.as_raw(),
-                "Waiting to classify a reported replica because its owner mapping is inconsistent"
+                inode_inode_id = inode.inode_id.as_raw(),
+                inode_kind = ?inode.kind,
+                payload_kind = ?inode.data.kind(),
+                "Waiting to classify a reported replica because its inode authority is inconsistent"
             );
-            return Ok((CleanupDecision::Wait, true));
+            return Ok(CleanupDecision::Wait);
         }
 
         let InodeData::File {
@@ -528,14 +546,14 @@ impl BlockCleanupCoordinator {
             ..
         } = &inode.data
         else {
-            observe::record_cleanup_anomaly("owner_not_file");
+            observe::record_cleanup_anomaly("inode_not_file");
             warn!(
                 group_name = %replica.group_name,
                 block_id = %replica.block_id,
                 inode_id = inode_id.as_raw(),
-                "Waiting to classify a reported replica because its owner is not a file"
+                "Waiting to classify a reported replica because its inode is not a file"
             );
-            return Ok((CleanupDecision::Wait, true));
+            return Ok(CleanupDecision::Wait);
         };
 
         if let Some(extent) = extents.iter().find(|extent| extent.block_id == replica.block_id) {
@@ -550,7 +568,7 @@ impl BlockCleanupCoordinator {
                     "Keeping a visible block with a conflicting reported stamp"
                 );
             }
-            return Ok((CleanupDecision::Keep, true));
+            return Ok(CleanupDecision::Keep);
         }
 
         if u64::from(replica.block_id.index.as_raw()) >= *next_block_index {
@@ -561,10 +579,10 @@ impl BlockCleanupCoordinator {
                 next_block_index,
                 "Waiting to classify a reported replica whose block index was not durably allocated"
             );
-            return Ok((CleanupDecision::Wait, true));
+            return Ok(CleanupDecision::Wait);
         }
 
-        Ok((CleanupDecision::Reclaimable, true))
+        Ok(CleanupDecision::Reclaimable)
     }
 
     /// Creates or renews a bounded candidate without resetting its grace period.
@@ -638,7 +656,7 @@ mod tests {
     use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus};
     use crate::MountTable;
     use beryl_types::fs::{Extent, FileAttrs, Inode, InodeData, InodeId};
-    use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, MountId, WorkerId};
+    use beryl_types::ids::{BlockId, BlockIndex, MountId, WorkerId};
     use beryl_types::{ClientId, FileLayout, WorkerRunId};
     use tempfile::TempDir;
 
@@ -688,9 +706,9 @@ mod tests {
         raft_node
     }
 
-    fn replica(data_handle_id: u64, index: u32, stamp: u64) -> ReplicaKey {
+    fn replica(inode_id: u64, index: u32, stamp: u64) -> ReplicaKey {
         replica_for_worker(
-            data_handle_id,
+            inode_id,
             index,
             stamp,
             WorkerId::new(1),
@@ -699,7 +717,7 @@ mod tests {
     }
 
     fn replica_for_worker(
-        data_handle_id: u64,
+        inode_id: u64,
         index: u32,
         stamp: u64,
         worker_id: WorkerId,
@@ -709,19 +727,18 @@ mod tests {
             group_name: group_name(),
             worker_id,
             worker_run_id,
-            block_id: BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(index)),
+            block_id: BlockId::new(InodeId::new(inode_id), BlockIndex::new(index)),
             block_stamp: stamp,
         }
     }
 
     fn persist_file(
         storage: &RocksDBStorage,
-        data_handle_id: DataHandleId,
+        inode_id: InodeId,
         extents: Vec<Extent>,
         next_block_index: u64,
     ) -> InodeId {
-        let inode_id = InodeId::new(data_handle_id.as_raw() + 1_000);
-        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
+        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1));
         inode.data = InodeData::File {
             extents,
             content_revision: Some(1),
@@ -729,16 +746,14 @@ mod tests {
             next_block_index,
         };
         storage.put_inode(&inode).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
         inode_id
     }
 
-    fn create_session(registry: &SessionRegistry, data_handle_id: DataHandleId, inode_id: InodeId) {
+    fn create_session(registry: &SessionRegistry, inode_id: InodeId) {
         registry
             .create_session(CreateSessionInput {
                 inode_id,
                 mount_id: MountId::new(1),
-                data_handle_id,
                 lease_epoch: 1,
                 base_size: 0,
                 content_revision: 0,
@@ -842,15 +857,15 @@ mod tests {
         assert_eq!(coordinator.classify(&detached).unwrap(), CleanupDecision::Reclaimable);
 
         let missing_inode = replica(11, 0, 1);
-        storage
-            .put_data_handle_owner(missing_inode.block_id.data_handle_id, InodeId::new(999))
-            .unwrap();
-        assert_eq!(coordinator.classify(&missing_inode).unwrap(), CleanupDecision::Wait);
+        assert_eq!(
+            coordinator.classify(&missing_inode).unwrap(),
+            CleanupDecision::Reclaimable
+        );
 
         let visible = replica(12, 0, 2);
         persist_file(
             &storage,
-            visible.block_id.data_handle_id,
+            visible.block_id.inode_id,
             vec![Extent {
                 file_offset: 0,
                 block_id: visible.block_id,
@@ -864,14 +879,14 @@ mod tests {
         assert_eq!(coordinator.classify(&visible).unwrap(), CleanupDecision::Keep);
 
         let active = replica(13, 0, 1);
-        let active_inode = persist_file(&storage, active.block_id.data_handle_id, Vec::new(), 1);
-        create_session(&sessions, active.block_id.data_handle_id, active_inode);
+        persist_file(&storage, active.block_id.inode_id, Vec::new(), 1);
+        create_session(&sessions, active.block_id.inode_id);
         assert_eq!(coordinator.classify(&active).unwrap(), CleanupDecision::Wait);
-        sessions.remove_session_if_epoch(active.block_id.data_handle_id, 1);
+        sessions.remove_session_if_epoch(active.block_id.inode_id, 1);
         assert_eq!(coordinator.classify(&active).unwrap(), CleanupDecision::Reclaimable);
 
         let unallocated = replica(14, 1, 1);
-        persist_file(&storage, unallocated.block_id.data_handle_id, Vec::new(), 1);
+        persist_file(&storage, unallocated.block_id.inode_id, Vec::new(), 1);
         assert_eq!(coordinator.classify(&unallocated).unwrap(), CleanupDecision::Wait);
     }
 
@@ -901,7 +916,7 @@ mod tests {
 
         persist_file(
             &storage,
-            becomes_visible.block_id.data_handle_id,
+            becomes_visible.block_id.inode_id,
             vec![Extent {
                 file_offset: 0,
                 block_id: becomes_visible.block_id,
@@ -1005,12 +1020,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (coordinator, storage, _worker_manager, sessions) = coordinator(&dir, cleanup_config(), false).await;
         let published = replica(60, 0, 1);
-        let inode_id = persist_file(&storage, published.block_id.data_handle_id, Vec::new(), 1);
-        create_session(&sessions, published.block_id.data_handle_id, inode_id);
+        let inode_id = persist_file(&storage, published.block_id.inode_id, Vec::new(), 1);
+        create_session(&sessions, published.block_id.inode_id);
 
-        let (initial, owner_present) = coordinator.classify_authority(&published).unwrap();
+        let initial = coordinator.classify_authority(&published).unwrap();
         assert_eq!(initial, CleanupDecision::Reclaimable);
-        assert!(owner_present);
 
         let mut inode = storage.get_inode(inode_id).unwrap().unwrap();
         let InodeData::File { extents, .. } = &mut inode.data else {
@@ -1027,9 +1041,9 @@ mod tests {
         storage
             .publish_file_atomic(&inode, FileLayout::new(64, 64, 1), &AppMetadataRaftState::default())
             .unwrap();
-        sessions.remove_session_if_epoch(published.block_id.data_handle_id, 1);
+        sessions.remove_session_if_epoch(published.block_id.inode_id, 1);
 
-        let decision = coordinator.revalidate_reclaimable(&published, owner_present).unwrap();
+        let decision = coordinator.revalidate_reclaimable(&published).unwrap();
         assert_eq!(decision, CleanupDecision::Keep);
         assert!(coordinator.apply_scan_page(vec![(published.clone(), decision)], 1, None, None, Instant::now()));
         assert!(!coordinator.state.lock().entries.contains_key(&published));
@@ -1044,7 +1058,7 @@ mod tests {
         assert!(coordinator.apply_scan_page(classified, 1, None, None, Instant::now()));
         assert!(coordinator.state.lock().entries.contains_key(&candidate));
 
-        let inode_id = persist_file(&storage, candidate.block_id.data_handle_id, Vec::new(), 1);
+        let inode_id = persist_file(&storage, candidate.block_id.inode_id, Vec::new(), 1);
         storage
             .with_pinned_db(|db| {
                 let cf = db.cf_handle("inodes").unwrap();
@@ -1387,6 +1401,76 @@ mod tests {
             .commands_for_heartbeat(&listed.group_name, listed.worker_id, listed.worker_run_id, now)
             .is_empty());
         assert!(!coordinator.state.lock().entries.contains_key(&listed));
+    }
+
+    #[tokio::test]
+    async fn cleanup_dispatch_revalidates_session_and_inode_authority() {
+        let dir = TempDir::new().unwrap();
+        let mut config = cleanup_config();
+        config.dispatch_enabled = true;
+        config.reclaim_grace_ms = 0;
+        let (coordinator, storage, worker_manager, sessions) = coordinator(&dir, config, true).await;
+        let session_started = replica(67, 0, 1);
+        let became_visible = replica(68, 0, 2);
+        let authority_unreadable = replica(69, 0, 3);
+        persist_file(&storage, became_visible.block_id.inode_id, Vec::new(), 1);
+        persist_file(&storage, authority_unreadable.block_id.inode_id, Vec::new(), 1);
+        let candidates = [
+            session_started.clone(),
+            became_visible.clone(),
+            authority_unreadable.clone(),
+        ];
+        publish_report(&worker_manager, &candidates);
+        coordinator.scan_once().await.unwrap();
+        assert!(candidates
+            .iter()
+            .all(|candidate| coordinator.state.lock().entries.contains_key(candidate)));
+
+        create_session(&sessions, session_started.block_id.inode_id);
+
+        create_session(&sessions, became_visible.block_id.inode_id);
+        let mut visible_inode = storage.get_inode(became_visible.block_id.inode_id).unwrap().unwrap();
+        let InodeData::File { extents, .. } = &mut visible_inode.data else {
+            panic!("test inode must be a file");
+        };
+        extents.push(Extent {
+            file_offset: 0,
+            block_id: became_visible.block_id,
+            block_offset: 0,
+            len: 64,
+            content_revision: Some(1),
+            block_stamp: Some(became_visible.block_stamp),
+        });
+        storage
+            .publish_file_atomic(
+                &visible_inode,
+                FileLayout::new(64, 64, 1),
+                &AppMetadataRaftState::default(),
+            )
+            .unwrap();
+        sessions.remove_session_if_epoch(became_visible.block_id.inode_id, 1);
+
+        storage
+            .with_pinned_db(|db| {
+                let cf = db.cf_handle("inodes").unwrap();
+                let mut key = b"inode/".to_vec();
+                key.extend_from_slice(&authority_unreadable.block_id.inode_id.to_be_bytes());
+                db.put_cf(cf, key, b"corrupt-inode").unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        let commands = coordinator.commands_for_heartbeat(
+            &group_name(),
+            session_started.worker_id,
+            session_started.worker_run_id,
+            Instant::now(),
+        );
+
+        assert!(commands.is_empty());
+        assert!(candidates
+            .iter()
+            .all(|candidate| !coordinator.state.lock().entries.contains_key(candidate)));
     }
 
     #[tokio::test]

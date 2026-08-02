@@ -23,7 +23,7 @@ use crate::worker::WorkerManager;
 use beryl_common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail};
 use beryl_common::header::RequestHeader;
 use beryl_types::fs::{FsErrorCode, InodeId};
-use beryl_types::ids::{DataHandleId, WorkerId};
+use beryl_types::ids::WorkerId;
 use beryl_types::{GroupName, GroupStateWatermark, WorkerEndpointInfo};
 use std::sync::Arc;
 
@@ -101,12 +101,13 @@ fn fs_failure_from_metadata_error(
 }
 
 fn fs_failure_from_rpc_error(
-    _ctx: &RequestContext,
+    ctx: &RequestContext,
     err: RpcErrorDetail,
     group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
     route_epoch: Option<u64>,
 ) -> FsFailure {
+    let group_name = group_name.or_else(|| ctx.caller.group_name.clone());
     FsFailure::new(err, group_name, mount_epoch, route_epoch, Vec::new())
 }
 
@@ -192,7 +193,7 @@ pub(crate) struct MetadataFileSystemDeps {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PresentedWriteHandle {
-    pub(crate) data_handle_id: DataHandleId,
+    pub(crate) inode_id: InodeId,
     pub(crate) lease_epoch: u64,
 }
 
@@ -461,7 +462,7 @@ mod test_support {
     };
     pub(super) use beryl_common::header::{CallerContext, RequestHeader};
     pub(super) use beryl_types::fs::{FileAttrs, FsErrorCode, Inode};
-    pub(super) use beryl_types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, MountId, WorkerId};
+    pub(super) use beryl_types::ids::{BlockId, BlockIndex, ClientId, InodeId, MountId, WorkerId};
     pub(super) use beryl_types::layout::FileLayout;
     pub(super) use beryl_types::lease::FencingToken;
     pub(super) use beryl_types::{CommittedBlock, GroupName, Tier, TierFree, WorkerRunId, WriteTarget};
@@ -511,11 +512,11 @@ mod test_support {
     }
 
     impl TestFilesystem {
-        pub(super) fn write_session_for_handle(
+        pub(super) fn write_session_for_inode(
             &self,
-            data_handle_id: DataHandleId,
+            inode_id: InodeId,
         ) -> Option<crate::session_registry::WriteSession> {
-            self.session_registry.get_session(data_handle_id)
+            self.session_registry.get_session(inode_id)
         }
 
         pub(super) fn session_registry(&self) -> Arc<SessionRegistry> {
@@ -622,6 +623,25 @@ mod test_support {
             caller: RequestHeader::new(ClientId::new(7)),
             route_epoch: None,
         }
+    }
+
+    #[test]
+    fn failure_without_resolved_authority_preserves_requested_group_identity() {
+        let group_name = group_name("requested");
+        let ctx = RequestContext {
+            caller: RequestHeader::new(ClientId::new(7)).with_group_name(group_name.clone()),
+            route_epoch: None,
+        };
+
+        let failure = fs_failure_from_metadata_error(
+            &ctx,
+            MetadataError::NotFound("missing inode".to_string()),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(failure.group_name, Some(group_name));
     }
 
     pub(super) fn group_name(raw: &str) -> GroupName {
@@ -879,11 +899,7 @@ mod test_support {
         }
     }
 
-    pub(super) fn install_write_session(
-        filesystem: &TestFilesystem,
-        inode_id: InodeId,
-        mount_id: MountId,
-    ) -> DataHandleId {
+    pub(super) fn install_write_session(filesystem: &TestFilesystem, inode_id: InodeId, mount_id: MountId) {
         install_write_session_with_ancestors(filesystem, inode_id, mount_id, vec![inode_id])
     }
 
@@ -892,14 +908,13 @@ mod test_support {
         inode_id: InodeId,
         mount_id: MountId,
         ancestor_inode_ids: Vec<InodeId>,
-    ) -> DataHandleId {
+    ) {
         let writer = ClientId::new(7);
-        let data_handle_id = DataHandleId::new(424_242);
         let (lease_epoch, expires_at_ms) = filesystem
             .lease_manager()
             .try_acquire(inode_id, writer, crate::inode_lease::WriteMode::Write, None)
             .expect("lease acquired");
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+        let block_id = BlockId::new(inode_id, BlockIndex::new(0));
         let target = WriteTarget {
             block_id,
             file_offset: 0,
@@ -921,7 +936,6 @@ mod test_support {
             .create_session(crate::session_registry::CreateSessionInput {
                 inode_id,
                 mount_id,
-                data_handle_id,
                 lease_epoch,
                 base_size: 0,
                 content_revision: 0,
@@ -934,9 +948,8 @@ mod test_support {
             .expect("session created");
         filesystem
             .session_registry()
-            .install_issued_target(data_handle_id, lease_epoch, None, Some(64), target)
+            .install_issued_target(inode_id, lease_epoch, None, Some(64), target)
             .expect("target installed");
-        data_handle_id
     }
 
     pub(super) fn committed_block(block_id: BlockId, file_offset: u64, len: u64) -> CommittedBlock {
@@ -954,12 +967,12 @@ mod test_support {
     ) -> WriteTarget {
         let previous_block_id = filesystem
             .session_registry
-            .get_session(key.data_handle_id)
+            .get_session(key.inode_id)
             .and_then(|session| session.issued_targets.last().map(|target| target.block_id));
         filesystem
             .add_block_session(
                 &request_context(),
-                key.data_handle_id,
+                key.inode_id,
                 key.lease_epoch,
                 Some(desired_len),
                 previous_block_id,
@@ -981,7 +994,7 @@ mod test_support {
             .close_write_session(
                 &request_context(),
                 PresentedWriteHandle {
-                    data_handle_id: key.data_handle_id,
+                    inode_id: key.inode_id,
                     lease_epoch: key.lease_epoch,
                 },
                 CloseWriteIntent {
@@ -993,7 +1006,7 @@ mod test_support {
                 key.content_revision,
                 match filesystem
                     .session_registry
-                    .get_session(key.data_handle_id)
+                    .get_session(key.inode_id)
                     .expect("active write session")
                     .mode
                 {
@@ -1009,7 +1022,6 @@ mod test_support {
         pub(super) storage: Arc<RocksDBStorage>,
         pub(super) filesystem: TestFilesystem,
         pub(super) inode_id: InodeId,
-        pub(super) data_handle_id: DataHandleId,
         pub(super) group_name: GroupName,
         pub(super) state_store: Arc<MemoryStateStore>,
     }
@@ -1026,8 +1038,7 @@ mod test_support {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_id = MountId::new(57 + base_size);
         let group_name = group_name(&format!("g{}", 15 + base_size));
-        let inode_id = InodeId::new(570 + base_size);
-        let data_handle_id = DataHandleId::new(9570 + base_size);
+        let inode_id = InodeId::new(9570 + base_size);
         let state_store = Arc::new(MemoryStateStore::new());
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name)
             .with_state_store(Arc::clone(&state_store) as Arc<dyn StateStore>);
@@ -1041,25 +1052,21 @@ mod test_support {
 
         let mut attrs = FileAttrs::new();
         attrs.size = base_size;
-        storage
-            .put_inode(&Inode::new_file(inode_id, attrs, mount_id, data_handle_id))
-            .unwrap();
+        storage.put_inode(&Inode::new_file(inode_id, attrs, mount_id)).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         WriteFlowEnv {
             _dir: dir,
             storage,
             filesystem,
             inode_id,
-            data_handle_id,
             group_name,
             state_store,
         }
     }
 
     pub(super) fn seed_committed_content_revision(env: &WriteFlowEnv, content_revision: u64, lease_epoch: u64) {
-        let block_id = BlockId::new(env.data_handle_id, BlockIndex::new(0));
+        let block_id = BlockId::new(env.inode_id, BlockIndex::new(0));
         let mut inode = env
             .storage
             .get_inode(env.inode_id)

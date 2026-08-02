@@ -470,7 +470,7 @@ mod tests {
         WriteStreamResponseProto,
     };
     use beryl_types::lease::FencingToken;
-    use beryl_types::{BlockId, BlockIndex, ClientId, DataHandleId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol};
+    use beryl_types::{BlockId, BlockIndex, ClientId, InodeId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol};
     use tonic::transport::Server;
     use tonic::{Request, Response, Status};
 
@@ -1162,7 +1162,7 @@ mod tests {
     }
 
     fn test_block_id() -> BlockId {
-        BlockId::new(DataHandleId::new(202), BlockIndex::new(0))
+        BlockId::new(InodeId::new(202), BlockIndex::new(0))
     }
 
     fn test_group_name() -> GroupName {
@@ -1275,7 +1275,7 @@ mod tests {
 
         use async_trait::async_trait;
         use beryl_types::{
-            BlockId, BlockIndex, ClientId, DataHandleId, GroupName, WorkerEndpointInfo, WorkerId, WorkerNetProtocol,
+            BlockId, BlockIndex, ClientId, GroupName, InodeId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol,
         };
         use bytes::Bytes;
 
@@ -1387,7 +1387,7 @@ mod tests {
                 file_offset: 0,
                 len: 4,
                 end_file_offset: 4,
-                block_id: BlockId::new(DataHandleId::new(202), BlockIndex::new(0)),
+                block_id: BlockId::new(InodeId::new(202), BlockIndex::new(0)),
                 block_offset: 0,
                 workers: vec![worker_endpoint()],
                 block_stamp,

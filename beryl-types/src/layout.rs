@@ -42,7 +42,7 @@ pub struct BlockFormatIdError {
     pub raw: u32,
 }
 
-/// Metadata-owned logical layout for a file version or data handle.
+/// Metadata-owned logical layout for a file inode.
 ///
 /// `block_size`, `chunk_size`, `replication`, and `block_format_id` are chosen
 /// by metadata for new blocks of this file version and then carried to worker

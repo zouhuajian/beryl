@@ -18,7 +18,7 @@ use beryl_proto::metadata::{
 };
 use beryl_types::chunk::ByteRange;
 use beryl_types::fs::FsErrorCode;
-use beryl_types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, WorkerId};
+use beryl_types::ids::{BlockId, BlockIndex, ClientId, InodeId, WorkerId};
 use beryl_types::layout::BlockFormatId;
 use beryl_types::{GroupName, Tier, TierFree, WorkerRunId};
 use bytes::Bytes;
@@ -45,7 +45,7 @@ const BLOCK_SIZE: u64 = 4096;
 const CHUNK_SIZE: u32 = 1024;
 
 fn block_id() -> BlockId {
-    BlockId::new(DataHandleId::new(7), BlockIndex::new(3))
+    BlockId::new(InodeId::new(7), BlockIndex::new(3))
 }
 
 fn group_name() -> GroupName {
@@ -1391,8 +1391,8 @@ fn block_report_scans_local_blocks_by_group_directory() {
     let store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(temp.path().to_path_buf()));
     let report_group = GroupName::parse("report").unwrap();
     let other_group = group_name();
-    let report_block = BlockId::new(DataHandleId::new(77), BlockIndex::new(0));
-    let other_block = BlockId::new(DataHandleId::new(78), BlockIndex::new(0));
+    let report_block = BlockId::new(InodeId::new(77), BlockIndex::new(0));
+    let other_block = BlockId::new(InodeId::new(78), BlockIndex::new(0));
     publish_ready_block_for(&store, report_group.clone(), report_block, payload(), 101);
     publish_ready_block_for(&store, other_group, other_block, payload(), 102);
 
@@ -1417,8 +1417,8 @@ async fn block_report_loop_sends_coalesced_ready_and_remove_deltas_on_store_chan
     state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
     let temp = TempDir::new().expect("tempdir");
     let store = report_store(&temp);
-    let first = BlockId::new(DataHandleId::new(7), BlockIndex::new(0));
-    let second = BlockId::new(DataHandleId::new(7), BlockIndex::new(1));
+    let first = BlockId::new(InodeId::new(7), BlockIndex::new(0));
+    let second = BlockId::new(InodeId::new(7), BlockIndex::new(1));
     let core = test_worker_core(Arc::clone(&store));
     let reporter = MetadataBlockReportLoop::new(
         test_registration_config(endpoint),
@@ -1844,7 +1844,7 @@ async fn startup_marker_recovery_precedes_first_full_block_report() {
     std::fs::write(
         &paths.deleting_marker_path,
         serde_json::to_vec(&serde_json::json!({
-            "version": 1,
+            "version": 2,
             "group_name": group_name().as_str(),
             "block_id": block_id(),
             "block_stamp": 101,
@@ -1930,14 +1930,14 @@ async fn full_block_report_batches_by_configured_limit() {
     publish_ready_block_for(
         store.as_ref(),
         group_name(),
-        BlockId::new(DataHandleId::new(7), BlockIndex::new(0)),
+        BlockId::new(InodeId::new(7), BlockIndex::new(0)),
         payload(),
         101,
     );
     publish_ready_block_for(
         store.as_ref(),
         group_name(),
-        BlockId::new(DataHandleId::new(7), BlockIndex::new(1)),
+        BlockId::new(InodeId::new(7), BlockIndex::new(1)),
         payload(),
         102,
     );
@@ -2024,14 +2024,14 @@ async fn full_block_report_stops_peer_batches_after_hard_report_errors() {
         publish_ready_block_for(
             store.as_ref(),
             group_name(),
-            BlockId::new(DataHandleId::new(7), BlockIndex::new(0)),
+            BlockId::new(InodeId::new(7), BlockIndex::new(0)),
             payload(),
             101,
         );
         publish_ready_block_for(
             store.as_ref(),
             group_name(),
-            BlockId::new(DataHandleId::new(7), BlockIndex::new(1)),
+            BlockId::new(InodeId::new(7), BlockIndex::new(1)),
             payload(),
             102,
         );
@@ -2128,14 +2128,14 @@ async fn full_report_required_from_one_peer_does_not_stop_other_peers() {
     publish_ready_block_for(
         store.as_ref(),
         group_name(),
-        BlockId::new(DataHandleId::new(7), BlockIndex::new(0)),
+        BlockId::new(InodeId::new(7), BlockIndex::new(0)),
         payload(),
         101,
     );
     publish_ready_block_for(
         store.as_ref(),
         group_name(),
-        BlockId::new(DataHandleId::new(7), BlockIndex::new(1)),
+        BlockId::new(InodeId::new(7), BlockIndex::new(1)),
         payload(),
         102,
     );
@@ -2264,8 +2264,8 @@ async fn delta_report_starts_after_full_and_full_required_resets_baseline() {
     state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
     let temp = TempDir::new().expect("tempdir");
     let store = report_store(&temp);
-    let first = BlockId::new(DataHandleId::new(7), BlockIndex::new(0));
-    let second = BlockId::new(DataHandleId::new(7), BlockIndex::new(1));
+    let first = BlockId::new(InodeId::new(7), BlockIndex::new(0));
+    let second = BlockId::new(InodeId::new(7), BlockIndex::new(1));
     publish_ready_block_for(store.as_ref(), group_name(), first, payload(), 101);
     let reporter = MetadataBlockReportLoop::new(
         test_registration_config(endpoint),

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use beryl_types::chunk::ByteRange;
-use beryl_types::ids::{BlockId, BlockIndex, ClientId, DataHandleId};
+use beryl_types::ids::{BlockId, BlockIndex, ClientId, InodeId};
 use beryl_types::layout::BlockFormatId;
 use beryl_types::lease::FencingToken;
 use beryl_types::{GroupName, Tier, WorkerRunId};
@@ -67,7 +67,7 @@ fn worker_run_id() -> WorkerRunId {
 }
 
 fn block_id() -> BlockId {
-    BlockId::new(DataHandleId::new(7), BlockIndex::new(0))
+    BlockId::new(InodeId::new(7), BlockIndex::new(0))
 }
 
 fn token() -> FencingToken {
