@@ -64,15 +64,27 @@ pub struct TestCluster {
 
 impl TestCluster {
     pub async fn start() -> TestResult<Self> {
-        Self::start_with_cleanup_grace(None).await
+        Self::start_with_cleanup_options(None, None).await
     }
 
     /// Starts a cluster with short cleanup timing for lifecycle tests.
     pub async fn start_with_cleanup() -> TestResult<Self> {
-        Self::start_with_cleanup_grace(Some(1)).await
+        Self::start_with_cleanup_options(Some(1), None).await
     }
 
-    async fn start_with_cleanup_grace(reclaim_grace_ms: Option<u64>) -> TestResult<Self> {
+    /// Starts a cleanup-enabled cluster with a specific replica page size.
+    ///
+    /// This keeps production visibility unchanged while allowing lifecycle
+    /// tests to force one cleanup cycle across multiple maintenance ticks.
+    pub async fn start_with_cleanup_page_size(max_replicas_per_scan: usize) -> TestResult<Self> {
+        Self::start_with_cleanup_options(Some(1), Some(max_replicas_per_scan)).await
+    }
+
+    /// Builds one isolated cluster after applying optional cleanup test overrides.
+    async fn start_with_cleanup_options(
+        reclaim_grace_ms: Option<u64>,
+        max_replicas_per_scan: Option<usize>,
+    ) -> TestResult<Self> {
         let temp_state = TempState::new()?;
         let group_name = GroupName::parse(GROUP_NAME)?;
         let metadata_port = PortReservation::reserve_localhost().await?;
@@ -86,6 +98,9 @@ impl TestCluster {
             metadata_config.cleanup.reclaim_grace_ms = reclaim_grace_ms;
             metadata_config.cleanup.retry_initial_backoff_ms = 20;
             metadata_config.cleanup.retry_max_backoff_ms = 100;
+        }
+        if let Some(max_replicas_per_scan) = max_replicas_per_scan {
+            metadata_config.cleanup.max_replicas_per_scan = max_replicas_per_scan;
         }
         format_metadata_storage(&metadata_config).await?;
         let (metadata_server, worker_manager) =

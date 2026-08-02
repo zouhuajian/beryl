@@ -7,9 +7,9 @@ use bytes::Bytes;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metadata_cleanup_commands_remove_only_deleted_file_blocks() {
-    let mut cluster = TestCluster::start_with_cleanup()
+    let mut cluster = TestCluster::start_with_cleanup_page_size(1)
         .await
-        .expect("start cleanup-enabled cluster");
+        .expect("start cleanup-enabled cluster with one replica per scan");
     cluster
         .start_metadata_process(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
         .await

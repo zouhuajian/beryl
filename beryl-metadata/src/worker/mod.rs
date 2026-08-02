@@ -13,8 +13,8 @@ pub(crate) mod metrics;
 mod service;
 
 pub use manager::{
-    BlockReportBlock, BlockReportBlockState, HealthStatus, ReadyReplicaListing, ReplicaKey, WorkerDescriptor,
-    WorkerInfo, WorkerLiveState, WorkerManager,
+    BlockReportBlock, BlockReportBlockState, HealthStatus, ReplicaKey, WorkerDescriptor, WorkerInfo, WorkerLiveState,
+    WorkerManager,
 };
-pub(crate) use manager::{PublishReadyConflict, PublishReadyStatus};
+pub(crate) use manager::{PublishReadyConflict, PublishReadyStatus, ReadyReplicaCursor};
 pub use service::{MetadataWorkerServiceImpl, WorkerBackgroundHandle};
