@@ -164,7 +164,7 @@ impl StoreDirs {
         }
         blocks.sort_by_key(|meta| {
             (
-                meta.identity.block_id.data_handle_id.as_raw(),
+                meta.identity.block_id.inode_id.as_raw(),
                 meta.identity.block_id.index.as_raw(),
             )
         });

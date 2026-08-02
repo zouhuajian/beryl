@@ -6,7 +6,7 @@
 //! These types are the authoritative representation of filesystem metadata.
 //! They are independent of transport (gRPC/proto) and storage (RocksDB) layers.
 
-use crate::ids::{DataHandleId, MountId};
+use crate::ids::MountId;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -194,7 +194,7 @@ pub enum InodeData {
     /// File inode data.
     /// Includes extents for the committed block map, content_revision for visible
     /// file state, lease_epoch for lease management, and the next durable block
-    /// ordinal reserved for this data handle.
+    /// ordinal reserved for this file inode.
     File {
         /// File extents (block map).
         /// Supports append-only write path.
@@ -202,14 +202,14 @@ pub enum InodeData {
         extents: Vec<Extent>,
         /// Visible file state version.
         /// Advanced by authoritative metadata apply when committed content,
-        /// size, data handle, or read-plan state changes.
+        /// size or read-plan state changes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         content_revision: Option<u64>,
         /// Lease epoch (monotonically increasing, for fencing).
         /// Persisted in inode for lease management.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         lease_epoch: Option<u64>,
-        /// Next block ordinal to allocate for this file's data handle.
+        /// Next block ordinal to allocate for this file.
         /// This counter is monotonic and is not derived from visible extents.
         next_block_index: u64,
     },
@@ -256,21 +256,11 @@ pub struct Inode {
     /// Root inode is set at mount creation; child inodes inherit from parent.
     /// Used for O(1) mount resolution during FS write routing.
     pub mount_id: MountId,
-    /// Data handle for this inode (data-plane identity for the active data instance).
-    /// This is the authoritative link from namespace (inode) to data-plane blocks.
-    /// Non-file inodes should use DataHandleId::new(0) and ignore this field.
-    pub data_handle_id: DataHandleId,
 }
 
 impl Inode {
     /// Creates a new inode with mount_id.
-    pub fn new(
-        inode_id: InodeId,
-        kind: InodeKind,
-        attrs: FileAttrs,
-        mount_id: MountId,
-        data_handle_id: DataHandleId,
-    ) -> Self {
+    pub fn new(inode_id: InodeId, kind: InodeKind, attrs: FileAttrs, mount_id: MountId) -> Self {
         let data = match kind {
             InodeKind::File => InodeData::File {
                 extents: Vec::new(),
@@ -287,18 +277,17 @@ impl Inode {
             attrs,
             data,
             mount_id,
-            data_handle_id,
         }
     }
 
     /// Creates a new file inode.
-    pub fn new_file(inode_id: InodeId, attrs: FileAttrs, mount_id: MountId, data_handle_id: DataHandleId) -> Self {
-        Self::new(inode_id, InodeKind::File, attrs, mount_id, data_handle_id)
+    pub fn new_file(inode_id: InodeId, attrs: FileAttrs, mount_id: MountId) -> Self {
+        Self::new(inode_id, InodeKind::File, attrs, mount_id)
     }
 
     /// Creates a new directory inode.
     pub fn new_dir(inode_id: InodeId, attrs: FileAttrs, mount_id: MountId) -> Self {
-        Self::new(inode_id, InodeKind::Dir, attrs, mount_id, DataHandleId::new(0))
+        Self::new(inode_id, InodeKind::Dir, attrs, mount_id)
     }
 
     /// Creates a new symlink inode.
@@ -309,7 +298,6 @@ impl Inode {
             attrs,
             data: InodeData::Symlink { target: Some(target) },
             mount_id,
-            data_handle_id: DataHandleId::new(0),
         }
     }
 }

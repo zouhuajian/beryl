@@ -153,7 +153,7 @@ fn meta_fields_from_proto(
     Ok(MetaFields {
         identity: BlockIdentity {
             block_id: BlockId::try_from(block_id)
-                .unwrap_or_else(|()| unreachable!("BlockIdProto conversion is infallible")),
+                .map_err(|error| corrupt(format!("block meta payload invalid block id: {error}")))?,
             group_name,
         },
         format: BlockFormat {

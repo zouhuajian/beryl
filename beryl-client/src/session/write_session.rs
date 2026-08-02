@@ -6,7 +6,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use beryl_proto::metadata::{OpenWriteModeProto, WriteHandleProto};
-use beryl_types::{BlockShape, CallId, ClientId, CommittedBlock, DataHandleId, FileLayout, WriteTarget};
+use beryl_types::{BlockShape, CallId, ClientId, CommittedBlock, FileLayout, InodeId, WriteTarget};
 use bytes::{Bytes, BytesMut};
 
 use crate::data::WorkerBlockWriteHandle;
@@ -19,7 +19,7 @@ const LEASE_EXPIRY_SAFETY_WINDOW_MS: u64 = 1_000;
 #[derive(Clone, Debug)]
 pub(crate) struct WriteSession {
     path: String,
-    data_handle_id: DataHandleId,
+    inode_id: InodeId,
     layout: FileLayout,
     content_revision: u64,
     mode: OpenWriteModeProto,
@@ -46,7 +46,7 @@ impl WriteSession {
         content_revision: u64,
         mode: OpenWriteModeProto,
     ) -> ClientResult<Self> {
-        let data_handle_id = validate_write_handle(&write_handle)?;
+        let inode_id = validate_write_handle(&write_handle)?;
         if expires_at_ms == 0 {
             return Err(ClientError::InvalidArgument(
                 "write session expires_at_ms must be non-zero".to_string(),
@@ -57,7 +57,7 @@ impl WriteSession {
             .map_err(|err| ClientError::InvalidLayout(format!("write session layout invalid: {err}")))?;
         Ok(Self {
             path,
-            data_handle_id,
+            inode_id,
             layout,
             content_revision,
             mode,
@@ -166,12 +166,12 @@ impl WriteSession {
         )
         .map_err(|err| ClientError::InvalidLayout(format!("write target has invalid shape: {err}")))?;
         let block = target.block_id;
-        if block.data_handle_id != self.data_handle_id {
+        if block.inode_id != self.inode_id {
             return Err(ClientError::StaleHandle {
                 reason: format!(
-                    "write target data_handle_id {} does not match session data_handle_id {}",
-                    block.data_handle_id.as_raw(),
-                    self.data_handle_id.as_raw()
+                    "write target inode_id {} does not match session inode_id {}",
+                    block.inode_id.as_raw(),
+                    self.inode_id.as_raw()
                 ),
             });
         }
@@ -776,18 +776,18 @@ impl AbortWorkerCleanupPlan {
     }
 }
 
-fn validate_write_handle(handle: &WriteHandleProto) -> ClientResult<DataHandleId> {
-    let data_handle_id = handle
-        .data_handle_id
-        .as_ref()
-        .filter(|id| id.value != 0)
-        .ok_or_else(|| ClientError::Metadata("write handle data_handle_id must be present and non-zero".to_string()))?;
+fn validate_write_handle(handle: &WriteHandleProto) -> ClientResult<InodeId> {
+    if handle.inode_id == 0 {
+        return Err(ClientError::Metadata(
+            "write handle inode_id must be non-zero".to_string(),
+        ));
+    }
     if handle.write_lease_epoch == 0 {
         return Err(ClientError::Metadata(
             "write handle write_lease_epoch must be non-zero".to_string(),
         ));
     }
-    Ok(DataHandleId::new(data_handle_id.value))
+    Ok(InodeId::new(handle.inode_id))
 }
 
 #[cfg(test)]
@@ -797,7 +797,7 @@ mod tests {
     use beryl_proto::common::StreamIdProto;
     use beryl_types::lease::FencingToken;
     use beryl_types::{
-        BlockId, BlockIndex, ClientId, CommittedBlock, DataHandleId, GroupName, WorkerEndpointInfo, WorkerId,
+        BlockId, BlockIndex, ClientId, CommittedBlock, GroupName, InodeId, WorkerEndpointInfo, WorkerId,
         WorkerNetProtocol, WriteTarget,
     };
 
@@ -809,7 +809,7 @@ mod tests {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
             test_layout(),
-            write_handle_proto(1, 302),
+            write_handle_proto(302),
             0,
             1_000,
             0,
@@ -850,7 +850,7 @@ mod tests {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
             test_layout(),
-            write_handle_proto(1, 302),
+            write_handle_proto(302),
             0,
             1_000,
             0,
@@ -885,7 +885,7 @@ mod tests {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
             test_layout(),
-            write_handle_proto(1, 302),
+            write_handle_proto(302),
             0,
             1_000,
             0,
@@ -940,7 +940,7 @@ mod tests {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
             test_layout(),
-            write_handle_proto(1, 302),
+            write_handle_proto(302),
             0,
             1_000,
             0,
@@ -984,7 +984,7 @@ mod tests {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
             test_layout(),
-            write_handle_proto(1, 302),
+            write_handle_proto(302),
             0,
             1_000,
             0,
@@ -1019,7 +1019,7 @@ mod tests {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
             test_layout(),
-            write_handle_proto(1, 302),
+            write_handle_proto(302),
             0,
             1_000,
             0,
@@ -1051,7 +1051,7 @@ mod tests {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
             test_layout(),
-            write_handle_proto(1, 302),
+            write_handle_proto(302),
             0,
             1_000,
             0,
@@ -1083,7 +1083,7 @@ mod tests {
             WriteSession::new(
                 "/alpha".to_string(),
                 test_layout(),
-                write_handle_proto(1, 302),
+                write_handle_proto(302),
                 0,
                 expires_at_ms,
                 0,
@@ -1150,7 +1150,7 @@ mod tests {
                 let mut session = WriteSession::new(
                     "/alpha".to_string(),
                     test_layout(),
-                    write_handle_proto(1, 302),
+                    write_handle_proto(302),
                     0,
                     10_000,
                     0,
@@ -1173,30 +1173,30 @@ mod tests {
         FileLayout::new(1024, 1024, 1)
     }
 
-    fn write_handle_proto(_handle_id: u64, data_handle_id: u64) -> WriteHandleProto {
+    fn write_handle_proto(inode_id: u64) -> WriteHandleProto {
         WriteHandleProto {
-            data_handle_id: Some(beryl_proto::common::DataHandleIdProto { value: data_handle_id }),
+            inode_id,
             write_lease_epoch: 1,
         }
     }
 
-    fn committed_block(data_handle_id: u64, block_index: u32, file_offset: u64, len: u64) -> CommittedBlock {
+    fn committed_block(inode_id: u64, block_index: u32, file_offset: u64, len: u64) -> CommittedBlock {
         CommittedBlock {
-            block_id: BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(block_index)),
+            block_id: BlockId::new(InodeId::new(inode_id), BlockIndex::new(block_index)),
             file_offset,
             len,
         }
     }
 
-    fn write_target(data_handle_id: u64, block_index: u32, file_offset: u64, len: u64) -> WriteTarget {
+    fn write_target(inode_id: u64, block_index: u32, file_offset: u64, len: u64) -> WriteTarget {
         WriteTarget {
-            block_id: BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(block_index)),
+            block_id: BlockId::new(InodeId::new(inode_id), BlockIndex::new(block_index)),
             file_offset,
             block_size: 1024,
             effective_len: len,
             worker_endpoints: vec![worker_endpoint()],
             fencing_token: FencingToken {
-                block_id: BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(block_index)),
+                block_id: BlockId::new(InodeId::new(inode_id), BlockIndex::new(block_index)),
                 owner: ClientId::new(7),
                 epoch: 1,
             },
@@ -1219,7 +1219,7 @@ mod tests {
     }
 
     fn block_write_handle(
-        data_handle_id: u64,
+        inode_id: u64,
         block_index: u32,
         file_offset: u64,
         len: u64,
@@ -1228,7 +1228,7 @@ mod tests {
         WorkerBlockWriteHandle {
             group_name: test_group_name(),
             worker: worker_endpoint(),
-            target: write_target(data_handle_id, block_index, file_offset, len),
+            target: write_target(inode_id, block_index, file_offset, len),
             stream_id: StreamIdProto {
                 high: 1,
                 low: stream_low,
@@ -1249,7 +1249,7 @@ mod tests {
             block.target.effective_len,
             block.target.block_stamp,
             block.target.block_id.index.as_raw(),
-            block.target.block_id.data_handle_id.as_raw(),
+            block.target.block_id.inode_id.as_raw(),
             block.stream_id.high,
             block.stream_id.low,
         )

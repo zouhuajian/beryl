@@ -4,10 +4,21 @@
 use super::*;
 
 impl AppRaftStateMachine {
+    fn ensure_file_inode_authority(inode_id: InodeId, inode: &Inode) -> MetadataResult<()> {
+        if inode.inode_id != inode_id || !inode.kind.is_file() || !matches!(&inode.data, InodeData::File { .. }) {
+            return Err(MetadataError::Internal(format!(
+                "inode authority is corrupt for file mutation: key={inode_id}, value_id={}, kind={:?}, payload={:?}",
+                inode.inode_id,
+                inode.kind,
+                inode.data.kind()
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) fn apply_allocate_block(
         &self,
         inode_id: InodeId,
-        data_handle_id: DataHandleId,
         lease_epoch: u64,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<BlockId> {
@@ -15,12 +26,7 @@ impl AppRaftStateMachine {
             .storage
             .get_inode(inode_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {inode_id}")))?;
-        if inode.data_handle_id != data_handle_id {
-            return Err(MetadataError::InvalidArgument(format!(
-                "data handle changed for inode {inode_id}: expected {data_handle_id}, current {}",
-                inode.data_handle_id
-            )));
-        }
+        Self::ensure_file_inode_authority(inode_id, &inode)?;
         let next_block_index = match &mut inode.data {
             InodeData::File {
                 lease_epoch: stored_lease_epoch,
@@ -48,7 +54,7 @@ impl AppRaftStateMachine {
         };
         let block_index = u32::try_from(next_block_index)
             .map_err(|_| MetadataError::InvalidArgument(format!("block index exhausted for inode {inode_id}")))?;
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(block_index));
+        let block_id = BlockId::new(inode_id, BlockIndex::new(block_index));
         self.storage.put_inode_atomic(&inode, raft_state)?;
         Ok(block_id)
     }
@@ -64,6 +70,7 @@ impl AppRaftStateMachine {
                 .storage
                 .get_inode(inode_id)?
                 .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {inode_id}")))?;
+            Self::ensure_file_inode_authority(inode_id, &inode)?;
             let lease_epoch = match &mut inode.data {
                 InodeData::File { lease_epoch, .. } => {
                     let current = lease_epoch.unwrap_or(0);
@@ -114,6 +121,7 @@ impl AppRaftStateMachine {
                 .storage
                 .get_inode(inode_id)?
                 .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {inode_id}")))?;
+            Self::ensure_file_inode_authority(inode_id, &inode)?;
             let next = lease_epoch.checked_add(1).ok_or_else(|| {
                 MetadataError::InvalidArgument(format!("write lease epoch overflow for inode {inode_id}"))
             })?;
@@ -180,17 +188,7 @@ impl AppRaftStateMachine {
                 .storage
                 .get_inode(inode_id)?
                 .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {inode_id}")))?;
-            if !inode.kind.is_file() {
-                return Err(MetadataError::InvalidArgument(format!(
-                    "Inode is not a file: {inode_id}"
-                )));
-            }
-            let data_handle_id = inode.data_handle_id;
-            if data_handle_id.as_raw() == 0 {
-                return Err(MetadataError::Internal(format!(
-                    "File inode {inode_id} is missing data_handle_id"
-                )));
-            }
+            Self::ensure_file_inode_authority(inode_id, &inode)?;
             let layout = self.storage.get_layout(inode_id)?;
             requested_extents.sort_by_key(|extent| (extent.file_offset, extent.block_id.index.as_raw()));
 
@@ -223,10 +221,10 @@ impl AppRaftStateMachine {
                         "Committed extent len must be greater than 0".to_string(),
                     ));
                 }
-                if extent.block_id.data_handle_id != data_handle_id {
+                if extent.block_id.inode_id != inode_id {
                     return Err(MetadataError::InvalidArgument(format!(
-                        "Extent block data_handle_id {} does not match inode {inode_id} data_handle_id {data_handle_id}",
-                        extent.block_id.data_handle_id
+                        "Extent block inode_id {} does not match inode {inode_id}",
+                        extent.block_id.inode_id
                     )));
                 }
                 if !seen.insert(extent.block_id) {
@@ -269,7 +267,6 @@ impl AppRaftStateMachine {
                     layout,
                     FsOkResult {
                         inode_id: Some(inode_id),
-                        data_handle_id: Some(data_handle_id),
                         content_revision: Some(current_content_revision),
                         ..FsOkResult::default()
                     },
@@ -287,7 +284,6 @@ impl AppRaftStateMachine {
                     layout,
                     FsOkResult {
                         inode_id: Some(inode_id),
-                        data_handle_id: Some(data_handle_id),
                         content_revision: Some(current_content_revision),
                         ..FsOkResult::default()
                     },
@@ -344,7 +340,6 @@ impl AppRaftStateMachine {
                 layout,
                 FsOkResult {
                     inode_id: Some(inode_id),
-                    data_handle_id: Some(data_handle_id),
                     content_revision: Some(content_revision),
                     ..FsOkResult::default()
                 },
@@ -370,6 +365,7 @@ impl AppRaftStateMachine {
 mod tests {
     use super::*;
     use crate::raft::state_machine::test_support::*;
+    use beryl_types::InodeKind;
 
     fn expect_block_allocated(result: CommandResult) -> BlockId {
         match result {
@@ -378,24 +374,82 @@ mod tests {
         }
     }
 
+    fn assert_file_mutations_reject_corrupt_inode(
+        storage: Arc<RocksDBStorage>,
+        inode_id: InodeId,
+        expected_inode: &Inode,
+    ) {
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage));
+        let applied_before = storage.load_raft_state().unwrap();
+        let rejected_applied_state = AppMetadataRaftState {
+            last_applied_log_id: Some(openraft::LogId::new(openraft::LeaderId::new(7, 1), 703)),
+            ..AppMetadataRaftState::default()
+        };
+        assert_ne!(rejected_applied_state, applied_before);
+        let commands = [
+            Command::AllocateBlock {
+                inode_id,
+                lease_epoch: 1,
+            },
+            Command::AcquireWriteLease {
+                proposed_at_ms: 1,
+                inode_id,
+                expected_lease_epoch: 1,
+            },
+            Command::EndWriteLease {
+                proposed_at_ms: 1,
+                inode_id,
+                lease_epoch: 1,
+            },
+            Command::PublishFile {
+                proposed_at_ms: 1,
+                inode_id,
+                extents: Vec::new(),
+                target_size: 0,
+                expected_content_revision: 0,
+                expected_file_size: 0,
+                lease_epoch: 1,
+                mode: PublishMode::ReplaceIfUnchanged,
+            },
+        ];
+
+        for command in commands {
+            let error = sm.apply_with_raft_state(command, &rejected_applied_state).unwrap_err();
+            assert!(error.to_string().contains("inode authority is corrupt"));
+            assert_eq!(storage.load_raft_state().unwrap(), applied_before);
+            assert_eq!(storage.get_inode(inode_id).unwrap().as_ref(), Some(expected_inode));
+        }
+    }
+
     #[test]
-    fn block_allocation_is_durable_and_rejects_stale_authority_without_consuming_an_index() {
+    fn file_mutations_reject_corrupt_inode_authority_without_advancing_apply_state() {
+        let kind_dir = TempDir::new().unwrap();
+        let kind_storage = Arc::new(RocksDBStorage::create_for_format(kind_dir.path()).unwrap());
+        let kind_inode_id = InodeId::new(108);
+        let mut kind_mismatch =
+            install_file_with_extents(&kind_storage, InodeId::new(100), "file", kind_inode_id, Vec::new(), 0);
+        kind_mismatch.kind = InodeKind::Dir;
+        kind_storage.put_inode(&kind_mismatch).unwrap();
+        assert_file_mutations_reject_corrupt_inode(kind_storage, kind_inode_id, &kind_mismatch);
+
+        let key_dir = TempDir::new().unwrap();
+        let key_storage = Arc::new(RocksDBStorage::create_for_format(key_dir.path()).unwrap());
+        let key_inode_id = InodeId::new(109);
+        let key_mismatch = Inode::new_file(InodeId::new(110), FileAttrs::new(), MountId::new(1));
+        key_storage
+            .put_inode_at_storage_key(key_inode_id, &key_mismatch)
+            .unwrap();
+        assert_file_mutations_reject_corrupt_inode(key_storage, key_inode_id, &key_mismatch);
+    }
+
+    #[test]
+    fn block_allocation_is_durable_and_lease_fencing_does_not_consume_an_index() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let inode_id = InodeId::new(106);
-        let data_handle_id = DataHandleId::new(206);
-        install_file_with_extents(
-            &storage,
-            InodeId::new(100),
-            "file",
-            inode_id,
-            data_handle_id,
-            Vec::new(),
-            0,
-        );
+        install_file_with_extents(&storage, InodeId::new(100), "file", inode_id, Vec::new(), 0);
         let allocate = || Command::AllocateBlock {
             inode_id,
-            data_handle_id,
             lease_epoch: 1,
         };
 
@@ -404,7 +458,7 @@ mod tests {
                 .apply(allocate())
                 .unwrap(),
         );
-        assert_eq!(first, BlockId::new(data_handle_id, BlockIndex::new(0)));
+        assert_eq!(first, BlockId::new(inode_id, BlockIndex::new(0)));
         expect_fs_ok(
             AppRaftStateMachine::new(Arc::clone(&storage))
                 .apply(Command::PublishFile {
@@ -422,19 +476,10 @@ mod tests {
 
         let restarted = AppRaftStateMachine::new(Arc::clone(&storage));
         let second = expect_block_allocated(restarted.apply(allocate()).unwrap());
-        assert_eq!(second, BlockId::new(data_handle_id, BlockIndex::new(1)));
+        assert_eq!(second, BlockId::new(inode_id, BlockIndex::new(1)));
         assert!(matches!(
             restarted.apply(Command::AllocateBlock {
                 inode_id,
-                data_handle_id: DataHandleId::new(999),
-                lease_epoch: 1,
-            }),
-            Err(MetadataError::InvalidArgument(_))
-        ));
-        assert!(matches!(
-            restarted.apply(Command::AllocateBlock {
-                inode_id,
-                data_handle_id,
                 lease_epoch: 0,
             }),
             Err(MetadataError::LeaseFenced { expected: 1, got: 0 })
@@ -452,16 +497,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let inode_id = InodeId::new(107);
-        let data_handle_id = DataHandleId::new(207);
-        let mut inode = install_file_with_extents(
-            &storage,
-            InodeId::new(100),
-            "file",
-            inode_id,
-            data_handle_id,
-            Vec::new(),
-            0,
-        );
+        let mut inode = install_file_with_extents(&storage, InodeId::new(100), "file", inode_id, Vec::new(), 0);
         let InodeData::File { next_block_index, .. } = &mut inode.data else {
             panic!("expected file inode")
         };
@@ -470,7 +506,6 @@ mod tests {
         let sm = AppRaftStateMachine::new(Arc::clone(&storage));
         let command = || Command::AllocateBlock {
             inode_id,
-            data_handle_id,
             lease_epoch: 1,
         };
 
@@ -493,15 +528,7 @@ mod tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage));
         let inode_id = InodeId::new(101);
-        install_file_with_extents(
-            &storage,
-            InodeId::new(100),
-            "file",
-            inode_id,
-            DataHandleId::new(201),
-            Vec::new(),
-            0,
-        );
+        install_file_with_extents(&storage, InodeId::new(100), "file", inode_id, Vec::new(), 0);
 
         let first = expect_fs_ok(
             sm.apply(Command::AcquireWriteLease {
@@ -535,20 +562,11 @@ mod tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage));
         let inode_id = InodeId::new(104);
-        let data_handle_id = DataHandleId::new(204);
-        install_file_with_extents(
-            &storage,
-            InodeId::new(100),
-            "file",
-            inode_id,
-            data_handle_id,
-            Vec::new(),
-            0,
-        );
+        install_file_with_extents(&storage, InodeId::new(100), "file", inode_id, Vec::new(), 0);
         let publish = Command::PublishFile {
             proposed_at_ms: 2,
             inode_id,
-            extents: vec![extent(BlockId::new(data_handle_id, BlockIndex::new(0)), 0, 1024)],
+            extents: vec![extent(BlockId::new(inode_id, BlockIndex::new(0)), 0, 1024)],
             target_size: 1024,
             expected_content_revision: 0,
             expected_file_size: 0,
@@ -584,22 +602,13 @@ mod tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage));
         let inode_id = InodeId::new(105);
-        let data_handle_id = DataHandleId::new(205);
-        install_file_with_extents(
-            &storage,
-            InodeId::new(100),
-            "file",
-            inode_id,
-            data_handle_id,
-            Vec::new(),
-            0,
-        );
+        install_file_with_extents(&storage, InodeId::new(100), "file", inode_id, Vec::new(), 0);
 
         expect_fs_ok(
             sm.apply(Command::PublishFile {
                 proposed_at_ms: 1,
                 inode_id,
-                extents: vec![extent(BlockId::new(data_handle_id, BlockIndex::new(0)), 0, 1024)],
+                extents: vec![extent(BlockId::new(inode_id, BlockIndex::new(0)), 0, 1024)],
                 target_size: 1024,
                 expected_content_revision: 0,
                 expected_file_size: 0,
@@ -638,20 +647,11 @@ mod tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage));
         let inode_id = InodeId::new(102);
-        let data_handle_id = DataHandleId::new(202);
-        install_file_with_extents(
-            &storage,
-            InodeId::new(100),
-            "file",
-            inode_id,
-            data_handle_id,
-            Vec::new(),
-            0,
-        );
+        install_file_with_extents(&storage, InodeId::new(100), "file", inode_id, Vec::new(), 0);
         let command = Command::PublishFile {
             proposed_at_ms: 10,
             inode_id,
-            extents: vec![extent(BlockId::new(data_handle_id, BlockIndex::new(0)), 0, 1024)],
+            extents: vec![extent(BlockId::new(inode_id, BlockIndex::new(0)), 0, 1024)],
             target_size: 1024,
             expected_content_revision: 0,
             expected_file_size: 0,
@@ -687,14 +687,12 @@ mod tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage));
         let inode_id = InodeId::new(103);
-        let data_handle_id = DataHandleId::new(203);
         install_file_with_extents(
             &storage,
             InodeId::new(100),
             "file",
             inode_id,
-            data_handle_id,
-            vec![extent(BlockId::new(data_handle_id, BlockIndex::new(0)), 0, 1024)],
+            vec![extent(BlockId::new(inode_id, BlockIndex::new(0)), 0, 1024)],
             1024,
         );
 
@@ -702,7 +700,7 @@ mod tests {
             sm.apply(Command::PublishFile {
                 proposed_at_ms: 10,
                 inode_id,
-                extents: vec![extent(BlockId::new(data_handle_id, BlockIndex::new(1)), 1024, 512)],
+                extents: vec![extent(BlockId::new(inode_id, BlockIndex::new(1)), 1024, 512)],
                 target_size: 1536,
                 expected_content_revision: 0,
                 expected_file_size: 1024,
@@ -717,7 +715,7 @@ mod tests {
             sm.apply(Command::PublishFile {
                 proposed_at_ms: 11,
                 inode_id,
-                extents: vec![extent(BlockId::new(data_handle_id, BlockIndex::new(2)), 1024, 512)],
+                extents: vec![extent(BlockId::new(inode_id, BlockIndex::new(2)), 1024, 512)],
                 target_size: 1536,
                 expected_content_revision: 0,
                 expected_file_size: 1024,
@@ -731,7 +729,7 @@ mod tests {
         let second_append = Command::PublishFile {
             proposed_at_ms: 12,
             inode_id,
-            extents: vec![extent(BlockId::new(data_handle_id, BlockIndex::new(2)), 1536, 512)],
+            extents: vec![extent(BlockId::new(inode_id, BlockIndex::new(2)), 1536, 512)],
             target_size: 2048,
             expected_content_revision: 1,
             expected_file_size: 1536,

@@ -1187,7 +1187,7 @@ impl WorkerManager {
         }
 
         let mut affected_blocks: Vec<_> = affected_blocks.into_iter().collect();
-        affected_blocks.sort_by_key(|block_id| (block_id.data_handle_id.as_raw(), block_id.index.as_raw()));
+        affected_blocks.sort_by_key(|block_id| (block_id.inode_id.as_raw(), block_id.index.as_raw()));
         if removed {
             self.notify_publication_observation_changed();
         }
@@ -1836,7 +1836,7 @@ mod tests {
         WorkerManager, WorkerRegistrationKey,
     };
     use crate::error::MetadataError;
-    use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
+    use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
     use beryl_types::lease::FencingToken;
     use beryl_types::{
         BlockFormatId, ClientId, GroupName, Tier, WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId, WriteTarget,
@@ -1852,7 +1852,7 @@ mod tests {
     }
 
     fn report_block(index: u32) -> BlockReportBlock {
-        let block_id = BlockId::new(DataHandleId::new(9), BlockIndex::new(index));
+        let block_id = BlockId::new(InodeId::new(9), BlockIndex::new(index));
         report_block_with_id(block_id)
     }
 
@@ -1932,7 +1932,7 @@ mod tests {
         let group_name_value = group_name("g-publish");
         let worker_id = WorkerId::new(5);
         let run_id = report_run_id();
-        let block_id = BlockId::new(DataHandleId::new(91), BlockIndex::new(0));
+        let block_id = BlockId::new(InodeId::new(91), BlockIndex::new(0));
         let target = publication_target(worker_id, run_id, block_id, 7);
         register_live_report_worker(&manager, &group_name_value, worker_id, run_id);
 
@@ -1979,7 +1979,7 @@ mod tests {
         let group_name_value = group_name("g-conflict");
         let worker_id = WorkerId::new(5);
         let run_id = report_run_id();
-        let block_id = BlockId::new(DataHandleId::new(92), BlockIndex::new(0));
+        let block_id = BlockId::new(InodeId::new(92), BlockIndex::new(0));
         let target = publication_target(worker_id, run_id, block_id, 7);
         register_live_report_worker(&manager, &group_name_value, worker_id, run_id);
 
@@ -2053,7 +2053,7 @@ mod tests {
         let group_name_value = group_name("g-watch");
         let worker_id = WorkerId::new(5);
         let run_id = report_run_id();
-        let block_id = BlockId::new(DataHandleId::new(93), BlockIndex::new(0));
+        let block_id = BlockId::new(InodeId::new(93), BlockIndex::new(0));
         let target = publication_target(worker_id, run_id, block_id, 7);
         register_live_report_worker(&manager, &group_name_value, worker_id, run_id);
         let mut observations = manager.subscribe_publication_observations();
@@ -2746,7 +2746,7 @@ mod tests {
         let second_worker = WorkerId::new(11);
         let first_run = report_run_id();
         let second_run: WorkerRunId = "550e8400-e29b-41d4-a716-446655440102".parse().unwrap();
-        let block_id = BlockId::new(DataHandleId::new(41), BlockIndex::new(0));
+        let block_id = BlockId::new(InodeId::new(41), BlockIndex::new(0));
 
         register_live_report_worker(&manager, &first_group, first_worker, first_run);
         register_live_report_worker(&manager, &second_group, second_worker, second_run);

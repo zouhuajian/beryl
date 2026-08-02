@@ -12,7 +12,6 @@
 
 extern crate core;
 
-pub mod block;
 pub mod chunk;
 pub mod fs;
 pub mod group_watermark;
@@ -27,8 +26,8 @@ pub mod worker;
 pub use fs::{DirEntry, Extent, FileAttrs, FsErrorCode, Inode, InodeData, InodeId, InodeKind};
 pub use group_watermark::{GroupStateWatermark, MountEpoch};
 pub use ids::{
-    BlockId, BlockIndex, CallId, ChunkId, ChunkIndex, ClientId, DataHandleId, GroupName, GroupNameError, MountId,
-    ShardId, StreamId, WorkerId,
+    BlockId, BlockIndex, CallId, ChunkId, ChunkIndex, ClientId, GroupName, GroupNameError, MountId, ShardId, StreamId,
+    WorkerId,
 };
 pub use layout::{BlockFormatId, BlockFormatIdError, BlockShape, BlockShapeError, FileLayout, FileLayoutError};
 pub use location::{CommittedBlock, FileBlockLocation, WriteTarget};

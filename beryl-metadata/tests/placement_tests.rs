@@ -2,7 +2,7 @@ use beryl_common::header::CallerContextFields;
 use beryl_metadata::placement::{
     PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus, ReportedBlockLocation, WorkerPlacementView,
 };
-use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
+use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
 use beryl_types::layout::{BlockFormatId, FileLayout};
 use beryl_types::{GroupName, Tier, TierFree, WorkerRunId};
 
@@ -12,8 +12,8 @@ fn run_id(suffix: u32) -> WorkerRunId {
         .expect("valid worker run id")
 }
 
-fn block(data_handle_id: u64, index: u32) -> BlockId {
-    BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(index))
+fn block(inode_id: u64, index: u32) -> BlockId {
+    BlockId::new(InodeId::new(inode_id), BlockIndex::new(index))
 }
 
 fn group_name(raw: &str) -> GroupName {

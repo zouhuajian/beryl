@@ -466,7 +466,7 @@ fn stable_order(group_name: &GroupName, block_id: BlockId, worker_id: WorkerId) 
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     for value in [
-        block_id.data_handle_id.as_raw(),
+        block_id.inode_id.as_raw(),
         u64::from(block_id.index.as_raw()),
         worker_id.as_raw(),
     ] {
@@ -494,13 +494,13 @@ fn write_tier_policy_label() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beryl_types::ids::{BlockIndex, DataHandleId};
+    use beryl_types::ids::{BlockIndex, InodeId};
 
     fn req(block_size: u32) -> PlacementRequest {
         PlacementRequest {
             group_name: GroupName::parse("root").unwrap(),
             op: PlacementOp::Write,
-            block_id: BlockId::new(DataHandleId::new(1), BlockIndex::new(0)),
+            block_id: BlockId::new(InodeId::new(1), BlockIndex::new(0)),
             block_stamp: Some(7),
             layout: FileLayout::new(block_size, 1024, 1),
             caller: None,

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Runtime registry for write-session handles.
+//! Runtime registry for write sessions.
 //!
 //! Sessions are leader-local and are normally removed on CommitFile or AbortFileWrite.
 //! LeaseManager is the authority for whether a write is still active; this
-//! registry only stores handle state needed to continue an admitted write.
+//! registry only stores continuation state needed to continue an admitted write.
 
 use crate::inode_lease::{LeaseManager, WriteMode};
 use beryl_types::fs::InodeId;
-use beryl_types::ids::{DataHandleId, MountId};
+use beryl_types::ids::MountId;
 use beryl_types::{BlockId, BlockShape, ClientId, FileLayout, WriteTarget};
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -28,8 +28,6 @@ pub struct WriteSession {
     pub inode_id: InodeId,
     /// Mount ID.
     pub mount_id: MountId,
-    /// Data handle used by this write session.
-    pub data_handle_id: DataHandleId,
     /// Lease epoch (for fencing validation).
     pub lease_epoch: u64,
     /// Base file size at open time (for append-only validation).
@@ -55,9 +53,8 @@ pub struct WriteSession {
 /// Inputs needed to create a runtime write session and its bounded ancestor index.
 #[derive(Clone)]
 pub struct CreateSessionInput {
-    pub inode_id: InodeId,
     pub mount_id: MountId,
-    pub data_handle_id: DataHandleId,
+    pub inode_id: InodeId,
     pub lease_epoch: u64,
     pub base_size: u64,
     pub content_revision: u64,
@@ -74,7 +71,7 @@ struct IssuedTarget {
     target: WriteTarget,
 }
 
-/// In-memory, leader-local registry of write-session handles and admission indexes.
+/// In-memory, leader-local registry of write sessions and admission indexes.
 ///
 /// One lock protects the primary session map and every derived inode,
 /// ancestor, and expiry index so readers never observe a partially updated
@@ -86,14 +83,12 @@ pub struct SessionRegistry {
 /// Primary write-session state and all indexes that must change atomically with it.
 #[derive(Default)]
 struct SessionRegistryState {
-    /// At most one active session exists for one data handle.
-    sessions: HashMap<DataHandleId, WriteSession>,
-    /// Exact inode lookup for bounded replacement and inactive-session cleanup.
-    sessions_by_inode: HashMap<InodeId, DataHandleId>,
+    /// At most one active session exists for one inode.
+    sessions: HashMap<InodeId, WriteSession>,
     /// Bounded, subtree-size-independent admission state for every ancestor of an open file.
     ancestor_activity: HashMap<InodeId, AncestorWriteActivity>,
     /// Sessions ordered by mirrored lease expiry for amortized cleanup.
-    sessions_by_expiry: BTreeSet<(u64, DataHandleId)>,
+    sessions_by_expiry: BTreeSet<(u64, InodeId)>,
 }
 
 /// Expiry multiset for every write session whose captured path contains one inode.
@@ -105,7 +100,7 @@ struct AncestorWriteActivity {
 }
 
 impl SessionRegistry {
-    /// Create one leader-local session for a data handle.
+    /// Create one leader-local session for an inode.
     pub fn create_session(&self, input: CreateSessionInput) -> Result<WriteSession, String> {
         self.create_session_at(input, current_time_ms())
     }
@@ -117,22 +112,15 @@ impl SessionRegistry {
     fn create_session_at(&self, input: CreateSessionInput, now_ms: u64) -> Result<WriteSession, String> {
         let mut state = self.state.write();
         Self::retire_expired_sessions(&mut state, now_ms);
-        Self::retire_expired_session_for_handle(&mut state, input.data_handle_id, now_ms);
-        if state.sessions.contains_key(&input.data_handle_id) {
-            return Err("data handle already has an active write session".to_string());
-        }
-        if let Some(existing_handle) = state.sessions_by_inode.get(&input.inode_id).copied() {
-            Self::retire_expired_session_for_handle(&mut state, existing_handle, now_ms);
-            if state.sessions_by_inode.contains_key(&input.inode_id) {
-                return Err("inode already has an active write session".to_string());
-            }
+        Self::retire_expired_session_for_inode(&mut state, input.inode_id, now_ms);
+        if state.sessions.contains_key(&input.inode_id) {
+            return Err("inode already has an active write session".to_string());
         }
         Self::validate_ancestor_chain(input.inode_id, &input.ancestor_inode_ids)?;
 
         let session = WriteSession {
             inode_id: input.inode_id,
             mount_id: input.mount_id,
-            data_handle_id: input.data_handle_id,
             lease_epoch: input.lease_epoch,
             base_size: input.base_size,
             content_revision: input.content_revision,
@@ -156,9 +144,8 @@ impl SessionRegistry {
         }
         state
             .sessions_by_expiry
-            .insert((session.expires_at_ms, session.data_handle_id));
-        state.sessions_by_inode.insert(session.inode_id, session.data_handle_id);
-        state.sessions.insert(input.data_handle_id, session.clone());
+            .insert((session.expires_at_ms, session.inode_id));
+        state.sessions.insert(input.inode_id, session.clone());
         Ok(session)
     }
 
@@ -166,7 +153,7 @@ impl SessionRegistry {
     /// the caller may allocate the next step.
     pub fn lookup_issued_target(
         &self,
-        data_handle_id: DataHandleId,
+        inode_id: InodeId,
         lease_epoch: u64,
         previous_block_id: Option<BlockId>,
         desired_len: Option<u64>,
@@ -174,7 +161,7 @@ impl SessionRegistry {
         let state = self.state.read();
         let session = state
             .sessions
-            .get(&data_handle_id)
+            .get(&inode_id)
             .ok_or_else(|| "write session not found".to_string())?;
         if session.lease_epoch != lease_epoch {
             return Err("write session lease epoch mismatch".to_string());
@@ -199,7 +186,7 @@ impl SessionRegistry {
     /// request for the same predecessor.
     pub fn install_issued_target(
         &self,
-        data_handle_id: DataHandleId,
+        inode_id: InodeId,
         lease_epoch: u64,
         previous_block_id: Option<BlockId>,
         desired_len: Option<u64>,
@@ -208,7 +195,7 @@ impl SessionRegistry {
         let mut state = self.state.write();
         let session = state
             .sessions
-            .get_mut(&data_handle_id)
+            .get_mut(&inode_id)
             .ok_or_else(|| "write session not found".to_string())?;
         if session.lease_epoch != lease_epoch {
             return Err("write session lease epoch mismatch".to_string());
@@ -225,8 +212,8 @@ impl SessionRegistry {
                 "AddBlock predecessor mismatch: expected {expected_previous:?}, got {previous_block_id:?}"
             ));
         }
-        if target.block_id.data_handle_id != data_handle_id {
-            return Err("write target data handle mismatch".to_string());
+        if target.block_id.inode_id != inode_id {
+            return Err("write target inode mismatch".to_string());
         }
         if target.fencing_token.block_id != target.block_id
             || target.fencing_token.owner != session.open_client_id
@@ -285,43 +272,38 @@ impl SessionRegistry {
         Ok(target)
     }
 
-    /// Get a non-expired write session after bounded global and exact-handle retirement.
-    pub fn get_session(&self, data_handle_id: DataHandleId) -> Option<WriteSession> {
+    /// Get a non-expired write session after bounded global and exact-inode retirement.
+    pub fn get_session(&self, inode_id: InodeId) -> Option<WriteSession> {
         let mut state = self.state.write();
         let now_ms = current_time_ms();
         Self::retire_expired_sessions(&mut state, now_ms);
-        Self::retire_expired_session_for_handle(&mut state, data_handle_id, now_ms);
-        state.sessions.get(&data_handle_id).cloned()
+        Self::retire_expired_session_for_inode(&mut state, inode_id, now_ms);
+        state.sessions.get(&inode_id).cloned()
     }
 
     /// Remove only the session identified by the presented lease epoch.
-    pub fn remove_session_if_epoch(&self, data_handle_id: DataHandleId, lease_epoch: u64) -> Option<WriteSession> {
+    pub fn remove_session_if_epoch(&self, inode_id: InodeId, lease_epoch: u64) -> Option<WriteSession> {
         let mut state = self.state.write();
         if state
             .sessions
-            .get(&data_handle_id)
+            .get(&inode_id)
             .is_none_or(|session| session.lease_epoch != lease_epoch)
         {
             return None;
         }
-        Self::remove_session(&mut state, data_handle_id)
+        Self::remove_session(&mut state, inode_id)
     }
 
     /// Update the mirrored lease expiry used by bounded, subtree-size-independent admission checks.
     ///
     /// Every expiry index is moved before the bounded sweep runs, so a
     /// successful renewal cannot be retired under its previous timestamp.
-    pub fn update_expiration(
-        &self,
-        data_handle_id: DataHandleId,
-        lease_epoch: u64,
-        expires_at_ms: u64,
-    ) -> Result<(), String> {
+    pub fn update_expiration(&self, inode_id: InodeId, lease_epoch: u64, expires_at_ms: u64) -> Result<(), String> {
         let mut state = self.state.write();
         let (ancestor_inode_ids, previous_expires_at_ms) = {
             let session = state
                 .sessions
-                .get(&data_handle_id)
+                .get(&inode_id)
                 .ok_or_else(|| "write session not found".to_string())?;
             if session.lease_epoch != lease_epoch {
                 return Err("write session lease epoch mismatch".to_string());
@@ -337,19 +319,16 @@ impl SessionRegistry {
         {
             return Err("write session ancestor index is missing".to_string());
         }
-        if !state
-            .sessions_by_expiry
-            .contains(&(previous_expires_at_ms, data_handle_id))
-        {
+        if !state.sessions_by_expiry.contains(&(previous_expires_at_ms, inode_id)) {
             return Err("write session expiry index is missing".to_string());
         }
-        Self::remove_from_expiry_index(&mut state, data_handle_id, previous_expires_at_ms);
+        Self::remove_from_expiry_index(&mut state, inode_id, previous_expires_at_ms);
         state
             .sessions
-            .get_mut(&data_handle_id)
+            .get_mut(&inode_id)
             .expect("validated write session must exist")
             .expires_at_ms = expires_at_ms;
-        state.sessions_by_expiry.insert((expires_at_ms, data_handle_id));
+        state.sessions_by_expiry.insert((expires_at_ms, inode_id));
         for ancestor_inode_id in ancestor_inode_ids {
             let activity = state
                 .ancestor_activity
@@ -404,7 +383,7 @@ impl SessionRegistry {
 
     pub fn update_published_state(
         &self,
-        data_handle_id: DataHandleId,
+        inode_id: InodeId,
         lease_epoch: u64,
         content_revision: u64,
         file_size: u64,
@@ -412,7 +391,7 @@ impl SessionRegistry {
         let mut state = self.state.write();
         let session = state
             .sessions
-            .get_mut(&data_handle_id)
+            .get_mut(&inode_id)
             .ok_or_else(|| "write session not found".to_string())?;
         if session.lease_epoch != lease_epoch {
             return Err("write session lease epoch mismatch".to_string());
@@ -422,35 +401,28 @@ impl SessionRegistry {
         Ok(())
     }
 
-    /// Remove handles for an inode whose lease is no longer current.
+    /// Remove the session for an inode whose lease is no longer current.
     pub fn remove_inactive_for_inode(&self, inode_id: InodeId, lease_manager: &LeaseManager) -> usize {
         let mut state = self.state.write();
-        let Some(data_handle_id) = state.sessions_by_inode.get(&inode_id).copied() else {
-            return 0;
-        };
-        let Some(session) = state.sessions.get(&data_handle_id) else {
-            debug_assert!(false, "write session inode index must reference a session");
-            state.sessions_by_inode.remove(&inode_id);
+        let Some(session) = state.sessions.get(&inode_id) else {
             return 0;
         };
         if lease_manager.is_active_lease(session.inode_id, session.lease_epoch) {
             return 0;
         }
-        usize::from(Self::remove_session(&mut state, data_handle_id).is_some())
+        usize::from(Self::remove_session(&mut state, inode_id).is_some())
     }
 
     /// Remove one primary session and every derived index entry under the state lock.
-    fn remove_session(state: &mut SessionRegistryState, data_handle_id: DataHandleId) -> Option<WriteSession> {
-        let session = state.sessions.remove(&data_handle_id)?;
+    fn remove_session(state: &mut SessionRegistryState, inode_id: InodeId) -> Option<WriteSession> {
+        let session = state.sessions.remove(&inode_id)?;
         Self::remove_from_indexes(state, &session);
         Some(session)
     }
 
     /// Remove the exact inode, global-expiry, and ancestor-expiry entries for a session.
     fn remove_from_indexes(state: &mut SessionRegistryState, session: &WriteSession) {
-        let removed_handle = state.sessions_by_inode.remove(&session.inode_id);
-        debug_assert_eq!(removed_handle, Some(session.data_handle_id));
-        Self::remove_from_expiry_index(state, session.data_handle_id, session.expires_at_ms);
+        Self::remove_from_expiry_index(state, session.inode_id, session.expires_at_ms);
         for ancestor_inode_id in &session.ancestor_inode_ids {
             let remove_entry = {
                 let activity = state
@@ -470,35 +442,31 @@ impl SessionRegistry {
     fn retire_expired_sessions(state: &mut SessionRegistryState, now_ms: u64) -> usize {
         let mut retired = 0;
         while retired < MAX_EXPIRED_SESSION_RETIREMENTS_PER_CALL {
-            let Some(&(expires_at_ms, data_handle_id)) = state.sessions_by_expiry.first() else {
+            let Some(&(expires_at_ms, inode_id)) = state.sessions_by_expiry.first() else {
                 break;
             };
             if expires_at_ms > now_ms {
                 break;
             }
-            if Self::remove_session(state, data_handle_id).is_none() {
-                Self::remove_from_expiry_index(state, data_handle_id, expires_at_ms);
+            if Self::remove_session(state, inode_id).is_none() {
+                Self::remove_from_expiry_index(state, inode_id, expires_at_ms);
             }
             retired += 1;
         }
         retired
     }
 
-    /// Retire one requested handle even when it remains beyond the global sweep budget.
-    fn retire_expired_session_for_handle(
-        state: &mut SessionRegistryState,
-        data_handle_id: DataHandleId,
-        now_ms: u64,
-    ) -> bool {
+    /// Retire one requested inode even when it remains beyond the global sweep budget.
+    fn retire_expired_session_for_inode(state: &mut SessionRegistryState, inode_id: InodeId, now_ms: u64) -> bool {
         let is_expired = state
             .sessions
-            .get(&data_handle_id)
+            .get(&inode_id)
             .is_some_and(|session| session.expires_at_ms <= now_ms);
-        is_expired && Self::remove_session(state, data_handle_id).is_some()
+        is_expired && Self::remove_session(state, inode_id).is_some()
     }
 
-    fn remove_from_expiry_index(state: &mut SessionRegistryState, data_handle_id: DataHandleId, expires_at_ms: u64) {
-        state.sessions_by_expiry.remove(&(expires_at_ms, data_handle_id));
+    fn remove_from_expiry_index(state: &mut SessionRegistryState, inode_id: InodeId, expires_at_ms: u64) {
+        state.sessions_by_expiry.remove(&(expires_at_ms, inode_id));
     }
 
     fn decrement_expiry_count(expirations: &mut BTreeMap<u64, usize>, expires_at_ms: u64) {
@@ -537,8 +505,8 @@ mod tests {
     use beryl_types::lease::FencingToken;
     use beryl_types::{BlockFormatId, Tier};
 
-    fn write_target(data_handle_id: DataHandleId, index: u32) -> WriteTarget {
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(index));
+    fn write_target(inode_id: InodeId, index: u32) -> WriteTarget {
+        let block_id = BlockId::new(inode_id, BlockIndex::new(index));
         WriteTarget {
             block_id,
             file_offset: 0,
@@ -557,12 +525,10 @@ mod tests {
         }
     }
 
-    fn create_input(data_handle_id: DataHandleId) -> CreateSessionInput {
-        let inode_id = InodeId::new(data_handle_id.as_raw());
+    fn create_input(inode_id: InodeId) -> CreateSessionInput {
         CreateSessionInput {
             inode_id,
             mount_id: MountId::new(1),
-            data_handle_id,
             lease_epoch: 7,
             base_size: 0,
             content_revision: 0,
@@ -576,46 +542,46 @@ mod tests {
 
     fn issue_target(
         registry: &SessionRegistry,
-        data_handle_id: DataHandleId,
+        inode_id: InodeId,
         previous_block_id: Option<BlockId>,
         desired_len: u64,
         index: u32,
         file_offset: u64,
         block_stamp: u64,
     ) -> WriteTarget {
-        let mut target = write_target(data_handle_id, index);
+        let mut target = write_target(inode_id, index);
         target.file_offset = file_offset;
         target.effective_len = desired_len;
         target.block_stamp = block_stamp;
         registry
-            .install_issued_target(data_handle_id, 7, previous_block_id, Some(desired_len), target)
+            .install_issued_target(inode_id, 7, previous_block_id, Some(desired_len), target)
             .unwrap()
     }
 
     #[test]
-    fn one_data_handle_has_at_most_one_active_session() {
+    fn one_inode_has_at_most_one_active_session() {
         let registry = SessionRegistry::default();
-        let data_handle_id = DataHandleId::new(10);
-        registry.create_session(create_input(data_handle_id)).unwrap();
+        let inode_id = InodeId::new(10);
+        registry.create_session(create_input(inode_id)).unwrap();
 
-        assert!(registry.create_session(create_input(data_handle_id)).is_err());
-        assert_eq!(registry.get_session(data_handle_id).unwrap().lease_epoch, 7);
-        assert!(registry.remove_session_if_epoch(data_handle_id, 7).is_some());
-        assert!(registry.get_session(data_handle_id).is_none());
+        assert!(registry.create_session(create_input(inode_id)).is_err());
+        assert_eq!(registry.get_session(inode_id).unwrap().lease_epoch, 7);
+        assert!(registry.remove_session_if_epoch(inode_id, 7).is_some());
+        assert!(registry.get_session(inode_id).is_none());
     }
 
     #[test]
     fn delayed_cleanup_cannot_remove_a_newer_session() {
         let registry = SessionRegistry::default();
-        let data_handle_id = DataHandleId::new(20);
-        registry.create_session(create_input(data_handle_id)).unwrap();
-        registry.remove_session_if_epoch(data_handle_id, 7).unwrap();
-        let mut replacement = create_input(data_handle_id);
+        let inode_id = InodeId::new(20);
+        registry.create_session(create_input(inode_id)).unwrap();
+        registry.remove_session_if_epoch(inode_id, 7).unwrap();
+        let mut replacement = create_input(inode_id);
         replacement.lease_epoch = 8;
         registry.create_session(replacement).unwrap();
 
-        assert!(registry.remove_session_if_epoch(data_handle_id, 7).is_none());
-        assert_eq!(registry.get_session(data_handle_id).unwrap().lease_epoch, 8);
+        assert!(registry.remove_session_if_epoch(inode_id, 7).is_none());
+        assert_eq!(registry.get_session(inode_id).unwrap().lease_epoch, 8);
     }
 
     #[test]
@@ -623,8 +589,8 @@ mod tests {
         let registry = SessionRegistry::default();
         let root_inode_id = InodeId::new(1);
         let directory_inode_id = InodeId::new(2);
-        let first_handle = DataHandleId::new(20);
-        let second_handle = DataHandleId::new(21);
+        let first_handle = InodeId::new(20);
+        let second_handle = InodeId::new(21);
         let mut first = create_input(first_handle);
         first.ancestor_inode_ids = vec![root_inode_id, directory_inode_id, first.inode_id];
         let mut second = create_input(second_handle);
@@ -649,19 +615,18 @@ mod tests {
     #[test]
     fn expired_session_does_not_keep_ancestor_busy() {
         let registry = SessionRegistry::default();
-        let data_handle_id = DataHandleId::new(22);
+        let inode_id = InodeId::new(22);
         let root_inode_id = InodeId::new(1);
-        let mut input = create_input(data_handle_id);
+        let mut input = create_input(inode_id);
         input.expires_at_ms = 0;
         input.ancestor_inode_ids = vec![root_inode_id, input.inode_id];
 
         registry.create_session(input).unwrap();
 
         assert!(!registry.has_active_write_under(root_inode_id));
-        assert!(!registry.has_active_write_under(InodeId::new(data_handle_id.as_raw())));
+        assert!(!registry.has_active_write_under(InodeId::new(inode_id.as_raw())));
         let state = registry.state.read();
         assert!(state.sessions.is_empty());
-        assert!(state.sessions_by_inode.is_empty());
         assert!(state.ancestor_activity.is_empty());
         assert!(state.sessions_by_expiry.is_empty());
     }
@@ -669,21 +634,21 @@ mod tests {
     #[test]
     fn renewed_session_updates_ancestor_expiry() {
         let registry = SessionRegistry::default();
-        let data_handle_id = DataHandleId::new(24);
+        let inode_id = InodeId::new(24);
         let root_inode_id = InodeId::new(1);
-        let mut input = create_input(data_handle_id);
+        let mut input = create_input(inode_id);
         input.expires_at_ms = 1;
         input.ancestor_inode_ids = vec![root_inode_id, input.inode_id];
         registry.create_session_at(input, 0).unwrap();
 
         registry
-            .update_expiration(data_handle_id, 7, u64::MAX)
+            .update_expiration(inode_id, 7, u64::MAX)
             .expect("renewal moves every expiry index before sweeping the old expiry");
 
-        assert!(registry.get_session(data_handle_id).is_some());
+        assert!(registry.get_session(inode_id).is_some());
         assert!(registry.has_active_write_under(root_inode_id));
         let state = registry.state.read();
-        assert_eq!(state.sessions_by_expiry, BTreeSet::from([(u64::MAX, data_handle_id)]));
+        assert_eq!(state.sessions_by_expiry, BTreeSet::from([(u64::MAX, inode_id)]));
         assert_eq!(
             state
                 .ancestor_activity
@@ -698,8 +663,8 @@ mod tests {
     fn expiry_renewal_and_close_retire_shared_ancestor_state() {
         let registry = SessionRegistry::default();
         let root_inode_id = InodeId::new(1);
-        let expired_handle = DataHandleId::new(25);
-        let active_handle = DataHandleId::new(26);
+        let expired_handle = InodeId::new(25);
+        let active_handle = InodeId::new(26);
         let mut expired = create_input(expired_handle);
         expired.expires_at_ms = 0;
         expired.ancestor_inode_ids = vec![root_inode_id, expired.inode_id];
@@ -712,7 +677,6 @@ mod tests {
         {
             let state = registry.state.read();
             assert_eq!(state.sessions.len(), 1);
-            assert_eq!(state.sessions_by_inode.len(), 1);
             assert_eq!(state.ancestor_activity.len(), 2);
             assert_eq!(state.sessions_by_expiry.len(), 1);
         }
@@ -724,31 +688,26 @@ mod tests {
 
         let state = registry.state.read();
         assert!(state.sessions.is_empty());
-        assert!(state.sessions_by_inode.is_empty());
         assert!(state.ancestor_activity.is_empty());
         assert!(state.sessions_by_expiry.is_empty());
     }
 
     #[test]
-    fn expiry_sweep_is_handle_bounded_and_queries_ignore_residual_expired_entries() {
+    fn expiry_sweep_is_bounded_and_queries_ignore_residual_expired_entries() {
         let registry = SessionRegistry::default();
         let historical_expired_count = 4_096;
         let residual_expired_count = MAX_EXPIRED_SESSION_RETIREMENTS_PER_CALL * 2 + 3;
         for raw in 1..=historical_expired_count {
-            let data_handle_id = DataHandleId::new(raw as u64);
-            let mut input = create_input(data_handle_id);
+            let inode_id = InodeId::new(raw as u64);
+            let mut input = create_input(inode_id);
             input.expires_at_ms = 10;
             registry.create_session_at(input, 0).unwrap();
         }
         for raw in 1..=(historical_expired_count - residual_expired_count) {
-            registry
-                .remove_session_if_epoch(DataHandleId::new(raw as u64), 7)
-                .unwrap();
+            registry.remove_session_if_epoch(InodeId::new(raw as u64), 7).unwrap();
         }
-        let active_handle = DataHandleId::new(10_000);
         let active_inode_id = InodeId::new(20_000);
-        let mut active = create_input(active_handle);
-        active.inode_id = active_inode_id;
+        let mut active = create_input(active_inode_id);
         active.expires_at_ms = 20;
         active.ancestor_inode_ids = vec![active_inode_id];
         registry.create_session_at(active, 0).unwrap();
@@ -760,7 +719,6 @@ mod tests {
                 state.sessions.len(),
                 residual_expired_count + 1 - MAX_EXPIRED_SESSION_RETIREMENTS_PER_CALL
             );
-            assert_eq!(state.sessions_by_inode.len(), state.sessions.len());
             assert!(state
                 .sessions_by_expiry
                 .iter()
@@ -787,10 +745,9 @@ mod tests {
             assert!(registry.has_active_write_under_at(active_inode_id, 11));
         }
 
-        registry.remove_session_if_epoch(active_handle, 7).unwrap();
+        registry.remove_session_if_epoch(active_inode_id, 7).unwrap();
         let state = registry.state.read();
         assert!(state.sessions.is_empty());
-        assert!(state.sessions_by_inode.is_empty());
         assert!(state.ancestor_activity.is_empty());
         assert!(state.sessions_by_expiry.is_empty());
     }
@@ -798,9 +755,9 @@ mod tests {
     #[test]
     fn new_leader_registry_has_no_old_session_ancestor_state() {
         let old_registry = SessionRegistry::default();
-        let data_handle_id = DataHandleId::new(23);
+        let inode_id = InodeId::new(23);
         let root_inode_id = InodeId::new(1);
-        let mut input = create_input(data_handle_id);
+        let mut input = create_input(inode_id);
         input.ancestor_inode_ids = vec![root_inode_id, input.inode_id];
         old_registry.create_session(input).unwrap();
         assert!(old_registry.has_active_write_under(root_inode_id));
@@ -812,21 +769,21 @@ mod tests {
     #[test]
     fn add_block_replays_by_predecessor_without_advancing() {
         let registry = SessionRegistry::default();
-        let data_handle_id = DataHandleId::new(11);
-        registry.create_session(create_input(data_handle_id)).unwrap();
+        let inode_id = InodeId::new(11);
+        registry.create_session(create_input(inode_id)).unwrap();
 
         assert!(registry
-            .lookup_issued_target(data_handle_id, 7, None, Some(32))
+            .lookup_issued_target(inode_id, 7, None, Some(32))
             .unwrap()
             .is_none());
-        let first = issue_target(&registry, data_handle_id, None, 32, 0, 0, 1);
+        let first = issue_target(&registry, inode_id, None, 32, 0, 0, 1);
         let replay = registry
-            .lookup_issued_target(data_handle_id, 7, None, Some(32))
+            .lookup_issued_target(inode_id, 7, None, Some(32))
             .unwrap()
             .unwrap();
         assert_eq!(replay, first);
 
-        let second = issue_target(&registry, data_handle_id, Some(first.block_id), 64, 1, 32, 1);
+        let second = issue_target(&registry, inode_id, Some(first.block_id), 64, 1, 32, 1);
         assert_eq!(second.block_id.index, BlockIndex::new(1));
         assert_eq!(second.file_offset, 32);
     }
@@ -834,8 +791,8 @@ mod tests {
     #[test]
     fn concurrent_duplicate_add_block_installs_one_target_and_returns_one_result() {
         let registry = std::sync::Arc::new(SessionRegistry::default());
-        let data_handle_id = DataHandleId::new(15);
-        registry.create_session(create_input(data_handle_id)).unwrap();
+        let inode_id = InodeId::new(15);
+        registry.create_session(create_input(inode_id)).unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
 
         let mut joins = Vec::new();
@@ -843,11 +800,11 @@ mod tests {
             let registry = std::sync::Arc::clone(&registry);
             let barrier = std::sync::Arc::clone(&barrier);
             joins.push(std::thread::spawn(move || {
-                let mut target = write_target(data_handle_id, index);
+                let mut target = write_target(inode_id, index);
                 target.effective_len = 32;
                 barrier.wait();
                 registry
-                    .install_issued_target(data_handle_id, 7, None, Some(32), target)
+                    .install_issued_target(inode_id, 7, None, Some(32), target)
                     .unwrap()
             }));
         }
@@ -855,7 +812,7 @@ mod tests {
         let first = joins.remove(0).join().unwrap();
         let second = joins.remove(0).join().unwrap();
         assert_eq!(first, second);
-        let session = registry.get_session(data_handle_id).unwrap();
+        let session = registry.get_session(inode_id).unwrap();
         assert_eq!(session.issued_targets, vec![first]);
         assert_eq!(session.issued_steps.len(), 1);
     }
@@ -863,51 +820,47 @@ mod tests {
     #[test]
     fn add_block_rejects_payload_drift_and_stale_lease_epoch() {
         let registry = SessionRegistry::default();
-        let data_handle_id = DataHandleId::new(12);
-        registry.create_session(create_input(data_handle_id)).unwrap();
-        issue_target(&registry, data_handle_id, None, 32, 0, 0, 1);
+        let inode_id = InodeId::new(12);
+        registry.create_session(create_input(inode_id)).unwrap();
+        issue_target(&registry, inode_id, None, 32, 0, 0, 1);
 
-        assert!(registry
-            .lookup_issued_target(data_handle_id, 7, None, Some(64))
-            .is_err());
-        assert!(registry
-            .lookup_issued_target(data_handle_id, 6, None, Some(32))
-            .is_err());
-        assert_eq!(registry.get_session(data_handle_id).unwrap().issued_targets.len(), 1);
+        assert!(registry.lookup_issued_target(inode_id, 7, None, Some(64)).is_err());
+        assert!(registry.lookup_issued_target(inode_id, 6, None, Some(32)).is_err());
+        assert_eq!(registry.get_session(inode_id).unwrap().issued_targets.len(), 1);
     }
 
     #[test]
     fn add_block_rejects_a_gap_in_the_predecessor_chain() {
         let registry = SessionRegistry::default();
-        let data_handle_id = DataHandleId::new(13);
-        registry.create_session(create_input(data_handle_id)).unwrap();
-        let unknown = BlockId::new(data_handle_id, BlockIndex::new(99));
+        let inode_id = InodeId::new(13);
+        registry.create_session(create_input(inode_id)).unwrap();
+        let unknown = BlockId::new(inode_id, BlockIndex::new(99));
 
         assert!(registry
-            .lookup_issued_target(data_handle_id, 7, Some(unknown), Some(32))
+            .lookup_issued_target(inode_id, 7, Some(unknown), Some(32))
             .unwrap_err()
             .contains("predecessor mismatch"));
-        assert!(registry.get_session(data_handle_id).unwrap().issued_targets.is_empty());
+        assert!(registry.get_session(inode_id).unwrap().issued_targets.is_empty());
     }
 
     #[test]
     fn new_target_uses_next_content_revision_while_replay_keeps_original_stamp() {
         let registry = SessionRegistry::default();
-        let data_handle_id = DataHandleId::new(14);
-        registry.create_session(create_input(data_handle_id)).unwrap();
+        let inode_id = InodeId::new(14);
+        registry.create_session(create_input(inode_id)).unwrap();
 
-        let first = issue_target(&registry, data_handle_id, None, 32, 0, 0, 1);
+        let first = issue_target(&registry, inode_id, None, 32, 0, 0, 1);
         assert_eq!(first.block_stamp, 1);
         registry
-            .update_published_state(data_handle_id, 7, 1, 32)
+            .update_published_state(inode_id, 7, 1, 32)
             .expect("advance published state");
 
         let replay = registry
-            .lookup_issued_target(data_handle_id, 7, None, Some(32))
+            .lookup_issued_target(inode_id, 7, None, Some(32))
             .unwrap()
             .unwrap();
         assert_eq!(replay, first);
-        let second = issue_target(&registry, data_handle_id, Some(first.block_id), 32, 1, 32, 2);
+        let second = issue_target(&registry, inode_id, Some(first.block_id), 32, 1, 32, 2);
         assert_eq!(second.block_stamp, 2);
         assert_eq!(second.file_offset, 32);
     }
@@ -915,25 +868,22 @@ mod tests {
     #[test]
     fn add_block_completion_cannot_install_a_target_from_an_old_revision() {
         let registry = SessionRegistry::default();
-        let data_handle_id = DataHandleId::new(16);
-        registry.create_session(create_input(data_handle_id)).unwrap();
-        let first = issue_target(&registry, data_handle_id, None, 32, 0, 0, 1);
+        let inode_id = InodeId::new(16);
+        registry.create_session(create_input(inode_id)).unwrap();
+        let first = issue_target(&registry, inode_id, None, 32, 0, 0, 1);
         registry
-            .update_published_state(data_handle_id, 7, 1, 32)
+            .update_published_state(inode_id, 7, 1, 32)
             .expect("advance published state while AddBlock is in flight");
-        let mut stale = write_target(data_handle_id, 1);
+        let mut stale = write_target(inode_id, 1);
         stale.file_offset = 32;
         stale.effective_len = 32;
         stale.block_stamp = 1;
 
         let error = registry
-            .install_issued_target(data_handle_id, 7, Some(first.block_id), Some(32), stale)
+            .install_issued_target(inode_id, 7, Some(first.block_id), Some(32), stale)
             .expect_err("an AddBlock result from the previous revision must be rejected");
 
         assert!(error.contains("block stamp changed: expected 2, got 1"));
-        assert_eq!(
-            registry.get_session(data_handle_id).unwrap().issued_targets,
-            vec![first]
-        );
+        assert_eq!(registry.get_session(inode_id).unwrap().issued_targets, vec![first]);
     }
 }

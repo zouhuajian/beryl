@@ -72,15 +72,58 @@ impl RocksDBStorage {
         Ok(())
     }
 
-    fn batch_put_file_allocation(
-        batch: &mut WriteBatch,
-        cf_meta: &ColumnFamily,
-        allocation: FileAllocation,
+    fn validate_inode_allocation_targets(
+        db: &DB,
+        allocation: InodeAllocation,
+        target_inode_ids: &[InodeId],
     ) -> MetadataResult<()> {
-        Self::batch_put_inode_allocation(batch, cf_meta, allocation.inode)?;
-        let value = encode_to_vec(allocation.next_data_handle_id.as_raw(), standard())
-            .map_err(|e| MetadataError::Internal(format!("Failed to serialize next_data_handle_id: {}", e)))?;
-        batch.put_cf(cf_meta, NEXT_DATA_HANDLE_ID_KEY, value);
+        if target_inode_ids.is_empty() || allocation.inode_id.as_raw() < 2 {
+            return Err(MetadataError::Internal(
+                "inode allocation has no valid target".to_string(),
+            ));
+        }
+        let cf_meta = Self::cf(db, CF_META)?;
+        let persisted = db
+            .get_cf(cf_meta, NEXT_INODE_ID_KEY)
+            .map_err(|error| MetadataError::Internal(format!("Failed to read next_inode_id: {error}")))?
+            .ok_or_else(|| MetadataError::Internal("next_inode_id allocator authority is missing".to_string()))?;
+        let persisted: u64 = decode_from_slice(&persisted, standard())
+            .map_err(|error| MetadataError::Internal(format!("Failed to deserialize next_inode_id: {error}")))?
+            .0;
+        if persisted != allocation.inode_id.as_raw() {
+            return Err(MetadataError::Internal(format!(
+                "inode allocation {} does not match durable next_inode_id {persisted}",
+                allocation.inode_id
+            )));
+        }
+
+        let cf_inodes = Self::cf(db, CF_INODES)?;
+        let mut expected_raw = allocation.inode_id.as_raw();
+        for inode_id in target_inode_ids {
+            if inode_id.as_raw() != expected_raw {
+                return Err(MetadataError::Internal(format!(
+                    "inode allocation target {inode_id} is not the expected inode {expected_raw}"
+                )));
+            }
+            if db
+                .get_cf(cf_inodes, Self::encode_inode_key(*inode_id))
+                .map_err(|error| MetadataError::Internal(format!("Failed to read inode {inode_id}: {error}")))?
+                .is_some()
+            {
+                return Err(MetadataError::Internal(format!(
+                    "inode allocation target already exists: {inode_id}"
+                )));
+            }
+            expected_raw = expected_raw
+                .checked_add(1)
+                .ok_or_else(|| MetadataError::Internal("inode ID allocator overflow".to_string()))?;
+        }
+        if allocation.next_inode_id.as_raw() != expected_raw {
+            return Err(MetadataError::Internal(format!(
+                "inode allocation next value {} does not match expected {expected_raw}",
+                allocation.next_inode_id
+            )));
+        }
         Ok(())
     }
 
@@ -166,13 +209,6 @@ impl RocksDBStorage {
             encode_to_vec(2u64, standard())
                 .map_err(|error| MetadataError::Internal(format!("Failed to serialize next_inode_id: {error}")))?,
         );
-        batch.put_cf(
-            cf_meta,
-            NEXT_DATA_HANDLE_ID_KEY,
-            encode_to_vec(1u64, standard()).map_err(|error| {
-                MetadataError::Internal(format!("Failed to serialize next_data_handle_id: {error}"))
-            })?,
-        );
         self.commit_authority_batch(batch.into(), raft_state)
     }
 
@@ -204,12 +240,6 @@ impl RocksDBStorage {
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize file layout: {}", e)))?;
         batch.put_cf(cf_meta, layout_key.as_bytes(), layout_value);
 
-        let data_handle_id = inode.data_handle_id;
-        let owner_key = format!("data_handle_owner:{}", data_handle_id.as_raw());
-        let owner_value = encode_to_vec(inode.inode_id.as_raw(), standard())
-            .map_err(|e| MetadataError::Internal(format!("Failed to serialize inode_id: {}", e)))?;
-        batch.put_cf(cf_meta, owner_key.as_bytes(), owner_value);
-
         Ok(batch)
     }
 
@@ -218,7 +248,7 @@ impl RocksDBStorage {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_file_atomic(
         &self,
-        allocation: FileAllocation,
+        allocation: InodeAllocation,
         parent_inode_id: InodeId,
         name: &str,
         inode: &Inode,
@@ -228,14 +258,10 @@ impl RocksDBStorage {
     ) -> MetadataResult<()> {
         let generation = self.pin_generation()?;
         let db = generation.db();
-        if inode.inode_id != allocation.inode.inode_id || inode.data_handle_id != allocation.data_handle_id {
-            return Err(MetadataError::Internal(
-                "file allocation does not match prepared inode".to_string(),
-            ));
-        }
+        Self::validate_inode_allocation_targets(db, allocation, std::slice::from_ref(&inode.inode_id))?;
         let mut batch = self.create_file_batch(parent_inode_id, name, inode, updated_parent, layout)?;
         let cf_meta = Self::cf(db, CF_META)?;
-        Self::batch_put_file_allocation(&mut batch, cf_meta, allocation)?;
+        Self::batch_put_inode_allocation(&mut batch, cf_meta, allocation)?;
         self.commit_authority_batch(batch.into(), raft_state)
     }
 
@@ -276,11 +302,7 @@ impl RocksDBStorage {
     ) -> MetadataResult<()> {
         let generation = self.pin_generation()?;
         let db = generation.db();
-        if inode.inode_id != allocation.inode_id {
-            return Err(MetadataError::Internal(
-                "directory allocation does not match prepared inode".to_string(),
-            ));
-        }
+        Self::validate_inode_allocation_targets(db, allocation, std::slice::from_ref(&inode.inode_id))?;
         let mut batch = self.create_dir_batch(parent_inode_id, name, inode, updated_parent)?;
         let cf_meta = Self::cf(db, CF_META)?;
         Self::batch_put_inode_allocation(&mut batch, cf_meta, allocation)?;
@@ -299,6 +321,8 @@ impl RocksDBStorage {
         let cf_inodes = Self::cf(db, CF_INODES)?;
         let cf_dentries = Self::cf(db, CF_DENTRIES)?;
         let cf_meta = Self::cf(db, CF_META)?;
+        let target_inode_ids: Vec<_> = entries.iter().map(|entry| entry.inode.inode_id).collect();
+        Self::validate_inode_allocation_targets(db, allocation, &target_inode_ids)?;
         let mut batch = WriteBatch::default();
         for entry in entries {
             Self::batch_put_inode(&mut batch, cf_inodes, &entry.inode)?;
@@ -347,7 +371,7 @@ impl RocksDBStorage {
         self.commit_authority_batch(batch.into(), raft_state)
     }
 
-    /// Atomically persist non-directory deletion with namespace and optional data-handle cleanup.
+    /// Atomically persist non-directory deletion with its file layout cleanup.
     // Atomic storage helpers keep every column-family mutation visible at the call boundary.
     #[allow(clippy::too_many_arguments)]
     pub fn delete_file_atomic(
@@ -355,7 +379,6 @@ impl RocksDBStorage {
         parent_inode_id: InodeId,
         name: &str,
         inode_id: InodeId,
-        data_handle_id: Option<DataHandleId>,
         updated_parent: &Inode,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
@@ -365,10 +388,6 @@ impl RocksDBStorage {
         let mut batch = self.delete_dentry_inode_batch(parent_inode_id, name, inode_id, updated_parent)?;
         let layout_key = format!("layout:{}", inode_id.as_raw());
         batch.delete_cf(cf_meta, layout_key.as_bytes());
-        if let Some(data_handle_id) = data_handle_id {
-            let owner_key = format!("data_handle_owner:{}", data_handle_id.as_raw());
-            batch.delete_cf(cf_meta, owner_key.as_bytes());
-        }
         self.commit_authority_batch(batch.into(), raft_state)
     }
 
@@ -431,9 +450,8 @@ impl RocksDBStorage {
             }
 
             batch.delete_cf(cf_inodes, Self::encode_inode_key(entry.inode_id));
-            if let Some(data_handle_id) = entry.data_handle_id {
+            if entry.remove_file_layout {
                 batch.delete_cf(cf_meta, Self::encode_layout_key(entry.inode_id));
-                batch.delete_cf(cf_meta, Self::encode_data_handle_owner_key(data_handle_id));
             }
         }
         for root_inode_id in update.completed_root_inode_ids {
@@ -461,10 +479,6 @@ impl RocksDBStorage {
             );
             let layout_key = format!("layout:{}", cleanup.inode_id.as_raw());
             batch.delete_cf(cf_meta, layout_key.as_bytes());
-            if let Some(data_handle_id) = cleanup.data_handle_id {
-                let owner_key = format!("data_handle_owner:{}", data_handle_id.as_raw());
-                batch.delete_cf(cf_meta, owner_key.as_bytes());
-            }
         }
 
         batch.delete_cf(
@@ -574,22 +588,6 @@ mod tests {
                 .map_err(|e| MetadataError::Internal(format!("Failed to serialize next_inode_id: {}", e)))?;
 
             db.put_cf(cf_meta, NEXT_INODE_ID_KEY, value)
-                .map_err(|e| MetadataError::Internal(format!("RocksDB error: {}", e)))?;
-            Ok(())
-        }
-
-        /// Persist mapping from data_handle_id -> inode_id for routing from data plane back to namespace.
-        pub fn put_data_handle_owner(&self, data_handle_id: DataHandleId, inode_id: InodeId) -> MetadataResult<()> {
-            let generation = self.pin_generation()?;
-            let db = generation.db();
-            let cf_meta = db
-                .cf_handle(CF_META)
-                .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
-            let key = format!("data_handle_owner:{}", data_handle_id.as_raw());
-            let value = encode_to_vec(inode_id.as_raw(), standard())
-                .map_err(|e| MetadataError::Internal(format!("Failed to serialize inode_id: {}", e)))?;
-
-            db.put_cf(cf_meta, key.as_bytes(), value)
                 .map_err(|e| MetadataError::Internal(format!("RocksDB error: {}", e)))?;
             Ok(())
         }
@@ -758,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn create_file_atomic_persists_namespace_and_data_handle_owner() {
+    fn create_file_atomic_persists_namespace_inode_and_layout() {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
 
@@ -766,9 +764,8 @@ mod tests {
         let mut parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
         storage.put_inode(&parent).unwrap();
 
-        let inode_id = InodeId::new(11);
-        let data_handle_id = DataHandleId::new(12);
-        let inode = Inode::new_file(inode_id, FileAttrs::new(), parent.mount_id, data_handle_id);
+        let inode_id = InodeId::new(12);
+        let inode = Inode::new_file(inode_id, FileAttrs::new(), parent.mount_id);
         parent.attrs.update_mtime_ctime(100);
         let layout = FileLayout::new(4096, 4096, 1);
 
@@ -777,26 +774,58 @@ mod tests {
             .unwrap();
 
         let stored_inode = storage.get_inode(inode_id).unwrap().unwrap();
-        assert_eq!(stored_inode.data_handle_id, data_handle_id);
+        assert_eq!(stored_inode.inode_id, inode_id);
         assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), Some(inode_id));
         assert_eq!(storage.get_layout(inode_id).unwrap(), layout);
-        assert_eq!(
-            storage.get_inode_by_data_handle(data_handle_id).unwrap(),
-            Some(inode_id)
-        );
         assert_eq!(storage.get_inode(parent_inode_id).unwrap().unwrap().attrs.mtime_ms, 100);
     }
 
     #[test]
-    fn delete_file_atomic_removes_namespace_and_data_owner() {
+    fn create_file_atomic_rejects_a_target_installed_after_allocation_preparation() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
+        let parent_inode_id = InodeId::new(10);
+        let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        storage.put_inode(&parent).unwrap();
+        storage.set_next_inode_id(InodeId::new(11)).unwrap();
+        let allocation = storage.prepare_inode_allocation().unwrap();
+        let existing = Inode::new_file(allocation.inode_id, FileAttrs::new(), MountId::new(1));
+        storage.put_inode(&existing).unwrap();
+        let applied_before = storage.load_raft_state().unwrap();
+        let rejected_applied_state = AppMetadataRaftState {
+            last_applied_log_id: Some(openraft::LogId::new(openraft::LeaderId::new(9, 1), 901)),
+            ..AppMetadataRaftState::default()
+        };
+
+        let error = storage
+            .create_file_atomic(
+                allocation,
+                parent_inode_id,
+                "file",
+                &Inode::new_file(allocation.inode_id, FileAttrs::new(), MountId::new(1)),
+                &parent,
+                FileLayout::new(4096, 4096, 1),
+                &rejected_applied_state,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(storage.load_raft_state().unwrap(), applied_before);
+        assert_eq!(storage.get_inode(allocation.inode_id).unwrap(), Some(existing));
+        assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), None);
+        assert_eq!(storage.get_layout_optional(allocation.inode_id).unwrap(), None);
+        assert_eq!(storage.get_next_inode_id().unwrap(), Some(allocation.inode_id));
+    }
+
+    #[test]
+    fn delete_file_atomic_removes_namespace_inode_and_layout() {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
 
         let parent_inode_id = InodeId::new(10);
         let mut parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
-        let inode_id = InodeId::new(11);
-        let data_handle_id = DataHandleId::new(12);
-        let inode = Inode::new_file(inode_id, FileAttrs::new(), parent.mount_id, data_handle_id);
+        let inode_id = InodeId::new(12);
+        let inode = Inode::new_file(inode_id, FileAttrs::new(), parent.mount_id);
         let layout = FileLayout::new(4096, 4096, 1);
         storage.put_inode(&parent).unwrap();
         storage
@@ -809,7 +838,6 @@ mod tests {
                 parent_inode_id,
                 "file",
                 inode_id,
-                Some(data_handle_id),
                 &parent,
                 &AppMetadataRaftState::default(),
             )
@@ -818,7 +846,6 @@ mod tests {
         assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), None);
         assert!(storage.get_inode(inode_id).unwrap().is_none());
         assert!(storage.get_layout(inode_id).is_err());
-        assert_eq!(storage.get_inode_by_data_handle(data_handle_id).unwrap(), None);
     }
 
     #[test]
@@ -857,7 +884,7 @@ mod tests {
         let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
 
         let inode_id = InodeId::new(12);
-        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), DataHandleId::new(120));
+        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1));
         inode.attrs.uid = 44;
         storage
             .put_inode_atomic(&inode, &AppMetadataRaftState::default())
@@ -872,10 +899,9 @@ mod tests {
         let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
 
         let inode_id = InodeId::new(13);
-        let data_handle_id = DataHandleId::new(130);
-        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
+        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1));
         let layout = FileLayout::new(4096, 4096, 1);
-        let block_id = BlockId::new(data_handle_id, beryl_types::ids::BlockIndex::new(0));
+        let block_id = BlockId::new(inode_id, beryl_types::ids::BlockIndex::new(0));
         if let InodeData::File {
             extents,
             content_revision,
@@ -939,7 +965,7 @@ mod tests {
         let inode_id = InodeId::new(32);
         let mut src_parent = Inode::new_dir(src_parent_id, FileAttrs::new(), MountId::new(1));
         let mut dst_parent = Inode::new_dir(dst_parent_id, FileAttrs::new(), MountId::new(1));
-        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), DataHandleId::new(33));
+        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1));
 
         storage.put_inode(&src_parent).unwrap();
         storage.put_inode(&dst_parent).unwrap();

@@ -15,7 +15,7 @@ impl AppRaftStateMachine {
     /// Apply one bounded reclamation batch from a leader-selected root set.
     ///
     /// Marker absence is an idempotent no-op. Every marker that is present is
-    /// validated with its inode, mount, descendants, layouts, and owners before
+    /// validated with its inode, mount, descendants, and layouts before
     /// one authority batch is published.
     pub(super) fn apply_reclaim_detached_roots(
         &self,
@@ -175,7 +175,7 @@ impl AppRaftStateMachine {
                 "DetachedRoot inode {root_inode_id} is not a directory"
             )));
         }
-        if root_inode.data_handle_id.as_raw() != 0 || self.storage.get_layout_optional(root_inode_id)?.is_some() {
+        if self.storage.get_layout_optional(root_inode_id)?.is_some() {
             return Err(MetadataError::Internal(format!(
                 "DetachedRoot directory inode {root_inode_id} carries file authority"
             )));
@@ -252,11 +252,9 @@ impl AppRaftStateMachine {
             )));
         }
 
-        let (data_handle_id, child_detached_root) = match child_inode.data {
+        let (remove_file_layout, child_detached_root) = match child_inode.data {
             InodeData::Dir => {
-                if child_inode.data_handle_id.as_raw() != 0
-                    || self.storage.get_layout_optional(child_inode_id)?.is_some()
-                {
+                if self.storage.get_layout_optional(child_inode_id)?.is_some() {
                     return Err(MetadataError::Internal(format!(
                         "directory inode {child_inode_id} under DetachedRoot {parent_inode_id} carries file authority"
                     )));
@@ -266,44 +264,23 @@ impl AppRaftStateMachine {
                         "DetachedRoot inode {parent_inode_id} reaches mount root inode {child_inode_id}"
                     )));
                 }
-                (None, Some(parent_detached_root))
+                (false, Some(parent_detached_root))
             }
             InodeData::File { .. } => {
-                let data_handle_id = child_inode.data_handle_id;
-                if data_handle_id.as_raw() == 0 {
-                    return Err(MetadataError::Internal(format!(
-                        "file inode {child_inode_id} under DetachedRoot {parent_inode_id} has no data handle"
-                    )));
-                }
-                match self.storage.get_inode_by_data_handle(data_handle_id)? {
-                    Some(owner_inode_id) if owner_inode_id == child_inode_id => {}
-                    Some(owner_inode_id) => {
-                        return Err(MetadataError::Internal(format!(
-                            "data handle {data_handle_id} belongs to inode {owner_inode_id}, not detached file inode {child_inode_id}"
-                        )))
-                    }
-                    None => {
-                        return Err(MetadataError::Internal(format!(
-                            "detached file inode {child_inode_id} has no owner for data handle {data_handle_id}"
-                        )))
-                    }
-                }
                 if self.storage.get_layout_optional(child_inode_id)?.is_none() {
                     return Err(MetadataError::Internal(format!(
                         "detached file inode {child_inode_id} has no file layout"
                     )));
                 }
-                (Some(data_handle_id), None)
+                (true, None)
             }
             InodeData::Symlink { .. } => {
-                if child_inode.data_handle_id.as_raw() != 0
-                    || self.storage.get_layout_optional(child_inode_id)?.is_some()
-                {
+                if self.storage.get_layout_optional(child_inode_id)?.is_some() {
                     return Err(MetadataError::Internal(format!(
                         "symlink inode {child_inode_id} under DetachedRoot {parent_inode_id} carries file authority"
                     )));
                 }
-                (None, None)
+                (false, None)
             }
         };
 
@@ -311,7 +288,7 @@ impl AppRaftStateMachine {
             parent_inode_id,
             name,
             inode_id: child_inode_id,
-            data_handle_id,
+            remove_file_layout,
             child_detached_root,
         })
     }
@@ -344,20 +321,12 @@ mod tests {
             .unwrap();
     }
 
-    fn seed_file(
-        storage: &RocksDBStorage,
-        parent_inode_id: InodeId,
-        name: &str,
-        inode_id: InodeId,
-        data_handle_id: DataHandleId,
-        mount_id: MountId,
-    ) {
+    fn seed_file(storage: &RocksDBStorage, parent_inode_id: InodeId, name: &str, inode_id: InodeId, mount_id: MountId) {
         storage
-            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id))
             .unwrap();
         storage.put_dentry(parent_inode_id, name, inode_id).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
     }
 
     fn reclaim(
@@ -400,7 +369,7 @@ mod tests {
         seed_directory(&storage, root_id, marker.mount_id);
         seed_directory(&storage, child_dir_id, marker.mount_id);
         storage.put_dentry(root_id, "a", child_dir_id).unwrap();
-        seed_file(&storage, root_id, "b", file_id, DataHandleId::new(12), marker.mount_id);
+        seed_file(&storage, root_id, "b", file_id, marker.mount_id);
         storage
             .put_inode(&Inode::new_symlink(
                 symlink_id,
@@ -419,10 +388,7 @@ mod tests {
         assert!(first.logical_batch_bytes <= MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES);
         assert_eq!(storage.get_detached_root(child_dir_id).unwrap(), Some(marker));
         assert!(storage.get_inode(file_id).unwrap().is_none());
-        assert!(storage
-            .get_inode_by_data_handle(DataHandleId::new(12))
-            .unwrap()
-            .is_none());
+        assert!(storage.get_layout_optional(file_id).unwrap().is_none());
         assert!(storage.get_inode(root_id).unwrap().is_some());
 
         let second = reclaim(&state_machine, vec![root_id], 2).unwrap();
@@ -450,14 +416,7 @@ mod tests {
         let cross_mount_dir_id = InodeId::new(22);
         let marker = detached_root(MountId::new(1), 88);
         seed_directory(&storage, root_id, marker.mount_id);
-        seed_file(
-            &storage,
-            root_id,
-            "a",
-            valid_file_id,
-            DataHandleId::new(21),
-            marker.mount_id,
-        );
+        seed_file(&storage, root_id, "a", valid_file_id, marker.mount_id);
         seed_directory(&storage, cross_mount_dir_id, MountId::new(2));
         storage.put_dentry(root_id, "b", cross_mount_dir_id).unwrap();
         storage.put_detached_root(root_id, marker).unwrap();
@@ -471,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_child_and_owner_mismatch_fail_closed_without_partial_delete() {
+    fn missing_child_and_missing_file_layout_fail_closed_without_partial_delete() {
         let (_dir, storage, state_machine) = new_state_machine();
         let missing_root_id = InodeId::new(30);
         let missing_child_id = InodeId::new(31);
@@ -489,19 +448,19 @@ mod tests {
             Some(missing_child_id)
         );
 
-        let owner_root_id = InodeId::new(40);
+        let layout_root_id = InodeId::new(40);
         let file_id = InodeId::new(41);
-        let wrong_owner_id = InodeId::new(42);
-        let handle_id = DataHandleId::new(41);
-        seed_directory(&storage, owner_root_id, marker.mount_id);
-        seed_file(&storage, owner_root_id, "file", file_id, handle_id, marker.mount_id);
-        storage.put_data_handle_owner(handle_id, wrong_owner_id).unwrap();
-        storage.put_detached_root(owner_root_id, marker).unwrap();
+        seed_directory(&storage, layout_root_id, marker.mount_id);
+        storage
+            .put_inode(&Inode::new_file(file_id, FileAttrs::new(), marker.mount_id))
+            .unwrap();
+        storage.put_dentry(layout_root_id, "file", file_id).unwrap();
+        storage.put_detached_root(layout_root_id, marker).unwrap();
 
-        let owner_error = reclaim(&state_machine, vec![owner_root_id], 10).unwrap_err();
-        assert!(owner_error.to_string().contains("not detached file inode"));
+        let layout_error = reclaim(&state_machine, vec![layout_root_id], 10).unwrap_err();
+        assert!(layout_error.to_string().contains("has no file layout"));
         assert!(storage.get_inode(file_id).unwrap().is_some());
-        assert_eq!(storage.get_dentry(owner_root_id, "file").unwrap(), Some(file_id));
+        assert_eq!(storage.get_dentry(layout_root_id, "file").unwrap(), Some(file_id));
     }
 
     #[test]
@@ -511,29 +470,17 @@ mod tests {
         let valid_file_inode_id = InodeId::new(44);
         let corrupt_inode_id = InodeId::new(45);
         let grandchild_inode_id = InodeId::new(46);
-        let valid_handle_id = DataHandleId::new(44);
-        let corrupt_handle_id = DataHandleId::new(45);
         let marker = detached_root(MountId::new(1), 101);
         let layout = FileLayout::new(4096, 4096, 1);
         seed_directory(&storage, root_inode_id, marker.mount_id);
-        seed_file(
-            &storage,
-            root_inode_id,
-            "a-valid",
-            valid_file_inode_id,
-            valid_handle_id,
-            marker.mount_id,
-        );
-        let mut corrupt_inode = Inode::new_file(corrupt_inode_id, FileAttrs::new(), marker.mount_id, corrupt_handle_id);
+        seed_file(&storage, root_inode_id, "a-valid", valid_file_inode_id, marker.mount_id);
+        let mut corrupt_inode = Inode::new_file(corrupt_inode_id, FileAttrs::new(), marker.mount_id);
         corrupt_inode.kind = InodeKind::Dir;
         storage.put_inode(&corrupt_inode).unwrap();
         storage
             .put_dentry(root_inode_id, "b-corrupt", corrupt_inode_id)
             .unwrap();
         storage.put_layout(corrupt_inode_id, layout).unwrap();
-        storage
-            .put_data_handle_owner(corrupt_handle_id, corrupt_inode_id)
-            .unwrap();
         seed_directory(&storage, grandchild_inode_id, marker.mount_id);
         storage
             .put_dentry(corrupt_inode_id, "grandchild", grandchild_inode_id)
@@ -576,14 +523,6 @@ mod tests {
         assert!(storage.get_inode(grandchild_inode_id).unwrap().is_some());
         assert_eq!(storage.get_layout(valid_file_inode_id).unwrap(), layout);
         assert_eq!(storage.get_layout(corrupt_inode_id).unwrap(), layout);
-        assert_eq!(
-            storage.get_inode_by_data_handle(valid_handle_id).unwrap(),
-            Some(valid_file_inode_id)
-        );
-        assert_eq!(
-            storage.get_inode_by_data_handle(corrupt_handle_id).unwrap(),
-            Some(corrupt_inode_id)
-        );
         assert_eq!(storage.get_detached_root(root_inode_id).unwrap(), Some(marker));
         assert!(storage.get_detached_root(corrupt_inode_id).unwrap().is_none());
         assert_eq!(storage.load_raft_state().unwrap(), applied_before);
@@ -672,22 +611,8 @@ mod tests {
             expect_mount_upserted(state_machine.apply(bootstrap_command("root", 1)).unwrap());
             let marker = detached_root(MountId::new(1), 111);
             seed_directory(&storage, root_id, marker.mount_id);
-            seed_file(
-                &storage,
-                root_id,
-                "a",
-                InodeId::new(51),
-                DataHandleId::new(51),
-                marker.mount_id,
-            );
-            seed_file(
-                &storage,
-                root_id,
-                "b",
-                InodeId::new(52),
-                DataHandleId::new(52),
-                marker.mount_id,
-            );
+            seed_file(&storage, root_id, "a", InodeId::new(51), marker.mount_id);
+            seed_file(&storage, root_id, "b", InodeId::new(52), marker.mount_id);
             storage.put_detached_root(root_id, marker).unwrap();
             let first = reclaim(&state_machine, vec![root_id], 1).unwrap();
             assert_eq!(first.processed_entries, 1);
@@ -738,19 +663,12 @@ mod tests {
         assert_eq!(storage.get_detached_root(missing_root_id).unwrap(), Some(marker));
 
         let file_root_id = InodeId::new(71);
-        let handle_id = DataHandleId::new(71);
         storage
-            .put_inode(&Inode::new_file(
-                file_root_id,
-                FileAttrs::new(),
-                marker.mount_id,
-                handle_id,
-            ))
+            .put_inode(&Inode::new_file(file_root_id, FileAttrs::new(), marker.mount_id))
             .unwrap();
         storage
             .put_layout(file_root_id, FileLayout::new(4096, 4096, 1))
             .unwrap();
-        storage.put_data_handle_owner(handle_id, file_root_id).unwrap();
         storage.put_detached_root(file_root_id, marker).unwrap();
 
         let type_error = reclaim(&state_machine, vec![file_root_id], 1).unwrap_err();

@@ -78,13 +78,11 @@ impl RocksDBStorage {
         let route_epoch = self.get_meta_u64_optional(b"route_epoch", "route_epoch")?;
         let mount_epoch = self.get_meta_u64_optional(b"mount_epoch", "mount_epoch")?;
         let next_inode = self.get_next_inode_id()?;
-        let next_data_handle = self.get_next_data_handle_id()?;
         let namespace_has_any_state = root_inode.is_some()
             || !mounts.is_empty()
             || route_epoch.is_some()
             || mount_epoch.is_some()
             || next_inode.is_some()
-            || next_data_handle.is_some()
             || self.max_inode_id()?.is_some();
         if !namespace_has_any_state {
             return Ok(BootstrapNamespaceState::Empty);
@@ -95,7 +93,6 @@ impl RocksDBStorage {
                 && inode.kind.is_dir()
                 && matches!(inode.data, beryl_types::fs::InodeData::Dir)
                 && inode.mount_id == MountId::new(1)
-                && inode.data_handle_id == DataHandleId::new(0)
         });
         let matching_mount = mounts.len() == 1
             && mounts.first().is_some_and(|mount| {
@@ -114,7 +111,6 @@ impl RocksDBStorage {
             && route_epoch == Some(1)
             && mount_epoch == Some(1)
             && next_inode == Some(InodeId::new(2))
-            && next_data_handle == Some(DataHandleId::new(1))
         {
             Ok(BootstrapNamespaceState::Matching)
         } else {
@@ -122,26 +118,29 @@ impl RocksDBStorage {
         }
     }
 
-    fn get_next_data_handle_id(&self) -> MetadataResult<Option<DataHandleId>> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf_meta = Self::cf(db, CF_META)?;
-        match db.get_cf(cf_meta, NEXT_DATA_HANDLE_ID_KEY) {
-            Ok(Some(value)) => {
-                let id: u64 = decode_from_slice(&value, standard())
-                    .map_err(|e| MetadataError::Internal(format!("Failed to deserialize next_data_handle_id: {}", e)))?
-                    .0;
-                Ok(Some(DataHandleId::new(id)))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
-        }
-    }
-
     /// Read allocator state without consuming an inode ID.
     pub(crate) fn prepare_inode_allocation(&self) -> MetadataResult<InodeAllocation> {
         let _generation = self.pin_generation()?;
-        let inode_id = self.get_next_inode_id()?.unwrap_or_else(|| InodeId::new(2));
+        let inode_id = self.get_next_inode_id()?.ok_or_else(|| {
+            MetadataError::Internal(
+                "next_inode_id allocator authority is missing; reformat metadata storage".to_string(),
+            )
+        })?;
+        if inode_id.as_raw() < 2 {
+            return Err(MetadataError::Internal(format!(
+                "next_inode_id allocator authority is invalid: {inode_id}; reformat metadata storage"
+            )));
+        }
+        let max_inode_id = self.max_inode_id()?.ok_or_else(|| {
+            MetadataError::Internal(
+                "next_inode_id allocator exists without inode authority; reformat metadata storage".to_string(),
+            )
+        })?;
+        if inode_id.as_raw() <= max_inode_id.as_raw() || self.get_inode(inode_id)?.is_some() {
+            return Err(MetadataError::Internal(format!(
+                "next_inode_id allocator {inode_id} is not ahead of inode authority {max_inode_id}; reformat metadata storage"
+            )));
+        }
         let next_raw = inode_id
             .as_raw()
             .checked_add(1)
@@ -149,22 +148,6 @@ impl RocksDBStorage {
         Ok(InodeAllocation {
             inode_id,
             next_inode_id: InodeId::new(next_raw),
-        })
-    }
-
-    /// Read allocator state without consuming file identities.
-    pub(crate) fn prepare_file_allocation(&self) -> MetadataResult<FileAllocation> {
-        let _generation = self.pin_generation()?;
-        let inode = self.prepare_inode_allocation()?;
-        let data_handle_id = self.get_next_data_handle_id()?.unwrap_or_else(|| DataHandleId::new(1));
-        let next_raw = data_handle_id
-            .as_raw()
-            .checked_add(1)
-            .ok_or_else(|| MetadataError::Internal("data handle ID allocator overflow".to_string()))?;
-        Ok(FileAllocation {
-            inode,
-            data_handle_id,
-            next_data_handle_id: DataHandleId::new(next_raw),
         })
     }
 
@@ -186,53 +169,6 @@ impl RocksDBStorage {
             Ok(None) => Ok(None),
             Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
         }
-    }
-
-    /// Lookup inode_id from a data_handle_id (authoritative mapping).
-    pub fn get_inode_by_data_handle(&self, data_handle_id: DataHandleId) -> MetadataResult<Option<InodeId>> {
-        crate::observe::record_rocksdb_read("data_handle_owner");
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf_meta = db
-            .cf_handle(CF_META)
-            .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
-        let key = format!("data_handle_owner:{}", data_handle_id.as_raw());
-
-        match db.get_cf(cf_meta, key.as_bytes()) {
-            Ok(Some(value)) => {
-                let inode_id_raw: u64 = decode_from_slice(&value, standard())
-                    .map_err(|e| MetadataError::Internal(format!("Failed to deserialize inode_id: {}", e)))?
-                    .0;
-                Ok(Some(InodeId::new(inode_id_raw)))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
-        }
-    }
-
-    /// Validate that a data_handle_id has a bound inode_id and optionally matches an expected inode.
-    /// Returns the authoritative inode_id on success.
-    pub fn validate_data_handle_owner(
-        &self,
-        data_handle_id: DataHandleId,
-        expect_inode: Option<InodeId>,
-    ) -> MetadataResult<InodeId> {
-        let _generation = self.pin_generation()?;
-        let inode_id = self.get_inode_by_data_handle(data_handle_id)?.ok_or_else(|| {
-            MetadataError::StaleState(format!(
-                "Missing owner for data_handle_id {}, refresh metadata state",
-                data_handle_id
-            ))
-        })?;
-        if let Some(expected) = expect_inode {
-            if expected != inode_id {
-                return Err(MetadataError::InvalidArgument(format!(
-                    "data_handle_id {} is owned by inode {}, not {}",
-                    data_handle_id, inode_id, expected
-                )));
-            }
-        }
-        Ok(inode_id)
     }
 
     /// Get one mount entry by its authority-local mount ID.
@@ -405,28 +341,26 @@ impl RocksDBStorage {
             .cf_handle(CF_INODES)
             .ok_or_else(|| MetadataError::Internal("Inodes CF not found".to_string()))?;
 
-        let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut max_inode_id = None;
-        for item in iter {
-            let (key, _) =
-                item.map_err(|e| MetadataError::Internal(format!("RocksDB iterator error (inodes): {}", e)))?;
-            let key = key.as_ref();
-            if !key.starts_with(b"inode/") || key.len() != b"inode/".len() + 8 {
-                continue;
-            }
-            let mut raw = [0u8; 8];
-            raw.copy_from_slice(&key[b"inode/".len()..]);
-            let inode_id = InodeId::new(u64::from_be_bytes(raw));
-            max_inode_id = Some(max_inode_id.map_or(inode_id, |current: InodeId| {
-                if inode_id.as_raw() > current.as_raw() {
-                    inode_id
-                } else {
-                    current
-                }
-            }));
+        let Some(item) = db.iterator_cf(cf, rocksdb::IteratorMode::End).next() else {
+            return Ok(None);
+        };
+        let (key, _) = item.map_err(|e| MetadataError::Internal(format!("RocksDB iterator error (inodes): {e}")))?;
+        let key = key.as_ref();
+        if !key.starts_with(b"inode/") || key.len() != b"inode/".len() + 8 {
+            return Err(MetadataError::Internal(format!(
+                "invalid inode authority key at the allocator high watermark: {:?}",
+                key
+            )));
         }
-
-        Ok(max_inode_id)
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&key[b"inode/".len()..]);
+        let inode_id = InodeId::new(u64::from_be_bytes(raw));
+        if inode_id.as_raw() == 0 {
+            return Err(MetadataError::Internal(
+                "inode authority contains zero at the allocator high watermark".to_string(),
+            ));
+        }
+        Ok(Some(inode_id))
     }
 
     /// Decode dentry key: extract parent_inode_id and name
@@ -636,30 +570,6 @@ mod tests {
                 Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
             }
         }
-    }
-
-    #[test]
-    fn validate_data_handle_owner_checks_presence_and_expected_inode() {
-        let dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
-        let data_handle_id = DataHandleId::new(1);
-        let inode_id = InodeId::new(10);
-        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
-
-        assert_eq!(
-            storage.validate_data_handle_owner(data_handle_id, None).unwrap(),
-            inode_id
-        );
-
-        let missing = storage
-            .validate_data_handle_owner(DataHandleId::new(99), None)
-            .expect_err("missing owner must be stale");
-        assert!(matches!(missing, MetadataError::StaleState(_)));
-
-        let mismatch = storage
-            .validate_data_handle_owner(data_handle_id, Some(InodeId::new(11)))
-            .expect_err("owner mismatch must be rejected");
-        assert!(matches!(mismatch, MetadataError::InvalidArgument(_)));
     }
 
     #[test]

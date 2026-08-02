@@ -9,6 +9,7 @@
 //! - IDs should serialize cleanly for wire/proto/logging.
 //! - Do NOT embed layout semantics, placement, or state in IDs.
 
+pub use crate::fs::InodeId;
 use core::fmt;
 use serde::{Deserialize, Serialize};
 
@@ -60,22 +61,7 @@ macro_rules! id_new_uint {
 }
 
 id_new_uint!(
-    /// Data handle identity for the data-plane.
-    /// A DataHandleId identifies a concrete data instance bound to an inode at a specific point in time
-    /// (e.g., after create, after a committed write session, or after a version switch).
-    /// It is NOT a namespace identity and MUST NOT be used for directory semantics or rename routing.
-    DataHandleId(u64)
-);
-
-impl fmt::Display for DataHandleId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Display as plain number, friendly for logs.
-        write!(f, "{}", self.0)
-    }
-}
-
-id_new_uint!(
-    /// A monotonically allocated block index within one data handle.
+    /// A monotonically allocated block index within one file inode.
     ///
     /// This is a stable ordinal, not a byte offset. Failed allocations may
     /// leave gaps, and an allocated value is never reused.
@@ -90,33 +76,48 @@ impl fmt::Display for BlockIndex {
 
 /// Data-plane block identity.
 ///
-/// Blocks are addressed under a `DataHandleId`, not under an inode. This
-/// prevents namespace identity from being conflated with data instances. The
-/// derived order is lexicographic by data handle and block index, providing a
+/// Blocks are addressed under the owning file's stable `InodeId`. The derived
+/// order is lexicographic by inode and block index, providing a
 /// deterministic traversal order without changing identity semantics.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct BlockId {
-    /// The data handle this block belongs to (data-plane scope).
-    pub data_handle_id: DataHandleId,
-    /// The index of this block within the data handle (ordinal, not byte offset).
+    /// The file inode this block belongs to.
+    pub inode_id: InodeId,
+    /// The index of this block within the file (ordinal, not byte offset).
     pub index: BlockIndex,
 }
 
-impl BlockId {
-    /// Creates a new `BlockId` from a data handle ID and block index.
-    #[inline]
-    pub const fn new(data_handle: DataHandleId, index: BlockIndex) -> Self {
-        Self {
-            data_handle_id: data_handle,
-            index,
+impl<'de> Deserialize<'de> for BlockId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SerializedBlockId {
+            inode_id: InodeId,
+            index: BlockIndex,
         }
+
+        let value = SerializedBlockId::deserialize(deserializer)?;
+        if value.inode_id.as_raw() == 0 {
+            return Err(serde::de::Error::custom("BlockId.inode_id must be non-zero"));
+        }
+        Ok(Self::new(value.inode_id, value.index))
+    }
+}
+
+impl BlockId {
+    /// Creates a new `BlockId` from an inode ID and block index.
+    #[inline]
+    pub const fn new(inode_id: InodeId, index: BlockIndex) -> Self {
+        Self { inode_id, index }
     }
 
     /// Convenience for tests/logging where you already have primitive values.
     #[inline]
-    pub const fn from_u64_u32(data_handle: u64, index: u32) -> Self {
+    pub const fn from_u64_u32(inode_id: u64, index: u32) -> Self {
         Self {
-            data_handle_id: DataHandleId(data_handle),
+            inode_id: InodeId(inode_id),
             index: BlockIndex(index),
         }
     }
@@ -125,17 +126,13 @@ impl BlockId {
 impl fmt::Debug for BlockId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Concise but structured.
-        write!(
-            f,
-            "BlockId(data_handle_id={}, index={})",
-            self.data_handle_id.0, self.index.0
-        )
+        write!(f, "BlockId(inode_id={}, index={})", self.inode_id.0, self.index.0)
     }
 }
 impl fmt::Display for BlockId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Stable, human-friendly: "<data_handle>:<block>"
-        write!(f, "{}:{}", self.data_handle_id.0, self.index.0)
+        // Stable, human-friendly: "<inode>:<block>"
+        write!(f, "{}:{}", self.inode_id.0, self.index.0)
     }
 }
 
@@ -146,18 +143,21 @@ impl std::str::FromStr for BlockId {
         let parts: Vec<&str> = s.split(':').collect();
         if parts.len() != 2 {
             return Err(format!(
-                "Invalid BlockId format: expected 'data_handle_id:block_index', got '{}'",
+                "Invalid BlockId format: expected 'inode_id:block_index', got '{}'",
                 s
             ));
         }
-        let data_handle_id = parts[0]
+        let inode_id = parts[0]
             .parse::<u64>()
-            .map_err(|e| format!("Failed to parse data_handle_id: {}", e))?;
+            .map_err(|e| format!("Failed to parse inode_id: {}", e))?;
+        if inode_id == 0 {
+            return Err("inode_id must be non-zero".to_string());
+        }
         let block_index = parts[1]
             .parse::<u32>()
             .map_err(|e| format!("Failed to parse block_index: {}", e))?;
         Ok(BlockId {
-            data_handle_id: DataHandleId::new(data_handle_id),
+            inode_id: InodeId::new(inode_id),
             index: BlockIndex::new(block_index),
         })
     }
@@ -197,19 +197,15 @@ impl fmt::Debug for ChunkId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "ChunkId(data_handle={}, block={}, chunk={})",
-            self.block.data_handle_id.0, self.block.index.0, self.index.0
+            "ChunkId(inode={}, block={}, chunk={})",
+            self.block.inode_id.0, self.block.index.0, self.index.0
         )
     }
 }
 impl fmt::Display for ChunkId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // "<data_handle>:<block>:<chunk>"
-        write!(
-            f,
-            "{}:{}:{}",
-            self.block.data_handle_id.0, self.block.index.0, self.index.0
-        )
+        // "<inode>:<block>:<chunk>"
+        write!(f, "{}:{}:{}", self.block.inode_id.0, self.block.index.0, self.index.0)
     }
 }
 
@@ -560,6 +556,12 @@ mod tests {
         let s2 = serde_json::to_string(&cid).unwrap();
         let back2: ChunkId = serde_json::from_str(&s2).unwrap();
         assert_eq!(cid, back2);
+    }
+
+    #[test]
+    fn block_id_parse_and_deserialize_reject_zero_inode() {
+        assert!("0:7".parse::<BlockId>().is_err());
+        assert!(serde_json::from_str::<BlockId>(r#"{"inode_id":0,"index":7}"#).is_err());
     }
 
     #[test]

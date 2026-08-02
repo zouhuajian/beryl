@@ -124,10 +124,10 @@ impl RepairPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
+    use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
 
-    fn make_block_id(data_handle_id: u64, index: u32) -> BlockId {
-        BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(index))
+    fn make_block_id(inode_id: u64, index: u32) -> BlockId {
+        BlockId::new(InodeId::new(inode_id), BlockIndex::new(index))
     }
 
     fn make_worker_id(id: u64) -> WorkerId {

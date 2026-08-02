@@ -296,7 +296,7 @@ impl BlockAccessRegistry {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        blocks.sort_by_key(|block| (block.block_id.data_handle_id.as_raw(), block.block_id.index.as_raw()));
+        blocks.sort_by_key(|block| (block.block_id.inode_id.as_raw(), block.block_id.index.as_raw()));
         blocks
     }
 
@@ -484,7 +484,7 @@ impl Default for BlockManager {
 mod tests {
     use std::time::Duration;
 
-    use beryl_types::ids::{BlockId, BlockIndex, DataHandleId};
+    use beryl_types::ids::{BlockId, BlockIndex, InodeId};
 
     use super::*;
 
@@ -493,7 +493,7 @@ mod tests {
     }
 
     fn block_id() -> BlockId {
-        BlockId::new(DataHandleId::new(7), BlockIndex::new(3))
+        BlockId::new(InodeId::new(7), BlockIndex::new(3))
     }
 
     #[tokio::test]

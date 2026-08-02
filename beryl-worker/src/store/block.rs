@@ -25,9 +25,9 @@ pub type StoreResult<T> = Result<T, WorkerError>;
 
 const BLOCK_META_MAGIC: [u8; 4] = *b"BRYL";
 const BLOCK_META_HEADER_LEN: usize = 20;
-const BLOCK_META_VERSION: u32 = 3;
+const BLOCK_META_VERSION: u32 = 4;
 const MAX_META_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
-const DELETING_MARKER_VERSION: u32 = 1;
+const DELETING_MARKER_VERSION: u32 = 2;
 
 /// Fixed little-endian header for a block metadata file.
 /// The header identifies the format and bounds the serialized payload.
@@ -549,7 +549,7 @@ impl FullBlockFileStore {
         }
         blocks.sort_by_key(|meta| {
             (
-                meta.identity.block_id.data_handle_id.as_raw(),
+                meta.identity.block_id.inode_id.as_raw(),
                 meta.identity.block_id.index.as_raw(),
             )
         });
@@ -722,11 +722,7 @@ impl FullBlockFileStore {
 
     pub fn paths(&self, group_name: &GroupName, block_id: BlockId) -> BlockPaths {
         let (hash_a, hash_b) = block_hash_prefix(block_id);
-        let stem = format!(
-            "b_{:016x}_{:08x}",
-            block_id.data_handle_id.as_raw(),
-            block_id.index.as_raw()
-        );
+        let stem = format!("b_{:016x}_{:08x}", block_id.inode_id.as_raw(), block_id.index.as_raw());
         let dir = self
             .group_dir(group_name)
             .join("blocks")
@@ -1343,7 +1339,7 @@ fn validate_ready_data_len(actual_len: u64, meta: &BlockMetaPayload) -> StoreRes
 }
 
 fn block_hash_prefix(block_id: BlockId) -> (u8, u8) {
-    let mut value = block_id.data_handle_id.as_raw() ^ (u64::from(block_id.index.as_raw()) << 32);
+    let mut value = block_id.inode_id.as_raw() ^ (u64::from(block_id.index.as_raw()) << 32);
     value ^= value >> 33;
     value = value.wrapping_mul(0xff51_afd7_ed55_8ccd);
     value ^= value >> 33;
@@ -1436,7 +1432,7 @@ mod tests {
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::OnceLock;
 
-    use beryl_types::ids::{BlockId, BlockIndex, DataHandleId};
+    use beryl_types::ids::{BlockId, BlockIndex, InodeId};
     use beryl_types::GroupName;
     use bytes::Bytes;
     use tempfile::TempDir;
@@ -1452,7 +1448,7 @@ mod tests {
     fn ids() -> (&'static GroupName, BlockId) {
         (
             test_group_name(),
-            BlockId::new(DataHandleId::new(0x1234), BlockIndex::new(7)),
+            BlockId::new(InodeId::new(0x1234), BlockIndex::new(7)),
         )
     }
 
@@ -1778,7 +1774,7 @@ mod tests {
             (
                 "block_id",
                 ExpectedBlockShape {
-                    block_id: BlockId::new(block_id.data_handle_id, BlockIndex::new(block_id.index.as_raw() + 1)),
+                    block_id: BlockId::new(block_id.inode_id, BlockIndex::new(block_id.index.as_raw() + 1)),
                     ..expected_shape(group_name_value, block_id, Some(99))
                 },
             ),
@@ -2540,7 +2536,7 @@ mod tests {
             |valid: &BlockMetaPayload| {
                 let mut invalid = valid.clone();
                 invalid.identity.block_id = BlockId::new(
-                    invalid.identity.block_id.data_handle_id,
+                    invalid.identity.block_id.inode_id,
                     BlockIndex::new(invalid.identity.block_id.index.as_raw() + 1),
                 );
                 encode_meta_payload(&invalid).expect("encode block id mismatch")
@@ -2953,6 +2949,32 @@ mod tests {
         let paths = store.paths(group_name_value, block_id);
         fs::create_dir_all(paths.deleting_marker_path.parent().expect("marker parent")).expect("create gc");
         fs::write(&paths.deleting_marker_path, b"not-json").expect("write corrupt marker");
+
+        assert_corrupt(store.recover_deleting_markers());
+        assert!(paths.data_path.exists());
+        assert!(paths.meta_path.exists());
+    }
+
+    #[test]
+    fn startup_recovery_rejects_previous_deleting_marker_version() {
+        let (_temp, store) = store();
+        let (group_name_value, block_id) = ids();
+        publish_default_block(&store, group_name_value, block_id);
+        let meta = store.load_meta(group_name_value, block_id).expect("ready meta");
+        let paths = store.paths(group_name_value, block_id);
+        fs::create_dir_all(paths.deleting_marker_path.parent().expect("marker parent")).expect("create gc");
+        let marker = DeletingMarker {
+            version: DELETING_MARKER_VERSION - 1,
+            group_name: group_name_value.as_str().to_string(),
+            block_id,
+            block_stamp: meta.visibility.block_stamp,
+            effective_len: meta.source.effective_len,
+        };
+        fs::write(
+            &paths.deleting_marker_path,
+            serde_json::to_vec(&marker).expect("encode previous marker"),
+        )
+        .expect("write previous marker");
 
         assert_corrupt(store.recover_deleting_markers());
         assert!(paths.data_path.exists());

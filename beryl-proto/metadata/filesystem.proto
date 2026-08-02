@@ -21,7 +21,7 @@ import "common/header.proto";
 //
 // Authority contract:
 // - Path is an adapter entrypoint.
-// - inode, data_handle, block, lease, fencing, and epoch identities carry the
+// - inode, block, lease, fencing, and epoch identities carry the
 //   consistency contract.
 // - WriteSession is an internal implementation concept and is not a public RPC
 //   name or message name.
@@ -70,7 +70,7 @@ message DirEntryProto {
 }
 
 message WriteHandleProto {
-  common.DataHandleIdProto data_handle_id = 1;
+  uint64 inode_id = 1;
   uint64 write_lease_epoch = 2;
 }
 
@@ -199,7 +199,7 @@ message OpenFileRequestProto {
 
 message OpenFileResponseProto {
   common.ResponseHeaderProto header = 1;
-  common.DataHandleIdProto data_handle_id = 2;
+  uint64 inode_id = 2;
   uint64 file_size = 3;
   // Durable visible file state version for the current committed read plan.
   // It advances when cached OpenFile/GetBlockLocations data may be invalid.
@@ -210,14 +210,14 @@ message GetBlockLocationsRequestProto {
   common.RequestHeaderProto header = 1;
   oneof target {
     string path = 2;
-    common.DataHandleIdProto data_handle_id = 3;
+    uint64 inode_id = 3;
   }
   optional common.ByteRangeProto range = 4;
 }
 
 message GetBlockLocationsResponseProto {
   common.ResponseHeaderProto header = 1;
-  common.DataHandleIdProto data_handle_id = 2;
+  uint64 inode_id = 2;
   uint64 file_size = 3;
   repeated FileBlockLocationProto locations = 4;
   // Same revision contract as OpenFileResponseProto.content_revision.
@@ -237,7 +237,7 @@ message CreateFileRequestProto {
 
 message CreateFileResponseProto {
   common.ResponseHeaderProto header = 1;
-  common.DataHandleIdProto data_handle_id = 2;
+  uint64 inode_id = 2;
   // Metadata-stored FileLayout accepted by the durable namespace mutation.
   common.FileLayoutProto layout = 3;
 }

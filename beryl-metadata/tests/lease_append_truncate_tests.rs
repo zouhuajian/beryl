@@ -6,7 +6,7 @@
 use beryl_metadata::inode_lease::{LeaseManager, WriteMode};
 use beryl_types::fs::{FsErrorCode, InodeId};
 use beryl_types::ids::ClientId;
-use beryl_types::ids::{BlockId, BlockIndex, DataHandleId};
+use beryl_types::ids::{BlockId, BlockIndex};
 
 #[test]
 fn test_lease_conflict() {
@@ -124,7 +124,7 @@ fn test_truncate_shrink_extents() {
     let extents = [
         Extent {
             file_offset: 0,
-            block_id: BlockId::new(DataHandleId::new(1), BlockIndex::new(0)),
+            block_id: BlockId::new(InodeId::new(1), BlockIndex::new(0)),
             block_offset: 0,
             len: 4096,
             content_revision: None,
@@ -132,7 +132,7 @@ fn test_truncate_shrink_extents() {
         },
         Extent {
             file_offset: 4096,
-            block_id: BlockId::new(DataHandleId::new(1), BlockIndex::new(1)),
+            block_id: BlockId::new(InodeId::new(1), BlockIndex::new(1)),
             block_offset: 0,
             len: 4096,
             content_revision: None,

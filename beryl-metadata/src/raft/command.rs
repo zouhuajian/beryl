@@ -4,7 +4,7 @@
 //! Metadata authority commands replicated through Raft.
 
 use beryl_types::fs::{Extent, FileAttrs, InodeId};
-use beryl_types::ids::{DataHandleId, MountId, WorkerId};
+use beryl_types::ids::{MountId, WorkerId};
 use beryl_types::layout::FileLayout;
 use beryl_types::GroupName;
 use serde::{Deserialize, Serialize};
@@ -87,7 +87,6 @@ pub(crate) enum Command {
     },
     AllocateBlock {
         inode_id: InodeId,
-        data_handle_id: DataHandleId,
         lease_epoch: u64,
     },
     EndWriteLease {

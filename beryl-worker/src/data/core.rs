@@ -419,7 +419,7 @@ impl WorkerCore {
         let group_name = req.group_name.clone();
         let block_id = req.block_id;
         let worker_run_id = req.worker_run_id;
-        let data_handle_id = req.block_id.data_handle_id;
+        let inode_id = req.block_id.inode_id;
         let block_stamp = req.block_stamp;
         let result = async {
             let frame_size = self.negotiate_frame_size(req.frame_size)?;
@@ -443,7 +443,7 @@ impl WorkerCore {
                     error_code = "none",
                     group_id = %group_name,
                     block_id = %block_id,
-                    data_handle_id = data_handle_id.as_raw(),
+                    inode_id = inode_id.as_raw(),
                     worker_run_id = %worker_run_id,
                     block_stamp,
                     "Block created"
@@ -456,7 +456,7 @@ impl WorkerCore {
                         error_code = observe::worker_error_kind(&error),
                         group_id = %group_name,
                         block_id = %block_id,
-                        data_handle_id = data_handle_id.as_raw(),
+                        inode_id = inode_id.as_raw(),
                         worker_run_id = %worker_run_id,
                         block_stamp,
                         "Block create rejected"
@@ -501,7 +501,7 @@ impl WorkerCore {
                 group_id = %group_name,
                 block_id = %block_id,
                 stream_id = %opened.stream_id,
-                data_handle_id = data_handle_id.as_raw(),
+                inode_id = inode_id.as_raw(),
                 worker_run_id = %worker_run_id,
                 block_stamp,
                 committed_length = opened.committed_length,
@@ -514,7 +514,7 @@ impl WorkerCore {
                 error_code = observe::worker_error_kind(error),
                 group_id = %group_name,
                 block_id = %block_id,
-                data_handle_id = data_handle_id.as_raw(),
+                inode_id = inode_id.as_raw(),
                 worker_run_id = %worker_run_id,
                 block_stamp,
                 "OpenWrite rejected"
@@ -528,7 +528,7 @@ impl WorkerCore {
         let block_id = req.block_id;
         let stream_id = req.stream_id;
         let worker_run_id = req.worker_run_id;
-        let data_handle_id = req.block_id.data_handle_id;
+        let inode_id = req.block_id.inode_id;
         let result = async {
             let state = self.write_state(req.stream_id).await?;
             validate_commit_request(&state, &req)?;
@@ -551,7 +551,7 @@ impl WorkerCore {
                         group_id = %group_name,
                         block_id = %block_id,
                         stream_id = %stream_id,
-                        data_handle_id = data_handle_id.as_raw(),
+                        inode_id = inode_id.as_raw(),
                         worker_run_id = %worker_run_id,
                         committed_length = meta.source.effective_len,
                         ready_chunks = 1_u64,
@@ -570,7 +570,7 @@ impl WorkerCore {
                         group_id = %group_name,
                         block_id = %block_id,
                         stream_id = %stream_id,
-                        data_handle_id = data_handle_id.as_raw(),
+                        inode_id = inode_id.as_raw(),
                         worker_run_id = %worker_run_id,
                         "Block publish_ready rejected"
                     );
@@ -585,7 +585,7 @@ impl WorkerCore {
                 group_id = %group_name,
                 block_id = %block_id,
                 stream_id = %stream_id,
-                data_handle_id = data_handle_id.as_raw(),
+                inode_id = inode_id.as_raw(),
                 worker_run_id = %worker_run_id,
                 committed_length = meta.source.effective_len,
                 bytes_written = meta.source.effective_len,
@@ -610,7 +610,7 @@ impl WorkerCore {
                 group_id = %group_name,
                 block_id = %block_id,
                 stream_id = %stream_id,
-                data_handle_id = data_handle_id.as_raw(),
+                inode_id = inode_id.as_raw(),
                 worker_run_id = %worker_run_id,
                 "CommitWrite rejected"
             );
@@ -1127,7 +1127,7 @@ mod tests {
 
     use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
     use beryl_types::chunk::ByteRange;
-    use beryl_types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, StreamId};
+    use beryl_types::ids::{BlockId, BlockIndex, ClientId, InodeId, StreamId};
     use beryl_types::layout::BlockFormatId;
     use beryl_types::lease::FencingToken;
     use beryl_types::{GroupName, Tier, WorkerRunId};
@@ -1150,7 +1150,7 @@ mod tests {
     const BLOCK_STAMP: u64 = 55;
 
     fn block_id() -> BlockId {
-        BlockId::new(DataHandleId::new(7), BlockIndex::new(3))
+        BlockId::new(InodeId::new(7), BlockIndex::new(3))
     }
 
     fn group_name() -> GroupName {

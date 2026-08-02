@@ -173,7 +173,7 @@ mod tests {
     };
     use beryl_types::lease::FencingToken;
     use beryl_types::{
-        BlockId, BlockIndex, ClientId, DataHandleId, FileBlockLocation, GroupName, WorkerEndpointInfo, WorkerId,
+        BlockId, BlockIndex, ClientId, FileBlockLocation, GroupName, InodeId, WorkerEndpointInfo, WorkerId,
         WorkerNetProtocol, WriteTarget,
     };
     use bytes::Bytes;
@@ -339,7 +339,7 @@ mod tests {
         let client = FsClient::try_new(config).expect("client");
         let read = FileReader::new(
             Arc::clone(&client.runtime),
-            ReadHandle::new("/alpha".to_string(), DataHandleId::new(202), 3, 10),
+            ReadHandle::new("/alpha".to_string(), InodeId::new(202), 3, 10),
         );
         let debug = format!("{read:?}");
 
@@ -623,7 +623,7 @@ mod tests {
             .into_iter()
             .find(|call| call.method == "read_layout")
             .expect("read layout call");
-        assert_eq!(read_layout.target_data_handle_id, Some(202));
+        assert_eq!(read_layout.target_inode_id, Some(202));
         assert_eq!(read_layout.range, Some((2, 5)));
     }
 
@@ -750,7 +750,6 @@ mod tests {
         assert!(debug.contains("cursor"));
         for needle in [
             concat!("inode", "_id"),
-            concat!("data", "_handle_id"),
             concat!("file", "_version"),
             concat!("write", "_handle"),
             "fencing",
@@ -1257,7 +1256,6 @@ mod tests {
     fn assert_debug_redacts_internal_identity_names(debug: &str) {
         for needle in [
             concat!("inode", "_id"),
-            concat!("data", "_handle_id"),
             concat!("file", "_version"),
             concat!("write", "_handle"),
             concat!("fen", "cing"),
@@ -1345,7 +1343,7 @@ mod tests {
         group_name: GroupName,
         call_id: String,
         deadline_ms: i64,
-        target_data_handle_id: Option<u64>,
+        target_inode_id: Option<u64>,
         range: Option<(u64, u32)>,
         target_size: Option<u64>,
         final_size: Option<u64>,
@@ -1584,7 +1582,7 @@ mod tests {
                 group_name: group_name_from(&header.group_name),
                 call_id: header.client.as_ref().expect("client").call_id.clone(),
                 deadline_ms: header.deadline_ms,
-                target_data_handle_id: None,
+                target_inode_id: None,
                 range: None,
                 target_size: None,
                 final_size: None,
@@ -1602,7 +1600,7 @@ mod tests {
                 group_name: group_name_from(&header.group_name),
                 call_id: header.client.as_ref().expect("client").call_id.clone(),
                 deadline_ms: header.deadline_ms,
-                target_data_handle_id: None,
+                target_inode_id: None,
                 range: None,
                 target_size: None,
                 final_size: None,
@@ -1615,10 +1613,8 @@ mod tests {
 
         fn record_read_layout(&self, ctx: &AttemptContext, req: &beryl_proto::metadata::GetBlockLocationsRequestProto) {
             let header = ctx.metadata_header().expect("metadata header");
-            let target_data_handle_id = match req.target.as_ref() {
-                Some(beryl_proto::metadata::get_block_locations_request_proto::Target::DataHandleId(id)) => {
-                    Some(id.value)
-                }
+            let target_inode_id = match req.target.as_ref() {
+                Some(beryl_proto::metadata::get_block_locations_request_proto::Target::InodeId(id)) => Some(*id),
                 _ => None,
             };
             let range = req.range.as_ref().map(|range| (range.offset, range.len));
@@ -1627,7 +1623,7 @@ mod tests {
                 group_name: group_name_from(&header.group_name),
                 call_id: header.client.as_ref().expect("client").call_id.clone(),
                 deadline_ms: header.deadline_ms,
-                target_data_handle_id,
+                target_inode_id,
                 range,
                 target_size: None,
                 final_size: None,
@@ -1646,11 +1642,7 @@ mod tests {
                 group_name: group_name_from(&header.group_name),
                 call_id: header.client.as_ref().expect("client").call_id.clone(),
                 deadline_ms: header.deadline_ms,
-                target_data_handle_id: req
-                    .write_handle
-                    .as_ref()
-                    .and_then(|handle| handle.data_handle_id.as_ref())
-                    .map(|id| id.value),
+                target_inode_id: req.write_handle.as_ref().map(|handle| handle.inode_id),
                 range: None,
                 target_size: None,
                 final_size: Some(req.final_size),
@@ -1668,11 +1660,7 @@ mod tests {
                 group_name: group_name_from(&header.group_name),
                 call_id: header.client.as_ref().expect("client").call_id.clone(),
                 deadline_ms: header.deadline_ms,
-                target_data_handle_id: req
-                    .write_handle
-                    .as_ref()
-                    .and_then(|handle| handle.data_handle_id.as_ref())
-                    .map(|id| id.value),
+                target_inode_id: req.write_handle.as_ref().map(|handle| handle.inode_id),
                 range: None,
                 target_size: Some(req.target_size),
                 final_size: None,
@@ -1690,7 +1678,7 @@ mod tests {
                 group_name: group_name_from(&header.group_name),
                 call_id: header.client.as_ref().expect("client").call_id.clone(),
                 deadline_ms: header.deadline_ms,
-                target_data_handle_id: None,
+                target_inode_id: None,
                 range: None,
                 target_size: None,
                 final_size: None,
@@ -1797,7 +1785,7 @@ mod tests {
         ) -> ClientResult<OpenFileResponseProto> {
             self.record("open_file", &ctx);
             Ok(OpenFileResponseProto {
-                data_handle_id: Some(beryl_proto::common::DataHandleIdProto { value: 202 }),
+                inode_id: 202,
                 file_size: 10,
                 content_revision: Some(3),
                 ..OpenFileResponseProto::default()
@@ -1835,7 +1823,7 @@ mod tests {
                 self.write_layouts.lock().expect("write layouts").insert(302, layout);
             }
             Ok(CreateFileResponseProto {
-                data_handle_id: Some(beryl_proto::common::DataHandleIdProto { value: 302 }),
+                inode_id: 302,
                 layout: response_layout.map(layout_proto),
                 ..CreateFileResponseProto::default()
             })
@@ -1860,11 +1848,8 @@ mod tests {
                 }
             }
             let append = req.mode == beryl_proto::metadata::OpenWriteModeProto::OpenWriteModeAppend as i32;
-            let (handle_id, data_handle_id, base_size) = if append { (2, 402, 10) } else { (1, 302, 0) };
-            self.next_offsets
-                .lock()
-                .expect("offsets")
-                .insert(data_handle_id, base_size);
+            let (inode_id, base_size) = if append { (402, 10) } else { (302, 0) };
+            self.next_offsets.lock().expect("offsets").insert(inode_id, base_size);
             let layout = if append {
                 self.append_write_layout
                     .lock()
@@ -1874,14 +1859,14 @@ mod tests {
                 self.write_layouts
                     .lock()
                     .expect("write layouts")
-                    .get(&data_handle_id)
+                    .get(&inode_id)
                     .copied()
                     .unwrap_or_else(default_layout)
             };
             self.write_layouts
                 .lock()
                 .expect("write layouts")
-                .insert(data_handle_id, layout);
+                .insert(inode_id, layout);
             let response_layout = if append {
                 self.append_response_layout
                     .lock()
@@ -1891,7 +1876,7 @@ mod tests {
                 Some(layout)
             };
             Ok(OpenWriteResponseProto {
-                write_handle: Some(write_handle_proto(handle_id, data_handle_id)),
+                write_handle: Some(write_handle_proto(inode_id)),
                 base_size,
                 expires_at_ms: u64::MAX / 2,
                 layout: response_layout.map(layout_proto),
@@ -1925,29 +1910,29 @@ mod tests {
                 .write_layouts
                 .lock()
                 .expect("write layouts")
-                .get(&data_handle_id_from_write_handle(write_handle))
+                .get(&inode_id_from_write_handle(write_handle))
                 .copied()
                 .unwrap_or_else(default_layout);
             let len = requested_len.min(u64::from(layout.block_size)).max(1);
             let offset = {
                 let mut offsets = self.next_offsets.lock().expect("offsets");
-                let session_id = data_handle_id_from_write_handle(write_handle);
+                let session_id = inode_id_from_write_handle(write_handle);
                 let offset = *offsets.entry(session_id).or_insert(0);
                 offsets.insert(session_id, offset + len);
                 offset
             };
             let block_index = {
                 let mut indexes = self.next_block_indexes.lock().expect("block indexes");
-                let session_id = data_handle_id_from_write_handle(write_handle);
+                let session_id = inode_id_from_write_handle(write_handle);
                 let index = *indexes.entry(session_id).or_insert(0);
                 indexes.insert(session_id, index + 1);
                 index
             };
-            let data_handle_id = data_handle_id_from_write_handle(write_handle);
+            let inode_id = inode_id_from_write_handle(write_handle);
             let header = ctx.metadata_header().expect("metadata header");
             Ok(AddBlockResult {
                 group_name: group_name_from(&header.group_name),
-                target: write_target_with_layout(data_handle_id, block_index, offset, len, layout),
+                target: write_target_with_layout(inode_id, block_index, offset, len, layout),
             })
         }
 
@@ -2312,20 +2297,20 @@ mod tests {
     fn read_reader(client: &FsClient, file_size: u64) -> FileReader {
         FileReader::new(
             Arc::clone(&client.runtime),
-            ReadHandle::new("/alpha".to_string(), DataHandleId::new(202), 3, file_size),
+            ReadHandle::new("/alpha".to_string(), InodeId::new(202), 3, file_size),
         )
     }
 
     fn layout_response(
         group_name: &str,
-        data_handle_id: u64,
+        inode_id: u64,
         content_revision: Option<u64>,
         file_size: u64,
         locations: Vec<FileBlockLocation>,
     ) -> ReadLayout {
         ReadLayout {
             group_name: group_name_from(group_name),
-            data_handle_id: DataHandleId::new(data_handle_id),
+            inode_id: InodeId::new(inode_id),
             file_size,
             content_revision,
             locations,
@@ -2345,25 +2330,25 @@ mod tests {
         }
     }
 
-    fn write_handle_proto(_handle_id: u64, data_handle_id: u64) -> WriteHandleProto {
+    fn write_handle_proto(inode_id: u64) -> WriteHandleProto {
         WriteHandleProto {
-            data_handle_id: Some(beryl_proto::common::DataHandleIdProto { value: data_handle_id }),
+            inode_id,
             write_lease_epoch: 1,
         }
     }
 
-    fn data_handle_id_from_write_handle(handle: &WriteHandleProto) -> u64 {
-        handle.data_handle_id.as_ref().expect("data handle id").value
+    fn inode_id_from_write_handle(handle: &WriteHandleProto) -> u64 {
+        handle.inode_id
     }
 
     fn write_handle_for_tests(path: &str, base_size: u64, expires_at_ms: u64) -> ClientResult<WriteHandle> {
-        let data_handle_id = DataHandleId::new(302);
+        let inode_id = InodeId::new(302);
         let layout = beryl_types::FileLayout::try_from(layout_proto(default_layout()))
             .map_err(|err| ClientError::InvalidLayout(err.to_string()))?;
         let session = WriteSession::new(
             path.to_string(),
             layout,
-            write_handle_proto(1, data_handle_id.as_raw()),
+            write_handle_proto(inode_id.as_raw()),
             base_size,
             expires_at_ms,
             0,
@@ -2373,13 +2358,13 @@ mod tests {
     }
 
     fn write_target_with_layout(
-        data_handle_id: u64,
+        inode_id: u64,
         block_index: u32,
         file_offset: u64,
         len: u64,
         layout: RecordedLayout,
     ) -> WriteTarget {
-        let block_id = BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(block_index));
+        let block_id = BlockId::new(InodeId::new(inode_id), BlockIndex::new(block_index));
         WriteTarget {
             block_id,
             file_offset,
@@ -2406,9 +2391,9 @@ mod tests {
         }
     }
 
-    fn location(data_handle_id: u64, block_index: u32, file_offset: u64, len: u64) -> FileBlockLocation {
+    fn location(inode_id: u64, block_index: u32, file_offset: u64, len: u64) -> FileBlockLocation {
         FileBlockLocation {
-            block_id: BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(block_index)),
+            block_id: BlockId::new(InodeId::new(inode_id), BlockIndex::new(block_index)),
             file_offset,
             len,
             workers: vec![worker_endpoint()],

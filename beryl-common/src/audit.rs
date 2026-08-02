@@ -24,9 +24,9 @@ pub struct AuditRecord {
     pub operation: String,
     /// File path (primary key for audit queries).
     pub path: Option<String>,
-    /// Block ID (format: data_handle_id:block_index).
+    /// Block ID (format: inode_id:block_index).
     pub block_id: Option<String>,
-    /// Chunk reference (format: data_handle_id:block_index:chunk_idx).
+    /// Chunk reference (format: inode_id:block_index:chunk_idx).
     pub chunk_ref: Option<String>,
     /// Request source.
     pub source: String,

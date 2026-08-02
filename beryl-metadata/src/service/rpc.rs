@@ -20,7 +20,7 @@ use super::MsyncHandler;
 use crate::error::{to_fs_error_detail, MetadataError};
 use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use beryl_proto::metadata::*;
-use beryl_types::ids::DataHandleId;
+use beryl_types::ids::InodeId;
 use beryl_types::CommittedBlock;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -110,9 +110,9 @@ impl MetadataFileSystemServiceImpl {
         }
     }
 
-    fn write_handle(data_handle_id: DataHandleId, lease_epoch: u64) -> WriteHandleProto {
+    fn write_handle(inode_id: InodeId, lease_epoch: u64) -> WriteHandleProto {
         WriteHandleProto {
-            data_handle_id: Some(Self::data_handle_proto(data_handle_id)),
+            inode_id: inode_id.as_raw(),
             write_lease_epoch: lease_epoch,
         }
     }
@@ -130,27 +130,20 @@ impl MetadataFileSystemServiceImpl {
             ))
         };
         let handle = handle.ok_or_else(|| invalid("missing write_handle"))?;
-        let data_handle_id = handle
-            .data_handle_id
-            .ok_or_else(|| invalid("write_handle.data_handle_id is required"))?;
-        if data_handle_id.value == 0 {
-            return Err(invalid("write_handle.data_handle_id must be non-zero"));
+        if handle.inode_id == 0 {
+            return Err(invalid("write_handle.inode_id must be non-zero"));
         }
         if handle.write_lease_epoch == 0 {
             return Err(invalid("write_handle.write_lease_epoch must be non-zero"));
         }
         Ok(PresentedWriteHandle {
-            data_handle_id: DataHandleId::new(data_handle_id.value),
+            inode_id: InodeId::new(handle.inode_id),
             lease_epoch: handle.write_lease_epoch,
         })
     }
 
     fn committed_block_from_proto(block: CommittedBlockProto) -> Result<CommittedBlock, MetadataError> {
         CommittedBlock::try_from(block).map_err(MetadataError::InvalidArgument)
-    }
-
-    fn data_handle_proto(data_handle_id: DataHandleId) -> beryl_proto::common::DataHandleIdProto {
-        data_handle_id.into()
     }
 }
 
@@ -373,7 +366,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 let payload = success.payload;
                 response_with_header!(
                     OpenFileResponseProto {
-                        data_handle_id: Some(Self::data_handle_proto(payload.data_handle_id)),
+                        inode_id: payload.inode_id.as_raw(),
                         file_size: payload.file_size,
                         content_revision: payload.content_revision,
                         ..Default::default()
@@ -394,11 +387,17 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         let req_ctx = request_context_or_error!(req, GetBlockLocationsResponseProto);
         let target = match req.target {
             Some(get_block_locations_request_proto::Target::Path(path)) => BlockLocationsTarget::Path(path),
-            Some(get_block_locations_request_proto::Target::DataHandleId(data_handle)) => {
-                BlockLocationsTarget::DataHandle(
-                    DataHandleId::try_from(data_handle)
-                        .unwrap_or_else(|()| unreachable!("DataHandleIdProto conversion is infallible")),
-                )
+            Some(get_block_locations_request_proto::Target::InodeId(inode_id)) => {
+                if inode_id == 0 {
+                    return error_response!(
+                        GetBlockLocationsResponseProto,
+                        Self::header_from_conversion_error(
+                            &req.header,
+                            MetadataError::InvalidArgument("inode_id must be non-zero".to_string()),
+                        )
+                    );
+                }
+                BlockLocationsTarget::InodeId(InodeId::new(inode_id))
             }
             None => {
                 return error_response!(
@@ -431,7 +430,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 let payload = success.payload;
                 response_with_header!(
                     GetBlockLocationsResponseProto {
-                        data_handle_id: Some(Self::data_handle_proto(payload.data_handle_id)),
+                        inode_id: payload.inode_id.as_raw(),
                         file_size: payload.file_size,
                         content_revision: payload.content_revision,
                         locations: payload.locations.iter().map(location_to_proto).collect(),
@@ -474,7 +473,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 let payload = success.payload;
                 response_with_header!(
                     CreateFileResponseProto {
-                        data_handle_id: Some(Self::data_handle_proto(payload.data_handle_id)),
+                        inode_id: payload.inode_id.as_raw(),
                         layout: Some((&payload.layout).into()),
                         ..Default::default()
                     },
@@ -522,7 +521,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 let payload = success.payload;
                 response_with_header!(
                     OpenWriteResponseProto {
-                        write_handle: Some(Self::write_handle(payload.data_handle_id, payload.lease_epoch)),
+                        write_handle: Some(Self::write_handle(payload.inode_id, payload.lease_epoch)),
                         base_size: payload.base_size,
                         expires_at_ms: payload.expires_at_ms,
                         layout: Some((&payload.layout).into()),
@@ -794,8 +793,7 @@ mod tests {
     };
     use beryl_common::header::RequestHeader;
     use beryl_proto::common::{
-        DataHandleIdProto, FsErrnoProto, GroupStateWatermarkProto, RaftLogIdProto, RequestHeaderProto,
-        ResponseHeaderProto,
+        FsErrnoProto, GroupStateWatermarkProto, RaftLogIdProto, RequestHeaderProto, ResponseHeaderProto,
     };
     use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
     use beryl_proto::metadata::{
@@ -805,7 +803,7 @@ mod tests {
         OpenWriteRequestProto, SyncWriteRequestProto, WriteHandleProto, WriteTargetProto,
     };
     use beryl_types::fs::{Extent, FileAttrs, FsErrorCode, Inode, InodeId};
-    use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, MountId, WorkerId};
+    use beryl_types::ids::{BlockId, BlockIndex, MountId, WorkerId};
     use beryl_types::layout::FileLayout;
     use beryl_types::{ClientId, GroupName, RaftLogId, WorkerRunId};
     use std::sync::Arc;
@@ -874,6 +872,21 @@ mod tests {
     fn publish_mount(table: &MountTable, entry: MountEntry) -> MountEntry {
         table.upsert(entry.clone()).expect("publish mount");
         entry
+    }
+
+    fn set_test_inode_allocator_after_current_max(storage: &RocksDBStorage) {
+        let max_inode_id = storage
+            .max_inode_id()
+            .expect("read maximum inode ID")
+            .expect("test namespace must contain an inode");
+        let next_inode_id = max_inode_id
+            .as_raw()
+            .checked_add(1)
+            .map(InodeId::new)
+            .expect("test inode ID must have a successor");
+        storage
+            .set_next_inode_id(next_inode_id)
+            .expect("initialize test inode allocator");
     }
 
     fn watermark_proto(group_name: &str, state_id: RaftLogId) -> GroupStateWatermarkProto {
@@ -1011,6 +1024,7 @@ mod tests {
         storage
             .put_inode(&Inode::new_dir(root_inode_id, root_attrs, mount_entry.mount_id))
             .expect("put root inode");
+        set_test_inode_allocator_after_current_max(&storage);
         storage.put_mount(&mount_entry).expect("put authoritative mount");
 
         let state_store: Arc<dyn crate::state::StateStore> = Arc::new(TestStateStore::new());
@@ -1098,6 +1112,7 @@ mod tests {
         storage
             .put_inode(&Inode::new_dir(root_inode_id, root_attrs, mount_entry.mount_id))
             .expect("put root inode");
+        set_test_inode_allocator_after_current_max(&storage);
         storage.put_mount(&mount_entry).expect("put authoritative mount");
 
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
@@ -1245,10 +1260,7 @@ mod tests {
             );
             let block_id = target.block_id.as_ref().expect("target block id");
             by_worker.entry(worker_id).or_default().push((
-                BlockId::new(
-                    DataHandleId::new(block_id.data_handle_id),
-                    BlockIndex::new(block_id.block_index),
-                ),
+                BlockId::new(InodeId::new(block_id.inode_id), BlockIndex::new(block_id.block_index)),
                 target.block_stamp,
             ));
         }
@@ -1327,7 +1339,7 @@ mod tests {
             env,
             reported_worker_id,
             BlockId::new(
-                DataHandleId::new(reported_block_id.data_handle_id),
+                InodeId::new(reported_block_id.inode_id),
                 BlockIndex::new(reported_block_id.block_index),
             ),
             target.block_stamp,
@@ -1371,13 +1383,9 @@ mod tests {
         let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
         let file_inode_id = InodeId::new(5001);
         env.storage
-            .put_inode(&Inode::new_file(
-                file_inode_id,
-                FileAttrs::new(),
-                env.mount_id,
-                DataHandleId::new(5001),
-            ))
+            .put_inode(&Inode::new_file(file_inode_id, FileAttrs::new(), env.mount_id))
             .expect("put file inode");
+        set_test_inode_allocator_after_current_max(&env.storage);
         env.storage
             .put_dentry(env.root_inode_id, "file", file_inode_id)
             .expect("put file dentry");
@@ -1409,6 +1417,7 @@ mod tests {
         env.storage
             .put_inode(&Inode::new_dir(inode_id, FileAttrs::new(), env.mount_id))
             .expect("put directory inode");
+        set_test_inode_allocator_after_current_max(&env.storage);
         env.storage
             .put_dentry(parent_inode_id, name, inode_id)
             .expect("put directory dentry");
@@ -1419,11 +1428,10 @@ mod tests {
         parent_inode_id: InodeId,
         name: &str,
         inode_id: InodeId,
-        data_handle_id: DataHandleId,
         block_id: BlockId,
         len: u64,
     ) {
-        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), env.mount_id, data_handle_id);
+        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), env.mount_id);
         inode.attrs.size = len;
         if let beryl_types::fs::InodeData::File {
             extents,
@@ -1445,15 +1453,13 @@ mod tests {
             *next_block_index = u64::from(block_id.index.as_raw()) + 1;
         }
         env.storage.put_inode(&inode).expect("put extent file inode");
+        set_test_inode_allocator_after_current_max(&env.storage);
         env.storage
             .put_dentry(parent_inode_id, name, inode_id)
             .expect("put extent file dentry");
         env.storage
             .put_layout(inode_id, FileLayout::new(4096, 4096, 1))
             .expect("put extent file layout");
-        env.storage
-            .put_data_handle_owner(data_handle_id, inode_id)
-            .expect("put extent file owner");
     }
 
     #[tokio::test]
@@ -1627,12 +1633,7 @@ mod tests {
             let env = build_env_with_nonleader_raft("/mnt/test", DataIoPolicy::Forbid).await;
             let file_inode_id = InodeId::new(2001);
             env.storage
-                .put_inode(&Inode::new_file(
-                    file_inode_id,
-                    FileAttrs::new(),
-                    env.mount_id,
-                    DataHandleId::new(2001),
-                ))
+                .put_inode(&Inode::new_file(file_inode_id, FileAttrs::new(), env.mount_id))
                 .expect("put test file inode");
             env.storage
                 .put_dentry(env.root_inode_id, "file", file_inode_id)
@@ -1666,12 +1667,12 @@ mod tests {
         let (write_handle, committed, expected_content_revision, write_mode) =
             open_write_session_with_committed_block(&env, "/mnt/test/sync-validation", 40).await;
 
-        let missing_data_handle = FileSystemServiceProto::sync_write(
+        let missing_inode_id = FileSystemServiceProto::sync_write(
             &env.service,
             Request::new(SyncWriteRequestProto {
                 header: header(40),
                 write_handle: Some(WriteHandleProto {
-                    data_handle_id: None,
+                    inode_id: 0,
                     write_lease_epoch: write_handle.write_lease_epoch,
                 }),
                 committed_blocks: vec![committed],
@@ -1684,12 +1685,12 @@ mod tests {
         .await
         .expect("transport status must remain OK")
         .into_inner();
-        let err = header_error(missing_data_handle.header);
+        let err = header_error(missing_inode_id.header);
         assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
-        assert!(err.message.contains("data_handle_id"));
+        assert!(err.message.contains("inode_id"));
 
         let mut mismatched = committed;
-        mismatched.block_id.as_mut().expect("block id").data_handle_id += 1;
+        mismatched.block_id.as_mut().expect("block id").inode_id += 1;
         let mismatch = FileSystemServiceProto::sync_write(
             &env.service,
             Request::new(SyncWriteRequestProto {
@@ -1707,7 +1708,7 @@ mod tests {
         .into_inner();
         let err = header_error(mismatch.header);
         assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
-        assert!(err.message.contains("committed block data_handle_id"));
+        assert!(err.message.contains("committed block inode_id"));
     }
 
     #[tokio::test]
@@ -1738,7 +1739,7 @@ mod tests {
         .into_inner();
         assert_success_header(create.header);
         let zero_epoch_handle = WriteHandleProto {
-            data_handle_id: create.data_handle_id,
+            inode_id: create.inode_id,
             write_lease_epoch: 0,
         };
 
@@ -1809,8 +1810,8 @@ mod tests {
         assert_success_header(response.header);
         assert_eq!(response.synced_size, 128);
         assert!(response.content_revision.is_some());
-        let data_handle_id = DataHandleId::new(write_handle.data_handle_id.as_ref().expect("data handle").value);
-        assert!(env.session_registry.get_session(data_handle_id).is_some());
+        let inode_id = InodeId::new(write_handle.inode_id);
+        assert!(env.session_registry.get_session(inode_id).is_some());
     }
 
     #[tokio::test]
@@ -1839,9 +1840,9 @@ mod tests {
             .into_inner();
         assert_success_header(first.header);
         let first_content_revision = first.content_revision.expect("content revision");
-        let data_handle_id = DataHandleId::new(write_handle.data_handle_id.as_ref().expect("data handle").value);
+        let inode_id = InodeId::new(write_handle.inode_id);
         env.session_registry
-            .remove_session_if_epoch(data_handle_id, write_handle.write_lease_epoch)
+            .remove_session_if_epoch(inode_id, write_handle.write_lease_epoch)
             .expect("remove session to model cleanup or restart");
 
         let replay = FileSystemServiceProto::sync_write(&env.service, Request::new(request.clone()))
@@ -1889,7 +1890,7 @@ mod tests {
             .expect("transport status must remain OK")
             .into_inner();
         assert_success_header(first.header);
-        let data_handle_id = DataHandleId::new(write_handle.data_handle_id.as_ref().expect("data handle").value);
+        let inode_id = InodeId::new(write_handle.inode_id);
 
         let mut foreign_sync = owner_sync;
         foreign_sync.header = header(foreign_client_id);
@@ -1901,7 +1902,7 @@ mod tests {
             rpc_error(&header_error(rejected_sync.header)).kind,
             ErrorKind::Metadata(MetadataErrorKind::SessionInvalid)
         );
-        assert!(env.session_registry.get_session(data_handle_id).is_some());
+        assert!(env.session_registry.get_session(inode_id).is_some());
 
         let foreign_commit = CommitFileRequestProto {
             header: header(foreign_client_id),
@@ -1920,7 +1921,7 @@ mod tests {
             rpc_error(&header_error(rejected_commit.header)).kind,
             ErrorKind::Metadata(MetadataErrorKind::SessionInvalid)
         );
-        assert!(env.session_registry.get_session(data_handle_id).is_some());
+        assert!(env.session_registry.get_session(inode_id).is_some());
 
         let owner_commit = FileSystemServiceProto::commit_file(
             &env.service,
@@ -1938,7 +1939,7 @@ mod tests {
         .expect("transport status must remain OK")
         .into_inner();
         assert_success_header(owner_commit.header);
-        assert!(env.session_registry.get_session(data_handle_id).is_none());
+        assert!(env.session_registry.get_session(inode_id).is_none());
     }
 
     #[tokio::test]
@@ -2085,50 +2086,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_locations_rejects_stale_handle() {
+    async fn get_locations_rejects_zero_inode_id() {
         let env = build_env("/", DataIoPolicy::Allow, None);
-        let file_inode_id = InodeId::new(9101);
-        let current_handle = DataHandleId::new(99101);
-        let stale_handle = DataHandleId::new(99100);
-        let mut attrs = FileAttrs::new();
-        attrs.size = 128;
-        let mut inode = Inode::new_file(file_inode_id, attrs, env.mount_id, current_handle);
-        inode.data = beryl_types::fs::InodeData::File {
-            extents: vec![Extent {
-                file_offset: 0,
-                block_id: BlockId::new(current_handle, BlockIndex::new(0)),
-                block_offset: 0,
-                len: 128,
-                content_revision: Some(4),
-                block_stamp: Some(4),
-            }],
-            content_revision: Some(4),
-            lease_epoch: Some(4),
-            next_block_index: 1,
-        };
-        env.storage.put_inode(&inode).expect("put file inode");
-        env.storage
-            .put_dentry(env.root_inode_id, "file", file_inode_id)
-            .expect("put file dentry");
-        env.storage
-            .put_layout(file_inode_id, FileLayout::new(4096, 4096, 1))
-            .expect("put layout");
-        env.storage
-            .put_data_handle_owner(current_handle, file_inode_id)
-            .expect("put current owner");
-        env.storage
-            .put_data_handle_owner(stale_handle, file_inode_id)
-            .expect("put stale owner");
-
         let response = FileSystemServiceProto::get_block_locations(
             &env.service,
             Request::new(GetBlockLocationsRequestProto {
                 header: header(21),
-                target: Some(get_block_locations_request_proto::Target::DataHandleId(
-                    DataHandleIdProto {
-                        value: stale_handle.as_raw(),
-                    },
-                )),
+                target: Some(get_block_locations_request_proto::Target::InodeId(0)),
                 range: None,
             }),
         )
@@ -2137,8 +2101,8 @@ mod tests {
         .into_inner();
 
         let err = header_error(response.header);
-        assert_refresh_metadata(&err, ErrorKind::Metadata(MetadataErrorKind::StaleState));
-        assert!(err.message.contains("not current data_handle_id"));
+        assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
+        assert!(err.message.contains("inode_id must be non-zero"));
     }
 
     #[tokio::test]
@@ -2205,7 +2169,8 @@ mod tests {
         .into_inner();
         assert_success_header(create.header);
 
-        let data_handle_id = create.data_handle_id.expect("data handle").value;
+        let inode_id = create.inode_id;
+        assert_ne!(inode_id, 0);
         let open = FileSystemServiceProto::open_write(
             &env.service,
             Request::new(OpenWriteRequestProto {
@@ -2221,14 +2186,9 @@ mod tests {
         let expected_content_revision = open.content_revision;
         let write_mode = OpenWriteModeProto::OpenWriteModeWrite as i32;
         let write_handle = open.write_handle.expect("write handle");
-        let file_inode_id = env
-            .storage
-            .get_inode_by_data_handle(DataHandleId::new(data_handle_id))
-            .unwrap()
-            .expect("created inode owner");
-        let session_data_handle =
-            DataHandleId::new(write_handle.data_handle_id.as_ref().expect("handle data handle").value);
-        assert!(env.session_registry.get_session(session_data_handle).is_some());
+        let file_inode_id = InodeId::new(inode_id);
+        let session_inode_id = InodeId::new(write_handle.inode_id);
+        assert!(env.session_registry.get_session(session_inode_id).is_some());
 
         let target = FileSystemServiceProto::add_block(
             &env.service,
@@ -2250,10 +2210,7 @@ mod tests {
             file_offset: target.file_offset,
             len: target.effective_len,
         }];
-        let typed_block_id = BlockId::new(
-            DataHandleId::new(block_id.data_handle_id),
-            BlockIndex::new(block_id.block_index),
-        );
+        let typed_block_id = BlockId::new(InodeId::new(block_id.inode_id), BlockIndex::new(block_id.block_index));
         let reported_worker_id = WorkerId::new(
             target
                 .worker_endpoints
@@ -2301,16 +2258,14 @@ mod tests {
             other => panic!("expected committed file inode data, got {:?}", other),
         };
         assert_ne!(first_content_revision, 0);
-        assert!(env.session_registry.get_session(session_data_handle).is_none());
+        assert!(env.session_registry.get_session(session_inode_id).is_none());
         assert_eq!(first_content_revision, target.block_stamp);
 
         let locations = FileSystemServiceProto::get_block_locations(
             &env.service,
             Request::new(GetBlockLocationsRequestProto {
                 header: header(33),
-                target: Some(get_block_locations_request_proto::Target::DataHandleId(
-                    DataHandleIdProto { value: data_handle_id },
-                )),
+                target: Some(get_block_locations_request_proto::Target::InodeId(inode_id)),
                 range: Some(beryl_proto::common::ByteRangeProto { offset: 0, len: 128 }),
             }),
         )
@@ -2433,16 +2388,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recursive_delete_detaches_then_reclaims_namespace_layout_and_owner_once() {
+    async fn recursive_delete_detaches_then_reclaims_namespace_and_layout_once() {
         let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
         let parent = InodeId::new(4200);
         let dir = InodeId::new(4201);
         let file = InodeId::new(4202);
-        let data_handle_id = DataHandleId::new(4202);
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+        let inode_id = InodeId::new(4202);
+        let block_id = BlockId::new(inode_id, BlockIndex::new(0));
         put_dir(&env, env.root_inode_id, "parent", parent);
         put_dir(&env, parent, "dir", dir);
-        put_extent_file(&env, dir, "file", file, data_handle_id, block_id, 64);
+        put_extent_file(&env, dir, "file", file, block_id, 64);
         let first = FileSystemServiceProto::delete(
             &env.service,
             Request::new(DeleteRequestProto {
@@ -2460,10 +2415,6 @@ mod tests {
         assert!(env.storage.get_inode(dir).unwrap().is_some());
         assert!(env.storage.get_inode(file).unwrap().is_some());
         assert!(env.storage.get_layout(file).is_ok());
-        assert_eq!(
-            env.storage.get_inode_by_data_handle(data_handle_id).unwrap(),
-            Some(file)
-        );
         assert!(env.storage.get_detached_root(dir).unwrap().is_some());
         assert_eq!(
             env.storage.get_dentry(env.root_inode_id, "parent").unwrap(),
@@ -2485,7 +2436,6 @@ mod tests {
         assert!(env.storage.get_inode(dir).unwrap().is_none());
         assert!(env.storage.get_inode(file).unwrap().is_none());
         assert!(env.storage.get_layout(file).is_err());
-        assert_eq!(env.storage.get_inode_by_data_handle(data_handle_id).unwrap(), None);
     }
 
     #[tokio::test]
@@ -2524,7 +2474,7 @@ mod tests {
         .expect("transport status must remain OK")
         .into_inner();
         assert_success_header(create.header);
-        let data_handle_id = DataHandleId::new(create.data_handle_id.expect("data handle").value);
+        let inode_id = InodeId::new(create.inode_id);
         let open = FileSystemServiceProto::open_write(
             &env.service,
             Request::new(OpenWriteRequestProto {
@@ -2538,14 +2488,9 @@ mod tests {
         .into_inner();
         assert_success_header(open.header);
         let write_handle = open.write_handle.expect("write handle");
-        let file_inode_id = env
-            .storage
-            .get_inode_by_data_handle(data_handle_id)
-            .unwrap()
-            .expect("created inode owner");
-        let session_data_handle =
-            DataHandleId::new(write_handle.data_handle_id.as_ref().expect("handle data handle").value);
-        assert!(env.session_registry.get_session(session_data_handle).is_some());
+        let file_inode_id = inode_id;
+        let session_inode_id = InodeId::new(write_handle.inode_id);
+        assert!(env.session_registry.get_session(session_inode_id).is_some());
 
         let response = FileSystemServiceProto::delete(
             &env.service,
@@ -2568,11 +2513,7 @@ mod tests {
         assert!(env.storage.get_inode(empty_subdir).unwrap().is_some());
         assert!(env.storage.get_inode(file_inode_id).unwrap().is_some());
         assert!(env.storage.get_layout(file_inode_id).is_ok());
-        assert_eq!(
-            env.storage.get_inode_by_data_handle(data_handle_id).unwrap(),
-            Some(file_inode_id)
-        );
-        assert!(env.session_registry.get_session(session_data_handle).is_some());
+        assert!(env.session_registry.get_session(session_inode_id).is_some());
     }
 
     #[tokio::test]
@@ -2678,12 +2619,7 @@ mod tests {
             .put_dentry(env.root_inode_id, "dir", dir_inode_id)
             .expect("put directory dentry");
         env.storage
-            .put_inode(&Inode::new_file(
-                child_inode_id,
-                FileAttrs::new(),
-                env.mount_id,
-                DataHandleId::new(7002),
-            ))
+            .put_inode(&Inode::new_file(child_inode_id, FileAttrs::new(), env.mount_id))
             .expect("put child inode");
         env.storage
             .put_dentry(dir_inode_id, "child", child_inode_id)

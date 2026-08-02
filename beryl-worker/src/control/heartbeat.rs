@@ -382,9 +382,9 @@ fn classify_heartbeat_response(
         .map(|command| {
             let block_id = required_block_id(command.block_id, "HeartbeatResponse.cleanup_commands.block_id")
                 .map_err(HeartbeatError::Fatal)?;
-            if block_id.data_handle_id.as_raw() == 0 {
+            if block_id.inode_id.as_raw() == 0 {
                 return Err(HeartbeatError::Fatal(
-                    "HeartbeatResponse.cleanup_commands.block_id.data_handle_id must be non-zero".to_string(),
+                    "HeartbeatResponse.cleanup_commands.block_id.inode_id must be non-zero".to_string(),
                 ));
             }
             if command.expected_block_stamp == 0 {

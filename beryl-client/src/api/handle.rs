@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
-use beryl_types::DataHandleId;
+use beryl_types::InodeId;
 use bytes::{Bytes, BytesMut};
 use tokio::sync::Mutex;
 
@@ -57,7 +57,7 @@ impl FileReader {
             return Ok(Bytes::new());
         };
         let content_revision = self.handle.content_revision();
-        let data_handle_id = self.handle.data_handle_id();
+        let inode_id = self.handle.inode_id();
         let operation = OperationContext::new_named(
             self.runtime.executor.client_id(),
             self.runtime.executor.client_name(),
@@ -69,20 +69,16 @@ impl FileReader {
             let layout = self
                 .runtime
                 .executor
-                .read_layout_for_data_handle(
+                .read_layout_for_inode(
                     self.handle.path(),
-                    data_handle_id,
+                    inode_id,
                     requested_range.file_offset,
                     requested_range.len,
                     operation.deadline().clone(),
                 )
                 .await?;
-            let (group_name, block_reads) = planner::plan_block_reads_from_layout(
-                data_handle_id,
-                Some(content_revision),
-                requested_range,
-                &layout,
-            )?;
+            let (group_name, block_reads) =
+                planner::plan_block_reads_from_layout(inode_id, Some(content_revision), requested_range, &layout)?;
             let ctx = self.runtime.data_context(&operation, attempt_index as u32);
             match self
                 .runtime
@@ -544,7 +540,7 @@ fn validate_sync_write_size(synced_size: u64, target_size: u64) -> ClientResult<
 #[derive(Clone)]
 pub(crate) struct ReadHandle {
     path: String,
-    data_handle_id: DataHandleId,
+    inode_id: InodeId,
     content_revision: u64,
     file_size: u64,
 }
@@ -558,17 +554,17 @@ impl ReadHandle {
         self.file_size
     }
 
-    pub(crate) fn new(path: String, data_handle_id: DataHandleId, content_revision: u64, file_size: u64) -> Self {
+    pub(crate) fn new(path: String, inode_id: InodeId, content_revision: u64, file_size: u64) -> Self {
         Self {
             path,
-            data_handle_id,
+            inode_id,
             content_revision,
             file_size,
         }
     }
 
-    pub(crate) fn data_handle_id(&self) -> DataHandleId {
-        self.data_handle_id
+    pub(crate) fn inode_id(&self) -> InodeId {
+        self.inode_id
     }
 
     pub(crate) fn content_revision(&self) -> u64 {

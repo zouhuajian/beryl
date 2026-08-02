@@ -29,7 +29,7 @@ message OpenReadStreamRequestProto {
   common.BlockIdProto block_id = 2;
 
   // Block-local byte range to read. The offset is relative to block_id,
-  // not relative to the file/data handle.
+  // not relative to the file.
   common.ByteRangeProto byte_range = 3;
 
   // Metadata-issued logical block stamp for direct read validation.

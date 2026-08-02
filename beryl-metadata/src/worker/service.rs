@@ -299,7 +299,7 @@ impl MetadataWorkerServiceImpl {
             .block_id
             .ok_or_else(|| MetadataError::InvalidArgument("block report entry missing block_id".to_string()))?;
         let block_id = BlockId::try_from(block_id_proto)
-            .unwrap_or_else(|()| unreachable!("BlockIdProto conversion is infallible"));
+            .unwrap_or_else(|error| panic!("validated BlockIdProto must be valid: {error}"));
         let block_state = match block.block_state() {
             BlockReportBlockStateProto::BlockReportBlockStateReady => BlockReportBlockState::Ready,
             BlockReportBlockStateProto::BlockReportBlockStatePartial => BlockReportBlockState::Partial,
@@ -2675,7 +2675,7 @@ mod tests {
         .await
         .expect("initial heartbeat succeeds");
 
-        let block_id = BlockId::new(beryl_types::DataHandleId::new(700), beryl_types::BlockIndex::new(0));
+        let block_id = BlockId::new(beryl_types::InodeId::new(700), beryl_types::BlockIndex::new(0));
         let block_stamp = 991;
         worker_manager
             .receive_full_block_report(
