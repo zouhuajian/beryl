@@ -32,12 +32,13 @@ pub(super) struct GetAttrOutput {
     pub(super) attrs: FileAttrs,
 }
 
+/// Internal request for one bounded directory-authority scan.
 #[derive(Clone, Debug)]
 struct ReadDirInput {
     ctx: RequestContext,
     parent_inode_id: InodeId,
     cursor_key: Option<Vec<u8>>,
-    max_entries: Option<usize>,
+    max_entries: usize,
     freshness: Freshness,
 }
 
@@ -84,11 +85,13 @@ pub(crate) struct GetStatusOutput {
     pub(crate) attrs: FileAttrs,
 }
 
+/// Validated filesystem arguments for one public directory-listing page.
 pub(crate) struct ListStatusArgs {
     pub(crate) path: String,
     pub(crate) recursive: bool,
     pub(crate) cursor_key: Option<Vec<u8>>,
-    pub(crate) max_entries: Option<usize>,
+    /// Positive server-resolved page size; wire defaults and caps are already applied.
+    pub(crate) max_entries: usize,
     pub(crate) freshness: Freshness,
 }
 
@@ -161,6 +164,7 @@ impl MetadataFileSystem {
         })
     }
 
+    /// Resolves a directory path and returns one bounded weakly consistent page.
     pub(crate) async fn list_status(&self, ctx: &RequestContext, args: ListStatusArgs) -> FsResult<ListStatusOutput> {
         if let Err(failure) = self.admission.check_meta_read(ctx).await {
             return self.failure_from_admission(failure);
@@ -522,6 +526,7 @@ impl MetadataFileSystem {
         result
     }
 
+    /// Reads a bounded dentry page and joins each dentry with its inode authority.
     async fn read_dir_resolved(&self, req: ReadDirInput) -> FsResult<ReadDirOutput> {
         let started = Instant::now();
         let result = async {
@@ -1435,7 +1440,7 @@ mod tests {
                 ctx: request_context(),
                 parent_inode_id,
                 cursor_key: None,
-                max_entries: None,
+                max_entries: 100,
                 freshness: Freshness {
                     mount_epoch: Some(8),
                     route_epoch: None,
@@ -1477,7 +1482,7 @@ mod tests {
                 ctx: request_context(),
                 parent_inode_id,
                 cursor_key: None,
-                max_entries: None,
+                max_entries: 100,
                 freshness: Freshness::default(),
             })
             .await
@@ -1526,7 +1531,7 @@ mod tests {
                 ctx: request_context(),
                 parent_inode_id,
                 cursor_key: None,
-                max_entries: None,
+                max_entries: 100,
                 freshness: Freshness::default(),
             })
             .await
@@ -1563,7 +1568,7 @@ mod tests {
                 ctx: request_context(),
                 parent_inode_id,
                 cursor_key: None,
-                max_entries: None,
+                max_entries: 100,
                 freshness: Freshness::default(),
             })
             .await

@@ -17,6 +17,7 @@ beryl-types = { path = "../beryl-types" }
 beryl-worker = { path = "../beryl-worker" }
 
 bytes = { workspace = true }
+futures = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }

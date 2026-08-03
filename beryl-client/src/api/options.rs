@@ -73,9 +73,13 @@ pub struct ListOptions {
     /// Whether the listing should recursively include descendants.
     pub recursive: bool,
 
-    /// Opaque cursor returned by a previous listing page.
+    /// Opaque seek cursor returned by a previous page for the same directory.
+    /// It does not identify a server-side iterator or snapshot.
     pub cursor: Option<Vec<u8>>,
 
-    /// Maximum number of entries to return. `None` lets metadata choose.
+    /// Maximum entries in one page. `None` selects the Metadata server default.
+    ///
+    /// A value above the server maximum is rejected instead of being silently
+    /// truncated.
     pub limit: Option<u32>,
 }

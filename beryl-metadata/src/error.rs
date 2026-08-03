@@ -64,6 +64,10 @@ pub enum MetadataError {
     #[error("resource temporarily unavailable: {0}")]
     Again(String),
 
+    /// A request exceeds a stable Metadata resource boundary.
+    #[error("resource exhausted: {0}")]
+    ResourceExhausted(String),
+
     /// Lease fenced: expected epoch >= {expected}, got {got}.
     #[error("lease fenced: expected epoch >= {expected}, got {got}")]
     LeaseFenced { expected: u64, got: u64 },
@@ -175,6 +179,10 @@ fn map_shared_rpc_error(err: MetadataError) -> Result<RpcErrorDetail, MetadataEr
             Some(1000),
             format!("service unavailable: {}", msg),
         )),
+        MetadataError::ResourceExhausted(msg) => Ok(RpcErrorDetail::fail(
+            ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted),
+            format!("resource exhausted: {}", msg),
+        )),
         other => Err(other),
     }
 }
@@ -241,6 +249,7 @@ fn map_rpc_application_error(err: MetadataError) -> RpcErrorDetail {
         | MetadataError::StaleState(_)
         | MetadataError::FullReportRequired(_)
         | MetadataError::LeaseFenced { .. }
+        | MetadataError::ResourceExhausted(_)
         | MetadataError::ServiceUnavailable(_) => unreachable!("shared metadata errors must be mapped earlier"),
     }
 }
@@ -267,6 +276,7 @@ fn map_fs_fatal_rpc_error(err: MetadataError) -> RpcErrorDetail {
         | MetadataError::StaleState(_)
         | MetadataError::FullReportRequired(_)
         | MetadataError::LeaseFenced { .. }
+        | MetadataError::ResourceExhausted(_)
         | MetadataError::ServiceUnavailable(_) => unreachable!("shared metadata errors must be mapped earlier"),
     }
 }
@@ -394,6 +404,7 @@ mod tests {
             MetadataError::RoutingStale("routing stale".to_string()),
             MetadataError::StaleState("stale state".to_string()),
             MetadataError::LeaseFenced { expected: 13, got: 12 },
+            MetadataError::ResourceExhausted("request exceeds limit".to_string()),
             MetadataError::ServiceUnavailable("node warming up".to_string()),
         ];
 
@@ -404,5 +415,13 @@ mod tests {
             assert_eq!(rpc.recovery, fs.recovery);
             assert_eq!(rpc.message, fs.message);
         }
+    }
+
+    #[test]
+    fn resource_exhausted_is_a_non_retryable_metadata_failure() {
+        let error = to_fs_error_detail(MetadataError::ResourceExhausted("request exceeds limit".to_string()));
+
+        assert_eq!(error.kind, ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted));
+        assert_eq!(error.recovery, RecoveryAction::Fail);
     }
 }

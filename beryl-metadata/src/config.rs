@@ -24,6 +24,8 @@ const METADATA_GROUP_NAME: &str = "metadata.group.name";
 const METADATA_STORAGE_DIR: &str = "metadata.storage.dir";
 const METADATA_RAFT_MODE: &str = "metadata.raft.mode";
 const METADATA_RAFT_NODE_ID: &str = "metadata.raft.node_id";
+const METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE: &str = "metadata.list_status.default_page_size";
+const METADATA_LIST_STATUS_MAX_PAGE_SIZE: &str = "metadata.list_status.max_page_size";
 const METADATA_CLEANUP_SCAN_INTERVAL_MS: &str = "metadata.cleanup.scan_interval_ms";
 const METADATA_CLEANUP_RECLAIM_GRACE_MS: &str = "metadata.cleanup.reclaim_grace_ms";
 const METADATA_CLEANUP_MAX_REPLICAS_PER_SCAN: &str = "metadata.cleanup.max_replicas_per_scan";
@@ -53,6 +55,9 @@ const METADATA_BOOTSTRAP_READY_TIMEOUT_MS: &str = "metadata.bootstrap.ready.time
 const METADATA_BOOTSTRAP_READY_WARN_AFTER_MS: &str = "metadata.bootstrap.ready.warn_after_ms";
 const METADATA_BOOTSTRAP_READY_FAIL_FAST: &str = "metadata.bootstrap.ready.fail_fast";
 
+const DEFAULT_LIST_STATUS_PAGE_SIZE: u32 = 1_000;
+pub(crate) const MAX_LIST_STATUS_PAGE_SIZE: u32 = 10_000;
+
 /// Metadata service configuration.
 #[derive(Clone, Debug)]
 pub struct MetadataConfig {
@@ -66,6 +71,8 @@ pub struct MetadataConfig {
     pub raft: RaftConfig,
     /// Metadata authority configuration.
     pub authority: MetadataAuthorityConfig,
+    /// Bounded public directory-listing policy.
+    pub list_status: ListStatusConfig,
     /// Block cleanup detection and dispatch configuration.
     pub cleanup: CleanupConfig,
     /// Bounded detached namespace reclamation configuration.
@@ -82,6 +89,18 @@ pub struct MetadataConfig {
 #[derive(Clone, Debug)]
 pub struct BootstrapConfig {
     pub root_readiness: RootReadinessConfig,
+}
+
+/// Server-owned page-size policy for one public `ListStatus` response.
+///
+/// `default_page_size` resolves the wire value zero. `max_page_size` may make
+/// one deployment stricter, but it cannot exceed the compiled safety ceiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListStatusConfig {
+    /// Page size used when the request leaves `limit` at zero.
+    default_page_size: u32,
+    /// Largest explicit page size accepted by this Metadata process.
+    max_page_size: u32,
 }
 
 /// Block cleanup detection and dispatch configuration.
@@ -223,6 +242,60 @@ impl Default for CleanupConfig {
     }
 }
 
+impl Default for ListStatusConfig {
+    fn default() -> Self {
+        Self {
+            default_page_size: DEFAULT_LIST_STATUS_PAGE_SIZE,
+            max_page_size: MAX_LIST_STATUS_PAGE_SIZE,
+        }
+    }
+}
+
+impl ListStatusConfig {
+    /// Builds a valid directory-listing policy without permitting the compiled
+    /// safety ceiling to be bypassed by programmatic configuration.
+    pub fn try_new(default_page_size: u32, max_page_size: u32) -> Result<Self, CommonError> {
+        if default_page_size == 0 {
+            return Err(invalid_config(
+                METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE,
+                "must be greater than zero",
+            ));
+        }
+        if max_page_size == 0 {
+            return Err(invalid_config(
+                METADATA_LIST_STATUS_MAX_PAGE_SIZE,
+                "must be greater than zero",
+            ));
+        }
+        if default_page_size > max_page_size {
+            return Err(invalid_config(
+                METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE,
+                "must be less than or equal to metadata.list_status.max_page_size",
+            ));
+        }
+        if max_page_size > MAX_LIST_STATUS_PAGE_SIZE {
+            return Err(invalid_config(
+                METADATA_LIST_STATUS_MAX_PAGE_SIZE,
+                "exceeds the compiled ListStatus page-size ceiling",
+            ));
+        }
+        Ok(Self {
+            default_page_size,
+            max_page_size,
+        })
+    }
+
+    /// Returns the page size used for a wire `limit` of zero.
+    pub fn default_page_size(self) -> u32 {
+        self.default_page_size
+    }
+
+    /// Returns the deployment maximum, which never exceeds the compiled ceiling.
+    pub fn max_page_size(self) -> u32 {
+        self.max_page_size
+    }
+}
+
 impl Default for DetachedRootReclamationConfig {
     fn default() -> Self {
         Self {
@@ -268,6 +341,15 @@ impl MetadataConfig {
         let authority = MetadataAuthorityConfig {
             group_name: parse_group_name(METADATA_GROUP_NAME, group_name_raw)?,
         };
+
+        let list_status = ListStatusConfig::try_new(
+            get_positive_u32_or(
+                flat,
+                METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE,
+                DEFAULT_LIST_STATUS_PAGE_SIZE,
+            )?,
+            get_positive_u32_or(flat, METADATA_LIST_STATUS_MAX_PAGE_SIZE, MAX_LIST_STATUS_PAGE_SIZE)?,
+        )?;
 
         let cleanup = CleanupConfig {
             scan_interval_ms: get_positive_u64_or(flat, METADATA_CLEANUP_SCAN_INTERVAL_MS, 30_000)?,
@@ -372,6 +454,7 @@ impl MetadataConfig {
             storage_dir,
             raft,
             authority,
+            list_status,
             cleanup,
             detached_root_reclamation,
             worker,
@@ -521,6 +604,7 @@ mod tests {
                 storage_dir: PathBuf::from("data/metadata"),
                 raft: RaftConfig::default(),
                 authority: MetadataAuthorityConfig::default(),
+                list_status: ListStatusConfig::default(),
                 cleanup: CleanupConfig::default(),
                 detached_root_reclamation: DetachedRootReclamationConfig::default(),
                 worker: WorkerConfig::default(),
@@ -633,6 +717,7 @@ mod tests {
         let config = MetadataConfig::from_server_config(ServerConfig::from_flat(test_flat())).unwrap();
 
         assert_eq!(config.raft.node_id, 1);
+        assert_eq!(config.list_status, ListStatusConfig::default());
         assert_eq!(config.cleanup.scan_interval_ms, 30_000);
         assert_eq!(config.cleanup.reclaim_grace_ms, 300_000);
         assert_eq!(config.cleanup.max_replicas_per_scan, 10_000);
@@ -668,6 +753,31 @@ mod tests {
     }
 
     #[test]
+    fn list_status_page_sizes_accept_a_stricter_server_policy() {
+        let mut flat = test_flat();
+        flat.set(METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE, 200_i64);
+        flat.set(METADATA_LIST_STATUS_MAX_PAGE_SIZE, 500_i64);
+
+        let config = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap();
+
+        assert_eq!(config.list_status, ListStatusConfig::try_new(200, 500).unwrap());
+    }
+
+    #[test]
+    fn list_status_programmatic_config_rejects_invalid_bounds() {
+        for (default_page_size, max_page_size, expected_key) in [
+            (0, 1, METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE),
+            (1, 0, METADATA_LIST_STATUS_MAX_PAGE_SIZE),
+            (2, 1, METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE),
+            (1, MAX_LIST_STATUS_PAGE_SIZE + 1, METADATA_LIST_STATUS_MAX_PAGE_SIZE),
+        ] {
+            let error = ListStatusConfig::try_new(default_page_size, max_page_size)
+                .expect_err("invalid programmatic ListStatus policy must fail");
+            assert!(error.message.contains(expected_key));
+        }
+    }
+
+    #[test]
     fn cleanup_dispatch_can_be_explicitly_disabled() {
         let mut flat = test_flat();
         flat.set(METADATA_CLEANUP_DISPATCH_ENABLED, false);
@@ -693,6 +803,8 @@ mod tests {
 
         let positive_keys = [
             METADATA_RAFT_NODE_ID,
+            METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE,
+            METADATA_LIST_STATUS_MAX_PAGE_SIZE,
             METADATA_CLEANUP_SCAN_INTERVAL_MS,
             METADATA_CLEANUP_RECLAIM_GRACE_MS,
             METADATA_CLEANUP_MAX_REPLICAS_PER_SCAN,
@@ -733,6 +845,20 @@ mod tests {
         flat.set(METADATA_REPAIR_MAX_ATTEMPTS, i64::from(u32::MAX) + 1);
         let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
         assert!(err.message.contains(METADATA_REPAIR_MAX_ATTEMPTS));
+
+        let mut flat = test_flat();
+        flat.set(METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE, 101_i64);
+        flat.set(METADATA_LIST_STATUS_MAX_PAGE_SIZE, 100_i64);
+        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
+        assert!(err.message.contains(METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE));
+
+        let mut flat = test_flat();
+        flat.set(
+            METADATA_LIST_STATUS_MAX_PAGE_SIZE,
+            i64::from(MAX_LIST_STATUS_PAGE_SIZE) + 1,
+        );
+        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
+        assert!(err.message.contains(METADATA_LIST_STATUS_MAX_PAGE_SIZE));
 
         let mut flat = test_flat();
         flat.set(METADATA_CLEANUP_RETRY_INITIAL_BACKOFF_MS, 100_i64);

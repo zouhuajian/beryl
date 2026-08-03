@@ -346,6 +346,7 @@ pub(crate) fn metadata_error_kind(error: &MetadataError) -> &'static str {
         MetadataError::Busy(_) => "busy",
         MetadataError::ActiveWorkerConflict(_) => "active_worker_conflict",
         MetadataError::Again(_) => "again",
+        MetadataError::ResourceExhausted(_) => "resource_exhausted",
         MetadataError::LeaseFenced { .. } => "lease_fenced",
         MetadataError::LeaderChanged(_) => "not_leader",
         MetadataError::EpochMismatch { .. } => "epoch_mismatch",

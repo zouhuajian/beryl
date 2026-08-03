@@ -17,6 +17,7 @@ use super::wire::{
 };
 use super::MetadataFileSystem;
 use super::MsyncHandler;
+use crate::config::{ListStatusConfig, MAX_LIST_STATUS_PAGE_SIZE};
 use crate::error::{to_fs_error_detail, MetadataError};
 use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use beryl_proto::metadata::*;
@@ -26,6 +27,7 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::instrument;
 
+/// Attaches the common response envelope without duplicating field access in handlers.
 trait HeaderResponse {
     fn with_header(self, header: beryl_proto::common::ResponseHeaderProto) -> Self;
 }
@@ -61,10 +63,11 @@ impl_header_response!(
     MsyncResponseProto,
 );
 
-/// FileSystemServiceProto implementation.
+/// Unary gRPC adapter that validates wire requests before entering metadata authority.
 pub struct MetadataFileSystemServiceImpl {
     filesystem: Arc<MetadataFileSystem>,
     msync: Option<MsyncHandler>,
+    list_status: ListStatusConfig,
 }
 
 macro_rules! response_with_header {
@@ -91,8 +94,40 @@ macro_rules! request_context_or_error {
 }
 
 impl MetadataFileSystemServiceImpl {
-    pub(crate) fn new(filesystem: Arc<MetadataFileSystem>, msync: Option<MsyncHandler>) -> Self {
-        Self { filesystem, msync }
+    /// Builds the wire adapter with immutable request-boundary policy.
+    pub(crate) fn new(
+        filesystem: Arc<MetadataFileSystem>,
+        msync: Option<MsyncHandler>,
+        list_status: ListStatusConfig,
+    ) -> Self {
+        Self {
+            filesystem,
+            msync,
+            list_status,
+        }
+    }
+
+    /// Resolves the proto3 zero sentinel and rejects explicit oversized pages.
+    ///
+    /// Every successful result is positive and no larger than the configured
+    /// server maximum, so lower layers never need an unbounded representation.
+    fn list_status_page_size(&self, requested: u32) -> Result<usize, MetadataError> {
+        let page_size = if requested == 0 {
+            self.list_status.default_page_size()
+        } else if requested > MAX_LIST_STATUS_PAGE_SIZE {
+            return Err(MetadataError::ResourceExhausted(format!(
+                "requested ListStatus limit {requested} exceeds compiled maximum {MAX_LIST_STATUS_PAGE_SIZE}"
+            )));
+        } else if requested <= self.list_status.max_page_size() {
+            requested
+        } else {
+            return Err(MetadataError::ResourceExhausted(format!(
+                "requested ListStatus limit {} exceeds server maximum {}",
+                requested,
+                self.list_status.max_page_size()
+            )));
+        };
+        Ok(page_size as usize)
     }
 
     fn header_from_conversion_error(
@@ -292,6 +327,15 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<ListStatusResponseProto>, Status> {
         let req = request.into_inner();
         let req_ctx = request_context_or_error!(req, ListStatusResponseProto);
+        let max_entries = match self.list_status_page_size(req.limit) {
+            Ok(max_entries) => max_entries,
+            Err(err) => {
+                return error_response!(
+                    ListStatusResponseProto,
+                    Self::header_from_conversion_error(&req.header, err)
+                );
+            }
+        };
         match self
             .filesystem
             .list_status(
@@ -300,7 +344,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     path: req.path,
                     recursive: req.recursive,
                     cursor_key: (!req.cursor.is_empty()).then_some(req.cursor),
-                    max_entries: (req.limit != 0).then_some(req.limit as usize),
+                    max_entries,
                     freshness: Self::freshness_from_header(&req.header),
                 },
             )
@@ -312,19 +356,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 let entries = payload
                     .entries
                     .into_iter()
-                    .map(|entry| beryl_proto::metadata::DirEntryProto {
+                    .map(|entry| DirEntryProto {
                         name: entry.name,
                         kind: match entry.kind {
-                            Some(beryl_types::fs::InodeKind::File) => {
-                                beryl_proto::metadata::InodeKindProto::InodeKindFile as i32
-                            }
-                            Some(beryl_types::fs::InodeKind::Dir) => {
-                                beryl_proto::metadata::InodeKindProto::InodeKindDir as i32
-                            }
-                            Some(beryl_types::fs::InodeKind::Symlink) => {
-                                beryl_proto::metadata::InodeKindProto::InodeKindSymlink as i32
-                            }
-                            None => beryl_proto::metadata::InodeKindProto::InodeKindUnspecified as i32,
+                            Some(beryl_types::fs::InodeKind::File) => InodeKindProto::InodeKindFile as i32,
+                            Some(beryl_types::fs::InodeKind::Dir) => InodeKindProto::InodeKindDir as i32,
+                            Some(beryl_types::fs::InodeKind::Symlink) => InodeKindProto::InodeKindSymlink as i32,
+                            None => InodeKindProto::InodeKindUnspecified as i32,
                         },
                         attrs: entry.attrs.as_ref().map(file_attrs_to_proto),
                     })
@@ -778,7 +816,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::RaftConfig;
+    use crate::config::{ListStatusConfig, RaftConfig, MAX_LIST_STATUS_PAGE_SIZE};
     use crate::mount::{DataIoPolicy, MountEntry, MountKind, MountTable, ROOT_INODE_ID};
     use crate::raft::{
         AppRaftNode, AppRaftStateMachine, Command, RocksDBStorage, MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES,
@@ -990,6 +1028,20 @@ mod tests {
         data_io_policy: DataIoPolicy,
         readiness_gate: Option<Arc<RootReadinessGate>>,
     ) -> PathTestEnv {
+        build_env_with_list_status_config(
+            mount_prefix,
+            data_io_policy,
+            readiness_gate,
+            ListStatusConfig::default(),
+        )
+    }
+
+    fn build_env_with_list_status_config(
+        mount_prefix: &str,
+        data_io_policy: DataIoPolicy,
+        readiness_gate: Option<Arc<RootReadinessGate>>,
+        list_status: ListStatusConfig,
+    ) -> PathTestEnv {
         let temp_dir = TempDir::new().expect("create temp dir");
         let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).expect("open rocksdb"));
         let mount_table = Arc::new(MountTable::new());
@@ -1041,7 +1093,7 @@ mod tests {
             metrics: None,
             readiness_gate,
         }));
-        let service = MetadataFileSystemServiceImpl::new(filesystem, None);
+        let service = MetadataFileSystemServiceImpl::new(filesystem, None, list_status);
 
         PathTestEnv {
             _temp_dir: temp_dir,
@@ -1160,7 +1212,7 @@ mod tests {
             readiness_gate: None,
         }));
         let msync = Some(MsyncHandler::new(Arc::clone(&raft_node), owner_group_name));
-        let service = MetadataFileSystemServiceImpl::new(filesystem, msync);
+        let service = MetadataFileSystemServiceImpl::new(filesystem, msync, ListStatusConfig::default());
 
         PathTestEnv {
             _temp_dir: temp_dir,
@@ -1352,6 +1404,156 @@ mod tests {
         };
 
         (write_handle, committed, expected_content_revision, write_mode)
+    }
+
+    fn put_list_children(env: &PathTestEnv, names: &[&str]) {
+        for (index, name) in names.iter().enumerate() {
+            let inode_id = InodeId::new(10_000 + index as u64);
+            env.storage
+                .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), env.mount_id))
+                .expect("put child inode");
+            env.storage
+                .put_dentry(env.root_inode_id, name, inode_id)
+                .expect("put child dentry");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_status_zero_limit_uses_server_default_and_continues_with_cursor() {
+        let env = build_env_with_list_status_config(
+            "/mnt/test",
+            DataIoPolicy::Allow,
+            None,
+            ListStatusConfig::try_new(2, 3).unwrap(),
+        );
+        put_list_children(&env, &["a", "b", "c"]);
+
+        let first = FileSystemServiceProto::list_status(
+            &env.service,
+            Request::new(ListStatusRequestProto {
+                header: header(707),
+                path: "/mnt/test".to_string(),
+                recursive: false,
+                cursor: Vec::new(),
+                limit: 0,
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert!(!first.eof);
+        assert!(!first.next_cursor.is_empty());
+
+        let second = FileSystemServiceProto::list_status(
+            &env.service,
+            Request::new(ListStatusRequestProto {
+                header: header(707),
+                path: "/mnt/test".to_string(),
+                recursive: false,
+                cursor: first.next_cursor,
+                limit: 0,
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        assert_eq!(
+            second
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c"]
+        );
+        assert!(second.eof);
+        assert!(second.next_cursor.is_empty());
+
+        let maximum = FileSystemServiceProto::list_status(
+            &env.service,
+            Request::new(ListStatusRequestProto {
+                header: header(707),
+                path: "/mnt/test".to_string(),
+                recursive: false,
+                cursor: Vec::new(),
+                limit: 3,
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        assert_eq!(maximum.entries.len(), 3);
+        assert!(maximum.eof);
+        assert!(maximum.next_cursor.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_status_rejects_limit_above_server_maximum_before_path_lookup() {
+        let env = build_env_with_list_status_config(
+            "/mnt/test",
+            DataIoPolicy::Allow,
+            None,
+            ListStatusConfig::try_new(2, 3).unwrap(),
+        );
+
+        let response = FileSystemServiceProto::list_status(
+            &env.service,
+            Request::new(ListStatusRequestProto {
+                header: header(708),
+                path: "/mnt/test/missing".to_string(),
+                recursive: false,
+                cursor: Vec::new(),
+                limit: 4,
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        let error = assert_fail_kind(
+            &header_error(response.header),
+            ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted),
+        );
+
+        assert!(error.message.contains("requested ListStatus limit 4"));
+        assert!(error.message.contains("server maximum 3"));
+        assert!(response.entries.is_empty());
+        assert!(response.next_cursor.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_status_compiled_ceiling_cannot_be_bypassed() {
+        let env =
+            build_env_with_list_status_config("/mnt/test", DataIoPolicy::Allow, None, ListStatusConfig::default());
+
+        let response = FileSystemServiceProto::list_status(
+            &env.service,
+            Request::new(ListStatusRequestProto {
+                header: header(709),
+                path: "/mnt/test".to_string(),
+                recursive: false,
+                cursor: Vec::new(),
+                limit: MAX_LIST_STATUS_PAGE_SIZE + 1,
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        let error = assert_fail_kind(
+            &header_error(response.header),
+            ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted),
+        );
+
+        assert!(error.message.contains("exceeds compiled maximum"));
+        assert!(matches!(error.recovery, beryl_common::error::rpc::RecoveryAction::Fail));
+        assert!(response.entries.is_empty());
+        assert!(response.next_cursor.is_empty());
     }
 
     #[tokio::test]
