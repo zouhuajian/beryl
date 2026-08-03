@@ -478,7 +478,7 @@ pub async fn build_filesystem_service(
 /// Production startup uses this path to share active-write authority with
 /// maintenance cleanup observation.
 async fn build_filesystem_service_with_sessions(
-    _config: &MetadataConfig,
+    config: &MetadataConfig,
     authority: &MetadataAuthority,
     worker_manager: Arc<WorkerManager>,
     session_registry: Arc<crate::session_registry::SessionRegistry>,
@@ -501,7 +501,11 @@ async fn build_filesystem_service_with_sessions(
         authority.group_name.clone(),
     ));
 
-    Ok(MetadataFileSystemServiceImpl::new(filesystem, msync))
+    Ok(MetadataFileSystemServiceImpl::new(
+        filesystem,
+        msync,
+        config.list_status,
+    ))
 }
 
 /// Separates RPC service values from lifecycle handles before entering server code.
@@ -670,7 +674,7 @@ mod tests {
             readiness_gate: None,
         }));
         let msync = Some(MsyncHandler::new(raft_node, group_name));
-        MetadataFileSystemServiceImpl::new(filesystem, msync)
+        MetadataFileSystemServiceImpl::new(filesystem, msync, crate::config::ListStatusConfig::default())
     }
 
     async fn call_msync(service: &MetadataFileSystemServiceImpl, header: RequestHeader) -> MsyncResponseProto {
@@ -703,6 +707,7 @@ mod tests {
             authority: MetadataAuthorityConfig {
                 group_name: GroupName::parse("root").unwrap(),
             },
+            list_status: crate::config::ListStatusConfig::default(),
             cleanup: CleanupConfig::default(),
             detached_root_reclamation: crate::config::DetachedRootReclamationConfig::default(),
             worker: WorkerConfig::default(),

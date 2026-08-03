@@ -4,6 +4,7 @@
 use beryl_client::{ClientResult, CreateOptions, DeleteOptions, InodeKind, ListOptions};
 use beryl_e2e::{data::deterministic_bytes, TestCluster};
 use bytes::Bytes;
+use futures::TryStreamExt;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_client_crud_roundtrip() {
@@ -57,6 +58,9 @@ async fn local_client_crud_roundtrip() {
         .expect("read appended bytes");
     assert_eq!(read.as_ref(), expected.as_slice());
 
+    let subdir = "/e2e/subdir";
+    client.mkdirs(subdir, false).await.expect("create second listing entry");
+
     let listing = client
         .list(dir, ListOptions::default())
         .await
@@ -71,6 +75,62 @@ async fn local_client_crud_roundtrip() {
         file_entry.attrs.as_ref().map(|attrs| attrs.size),
         Some(expected.len() as u64)
     );
+
+    let first_page = client
+        .list(
+            dir,
+            ListOptions {
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("first bounded listing page");
+    assert_eq!(first_page.entries.len(), 1);
+    assert!(!first_page.eof);
+    let second_page = client
+        .list(
+            dir,
+            ListOptions {
+                cursor: first_page.next_cursor.clone(),
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("second bounded listing page");
+    assert_eq!(second_page.entries.len(), 1);
+    assert!(second_page.eof);
+    assert!(second_page.next_cursor.is_none());
+    let mut paged_names = first_page
+        .entries
+        .into_iter()
+        .chain(second_page.entries)
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+    paged_names.sort();
+    assert_eq!(paged_names, vec!["file", "subdir"]);
+
+    let mut streamed_names = client
+        .list_stream(
+            dir,
+            ListOptions {
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .expect("create automatic listing stream")
+        .map_ok(|entry| entry.name)
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("automatically paginate directory listing");
+    streamed_names.sort();
+    assert_eq!(streamed_names, vec!["file", "subdir"]);
+
+    client
+        .delete(subdir, DeleteOptions::default())
+        .await
+        .expect("delete empty listing subdirectory");
 
     let reader_opened_before_rename = client.open(path).await.expect("open reader before rename");
     client

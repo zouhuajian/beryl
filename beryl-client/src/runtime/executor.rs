@@ -16,7 +16,7 @@ use crate::api::options::DEFAULT_REPLICATION;
 use crate::api::path::NamespacePathBuf;
 use crate::api::{CreateOptions, DeleteOptions, DirectoryEntry, DirectoryListing, FileStatus, ListOptions};
 use crate::config::{ClientConfig, RetryConfig};
-use crate::error::{ClientError, ClientResult};
+use crate::error::{invalid_response, ClientError, ClientResult};
 use crate::metadata::{AddBlockResult, MetadataGateway, ReadLayout};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
 use crate::rpc_error::ClientAction;
@@ -101,7 +101,7 @@ impl MetadataExecutor {
                 |gateway, ctx, req| async move { gateway.list_status(ctx, req).await },
             )
             .await?;
-        Ok(directory_listing_from_response(path, response))
+        directory_listing_from_response(path, response)
     }
 
     pub(crate) async fn create_directory(&self, path: NamespacePathBuf, recursive: bool) -> ClientResult<FileStatus> {
@@ -850,10 +850,17 @@ fn directory_status_from_response(
     Ok(FileStatus::new(path, attrs.into()))
 }
 
+/// Converts a successful wire page while enforcing its cursor/EOF invariant.
 fn directory_listing_from_response(
     path: String,
     response: beryl_proto::metadata::ListStatusResponseProto,
-) -> DirectoryListing {
+) -> ClientResult<DirectoryListing> {
+    if response.eof != response.next_cursor.is_empty() {
+        return Err(invalid_response(
+            "ListStatus",
+            "eof must be true exactly when next_cursor is empty",
+        ));
+    }
     let next_cursor = if response.next_cursor.is_empty() {
         None
     } else {
@@ -869,5 +876,5 @@ fn directory_listing_from_response(
             DirectoryEntry::new(entry.name, kind, entry.attrs.map(Into::into))
         })
         .collect();
-    DirectoryListing::new(path, entries, next_cursor, response.eof)
+    Ok(DirectoryListing::new(path, entries, next_cursor, response.eof))
 }

@@ -5,12 +5,17 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::vec::IntoIter;
 
-use super::{CreateOptions, DeleteOptions, DirectoryListing, FileReader, FileStatus, FileWriter, ListOptions};
+use futures::{stream, StreamExt};
+
+use super::{
+    CreateOptions, DeleteOptions, DirectoryEntry, DirectoryListing, FileReader, FileStatus, FileWriter, ListOptions,
+};
 use crate::api::path::NamespacePathBuf;
 use crate::config::ClientConfig;
 use crate::data::WorkerDataPlane;
-use crate::error::ClientResult;
+use crate::error::{invalid_response, ClientResult};
 use crate::metadata::{GrpcMetadataGateway, MetadataGateway};
 use crate::metrics::{ClientMetrics, NoopClientMetrics};
 use crate::runtime::{ClientRuntime, MetadataTargets};
@@ -20,6 +25,15 @@ use crate::runtime::{ClientRuntime, MetadataTargets};
 pub struct FsClient {
     /// Shared runtime state reused by this facade and the handles it opens.
     pub(crate) runtime: Arc<ClientRuntime>,
+}
+
+/// Owned state for a lazily paginated public directory-entry stream.
+struct DirectoryListStreamState {
+    client: FsClient,
+    path: NamespacePathBuf,
+    options: ListOptions,
+    buffered_entries: IntoIter<DirectoryEntry>,
+    eof: bool,
 }
 
 impl FsClient {
@@ -76,10 +90,69 @@ impl FsClient {
         self.runtime.executor.stat(path).await
     }
 
-    /// Lists a directory using explicit pagination options.
+    /// Lists one bounded directory page using explicit pagination options.
+    ///
+    /// Continue with [`DirectoryListing::next_cursor`] until
+    /// [`DirectoryListing::eof`] is true. The server retains no iterator or
+    /// snapshot between calls, so pages are weakly consistent: entries inserted
+    /// at or before the cursor may be omitted, while later insertions may appear.
+    /// A cursor is valid only for the same directory path.
     pub async fn list(&self, path: &str, options: ListOptions) -> ClientResult<DirectoryListing> {
         let path = NamespacePathBuf::parse(path)?;
         self.runtime.executor.list(path, options).await
+    }
+
+    /// Lazily lists directory entries across bounded unary RPC pages.
+    ///
+    /// The returned stream fetches the next page only after buffered entries
+    /// from the current page have been consumed. Dropping it cancels further
+    /// pagination. `options.cursor` may resume from an earlier page, and
+    /// `options.limit` applies independently to every request.
+    ///
+    /// Pagination remains weakly consistent because Metadata retains no
+    /// iterator or snapshot between requests. Use [`Self::list`] when callers
+    /// need explicit page boundaries or access to continuation cursors.
+    pub fn list_stream(
+        &self,
+        path: &str,
+        options: ListOptions,
+    ) -> ClientResult<impl futures::Stream<Item = ClientResult<DirectoryEntry>> + Send + Unpin + 'static> {
+        let state = DirectoryListStreamState {
+            client: self.clone(),
+            path: NamespacePathBuf::parse(path)?,
+            options,
+            buffered_entries: Vec::new().into_iter(),
+            eof: false,
+        };
+        Ok(stream::try_unfold(state, |mut state| async move {
+            loop {
+                if let Some(entry) = state.buffered_entries.next() {
+                    return Ok(Some((entry, state)));
+                }
+                if state.eof {
+                    return Ok(None);
+                }
+
+                let previous_cursor = state.options.cursor.clone();
+                let page = state
+                    .client
+                    .runtime
+                    .executor
+                    .list(state.path.clone(), state.options.clone())
+                    .await?;
+                if !page.eof && page.next_cursor == previous_cursor {
+                    return Err(invalid_response(
+                        "ListStatus",
+                        "non-EOF page did not advance next_cursor",
+                    ));
+                }
+
+                state.eof = page.eof;
+                state.options.cursor = page.next_cursor;
+                state.buffered_entries = page.entries.into_iter();
+            }
+        })
+        .boxed())
     }
 
     /// Create a directory through the metadata runtime.
@@ -164,7 +237,8 @@ mod tests {
     use crate::session::write_session::WriteSession;
     use async_trait::async_trait;
     use beryl_common::error::rpc::{
-        ErrorKind, InternalErrorKind, MetadataErrorKind, RefreshHint as RpcRefreshHint, RpcErrorDetail, WorkerErrorKind,
+        ErrorKind, InternalErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint as RpcRefreshHint, RpcErrorDetail,
+        WorkerErrorKind,
     };
     use beryl_proto::metadata::{
         AbortFileWriteResponseProto, CommitFileResponseProto, CreateDirectoryResponseProto, CreateFileResponseProto,
@@ -177,6 +251,7 @@ mod tests {
         WorkerNetProtocol, WriteTarget,
     };
     use bytes::Bytes;
+    use futures::TryStreamExt;
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -586,6 +661,175 @@ mod tests {
                 "rename"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn list_rejects_inconsistent_eof_and_cursor_pairs() {
+        for response in [
+            ListStatusResponseProto {
+                eof: false,
+                next_cursor: Vec::new(),
+                ..ListStatusResponseProto::default()
+            },
+            ListStatusResponseProto {
+                eof: true,
+                next_cursor: vec![1],
+                ..ListStatusResponseProto::default()
+            },
+        ] {
+            let gateway = Arc::new(MockGateway::with_list_result(Ok(response)));
+            let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
+
+            let error = client
+                .list("/alpha", ListOptions::default())
+                .await
+                .expect_err("an inconsistent pagination response must fail closed");
+
+            assert!(matches!(
+                error,
+                ClientError::InvalidResponse { operation: "ListStatus", reason }
+                    if reason.contains("eof must be true exactly when next_cursor is empty")
+            ));
+            assert_eq!(methods(&gateway.calls()), vec!["list_status"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn list_accepts_a_continuation_cursor() {
+        let gateway = Arc::new(MockGateway::with_list_result(Ok(ListStatusResponseProto {
+            next_cursor: vec![1, 2, 3],
+            eof: false,
+            ..ListStatusResponseProto::default()
+        })));
+        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
+
+        let listing = client
+            .list("/alpha", ListOptions::default())
+            .await
+            .expect("a valid continuation response");
+
+        assert_eq!(listing.next_cursor, Some(vec![1, 2, 3]));
+        assert!(!listing.eof);
+        assert_eq!(methods(&gateway.calls()), vec!["list_status"]);
+    }
+
+    #[tokio::test]
+    async fn list_stream_fetches_bounded_pages_lazily() {
+        let entry = |name: &str| beryl_proto::metadata::DirEntryProto {
+            name: name.to_string(),
+            kind: beryl_proto::metadata::InodeKindProto::InodeKindFile as i32,
+            attrs: None,
+        };
+        let gateway = Arc::new(MockGateway::with_list_results(vec![
+            Ok(ListStatusResponseProto {
+                entries: vec![entry("a"), entry("b")],
+                next_cursor: vec![2],
+                eof: false,
+                ..ListStatusResponseProto::default()
+            }),
+            Ok(ListStatusResponseProto {
+                entries: vec![entry("c")],
+                eof: true,
+                ..ListStatusResponseProto::default()
+            }),
+        ]));
+        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
+        let stream = client
+            .list_stream(
+                "/alpha",
+                ListOptions {
+                    cursor: Some(vec![1]),
+                    limit: Some(2),
+                    ..ListOptions::default()
+                },
+            )
+            .expect("valid list stream");
+        assert!(gateway.calls().is_empty(), "creating the stream must not fetch a page");
+
+        let entries = stream.try_collect::<Vec<_>>().await.expect("collect paginated entries");
+
+        assert_eq!(
+            entries.into_iter().map(|entry| entry.name).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        let requests = gateway.list_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].cursor, vec![1]);
+        assert_eq!(requests[1].cursor, vec![2]);
+        assert_eq!(requests[0].limit, 2);
+        assert_eq!(requests[1].limit, 2);
+    }
+
+    #[tokio::test]
+    async fn list_stream_rejects_a_non_advancing_cursor() {
+        let gateway = Arc::new(MockGateway::with_list_result(Ok(ListStatusResponseProto {
+            entries: vec![beryl_proto::metadata::DirEntryProto {
+                name: "repeated".to_string(),
+                kind: beryl_proto::metadata::InodeKindProto::InodeKindFile as i32,
+                attrs: None,
+            }],
+            next_cursor: vec![1],
+            eof: false,
+            ..ListStatusResponseProto::default()
+        })));
+        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
+        let stream = client
+            .list_stream(
+                "/alpha",
+                ListOptions {
+                    cursor: Some(vec![1]),
+                    ..ListOptions::default()
+                },
+            )
+            .expect("valid list stream");
+
+        let error = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect_err("a non-advancing cursor must fail closed");
+
+        assert!(matches!(
+            error,
+            ClientError::InvalidResponse { operation: "ListStatus", reason }
+                if reason.contains("did not advance next_cursor")
+        ));
+        assert_eq!(methods(&gateway.calls()), vec!["list_status"]);
+    }
+
+    #[tokio::test]
+    async fn list_resource_exhausted_is_not_retried() {
+        let rpc_error = RpcErrorDetail::fail(
+            ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted),
+            "ListStatus limit exceeds server maximum",
+        );
+        let gateway = Arc::new(MockGateway::with_list_result(Err(ClientError::from(
+            ClientAction::Fail {
+                rpc_error: Box::new(rpc_error),
+            },
+        ))));
+        let client = fs_client_with_gateway(test_config_with_retries("root", 3), gateway.clone()).expect("client");
+
+        let error = client
+            .list(
+                "/alpha",
+                ListOptions {
+                    limit: Some(10_001),
+                    ..ListOptions::default()
+                },
+            )
+            .await
+            .expect_err("ResourceExhausted must fail without retry");
+
+        let ClientError::Action(action) = error else {
+            panic!("unexpected error type");
+        };
+        assert_eq!(
+            action.kind(),
+            Some(ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted))
+        );
+        assert!(matches!(action.recovery(), Some(RecoveryAction::Fail)));
+        assert_eq!(methods(&gateway.calls()), vec!["list_status"]);
+        assert_eq!(gateway.list_requests()[0].limit, 10_001);
     }
 
     #[tokio::test]
@@ -1412,6 +1656,7 @@ mod tests {
         calls: Mutex<Vec<RecordedCall>>,
         layouts: Mutex<VecDeque<ReadLayout>>,
         list_requests: Mutex<Vec<beryl_proto::metadata::ListStatusRequestProto>>,
+        list_results: Mutex<VecDeque<ClientResult<ListStatusResponseProto>>>,
         delete_requests: Mutex<Vec<beryl_proto::metadata::DeleteRequestProto>>,
         create_directory_requests: Mutex<Vec<(String, bool)>>,
         next_offsets: Mutex<HashMap<u64, u64>>,
@@ -1455,6 +1700,17 @@ mod tests {
             layouts.push_back(layout);
             Self {
                 layouts: Mutex::new(layouts),
+                ..Self::default()
+            }
+        }
+
+        fn with_list_result(result: ClientResult<ListStatusResponseProto>) -> Self {
+            Self::with_list_results(vec![result])
+        }
+
+        fn with_list_results(results: Vec<ClientResult<ListStatusResponseProto>>) -> Self {
+            Self {
+                list_results: Mutex::new(results.into()),
                 ..Self::default()
             }
         }
@@ -1729,6 +1985,9 @@ mod tests {
         ) -> ClientResult<ListStatusResponseProto> {
             self.record("list_status", &ctx);
             self.list_requests.lock().expect("list requests").push(req);
+            if let Some(result) = self.list_results.lock().expect("list results").pop_front() {
+                return result;
+            }
             Ok(ListStatusResponseProto {
                 entries: vec![beryl_proto::metadata::DirEntryProto {
                     name: "child".to_string(),

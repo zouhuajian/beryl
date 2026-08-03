@@ -23,6 +23,10 @@ metadata.group.name: "root"
 metadata.raft.node_id: 1
 metadata.raft.mode: "single"
 
+# Public ListStatus pages are server-bounded; clients continue with next_cursor.
+metadata.list_status.default_page_size: 1000
+metadata.list_status.max_page_size: 10000
+
 # Worker cleanup execution is enabled; set false only as an operational kill switch.
 metadata.cleanup.dispatch_enabled: true
 metadata.cleanup.max_commands_per_heartbeat: 32

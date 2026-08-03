@@ -54,7 +54,7 @@ pub struct DirectoryListing {
     path: String,
     /// Entries returned for the directory.
     pub entries: Vec<DirectoryEntry>,
-    /// Opaque cursor for continuing a paginated listing when metadata returns one.
+    /// Opaque same-directory seek cursor; present exactly when [`Self::eof`] is false.
     pub next_cursor: Option<Vec<u8>>,
     /// Whether metadata reported the listing as complete.
     pub eof: bool,

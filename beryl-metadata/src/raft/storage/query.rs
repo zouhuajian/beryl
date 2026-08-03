@@ -451,24 +451,29 @@ impl RocksDBStorage {
         Ok((entries, true))
     }
 
-    /// List dentries with pagination support (for ReadDir).
+    /// Returns one bounded dentry page for a directory.
     ///
-    /// Args:
-    /// - parent_inode_id: Parent directory inode ID
-    /// - cursor_key: Optional cursor key (opaque bytes from previous ReadDir response).
-    ///   If None, starts from the beginning. If Some, seeks to the key's successor.
-    /// - max_entries: Maximum number of entries to return. If None, returns all.
+    /// `cursor_key` is normally the opaque key of the last entry returned to
+    /// the caller. It must be syntactically valid for this directory, but it is
+    /// not authenticated; a valid same-directory key acts as an exclusive seek
+    /// position even when that exact key no longer exists.
     ///
-    /// Returns:
-    /// - entries: Vec of (name, child_inode_id) pairs
-    /// - next_cursor_key: Next cursor key for pagination (None if EOF)
-    /// - eof: Whether this is the last page
+    /// The scan is weakly consistent across calls and does not retain a RocksDB
+    /// iterator or snapshot after this method returns. Entries inserted at or
+    /// before the cursor may be omitted, while entries inserted after it may be
+    /// returned. `max_entries` must be positive; successful pages never contain
+    /// more entries than that bound.
     pub fn list_dentries_with_cursor(
         &self,
         parent_inode_id: InodeId,
         cursor_key: Option<&[u8]>,
-        max_entries: Option<usize>,
+        max_entries: usize,
     ) -> MetadataResult<DentryPage> {
+        if max_entries == 0 {
+            return Err(MetadataError::InvalidArgument(
+                "ListStatus page size must be positive".to_string(),
+            ));
+        }
         crate::observe::record_rocksdb_read("dentry_scan");
         let generation = self.pin_generation()?;
         let db = generation.db();
@@ -478,10 +483,18 @@ impl RocksDBStorage {
 
         let prefix = Self::encode_dentry_key(parent_inode_id, "");
 
-        let (start_key, mut skip_first) = match cursor_key {
-            Some(c) if c.starts_with(&prefix) => (c.to_vec(), true),
-            _ => (prefix.clone(), false),
+        let start_key = match cursor_key {
+            Some(cursor) => match Self::decode_dentry_key(cursor) {
+                Some((cursor_parent, name)) if cursor_parent == parent_inode_id && !name.is_empty() => cursor.to_vec(),
+                _ => {
+                    return Err(MetadataError::InvalidArgument(
+                        "ListStatus cursor does not belong to the requested directory".to_string(),
+                    ));
+                }
+            },
+            None => prefix.clone(),
         };
+        let mut skip_cursor = cursor_key.is_some();
 
         let mut entries = Vec::new();
         let mut iter = db.iterator_cf(cf, rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward));
@@ -494,18 +507,22 @@ impl RocksDBStorage {
                 break; // finished this directory
             }
 
-            // Skip the cursor key entry itself
-            if skip_first {
-                skip_first = false;
-                continue;
+            // A deleted cursor key seeks directly to its successor, which must
+            // remain visible instead of being mistaken for the cursor itself.
+            if skip_cursor {
+                skip_cursor = false;
+                if key.as_ref() == start_key.as_slice() {
+                    continue;
+                }
             }
 
-            let Some((decoded_parent, name)) = Self::decode_dentry_key(&key) else {
-                continue;
-            };
-
-            if decoded_parent != parent_inode_id || value.len() != 8 {
-                continue;
+            let (decoded_parent, name) = Self::decode_dentry_key(&key).ok_or_else(|| {
+                MetadataError::Internal(format!("Malformed dentry key under parent inode {parent_inode_id}"))
+            })?;
+            if decoded_parent != parent_inode_id || name.is_empty() || value.len() != 8 {
+                return Err(MetadataError::Internal(format!(
+                    "Malformed dentry under parent inode {parent_inode_id}"
+                )));
             }
 
             let mut child_bytes = [0u8; 8];
@@ -513,19 +530,17 @@ impl RocksDBStorage {
             let child_inode_id = InodeId::from_be_bytes(child_bytes);
             entries.push((name, child_inode_id));
 
-            if let Some(max) = max_entries {
-                if entries.len() == max {
-                    // Peek ahead to know if another page exists; only set cursor when there is more.
-                    let has_more = if let Some(next_item) = iter.next() {
-                        let (next_key, _) =
-                            next_item.map_err(|e| MetadataError::Internal(format!("RocksDB iterator error: {}", e)))?;
-                        next_key.starts_with(&prefix)
-                    } else {
-                        false
-                    };
-                    let next_cursor_key = if has_more { Some(key.to_vec()) } else { None };
-                    return Ok((entries, next_cursor_key, !has_more));
-                }
+            if entries.len() == max_entries {
+                // Peek ahead to know if another page exists; only set cursor when there is more.
+                let has_more = if let Some(next_item) = iter.next() {
+                    let (next_key, _) =
+                        next_item.map_err(|e| MetadataError::Internal(format!("RocksDB iterator error: {}", e)))?;
+                    next_key.starts_with(&prefix)
+                } else {
+                    false
+                };
+                let next_cursor_key = if has_more { Some(key.to_vec()) } else { None };
+                return Ok((entries, next_cursor_key, !has_more));
             }
         }
         Ok((entries, None, true))
@@ -534,7 +549,7 @@ impl RocksDBStorage {
     /// Check if directory is empty (has no dentries).
     pub fn is_directory_empty(&self, parent_inode_id: InodeId) -> MetadataResult<bool> {
         let _generation = self.pin_generation()?;
-        let (entries, _, _) = self.list_dentries_with_cursor(parent_inode_id, None, Some(1))?;
+        let (entries, _, _) = self.list_dentries_with_cursor(parent_inode_id, None, 1)?;
         Ok(entries.is_empty())
     }
 }
@@ -602,14 +617,35 @@ mod tests {
         (temp_dir, storage)
     }
 
+    fn put_numbered_dentries(storage: &RocksDBStorage, parent_inode_id: InodeId, count: usize) {
+        storage
+            .with_pinned_db(|db| {
+                let cf = db
+                    .cf_handle(CF_DENTRIES)
+                    .ok_or_else(|| MetadataError::Internal("Dentries CF not found".to_string()))?;
+                let mut batch = WriteBatch::default();
+                for index in 0..count {
+                    let name = format!("{index:06}");
+                    let child_inode_id = InodeId::new(index as u64 + 2);
+                    batch.put_cf(
+                        cf,
+                        RocksDBStorage::encode_dentry_key(parent_inode_id, &name),
+                        child_inode_id.to_be_bytes(),
+                    );
+                }
+                db.write(batch)
+                    .map_err(|error| MetadataError::Internal(format!("RocksDB batch write failed: {error}")))?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
     #[test]
     fn test_list_dentries_with_cursor_pagination() {
         let entries = [("a", InodeId::new(2)), ("b", InodeId::new(3)), ("c", InodeId::new(4))];
         let (_tmp_dir, storage) = setup_dir_with_entries(InodeId::new(1), &entries);
 
-        let (page1, cursor1, eof1) = storage
-            .list_dentries_with_cursor(InodeId::new(1), None, Some(2))
-            .unwrap();
+        let (page1, cursor1, eof1) = storage.list_dentries_with_cursor(InodeId::new(1), None, 2).unwrap();
         assert_eq!(
             page1,
             vec![("a".to_string(), InodeId::new(2)), ("b".to_string(), InodeId::new(3))]
@@ -620,7 +656,7 @@ mod tests {
         // When continuing iteration using the returned cursor,
         // you should skip the last record that has already been returned.
         let (page2, cursor2, eof2) = storage
-            .list_dentries_with_cursor(InodeId::new(1), cursor1.as_deref(), Some(10))
+            .list_dentries_with_cursor(InodeId::new(1), cursor1.as_deref(), 10)
             .unwrap();
         assert_eq!(page2, vec![("c".to_string(), InodeId::new(4))]);
         assert!(eof2);
@@ -628,23 +664,191 @@ mod tests {
     }
 
     #[test]
-    fn test_list_dentries_with_cursor_ignores_off_prefix_cursor() {
+    fn list_dentries_with_cursor_rejects_off_prefix_cursor() {
         let entries = [("x", InodeId::new(11)), ("y", InodeId::new(12))];
         let (_tmp_dir, storage) = setup_dir_with_entries(InodeId::new(10), &entries);
 
-        // The cursor lands under another directory prefix,
-        // the expectation is to start from that directory prefix without skipping the first entry.
+        // A cursor is scoped to the directory from which it was returned.
         let mut other_cursor = b"dentry/".to_vec();
         other_cursor.extend_from_slice(&InodeId::new(99).to_be_bytes());
         other_cursor.extend_from_slice(b"zzz");
 
-        let (page, _cursor, eof) = storage
-            .list_dentries_with_cursor(InodeId::new(10), Some(&other_cursor), Some(10))
+        let error = storage
+            .list_dentries_with_cursor(InodeId::new(10), Some(&other_cursor), 10)
+            .expect_err("a cursor from another directory must fail closed");
+        assert!(matches!(error, MetadataError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn list_dentries_with_cursor_keeps_successor_when_cursor_was_deleted() {
+        let entries = [("a", InodeId::new(2)), ("b", InodeId::new(3)), ("c", InodeId::new(4))];
+        let (_tmp_dir, storage) = setup_dir_with_entries(InodeId::new(1), &entries);
+        let (_, cursor, _) = storage.list_dentries_with_cursor(InodeId::new(1), None, 2).unwrap();
+        let cursor = cursor.expect("first page cursor");
+
+        storage
+            .with_pinned_db(|db| {
+                let cf = db
+                    .cf_handle(CF_DENTRIES)
+                    .ok_or_else(|| MetadataError::Internal("Dentries CF not found".to_string()))?;
+                db.delete_cf(cf, &cursor)
+                    .map_err(|error| MetadataError::Internal(format!("RocksDB delete failed: {error}")))?;
+                Ok(())
+            })
+            .unwrap();
+
+        let (page, next_cursor, eof) = storage
+            .list_dentries_with_cursor(InodeId::new(1), Some(&cursor), 2)
+            .unwrap();
+        assert_eq!(page, vec![("c".to_string(), InodeId::new(4))]);
+        assert!(next_cursor.is_none());
+        assert!(eof);
+    }
+
+    #[test]
+    fn list_dentries_with_cursor_returns_empty_directory_eof() {
+        let (_tmp_dir, storage) = setup_dir_with_entries(InodeId::new(1), &[]);
+
+        let (page, next_cursor, eof) = storage.list_dentries_with_cursor(InodeId::new(1), None, 10).unwrap();
+
+        assert!(page.is_empty());
+        assert!(next_cursor.is_none());
+        assert!(eof);
+    }
+
+    #[test]
+    fn list_dentries_with_cursor_rejects_malformed_cursors() {
+        let (_tmp_dir, storage) = setup_dir_with_entries(InodeId::new(1), &[]);
+        let empty_name = RocksDBStorage::encode_dentry_key(InodeId::new(1), "");
+        let mut invalid_utf8 = empty_name.clone();
+        invalid_utf8.push(0xff);
+
+        for cursor in [b"dentry/".to_vec(), empty_name, invalid_utf8] {
+            let error = storage
+                .list_dentries_with_cursor(InodeId::new(1), Some(&cursor), 10)
+                .expect_err("malformed cursors must fail closed");
+            assert!(matches!(error, MetadataError::InvalidArgument(_)));
+        }
+    }
+
+    #[test]
+    fn list_dentries_with_cursor_allows_same_directory_seek_key() {
+        let entries = [("a", InodeId::new(2)), ("c", InodeId::new(3))];
+        let (_tmp_dir, storage) = setup_dir_with_entries(InodeId::new(1), &entries);
+        let forged_seek_key = RocksDBStorage::encode_dentry_key(InodeId::new(1), "b");
+
+        let (page, next_cursor, eof) = storage
+            .list_dentries_with_cursor(InodeId::new(1), Some(&forged_seek_key), 10)
+            .unwrap();
+
+        assert_eq!(page, vec![("c".to_string(), InodeId::new(3))]);
+        assert!(next_cursor.is_none());
+        assert!(eof);
+    }
+
+    #[test]
+    fn list_dentries_with_cursor_is_weakly_consistent_across_insertions() {
+        let entries = [("a", InodeId::new(2)), ("c", InodeId::new(3))];
+        let (_tmp_dir, storage) = setup_dir_with_entries(InodeId::new(1), &entries);
+        let (_, cursor, eof) = storage.list_dentries_with_cursor(InodeId::new(1), None, 1).unwrap();
+        assert!(!eof);
+        let cursor = cursor.expect("first page cursor");
+
+        storage.put_dentry(InodeId::new(1), "0", InodeId::new(4)).unwrap();
+        storage.put_dentry(InodeId::new(1), "b", InodeId::new(5)).unwrap();
+
+        let (page, next_cursor, eof) = storage
+            .list_dentries_with_cursor(InodeId::new(1), Some(&cursor), 10)
             .unwrap();
         assert_eq!(
             page,
-            vec![("x".to_string(), InodeId::new(11)), ("y".to_string(), InodeId::new(12))]
+            vec![("b".to_string(), InodeId::new(5)), ("c".to_string(), InodeId::new(3))]
         );
+        assert!(next_cursor.is_none());
         assert!(eof);
+    }
+
+    #[test]
+    fn list_dentries_with_cursor_rejects_zero_page_size() {
+        let (_tmp_dir, storage) = setup_dir_with_entries(InodeId::new(1), &[]);
+
+        let error = storage
+            .list_dentries_with_cursor(InodeId::new(1), None, 0)
+            .expect_err("zero page size must not express an unbounded scan");
+        assert!(matches!(error, MetadataError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn list_dentries_with_cursor_fails_closed_on_malformed_dentry() {
+        let (_tmp_dir, storage) = setup_dir_with_entries(InodeId::new(1), &[]);
+        storage
+            .with_pinned_db(|db| {
+                let cf = db
+                    .cf_handle(CF_DENTRIES)
+                    .ok_or_else(|| MetadataError::Internal("Dentries CF not found".to_string()))?;
+                db.put_cf(cf, RocksDBStorage::encode_dentry_key(InodeId::new(1), "bad"), b"x")
+                    .map_err(|error| MetadataError::Internal(format!("RocksDB write failed: {error}")))?;
+                Ok(())
+            })
+            .unwrap();
+
+        let error = storage
+            .list_dentries_with_cursor(InodeId::new(1), None, 10)
+            .expect_err("malformed authority must fail closed");
+        assert!(matches!(error, MetadataError::Internal(_)));
+    }
+
+    #[test]
+    fn list_dentries_with_cursor_fails_closed_on_malformed_dentry_key() {
+        let (_tmp_dir, storage) = setup_dir_with_entries(InodeId::new(1), &[]);
+        storage
+            .with_pinned_db(|db| {
+                let cf = db
+                    .cf_handle(CF_DENTRIES)
+                    .ok_or_else(|| MetadataError::Internal("Dentries CF not found".to_string()))?;
+                let mut key = RocksDBStorage::encode_dentry_key(InodeId::new(1), "");
+                key.push(0xff);
+                db.put_cf(cf, key, InodeId::new(2).to_be_bytes())
+                    .map_err(|error| MetadataError::Internal(format!("RocksDB write failed: {error}")))?;
+                Ok(())
+            })
+            .unwrap();
+
+        let error = storage
+            .list_dentries_with_cursor(InodeId::new(1), None, 10)
+            .expect_err("malformed authority keys must fail closed");
+        assert!(matches!(error, MetadataError::Internal(_)));
+    }
+
+    #[test]
+    fn list_dentries_with_cursor_pages_one_hundred_thousand_entries() {
+        const ENTRY_COUNT: usize = 100_000;
+        const PAGE_SIZE: usize = 1_000;
+
+        let parent_inode_id = InodeId::new(1);
+        let (_tmp_dir, storage) = setup_dir_with_entries(parent_inode_id, &[]);
+        put_numbered_dentries(&storage, parent_inode_id, ENTRY_COUNT);
+
+        let mut cursor = None;
+        let mut expected_index = 0;
+        loop {
+            let (page, next_cursor, eof) = storage
+                .list_dentries_with_cursor(parent_inode_id, cursor.as_deref(), PAGE_SIZE)
+                .unwrap();
+            assert!(!page.is_empty());
+            assert!(page.len() <= PAGE_SIZE);
+            for (name, child_inode_id) in page {
+                assert_eq!(name, format!("{expected_index:06}"));
+                assert_eq!(child_inode_id, InodeId::new(expected_index as u64 + 2));
+                expected_index += 1;
+            }
+            assert_eq!(next_cursor.is_none(), eof);
+            if eof {
+                break;
+            }
+            cursor = next_cursor;
+        }
+
+        assert_eq!(expected_index, ENTRY_COUNT);
     }
 }

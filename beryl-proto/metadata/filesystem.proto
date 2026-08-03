@@ -140,14 +140,23 @@ message ListStatusRequestProto {
   common.RequestHeaderProto header = 1;
   string path = 2;
   bool recursive = 3;
+  // Opaque seek key returned as next_cursor by a preceding page for this same
+  // directory. The server retains no iterator or snapshot between requests;
+  // entries inserted at or before the cursor may be omitted, while entries
+  // inserted after it may appear in later pages.
   bytes cursor = 4;
+  // Maximum entries in this page. Zero selects the Metadata server default;
+  // a non-zero value above the server maximum is rejected.
   uint32 limit = 5;
 }
 
 message ListStatusResponseProto {
   common.ResponseHeaderProto header = 1;
   repeated DirEntryProto entries = 2;
+  // On success, an opaque continuation key present exactly when eof is false.
   bytes next_cursor = 3;
+  // True when this page reached the current end of the directory scan. A
+  // successful EOF response has an empty next_cursor.
   bool eof = 4;
 }
 

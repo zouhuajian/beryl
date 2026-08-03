@@ -791,6 +791,7 @@ fn metadata_config(
         storage_dir,
         raft: RaftConfig::default(),
         authority: MetadataAuthorityConfig { group_name },
+        list_status: Default::default(),
         cleanup: CleanupConfig::default(),
         detached_root_reclamation: DetachedRootReclamationConfig::default(),
         worker: WorkerConfig::default(),
