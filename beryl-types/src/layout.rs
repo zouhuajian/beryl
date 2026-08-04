@@ -4,6 +4,19 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Largest logical block size accepted by the current Beryl block format.
+///
+/// This is a persisted domain invariant, not a client buffering or transport
+/// policy. Lowering it requires an explicit metadata and worker-format
+/// migration for blocks created under the previous ceiling.
+pub const MAX_BLOCK_SIZE: u32 = 1024 * 1024 * 1024;
+
+/// Largest storage chunk size accepted by the current Beryl block format.
+///
+/// Transport frames may be smaller than a chunk and do not change this
+/// persisted layout invariant.
+pub const MAX_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
+
 /// Beryl block data/meta interpretation format selected by metadata.
 ///
 /// This is not a worker StoreBackend or IoEngine. A worker may execute the same
@@ -151,8 +164,20 @@ fn validate_block_layout_parts(
     if block_size == 0 {
         return Err(BlockShapeError::ZeroBlockSize);
     }
+    if block_size > u64::from(MAX_BLOCK_SIZE) {
+        return Err(BlockShapeError::BlockTooLarge {
+            actual: block_size,
+            maximum: u64::from(MAX_BLOCK_SIZE),
+        });
+    }
     if chunk_size == 0 {
         return Err(BlockShapeError::ZeroChunkSize);
+    }
+    if chunk_size > MAX_CHUNK_SIZE {
+        return Err(BlockShapeError::ChunkTooLarge {
+            actual: chunk_size,
+            maximum: MAX_CHUNK_SIZE,
+        });
     }
     if u64::from(chunk_size) > block_size {
         return Err(BlockShapeError::ChunkLargerThanBlock);
@@ -168,8 +193,12 @@ fn validate_block_layout_parts(
 pub enum BlockShapeError {
     #[error("block_size must be non-zero")]
     ZeroBlockSize,
+    #[error("block_size {actual} exceeds maximum {maximum}")]
+    BlockTooLarge { actual: u64, maximum: u64 },
     #[error("chunk_size must be non-zero")]
     ZeroChunkSize,
+    #[error("chunk_size {actual} exceeds maximum {maximum}")]
+    ChunkTooLarge { actual: u32, maximum: u32 },
     #[error("chunk_size must not exceed block_size")]
     ChunkLargerThanBlock,
     #[error("block_size must be a multiple of chunk_size")]
@@ -186,8 +215,12 @@ pub enum BlockShapeError {
 pub enum FileLayoutError {
     #[error("block_size must be non-zero")]
     ZeroBlockSize,
+    #[error("block_size {actual} exceeds maximum {maximum}")]
+    BlockTooLarge { actual: u64, maximum: u64 },
     #[error("chunk_size must be non-zero")]
     ZeroChunkSize,
+    #[error("chunk_size {actual} exceeds maximum {maximum}")]
+    ChunkTooLarge { actual: u32, maximum: u32 },
     #[error("chunk_size must not exceed block_size")]
     ChunkLargerThanBlock,
     #[error("block_size must be a multiple of chunk_size")]
@@ -202,7 +235,9 @@ impl FileLayoutError {
     fn from_block_shape_error(err: BlockShapeError) -> Self {
         match err {
             BlockShapeError::ZeroBlockSize => Self::ZeroBlockSize,
+            BlockShapeError::BlockTooLarge { actual, maximum } => Self::BlockTooLarge { actual, maximum },
             BlockShapeError::ZeroChunkSize => Self::ZeroChunkSize,
+            BlockShapeError::ChunkTooLarge { actual, maximum } => Self::ChunkTooLarge { actual, maximum },
             BlockShapeError::ChunkLargerThanBlock => Self::ChunkLargerThanBlock,
             BlockShapeError::BlockSizeNotChunkAligned => Self::BlockSizeNotChunkAligned,
             BlockShapeError::UnknownBlockFormat(err) => Self::UnknownBlockFormat(err),
@@ -239,8 +274,32 @@ mod tests {
                 BlockShapeError::ZeroBlockSize,
             ),
             (
+                BlockShape::new(
+                    BlockFormatId::FULL_EFFECTIVE,
+                    u64::from(MAX_BLOCK_SIZE) + 1,
+                    1024,
+                    u64::from(MAX_BLOCK_SIZE) + 1,
+                ),
+                BlockShapeError::BlockTooLarge {
+                    actual: u64::from(MAX_BLOCK_SIZE) + 1,
+                    maximum: u64::from(MAX_BLOCK_SIZE),
+                },
+            ),
+            (
                 BlockShape::new(BlockFormatId::FULL_EFFECTIVE, 4096, 0, 1),
                 BlockShapeError::ZeroChunkSize,
+            ),
+            (
+                BlockShape::new(
+                    BlockFormatId::FULL_EFFECTIVE,
+                    u64::from(MAX_BLOCK_SIZE),
+                    MAX_CHUNK_SIZE + 1,
+                    u64::from(MAX_BLOCK_SIZE),
+                ),
+                BlockShapeError::ChunkTooLarge {
+                    actual: MAX_CHUNK_SIZE + 1,
+                    maximum: MAX_CHUNK_SIZE,
+                },
             ),
             (
                 BlockShape::new(BlockFormatId::FULL_EFFECTIVE, 1024, 4096, 1),
@@ -263,5 +322,31 @@ mod tests {
         for (result, expected) in cases {
             assert_eq!(result.expect_err("invalid shape must fail"), expected);
         }
+    }
+
+    #[test]
+    fn file_layout_accepts_hard_maximum_and_rejects_larger_values() {
+        FileLayout::new(MAX_BLOCK_SIZE, MAX_CHUNK_SIZE, 1)
+            .validate()
+            .expect("maximum supported layout must pass");
+
+        assert_eq!(
+            FileLayout::new(MAX_BLOCK_SIZE + 1, MAX_CHUNK_SIZE, 1)
+                .validate()
+                .expect_err("block size above the hard maximum must fail"),
+            FileLayoutError::BlockTooLarge {
+                actual: u64::from(MAX_BLOCK_SIZE) + 1,
+                maximum: u64::from(MAX_BLOCK_SIZE),
+            }
+        );
+        assert_eq!(
+            FileLayout::new(MAX_BLOCK_SIZE, MAX_CHUNK_SIZE + 1, 1)
+                .validate()
+                .expect_err("chunk size above the hard maximum must fail"),
+            FileLayoutError::ChunkTooLarge {
+                actual: MAX_CHUNK_SIZE + 1,
+                maximum: MAX_CHUNK_SIZE,
+            }
+        );
     }
 }

@@ -198,7 +198,17 @@ impl AppRaftStateMachine {
                     content_revision,
                     lease_epoch,
                     ..
-                } => (extents.clone(), content_revision.unwrap_or(0), lease_epoch.unwrap_or(0)),
+                } => {
+                    if extents.len() > MAX_FILE_EXTENTS {
+                        return Err(MetadataError::ResourceExhausted(format!(
+                            "stored file extent count {} exceeds maximum {} for inode {}",
+                            extents.len(),
+                            MAX_FILE_EXTENTS,
+                            inode_id
+                        )));
+                    }
+                    (extents.clone(), content_revision.unwrap_or(0), lease_epoch.unwrap_or(0))
+                }
                 _ => unreachable!("file inode must carry file data"),
             };
             if stored_lease_epoch != lease_epoch {
@@ -312,6 +322,20 @@ impl AppRaftStateMachine {
                     )?
                 }
             };
+            let final_extent_count = match mode {
+                PublishMode::ReplaceIfUnchanged => extents_to_publish.len(),
+                PublishMode::AppendIfUnchanged => existing_extents
+                    .len()
+                    .checked_add(extents_to_publish.len())
+                    .ok_or_else(|| {
+                        MetadataError::ResourceExhausted("final file extent count overflowed".to_string())
+                    })?,
+            };
+            if final_extent_count > MAX_FILE_EXTENTS {
+                return Err(MetadataError::ResourceExhausted(format!(
+                    "final file extent count {final_extent_count} exceeds maximum {MAX_FILE_EXTENTS} for inode {inode_id}"
+                )));
+            }
             let content_revision = Self::next_content_revision(inode_id, Some(current_content_revision))?;
             Self::stamp_extents(&mut extents_to_publish, &existing_extents, content_revision);
             match &mut inode.data {
@@ -349,6 +373,7 @@ impl AppRaftStateMachine {
 
         let (inode, layout, ok, changed) = match prepared {
             Ok(prepared) => prepared,
+            Err(error @ MetadataError::ResourceExhausted(_)) => return Err(error),
             Err(err) => return self.persist_fs_error(err, raft_state),
         };
         let result = FsCommandResult::Ok(ok);
@@ -365,7 +390,7 @@ impl AppRaftStateMachine {
 mod tests {
     use super::*;
     use crate::raft::state_machine::test_support::*;
-    use beryl_types::InodeKind;
+    use beryl_types::{InodeKind, MAX_FILE_EXTENTS};
 
     fn expect_block_allocated(result: CommandResult) -> BlockId {
         match result {
@@ -440,6 +465,78 @@ mod tests {
             .put_inode_at_storage_key(key_inode_id, &key_mismatch)
             .unwrap();
         assert_file_mutations_reject_corrupt_inode(key_storage, key_inode_id, &key_mismatch);
+    }
+
+    #[test]
+    fn publish_file_extent_limits_reject_without_mutating_inode_and_advance_apply_state() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let inode_id = InodeId::new(120);
+        let existing_extents = (0..MAX_FILE_EXTENTS)
+            .map(|index| extent(BlockId::new(inode_id, BlockIndex::new(index as u32)), index as u64, 1))
+            .collect::<Vec<_>>();
+        let original = install_file_with_extents(
+            &storage,
+            InodeId::new(100),
+            "file",
+            inode_id,
+            existing_extents,
+            MAX_FILE_EXTENTS as u64,
+        );
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage));
+
+        let requested_state = AppMetadataRaftState {
+            last_applied_log_id: Some(openraft::LogId::new(openraft::LeaderId::new(8, 1), 801)),
+            ..AppMetadataRaftState::default()
+        };
+        let oversized_request = (0..=MAX_FILE_EXTENTS)
+            .map(|index| extent(BlockId::new(inode_id, BlockIndex::new(index as u32)), index as u64, 1))
+            .collect();
+        let error = sm
+            .apply_with_raft_state(
+                Command::PublishFile {
+                    proposed_at_ms: 1,
+                    inode_id,
+                    extents: oversized_request,
+                    target_size: (MAX_FILE_EXTENTS + 1) as u64,
+                    expected_content_revision: 0,
+                    expected_file_size: MAX_FILE_EXTENTS as u64,
+                    lease_epoch: 1,
+                    mode: PublishMode::ReplaceIfUnchanged,
+                },
+                &requested_state,
+            )
+            .expect_err("oversized requested extent vector must fail");
+        assert!(matches!(error, MetadataError::ResourceExhausted(_)));
+        assert_eq!(storage.load_raft_state().unwrap(), requested_state);
+        assert_eq!(storage.get_inode(inode_id).unwrap().as_ref(), Some(&original));
+
+        let append_state = AppMetadataRaftState {
+            last_applied_log_id: Some(openraft::LogId::new(openraft::LeaderId::new(8, 1), 802)),
+            ..AppMetadataRaftState::default()
+        };
+        let error = sm
+            .apply_with_raft_state(
+                Command::PublishFile {
+                    proposed_at_ms: 2,
+                    inode_id,
+                    extents: vec![extent(
+                        BlockId::new(inode_id, BlockIndex::new(MAX_FILE_EXTENTS as u32)),
+                        MAX_FILE_EXTENTS as u64,
+                        1,
+                    )],
+                    target_size: (MAX_FILE_EXTENTS + 1) as u64,
+                    expected_content_revision: 0,
+                    expected_file_size: MAX_FILE_EXTENTS as u64,
+                    lease_epoch: 1,
+                    mode: PublishMode::AppendIfUnchanged,
+                },
+                &append_state,
+            )
+            .expect_err("append beyond final extent limit must fail");
+        assert!(matches!(error, MetadataError::ResourceExhausted(_)));
+        assert_eq!(storage.load_raft_state().unwrap(), append_state);
+        assert_eq!(storage.get_inode(inode_id).unwrap().as_ref(), Some(&original));
     }
 
     #[test]

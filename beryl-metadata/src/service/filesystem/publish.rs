@@ -11,7 +11,7 @@ use crate::worker::{PublishReadyConflict, PublishReadyStatus};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint, WorkerErrorKind};
 use beryl_types::fs::{Extent, FsErrorCode, InodeId};
 use beryl_types::ids::MountId;
-use beryl_types::{CommittedBlock, GroupName, WriteTarget};
+use beryl_types::{CommittedBlock, GroupName, WriteTarget, MAX_FILE_EXTENTS};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]
@@ -839,6 +839,9 @@ impl MetadataFileSystem {
                 return Err(self.invalid_sync_write_failure(ctx, err.to_string(), group_name, mount_epoch));
             }
         };
+        if let Err(error) = self.validate_final_extent_count(session.inode_id, &extents, publish_mode) {
+            return self.failure_from_error_with_route_epoch(ctx, error, group_name, mount_epoch, route_epoch);
+        }
         let worker_lookup_group_name =
             self.require_worker_lookup_group(ctx, group_name.clone(), mount_epoch, route_epoch, "SyncWrite")?;
         let new_targets =
@@ -977,6 +980,63 @@ impl MetadataFileSystem {
 
     fn block_end(block: &CommittedBlock) -> Option<u64> {
         block.file_offset.checked_add(block.len)
+    }
+
+    /// Validate the post-publication inline extent count before proposing Raft.
+    ///
+    /// Append retries may include extents that are already visible, so this
+    /// counts only the requested suffix that apply would add. Apply repeats the
+    /// check against authoritative state to close the read/proposal race.
+    fn validate_final_extent_count(
+        &self,
+        inode_id: InodeId,
+        requested_extents: &[Extent],
+        mode: PublishMode,
+    ) -> MetadataResult<()> {
+        let final_extent_count = match mode {
+            PublishMode::ReplaceIfUnchanged => requested_extents.len(),
+            PublishMode::AppendIfUnchanged => {
+                let inode = self
+                    .read_inode(inode_id)?
+                    .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {inode_id}")))?;
+                let visible_extents = match &inode.data {
+                    beryl_types::fs::InodeData::File { extents, .. } => extents,
+                    _ => {
+                        return Err(MetadataError::InvalidArgument(format!(
+                            "Inode is not a file: {inode_id}"
+                        )))
+                    }
+                };
+                if visible_extents.len() > MAX_FILE_EXTENTS {
+                    return Err(MetadataError::ResourceExhausted(format!(
+                        "persisted file extent count {} exceeds maximum {} for inode {inode_id}",
+                        visible_extents.len(),
+                        MAX_FILE_EXTENTS
+                    )));
+                }
+                let added = requested_extents
+                    .iter()
+                    .filter(|candidate| {
+                        !visible_extents.iter().any(|visible| {
+                            visible.block_id == candidate.block_id
+                                && visible.file_offset == candidate.file_offset
+                                && visible.block_offset == candidate.block_offset
+                                && visible.len == candidate.len
+                        })
+                    })
+                    .count();
+                visible_extents
+                    .len()
+                    .checked_add(added)
+                    .ok_or_else(|| MetadataError::ResourceExhausted("final file extent count overflowed".to_string()))?
+            }
+        };
+        if final_extent_count > MAX_FILE_EXTENTS {
+            return Err(MetadataError::ResourceExhausted(format!(
+                "final file extent count {final_extent_count} exceeds maximum {MAX_FILE_EXTENTS} for inode {inode_id}"
+            )));
+        }
+        Ok(())
     }
 
     fn validate_committed_blocks(
@@ -1224,6 +1284,9 @@ impl MetadataFileSystem {
             Ok(extents) => extents,
             Err(err) => return Err(self.invalid_commit_failure(ctx, err.to_string(), group_name.clone(), mount_epoch)),
         };
+        if let Err(error) = self.validate_final_extent_count(session.inode_id, &extents, publish_mode) {
+            return self.failure_from_error_with_route_epoch(ctx, error, group_name, mount_epoch, route_epoch);
+        }
         let worker_lookup_group_name =
             self.require_worker_lookup_group(ctx, group_name.clone(), mount_epoch, route_epoch, "CommitFile")?;
         let new_targets =
@@ -1363,6 +1426,80 @@ mod tests {
             final_size: target.file_offset + target.effective_len,
             expected_file_size,
         }
+    }
+
+    #[tokio::test]
+    async fn final_extent_limit_counts_only_new_append_extents() {
+        let env = write_flow_env(0).await;
+        let visible = (0..MAX_FILE_EXTENTS)
+            .map(|index| Extent {
+                file_offset: index as u64,
+                block_id: beryl_types::BlockId::new(env.inode_id, beryl_types::BlockIndex::new(index as u32)),
+                block_offset: 0,
+                len: 1,
+                content_revision: Some(1),
+                block_stamp: Some(1),
+            })
+            .collect::<Vec<_>>();
+        let mut inode = env.storage.get_inode(env.inode_id).unwrap().expect("file inode");
+        let beryl_types::fs::InodeData::File { extents, .. } = &mut inode.data else {
+            panic!("file inode must carry file data");
+        };
+        *extents = visible.clone();
+        env.storage.put_inode(&inode).unwrap();
+
+        env.filesystem
+            .validate_final_extent_count(env.inode_id, &visible, PublishMode::AppendIfUnchanged)
+            .expect("already-visible append extents must not be counted twice");
+
+        let new_extent = Extent {
+            file_offset: MAX_FILE_EXTENTS as u64,
+            block_id: beryl_types::BlockId::new(env.inode_id, beryl_types::BlockIndex::new(MAX_FILE_EXTENTS as u32)),
+            block_offset: 0,
+            len: 1,
+            content_revision: None,
+            block_stamp: None,
+        };
+        let error = env
+            .filesystem
+            .validate_final_extent_count(env.inode_id, &[new_extent], PublishMode::AppendIfUnchanged)
+            .expect_err("new append extent beyond the hard maximum must fail before proposal");
+        assert!(matches!(error, MetadataError::ResourceExhausted(_)));
+    }
+
+    #[tokio::test]
+    async fn final_extent_limit_rejects_oversized_persisted_state_before_append_scan() {
+        let env = write_flow_env(0).await;
+        let visible = (0..=MAX_FILE_EXTENTS)
+            .map(|index| Extent {
+                file_offset: index as u64,
+                block_id: beryl_types::BlockId::new(env.inode_id, beryl_types::BlockIndex::new(index as u32)),
+                block_offset: 0,
+                len: 1,
+                content_revision: Some(1),
+                block_stamp: Some(1),
+            })
+            .collect::<Vec<_>>();
+        let mut inode = env.storage.get_inode(env.inode_id).unwrap().expect("file inode");
+        let beryl_types::fs::InodeData::File { extents, .. } = &mut inode.data else {
+            panic!("file inode must carry file data");
+        };
+        *extents = visible.clone();
+        env.storage.put_inode(&inode).unwrap();
+
+        let error = env
+            .filesystem
+            .validate_final_extent_count(env.inode_id, &visible[..1], PublishMode::AppendIfUnchanged)
+            .expect_err("oversized persisted extent state must fail before append matching");
+        assert!(
+            matches!(error, MetadataError::ResourceExhausted(message) if message.contains("persisted file extent count"))
+        );
+
+        let stored = env.storage.get_inode(env.inode_id).unwrap().expect("file inode");
+        let beryl_types::fs::InodeData::File { extents, .. } = stored.data else {
+            panic!("file inode must carry file data");
+        };
+        assert_eq!(extents.len(), MAX_FILE_EXTENTS + 1);
     }
 
     #[tokio::test]

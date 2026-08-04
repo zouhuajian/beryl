@@ -24,6 +24,8 @@ use tonic::transport::Endpoint;
 use tonic::Code;
 use tracing::{debug, warn};
 
+use beryl_types::MAX_REPORT_ENTRIES;
+
 use crate::config::WorkerRegistrationConfig;
 use crate::control::{
     metadata_tonic_request, ControlIdentity, ControlOp, Registration, RegistrationDescriptor, RegistrationSet,
@@ -33,17 +35,20 @@ use crate::store::block::{BlockMetaPayload, BlockState};
 use crate::store::dirs::StoreDirs;
 use crate::WorkerCore;
 
+/// Worker-side batching policy constrained by the shared report protocol cap.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockReportOptions {
+    /// Maximum block entries sent in one full-report batch.
     pub full_max_blocks_per_batch: usize,
+    /// Maximum delta entries sent in one delta-report request.
     pub delta_max_entries_per_batch: usize,
 }
 
 impl Default for BlockReportOptions {
     fn default() -> Self {
         Self {
-            full_max_blocks_per_batch: 1_000,
-            delta_max_entries_per_batch: 1_000,
+            full_max_blocks_per_batch: MAX_REPORT_ENTRIES,
+            delta_max_entries_per_batch: MAX_REPORT_ENTRIES,
         }
     }
 }
@@ -122,10 +127,22 @@ impl MetadataBlockReportLoop {
                 "full_max_blocks_per_batch must be greater than zero".to_string(),
             ));
         }
+        if options.full_max_blocks_per_batch > MAX_REPORT_ENTRIES {
+            return Err(BlockReportError::InvalidConfig(format!(
+                "full_max_blocks_per_batch {} exceeds maximum {}",
+                options.full_max_blocks_per_batch, MAX_REPORT_ENTRIES
+            )));
+        }
         if options.delta_max_entries_per_batch == 0 {
             return Err(BlockReportError::InvalidConfig(
                 "delta_max_entries_per_batch must be greater than zero".to_string(),
             ));
+        }
+        if options.delta_max_entries_per_batch > MAX_REPORT_ENTRIES {
+            return Err(BlockReportError::InvalidConfig(format!(
+                "delta_max_entries_per_batch {} exceeds maximum {}",
+                options.delta_max_entries_per_batch, MAX_REPORT_ENTRIES
+            )));
         }
 
         let mut endpoints = Vec::with_capacity(config.endpoints.len());

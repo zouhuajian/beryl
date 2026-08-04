@@ -20,7 +20,7 @@ use beryl_types::chunk::ByteRange;
 use beryl_types::fs::FsErrorCode;
 use beryl_types::ids::{BlockId, BlockIndex, ClientId, InodeId, WorkerId};
 use beryl_types::layout::BlockFormatId;
-use beryl_types::{GroupName, Tier, TierFree, WorkerRunId};
+use beryl_types::{GroupName, Tier, TierFree, WorkerRunId, MAX_REPORT_ENTRIES};
 use bytes::Bytes;
 use tempfile::TempDir;
 use tonic::transport::Server;
@@ -1987,6 +1987,35 @@ async fn full_block_report_batches_by_configured_limit() {
         other => panic!("expected full report, got {other:?}"),
     }
     shutdown.send(()).ok();
+}
+
+#[test]
+fn block_report_batch_configuration_cannot_exceed_protocol_limit() {
+    let cases = [
+        BlockReportOptions {
+            full_max_blocks_per_batch: MAX_REPORT_ENTRIES + 1,
+            ..BlockReportOptions::default()
+        },
+        BlockReportOptions {
+            delta_max_entries_per_batch: MAX_REPORT_ENTRIES + 1,
+            ..BlockReportOptions::default()
+        },
+    ];
+
+    for options in cases {
+        let temp = TempDir::new().expect("tempdir");
+        let store = report_store(&temp);
+        let result = MetadataBlockReportLoop::with_options(
+            test_registration_config("http://127.0.0.1:1".to_string()),
+            test_registration_descriptor(test_worker_run_id()),
+            Arc::new(RegistrationSet::new()),
+            Arc::clone(&store),
+            test_worker_core(store),
+            options,
+        );
+
+        assert!(matches!(result, Err(BlockReportError::InvalidConfig(_))));
+    }
 }
 
 #[tokio::test]

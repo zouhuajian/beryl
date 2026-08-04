@@ -25,7 +25,7 @@ use crate::raft::RoutingDelta;
 use beryl_types::fs::{Extent, FileAttrs, FsErrorCode, Inode, InodeData, InodeId};
 use beryl_types::ids::{BlockId, BlockIndex, MountId, WorkerId};
 use beryl_types::layout::FileLayout;
-use beryl_types::GroupName;
+use beryl_types::{GroupName, MAX_FILE_EXTENTS};
 use std::sync::Arc;
 
 fn meta_err_to_fs_errno(err: &MetadataError) -> Option<FsErrorCode> {
@@ -248,6 +248,13 @@ impl AppRaftStateMachine {
                 lease_epoch,
                 mode,
             } => {
+                if extents.len() > MAX_FILE_EXTENTS {
+                    return Err(MetadataError::ResourceExhausted(format!(
+                        "PublishFile extent count {} exceeds maximum {}",
+                        extents.len(),
+                        MAX_FILE_EXTENTS
+                    )));
+                }
                 let result = self.apply_publish_file(
                     inode_id,
                     extents,

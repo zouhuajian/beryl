@@ -25,6 +25,13 @@ use tonic_health::pb::health_server::HealthServer;
 use tonic_health::server::{HealthReporter, HealthService};
 use tracing::info;
 
+/// Largest protobuf request accepted by either Metadata gRPC service.
+///
+/// Repeated-field limits remain the semantic authority. This transport bound
+/// prevents protobuf decoding from allocating an arbitrarily large request
+/// before service handlers can enforce those limits.
+const MAX_REQUEST_SIZE: usize = 4 * 1024 * 1024;
+
 pub type DynError = Box<dyn std::error::Error>;
 
 type MetadataHealthServer = HealthServer<HealthService>;
@@ -540,8 +547,8 @@ pub async fn serve(config: &MetadataConfig, services: RpcServices, _handles: Run
     let addr = config.rpc_addr;
     info!(addr = %addr, "Listening on (path/filesystem + worker services)");
     tonic_net::Server::builder()
-        .add_service(FileSystemServiceProtoServer::new(services.filesystem))
-        .add_service(MetadataWorkerServiceProtoServer::new(services.worker))
+        .add_service(FileSystemServiceProtoServer::new(services.filesystem).max_decoding_message_size(MAX_REQUEST_SIZE))
+        .add_service(MetadataWorkerServiceProtoServer::new(services.worker).max_decoding_message_size(MAX_REQUEST_SIZE))
         .add_service(services.health)
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
@@ -580,12 +587,40 @@ mod tests {
     use crate::raft::Command;
     use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction};
     use beryl_common::header::{RequestHeader, ResponseHeader};
+    use beryl_proto::common::BlockIdProto;
     use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
-    use beryl_proto::metadata::{MsyncRequestProto, MsyncResponseProto};
+    use beryl_proto::metadata::{CommitFileRequestProto, CommittedBlockProto, MsyncRequestProto, MsyncResponseProto};
     use beryl_types::ids::WorkerId;
-    use beryl_types::{ClientId, GroupName, GroupStateWatermark, RaftLogId};
+    use beryl_types::{ClientId, GroupName, GroupStateWatermark, RaftLogId, MAX_FILE_EXTENTS};
+    use prost::Message;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn maximum_commit_body_fits_metadata_request_limit() {
+        let committed_blocks = (0..MAX_FILE_EXTENTS)
+            .map(|index| CommittedBlockProto {
+                block_id: Some(BlockIdProto {
+                    inode_id: u64::MAX,
+                    block_index: index as u32,
+                }),
+                file_offset: u64::MAX,
+                len: u64::MAX,
+            })
+            .collect();
+        let request = CommitFileRequestProto {
+            committed_blocks,
+            final_size: u64::MAX,
+            expected_content_revision: u64::MAX,
+            expected_file_size: u64::MAX,
+            ..Default::default()
+        };
+
+        assert!(
+            request.encoded_len() < MAX_REQUEST_SIZE,
+            "maximum legal CommitFile body must fit the transport request ceiling"
+        );
+    }
 
     async fn test_authority(dir: &TempDir) -> MetadataAuthority {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
