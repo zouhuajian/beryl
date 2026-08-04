@@ -22,7 +22,7 @@ use crate::error::{to_fs_error_detail, MetadataError};
 use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use beryl_proto::metadata::*;
 use beryl_types::ids::InodeId;
-use beryl_types::CommittedBlock;
+use beryl_types::{CommittedBlock, MAX_FILE_EXTENTS};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::instrument;
@@ -644,6 +644,19 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
         };
+        if req.committed_blocks.len() > MAX_FILE_EXTENTS {
+            return error_response!(
+                CommitFileResponseProto,
+                Self::header_from_conversion_error(
+                    &req.header,
+                    MetadataError::ResourceExhausted(format!(
+                        "CommitFile committed block count {} exceeds maximum {}",
+                        req.committed_blocks.len(),
+                        MAX_FILE_EXTENTS
+                    )),
+                )
+            );
+        }
         let mut committed_blocks = Vec::with_capacity(req.committed_blocks.len());
         for block in req.committed_blocks {
             match Self::committed_block_from_proto(block) {
@@ -773,6 +786,19 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
         };
+        if req.committed_blocks.len() > MAX_FILE_EXTENTS {
+            return error_response!(
+                SyncWriteResponseProto,
+                Self::header_from_conversion_error(
+                    &req.header,
+                    MetadataError::ResourceExhausted(format!(
+                        "SyncWrite committed block count {} exceeds maximum {}",
+                        req.committed_blocks.len(),
+                        MAX_FILE_EXTENTS
+                    )),
+                )
+            );
+        }
         let mut committed_blocks = Vec::with_capacity(req.committed_blocks.len());
         for block in req.committed_blocks {
             match Self::committed_block_from_proto(block) {
@@ -843,7 +869,7 @@ mod tests {
     use beryl_types::fs::{Extent, FileAttrs, FsErrorCode, Inode, InodeId};
     use beryl_types::ids::{BlockId, BlockIndex, MountId, WorkerId};
     use beryl_types::layout::FileLayout;
-    use beryl_types::{ClientId, GroupName, RaftLogId, WorkerRunId};
+    use beryl_types::{ClientId, GroupName, RaftLogId, WorkerRunId, MAX_FILE_EXTENTS};
     use std::sync::Arc;
     use tempfile::TempDir;
     use tonic::Request;
@@ -1578,6 +1604,110 @@ mod tests {
         assert_fs_errno(&err, FsErrnoProto::FsErrnoEnotsup);
         assert!(err.message.contains("Recursive listing not yet implemented"));
         assert!(response.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_and_sync_allow_exact_limit_and_reject_larger_before_block_conversion() {
+        let env = build_env("/mnt/test", DataIoPolicy::Allow, None);
+        let committed_block = CommittedBlockProto {
+            block_id: Some(BlockId::new(InodeId::new(1), BlockIndex::new(1)).into()),
+            file_offset: 0,
+            len: 1,
+        };
+        let committed_blocks_at_limit = vec![committed_block; MAX_FILE_EXTENTS];
+
+        let commit_at_limit = FileSystemServiceProto::commit_file(
+            &env.service,
+            Request::new(CommitFileRequestProto {
+                header: header(708),
+                write_handle: Some(WriteHandleProto {
+                    inode_id: 1,
+                    write_lease_epoch: 1,
+                }),
+                committed_blocks: committed_blocks_at_limit.clone(),
+                write_mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        if let Some(error) = commit_at_limit.header.expect("response header").error {
+            assert_ne!(
+                rpc_error(&error).kind,
+                ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted)
+            );
+        }
+
+        let sync_at_limit = FileSystemServiceProto::sync_write(
+            &env.service,
+            Request::new(SyncWriteRequestProto {
+                header: header(709),
+                write_handle: Some(WriteHandleProto {
+                    inode_id: 1,
+                    write_lease_epoch: 1,
+                }),
+                committed_blocks: committed_blocks_at_limit,
+                write_mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        if let Some(error) = sync_at_limit.header.expect("response header").error {
+            assert_ne!(
+                rpc_error(&error).kind,
+                ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted)
+            );
+        }
+
+        let committed_blocks = vec![CommittedBlockProto::default(); MAX_FILE_EXTENTS + 1];
+        let write_handle = Some(WriteHandleProto {
+            inode_id: 1,
+            write_lease_epoch: 1,
+        });
+
+        let commit = FileSystemServiceProto::commit_file(
+            &env.service,
+            Request::new(CommitFileRequestProto {
+                header: header(710),
+                write_handle,
+                committed_blocks: committed_blocks.clone(),
+                write_mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        let commit_error = assert_fail_kind(
+            &header_error(commit.header),
+            ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted),
+        );
+        assert!(commit_error.message.contains("CommitFile committed block count"));
+
+        let sync = FileSystemServiceProto::sync_write(
+            &env.service,
+            Request::new(SyncWriteRequestProto {
+                header: header(711),
+                write_handle: Some(WriteHandleProto {
+                    inode_id: 1,
+                    write_lease_epoch: 1,
+                }),
+                committed_blocks,
+                write_mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        let sync_error = assert_fail_kind(
+            &header_error(sync.header),
+            ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted),
+        );
+        assert!(sync_error.message.contains("SyncWrite committed block count"));
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@ use crate::error::MetadataError;
 use beryl_common::error::rpc::{ErrorKind, ProtocolErrorKind, RpcErrorDetail};
 use beryl_common::header::{RequestHeader, ResponseHeader};
 use beryl_types::layout::FileLayout;
-use beryl_types::{FileBlockLocation, GroupName, GroupStateWatermark, WriteTarget};
+use beryl_types::{FileBlockLocation, GroupName, GroupStateWatermark, WriteTarget, MAX_BLOCK_SIZE, MAX_CHUNK_SIZE};
 use tracing::Span;
 
 #[allow(clippy::result_large_err)]
@@ -211,6 +211,18 @@ pub(crate) fn file_layout_from_proto(
     layout: Option<beryl_proto::common::FileLayoutProto>,
 ) -> Result<FileLayout, MetadataError> {
     let layout = layout.ok_or_else(|| MetadataError::InvalidArgument("Missing FileLayout".to_string()))?;
+    if layout.block_size > MAX_BLOCK_SIZE {
+        return Err(MetadataError::ResourceExhausted(format!(
+            "block_size {} exceeds maximum {}",
+            layout.block_size, MAX_BLOCK_SIZE
+        )));
+    }
+    if layout.chunk_size > MAX_CHUNK_SIZE {
+        return Err(MetadataError::ResourceExhausted(format!(
+            "chunk_size {} exceeds maximum {}",
+            layout.chunk_size, MAX_CHUNK_SIZE
+        )));
+    }
     FileLayout::try_from(layout).map_err(MetadataError::InvalidArgument)
 }
 
@@ -224,9 +236,30 @@ pub(crate) fn location_to_proto(location: &FileBlockLocation) -> beryl_proto::me
 
 #[cfg(test)]
 mod tests {
-    use super::request_context_from_proto;
+    use super::{file_layout_from_proto, request_context_from_proto};
     use beryl_common::error::rpc::{ErrorKind, ProtocolErrorKind, RecoveryAction, RpcErrorDetail};
-    use beryl_types::ClientId;
+    use beryl_types::{BlockFormatId, ClientId, MAX_BLOCK_SIZE, MAX_CHUNK_SIZE};
+
+    #[test]
+    fn file_layout_wire_conversion_maps_hard_size_limits_to_resource_exhausted() {
+        let block_error = file_layout_from_proto(Some(beryl_proto::common::FileLayoutProto {
+            block_size: MAX_BLOCK_SIZE + 1,
+            chunk_size: MAX_CHUNK_SIZE,
+            replication: 1,
+            block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
+        }))
+        .expect_err("oversized block must fail");
+        assert!(matches!(block_error, crate::MetadataError::ResourceExhausted(_)));
+
+        let chunk_error = file_layout_from_proto(Some(beryl_proto::common::FileLayoutProto {
+            block_size: MAX_BLOCK_SIZE,
+            chunk_size: MAX_CHUNK_SIZE + 1,
+            replication: 1,
+            block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
+        }))
+        .expect_err("oversized chunk must fail");
+        assert!(matches!(chunk_error, crate::MetadataError::ResourceExhausted(_)));
+    }
 
     fn assert_invalid_header_error(error: &RpcErrorDetail, expected_message: &str) {
         assert_eq!(error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));

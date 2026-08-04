@@ -10,6 +10,13 @@ use crate::ids::MountId;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// Largest number of extents stored in one file inode by the inline layout.
+///
+/// This fixed ceiling bounds replicated publication and inode serialization.
+/// Files that need more extents require paged extent storage rather than a
+/// larger inline vector.
+pub const MAX_FILE_EXTENTS: usize = 10_000;
+
 /// Inode identifier (64-bit).
 ///
 /// Inodes are the authoritative identity for filesystem objects.

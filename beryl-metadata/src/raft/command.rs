@@ -15,6 +15,13 @@ pub(crate) const MAX_RECLAIM_DETACHED_ROOT_ENTRIES: u32 = 256;
 pub(crate) const MIN_RECLAIM_DETACHED_ROOT_BATCH_BYTES: u32 = 4 * 1024;
 pub(crate) const MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES: u32 = 1024 * 1024;
 
+/// Largest serialized application command admitted to Raft.
+///
+/// This limits the command payload before OpenRaft constructs or persists a
+/// log entry. Semantic apply limits remain responsible for bounding state
+/// machine work after replay.
+pub(crate) const MAX_COMMAND_BYTES: usize = 4 * 1024 * 1024;
+
 /// File publication precondition and merge behavior.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PublishMode {
@@ -150,4 +157,43 @@ pub(crate) fn proposal_timestamp_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beryl_types::{BlockId, BlockIndex, MAX_FILE_EXTENTS};
+
+    #[test]
+    fn maximum_publish_file_command_fits_command_limit() {
+        let inode_id = InodeId::new(u64::MAX);
+        let extents = (0..MAX_FILE_EXTENTS)
+            .map(|index| Extent {
+                file_offset: u64::MAX,
+                block_id: BlockId::new(inode_id, BlockIndex::new(index as u32)),
+                block_offset: u64::MAX,
+                len: u64::MAX,
+                content_revision: Some(u64::MAX),
+                block_stamp: Some(u64::MAX),
+            })
+            .collect();
+        let command = Command::PublishFile {
+            proposed_at_ms: u64::MAX,
+            inode_id,
+            extents,
+            target_size: u64::MAX,
+            expected_content_revision: u64::MAX,
+            expected_file_size: u64::MAX,
+            lease_epoch: u64::MAX,
+            mode: PublishMode::ReplaceIfUnchanged,
+        };
+
+        let encoded = serde_json::to_vec(&command).expect("maximum legal command must serialize");
+        assert!(
+            encoded.len() <= MAX_COMMAND_BYTES,
+            "maximum legal PublishFile command is {} bytes, exceeding {}",
+            encoded.len(),
+            MAX_COMMAND_BYTES
+        );
+    }
 }

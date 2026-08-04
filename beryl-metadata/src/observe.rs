@@ -18,6 +18,7 @@ pub(crate) const METADATA_RAFT_LAST_APPLIED_INDEX: &str = "metadata_raft_last_ap
 pub(crate) const METADATA_RAFT_COMMITTED_INDEX: &str = "metadata_raft_committed_index";
 pub(crate) const METADATA_RAFT_PROPOSALS_TOTAL: &str = "metadata_raft_proposals_total";
 pub(crate) const METADATA_RAFT_PROPOSE_DURATION_SECONDS: &str = "metadata_raft_propose_duration_seconds";
+pub(crate) const METADATA_RAFT_COMMAND_BYTES: &str = "metadata_raft_command_bytes";
 pub(crate) const METADATA_RAFT_APPLY_TOTAL: &str = "metadata_raft_apply_total";
 pub(crate) const METADATA_RAFT_APPLY_DURATION_SECONDS: &str = "metadata_raft_apply_duration_seconds";
 pub(crate) const METADATA_RAFT_LOG_DURABLE_WRITE_BYTES_TOTAL: &str = "metadata_raft_log_durable_write_bytes_total";
@@ -111,6 +112,11 @@ pub(crate) fn record_raft_proposal(status: &str, error_kind: &str, duration_seco
         "error_kind" => error_kind.to_string()
     )
     .record(duration_seconds);
+}
+
+/// Records serialized command size with one stable operation label.
+pub(crate) fn record_raft_command_bytes(operation: &'static str, bytes: usize) {
+    metrics::histogram!(METADATA_RAFT_COMMAND_BYTES, "operation" => operation).record(bytes as f64);
 }
 
 pub(crate) fn record_raft_apply(status: &str, error_kind: &str, duration_seconds: f64) {
@@ -657,6 +663,7 @@ mod tests {
         record_raft_term(2);
         record_raft_indexes(Some(3), Some(4));
         record_raft_proposal("ok", "none", 0.001);
+        record_raft_command_bytes("publish_file", 128);
         record_raft_apply("ok", "none", 0.002);
         record_raft_log_durable_write("ok", 128, 0.002);
         record_raft_snapshot("build", "complete", "ok", 1024, 0.002);

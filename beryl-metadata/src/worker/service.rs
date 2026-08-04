@@ -20,7 +20,7 @@ use ::beryl_common::observe::propagation::{extract_trace_context, ExtractedConte
 use beryl_proto::convert::require_worker_run_id;
 use beryl_proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProto;
 use beryl_proto::metadata::*;
-use beryl_types::{BlockId, GroupName, TierFree, WorkerId};
+use beryl_types::{BlockId, GroupName, TierFree, WorkerId, MAX_REPORT_ENTRIES};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -990,6 +990,17 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 block_report_request_proto::Report::Full(full) => {
                     let batch_seq = full.batch_seq;
                     let final_batch = full.final_batch;
+                    if full.blocks.len() > MAX_REPORT_ENTRIES {
+                        return self.metadata_error_response(
+                            &req.header,
+                            block_report_response_with_header,
+                            MetadataError::ResourceExhausted(format!(
+                                "full block report entry count {} exceeds maximum {}",
+                                full.blocks.len(),
+                                MAX_REPORT_ENTRIES
+                            )),
+                        );
+                    }
                     let mut blocks = Vec::with_capacity(full.blocks.len());
                     for block in full.blocks {
                         match Self::proto_to_report_block(block) {
@@ -1084,6 +1095,17 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 }
                 block_report_request_proto::Report::Delta(delta) => {
                     let delta_seq = delta.delta_seq;
+                    if delta.deltas.len() > MAX_REPORT_ENTRIES {
+                        return self.metadata_error_response(
+                            &req.header,
+                            block_report_response_with_header,
+                            MetadataError::ResourceExhausted(format!(
+                                "delta block report entry count {} exceeds maximum {}",
+                                delta.deltas.len(),
+                                MAX_REPORT_ENTRIES
+                            )),
+                        );
+                    }
                     let mut deltas = Vec::with_capacity(delta.deltas.len());
                     for delta in delta.deltas {
                         match Self::proto_to_delta(delta) {
@@ -1259,8 +1281,7 @@ mod tests {
     use crate::MountTable;
     use ::beryl_common::error::rpc::{InternalErrorKind, ProtocolErrorKind, RecoveryAction};
     use beryl_proto::convert::rpc_error_from_proto;
-    use beryl_types::ClientId;
-    use beryl_types::WorkerRunId;
+    use beryl_types::{BlockIndex, ClientId, InodeId, WorkerRunId};
     use metrics::{
         Counter, CounterFn, Gauge, Histogram, HistogramFn, Key, KeyName, Metadata, Recorder, SharedString, Unit,
     };
@@ -1515,6 +1536,119 @@ mod tests {
         format!("550e8400-e29b-41d4-a716-{suffix:012x}")
             .parse()
             .expect("valid test WorkerRunId")
+    }
+
+    #[tokio::test]
+    async fn block_report_allows_exact_limit_and_rejects_larger_batches_before_entry_conversion() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            Arc::new(WorkerManager::new(60)),
+            Arc::new(MountTable::new()),
+            group_name("root"),
+        );
+        let worker_id = WorkerId::new(41);
+        let worker_run_id = test_worker_run_id();
+        let block_ids_at_limit = (0..MAX_REPORT_ENTRIES)
+            .map(|index| BlockId::new(InodeId::new(77), BlockIndex::new(index as u32)))
+            .collect::<Vec<_>>();
+
+        let full_at_limit = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+            &service,
+            Request::new(full_report_request(
+                group_name("root"),
+                worker_id,
+                worker_run_id,
+                1,
+                0,
+                true,
+                block_ids_at_limit.clone(),
+            )),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        assert_error_kind(
+            &full_at_limit
+                .header
+                .expect("response header")
+                .error
+                .expect("registration error"),
+            ErrorKind::Worker(WorkerErrorKind::NotRegistered),
+        );
+
+        let deltas_at_limit = block_ids_at_limit
+            .into_iter()
+            .map(|block_id| (BlockReportDeltaOpProto::BlockReportDeltaOpAddUpdate, block_id))
+            .collect();
+        let delta_at_limit = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+            &service,
+            Request::new(delta_report_request(
+                group_name("root"),
+                worker_id,
+                worker_run_id,
+                2,
+                1,
+                deltas_at_limit,
+            )),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        assert_error_kind(
+            &delta_at_limit
+                .header
+                .expect("response header")
+                .error
+                .expect("registration error"),
+            ErrorKind::Worker(WorkerErrorKind::NotRegistered),
+        );
+
+        let block_ids = (0..=MAX_REPORT_ENTRIES)
+            .map(|index| BlockId::new(InodeId::new(77), BlockIndex::new(index as u32)))
+            .collect::<Vec<_>>();
+
+        let full = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+            &service,
+            Request::new(full_report_request(
+                group_name("root"),
+                worker_id,
+                worker_run_id,
+                3,
+                0,
+                true,
+                block_ids.clone(),
+            )),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        let full_error = full.header.expect("response header").error.expect("limit error");
+        let full_error = assert_error_fail(&full_error, ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted));
+        assert!(full_error.message.contains("full block report entry count"));
+
+        let deltas = block_ids
+            .into_iter()
+            .map(|block_id| (BlockReportDeltaOpProto::BlockReportDeltaOpAddUpdate, block_id))
+            .collect();
+        let delta = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+            &service,
+            Request::new(delta_report_request(
+                group_name("root"),
+                worker_id,
+                worker_run_id,
+                4,
+                1,
+                deltas,
+            )),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        let delta_error = delta.header.expect("response header").error.expect("limit error");
+        let delta_error = assert_error_fail(&delta_error, ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted));
+        assert!(delta_error.message.contains("delta block report entry count"));
     }
 
     #[allow(clippy::too_many_arguments)]

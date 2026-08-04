@@ -53,6 +53,7 @@ pub(crate) enum ApplyRejectionKind {
     Busy,
     ActiveWorkerConflict,
     Again,
+    ResourceExhausted,
     LeaseFenced { expected: u64, got: u64 },
 }
 
@@ -114,6 +115,10 @@ impl ApplyRejection {
                 kind: ApplyRejectionKind::Again,
                 message,
             },
+            MetadataError::ResourceExhausted(message) => Self {
+                kind: ApplyRejectionKind::ResourceExhausted,
+                message,
+            },
             MetadataError::LeaseFenced { expected, got } => Self {
                 kind: ApplyRejectionKind::LeaseFenced { expected, got },
                 message: format!("lease fenced: expected epoch >= {expected}, got {got}"),
@@ -124,7 +129,6 @@ impl ApplyRejection {
             | MetadataError::RoutingStale(_)
             | MetadataError::StaleState(_)
             | MetadataError::FullReportRequired(_)
-            | MetadataError::ResourceExhausted(_)
             | MetadataError::Internal(_)
             | MetadataError::ServiceUnavailable(_)) => return Err(FatalApplyError(fatal)),
         };
@@ -145,6 +149,7 @@ impl ApplyRejection {
             ApplyRejectionKind::Busy => MetadataError::Busy(self.message),
             ApplyRejectionKind::ActiveWorkerConflict => MetadataError::ActiveWorkerConflict(self.message),
             ApplyRejectionKind::Again => MetadataError::Again(self.message),
+            ApplyRejectionKind::ResourceExhausted => MetadataError::ResourceExhausted(self.message),
             ApplyRejectionKind::LeaseFenced { expected, got } => MetadataError::LeaseFenced { expected, got },
         }
     }
@@ -205,6 +210,13 @@ mod tests {
         assert!(matches!(
             rejection.into_metadata_error(),
             MetadataError::NotFound(message) if message == "inode 7"
+        ));
+
+        let rejection =
+            ApplyRejection::from_metadata_error(MetadataError::ResourceExhausted("extent limit".to_string())).unwrap();
+        assert!(matches!(
+            rejection.into_metadata_error(),
+            MetadataError::ResourceExhausted(message) if message == "extent limit"
         ));
     }
 

@@ -7,7 +7,7 @@ use crate::config::RaftConfig;
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::MountTable;
 use crate::observe;
-use crate::raft::command::Command;
+use crate::raft::command::{Command, MAX_COMMAND_BYTES};
 use crate::raft::network::SingleNodeNetworkFactory;
 use crate::raft::response::CommandResult;
 use crate::raft::state_machine::AppRaftStateMachine as AppStateMachine;
@@ -19,7 +19,7 @@ use openraft::{Config, Raft, RaftMetrics, RaftTypeConfig, ServerState, SnapshotP
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Raft node ID type.
 pub(crate) type NodeId = <MetadataRaftTypeConfig as RaftTypeConfig>::NodeId;
@@ -138,9 +138,44 @@ impl AppRaftNode {
         Ok(())
     }
 
-    /// Propose a command to Raft.
+    /// Propose one bounded application command to Raft.
+    ///
+    /// Serialized size is checked before `client_write`, so an oversized
+    /// command has a definite failure outcome and cannot enter the Raft log.
     pub async fn propose(&self, command: Command) -> MetadataResult<CommandResult> {
         let started = Instant::now();
+        let operation = command.operation_name();
+        let command_bytes = match serde_json::to_vec(&command) {
+            Ok(encoded) => encoded.len(),
+            Err(error) => {
+                let error = MetadataError::Internal(format!("Failed to serialize {operation} Raft command: {error}"));
+                observe::record_raft_proposal(
+                    "error",
+                    observe::metadata_error_kind(&error),
+                    started.elapsed().as_secs_f64(),
+                );
+                return Err(error);
+            }
+        };
+        observe::record_raft_command_bytes(operation, command_bytes);
+        if command_bytes > MAX_COMMAND_BYTES {
+            let error = MetadataError::ResourceExhausted(format!(
+                "Raft command {operation} serialized to {command_bytes} bytes, exceeding maximum {MAX_COMMAND_BYTES}"
+            ));
+            observe::record_raft_proposal(
+                "error",
+                observe::metadata_error_kind(&error),
+                started.elapsed().as_secs_f64(),
+            );
+            warn!(
+                target: "metadata.raft",
+                operation,
+                command_bytes,
+                maximum = MAX_COMMAND_BYTES,
+                "Raft command rejected before proposal"
+            );
+            return Err(error);
+        }
         match self.raft.client_write(command).await {
             Ok(result) => {
                 self.record_current_raft_metrics();
@@ -300,6 +335,7 @@ mod tests {
     use crate::raft::storage::RocksDBStorage;
     use crate::state::{RaftStateStore, RouteEpoch, StateStore};
     use crate::MetadataConfig;
+    use beryl_types::{GroupName, WorkerId};
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -354,6 +390,77 @@ mod tests {
         assert_eq!(node.get_membership_nodes(), expected_membership_nodes);
         assert_eq!(node.committed_index(), expected_committed);
         assert_eq!(route_store.get_route_epoch().await.unwrap(), RouteEpoch::new(7));
+        node.shutdown().await.unwrap();
+    }
+
+    fn register_worker_command_with_encoded_size(worker_id: WorkerId, encoded_size: usize) -> Command {
+        let mut command = Command::RegisterWorkerDescriptor {
+            proposed_at_ms: 1,
+            group_name: GroupName::parse("root").unwrap(),
+            worker_id,
+            address: String::new(),
+            worker_net_protocol: 1,
+            fault_domain: None,
+        };
+        let base_size = serde_json::to_vec(&command).unwrap().len();
+        let Command::RegisterWorkerDescriptor { address, .. } = &mut command else {
+            unreachable!("test command variant is fixed")
+        };
+        *address = "x".repeat(
+            encoded_size
+                .checked_sub(base_size)
+                .expect("target size must fit command envelope"),
+        );
+        assert_eq!(serde_json::to_vec(&command).unwrap().len(), encoded_size);
+        command
+    }
+
+    #[tokio::test]
+    async fn command_at_limit_is_admitted_and_larger_command_is_rejected_before_raft_log_admission() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let state_machine = Arc::new(AppStateMachine::new(Arc::clone(&storage)));
+        let node = Arc::new(
+            AppRaftNode::new(
+                1,
+                Arc::clone(&storage),
+                state_machine,
+                mount_table,
+                &RaftConfig::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        node.initialize_single_node("127.0.0.1:0".to_string()).await.unwrap();
+        for _ in 0..100 {
+            if node.is_leader() && node.get_last_applied_state_id().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(node.is_leader());
+
+        node.propose(register_worker_command_with_encoded_size(
+            WorkerId::new(1),
+            MAX_COMMAND_BYTES,
+        ))
+        .await
+        .expect("command exactly at the byte limit must be admitted");
+        let applied_after_limit = node.get_last_applied_state_id();
+        let committed_after_limit = node.committed_index();
+
+        let error = node
+            .propose(register_worker_command_with_encoded_size(
+                WorkerId::new(2),
+                MAX_COMMAND_BYTES + 1,
+            ))
+            .await
+            .expect_err("oversized command must fail before client_write");
+
+        assert!(matches!(error, MetadataError::ResourceExhausted(_)));
+        assert_eq!(node.get_last_applied_state_id(), applied_after_limit);
+        assert_eq!(node.committed_index(), committed_after_limit);
         node.shutdown().await.unwrap();
     }
 

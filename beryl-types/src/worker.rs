@@ -10,6 +10,13 @@ use uuid::Uuid;
 
 use crate::ids::WorkerId;
 
+/// Largest number of block entries accepted in one full or delta report batch.
+///
+/// A complete full report may contain multiple batches. This ceiling bounds
+/// one Worker-to-Metadata RPC without limiting the total blocks owned by a
+/// Worker.
+pub const MAX_REPORT_ENTRIES: usize = 1_000;
+
 /// Worker network protocol advertised by metadata and consumed by clients/workers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum WorkerNetProtocol {
