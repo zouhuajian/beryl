@@ -9,13 +9,13 @@ use super::{
     RequestContext,
 };
 use crate::error::MetadataError;
-use crate::inode_lease::WriteMode;
+use crate::inode_lease::{LeaseError, WriteMode};
 use crate::observe;
 use crate::placement::{PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus};
 use crate::raft::FsCommandResult;
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
 use beryl_common::header::CallerContextFields;
-use beryl_types::fs::{FsErrorCode, InodeId};
+use beryl_types::fs::InodeId;
 use beryl_types::ids::BlockId;
 use beryl_types::layout::FileLayout;
 use beryl_types::lease::FencingToken;
@@ -272,8 +272,8 @@ impl MetadataFileSystem {
             .await
         {
             Ok(FsCommandResult::Ok(ok)) => ok.lease_epoch,
-            Ok(FsCommandResult::Err(err)) => {
-                return self.fatal_fs_failure(ctx, err.errno, err.message, group_name, mount_epoch);
+            Ok(FsCommandResult::Err(rejection)) => {
+                return self.failure_from_error(ctx, rejection.into_metadata_error(), group_name, mount_epoch);
             }
             Err(err) => return self.failure_from_error(ctx, err, group_name, mount_epoch),
         };
@@ -489,20 +489,28 @@ impl MetadataFileSystem {
                 .try_acquire(inode_id, caller_ctx.client.client_id, mode, current_lease_epoch)
             {
                 Ok(result) => result,
-                Err(FsErrorCode::EBusy) => {
-                    return self.fatal_fs_failure(
+                Err(LeaseError::Active) => {
+                    return self.failure_from_error(
                         ctx,
-                        FsErrorCode::EBusy,
-                        format!("File already has an active write lease: {}", inode_id),
+                        MetadataError::Busy(format!("File already has an active write lease: {}", inode_id)),
                         group_name,
                         mount_epoch,
                     );
                 }
-                Err(e) => {
-                    return self.fatal_fs_failure(
+                Err(LeaseError::EpochExhausted) => {
+                    return self.failure_from_error(
                         ctx,
-                        e,
-                        format!("Failed to acquire lease: {}", inode_id),
+                        MetadataError::ResourceExhausted(format!("write lease epoch exhausted for inode {inode_id}")),
+                        group_name,
+                        mount_epoch,
+                    );
+                }
+                Err(error) => {
+                    return self.failure_from_error(
+                        ctx,
+                        MetadataError::Internal(format!(
+                            "unexpected lease acquisition failure for inode {inode_id}: {error:?}"
+                        )),
                         group_name,
                         mount_epoch,
                     );
@@ -527,9 +535,9 @@ impl MetadataFileSystem {
                     mount_epoch,
                 );
             }
-            Ok(FsCommandResult::Err(err)) => {
+            Ok(FsCommandResult::Err(rejection)) => {
                 self.lease_manager.release(inode_id, lease_epoch);
-                return self.fatal_fs_failure(ctx, err.errno, err.message, group_name, mount_epoch);
+                return self.failure_from_error(ctx, rejection.into_metadata_error(), group_name, mount_epoch);
             }
             Err(err) => {
                 self.lease_manager.release(inode_id, lease_epoch);
@@ -960,10 +968,10 @@ impl MetadataFileSystem {
 }
 
 #[cfg(test)]
-mod open_write_tests {
+mod tests {
     use super::*;
     use crate::raft::Command;
-    use crate::service::filesystem::test_support::*;
+    use crate::service::filesystem::tests::*;
 
     #[tokio::test]
     async fn open_write_does_not_require_worker_placement() {
@@ -1065,7 +1073,7 @@ mod open_write_tests {
             .finish_open_write(&request_context(), open_path, &resolved, opened)
             .expect_err("OpenWrite must not publish a stale ancestor chain");
 
-        assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EAgain));
+        assert_retry(&failure.error, ErrorKind::Metadata(MetadataErrorKind::Conflict));
         assert!(filesystem.write_session_for_inode(file_inode_id).is_none());
         assert!(!filesystem.lease_manager().is_active_lease(file_inode_id, lease_epoch));
         let moved = filesystem.path_resolver.resolve_path("/new/file").unwrap();
@@ -1135,7 +1143,7 @@ mod open_write_tests {
             .expect_err("a duplicate OpenWrite must fail closed while the lease is active");
         assert_fail(
             &duplicate.error,
-            beryl_common::error::rpc::ErrorKind::Fs(FsErrorCode::EBusy),
+            beryl_common::error::rpc::ErrorKind::Metadata(MetadataErrorKind::Busy),
         );
         let epoch_after_duplicate = storage.get_inode(inode_id).unwrap().and_then(|inode| match inode.data {
             beryl_types::fs::InodeData::File { lease_epoch, .. } => lease_epoch,

@@ -10,8 +10,7 @@ use crate::mount::{DataIoPolicy, MountTable};
 use crate::raft::AppRaftNode;
 use crate::readiness::RootReadinessGate;
 use crate::state::StateStore;
-use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint, RpcErrorDetail};
-use beryl_types::fs::FsErrorCode;
+use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RefreshHint, RpcErrorDetail};
 use beryl_types::ids::MountId;
 use beryl_types::{GroupName, RaftLogId};
 use std::sync::Arc;
@@ -167,8 +166,8 @@ impl DataIoPolicyGuard {
             return Ok(());
         }
 
-        let err = RpcErrorDetail::fs(
-            FsErrorCode::ENotsup,
+        let err = RpcErrorDetail::fail(
+            ErrorKind::Protocol(ProtocolErrorKind::Unsupported),
             format!(
                 "MountDataIoForbidden: op={} mount_prefix={}",
                 op.as_str(),
@@ -179,130 +178,6 @@ impl DataIoPolicyGuard {
             Some(mount_entry.namespace_owner_group_name),
             Some(mount_entry.mount_epoch),
         ))
-    }
-}
-
-#[cfg(test)]
-mod admission_tests {
-    use super::*;
-    use crate::config::RaftConfig;
-    use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
-    use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
-    use crate::readiness::RootReadinessGate;
-    use beryl_common::error::rpc::InternalErrorKind;
-    use beryl_common::error::rpc::{ErrorKind, RecoveryAction};
-    use beryl_common::header::RequestHeader;
-    use beryl_types::GroupName;
-    use tempfile::TempDir;
-
-    fn group_name(raw: &str) -> GroupName {
-        GroupName::parse(raw).unwrap()
-    }
-
-    fn request_context(client_id: u128) -> RequestContext {
-        let caller = RequestHeader::new(beryl_types::ClientId::new(client_id));
-        RequestContext {
-            caller,
-            route_epoch: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn readiness_guard_blocks_when_not_ready() {
-        let mount_table = Arc::new(MountTable::new());
-        let gate = Arc::new(RootReadinessGate::new(None));
-        let chain = AdmissionGuard::new(mount_table).with_readiness_gate(Some(Arc::clone(&gate)));
-
-        let err = chain.check_meta_read(&request_context(1)).await.unwrap_err();
-        assert_eq!(err.err.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
-        assert_eq!(err.err.recovery, RecoveryAction::Retry { after_ms: Some(1000) });
-        assert!(!gate.is_ready());
-    }
-
-    #[tokio::test]
-    async fn check_meta_write_checks_readiness_then_leadership() {
-        let gate = Arc::new(RootReadinessGate::new(None));
-        let chain = AdmissionGuard::new(Arc::new(MountTable::new())).with_readiness_gate(Some(Arc::clone(&gate)));
-
-        let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
-        assert_eq!(err.err.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
-        assert_eq!(err.err.recovery, RecoveryAction::Retry { after_ms: Some(1000) });
-    }
-
-    #[tokio::test]
-    async fn leadership_guard_without_raft_node_returns_unavailable() {
-        let chain = AdmissionGuard::new(Arc::new(MountTable::new()));
-
-        let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
-        assert_eq!(err.err.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
-        assert_eq!(err.err.recovery, RecoveryAction::Retry { after_ms: Some(1000) });
-    }
-
-    #[tokio::test]
-    async fn leadership_guard_returns_not_leader_for_nonleader_raft_node() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_table = Arc::new(MountTable::new());
-        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
-        let raft_config = RaftConfig::default();
-        let raft_node = Arc::new(
-            AppRaftNode::new(1, storage, state_machine, Arc::clone(&mount_table), &raft_config)
-                .await
-                .unwrap(),
-        );
-        assert!(!raft_node.is_leader());
-        let chain = AdmissionGuard::new(mount_table).with_raft_node(Some(raft_node));
-
-        let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
-
-        assert_eq!(err.err.kind, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
-        assert!(matches!(err.err.recovery, RecoveryAction::RefreshMetadata { .. }));
-    }
-
-    #[tokio::test]
-    async fn check_data_write_checks_leadership_before_data_io_policy() {
-        let mount_table = Arc::new(MountTable::new());
-        let mount_entry = MountEntry {
-            mount_id: MountId::new(1),
-            mount_prefix: "/archive".to_string(),
-            mount_kind: MountKind::External,
-            ufs_uri: Some("s3://archive".to_string()),
-            data_io_policy: DataIoPolicy::Forbid,
-            mount_epoch: 1,
-            namespace_owner_group_name: group_name("root"),
-            root_inode_id: ROOT_INODE_ID,
-        };
-        mount_table.upsert(mount_entry.clone()).unwrap();
-        let chain = AdmissionGuard::new(Arc::clone(&mount_table));
-
-        let err = chain
-            .check_data_write(&request_context(3), mount_entry.mount_id)
-            .await
-            .unwrap_err();
-        assert_eq!(err.err.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
-        assert_eq!(err.err.recovery, RecoveryAction::Retry { after_ms: Some(1000) });
-    }
-
-    #[tokio::test]
-    async fn data_io_guard_allows_writable_root() {
-        let mount_table = Arc::new(MountTable::new());
-        let root_entry = MountEntry {
-            mount_id: MountId::new(1),
-            mount_prefix: ROOT_MOUNT_PREFIX.to_string(),
-            mount_kind: MountKind::Internal,
-            ufs_uri: None,
-            data_io_policy: DataIoPolicy::Allow,
-            mount_epoch: 1,
-            namespace_owner_group_name: group_name("root"),
-            root_inode_id: ROOT_INODE_ID,
-        };
-        mount_table.upsert(root_entry.clone()).unwrap();
-        let chain = AdmissionGuard::new(Arc::clone(&mount_table));
-
-        chain
-            .check_data_read(&request_context(3), root_entry.mount_id)
-            .await
-            .unwrap();
     }
 }
 
@@ -467,7 +342,130 @@ impl FreshnessValidator {
 }
 
 #[cfg(test)]
-mod freshness_tests {
+mod tests {
+    mod admission {
+        use super::super::*;
+        use crate::config::RaftConfig;
+        use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
+        use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
+        use crate::readiness::RootReadinessGate;
+        use beryl_common::error::rpc::InternalErrorKind;
+        use beryl_common::error::rpc::{ErrorKind, RecoveryAction};
+        use beryl_common::header::RequestHeader;
+        use beryl_types::GroupName;
+        use tempfile::TempDir;
+
+        fn group_name(raw: &str) -> GroupName {
+            GroupName::parse(raw).unwrap()
+        }
+
+        fn request_context(client_id: u128) -> RequestContext {
+            let caller = RequestHeader::new(beryl_types::ClientId::new(client_id));
+            RequestContext {
+                caller,
+                route_epoch: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn readiness_guard_blocks_when_not_ready() {
+            let mount_table = Arc::new(MountTable::new());
+            let gate = Arc::new(RootReadinessGate::new(None));
+            let chain = AdmissionGuard::new(mount_table).with_readiness_gate(Some(Arc::clone(&gate)));
+
+            let err = chain.check_meta_read(&request_context(1)).await.unwrap_err();
+            assert_eq!(err.err.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
+            assert_eq!(err.err.recovery, RecoveryAction::Retry { after_ms: Some(1000) });
+            assert!(!gate.is_ready());
+        }
+
+        #[tokio::test]
+        async fn check_meta_write_checks_readiness_then_leadership() {
+            let gate = Arc::new(RootReadinessGate::new(None));
+            let chain = AdmissionGuard::new(Arc::new(MountTable::new())).with_readiness_gate(Some(Arc::clone(&gate)));
+
+            let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
+            assert_eq!(err.err.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
+            assert_eq!(err.err.recovery, RecoveryAction::Retry { after_ms: Some(1000) });
+        }
+
+        #[tokio::test]
+        async fn leadership_guard_without_raft_node_returns_unavailable() {
+            let chain = AdmissionGuard::new(Arc::new(MountTable::new()));
+
+            let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
+            assert_eq!(err.err.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
+            assert_eq!(err.err.recovery, RecoveryAction::Retry { after_ms: Some(1000) });
+        }
+
+        #[tokio::test]
+        async fn leadership_guard_returns_not_leader_for_nonleader_raft_node() {
+            let dir = TempDir::new().unwrap();
+            let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+            let mount_table = Arc::new(MountTable::new());
+            let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
+            let raft_config = RaftConfig::default();
+            let raft_node = Arc::new(
+                AppRaftNode::new(1, storage, state_machine, Arc::clone(&mount_table), &raft_config)
+                    .await
+                    .unwrap(),
+            );
+            assert!(!raft_node.is_leader());
+            let chain = AdmissionGuard::new(mount_table).with_raft_node(Some(raft_node));
+
+            let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
+
+            assert_eq!(err.err.kind, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
+            assert!(matches!(err.err.recovery, RecoveryAction::RefreshMetadata { .. }));
+        }
+
+        #[tokio::test]
+        async fn check_data_write_checks_leadership_before_data_io_policy() {
+            let mount_table = Arc::new(MountTable::new());
+            let mount_entry = MountEntry {
+                mount_id: MountId::new(1),
+                mount_prefix: "/archive".to_string(),
+                mount_kind: MountKind::External,
+                ufs_uri: Some("s3://archive".to_string()),
+                data_io_policy: DataIoPolicy::Forbid,
+                mount_epoch: 1,
+                namespace_owner_group_name: group_name("root"),
+                root_inode_id: ROOT_INODE_ID,
+            };
+            mount_table.upsert(mount_entry.clone()).unwrap();
+            let chain = AdmissionGuard::new(Arc::clone(&mount_table));
+
+            let err = chain
+                .check_data_write(&request_context(3), mount_entry.mount_id)
+                .await
+                .unwrap_err();
+            assert_eq!(err.err.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
+            assert_eq!(err.err.recovery, RecoveryAction::Retry { after_ms: Some(1000) });
+        }
+
+        #[tokio::test]
+        async fn data_io_guard_allows_writable_root() {
+            let mount_table = Arc::new(MountTable::new());
+            let root_entry = MountEntry {
+                mount_id: MountId::new(1),
+                mount_prefix: ROOT_MOUNT_PREFIX.to_string(),
+                mount_kind: MountKind::Internal,
+                ufs_uri: None,
+                data_io_policy: DataIoPolicy::Allow,
+                mount_epoch: 1,
+                namespace_owner_group_name: group_name("root"),
+                root_inode_id: ROOT_INODE_ID,
+            };
+            mount_table.upsert(root_entry.clone()).unwrap();
+            let chain = AdmissionGuard::new(Arc::clone(&mount_table));
+
+            chain
+                .check_data_read(&request_context(3), root_entry.mount_id)
+                .await
+                .unwrap();
+        }
+    }
+
     use super::*;
     use crate::error::MetadataError;
     use crate::state::RouteEpoch;
@@ -489,7 +487,7 @@ mod freshness_tests {
 
         assert!(matches!(error, MetadataError::Internal(_)));
     }
-    use crate::service::filesystem::test_support::*;
+    use crate::service::filesystem::tests::*;
 
     #[test]
     fn freshness_validator_rejects_mount_epoch_with_replay_hint() {

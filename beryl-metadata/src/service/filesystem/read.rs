@@ -898,7 +898,7 @@ fn record_fs_read_result<T>(operation: &str, started: Instant, result: &FsResult
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::filesystem::test_support::*;
+    use crate::service::filesystem::tests::*;
 
     fn seed_visible_block(storage: &RocksDBStorage, mount_id: MountId, inode_id: InodeId, block_id: BlockId) {
         let mut attrs = FileAttrs::new();
@@ -1051,7 +1051,7 @@ mod tests {
             .await
             .expect_err("key/value identity mismatch must fail closed");
 
-        assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EInval));
+        assert_fail(&failure.error, ErrorKind::Internal(InternalErrorKind::Internal));
         assert!(failure.error.message.contains("inode authority is corrupt"));
     }
 
@@ -1413,7 +1413,7 @@ mod tests {
                 .await
                 .expect_err("invalid block_stamp must reject returned layout");
 
-            assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EInval));
+            assert_fail(&failure.error, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
             assert!(
                 failure.error.message.contains(expected_message),
                 "unexpected error for block_stamp {block_stamp:?}: {}",
@@ -1537,7 +1537,7 @@ mod tests {
             .await
             .expect_err("child inode storage failure must reject ListStatus");
 
-        assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EInval));
+        assert_fail(&failure.error, ErrorKind::Internal(InternalErrorKind::Internal));
         assert!(
             failure.error.message.contains("Failed to deserialize Inode"),
             "{}",
@@ -1574,7 +1574,7 @@ mod tests {
             .await
             .expect_err("dangling child inode must reject ListStatus");
 
-        assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::ENoEnt));
+        assert_fail(&failure.error, ErrorKind::Metadata(MetadataErrorKind::NotFound));
         assert!(
             failure.error.message.contains("missing-child")
                 && failure.error.message.contains(&child_inode_id.to_string()),
@@ -1686,7 +1686,7 @@ mod tests {
             })
             .await
             .expect_err("overflowing range must be rejected");
-        assert_fail(&overflow.error, ErrorKind::Fs(FsErrorCode::EInval));
+        assert_fail(&overflow.error, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
         assert!(overflow.error.message.contains("range end overflows"));
 
         let empty = filesystem

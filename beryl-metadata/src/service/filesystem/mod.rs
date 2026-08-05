@@ -10,7 +10,7 @@ mod publish;
 mod read;
 mod write;
 
-use crate::error::{to_fs_error_detail, MetadataError, MetadataResult};
+use crate::error::{to_rpc_error, MetadataError, MetadataResult};
 use crate::inode_lease::LeaseManager;
 use crate::metrics::MetadataMetrics;
 use crate::mount::MountTable;
@@ -22,7 +22,7 @@ use crate::state::StateStore;
 use crate::worker::WorkerManager;
 use beryl_common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail};
 use beryl_common::header::RequestHeader;
-use beryl_types::fs::{FsErrorCode, InodeId};
+use beryl_types::fs::InodeId;
 use beryl_types::ids::WorkerId;
 use beryl_types::{GroupName, GroupStateWatermark, WorkerEndpointInfo};
 use std::sync::Arc;
@@ -97,7 +97,7 @@ fn fs_failure_from_metadata_error(
     mount_epoch: Option<u64>,
     route_epoch: Option<u64>,
 ) -> FsFailure {
-    fs_failure_from_rpc_error(ctx, to_fs_error_detail(err), group_name, mount_epoch, route_epoch)
+    fs_failure_from_rpc_error(ctx, to_rpc_error(err), group_name, mount_epoch, route_epoch)
 }
 
 fn fs_failure_from_rpc_error(
@@ -123,16 +123,6 @@ fn refresh_metadata_fs_failure(
 ) -> FsFailure {
     let err = RpcErrorDetail::refresh_metadata(kind, hint.unwrap_or_default(), message);
     fs_failure_from_rpc_error(ctx, err, group_name, mount_epoch, route_epoch)
-}
-
-fn fatal_fs_failure(
-    ctx: &RequestContext,
-    errno: FsErrorCode,
-    message: impl Into<String>,
-    group_name: Option<GroupName>,
-    mount_epoch: Option<u64>,
-) -> FsFailure {
-    fs_failure_from_rpc_error(ctx, RpcErrorDetail::fs(errno, message), group_name, mount_epoch, None)
 }
 
 fn worker_endpoint_from_parts(
@@ -397,17 +387,6 @@ impl MetadataFileSystem {
         ))
     }
 
-    fn fatal_fs_failure<T>(
-        &self,
-        ctx: &RequestContext,
-        errno: FsErrorCode,
-        message: impl Into<String>,
-        group_name: Option<GroupName>,
-        mount_epoch: Option<u64>,
-    ) -> FsResult<T> {
-        Err(fatal_fs_failure(ctx, errno, message, group_name, mount_epoch))
-    }
-
     fn session_terminal_failure<T>(
         &self,
         ctx: &RequestContext,
@@ -449,7 +428,7 @@ fn validate_active_write_layout(layout: &beryl_types::layout::FileLayout) -> Res
 }
 
 #[cfg(test)]
-mod test_support {
+mod tests {
     pub(super) use super::*;
     pub(super) use crate::config::RaftConfig;
     pub(super) use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
@@ -458,10 +437,11 @@ mod test_support {
     pub(super) use crate::service::filesystem::write::OpenWriteOutput;
     pub(super) use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerManager};
     pub(super) use beryl_common::error::rpc::{
-        ErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail, WorkerErrorKind,
+        ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RefreshHint,
+        RpcErrorDetail, WorkerErrorKind,
     };
     pub(super) use beryl_common::header::{CallerContext, RequestHeader};
-    pub(super) use beryl_types::fs::{FileAttrs, FsErrorCode, Inode};
+    pub(super) use beryl_types::fs::{FileAttrs, Inode};
     pub(super) use beryl_types::ids::{BlockId, BlockIndex, ClientId, InodeId, MountId, WorkerId};
     pub(super) use beryl_types::layout::FileLayout;
     pub(super) use beryl_types::lease::FencingToken;
@@ -885,6 +865,11 @@ mod test_support {
     pub(super) fn assert_fail(error: &RpcErrorDetail, kind: ErrorKind) {
         assert_eq!(error.kind, kind);
         assert_eq!(error.recovery, RecoveryAction::Fail);
+    }
+
+    pub(super) fn assert_retry(error: &RpcErrorDetail, kind: ErrorKind) {
+        assert_eq!(error.kind, kind);
+        assert!(matches!(error.recovery, RecoveryAction::Retry { .. }));
     }
 
     pub(super) fn assert_refresh_metadata(error: &RpcErrorDetail, kind: ErrorKind) {

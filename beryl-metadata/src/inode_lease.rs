@@ -24,6 +24,27 @@ pub enum WriteMode {
     Append,
 }
 
+/// Exact leader-local lease failure before RPC recovery policy is selected.
+///
+/// The filesystem service maps these facts to session, fencing, busy, or
+/// resource-exhausted RPC errors. Keeping the reasons local prevents transport
+/// policy and platform errno values from entering lease authority logic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseError {
+    /// Another non-expired lease currently owns the inode.
+    Active,
+    /// The durable lease epoch cannot be incremented without overflow.
+    EpochExhausted,
+    /// No leader-local lease exists for the inode.
+    NotFound,
+    /// The presented epoch does not identify the current lease.
+    EpochMismatch { expected: u64, got: u64 },
+    /// The presented client does not own the current lease.
+    OwnerMismatch,
+    /// The identified lease has already expired.
+    Expired,
+}
+
 /// Active lease entry (runtime-only, not persisted to Raft).
 #[derive(Clone, Debug)]
 pub struct ActiveLease {
@@ -69,14 +90,15 @@ impl LeaseManager {
     ///
     /// Returns:
     /// - Ok((lease_epoch, expires_at_ms)) if acquired
-    /// - Err(EBusy) if there's an active, non-expired lease
+    /// - `Err(LeaseError::Active)` if another non-expired lease exists.
+    /// - `Err(LeaseError::EpochExhausted)` if the durable fence cannot advance.
     pub fn try_acquire(
         &self,
         inode_id: InodeId,
         client_id: ClientId,
         mode: WriteMode,
         current_lease_epoch: Option<u64>, // From inode (persisted)
-    ) -> Result<(u64, u64), FsErrorCode> {
+    ) -> Result<(u64, u64), LeaseError> {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
 
         let mut leases = self.leases.write();
@@ -91,7 +113,7 @@ impl LeaseManager {
                     expires_at = existing.expires_at_ms,
                     "Lease conflict: active lease exists"
                 );
-                return Err(FsErrorCode::EBusy);
+                return Err(LeaseError::Active);
             }
             // Lease expired, can be stolen
             debug!(
@@ -103,7 +125,7 @@ impl LeaseManager {
 
         // Generate new lease
         let base_epoch = current_lease_epoch.unwrap_or(0);
-        let new_epoch = base_epoch.checked_add(1).ok_or(FsErrorCode::EInval)?;
+        let new_epoch = base_epoch.checked_add(1).ok_or(LeaseError::EpochExhausted)?;
         let expires_at_ms = now_ms.saturating_add(self.lease_ttl_ms);
 
         let active_lease = ActiveLease {
@@ -128,15 +150,14 @@ impl LeaseManager {
 
     /// Renew a lease (runtime-only, does not write to Raft).
     ///
-    /// Returns:
-    /// - Ok(expires_at_ms) if renewed
-    /// - Err(EPerm) if the lease epoch, owner, or expiry is invalid
-    pub fn renew(&self, inode_id: InodeId, lease_epoch: u64, client_id: ClientId) -> Result<u64, FsErrorCode> {
+    /// Returns the new expiration time, or the exact reason why the lease is
+    /// absent, stale, unowned, or expired.
+    pub fn renew(&self, inode_id: InodeId, lease_epoch: u64, client_id: ClientId) -> Result<u64, LeaseError> {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
 
         let mut leases = self.leases.write();
 
-        let active_lease = leases.get_mut(&inode_id).ok_or(FsErrorCode::EPerm)?;
+        let active_lease = leases.get_mut(&inode_id).ok_or(LeaseError::NotFound)?;
 
         if active_lease.lease_epoch != lease_epoch {
             warn!(
@@ -145,11 +166,14 @@ impl LeaseManager {
                 got_epoch = lease_epoch,
                 "Lease renewal failed: mismatch"
             );
-            return Err(FsErrorCode::EPerm);
+            return Err(LeaseError::EpochMismatch {
+                expected: active_lease.lease_epoch,
+                got: lease_epoch,
+            });
         }
 
         if active_lease.owner_client_id != client_id {
-            return Err(FsErrorCode::EPerm);
+            return Err(LeaseError::OwnerMismatch);
         }
         // Check if already expired
         if now_ms >= active_lease.expires_at_ms {
@@ -159,7 +183,7 @@ impl LeaseManager {
                 "Lease renewal failed: already expired"
             );
             leases.remove(&inode_id);
-            return Err(FsErrorCode::EPerm);
+            return Err(LeaseError::Expired);
         }
 
         // Extend expiration
@@ -192,14 +216,12 @@ impl LeaseManager {
 
     /// Validate lease for commit/truncate (fencing check).
     ///
-    /// Returns:
-    /// - Ok(()) if lease is valid
-    /// - Err(EPerm) if lease is invalid (mismatch or expired)
-    pub fn validate_lease(&self, inode_id: InodeId, lease_epoch: u64) -> Result<(), FsErrorCode> {
+    /// Returns the exact reason when the lease is absent, stale, or expired.
+    pub fn validate_lease(&self, inode_id: InodeId, lease_epoch: u64) -> Result<(), LeaseError> {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
 
         let leases = self.leases.read();
-        let active_lease = leases.get(&inode_id).ok_or(FsErrorCode::EPerm)?;
+        let active_lease = leases.get(&inode_id).ok_or(LeaseError::NotFound)?;
 
         if active_lease.lease_epoch != lease_epoch {
             warn!(
@@ -208,7 +230,10 @@ impl LeaseManager {
                 got_epoch = lease_epoch,
                 "Lease validation failed: mismatch (fencing)"
             );
-            return Err(FsErrorCode::EPerm);
+            return Err(LeaseError::EpochMismatch {
+                expected: active_lease.lease_epoch,
+                got: lease_epoch,
+            });
         }
 
         // Check expiration
@@ -218,7 +243,7 @@ impl LeaseManager {
                 lease_epoch,
                 "Lease validation failed: expired"
             );
-            return Err(FsErrorCode::EPerm);
+            return Err(LeaseError::Expired);
         }
 
         Ok(())
@@ -290,5 +315,3 @@ impl Default for LeaseManager {
         Self::new(60_000, 10_000) // 60s TTL, 10s cleanup interval
     }
 }
-
-use beryl_types::fs::FsErrorCode;

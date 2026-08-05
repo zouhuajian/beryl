@@ -23,7 +23,7 @@ pub mod raft_log_id;
 pub mod tier;
 pub mod worker;
 
-pub use fs::{DirEntry, Extent, FileAttrs, FsErrorCode, Inode, InodeData, InodeId, InodeKind, MAX_FILE_EXTENTS};
+pub use fs::{DirEntry, Extent, FileAttrs, Inode, InodeData, InodeId, InodeKind, MAX_FILE_EXTENTS};
 pub use group_watermark::{GroupStateWatermark, MountEpoch};
 pub use ids::{
     BlockId, BlockIndex, CallId, ChunkId, ChunkIndex, ClientId, GroupName, GroupNameError, MountId, ShardId, StreamId,

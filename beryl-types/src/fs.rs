@@ -309,72 +309,6 @@ impl Inode {
     }
 }
 
-/// Filesystem error codes.
-///
-/// These map to standard POSIX error codes and are used in ResponseHeaderProto.error_code.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-#[repr(u32)]
-pub enum FsErrorCode {
-    /// No error (success).
-    Ok = 0,
-    /// No such file or directory.
-    ENoEnt = 2,
-    /// File exists.
-    EExist = 17,
-    /// Directory not empty.
-    ENotEmpty = 39,
-    /// Not a directory.
-    ENotDir = 20,
-    /// Is a directory.
-    EIsDir = 21,
-    /// Cross-device link (rename across mounts).
-    EXDev = 18,
-    /// Permission denied.
-    EPerm = 1,
-    /// Permission denied (access).
-    EAcces = 13,
-    /// Invalid argument.
-    EInval = 22,
-    /// Operation not supported.
-    ENotsup = 45,
-    /// Not implemented.
-    ENotImpl = 38,
-    /// Resource temporarily unavailable (e.g., lease conflict).
-    EAgain = 11,
-    /// Device or resource busy (e.g., file locked by another writer).
-    EBusy = 16,
-}
-
-impl FsErrorCode {
-    /// Converts to u32 for proto encoding.
-    #[inline]
-    pub fn as_u32(self) -> u32 {
-        self as u32
-    }
-
-    /// Converts from u32 (for proto decoding).
-    pub fn from_u32(v: u32) -> Option<Self> {
-        match v {
-            0 => Some(Self::Ok),
-            2 => Some(Self::ENoEnt),
-            17 => Some(Self::EExist),
-            39 => Some(Self::ENotEmpty),
-            20 => Some(Self::ENotDir),
-            21 => Some(Self::EIsDir),
-            18 => Some(Self::EXDev),
-            1 => Some(Self::EPerm),
-            13 => Some(Self::EAcces),
-            22 => Some(Self::EInval),
-            45 => Some(Self::ENotsup),
-            38 => Some(Self::ENotImpl),
-            11 => Some(Self::EAgain),
-            16 => Some(Self::EBusy),
-            _ => None,
-        }
-    }
-}
-
 /// Directory entry (name + inode reference).
 ///
 /// Used in ReadDir responses.
@@ -422,12 +356,5 @@ mod tests {
         let bytes = id.to_be_bytes();
         let decoded = InodeId::from_be_bytes(bytes);
         assert_eq!(id, decoded);
-    }
-
-    #[test]
-    fn fs_error_code_conversion() {
-        assert_eq!(FsErrorCode::ENoEnt.as_u32(), 2);
-        assert_eq!(FsErrorCode::from_u32(2), Some(FsErrorCode::ENoEnt));
-        assert_eq!(FsErrorCode::from_u32(999), None);
     }
 }

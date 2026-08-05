@@ -8,7 +8,6 @@ use beryl_common::error::rpc::{
     ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail,
 };
 use beryl_common::{CommonError, CommonErrorKind};
-use beryl_types::fs::FsErrorCode;
 use thiserror::Error;
 
 /// Opaque structured action error derived from RPC header validation.
@@ -330,7 +329,10 @@ fn rpc_error_from_common_error(err: CommonError) -> RpcErrorDetail {
         CommonErrorKind::NotFound => {
             RpcErrorDetail::fail(ErrorKind::Metadata(MetadataErrorKind::NotFound), err.to_string())
         }
-        CommonErrorKind::PermissionDenied => RpcErrorDetail::fs(FsErrorCode::EAcces, err.to_string()),
+        CommonErrorKind::PermissionDenied => RpcErrorDetail::fail(
+            ErrorKind::Protocol(ProtocolErrorKind::PermissionDenied),
+            err.to_string(),
+        ),
         CommonErrorKind::InvalidArgument => {
             RpcErrorDetail::fail(ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument), err.to_string())
         }

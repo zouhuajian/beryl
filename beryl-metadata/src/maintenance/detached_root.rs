@@ -148,9 +148,9 @@ impl DetachedRootReclaimer {
 mod tests {
     use super::*;
     use crate::config::RaftConfig;
-    use crate::mount::{DataIoPolicy, MountEntry, MountKind, MountTable};
-    use crate::raft::{AppRaftStateMachine, DetachedRoot};
-    use beryl_types::fs::{FileAttrs, Inode, InodeId};
+    use crate::mount::{MountTable, ROOT_INODE_ID};
+    use crate::raft::{AppRaftStateMachine, FsCommandResult};
+    use beryl_types::fs::FileAttrs;
     use beryl_types::ids::MountId;
     use beryl_types::GroupName;
     use std::time::Duration;
@@ -161,18 +161,6 @@ mod tests {
         initialize_leader: bool,
     ) -> (Arc<RocksDBStorage>, Arc<AppRaftNode>, DetachedRootReclaimer) {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        storage
-            .put_mount(&MountEntry {
-                mount_id: MountId::new(1),
-                mount_prefix: "/".to_string(),
-                mount_kind: MountKind::Internal,
-                ufs_uri: None,
-                data_io_policy: DataIoPolicy::Allow,
-                mount_epoch: 1,
-                namespace_owner_group_name: GroupName::parse("root").unwrap(),
-                root_inode_id: InodeId::new(1),
-            })
-            .unwrap();
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
         let raft_node = Arc::new(
             AppRaftNode::new(
@@ -197,6 +185,14 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             assert!(raft_node.is_leader());
+            let bootstrap = raft_node
+                .propose(Command::BootstrapNamespace {
+                    proposed_at_ms: 1,
+                    group_name: GroupName::parse("root").unwrap(),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(bootstrap, CommandResult::MountUpserted(_)));
         }
         let reclaimer = DetachedRootReclaimer::new(
             Arc::clone(&raft_node),
@@ -210,19 +206,35 @@ mod tests {
     async fn leader_reclaims_selected_empty_root_and_follower_does_not_propose() {
         let leader_dir = TempDir::new().unwrap();
         let (storage, raft_node, leader) = reclaimer(&leader_dir, true).await;
-        let root_id = InodeId::new(10);
-        storage
-            .put_inode(&Inode::new_dir(root_id, FileAttrs::new(), MountId::new(1)))
+        let created = raft_node
+            .propose(Command::CreateDirectory {
+                proposed_at_ms: 2,
+                root_inode_id: ROOT_INODE_ID,
+                components: vec!["detached".to_string()],
+                attrs: FileAttrs::new(),
+                recursive: false,
+            })
+            .await
             .unwrap();
-        storage
-            .put_detached_root(
-                root_id,
-                DetachedRoot {
-                    mount_id: MountId::new(1),
-                    detached_at_ms: 1,
-                },
-            )
+        let CommandResult::Fs(FsCommandResult::Ok(created)) = created else {
+            panic!("create directory returned unexpected result: {created:?}");
+        };
+        let root_id = created.inode_id.expect("created directory inode");
+        let deleted = raft_node
+            .propose(Command::Delete {
+                proposed_at_ms: 3,
+                mount_id: MountId::new(1),
+                expected_mount_epoch: 1,
+                mount_root_inode_id: ROOT_INODE_ID,
+                relative_components: vec!["detached".to_string()],
+                expected_inode_id: root_id,
+                expected_file_lease_epoch: None,
+                recursive: true,
+            })
+            .await
             .unwrap();
+        assert!(matches!(deleted, CommandResult::Fs(FsCommandResult::Ok(_))));
+        assert!(storage.get_detached_root(root_id).unwrap().is_some());
 
         let pass = leader.reclaim_once().await.unwrap();
         assert!(matches!(

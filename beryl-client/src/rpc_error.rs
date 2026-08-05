@@ -223,7 +223,6 @@ mod tests {
     use beryl_common::error::rpc::{RefreshHint as RpcRefreshHint, WorkerEndpointHint};
     use beryl_common::header::{ClientInfo, ResponseHeader};
     use beryl_proto::convert::rpc_error_to_proto;
-    use beryl_types::fs::FsErrorCode;
 
     #[derive(Clone, Debug)]
     enum RpcEnvelope {
@@ -466,15 +465,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_fs_error_fails_without_refresh() {
-        let rpc_error = RpcErrorDetail::fs(FsErrorCode::EPerm, "denied");
+    fn validate_permission_error_fails_without_refresh() {
+        let rpc_error = RpcErrorDetail::fail(ErrorKind::Protocol(ProtocolErrorKind::PermissionDenied), "denied");
         let header = ResponseHeader::error(ClientInfo::new(beryl_types::ClientId::new(1)), rpc_error);
 
         let result = validate_header_or_action(&header);
 
         match result {
             Err(ClientAction::Fail { rpc_error }) => {
-                assert_eq!(rpc_error.kind, ErrorKind::Fs(FsErrorCode::EPerm));
+                assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::PermissionDenied));
                 assert_eq!(rpc_error.recovery, RecoveryAction::Fail);
             }
             _ => panic!("expected Fail action"),

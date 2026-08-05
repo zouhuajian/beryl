@@ -16,17 +16,22 @@ pub mod rpc {
     //! Human-readable `message` is diagnostic only. Machine control flow must
     //! branch on `kind` and `recovery`.
 
-    use beryl_types::fs::FsErrorCode;
     use serde::{Deserialize, Serialize};
 
-    /// Stable, machine-readable failure fact.
+    /// Stable, machine-readable failure fact classified by the boundary that owns it.
+    ///
+    /// Success is represented by the absence of an `RpcErrorDetail`; every value
+    /// of this enum therefore denotes a real failure.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
     #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
     pub enum ErrorKind {
-        Fs(FsErrorCode),
+        /// Metadata namespace, authority, freshness, or session failure.
         Metadata(MetadataErrorKind),
+        /// Worker storage or execution failure.
         Worker(WorkerErrorKind),
+        /// Malformed, unauthorized, or unsupported request/protocol failure.
         Protocol(ProtocolErrorKind),
+        /// Infrastructure or invariant failure not owned by a service domain.
         Internal(InternalErrorKind),
     }
 
@@ -73,6 +78,8 @@ pub mod rpc {
         Fencing,
         Cancelled,
         Io,
+        /// A worker-owned local block or storage resource is absent.
+        NotFound,
     }
 
     /// Protocol and request-shape failure fact.
@@ -145,10 +152,6 @@ pub mod rpc {
                 recovery,
                 message: message.into(),
             }
-        }
-
-        pub fn fs(errno: FsErrorCode, message: impl Into<String>) -> Self {
-            Self::new(ErrorKind::Fs(errno), RecoveryAction::Fail, message)
         }
 
         pub fn fail(kind: ErrorKind, message: impl Into<String>) -> Self {
@@ -259,7 +262,6 @@ impl From<CommonErrorKind> for CommonError {
 mod tests {
     use super::rpc::{ErrorKind, InternalErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail};
     use super::{CommonError, CommonErrorKind};
-    use beryl_types::fs::FsErrorCode;
 
     #[test]
     fn common_error_retryability_is_derived_from_kind() {
@@ -272,10 +274,6 @@ mod tests {
 
     #[test]
     fn rpc_error_constructors_preserve_kind_and_recovery() {
-        let err = RpcErrorDetail::fs(FsErrorCode::ENoEnt, "no such file");
-        assert_eq!(err.kind, ErrorKind::Fs(FsErrorCode::ENoEnt));
-        assert_eq!(err.recovery, RecoveryAction::Fail);
-
         let hint = RefreshHint {
             group_name: Some("root".to_string()),
             ..RefreshHint::default()

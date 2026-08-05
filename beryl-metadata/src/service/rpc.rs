@@ -18,7 +18,7 @@ use super::wire::{
 use super::MetadataFileSystem;
 use super::MsyncHandler;
 use crate::config::{ListStatusConfig, MAX_LIST_STATUS_PAGE_SIZE};
-use crate::error::{to_fs_error_detail, MetadataError};
+use crate::error::{to_rpc_error, MetadataError};
 use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use beryl_proto::metadata::*;
 use beryl_types::ids::InodeId;
@@ -134,7 +134,7 @@ impl MetadataFileSystemServiceImpl {
         req_header: &Option<beryl_proto::common::RequestHeaderProto>,
         err: MetadataError,
     ) -> beryl_proto::common::ResponseHeaderProto {
-        let rpc_error = to_fs_error_detail(err);
+        let rpc_error = to_rpc_error(err);
         header_from_rpc_error(req_header, None, None, &rpc_error)
     }
 
@@ -161,7 +161,7 @@ impl MetadataFileSystemServiceImpl {
                 header,
                 None,
                 None,
-                &to_fs_error_detail(MetadataError::InvalidArgument(message.to_string())),
+                &to_rpc_error(MetadataError::InvalidArgument(message.to_string())),
             ))
         };
         let handle = handle.ok_or_else(|| invalid("missing write_handle"))?;
@@ -853,12 +853,10 @@ mod tests {
     use crate::state::RouteEpoch;
     use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerManager};
     use beryl_common::error::rpc::{
-        ErrorKind, InternalErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail,
+        ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail,
     };
     use beryl_common::header::RequestHeader;
-    use beryl_proto::common::{
-        FsErrnoProto, GroupStateWatermarkProto, RaftLogIdProto, RequestHeaderProto, ResponseHeaderProto,
-    };
+    use beryl_proto::common::{GroupStateWatermarkProto, RaftLogIdProto, RequestHeaderProto, ResponseHeaderProto};
     use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
     use beryl_proto::metadata::{
         get_block_locations_request_proto, AddBlockRequestProto, CommitFileRequestProto, CommittedBlockProto,
@@ -866,7 +864,7 @@ mod tests {
         GetBlockLocationsRequestProto, GetStatusRequestProto, ListStatusRequestProto, OpenWriteModeProto,
         OpenWriteRequestProto, SyncWriteRequestProto, WriteHandleProto, WriteTargetProto,
     };
-    use beryl_types::fs::{Extent, FileAttrs, FsErrorCode, Inode, InodeId};
+    use beryl_types::fs::{Extent, FileAttrs, Inode, InodeId};
     use beryl_types::ids::{BlockId, BlockIndex, MountId, WorkerId};
     use beryl_types::layout::FileLayout;
     use beryl_types::{ClientId, GroupName, RaftLogId, WorkerRunId, MAX_FILE_EXTENTS};
@@ -988,35 +986,11 @@ mod tests {
         beryl_proto::convert::rpc_error_from_proto(err)
     }
 
-    fn fs_errno_to_error_kind(errno: FsErrnoProto) -> ErrorKind {
-        let errno = match errno {
-            FsErrnoProto::FsErrnoEnoent => FsErrorCode::ENoEnt,
-            FsErrnoProto::FsErrnoEexist => FsErrorCode::EExist,
-            FsErrnoProto::FsErrnoEnotempty => FsErrorCode::ENotEmpty,
-            FsErrnoProto::FsErrnoEnotdir => FsErrorCode::ENotDir,
-            FsErrnoProto::FsErrnoEisdir => FsErrorCode::EIsDir,
-            FsErrnoProto::FsErrnoExdev => FsErrorCode::EXDev,
-            FsErrnoProto::FsErrnoEperm => FsErrorCode::EPerm,
-            FsErrnoProto::FsErrnoEacces => FsErrorCode::EAcces,
-            FsErrnoProto::FsErrnoEinval => FsErrorCode::EInval,
-            FsErrnoProto::FsErrnoEnotsup => FsErrorCode::ENotsup,
-            FsErrnoProto::FsErrnoEnotimpl => FsErrorCode::ENotImpl,
-            FsErrnoProto::FsErrnoEagain => FsErrorCode::EAgain,
-            FsErrnoProto::FsErrnoEbusy => FsErrorCode::EBusy,
-            FsErrnoProto::FsErrnoOk => FsErrorCode::Ok,
-        };
-        ErrorKind::Fs(errno)
-    }
-
     fn assert_fail_kind(err: &beryl_proto::common::ErrorDetailProto, expected: ErrorKind) -> RpcErrorDetail {
         let rpc_error = rpc_error(err);
         assert_eq!(rpc_error.kind, expected, "{rpc_error:?}");
         assert!(matches!(rpc_error.recovery, RecoveryAction::Fail), "{rpc_error:?}");
         rpc_error
-    }
-
-    fn assert_fs_errno(err: &beryl_proto::common::ErrorDetailProto, expected: FsErrnoProto) {
-        assert_fail_kind(err, fs_errno_to_error_kind(expected));
     }
 
     fn assert_not_leader(err: &beryl_proto::common::ErrorDetailProto) {
@@ -1601,7 +1575,7 @@ mod tests {
         .into_inner();
         let err = header_error(response.header);
 
-        assert_fs_errno(&err, FsErrnoProto::FsErrnoEnotsup);
+        assert_fail_kind(&err, ErrorKind::Protocol(ProtocolErrorKind::Unsupported));
         assert!(err.message.contains("Recursive listing not yet implemented"));
         assert!(response.entries.is_empty());
     }
@@ -1741,7 +1715,7 @@ mod tests {
         .into_inner();
 
         let err = header_error(response.header);
-        assert_fs_errno(&err, FsErrnoProto::FsErrnoEnotdir);
+        assert_fail_kind(&err, ErrorKind::Metadata(MetadataErrorKind::NotDirectory));
         assert_eq!(env.storage.get_dentry(file_inode_id, "child").unwrap(), None);
     }
 
@@ -2018,7 +1992,7 @@ mod tests {
         .expect("transport status must remain OK")
         .into_inner();
         let err = header_error(missing_inode_id.header);
-        assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
+        assert_fail_kind(&err, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
         assert!(err.message.contains("inode_id"));
 
         let mut mismatched = committed;
@@ -2039,7 +2013,7 @@ mod tests {
         .expect("transport status must remain OK")
         .into_inner();
         let err = header_error(mismatch.header);
-        assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
+        assert_fail_kind(&err, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
         assert!(err.message.contains("committed block inode_id"));
     }
 
@@ -2091,7 +2065,7 @@ mod tests {
         .expect("transport status must remain OK")
         .into_inner();
         let sync_error = header_error(sync.header);
-        assert_fs_errno(&sync_error, FsErrnoProto::FsErrnoEinval);
+        assert_fail_kind(&sync_error, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
         assert!(sync_error.message.contains("write_lease_epoch"));
 
         let commit = FileSystemServiceProto::commit_file(
@@ -2110,7 +2084,7 @@ mod tests {
         .expect("transport status must remain OK")
         .into_inner();
         let commit_error = header_error(commit.header);
-        assert_fs_errno(&commit_error, FsErrnoProto::FsErrnoEinval);
+        assert_fail_kind(&commit_error, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
         assert!(commit_error.message.contains("write_lease_epoch"));
     }
 
@@ -2192,7 +2166,7 @@ mod tests {
             .expect("transport status must remain OK")
             .into_inner();
         let err = header_error(changed.header);
-        assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
+        assert_fail_kind(&err, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
         assert!(err.message.contains("completed publish payload"));
     }
 
@@ -2413,7 +2387,7 @@ mod tests {
         .expect("transport status must remain OK")
         .into_inner();
         let err = header_error(non_equivalent.header);
-        assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
+        assert_fail_kind(&err, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
         assert!(err.message.contains("contiguous"));
     }
 
@@ -2433,7 +2407,7 @@ mod tests {
         .into_inner();
 
         let err = header_error(response.header);
-        assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
+        assert_fail_kind(&err, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
         assert!(err.message.contains("inode_id must be non-zero"));
     }
 
@@ -2664,7 +2638,7 @@ mod tests {
         .expect("transport status must remain OK")
         .into_inner();
         let err = header_error(mismatch.header);
-        assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
+        assert_fail_kind(&err, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
         assert!(err.message.contains("completed publish payload ends"));
         let after_mismatch = env
             .storage
@@ -2697,7 +2671,7 @@ mod tests {
         .into_inner();
 
         let err = header_error(response.header);
-        assert_fs_errno(&err, FsErrnoProto::FsErrnoEnoent);
+        assert_fail_kind(&err, ErrorKind::Metadata(MetadataErrorKind::NotFound));
     }
 
     #[tokio::test]
@@ -2716,7 +2690,7 @@ mod tests {
         .into_inner();
 
         let err = header_error(response.header);
-        assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
+        assert_fail_kind(&err, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
     }
 
     #[tokio::test]
@@ -2837,7 +2811,7 @@ mod tests {
         .into_inner();
 
         let err = header_error(response.header);
-        assert_fs_errno(&err, FsErrnoProto::FsErrnoEbusy);
+        assert_fail_kind(&err, ErrorKind::Metadata(MetadataErrorKind::Busy));
         assert_eq!(env.storage.get_dentry(env.root_inode_id, "dir").unwrap(), Some(dir));
         assert_eq!(env.storage.get_dentry(dir, "empty_subdir").unwrap(), Some(empty_subdir));
         assert_eq!(env.storage.get_dentry(dir, "file").unwrap(), Some(file_inode_id));
@@ -2865,7 +2839,7 @@ mod tests {
         .into_inner();
 
         let err = header_error(mount_root_response.header);
-        assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
+        assert_fail_kind(&err, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
         assert!(env.storage.get_inode(env.root_inode_id).unwrap().is_some());
 
         let root_env = build_env_with_raft("/", DataIoPolicy::Allow).await;
@@ -2882,7 +2856,7 @@ mod tests {
         .into_inner();
 
         let err = header_error(root_response.header);
-        assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
+        assert_fail_kind(&err, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
         assert!(root_env.storage.get_inode(root_env.root_inode_id).unwrap().is_some());
     }
 
@@ -2932,7 +2906,7 @@ mod tests {
         .into_inner();
 
         let err = header_error(response.header);
-        assert_fs_errno(&err, FsErrnoProto::FsErrnoExdev);
+        assert_fail_kind(&err, ErrorKind::Metadata(MetadataErrorKind::CrossMountRename));
         assert_eq!(env.storage.get_dentry(env.root_inode_id, "dir").unwrap(), Some(dir));
         assert_eq!(env.storage.get_dentry(dir, "mnt").unwrap(), Some(child_mount_root));
         assert!(env.storage.get_inode(dir).unwrap().is_some());
@@ -2970,7 +2944,7 @@ mod tests {
         .into_inner();
 
         let err = header_error(response.header);
-        assert_fs_errno(&err, FsErrnoProto::FsErrnoEnotempty);
+        assert_fail_kind(&err, ErrorKind::Metadata(MetadataErrorKind::DirectoryNotEmpty));
         assert_eq!(
             env.storage.get_dentry(env.root_inode_id, "dir").unwrap(),
             Some(dir_inode_id)

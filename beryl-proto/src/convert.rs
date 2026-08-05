@@ -814,48 +814,9 @@ impl From<&RequestHeader> for crate::worker::DataRequestHeaderProto {
 // RPC error helpers (shared between control/data-plane conversions)
 // ============================================================================
 
-fn fs_errno_proto_to_enum(code: i32) -> beryl_types::fs::FsErrorCode {
-    match code {
-        x if x == proto_common::FsErrnoProto::FsErrnoOk as i32 => beryl_types::fs::FsErrorCode::Ok,
-        x if x == proto_common::FsErrnoProto::FsErrnoEnoent as i32 => beryl_types::fs::FsErrorCode::ENoEnt,
-        x if x == proto_common::FsErrnoProto::FsErrnoEexist as i32 => beryl_types::fs::FsErrorCode::EExist,
-        x if x == proto_common::FsErrnoProto::FsErrnoEnotempty as i32 => beryl_types::fs::FsErrorCode::ENotEmpty,
-        x if x == proto_common::FsErrnoProto::FsErrnoEnotdir as i32 => beryl_types::fs::FsErrorCode::ENotDir,
-        x if x == proto_common::FsErrnoProto::FsErrnoEisdir as i32 => beryl_types::fs::FsErrorCode::EIsDir,
-        x if x == proto_common::FsErrnoProto::FsErrnoExdev as i32 => beryl_types::fs::FsErrorCode::EXDev,
-        x if x == proto_common::FsErrnoProto::FsErrnoEperm as i32 => beryl_types::fs::FsErrorCode::EPerm,
-        x if x == proto_common::FsErrnoProto::FsErrnoEacces as i32 => beryl_types::fs::FsErrorCode::EAcces,
-        x if x == proto_common::FsErrnoProto::FsErrnoEinval as i32 => beryl_types::fs::FsErrorCode::EInval,
-        x if x == proto_common::FsErrnoProto::FsErrnoEnotsup as i32 => beryl_types::fs::FsErrorCode::ENotsup,
-        x if x == proto_common::FsErrnoProto::FsErrnoEnotimpl as i32 => beryl_types::fs::FsErrorCode::ENotImpl,
-        x if x == proto_common::FsErrnoProto::FsErrnoEagain as i32 => beryl_types::fs::FsErrorCode::EAgain,
-        x if x == proto_common::FsErrnoProto::FsErrnoEbusy as i32 => beryl_types::fs::FsErrorCode::EBusy,
-        _ => beryl_types::fs::FsErrorCode::EInval,
-    }
-}
-
-fn fs_errno_enum_to_proto(code: &beryl_types::fs::FsErrorCode) -> proto_common::FsErrnoProto {
-    match code {
-        beryl_types::fs::FsErrorCode::Ok => proto_common::FsErrnoProto::FsErrnoOk,
-        beryl_types::fs::FsErrorCode::ENoEnt => proto_common::FsErrnoProto::FsErrnoEnoent,
-        beryl_types::fs::FsErrorCode::EExist => proto_common::FsErrnoProto::FsErrnoEexist,
-        beryl_types::fs::FsErrorCode::ENotEmpty => proto_common::FsErrnoProto::FsErrnoEnotempty,
-        beryl_types::fs::FsErrorCode::ENotDir => proto_common::FsErrnoProto::FsErrnoEnotdir,
-        beryl_types::fs::FsErrorCode::EIsDir => proto_common::FsErrnoProto::FsErrnoEisdir,
-        beryl_types::fs::FsErrorCode::EXDev => proto_common::FsErrnoProto::FsErrnoExdev,
-        beryl_types::fs::FsErrorCode::EPerm => proto_common::FsErrnoProto::FsErrnoEperm,
-        beryl_types::fs::FsErrorCode::EAcces => proto_common::FsErrnoProto::FsErrnoEacces,
-        beryl_types::fs::FsErrorCode::EInval => proto_common::FsErrnoProto::FsErrnoEinval,
-        beryl_types::fs::FsErrorCode::ENotsup => proto_common::FsErrnoProto::FsErrnoEnotsup,
-        beryl_types::fs::FsErrorCode::ENotImpl => proto_common::FsErrnoProto::FsErrnoEnotimpl,
-        beryl_types::fs::FsErrorCode::EAgain => proto_common::FsErrnoProto::FsErrnoEagain,
-        beryl_types::fs::FsErrorCode::EBusy => proto_common::FsErrnoProto::FsErrnoEbusy,
-    }
-}
-
-fn metadata_kind_proto_to_kind(kind: proto_common::MetadataErrorKindProto) -> RpcMetadataErrorKind {
-    match kind {
-        proto_common::MetadataErrorKindProto::MetadataErrorKindUnspecified => RpcMetadataErrorKind::StaleState,
+fn metadata_kind_proto_to_kind(kind: proto_common::MetadataErrorKindProto) -> Option<RpcMetadataErrorKind> {
+    Some(match kind {
+        proto_common::MetadataErrorKindProto::MetadataErrorKindUnspecified => return None,
         proto_common::MetadataErrorKindProto::MetadataErrorKindNotFound => RpcMetadataErrorKind::NotFound,
         proto_common::MetadataErrorKindProto::MetadataErrorKindAlreadyExists => RpcMetadataErrorKind::AlreadyExists,
         proto_common::MetadataErrorKindProto::MetadataErrorKindNotDirectory => RpcMetadataErrorKind::NotDirectory,
@@ -887,7 +848,7 @@ fn metadata_kind_proto_to_kind(kind: proto_common::MetadataErrorKindProto) -> Rp
         proto_common::MetadataErrorKindProto::MetadataErrorKindResourceExhausted => {
             RpcMetadataErrorKind::ResourceExhausted
         }
-    }
+    })
 }
 
 fn metadata_kind_to_proto(kind: RpcMetadataErrorKind) -> proto_common::MetadataErrorKindProto {
@@ -926,9 +887,9 @@ fn metadata_kind_to_proto(kind: RpcMetadataErrorKind) -> proto_common::MetadataE
     }
 }
 
-fn worker_kind_proto_to_kind(kind: proto_common::WorkerErrorKindProto) -> RpcWorkerErrorKind {
-    match kind {
-        proto_common::WorkerErrorKindProto::WorkerErrorKindUnspecified => RpcWorkerErrorKind::Io,
+fn worker_kind_proto_to_kind(kind: proto_common::WorkerErrorKindProto) -> Option<RpcWorkerErrorKind> {
+    Some(match kind {
+        proto_common::WorkerErrorKindProto::WorkerErrorKindUnspecified => return None,
         proto_common::WorkerErrorKindProto::WorkerErrorKindNotRegistered => RpcWorkerErrorKind::NotRegistered,
         proto_common::WorkerErrorKindProto::WorkerErrorKindRunMismatch => RpcWorkerErrorKind::RunMismatch,
         proto_common::WorkerErrorKindProto::WorkerErrorKindDescriptorMismatch => RpcWorkerErrorKind::DescriptorMismatch,
@@ -945,7 +906,8 @@ fn worker_kind_proto_to_kind(kind: proto_common::WorkerErrorKindProto) -> RpcWor
         proto_common::WorkerErrorKindProto::WorkerErrorKindFencing => RpcWorkerErrorKind::Fencing,
         proto_common::WorkerErrorKindProto::WorkerErrorKindCancelled => RpcWorkerErrorKind::Cancelled,
         proto_common::WorkerErrorKindProto::WorkerErrorKindIo => RpcWorkerErrorKind::Io,
-    }
+        proto_common::WorkerErrorKindProto::WorkerErrorKindNotFound => RpcWorkerErrorKind::NotFound,
+    })
 }
 
 fn worker_kind_to_proto(kind: RpcWorkerErrorKind) -> proto_common::WorkerErrorKindProto {
@@ -966,12 +928,13 @@ fn worker_kind_to_proto(kind: RpcWorkerErrorKind) -> proto_common::WorkerErrorKi
         RpcWorkerErrorKind::Fencing => proto_common::WorkerErrorKindProto::WorkerErrorKindFencing,
         RpcWorkerErrorKind::Cancelled => proto_common::WorkerErrorKindProto::WorkerErrorKindCancelled,
         RpcWorkerErrorKind::Io => proto_common::WorkerErrorKindProto::WorkerErrorKindIo,
+        RpcWorkerErrorKind::NotFound => proto_common::WorkerErrorKindProto::WorkerErrorKindNotFound,
     }
 }
 
-fn protocol_kind_proto_to_kind(kind: proto_common::ProtocolErrorKindProto) -> RpcProtocolErrorKind {
-    match kind {
-        proto_common::ProtocolErrorKindProto::ProtocolErrorKindUnspecified => RpcProtocolErrorKind::InvalidHeader,
+fn protocol_kind_proto_to_kind(kind: proto_common::ProtocolErrorKindProto) -> Option<RpcProtocolErrorKind> {
+    Some(match kind {
+        proto_common::ProtocolErrorKindProto::ProtocolErrorKindUnspecified => return None,
         proto_common::ProtocolErrorKindProto::ProtocolErrorKindInvalidHeader => RpcProtocolErrorKind::InvalidHeader,
         proto_common::ProtocolErrorKindProto::ProtocolErrorKindInvalidArgument => RpcProtocolErrorKind::InvalidArgument,
         proto_common::ProtocolErrorKindProto::ProtocolErrorKindPermissionDenied => {
@@ -980,7 +943,7 @@ fn protocol_kind_proto_to_kind(kind: proto_common::ProtocolErrorKindProto) -> Rp
         proto_common::ProtocolErrorKindProto::ProtocolErrorKindUnsupported => RpcProtocolErrorKind::Unsupported,
         proto_common::ProtocolErrorKindProto::ProtocolErrorKindCancelled => RpcProtocolErrorKind::Cancelled,
         proto_common::ProtocolErrorKindProto::ProtocolErrorKindCorrupt => RpcProtocolErrorKind::Corrupt,
-    }
+    })
 }
 
 fn protocol_kind_to_proto(kind: RpcProtocolErrorKind) -> proto_common::ProtocolErrorKindProto {
@@ -996,9 +959,9 @@ fn protocol_kind_to_proto(kind: RpcProtocolErrorKind) -> proto_common::ProtocolE
     }
 }
 
-fn internal_kind_proto_to_kind(kind: proto_common::InternalErrorKindProto) -> RpcInternalErrorKind {
-    match kind {
-        proto_common::InternalErrorKindProto::InternalErrorKindUnspecified => RpcInternalErrorKind::Internal,
+fn internal_kind_proto_to_kind(kind: proto_common::InternalErrorKindProto) -> Option<RpcInternalErrorKind> {
+    Some(match kind {
+        proto_common::InternalErrorKindProto::InternalErrorKindUnspecified => return None,
         proto_common::InternalErrorKindProto::InternalErrorKindNodeUnavailable => RpcInternalErrorKind::NodeUnavailable,
         proto_common::InternalErrorKindProto::InternalErrorKindTimeout => RpcInternalErrorKind::Timeout,
         proto_common::InternalErrorKindProto::InternalErrorKindResourceExhausted => {
@@ -1007,7 +970,7 @@ fn internal_kind_proto_to_kind(kind: proto_common::InternalErrorKindProto) -> Rp
         proto_common::InternalErrorKindProto::InternalErrorKindCancelled => RpcInternalErrorKind::Cancelled,
         proto_common::InternalErrorKindProto::InternalErrorKindCorrupt => RpcInternalErrorKind::Corrupt,
         proto_common::InternalErrorKindProto::InternalErrorKindInternal => RpcInternalErrorKind::Internal,
-    }
+    })
 }
 
 fn internal_kind_to_proto(kind: RpcInternalErrorKind) -> proto_common::InternalErrorKindProto {
@@ -1023,36 +986,30 @@ fn internal_kind_to_proto(kind: RpcInternalErrorKind) -> proto_common::InternalE
     }
 }
 
-fn error_kind_proto_to_kind(kind: Option<&proto_common::ErrorKindProto>) -> RpcErrorKind {
+fn error_kind_proto_to_kind(kind: Option<&proto_common::ErrorKindProto>) -> Option<RpcErrorKind> {
     match kind.and_then(|kind| kind.kind.as_ref()) {
-        Some(proto_common::error_kind_proto::Kind::Fs(errno)) => RpcErrorKind::Fs(fs_errno_proto_to_enum(*errno)),
         Some(proto_common::error_kind_proto::Kind::Metadata(kind)) => {
-            let kind = proto_common::MetadataErrorKindProto::try_from(*kind)
-                .unwrap_or(proto_common::MetadataErrorKindProto::MetadataErrorKindUnspecified);
-            RpcErrorKind::Metadata(metadata_kind_proto_to_kind(kind))
+            let kind = proto_common::MetadataErrorKindProto::try_from(*kind).ok()?;
+            Some(RpcErrorKind::Metadata(metadata_kind_proto_to_kind(kind)?))
         }
         Some(proto_common::error_kind_proto::Kind::Worker(kind)) => {
-            let kind = proto_common::WorkerErrorKindProto::try_from(*kind)
-                .unwrap_or(proto_common::WorkerErrorKindProto::WorkerErrorKindUnspecified);
-            RpcErrorKind::Worker(worker_kind_proto_to_kind(kind))
+            let kind = proto_common::WorkerErrorKindProto::try_from(*kind).ok()?;
+            Some(RpcErrorKind::Worker(worker_kind_proto_to_kind(kind)?))
         }
         Some(proto_common::error_kind_proto::Kind::Protocol(kind)) => {
-            let kind = proto_common::ProtocolErrorKindProto::try_from(*kind)
-                .unwrap_or(proto_common::ProtocolErrorKindProto::ProtocolErrorKindUnspecified);
-            RpcErrorKind::Protocol(protocol_kind_proto_to_kind(kind))
+            let kind = proto_common::ProtocolErrorKindProto::try_from(*kind).ok()?;
+            Some(RpcErrorKind::Protocol(protocol_kind_proto_to_kind(kind)?))
         }
         Some(proto_common::error_kind_proto::Kind::Internal(kind)) => {
-            let kind = proto_common::InternalErrorKindProto::try_from(*kind)
-                .unwrap_or(proto_common::InternalErrorKindProto::InternalErrorKindUnspecified);
-            RpcErrorKind::Internal(internal_kind_proto_to_kind(kind))
+            let kind = proto_common::InternalErrorKindProto::try_from(*kind).ok()?;
+            Some(RpcErrorKind::Internal(internal_kind_proto_to_kind(kind)?))
         }
-        None => RpcErrorKind::Internal(RpcInternalErrorKind::Internal),
+        None => None,
     }
 }
 
 fn error_kind_to_proto(kind: RpcErrorKind) -> proto_common::ErrorKindProto {
     let kind = match kind {
-        RpcErrorKind::Fs(errno) => proto_common::error_kind_proto::Kind::Fs(fs_errno_enum_to_proto(&errno) as i32),
         RpcErrorKind::Metadata(kind) => {
             proto_common::error_kind_proto::Kind::Metadata(metadata_kind_to_proto(kind) as i32)
         }
@@ -1106,27 +1063,27 @@ fn refresh_hint_to_proto(hint: &RpcRefreshHint) -> proto_common::RefreshHintProt
     }
 }
 
-fn recovery_proto_to_action(recovery: Option<&proto_common::RecoveryActionProto>) -> RpcRecoveryAction {
+fn recovery_proto_to_action(recovery: Option<&proto_common::RecoveryActionProto>) -> Option<RpcRecoveryAction> {
     match recovery.and_then(|recovery| recovery.action.as_ref()) {
-        Some(proto_common::recovery_action_proto::Action::Fail(_)) => RpcRecoveryAction::Fail,
-        Some(proto_common::recovery_action_proto::Action::Retry(retry)) => RpcRecoveryAction::Retry {
+        Some(proto_common::recovery_action_proto::Action::Fail(_)) => Some(RpcRecoveryAction::Fail),
+        Some(proto_common::recovery_action_proto::Action::Retry(retry)) => Some(RpcRecoveryAction::Retry {
             after_ms: retry.after_ms,
-        },
+        }),
         Some(proto_common::recovery_action_proto::Action::RefreshMetadata(refresh)) => {
-            RpcRecoveryAction::RefreshMetadata {
+            Some(RpcRecoveryAction::RefreshMetadata {
                 hint: refresh_hint_proto_to_hint(refresh.hint.as_ref()),
-            }
+            })
         }
         Some(proto_common::recovery_action_proto::Action::ReopenWriteSession(reopen)) => {
-            RpcRecoveryAction::ReopenWriteSession {
+            Some(RpcRecoveryAction::ReopenWriteSession {
                 hint: refresh_hint_proto_to_hint(reopen.hint.as_ref()),
-            }
+            })
         }
-        Some(proto_common::recovery_action_proto::Action::RegisterWorker(_)) => RpcRecoveryAction::RegisterWorker,
+        Some(proto_common::recovery_action_proto::Action::RegisterWorker(_)) => Some(RpcRecoveryAction::RegisterWorker),
         Some(proto_common::recovery_action_proto::Action::SendFullBlockReport(_)) => {
-            RpcRecoveryAction::SendFullBlockReport
+            Some(RpcRecoveryAction::SendFullBlockReport)
         }
-        None => RpcRecoveryAction::Fail,
+        None => None,
     }
 }
 
@@ -1161,10 +1118,23 @@ fn recovery_action_to_proto(action: &RpcRecoveryAction) -> proto_common::Recover
 }
 
 /// Convert proto ErrorDetailProto into RPC error.
+///
+/// Missing or unknown failure facts and recovery actions fail closed as an
+/// invalid header. Malformed input cannot retain a retry or refresh action
+/// supplied by the wire payload.
 pub fn rpc_error_from_proto(err_detail: &proto_common::ErrorDetailProto) -> RpcErrorDetail {
+    let (Some(kind), Some(recovery)) = (
+        error_kind_proto_to_kind(err_detail.kind.as_ref()),
+        recovery_proto_to_action(err_detail.recovery.as_ref()),
+    ) else {
+        return RpcErrorDetail::fail(
+            RpcErrorKind::Protocol(RpcProtocolErrorKind::InvalidHeader),
+            "malformed RPC error detail",
+        );
+    };
     RpcErrorDetail {
-        kind: error_kind_proto_to_kind(err_detail.kind.as_ref()),
-        recovery: recovery_proto_to_action(err_detail.recovery.as_ref()),
+        kind,
+        recovery,
         message: err_detail.message.clone(),
     }
 }
@@ -1420,13 +1390,7 @@ mod tests {
         assert_message_fields(
             &descriptors,
             "common.ErrorKindProto",
-            &[
-                ("fs", 1),
-                ("metadata", 2),
-                ("worker", 3),
-                ("protocol", 4),
-                ("internal", 5),
-            ],
+            &[("metadata", 1), ("worker", 2), ("protocol", 3), ("internal", 4)],
         );
         assert_message_fields(
             &descriptors,
@@ -1843,6 +1807,83 @@ mod tests {
         assert_eq!(decoded_rpc_error.recovery, RpcRecoveryAction::RefreshMetadata { hint });
 
         assert_eq!(proto.error, reencoded.error, "wire form must roundtrip");
+    }
+
+    #[test]
+    fn worker_not_found_rpc_error_round_trips() {
+        let original = RpcErrorDetail::fail(
+            RpcErrorKind::Worker(RpcWorkerErrorKind::NotFound),
+            "missing local block",
+        );
+
+        let encoded = rpc_error_to_proto(&original);
+        let decoded = rpc_error_from_proto(&encoded);
+
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn malformed_rpc_error_details_fail_closed_without_recovery() {
+        let retry = || proto_common::RecoveryActionProto {
+            action: Some(proto_common::recovery_action_proto::Action::Retry(
+                proto_common::RetryRecoveryProto { after_ms: Some(1) },
+            )),
+        };
+        let refresh = || proto_common::RecoveryActionProto {
+            action: Some(proto_common::recovery_action_proto::Action::RefreshMetadata(
+                proto_common::RefreshMetadataRecoveryProto {
+                    hint: Some(proto_common::RefreshHintProto::default()),
+                },
+            )),
+        };
+        let valid_kind = || proto_common::ErrorKindProto {
+            kind: Some(proto_common::error_kind_proto::Kind::Metadata(
+                proto_common::MetadataErrorKindProto::MetadataErrorKindNotFound as i32,
+            )),
+        };
+        let malformed = [
+            proto_common::ErrorDetailProto {
+                kind: Some(proto_common::ErrorKindProto {
+                    kind: Some(proto_common::error_kind_proto::Kind::Metadata(i32::MAX)),
+                }),
+                recovery: Some(retry()),
+                message: "unknown kind with retry".to_string(),
+            },
+            proto_common::ErrorDetailProto {
+                kind: Some(proto_common::ErrorKindProto {
+                    kind: Some(proto_common::error_kind_proto::Kind::Metadata(
+                        proto_common::MetadataErrorKindProto::MetadataErrorKindUnspecified as i32,
+                    )),
+                }),
+                recovery: Some(retry()),
+                message: "unspecified kind with retry".to_string(),
+            },
+            proto_common::ErrorDetailProto {
+                kind: None,
+                recovery: Some(refresh()),
+                message: "missing kind with refresh".to_string(),
+            },
+            proto_common::ErrorDetailProto {
+                kind: Some(valid_kind()),
+                recovery: None,
+                message: "missing recovery".to_string(),
+            },
+            proto_common::ErrorDetailProto {
+                kind: Some(valid_kind()),
+                recovery: Some(proto_common::RecoveryActionProto { action: None }),
+                message: "missing recovery action".to_string(),
+            },
+        ];
+
+        for encoded in malformed {
+            let decoded = rpc_error_from_proto(&encoded);
+            assert_eq!(
+                decoded.kind,
+                RpcErrorKind::Protocol(RpcProtocolErrorKind::InvalidHeader)
+            );
+            assert_eq!(decoded.recovery, RpcRecoveryAction::Fail);
+            assert_eq!(decoded.message, "malformed RPC error detail");
+        }
     }
 
     #[test]

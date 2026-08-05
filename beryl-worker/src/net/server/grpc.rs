@@ -708,14 +708,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, RpcErrorDetail, WorkerErrorKind};
+    use beryl_common::error::rpc::{
+        ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RpcErrorDetail, WorkerErrorKind,
+    };
     use beryl_proto::common::{BlockIdProto, ByteRangeProto, ClientInfoProto, FencingTokenProto, StreamIdProto};
     use beryl_proto::worker::worker_data_service_server::WorkerDataService;
     use beryl_proto::worker::{
         AbortWriteRequestProto, CommitWriteRequestProto, DataRequestHeaderProto, OpenReadStreamRequestProto,
         OpenWriteStreamRequestProto, ReadStreamRequestProto, SyncCommittedBlockRequestProto, WriteStreamRequestProto,
     };
-    use beryl_types::fs::FsErrorCode;
     use beryl_types::ids::{BlockId, BlockIndex, ClientId, InodeId, StreamId, WorkerId};
     use beryl_types::layout::BlockFormatId;
     use beryl_types::lease::FencingToken;
@@ -1490,7 +1491,7 @@ mod tests {
             .error
             .expect("zero stamp should return structured error");
 
-        assert_header_fail(&error, ErrorKind::Fs(FsErrorCode::EInval));
+        assert_header_fail(&error, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
         assert!(error.message.contains("block_stamp"));
         assert!(response.stream_id.is_none());
     }

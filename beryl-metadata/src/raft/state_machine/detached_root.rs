@@ -297,7 +297,7 @@ impl AppRaftStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::state_machine::test_support::*;
+    use crate::raft::state_machine::tests::*;
     use beryl_types::fs::{InodeData, InodeKind};
 
     fn new_state_machine() -> (TempDir, Arc<RocksDBStorage>, AppRaftStateMachine) {

@@ -20,11 +20,10 @@ message ErrorDetailProto {
 
 message ErrorKindProto {
   oneof kind {
-    FsErrnoProto fs = 1;
-    MetadataErrorKindProto metadata = 2;
-    WorkerErrorKindProto worker = 3;
-    ProtocolErrorKindProto protocol = 4;
-    InternalErrorKindProto internal = 5;
+    MetadataErrorKindProto metadata = 1;
+    WorkerErrorKindProto worker = 2;
+    ProtocolErrorKindProto protocol = 3;
+    InternalErrorKindProto internal = 4;
   }
 }
 
@@ -67,6 +66,8 @@ enum WorkerErrorKindProto {
   WORKER_ERROR_KIND_FENCING = 12;
   WORKER_ERROR_KIND_CANCELLED = 13;
   WORKER_ERROR_KIND_IO = 14;
+  // A worker-owned local block or storage resource is absent.
+  WORKER_ERROR_KIND_NOT_FOUND = 15;
 }
 
 enum ProtocolErrorKindProto {
@@ -126,21 +127,4 @@ message RefreshHintProto {
   optional uint64 route_epoch = 5;
   repeated WorkerEndpointInfoProto worker_endpoints = 6;
   bool worker_resolve_required = 7;
-}
-
-enum FsErrnoProto {
-  FS_ERRNO_OK = 0;
-  FS_ERRNO_ENOENT = 1;
-  FS_ERRNO_EEXIST = 2;
-  FS_ERRNO_ENOTEMPTY = 3;
-  FS_ERRNO_ENOTDIR = 4;
-  FS_ERRNO_EISDIR = 5;
-  FS_ERRNO_EXDEV = 6;
-  FS_ERRNO_EPERM = 7;
-  FS_ERRNO_EACCES = 8;
-  FS_ERRNO_EINVAL = 9;
-  FS_ERRNO_ENOTSUP = 10;
-  FS_ERRNO_ENOTIMPL = 11;
-  FS_ERRNO_EAGAIN = 12;
-  FS_ERRNO_EBUSY = 13;
 }

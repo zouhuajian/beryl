@@ -10,11 +10,10 @@ mod namespace;
 mod worker;
 mod write;
 
-use crate::error::{to_fs_error_detail, MetadataError, MetadataResult};
+use crate::error::{MetadataError, MetadataResult};
 use crate::raft::command::{Command, PublishMode};
 use crate::raft::response::{
-    ApplyRejection, CommandResult, DetachedRootReclaimResult, FatalApplyError, FsCommandResult, FsErrnoResult,
-    FsOkResult,
+    ApplyRejection, CommandResult, DetachedRootReclaimResult, FatalApplyError, FsCommandResult, FsOkResult,
 };
 use crate::raft::storage::{
     BootstrapNamespaceState, DetachedRoot, DetachedRootReclaimEntry, DetachedRootReclaimUpdate, InodeAllocation,
@@ -22,18 +21,11 @@ use crate::raft::storage::{
 };
 use crate::raft::types::AppMetadataRaftState;
 use crate::raft::RoutingDelta;
-use beryl_types::fs::{Extent, FileAttrs, FsErrorCode, Inode, InodeData, InodeId};
+use beryl_types::fs::{Extent, FileAttrs, Inode, InodeData, InodeId};
 use beryl_types::ids::{BlockId, BlockIndex, MountId, WorkerId};
 use beryl_types::layout::FileLayout;
 use beryl_types::{GroupName, MAX_FILE_EXTENTS};
 use std::sync::Arc;
-
-fn meta_err_to_fs_errno(err: &MetadataError) -> Option<FsErrorCode> {
-    match to_fs_error_detail(err.clone()).kind {
-        beryl_common::error::rpc::ErrorKind::Fs(errno) => Some(errno),
-        _ => None,
-    }
-}
 
 /// Raft state machine.
 pub(crate) struct AppRaftStateMachine {
@@ -300,19 +292,6 @@ impl AppRaftStateMachine {
         proposed_at_ms.max(inode.attrs.mtime_ms).max(inode.attrs.ctime_ms)
     }
 
-    fn fs_command_result(result: MetadataResult<FsOkResult>) -> FsCommandResult {
-        match result {
-            Ok(ok) => FsCommandResult::Ok(ok),
-            Err(err) => {
-                let errno = meta_err_to_fs_errno(&err).unwrap_or(FsErrorCode::EInval);
-                FsCommandResult::Err(FsErrnoResult {
-                    errno,
-                    message: err.to_string(),
-                })
-            }
-        }
-    }
-
     fn persist_fs_apply_result(
         &self,
         result: FsCommandResult,
@@ -327,11 +306,11 @@ impl AppRaftStateMachine {
         error: MetadataError,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<FsCommandResult> {
-        let error = match ApplyRejection::from_metadata_error(error) {
-            Ok(rejection) => rejection.into_metadata_error(),
+        let rejection = match ApplyRejection::from_metadata_error(error) {
+            Ok(rejection) => rejection,
             Err(fatal) => return Err(fatal.into_inner()),
         };
-        self.persist_fs_apply_result(Self::fs_command_result(Err(error)), raft_state)
+        self.persist_fs_apply_result(FsCommandResult::Err(rejection), raft_state)
     }
 
     fn extent_end(extent: &Extent) -> MetadataResult<u64> {
@@ -464,8 +443,9 @@ impl AppRaftStateMachine {
 }
 
 #[cfg(test)]
-pub(crate) mod test_support {
+pub(crate) mod tests {
     pub(crate) use super::*;
+    use crate::raft::response::ApplyRejectionKind;
     pub(crate) use beryl_types::fs::{FileAttrs, Inode};
     pub(crate) use beryl_types::ids::{BlockId, InodeId, MountId, WorkerId};
     pub(crate) use beryl_types::layout::FileLayout;
@@ -510,9 +490,9 @@ pub(crate) mod test_support {
         }
     }
 
-    pub(crate) fn expect_fs_errno(raw: CommandResult, errno: FsErrorCode) {
+    pub(crate) fn expect_fs_rejection(raw: CommandResult, expected: ApplyRejectionKind) {
         match raw {
-            CommandResult::Fs(FsCommandResult::Err(err)) => assert_eq!(err.errno, errno),
+            CommandResult::Fs(FsCommandResult::Err(rejection)) => assert_eq!(rejection.kind, expected),
             other => panic!("unexpected apply response: {other:?}"),
         }
     }
@@ -576,11 +556,6 @@ pub(crate) mod test_support {
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         inode
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::test_support::*;
 
     #[test]
     fn bootstrap_namespace_is_convergent_and_creates_one_root() {

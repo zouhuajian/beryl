@@ -234,7 +234,6 @@ pub(crate) fn worker_error_kind(error: &WorkerError) -> &'static str {
 
 fn error_kind_label(kind: ErrorKind) -> &'static str {
     match kind {
-        ErrorKind::Fs(_) => "fs",
         ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader) => "invalid_header",
         ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument) => "invalid_argument",
         ErrorKind::Protocol(ProtocolErrorKind::PermissionDenied) => "permission_denied",
@@ -291,6 +290,7 @@ fn rpc_worker_error_kind(kind: WorkerErrorKind) -> &'static str {
         WorkerErrorKind::Fencing => "worker_fencing",
         WorkerErrorKind::Cancelled => "worker_cancelled",
         WorkerErrorKind::Io => "worker_io",
+        WorkerErrorKind::NotFound => "worker_not_found",
     }
 }
 

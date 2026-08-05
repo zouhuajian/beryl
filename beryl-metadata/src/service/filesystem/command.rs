@@ -225,11 +225,12 @@ fn record_fs_write_result(operation_name: &'static str, started: Instant, result
         FsCommandResult::Ok(_) => {
             observe::record_fs_op(operation_name, "ok", "none", started.elapsed().as_secs_f64());
         }
-        FsCommandResult::Err(err) => {
+        FsCommandResult::Err(rejection) => {
+            let error = rejection.clone().into_metadata_error();
             observe::record_fs_op(
                 operation_name,
                 "error",
-                observe::fs_errno_kind(err.errno),
+                observe::metadata_error_kind(&error),
                 started.elapsed().as_secs_f64(),
             );
         }
