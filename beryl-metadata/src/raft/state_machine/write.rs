@@ -389,7 +389,8 @@ impl AppRaftStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::state_machine::test_support::*;
+    use crate::raft::response::ApplyRejectionKind;
+    use crate::raft::state_machine::tests::*;
     use beryl_types::{InodeKind, MAX_FILE_EXTENTS};
 
     fn expect_block_allocated(result: CommandResult) -> BlockId {
@@ -637,14 +638,14 @@ mod tests {
         );
         assert_eq!(first.lease_epoch, Some(2));
 
-        expect_fs_errno(
+        expect_fs_rejection(
             sm.apply(Command::AcquireWriteLease {
                 proposed_at_ms: 2,
                 inode_id,
                 expected_lease_epoch: 1,
             })
             .unwrap(),
-            FsErrorCode::EAgain,
+            ApplyRejectionKind::Again,
         );
         let inode = storage.get_inode(inode_id).unwrap().unwrap();
         let InodeData::File { lease_epoch, .. } = inode.data else {
@@ -689,7 +690,10 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(replayed_end.lease_epoch, Some(2));
-        expect_fs_errno(sm.apply(publish).unwrap(), FsErrorCode::EInval);
+        expect_fs_rejection(
+            sm.apply(publish).unwrap(),
+            ApplyRejectionKind::LeaseFenced { expected: 2, got: 1 },
+        );
         assert_eq!(storage.get_inode(inode_id).unwrap().unwrap().attrs.size, 0);
     }
 
@@ -761,7 +765,7 @@ mod tests {
         assert_eq!(first.content_revision, Some(1));
         assert_eq!(replay.content_revision, first.content_revision);
 
-        expect_fs_errno(
+        expect_fs_rejection(
             sm.apply(Command::PublishFile {
                 proposed_at_ms: 11,
                 inode_id,
@@ -773,7 +777,7 @@ mod tests {
                 mode: PublishMode::ReplaceIfUnchanged,
             })
             .unwrap(),
-            FsErrorCode::EAgain,
+            ApplyRejectionKind::Again,
         );
         assert_eq!(storage.get_inode(inode_id).unwrap().unwrap().attrs.size, 1024);
     }
@@ -808,7 +812,7 @@ mod tests {
         );
         assert_eq!(result.content_revision, Some(1));
 
-        expect_fs_errno(
+        expect_fs_rejection(
             sm.apply(Command::PublishFile {
                 proposed_at_ms: 11,
                 inode_id,
@@ -820,7 +824,7 @@ mod tests {
                 mode: PublishMode::AppendIfUnchanged,
             })
             .unwrap(),
-            FsErrorCode::EAgain,
+            ApplyRejectionKind::Again,
         );
 
         let second_append = Command::PublishFile {

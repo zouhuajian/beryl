@@ -5,13 +5,11 @@ use beryl_common::error::rpc::{
     ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail,
     WorkerErrorKind,
 };
-use beryl_types::fs::FsErrorCode;
-
 #[test]
-fn fs_error_records_fact_without_recovery_coupling() {
-    let err = RpcErrorDetail::fs(FsErrorCode::ENoEnt, "missing inode");
+fn metadata_error_records_fact_without_recovery_coupling() {
+    let err = RpcErrorDetail::fail(ErrorKind::Metadata(MetadataErrorKind::NotFound), "missing inode");
 
-    assert_eq!(err.kind, ErrorKind::Fs(FsErrorCode::ENoEnt));
+    assert_eq!(err.kind, ErrorKind::Metadata(MetadataErrorKind::NotFound));
     assert_eq!(err.recovery, RecoveryAction::Fail);
     assert_eq!(err.message, "missing inode");
 }

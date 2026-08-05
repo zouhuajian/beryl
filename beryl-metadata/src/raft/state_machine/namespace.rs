@@ -1012,7 +1012,8 @@ impl AppRaftStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::state_machine::test_support::*;
+    use crate::raft::response::ApplyRejectionKind;
+    use crate::raft::state_machine::tests::*;
 
     fn test_state() -> (TempDir, Arc<RocksDBStorage>, AppRaftStateMachine, InodeId) {
         let dir = TempDir::new().unwrap();
@@ -1079,9 +1080,9 @@ mod tests {
         parent_inode_id: InodeId,
         directory_inode_id: InodeId,
         command: Command,
-        expected_errno: FsErrorCode,
+        expected_rejection: ApplyRejectionKind,
     ) {
-        expect_fs_errno(sm.apply(command).unwrap(), expected_errno);
+        expect_fs_rejection(sm.apply(command).unwrap(), expected_rejection);
         assert_eq!(
             storage.get_dentry(parent_inode_id, "target").unwrap(),
             Some(directory_inode_id)
@@ -1101,7 +1102,7 @@ mod tests {
         assert_eq!(storage.get_inode(inode_id).unwrap().unwrap().inode_id, inode_id);
         assert_eq!(storage.get_layout(inode_id).unwrap(), FileLayout::new(4096, 4096, 1));
 
-        expect_fs_errno(
+        expect_fs_rejection(
             sm.apply(Command::CreateFile {
                 proposed_at_ms: 2,
                 parent_inode_id,
@@ -1110,7 +1111,7 @@ mod tests {
                 layout: FileLayout::new(8192, 8192, 1),
             })
             .unwrap(),
-            FsErrorCode::EExist,
+            ApplyRejectionKind::AlreadyExists,
         );
     }
 
@@ -1198,9 +1199,9 @@ mod tests {
         let replacement = create_file(&sm, parent_inode_id, "replacement").inode_id.unwrap();
         storage.put_dentry(parent_inode_id, "target", replacement).unwrap();
 
-        expect_fs_errno(
+        expect_fs_rejection(
             sm.apply(delete_command("target", original, Some(0), false)).unwrap(),
-            FsErrorCode::EAgain,
+            ApplyRejectionKind::Again,
         );
 
         assert_eq!(
@@ -1357,7 +1358,7 @@ mod tests {
                 parent_inode_id,
                 directory,
                 command,
-                FsErrorCode::EAgain,
+                ApplyRejectionKind::Again,
             );
         }
     }
@@ -1403,7 +1404,7 @@ mod tests {
                 parent_inode_id,
                 directory,
                 command,
-                FsErrorCode::EInval,
+                ApplyRejectionKind::InvalidArgument,
             );
         }
     }
@@ -1414,7 +1415,7 @@ mod tests {
         let source = create_file(&sm, parent_inode_id, "source").inode_id.unwrap();
         let replacement = create_file(&sm, parent_inode_id, "destination").inode_id.unwrap();
 
-        expect_fs_errno(
+        expect_fs_rejection(
             sm.apply(Command::Rename {
                 proposed_at_ms: 2,
                 src_parent_inode_id: parent_inode_id,
@@ -1427,7 +1428,7 @@ mod tests {
                 flags: 0,
             })
             .unwrap(),
-            FsErrorCode::EAgain,
+            ApplyRejectionKind::Again,
         );
 
         assert_eq!(storage.get_dentry(parent_inode_id, "source").unwrap(), Some(source));
@@ -1443,7 +1444,7 @@ mod tests {
         let source = create_file(&sm, parent_inode_id, "source").inode_id.unwrap();
         let destination = create_file(&sm, parent_inode_id, "destination").inode_id.unwrap();
 
-        expect_fs_errno(
+        expect_fs_rejection(
             sm.apply(Command::Rename {
                 proposed_at_ms: 2,
                 src_parent_inode_id: parent_inode_id,
@@ -1456,7 +1457,7 @@ mod tests {
                 flags: 0x1,
             })
             .unwrap(),
-            FsErrorCode::EExist,
+            ApplyRejectionKind::AlreadyExists,
         );
         assert_eq!(storage.get_dentry(parent_inode_id, "source").unwrap(), Some(source));
     }
@@ -1584,7 +1585,7 @@ mod tests {
         let stale_inner_delete = delete_path_command(vec!["outer".to_string(), "inner".to_string()], inner, None, true);
 
         expect_fs_ok(sm.apply(delete_command("outer", outer, None, true)).unwrap());
-        expect_fs_errno(sm.apply(stale_inner_delete).unwrap(), FsErrorCode::ENoEnt);
+        expect_fs_rejection(sm.apply(stale_inner_delete).unwrap(), ApplyRejectionKind::NotFound);
 
         assert_eq!(storage.get_dentry(outer, "inner").unwrap(), Some(inner));
         assert!(storage.get_detached_root(outer).unwrap().is_some());
@@ -1619,9 +1620,9 @@ mod tests {
             })
             .unwrap();
 
-        expect_fs_errno(
+        expect_fs_rejection(
             sm.apply(delete_command("dir", directory, None, true)).unwrap(),
-            FsErrorCode::EXDev,
+            ApplyRejectionKind::CrossMountRename,
         );
 
         assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), Some(directory));
@@ -1642,9 +1643,9 @@ mod tests {
             })
             .unwrap(),
         );
-        expect_fs_errno(
+        expect_fs_rejection(
             sm.apply(delete_command("target", inode_id, Some(0), false)).unwrap(),
-            FsErrorCode::EAgain,
+            ApplyRejectionKind::Again,
         );
 
         assert_eq!(storage.get_dentry(parent_inode_id, "target").unwrap(), Some(inode_id));
@@ -1657,14 +1658,14 @@ mod tests {
         let inode_id = file.inode_id.unwrap();
 
         expect_fs_ok(sm.apply(delete_command("target", inode_id, Some(0), false)).unwrap());
-        expect_fs_errno(
+        expect_fs_rejection(
             sm.apply(Command::AcquireWriteLease {
                 proposed_at_ms: 3,
                 inode_id,
                 expected_lease_epoch: 0,
             })
             .unwrap(),
-            FsErrorCode::ENoEnt,
+            ApplyRejectionKind::NotFound,
         );
 
         assert_eq!(storage.get_dentry(parent_inode_id, "target").unwrap(), None);
@@ -1717,7 +1718,7 @@ mod tests {
             })
             .unwrap(),
         );
-        expect_fs_errno(
+        expect_fs_rejection(
             sm.apply(Command::Rename {
                 proposed_at_ms: 3,
                 src_parent_inode_id: parent_inode_id,
@@ -1730,7 +1731,7 @@ mod tests {
                 flags: 0,
             })
             .unwrap(),
-            FsErrorCode::EAgain,
+            ApplyRejectionKind::Again,
         );
 
         assert_eq!(storage.get_dentry(parent_inode_id, "source").unwrap(), Some(source));
@@ -1760,14 +1761,14 @@ mod tests {
             })
             .unwrap(),
         );
-        expect_fs_errno(
+        expect_fs_rejection(
             sm.apply(Command::AcquireWriteLease {
                 proposed_at_ms: 3,
                 inode_id: destination,
                 expected_lease_epoch: 0,
             })
             .unwrap(),
-            FsErrorCode::ENoEnt,
+            ApplyRejectionKind::NotFound,
         );
 
         assert_eq!(

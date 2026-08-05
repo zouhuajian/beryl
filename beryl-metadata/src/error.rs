@@ -9,7 +9,6 @@
 use beryl_common::error::rpc::{
     ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind,
 };
-use beryl_types::fs::FsErrorCode;
 use beryl_types::ids::MountId;
 use thiserror::Error;
 
@@ -109,7 +108,11 @@ pub enum MetadataError {
     ServiceUnavailable(String),
 }
 
-/// Authoritative metadata -> rpc_error mapping for non-filesystem handlers.
+/// Map one metadata failure into the shared RPC fact and recovery model.
+///
+/// This is the only metadata-to-RPC mapping entry point. Filesystem handlers
+/// use the same domain facts as other metadata handlers; a POSIX adapter, if
+/// added later, must translate those facts at its own boundary.
 pub fn to_rpc_error(err: MetadataError) -> RpcErrorDetail {
     match map_shared_rpc_error(err) {
         Ok(rpc_error) => rpc_error,
@@ -119,17 +122,6 @@ pub fn to_rpc_error(err: MetadataError) -> RpcErrorDetail {
 
 /// Result type for metadata operations.
 pub type MetadataResult<T> = Result<T, MetadataError>;
-
-/// Authoritative FS error mapping entrypoint.
-///
-/// This is the single place that maps `MetadataError` into FS errno-backed
-/// RPC errors for filesystem-facing handlers.
-pub fn to_fs_error_detail(err: MetadataError) -> RpcErrorDetail {
-    match map_shared_rpc_error(err) {
-        Ok(rpc_error) => rpc_error,
-        Err(err) => map_fs_fatal_rpc_error(err),
-    }
-}
 
 fn map_shared_rpc_error(err: MetadataError) -> Result<RpcErrorDetail, MetadataError> {
     match err {
@@ -234,7 +226,7 @@ fn map_rpc_application_error(err: MetadataError) -> RpcErrorDetail {
             format!("active worker conflict: {}", msg),
         ),
         MetadataError::Again(msg) => RpcErrorDetail::retry(
-            ErrorKind::Internal(InternalErrorKind::ResourceExhausted),
+            ErrorKind::Metadata(MetadataErrorKind::Conflict),
             None,
             format!("resource temporarily unavailable: {}", msg),
         ),
@@ -254,65 +246,10 @@ fn map_rpc_application_error(err: MetadataError) -> RpcErrorDetail {
     }
 }
 
-fn map_fs_fatal_rpc_error(err: MetadataError) -> RpcErrorDetail {
-    match err {
-        MetadataError::NotFound(msg) => RpcErrorDetail::fs(FsErrorCode::ENoEnt, msg),
-        MetadataError::AlreadyExists(msg) => RpcErrorDetail::fs(FsErrorCode::EExist, msg),
-        MetadataError::InvalidArgument(msg) => RpcErrorDetail::fs(FsErrorCode::EInval, msg),
-        MetadataError::NotDir(msg) => RpcErrorDetail::fs(FsErrorCode::ENotDir, msg),
-        MetadataError::IsDir(msg) => RpcErrorDetail::fs(FsErrorCode::EIsDir, msg),
-        MetadataError::DirectoryNotEmpty(msg) => RpcErrorDetail::fs(FsErrorCode::ENotEmpty, msg),
-        MetadataError::CrossMountRename(msg) => RpcErrorDetail::fs(FsErrorCode::EXDev, msg),
-        MetadataError::PermissionDenied(msg) => RpcErrorDetail::fs(FsErrorCode::EAcces, msg),
-        MetadataError::NotSupported(msg) => RpcErrorDetail::fs(FsErrorCode::ENotsup, msg),
-        MetadataError::Busy(msg) => RpcErrorDetail::fs(FsErrorCode::EBusy, msg),
-        MetadataError::ActiveWorkerConflict(msg) => RpcErrorDetail::fs(FsErrorCode::EBusy, msg),
-        MetadataError::Again(msg) => RpcErrorDetail::fs(FsErrorCode::EAgain, msg),
-        MetadataError::Internal(msg) => RpcErrorDetail::fs(FsErrorCode::EInval, msg),
-        MetadataError::LeaderChanged(_)
-        | MetadataError::EpochMismatch { .. }
-        | MetadataError::MountEpochMismatch { .. }
-        | MetadataError::RoutingStale(_)
-        | MetadataError::StaleState(_)
-        | MetadataError::FullReportRequired(_)
-        | MetadataError::LeaseFenced { .. }
-        | MetadataError::ResourceExhausted(_)
-        | MetadataError::ServiceUnavailable(_) => unreachable!("shared metadata errors must be mapped earlier"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use beryl_common::error::rpc::RecoveryAction;
-    use beryl_types::fs::FsErrorCode;
-
-    #[test]
-    fn test_to_fs_error_detail_errno_coverage() {
-        let cases = vec![
-            (MetadataError::NotFound("x".to_string()), FsErrorCode::ENoEnt),
-            (MetadataError::AlreadyExists("x".to_string()), FsErrorCode::EExist),
-            (MetadataError::InvalidArgument("x".to_string()), FsErrorCode::EInval),
-            (MetadataError::NotDir("x".to_string()), FsErrorCode::ENotDir),
-            (MetadataError::IsDir("x".to_string()), FsErrorCode::EIsDir),
-            (
-                MetadataError::DirectoryNotEmpty("x".to_string()),
-                FsErrorCode::ENotEmpty,
-            ),
-            (MetadataError::CrossMountRename("x".to_string()), FsErrorCode::EXDev),
-            (MetadataError::PermissionDenied("x".to_string()), FsErrorCode::EAcces),
-            (MetadataError::NotSupported("x".to_string()), FsErrorCode::ENotsup),
-            (MetadataError::Busy("x".to_string()), FsErrorCode::EBusy),
-            (MetadataError::ActiveWorkerConflict("x".to_string()), FsErrorCode::EBusy),
-            (MetadataError::Again("x".to_string()), FsErrorCode::EAgain),
-        ];
-
-        for (input, expected_errno) in cases {
-            let rpc_error = to_fs_error_detail(input);
-            assert_eq!(rpc_error.kind, ErrorKind::Fs(expected_errno));
-            assert_eq!(rpc_error.recovery, RecoveryAction::Fail);
-        }
-    }
 
     #[test]
     fn test_to_rpc_error_kind_coverage() {
@@ -374,7 +311,7 @@ mod tests {
             ),
             (
                 MetadataError::Again("x".to_string()),
-                ErrorKind::Internal(InternalErrorKind::ResourceExhausted),
+                ErrorKind::Metadata(MetadataErrorKind::Conflict),
                 "resource temporarily unavailable: x".to_string(),
             ),
             (
@@ -392,34 +329,29 @@ mod tests {
     }
 
     #[test]
-    fn test_shared_retryable_and_refresh_mapping_matches_between_rpc_and_fs() {
-        let cases = vec![
-            MetadataError::LeaderChanged("leader changed".to_string()),
-            MetadataError::EpochMismatch { expected: 7, got: 5 },
-            MetadataError::MountEpochMismatch {
-                expected: 9,
-                got: 8,
-                mount_id: Some(MountId::new(11)),
-            },
-            MetadataError::RoutingStale("routing stale".to_string()),
-            MetadataError::StaleState("stale state".to_string()),
-            MetadataError::LeaseFenced { expected: 13, got: 12 },
-            MetadataError::ResourceExhausted("request exceeds limit".to_string()),
-            MetadataError::ServiceUnavailable("node warming up".to_string()),
-        ];
+    fn shared_retryable_and_refresh_failures_preserve_recovery() {
+        let leader = to_rpc_error(MetadataError::LeaderChanged("leader changed".to_string()));
+        assert!(matches!(leader.recovery, RecoveryAction::RefreshMetadata { .. }));
 
-        for input in cases {
-            let rpc = to_rpc_error(input.clone());
-            let fs = to_fs_error_detail(input);
-            assert_eq!(rpc.kind, fs.kind);
-            assert_eq!(rpc.recovery, fs.recovery);
-            assert_eq!(rpc.message, fs.message);
-        }
+        let epoch = to_rpc_error(MetadataError::EpochMismatch { expected: 7, got: 5 });
+        assert!(matches!(epoch.recovery, RecoveryAction::ReopenWriteSession { .. }));
+
+        let stale = to_rpc_error(MetadataError::StaleState("stale state".to_string()));
+        assert!(matches!(stale.recovery, RecoveryAction::RefreshMetadata { .. }));
+
+        let again = to_rpc_error(MetadataError::Again("try again".to_string()));
+        assert!(matches!(again.recovery, RecoveryAction::Retry { after_ms: None }));
+
+        let unavailable = to_rpc_error(MetadataError::ServiceUnavailable("node warming up".to_string()));
+        assert!(matches!(
+            unavailable.recovery,
+            RecoveryAction::Retry { after_ms: Some(1000) }
+        ));
     }
 
     #[test]
     fn resource_exhausted_is_a_non_retryable_metadata_failure() {
-        let error = to_fs_error_detail(MetadataError::ResourceExhausted("request exceeds limit".to_string()));
+        let error = to_rpc_error(MetadataError::ResourceExhausted("request exceeds limit".to_string()));
 
         assert_eq!(error.kind, ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted));
         assert_eq!(error.recovery, RecoveryAction::Fail);

@@ -4,7 +4,7 @@
 //! Responses produced by committed metadata Raft commands.
 
 use crate::error::MetadataError;
-use beryl_types::fs::{FileAttrs, FsErrorCode, InodeId};
+use beryl_types::fs::{FileAttrs, InodeId};
 use beryl_types::ids::{BlockId, WorkerId};
 use beryl_types::layout::FileLayout;
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,7 @@ use thiserror::Error;
 /// Application-level response propagated from the state machine to the proposer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum CommandResult {
-    /// Filesystem command result with errno fidelity.
+    /// Filesystem command result with deterministic rejection fidelity.
     Fs(FsCommandResult),
     /// Root mount created or confirmed by namespace bootstrap.
     MountUpserted(crate::mount::MountEntry),
@@ -65,6 +65,11 @@ pub(crate) struct ApplyRejection {
 }
 
 impl ApplyRejection {
+    /// Convert a deterministic metadata-domain failure into a committed result.
+    ///
+    /// Infrastructure, leadership, freshness, and invariant failures remain
+    /// fatal because replaying them as business rejections would hide an apply
+    /// failure or make it dependent on leader-local state.
     pub(crate) fn from_metadata_error(error: MetadataError) -> Result<Self, FatalApplyError> {
         let rejection = match error {
             MetadataError::NotFound(message) => Self {
@@ -135,6 +140,7 @@ impl ApplyRejection {
         Ok(rejection)
     }
 
+    /// Restore the metadata-domain failure after a committed result reaches the proposer.
     pub fn into_metadata_error(self) -> MetadataError {
         match self.kind {
             ApplyRejectionKind::NotFound => MetadataError::NotFound(self.message),
@@ -175,10 +181,13 @@ impl FatalApplyError {
 }
 
 /// Filesystem apply result returned synchronously via Raft.
+///
+/// Rejections carry the same metadata-domain fact used by every other Raft
+/// command. They never contain transport policy or platform errno values.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum FsCommandResult {
     Ok(FsOkResult),
-    Err(FsErrnoResult),
+    Err(ApplyRejection),
 }
 
 /// Successful FS command payload (minimal for now; extensible).
@@ -189,13 +198,6 @@ pub(crate) struct FsOkResult {
     pub attrs: Option<FileAttrs>,
     pub layout: Option<FileLayout>,
     pub lease_epoch: Option<u64>,
-}
-
-/// FS errno surfaced by apply.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct FsErrnoResult {
-    pub errno: FsErrorCode,
-    pub message: String,
 }
 
 #[cfg(test)]

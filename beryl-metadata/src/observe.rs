@@ -7,7 +7,6 @@ use crate::error::MetadataError;
 use beryl_common::error::rpc::{
     ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RpcErrorDetail, WorkerErrorKind,
 };
-use beryl_types::fs::FsErrorCode;
 
 pub(crate) const METADATA_UP: &str = "metadata_up";
 pub(crate) const METADATA_BUILD_INFO: &str = "metadata_build_info";
@@ -369,28 +368,8 @@ pub(crate) fn rpc_error_kind(error: &RpcErrorDetail) -> &'static str {
     error_kind_label(error.kind)
 }
 
-pub(crate) fn fs_errno_kind(errno: FsErrorCode) -> &'static str {
-    match errno {
-        FsErrorCode::Ok => "none",
-        FsErrorCode::ENoEnt => "enoent",
-        FsErrorCode::EExist => "eexist",
-        FsErrorCode::ENotEmpty => "enotempty",
-        FsErrorCode::ENotDir => "enotdir",
-        FsErrorCode::EIsDir => "eisdir",
-        FsErrorCode::EXDev => "exdev",
-        FsErrorCode::EPerm => "eperm",
-        FsErrorCode::EAcces => "eacces",
-        FsErrorCode::EInval => "einval",
-        FsErrorCode::ENotsup => "enotsup",
-        FsErrorCode::ENotImpl => "enotimpl",
-        FsErrorCode::EAgain => "eagain",
-        FsErrorCode::EBusy => "ebusy",
-    }
-}
-
 fn error_kind_label(kind: ErrorKind) -> &'static str {
     match kind {
-        ErrorKind::Fs(errno) => fs_errno_kind(errno),
         ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader) => "invalid_header",
         ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument) => "invalid_argument",
         ErrorKind::Protocol(ProtocolErrorKind::PermissionDenied) => "permission_denied",
@@ -447,6 +426,7 @@ fn worker_error_kind(kind: WorkerErrorKind) -> &'static str {
         WorkerErrorKind::Fencing => "worker_fencing",
         WorkerErrorKind::Cancelled => "worker_cancelled",
         WorkerErrorKind::Io => "worker_io",
+        WorkerErrorKind::NotFound => "worker_not_found",
     }
 }
 

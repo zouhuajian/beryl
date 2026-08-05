@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
 use beryl_client::{ClientError, CreateOptions, FileStatus};
-use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction};
+use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction};
 use beryl_common::header::RequestHeader;
 use beryl_e2e::{data::deterministic_bytes, TestCluster, TestResult};
 use beryl_proto::common::{ByteRangeProto, FileLayoutProto, RequestHeaderProto, ResponseHeaderProto};
@@ -20,7 +20,6 @@ use beryl_proto::worker::{
     CommitWriteRequestProto, DataRequestHeaderProto, DataResponseHeaderProto, OpenWriteStreamRequestProto,
     WriteStreamRequestProto,
 };
-use beryl_types::fs::FsErrorCode;
 use beryl_types::{BlockFormatId, ClientId};
 use bytes::Bytes;
 use tokio_stream::iter;
@@ -290,7 +289,10 @@ async fn session_operations_converge_by_predecessor_and_ensure_absent() {
         .expect("AddBlock conflict response")
         .into_inner();
     let error = conflict.header.expect("conflict header").error.expect("conflict error");
-    assert_eq!(rpc_error_from_proto(&error).kind, ErrorKind::Fs(FsErrorCode::EInval));
+    assert_eq!(
+        rpc_error_from_proto(&error).kind,
+        ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument)
+    );
 
     let abort_request = AbortFileWriteRequestProto {
         header: Some(metadata_header(801)),
@@ -754,10 +756,7 @@ fn assert_stale_writer_error(err: &ClientError) {
 
 fn assert_not_found(err: &ClientError) {
     if let ClientError::Action(action) = err {
-        if matches!(
-            action.kind(),
-            Some(ErrorKind::Fs(FsErrorCode::ENoEnt) | ErrorKind::Metadata(MetadataErrorKind::NotFound))
-        ) {
+        if matches!(action.kind(), Some(ErrorKind::Metadata(MetadataErrorKind::NotFound))) {
             return;
         }
     }

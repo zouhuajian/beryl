@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use beryl_common::error::rpc::{ErrorKind, InternalErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind};
+use beryl_common::error::rpc::{
+    ErrorKind, InternalErrorKind, ProtocolErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind,
+};
 use beryl_proto::common::{EndpointProto, ResponseHeaderProto};
 use beryl_proto::convert::rpc_error_to_proto;
 use beryl_proto::metadata::metadata_worker_service_proto_server::{
@@ -17,7 +19,6 @@ use beryl_proto::metadata::{
     RegisterWorkerRequestProto, RegisterWorkerResponseProto,
 };
 use beryl_types::chunk::ByteRange;
-use beryl_types::fs::FsErrorCode;
 use beryl_types::ids::{BlockId, BlockIndex, ClientId, InodeId, WorkerId};
 use beryl_types::layout::BlockFormatId;
 use beryl_types::{GroupName, Tier, TierFree, WorkerRunId, MAX_REPORT_ENTRIES};
@@ -707,7 +708,10 @@ async fn transport_register_unavailable_is_retried() {
 
 #[tokio::test]
 async fn fatal_register_failure_stops_startup() {
-    let fatal = RpcErrorDetail::fs(FsErrorCode::EInval, "bad worker descriptor");
+    let fatal = RpcErrorDetail::fail(
+        ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument),
+        "bad worker descriptor",
+    );
     let (endpoint, mock, shutdown) = start_mock_metadata(vec![MockRegisterReply::HeaderError(fatal)]).await;
     let state = Arc::new(RegistrationSet::new());
     let registrar = MetadataRegistrar::new(

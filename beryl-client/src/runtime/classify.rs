@@ -6,7 +6,6 @@
 use crate::error::ClientError;
 use crate::rpc_error::ClientAction;
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RpcErrorDetail};
-use beryl_types::fs::FsErrorCode;
 
 /// Runtime error classification used by the metadata executor.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,13 +118,9 @@ fn classify_fail_action(rpc_error: &RpcErrorDetail) -> ErrorClass {
         ErrorKind::Metadata(MetadataErrorKind::Fencing) | ErrorKind::Metadata(MetadataErrorKind::EpochMismatch) => {
             ErrorClass::Fencing
         }
-        ErrorKind::Protocol(ProtocolErrorKind::PermissionDenied)
-        | ErrorKind::Fs(FsErrorCode::EPerm | FsErrorCode::EAcces) => ErrorClass::PermissionDenied,
-        ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument) | ErrorKind::Fs(FsErrorCode::EInval) => {
-            ErrorClass::InvalidArgument
-        }
-        ErrorKind::Protocol(ProtocolErrorKind::Unsupported)
-        | ErrorKind::Fs(FsErrorCode::ENotsup | FsErrorCode::ENotImpl) => ErrorClass::Unsupported,
+        ErrorKind::Protocol(ProtocolErrorKind::PermissionDenied) => ErrorClass::PermissionDenied,
+        ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument) => ErrorClass::InvalidArgument,
+        ErrorKind::Protocol(ProtocolErrorKind::Unsupported) => ErrorClass::Unsupported,
         _ => ErrorClass::Fatal,
     }
 }

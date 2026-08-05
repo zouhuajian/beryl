@@ -1247,7 +1247,7 @@ mod tests {
         };
         storage_a.put_mount(&snapshot_mount).unwrap();
         let detached_inode_id = InodeId::new(71);
-        let detached_root = crate::raft::DetachedRoot {
+        let detached_root = DetachedRoot {
             mount_id: snapshot_mount.mount_id,
             detached_at_ms: 123,
         };

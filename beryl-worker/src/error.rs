@@ -7,9 +7,8 @@
 //! to gRPC Status codes with retry information and details.
 
 use beryl_common::error::rpc::{
-    ErrorKind, InternalErrorKind, MetadataErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind,
+    ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind,
 };
-use beryl_types::fs::FsErrorCode;
 use thiserror::Error;
 use tonic::Status;
 
@@ -207,10 +206,14 @@ impl From<WorkerError> for RpcErrorDetail {
                 ErrorKind::Worker(WorkerErrorKind::Cancelled),
                 format!("operation cancelled: {}", msg),
             ),
-            WorkerError::InvalidArgument(msg) => {
-                RpcErrorDetail::fs(FsErrorCode::EInval, format!("invalid argument: {}", msg))
-            }
-            WorkerError::NotFound(msg) => RpcErrorDetail::fs(FsErrorCode::ENoEnt, format!("not found: {}", msg)),
+            WorkerError::InvalidArgument(msg) => RpcErrorDetail::fail(
+                ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument),
+                format!("invalid argument: {}", msg),
+            ),
+            WorkerError::NotFound(msg) => RpcErrorDetail::fail(
+                ErrorKind::Worker(WorkerErrorKind::NotFound),
+                format!("not found: {}", msg),
+            ),
             WorkerError::Corrupt(msg) => {
                 RpcErrorDetail::fail(ErrorKind::Worker(WorkerErrorKind::Corrupt), format!("corrupt: {}", msg))
             }
@@ -220,12 +223,14 @@ impl From<WorkerError> for RpcErrorDetail {
             WorkerError::Fencing(msg) => {
                 RpcErrorDetail::fail(ErrorKind::Worker(WorkerErrorKind::Fencing), format!("fencing: {}", msg))
             }
-            WorkerError::PermissionDenied(msg) => {
-                RpcErrorDetail::fs(FsErrorCode::EAcces, format!("permission denied: {}", msg))
-            }
-            WorkerError::Unimplemented(msg) => {
-                RpcErrorDetail::fs(FsErrorCode::ENotImpl, format!("unimplemented: {}", msg))
-            }
+            WorkerError::PermissionDenied(msg) => RpcErrorDetail::fail(
+                ErrorKind::Worker(WorkerErrorKind::Io),
+                format!("permission denied: {}", msg),
+            ),
+            WorkerError::Unimplemented(msg) => RpcErrorDetail::fail(
+                ErrorKind::Protocol(ProtocolErrorKind::Unsupported),
+                format!("unimplemented: {}", msg),
+            ),
             WorkerError::Internal(msg) => RpcErrorDetail::fail(
                 ErrorKind::Internal(InternalErrorKind::Internal),
                 format!("internal error: {}", msg),
@@ -269,5 +274,18 @@ mod tests {
         let status = err.to_status();
         assert_eq!(status.code(), tonic::Code::Unavailable);
         assert!(!status.message().contains("retry_after_ms"));
+    }
+
+    #[test]
+    fn rpc_error_detail_preserves_failure_owner() {
+        let not_found = RpcErrorDetail::from(WorkerError::NotFound("block".to_string()));
+        assert_eq!(not_found.kind, ErrorKind::Worker(WorkerErrorKind::NotFound));
+        assert_eq!(not_found.recovery, beryl_common::error::rpc::RecoveryAction::Fail);
+
+        let invalid = RpcErrorDetail::from(WorkerError::InvalidArgument("request".to_string()));
+        assert_eq!(invalid.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
+
+        let permission = RpcErrorDetail::from(WorkerError::PermissionDenied("local file".to_string()));
+        assert_eq!(permission.kind, ErrorKind::Worker(WorkerErrorKind::Io));
     }
 }

@@ -3,13 +3,16 @@
 
 //! Durable file visibility publication for sync and commit.
 
-use super::{Freshness, FsFailure, FsResult, MetadataFileSystem, PresentedWriteHandle, RequestContext};
+use super::{
+    fs_failure_from_metadata_error, Freshness, FsFailure, FsResult, MetadataFileSystem, PresentedWriteHandle,
+    RequestContext,
+};
 use crate::error::{MetadataError, MetadataResult};
 use crate::observe;
 use crate::raft::{Command, FsCommandResult, PublishMode};
 use crate::worker::{PublishReadyConflict, PublishReadyStatus};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint, WorkerErrorKind};
-use beryl_types::fs::{Extent, FsErrorCode, InodeId};
+use beryl_types::fs::{Extent, InodeId};
 use beryl_types::ids::MountId;
 use beryl_types::{CommittedBlock, GroupName, WriteTarget, MAX_FILE_EXTENTS};
 use std::collections::{HashMap, HashSet};
@@ -904,11 +907,10 @@ impl MetadataFileSystem {
         };
         let content_revision = match self.propose_fs_write_command(command).await {
             Ok(FsCommandResult::Ok(ok)) => ok.content_revision,
-            Ok(FsCommandResult::Err(err)) => {
-                return self.fatal_fs_failure(
+            Ok(FsCommandResult::Err(rejection)) => {
+                return self.failure_from_error(
                     ctx,
-                    err.errno,
-                    err.message,
+                    rejection.into_metadata_error(),
                     Some(routed.group_name.clone()),
                     Some(routed.mount_epoch),
                 );
@@ -959,10 +961,13 @@ impl MetadataFileSystem {
         group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
     ) -> FsFailure {
-        match self.fatal_fs_failure::<()>(ctx, FsErrorCode::EInval, message, group_name, mount_epoch) {
-            Err(failure) => failure,
-            Ok(_) => unreachable!("fatal_fs_failure always returns Err"),
-        }
+        fs_failure_from_metadata_error(
+            ctx,
+            MetadataError::InvalidArgument(message.into()),
+            group_name,
+            mount_epoch,
+            None,
+        )
     }
 
     fn invalid_sync_write_failure(
@@ -972,10 +977,13 @@ impl MetadataFileSystem {
         group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
     ) -> FsFailure {
-        match self.fatal_fs_failure::<()>(ctx, FsErrorCode::EInval, message, group_name, mount_epoch) {
-            Err(failure) => failure,
-            Ok(_) => unreachable!("fatal_fs_failure always returns Err"),
-        }
+        fs_failure_from_metadata_error(
+            ctx,
+            MetadataError::InvalidArgument(message.into()),
+            group_name,
+            mount_epoch,
+            None,
+        )
     }
 
     fn block_end(block: &CommittedBlock) -> Option<u64> {
@@ -1355,11 +1363,10 @@ impl MetadataFileSystem {
         };
         let content_revision = match self.propose_fs_write_command(command).await {
             Ok(FsCommandResult::Ok(ok)) => ok.content_revision,
-            Ok(FsCommandResult::Err(err)) => {
-                return self.fatal_fs_failure(
+            Ok(FsCommandResult::Err(rejection)) => {
+                return self.failure_from_error(
                     ctx,
-                    err.errno,
-                    err.message,
+                    rejection.into_metadata_error(),
                     Some(routed.group_name.clone()),
                     Some(routed.mount_epoch),
                 );
@@ -1395,7 +1402,7 @@ impl MetadataFileSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::filesystem::test_support::*;
+    use crate::service::filesystem::tests::*;
     use beryl_common::error::rpc::MetadataErrorKind;
     use beryl_common::Deadline;
 
