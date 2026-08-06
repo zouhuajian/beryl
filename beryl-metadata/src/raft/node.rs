@@ -9,7 +9,7 @@ use crate::mount::MountTable;
 use crate::observe;
 use crate::raft::command::{Command, MAX_COMMAND_BYTES};
 use crate::raft::network::SingleNodeNetworkFactory;
-use crate::raft::response::CommandResult;
+use crate::raft::response::ApplySuccess;
 use crate::raft::state_machine::AppRaftStateMachine as AppStateMachine;
 use crate::raft::storage::{AppLogStorage, RocksDBStorage, SnapshotInstallTracker, StateMachineStorage};
 use crate::raft::types::{MetadataNode, MetadataRaftTypeConfig};
@@ -138,11 +138,13 @@ impl AppRaftNode {
         Ok(())
     }
 
-    /// Propose one bounded application command to Raft.
+    /// Propose one bounded application command and return its committed success.
     ///
     /// Serialized size is checked before `client_write`, so an oversized
     /// command has a definite failure outcome and cannot enter the Raft log.
-    pub async fn propose(&self, command: Command) -> MetadataResult<CommandResult> {
+    /// Deterministic committed rejections are restored to `MetadataError` here;
+    /// callers therefore only receive an operation-specific success variant.
+    pub async fn propose(&self, command: Command) -> MetadataResult<ApplySuccess> {
         let started = Instant::now();
         let operation = command.operation_name();
         let command_bytes = match serde_json::to_vec(&command) {
@@ -180,7 +182,7 @@ impl AppRaftNode {
             Ok(result) => {
                 self.record_current_raft_metrics();
                 match result.data {
-                    CommandResult::Rejected(rejection) => {
+                    Err(rejection) => {
                         let error = rejection.into_metadata_error();
                         observe::record_raft_proposal(
                             "error",
@@ -189,9 +191,9 @@ impl AppRaftNode {
                         );
                         Err(error)
                     }
-                    response => {
+                    Ok(success) => {
                         observe::record_raft_proposal("ok", "none", started.elapsed().as_secs_f64());
-                        Ok(response)
+                        Ok(success)
                     }
                 }
             }

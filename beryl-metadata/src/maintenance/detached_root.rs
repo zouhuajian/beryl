@@ -6,7 +6,7 @@
 use crate::config::DetachedRootReclamationConfig;
 use crate::error::{MetadataError, MetadataResult};
 use crate::observe;
-use crate::raft::{AppRaftNode, Command, CommandResult, DetachedRootReclaimResult, RocksDBStorage};
+use crate::raft::{AppRaftNode, ApplySuccess, Command, DetachedRootReclaimResult, RocksDBStorage};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -136,7 +136,7 @@ impl DetachedRootReclaimer {
             })
             .await?;
         match response {
-            CommandResult::DetachedRootsReclaimed(result) => Ok(DetachedRootReclaimPass::Applied(result)),
+            ApplySuccess::DetachedRootsReclaimed(result) => Ok(DetachedRootReclaimPass::Applied(result)),
             unexpected => Err(MetadataError::Internal(format!(
                 "detached-root Raft command returned unexpected result: {unexpected:?}"
             ))),
@@ -149,7 +149,7 @@ mod tests {
     use super::*;
     use crate::config::RaftConfig;
     use crate::mount::{MountTable, ROOT_INODE_ID};
-    use crate::raft::{AppRaftStateMachine, FsCommandResult};
+    use crate::raft::AppRaftStateMachine;
     use beryl_types::fs::FileAttrs;
     use beryl_types::ids::MountId;
     use beryl_types::GroupName;
@@ -192,7 +192,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert!(matches!(bootstrap, CommandResult::MountUpserted(_)));
+            assert!(matches!(bootstrap, ApplySuccess::MountUpserted(_)));
         }
         let reclaimer = DetachedRootReclaimer::new(
             Arc::clone(&raft_node),
@@ -216,10 +216,9 @@ mod tests {
             })
             .await
             .unwrap();
-        let CommandResult::Fs(FsCommandResult::Ok(created)) = created else {
+        let ApplySuccess::DirectoryEnsured { inode_id: root_id, .. } = created else {
             panic!("create directory returned unexpected result: {created:?}");
         };
-        let root_id = created.inode_id.expect("created directory inode");
         let deleted = raft_node
             .propose(Command::Delete {
                 proposed_at_ms: 3,
@@ -233,7 +232,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(matches!(deleted, CommandResult::Fs(FsCommandResult::Ok(_))));
+        assert!(matches!(deleted, ApplySuccess::DeleteApplied));
         assert!(storage.get_detached_root(root_id).unwrap().is_some());
 
         let pass = leader.reclaim_once().await.unwrap();

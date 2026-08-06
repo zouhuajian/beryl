@@ -3,13 +3,14 @@
 
 //! Durable file visibility publication for sync and commit.
 
+use super::command::unexpected_raft_apply_success;
 use super::{
     fs_failure_from_metadata_error, Freshness, FsFailure, FsResult, MetadataFileSystem, PresentedWriteHandle,
     RequestContext,
 };
 use crate::error::{MetadataError, MetadataResult};
 use crate::observe;
-use crate::raft::{Command, FsCommandResult, PublishMode};
+use crate::raft::{ApplySuccess, Command, PublishMode};
 use crate::worker::{PublishReadyConflict, PublishReadyStatus};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint, WorkerErrorKind};
 use beryl_types::fs::{Extent, InodeId};
@@ -905,29 +906,20 @@ impl MetadataFileSystem {
             lease_epoch,
             mode: publish_mode,
         };
-        let content_revision = match self.propose_fs_write_command(command).await {
-            Ok(FsCommandResult::Ok(ok)) => ok.content_revision,
-            Ok(FsCommandResult::Err(rejection)) => {
-                return self.failure_from_error(
-                    ctx,
-                    rejection.into_metadata_error(),
-                    Some(routed.group_name.clone()),
-                    Some(routed.mount_epoch),
-                );
-            }
+        let expected_inode_id = session.inode_id;
+        let content_revision = match self
+            .propose_fs_write_command(command, move |success| match success {
+                ApplySuccess::FilePublished {
+                    inode_id: returned_inode_id,
+                    content_revision,
+                } if returned_inode_id == expected_inode_id => Ok(content_revision),
+                unexpected => Err(unexpected_raft_apply_success("PublishFile", unexpected)),
+            })
+            .await
+        {
+            Ok(content_revision) => content_revision,
             Err(err) => {
                 return self.failure_from_error(ctx, err, Some(routed.group_name.clone()), Some(routed.mount_epoch));
-            }
-        };
-        let content_revision = match content_revision {
-            Some(content_revision) => content_revision,
-            None => {
-                return self.failure_from_error(
-                    ctx,
-                    MetadataError::Internal("PublishFile returned no content revision".to_string()),
-                    Some(routed.group_name.clone()),
-                    Some(routed.mount_epoch),
-                )
             }
         };
         if let Err(message) =
@@ -1361,27 +1353,21 @@ impl MetadataFileSystem {
             lease_epoch,
             mode: publish_mode,
         };
-        let content_revision = match self.propose_fs_write_command(command).await {
-            Ok(FsCommandResult::Ok(ok)) => ok.content_revision,
-            Ok(FsCommandResult::Err(rejection)) => {
-                return self.failure_from_error(
-                    ctx,
-                    rejection.into_metadata_error(),
-                    Some(routed.group_name.clone()),
-                    Some(routed.mount_epoch),
-                );
-            }
+        let expected_inode_id = session.inode_id;
+        match self
+            .propose_fs_write_command(command, move |success| match success {
+                ApplySuccess::FilePublished {
+                    inode_id: returned_inode_id,
+                    ..
+                } if returned_inode_id == expected_inode_id => Ok(()),
+                unexpected => Err(unexpected_raft_apply_success("PublishFile", unexpected)),
+            })
+            .await
+        {
+            Ok(()) => {}
             Err(err) => {
                 return self.failure_from_error(ctx, err, Some(routed.group_name.clone()), Some(routed.mount_epoch));
             }
-        };
-        if content_revision.is_none() {
-            return self.failure_from_error(
-                ctx,
-                MetadataError::Internal("PublishFile returned no content revision".to_string()),
-                Some(routed.group_name.clone()),
-                Some(routed.mount_epoch),
-            );
         }
 
         self.lease_manager.release(session.inode_id, session.lease_epoch);

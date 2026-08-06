@@ -5,10 +5,10 @@
 
 use crate::config::{MetadataConfig, RaftMode};
 use crate::error::{MetadataError, MetadataResult};
-use crate::mount::{DataIoPolicy, MountKind, MountTable, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
-use crate::raft::{AppRaftNode, AppRaftStateMachine, Command, RocksDBStorage, StorageIdentity};
+use crate::mount::{DataIoPolicy, MountEntry, MountKind, MountTable, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
+use crate::raft::{AppRaftNode, AppRaftStateMachine, ApplySuccess, Command, RocksDBStorage, StorageIdentity};
 use crate::readiness::{wait_for_root_ready_with_inputs, RootReadinessGate, RootReadinessLogFields, RootReadyInputs};
-use beryl_types::ids::ClientId;
+use beryl_types::ids::{ClientId, MountId};
 use beryl_types::{CallId, GroupName};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -79,12 +79,13 @@ pub async fn format_metadata_storage(config: &MetadataConfig) -> MetadataResult<
     wait_for_single_node_leader(&raft_node, config.bootstrap.root_readiness.timeout_ms).await?;
 
     let group_name = config.authority.group_name.clone();
-    raft_node
+    let bootstrap_result = raft_node
         .propose(Command::BootstrapNamespace {
             proposed_at_ms: marker.bootstrap_proposed_at_ms,
             group_name: group_name.clone(),
         })
         .await?;
+    require_bootstrap_namespace_success(bootstrap_result, &group_name)?;
     wait_for_root_ready_with_inputs(RootReadyInputs {
         raft_node: Arc::clone(&raft_node),
         mount_table: Arc::clone(&mount_table),
@@ -430,14 +431,7 @@ fn verify_root(storage: &RocksDBStorage, mount_table: &MountTable, group_name: &
         .into_iter()
         .find(|entry| entry.mount_prefix == ROOT_MOUNT_PREFIX)
         .ok_or_else(|| MetadataError::ServiceUnavailable("root mount missing after metadata format".to_string()))?;
-    if root.root_inode_id != ROOT_INODE_ID
-        || root.mount_kind != MountKind::Internal
-        || root.ufs_uri.is_some()
-        || root.data_io_policy != DataIoPolicy::Allow
-        || root.mount_id != beryl_types::ids::MountId::new(1)
-        || root.mount_epoch != 1
-        || root.namespace_owner_group_name != *group_name
-    {
+    if !root_mount_matches_bootstrap_contract(&root, group_name) {
         return Err(MetadataError::InvalidArgument(
             "root mount exists but violates root invariants".to_string(),
         ));
@@ -455,6 +449,33 @@ fn verify_root(storage: &RocksDBStorage, mount_table: &MountTable, group_name: &
         ));
     }
     Ok(())
+}
+
+/// Require the committed bootstrap response to identify the exact writable root.
+fn require_bootstrap_namespace_success(result: ApplySuccess, group_name: &GroupName) -> MetadataResult<()> {
+    let ApplySuccess::MountUpserted(root) = result else {
+        return Err(MetadataError::Internal(format!(
+            "BootstrapNamespace returned an unexpected success: {result:?}"
+        )));
+    };
+    if !root_mount_matches_bootstrap_contract(&root, group_name) {
+        return Err(MetadataError::Internal(format!(
+            "BootstrapNamespace returned an invalid root mount: {root:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Check the immutable identity and shape of the internal writable root mount.
+fn root_mount_matches_bootstrap_contract(root: &MountEntry, group_name: &GroupName) -> bool {
+    root.root_inode_id == ROOT_INODE_ID
+        && root.mount_kind == MountKind::Internal
+        && root.ufs_uri.is_none()
+        && root.data_io_policy == DataIoPolicy::Allow
+        && root.mount_id == MountId::new(1)
+        && root.mount_prefix == ROOT_MOUNT_PREFIX
+        && root.mount_epoch == 1
+        && root.namespace_owner_group_name == *group_name
 }
 
 async fn wait_for_single_node_leader(raft_node: &AppRaftNode, timeout_ms: u64) -> MetadataResult<()> {
@@ -480,8 +501,54 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beryl_types::ids::MountId;
     use tempfile::TempDir;
+
+    fn bootstrap_root(group_name: GroupName) -> MountEntry {
+        MountEntry {
+            mount_id: MountId::new(1),
+            mount_prefix: ROOT_MOUNT_PREFIX.to_string(),
+            mount_kind: MountKind::Internal,
+            ufs_uri: None,
+            data_io_policy: DataIoPolicy::Allow,
+            mount_epoch: 1,
+            namespace_owner_group_name: group_name,
+            root_inode_id: ROOT_INODE_ID,
+        }
+    }
+
+    #[test]
+    fn bootstrap_success_requires_mount_result() {
+        let group_name = GroupName::parse("root").unwrap();
+
+        let error = require_bootstrap_namespace_success(ApplySuccess::RaftEntryApplied, &group_name)
+            .expect_err("protocol entry success must not satisfy namespace bootstrap");
+
+        assert!(matches!(
+            error,
+            MetadataError::Internal(message) if message.contains("unexpected success")
+        ));
+    }
+
+    #[test]
+    fn bootstrap_success_requires_exact_root_identity() {
+        let group_name = GroupName::parse("root").unwrap();
+        require_bootstrap_namespace_success(
+            ApplySuccess::MountUpserted(bootstrap_root(group_name.clone())),
+            &group_name,
+        )
+        .unwrap();
+
+        let mut wrong_owner = bootstrap_root(GroupName::parse("other").unwrap());
+        let error = require_bootstrap_namespace_success(ApplySuccess::MountUpserted(wrong_owner.clone()), &group_name)
+            .expect_err("a different namespace owner must fail closed");
+        assert!(matches!(error, MetadataError::Internal(_)));
+
+        wrong_owner.namespace_owner_group_name = group_name.clone();
+        wrong_owner.root_inode_id = beryl_types::fs::InodeId::new(2);
+        let error = require_bootstrap_namespace_success(ApplySuccess::MountUpserted(wrong_owner), &group_name)
+            .expect_err("a different root inode must fail closed");
+        assert!(matches!(error, MetadataError::Internal(_)));
+    }
 
     #[test]
     fn format_lock_has_single_owner() {

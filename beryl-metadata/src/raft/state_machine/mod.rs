@@ -13,7 +13,7 @@ mod write;
 use crate::error::{MetadataError, MetadataResult};
 use crate::raft::command::{Command, PublishMode};
 use crate::raft::response::{
-    ApplyRejection, CommandResult, DetachedRootReclaimResult, FatalApplyError, FsCommandResult, FsOkResult,
+    ApplyRejection, ApplySuccess, DetachedRootReclaimResult, FatalApplyError, RaftApplyResult,
 };
 use crate::raft::storage::{
     BootstrapNamespaceState, DetachedRoot, DetachedRootReclaimEntry, DetachedRootReclaimUpdate, InodeAllocation,
@@ -32,8 +32,12 @@ pub(crate) struct AppRaftStateMachine {
     storage: Arc<RocksDBStorage>,
 }
 
+/// Persisted apply outcome and any routing publication it makes authoritative.
+///
+/// The storage adapter must publish `routing_delta` before exposing the new
+/// in-memory applied state so readers cannot observe an index ahead of routing.
 pub(crate) struct CommittedApply {
-    pub(crate) response: CommandResult,
+    pub(crate) response: RaftApplyResult,
     pub(crate) routing_delta: RoutingDelta,
 }
 
@@ -53,9 +57,9 @@ impl From<&Command> for RoutingIntent {
 }
 
 impl CommittedApply {
-    fn new(intent: RoutingIntent, response: CommandResult) -> Self {
+    fn new(intent: RoutingIntent, response: RaftApplyResult) -> Self {
         let routing_delta = match (intent, &response) {
-            (RoutingIntent::Upsert, CommandResult::MountUpserted(entry)) => RoutingDelta::Upsert(entry.clone()),
+            (RoutingIntent::Upsert, Ok(ApplySuccess::MountUpserted(entry))) => RoutingDelta::Upsert(entry.clone()),
             _ => RoutingDelta::None,
         };
         Self {
@@ -77,27 +81,32 @@ struct PreparedRename {
     updated_src_inode: Inode,
 }
 
-type PreparedUnlink = (InodeId, Inode, FsOkResult);
+type PreparedUnlink = (InodeId, Inode);
 
 impl AppRaftStateMachine {
     pub fn new(storage: Arc<RocksDBStorage>) -> Self {
         Self { storage }
     }
 
-    /// Apply a command to the state machine.
+    /// Apply one committed application command under the supplied Raft state.
+    ///
+    /// Successful mutations persist their authority change and applied index
+    /// atomically. Deterministic domain errors commit only the applied index and
+    /// become `ApplyRejection`; storage, infrastructure, and invariant failures
+    /// return `FatalApplyError` without advancing applied state.
     pub(crate) fn apply_committed(
         &self,
         command: Command,
         raft_state: &AppMetadataRaftState,
     ) -> Result<CommittedApply, FatalApplyError> {
         let routing_intent = RoutingIntent::from(&command);
-        let outcome: MetadataResult<CommandResult> = (|| match command {
+        let outcome: MetadataResult<ApplySuccess> = (|| match command {
             Command::BootstrapNamespace {
                 proposed_at_ms,
                 group_name,
             } => {
                 let result = self.apply_bootstrap_namespace(group_name, proposed_at_ms, raft_state)?;
-                Ok(CommandResult::MountUpserted(result))
+                Ok(ApplySuccess::MountUpserted(result))
             }
             Command::RegisterWorkerDescriptor {
                 proposed_at_ms: _,
@@ -115,7 +124,7 @@ impl AppRaftStateMachine {
                     fault_domain,
                     raft_state,
                 )?;
-                Ok(CommandResult::WorkerUpserted(result))
+                Ok(ApplySuccess::WorkerUpserted(result))
             }
             Command::CreateDirectory {
                 proposed_at_ms,
@@ -124,7 +133,7 @@ impl AppRaftStateMachine {
                 attrs,
                 recursive,
             } => {
-                let result = if recursive {
+                let (inode_id, attrs) = if recursive {
                     self.apply_create_directory(root_inode_id, components, attrs, proposed_at_ms, raft_state)?
                 } else {
                     let mut components = components;
@@ -141,7 +150,7 @@ impl AppRaftStateMachine {
                         raft_state,
                     )?
                 };
-                Ok(CommandResult::Fs(result))
+                Ok(ApplySuccess::DirectoryEnsured { inode_id, attrs })
             }
             Command::CreateFile {
                 proposed_at_ms,
@@ -150,8 +159,8 @@ impl AppRaftStateMachine {
                 attrs,
                 layout,
             } => {
-                let result = self.apply_create(parent_inode_id, name, attrs, layout, proposed_at_ms, raft_state)?;
-                Ok(CommandResult::Fs(result))
+                let inode_id = self.apply_create(parent_inode_id, name, attrs, layout, proposed_at_ms, raft_state)?;
+                Ok(ApplySuccess::FileCreated { inode_id, layout })
             }
             Command::Delete {
                 proposed_at_ms,
@@ -163,7 +172,7 @@ impl AppRaftStateMachine {
                 expected_file_lease_epoch,
                 recursive,
             } => {
-                let result = self.apply_delete(
+                self.apply_delete(
                     mount_id,
                     expected_mount_epoch,
                     mount_root_inode_id,
@@ -174,7 +183,7 @@ impl AppRaftStateMachine {
                     proposed_at_ms,
                     raft_state,
                 )?;
-                Ok(CommandResult::Fs(result))
+                Ok(ApplySuccess::DeleteApplied)
             }
             Command::Rename {
                 proposed_at_ms,
@@ -187,7 +196,7 @@ impl AppRaftStateMachine {
                 expected_dst_lease_epoch,
                 flags,
             } => {
-                let result = self.apply_rename(
+                self.apply_rename(
                     src_parent_inode_id,
                     src_name,
                     expected_src_inode_id,
@@ -199,36 +208,27 @@ impl AppRaftStateMachine {
                     proposed_at_ms,
                     raft_state,
                 )?;
-                Ok(CommandResult::Fs(result))
-            }
-            Command::SetAttr {
-                proposed_at_ms,
-                inode_id,
-                mask,
-                attrs,
-            } => {
-                let result = self.apply_set_attr(inode_id, mask, attrs, proposed_at_ms, raft_state)?;
-                Ok(CommandResult::Fs(result))
+                Ok(ApplySuccess::RenameApplied)
             }
             Command::AcquireWriteLease {
                 proposed_at_ms: _,
                 inode_id,
                 expected_lease_epoch,
             } => {
-                let result = self.apply_acquire_write_lease(inode_id, expected_lease_epoch, raft_state)?;
-                Ok(CommandResult::Fs(result))
+                let lease_epoch = self.apply_acquire_write_lease(inode_id, expected_lease_epoch, raft_state)?;
+                Ok(ApplySuccess::WriteLeaseAcquired { inode_id, lease_epoch })
             }
             Command::AllocateBlock { inode_id, lease_epoch } => {
                 let block_id = self.apply_allocate_block(inode_id, lease_epoch, raft_state)?;
-                Ok(CommandResult::BlockAllocated(block_id))
+                Ok(ApplySuccess::BlockAllocated(block_id))
             }
             Command::EndWriteLease {
                 proposed_at_ms: _,
                 inode_id,
                 lease_epoch,
             } => {
-                let result = self.apply_end_write_lease(inode_id, lease_epoch, raft_state)?;
-                Ok(CommandResult::Fs(result))
+                let lease_epoch = self.apply_end_write_lease(inode_id, lease_epoch, raft_state)?;
+                Ok(ApplySuccess::WriteLeaseEnded { inode_id, lease_epoch })
             }
             Command::PublishFile {
                 proposed_at_ms,
@@ -247,7 +247,7 @@ impl AppRaftStateMachine {
                         MAX_FILE_EXTENTS
                     )));
                 }
-                let result = self.apply_publish_file(
+                let content_revision = self.apply_publish_file(
                     inode_id,
                     extents,
                     target_size,
@@ -258,7 +258,10 @@ impl AppRaftStateMachine {
                     proposed_at_ms,
                     raft_state,
                 )?;
-                Ok(CommandResult::Fs(result))
+                Ok(ApplySuccess::FilePublished {
+                    inode_id,
+                    content_revision,
+                })
             }
             Command::ReclaimDetachedRoots {
                 candidate_root_inode_ids,
@@ -271,46 +274,24 @@ impl AppRaftStateMachine {
                     max_batch_bytes,
                     raft_state,
                 )?;
-                Ok(CommandResult::DetachedRootsReclaimed(result))
+                Ok(ApplySuccess::DetachedRootsReclaimed(result))
             }
         })();
 
         match outcome {
-            Ok(response) => Ok(CommittedApply::new(routing_intent, response)),
+            Ok(success) => Ok(CommittedApply::new(routing_intent, Ok(success))),
             Err(error) => {
                 let rejection = ApplyRejection::from_metadata_error(error)?;
-                let response = CommandResult::Rejected(rejection);
                 self.storage
                     .commit_applied_state(raft_state)
                     .map_err(FatalApplyError::new)?;
-                Ok(CommittedApply::new(routing_intent, response))
+                Ok(CommittedApply::new(routing_intent, Err(rejection)))
             }
         }
     }
 
     fn mutation_timestamp(inode: &Inode, proposed_at_ms: u64) -> u64 {
         proposed_at_ms.max(inode.attrs.mtime_ms).max(inode.attrs.ctime_ms)
-    }
-
-    fn persist_fs_apply_result(
-        &self,
-        result: FsCommandResult,
-        raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<FsCommandResult> {
-        self.storage.commit_applied_state(raft_state)?;
-        Ok(result)
-    }
-
-    fn persist_fs_error(
-        &self,
-        error: MetadataError,
-        raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<FsCommandResult> {
-        let rejection = match ApplyRejection::from_metadata_error(error) {
-            Ok(rejection) => rejection,
-            Err(fatal) => return Err(fatal.into_inner()),
-        };
-        self.persist_fs_apply_result(FsCommandResult::Err(rejection), raft_state)
     }
 
     fn extent_end(extent: &Extent) -> MetadataResult<u64> {
@@ -452,7 +433,7 @@ pub(crate) mod tests {
     pub(crate) use tempfile::TempDir;
 
     impl AppRaftStateMachine {
-        pub(crate) fn apply(&self, command: Command) -> MetadataResult<CommandResult> {
+        pub(crate) fn apply(&self, command: Command) -> MetadataResult<ApplySuccess> {
             self.apply_with_raft_state(command, &AppMetadataRaftState::default())
         }
 
@@ -460,13 +441,15 @@ pub(crate) mod tests {
             &self,
             command: Command,
             raft_state: &AppMetadataRaftState,
-        ) -> MetadataResult<CommandResult> {
+        ) -> MetadataResult<ApplySuccess> {
             match self.apply_committed(command, raft_state) {
                 Ok(CommittedApply {
-                    response: CommandResult::Rejected(rejection),
+                    response: Ok(success), ..
+                }) => Ok(success),
+                Ok(CommittedApply {
+                    response: Err(rejection),
                     ..
                 }) => Err(rejection.into_metadata_error()),
-                Ok(applied) => Ok(applied.response),
                 Err(fatal) => Err(fatal.into_inner()),
             }
         }
@@ -483,30 +466,74 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn expect_fs_ok(raw: CommandResult) -> FsOkResult {
+    pub(crate) fn expect_directory_ensured(raw: ApplySuccess) -> (InodeId, FileAttrs) {
         match raw {
-            CommandResult::Fs(FsCommandResult::Ok(ok)) => ok,
+            ApplySuccess::DirectoryEnsured { inode_id, attrs } => (inode_id, attrs),
             other => panic!("unexpected apply response: {other:?}"),
         }
     }
 
-    pub(crate) fn expect_fs_rejection(raw: CommandResult, expected: ApplyRejectionKind) {
+    pub(crate) fn expect_file_created(raw: ApplySuccess) -> (InodeId, FileLayout) {
         match raw {
-            CommandResult::Fs(FsCommandResult::Err(rejection)) => assert_eq!(rejection.kind, expected),
+            ApplySuccess::FileCreated { inode_id, layout } => (inode_id, layout),
             other => panic!("unexpected apply response: {other:?}"),
         }
     }
 
-    pub(crate) fn expect_mount_upserted(raw: CommandResult) -> crate::mount::MountEntry {
+    pub(crate) fn expect_delete_applied(raw: ApplySuccess) {
+        assert!(
+            matches!(&raw, ApplySuccess::DeleteApplied),
+            "unexpected apply response: {raw:?}"
+        );
+    }
+
+    pub(crate) fn expect_rename_applied(raw: ApplySuccess) {
+        assert!(
+            matches!(&raw, ApplySuccess::RenameApplied),
+            "unexpected apply response: {raw:?}"
+        );
+    }
+
+    pub(crate) fn expect_apply_rejection(result: MetadataResult<ApplySuccess>, expected: ApplyRejectionKind) {
+        let error = result.expect_err("command must be rejected");
+        let rejection = ApplyRejection::from_metadata_error(error).expect("expected deterministic apply rejection");
+        assert_eq!(rejection.kind, expected);
+    }
+
+    pub(crate) fn expect_mount_upserted(raw: ApplySuccess) -> crate::mount::MountEntry {
         match raw {
-            CommandResult::MountUpserted(entry) => entry,
+            ApplySuccess::MountUpserted(entry) => entry,
             other => panic!("unexpected apply response: {other:?}"),
         }
     }
 
-    pub(crate) fn expect_worker_upserted(raw: CommandResult) -> WorkerId {
+    pub(crate) fn expect_worker_upserted(raw: ApplySuccess) -> WorkerId {
         match raw {
-            CommandResult::WorkerUpserted(worker_id) => worker_id,
+            ApplySuccess::WorkerUpserted(worker_id) => worker_id,
+            other => panic!("unexpected apply response: {other:?}"),
+        }
+    }
+
+    pub(crate) fn expect_write_lease_acquired(raw: ApplySuccess) -> (InodeId, u64) {
+        match raw {
+            ApplySuccess::WriteLeaseAcquired { inode_id, lease_epoch } => (inode_id, lease_epoch),
+            other => panic!("unexpected apply response: {other:?}"),
+        }
+    }
+
+    pub(crate) fn expect_write_lease_ended(raw: ApplySuccess) -> (InodeId, u64) {
+        match raw {
+            ApplySuccess::WriteLeaseEnded { inode_id, lease_epoch } => (inode_id, lease_epoch),
+            other => panic!("unexpected apply response: {other:?}"),
+        }
+    }
+
+    pub(crate) fn expect_file_published(raw: ApplySuccess) -> (InodeId, u64) {
+        match raw {
+            ApplySuccess::FilePublished {
+                inode_id,
+                content_revision,
+            } => (inode_id, content_revision),
             other => panic!("unexpected apply response: {other:?}"),
         }
     }
@@ -610,7 +637,7 @@ pub(crate) mod tests {
                 recursive: false,
             })
             .unwrap();
-        let child_id = expect_fs_ok(response).inode_id.unwrap();
+        let child_id = expect_directory_ensured(response).0;
 
         assert_eq!(storage.get_inode(child_id).unwrap().unwrap().attrs.mtime_ms, 1_000);
         assert_eq!(

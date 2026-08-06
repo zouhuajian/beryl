@@ -6,7 +6,7 @@
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::{MountEntry, MountTable, MountTableState};
 use crate::observe;
-use crate::raft::response::CommandResult;
+use crate::raft::response::{ApplySuccess, RaftApplyResult};
 use crate::raft::storage::snapshot::{
     decode_snapshot, is_node_local_meta_key, SnapshotCodecError, SnapshotIdentity, SnapshotWriter,
 };
@@ -93,7 +93,7 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
         Ok((last_applied, membership))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<CommandResult>, StorageError<u64>>
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<RaftApplyResult>, StorageError<u64>>
     where
         I: IntoIterator<Item = Entry<MetadataRaftTypeConfig>> + openraft::OptionalSend,
         I::IntoIter: openraft::OptionalSend,
@@ -154,7 +154,7 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
                     }
                     *current = next;
 
-                    results.push(CommandResult::None);
+                    results.push(Ok(ApplySuccess::RaftEntryApplied));
                     observe::record_raft_apply("ok", "none", apply_started.elapsed().as_secs_f64());
                 }
                 EntryPayload::Blank => {
@@ -169,7 +169,7 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
                     }
                     *current = next;
 
-                    results.push(CommandResult::None);
+                    results.push(Ok(ApplySuccess::RaftEntryApplied));
                     observe::record_raft_apply("ok", "none", apply_started.elapsed().as_secs_f64());
                 }
             }
@@ -967,7 +967,7 @@ mod tests {
     use crate::mount::{DataIoPolicy, MountEntry, MountKind, MountTable};
     use crate::raft::state_machine::AppRaftStateMachine;
     use crate::raft::{
-        Command, CommandResult, MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES, MAX_RECLAIM_DETACHED_ROOT_ENTRIES,
+        ApplySuccess, Command, MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES, MAX_RECLAIM_DETACHED_ROOT_ENTRIES,
     };
     use crate::state::RouteEpoch;
     use beryl_types::fs::{FileAttrs, Inode, InodeId};
@@ -977,6 +977,7 @@ mod tests {
     use metrics::{Counter, CounterFn, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
     use openraft::storage::RaftSnapshotBuilder;
     use openraft::LeaderId;
+    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tempfile::TempDir;
     use tokio::io::AsyncWriteExt;
@@ -997,6 +998,20 @@ mod tests {
         Entry {
             log_id: LogId::new(LeaderId::new(1, 1), index),
             payload: EntryPayload::Normal(command),
+        }
+    }
+
+    fn blank_entry(index: u64) -> Entry<MetadataRaftTypeConfig> {
+        Entry {
+            log_id: LogId::new(LeaderId::new(1, 1), index),
+            payload: EntryPayload::Blank,
+        }
+    }
+
+    fn membership_entry(index: u64) -> Entry<MetadataRaftTypeConfig> {
+        Entry {
+            log_id: LogId::new(LeaderId::new(1, 1), index),
+            payload: EntryPayload::Membership(openraft::Membership::new(vec![BTreeSet::from([1])], ())),
         }
     }
 
@@ -1041,6 +1056,19 @@ mod tests {
         tokio::io::copy(&mut *snapshot, &mut *incoming).await.unwrap();
         incoming.flush().await.unwrap();
         (meta, incoming)
+    }
+
+    #[tokio::test]
+    async fn protocol_entries_return_one_explicit_success_per_applied_entry() {
+        let (_dir, storage, mut store) = committed_apply_test_store();
+
+        let responses = store.apply([blank_entry(1), membership_entry(2)]).await.unwrap();
+
+        assert_eq!(responses.len(), 2);
+        assert!(responses
+            .iter()
+            .all(|response| matches!(response, Ok(ApplySuccess::RaftEntryApplied))));
+        assert_eq!(storage.load_raft_state().unwrap().last_applied_log_id.unwrap().index, 2);
     }
 
     #[tokio::test]
@@ -1113,7 +1141,7 @@ mod tests {
 
         let responses = store.apply([normal_entry(1, command)]).await.unwrap();
 
-        assert!(matches!(responses.as_slice(), [CommandResult::Rejected(_)]));
+        assert!(matches!(responses.as_slice(), [Err(_)]));
         assert_eq!(storage.load_raft_state().unwrap().last_applied_log_id.unwrap().index, 1);
     }
 
@@ -1158,10 +1186,7 @@ mod tests {
         };
 
         let responses = store.apply([normal_entry(1, command)]).await.unwrap();
-        assert!(matches!(
-            responses.as_slice(),
-            [CommandResult::Fs(crate::raft::FsCommandResult::Ok(_))]
-        ));
+        assert!(matches!(responses.as_slice(), [Ok(ApplySuccess::FileCreated { .. })]));
         assert_eq!(
             storage.get_dentry(parent_inode_id, "file").unwrap(),
             Some(InodeId::new(2))
@@ -1209,10 +1234,7 @@ mod tests {
         let responses = store.apply([normal_entry(2, collision)]).await.unwrap();
         let after = storage.prepare_inode_allocation().unwrap();
 
-        assert!(matches!(
-            responses.as_slice(),
-            [CommandResult::Fs(crate::raft::FsCommandResult::Err(_))]
-        ));
+        assert!(matches!(responses.as_slice(), [Err(_)]));
         assert_eq!(before, after);
         assert_eq!(storage.load_raft_state().unwrap().last_applied_log_id.unwrap().index, 2);
     }
@@ -1333,9 +1355,9 @@ mod tests {
             .unwrap();
         assert!(matches!(
             reclaim_responses.as_slice(),
-            [CommandResult::DetachedRootsReclaimed(
+            [Ok(ApplySuccess::DetachedRootsReclaimed(
                 crate::raft::DetachedRootReclaimResult { completed_roots: 1, .. }
-            )]
+            ))]
         ));
         assert!(storage_b.get_detached_root(detached_inode_id).unwrap().is_none());
         assert!(storage_b.get_inode(detached_inode_id).unwrap().is_none());

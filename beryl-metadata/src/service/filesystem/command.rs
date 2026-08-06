@@ -6,7 +6,7 @@
 use super::{fs_failure_from_metadata_error, Freshness, FsFailure, MetadataFileSystem, RequestContext};
 use crate::error::{MetadataError, MetadataResult};
 use crate::observe;
-use crate::raft::{Command, CommandResult, FsCommandResult};
+use crate::raft::{ApplySuccess, Command};
 use beryl_types::fs::InodeId;
 use beryl_types::ids::{BlockId, MountId};
 use beryl_types::GroupName;
@@ -115,36 +115,55 @@ impl MetadataFileSystem {
         })
     }
 
-    pub(super) async fn propose_fs_write_command(&self, command: Command) -> MetadataResult<FsCommandResult> {
+    /// Propose one filesystem command and record its fully validated outcome.
+    ///
+    /// The Raft node has already converted committed application rejections to
+    /// `MetadataError`. `decode_success` must accept only the exact success
+    /// variant and identity expected by the submitted command, so FS metrics
+    /// cannot report success before that invariant is checked.
+    pub(super) async fn propose_fs_write_command<T>(
+        &self,
+        command: Command,
+        decode_success: impl FnOnce(ApplySuccess) -> MetadataResult<T>,
+    ) -> MetadataResult<T> {
         let started = Instant::now();
         let operation_name = command.operation_name();
-        let response = self.propose_write_command(command, started).await?;
-        let fs_result = require_fs_command_result(response).inspect_err(|error| {
-            observe::record_fs_op(
-                operation_name,
-                "error",
-                observe::metadata_error_kind(error),
-                started.elapsed().as_secs_f64(),
-            );
-        })?;
-
-        record_fs_write_result(operation_name, started, &fs_result);
-        Ok(fs_result)
+        let result = match self.propose_write_command(command).await {
+            Ok(success) => decode_success(success),
+            Err(error) => Err(error),
+        };
+        record_fs_write_result(operation_name, started, &result);
+        result
     }
 
-    pub(super) async fn propose_block_allocation(&self, command: Command) -> MetadataResult<BlockId> {
+    /// Allocate the next durable block ordinal for one exact inode and lease epoch.
+    pub(super) async fn propose_block_allocation(
+        &self,
+        inode_id: InodeId,
+        lease_epoch: u64,
+    ) -> MetadataResult<BlockId> {
         let started = Instant::now();
+        let command = Command::AllocateBlock { inode_id, lease_epoch };
         let operation_name = command.operation_name();
-        let response = self.propose_write_command(command, started).await?;
+        let response = match self.propose_write_command(command).await {
+            Ok(response) => response,
+            Err(error) => {
+                observe::record_fs_op(
+                    operation_name,
+                    "error",
+                    observe::metadata_error_kind(&error),
+                    started.elapsed().as_secs_f64(),
+                );
+                return Err(error);
+            }
+        };
         match response {
-            CommandResult::BlockAllocated(block_id) => {
+            ApplySuccess::BlockAllocated(block_id) if block_id.inode_id == inode_id => {
                 observe::record_fs_op(operation_name, "ok", "none", started.elapsed().as_secs_f64());
                 Ok(block_id)
             }
             unexpected => {
-                let error = MetadataError::Internal(format!(
-                    "block allocation Raft command returned unexpected result: {unexpected:?}"
-                ));
+                let error = unexpected_raft_apply_success("AllocateBlock", unexpected);
                 observe::record_fs_op(
                     operation_name,
                     "error",
@@ -156,18 +175,11 @@ impl MetadataFileSystem {
         }
     }
 
-    async fn propose_write_command(&self, command: Command, started: Instant) -> MetadataResult<CommandResult> {
-        let operation_name = command.operation_name();
-        let raft_node = self.raft_node.as_ref().ok_or_else(|| {
-            let error = MetadataError::Internal("Raft node not available".to_string());
-            observe::record_fs_op(
-                operation_name,
-                "error",
-                observe::metadata_error_kind(&error),
-                started.elapsed().as_secs_f64(),
-            );
-            error
-        })?;
+    async fn propose_write_command(&self, command: Command) -> MetadataResult<ApplySuccess> {
+        let raft_node = self
+            .raft_node
+            .as_ref()
+            .ok_or_else(|| MetadataError::Internal("Raft node not available".to_string()))?;
 
         if let Some(metrics) = &self.metrics {
             metrics.fs_raft_appends_total.fetch_add(1, Ordering::Relaxed);
@@ -181,8 +193,8 @@ impl MetadataFileSystem {
                 Command::Rename { .. } => {
                     metrics.fs_raft_appends_rename.fetch_add(1, Ordering::Relaxed);
                 }
-                Command::SetAttr { .. } | Command::PublishFile { .. } => {
-                    metrics.fs_raft_appends_setattr.fetch_add(1, Ordering::Relaxed);
+                Command::PublishFile { .. } => {
+                    metrics.fs_raft_appends_publish.fetch_add(1, Ordering::Relaxed);
                 }
                 Command::BootstrapNamespace { .. }
                 | Command::Delete { .. }
@@ -194,47 +206,31 @@ impl MetadataFileSystem {
             }
         }
 
-        let response = match raft_node.propose(command).await {
-            Ok(response) => response,
-            Err(error) => {
-                observe::record_fs_op(
-                    operation_name,
-                    "error",
-                    observe::metadata_error_kind(&error),
-                    started.elapsed().as_secs_f64(),
-                );
-                return Err(error);
-            }
-        };
-
-        Ok(response)
+        raft_node.propose(command).await
     }
 }
 
-fn require_fs_command_result(response: CommandResult) -> MetadataResult<FsCommandResult> {
-    match response {
-        CommandResult::Fs(result) => Ok(result),
-        unexpected => Err(MetadataError::Internal(format!(
-            "filesystem Raft command returned unexpected result: {unexpected:?}"
-        ))),
-    }
-}
-
-fn record_fs_write_result(operation_name: &'static str, started: Instant, result: &FsCommandResult) {
+fn record_fs_write_result<T>(operation_name: &'static str, started: Instant, result: &MetadataResult<T>) {
     match result {
-        FsCommandResult::Ok(_) => {
+        Ok(_) => {
             observe::record_fs_op(operation_name, "ok", "none", started.elapsed().as_secs_f64());
         }
-        FsCommandResult::Err(rejection) => {
-            let error = rejection.clone().into_metadata_error();
+        Err(error) => {
             observe::record_fs_op(
                 operation_name,
                 "error",
-                observe::metadata_error_kind(&error),
+                observe::metadata_error_kind(error),
                 started.elapsed().as_secs_f64(),
             );
         }
     }
+}
+
+/// Fail closed when Raft returns a success variant for a different command.
+pub(super) fn unexpected_raft_apply_success(operation_name: &'static str, success: ApplySuccess) -> MetadataError {
+    MetadataError::Internal(format!(
+        "{operation_name} Raft command returned unexpected success: {success:?}"
+    ))
 }
 
 #[cfg(test)]
@@ -242,12 +238,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn non_filesystem_raft_result_fails_closed() {
-        let error = require_fs_command_result(CommandResult::None).expect_err("unexpected result must fail");
+    fn mismatched_raft_success_fails_closed() {
+        let error = unexpected_raft_apply_success("CreateFile", ApplySuccess::RaftEntryApplied);
 
         assert!(matches!(
             error,
-            MetadataError::Internal(message) if message.contains("unexpected result")
+            MetadataError::Internal(message)
+                if message.contains("CreateFile") && message.contains("unexpected success")
         ));
     }
 }

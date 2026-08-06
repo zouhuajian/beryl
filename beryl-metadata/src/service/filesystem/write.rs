@@ -3,6 +3,7 @@
 
 //! Leader-local write lease, placement, and session lifecycle.
 
+use super::command::unexpected_raft_apply_success;
 use super::{missing_resolved_target_error, validate_active_write_layout};
 use super::{
     worker_endpoint_from_parts, AdmissionFailure, Freshness, FsResult, MetadataFileSystem, PresentedWriteHandle,
@@ -12,7 +13,7 @@ use crate::error::MetadataError;
 use crate::inode_lease::{LeaseError, WriteMode};
 use crate::observe;
 use crate::placement::{PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus};
-use crate::raft::FsCommandResult;
+use crate::raft::ApplySuccess;
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
 use beryl_common::header::CallerContextFields;
 use beryl_types::fs::InodeId;
@@ -263,27 +264,27 @@ impl MetadataFileSystem {
             );
         }
 
-        let ended_epoch = match self
-            .propose_fs_write_command(crate::raft::Command::EndWriteLease {
-                proposed_at_ms: crate::raft::proposal_timestamp_ms(),
-                inode_id: session.inode_id,
-                lease_epoch,
-            })
+        let expected_inode_id = session.inode_id;
+        let expected_ended_epoch = lease_epoch.checked_add(1);
+        match self
+            .propose_fs_write_command(
+                crate::raft::Command::EndWriteLease {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    inode_id: expected_inode_id,
+                    lease_epoch,
+                },
+                move |success| match success {
+                    ApplySuccess::WriteLeaseEnded {
+                        inode_id: returned_inode_id,
+                        lease_epoch: ended_epoch,
+                    } if returned_inode_id == expected_inode_id && Some(ended_epoch) == expected_ended_epoch => Ok(()),
+                    unexpected => Err(unexpected_raft_apply_success("EndWriteLease", unexpected)),
+                },
+            )
             .await
         {
-            Ok(FsCommandResult::Ok(ok)) => ok.lease_epoch,
-            Ok(FsCommandResult::Err(rejection)) => {
-                return self.failure_from_error(ctx, rejection.into_metadata_error(), group_name, mount_epoch);
-            }
+            Ok(()) => {}
             Err(err) => return self.failure_from_error(ctx, err, group_name, mount_epoch),
-        };
-        if ended_epoch != lease_epoch.checked_add(1) {
-            return self.failure_from_error(
-                ctx,
-                MetadataError::Internal("EndWriteLease returned an unexpected lease epoch".to_string()),
-                group_name,
-                mount_epoch,
-            );
         }
         self.lease_manager.release(session.inode_id, lease_epoch);
         self.session_registry.remove_session_if_epoch(inode_id, lease_epoch);
@@ -518,27 +519,23 @@ impl MetadataFileSystem {
             };
 
         let lease_result = self
-            .propose_fs_write_command(crate::raft::Command::AcquireWriteLease {
-                proposed_at_ms: crate::raft::proposal_timestamp_ms(),
-                inode_id,
-                expected_lease_epoch: current_lease_epoch.unwrap_or(0),
-            })
+            .propose_fs_write_command(
+                crate::raft::Command::AcquireWriteLease {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    inode_id,
+                    expected_lease_epoch: current_lease_epoch.unwrap_or(0),
+                },
+                move |success| match success {
+                    ApplySuccess::WriteLeaseAcquired {
+                        inode_id: returned_inode_id,
+                        lease_epoch: returned_lease_epoch,
+                    } if returned_inode_id == inode_id && returned_lease_epoch == lease_epoch => Ok(()),
+                    unexpected => Err(unexpected_raft_apply_success("AcquireWriteLease", unexpected)),
+                },
+            )
             .await;
         match lease_result {
-            Ok(FsCommandResult::Ok(ok)) if ok.lease_epoch == Some(lease_epoch) => {}
-            Ok(FsCommandResult::Ok(_)) => {
-                self.lease_manager.release(inode_id, lease_epoch);
-                return self.failure_from_error(
-                    ctx,
-                    MetadataError::Internal("AcquireWriteLease returned an unexpected lease epoch".to_string()),
-                    group_name,
-                    mount_epoch,
-                );
-            }
-            Ok(FsCommandResult::Err(rejection)) => {
-                self.lease_manager.release(inode_id, lease_epoch);
-                return self.failure_from_error(ctx, rejection.into_metadata_error(), group_name, mount_epoch);
-            }
+            Ok(()) => {}
             Err(err) => {
                 self.lease_manager.release(inode_id, lease_epoch);
                 return self.failure_from_error(ctx, err, group_name, mount_epoch);
@@ -704,10 +701,7 @@ impl MetadataFileSystem {
                 )
             }
         };
-        let block_id = match self
-            .propose_block_allocation(crate::raft::Command::AllocateBlock { inode_id, lease_epoch })
-            .await
-        {
+        let block_id = match self.propose_block_allocation(inode_id, lease_epoch).await {
             Ok(block_id) => block_id,
             Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
         };
@@ -1064,10 +1058,7 @@ mod tests {
             })
             .await
             .expect("already admitted Rename must apply");
-        assert!(matches!(
-            rename_result,
-            crate::raft::CommandResult::Fs(FsCommandResult::Ok(_))
-        ));
+        assert!(matches!(rename_result, ApplySuccess::RenameApplied));
 
         let failure = filesystem
             .finish_open_write(&request_context(), open_path, &resolved, opened)

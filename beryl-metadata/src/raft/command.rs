@@ -81,12 +81,6 @@ pub(crate) enum Command {
         expected_dst_lease_epoch: Option<u64>,
         flags: u32,
     },
-    SetAttr {
-        proposed_at_ms: u64,
-        inode_id: InodeId,
-        mask: u32,
-        attrs: FileAttrs,
-    },
     AcquireWriteLease {
         proposed_at_ms: u64,
         inode_id: InodeId,
@@ -140,7 +134,6 @@ impl Command {
             Self::CreateFile { .. } => "create_file",
             Self::Delete { .. } => "delete",
             Self::Rename { .. } => "rename",
-            Self::SetAttr { .. } => "set_attr",
             Self::AcquireWriteLease { .. } => "acquire_write_lease",
             Self::AllocateBlock { .. } => "allocate_block",
             Self::EndWriteLease { .. } => "end_write_lease",
