@@ -59,13 +59,14 @@ impl AppRaftStateMachine {
         Ok(block_id)
     }
 
+    /// Advance durable write-lease authority from the caller's exact expected epoch.
     pub(super) fn apply_acquire_write_lease(
         &self,
         inode_id: InodeId,
         expected_lease_epoch: u64,
         raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<FsCommandResult> {
-        let prepared: MetadataResult<(Inode, FsOkResult)> = (|| {
+    ) -> MetadataResult<u64> {
+        let prepared: MetadataResult<(Inode, u64)> = (|| {
             let mut inode = self
                 .storage
                 .get_inode(inode_id)?
@@ -91,31 +92,21 @@ impl AppRaftStateMachine {
                     )))
                 }
             };
-            Ok((
-                inode,
-                FsOkResult {
-                    inode_id: Some(inode_id),
-                    lease_epoch: Some(lease_epoch),
-                    ..FsOkResult::default()
-                },
-            ))
+            Ok((inode, lease_epoch))
         })();
 
-        let (inode, ok) = match prepared {
-            Ok(prepared) => prepared,
-            Err(err) => return self.persist_fs_error(err, raft_state),
-        };
-        let result = FsCommandResult::Ok(ok);
+        let (inode, lease_epoch) = prepared?;
         self.storage.put_inode_atomic(&inode, raft_state)?;
-        Ok(result)
+        Ok(lease_epoch)
     }
 
+    /// End one exact lease epoch, accepting replay only at its immediate successor.
     pub(super) fn apply_end_write_lease(
         &self,
         inode_id: InodeId,
         lease_epoch: u64,
         raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<FsCommandResult> {
+    ) -> MetadataResult<u64> {
         let prepared: MetadataResult<(Option<Inode>, u64)> = (|| {
             let mut inode = self
                 .storage
@@ -153,23 +144,19 @@ impl AppRaftStateMachine {
             Ok((Some(inode), next))
         })();
 
-        let (inode, ended_epoch) = match prepared {
-            Ok(prepared) => prepared,
-            Err(err) => return self.persist_fs_error(err, raft_state),
-        };
-        let result = FsCommandResult::Ok(FsOkResult {
-            inode_id: Some(inode_id),
-            lease_epoch: Some(ended_epoch),
-            ..FsOkResult::default()
-        });
+        let (inode, ended_epoch) = prepared?;
         if let Some(inode) = inode {
             self.storage.put_inode_atomic(&inode, raft_state)?;
         } else {
             self.storage.commit_applied_state(raft_state)?;
         }
-        Ok(result)
+        Ok(ended_epoch)
     }
 
+    /// Publish one fenced file version or confirm an exact idempotent replay.
+    ///
+    /// The returned revision is always the durable revision visible after the
+    /// command. Both mutation and replay paths commit the supplied applied index.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn apply_publish_file(
         &self,
@@ -182,8 +169,8 @@ impl AppRaftStateMachine {
         mode: PublishMode,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<FsCommandResult> {
-        let prepared: MetadataResult<(Inode, FileLayout, FsOkResult, bool)> = (|| {
+    ) -> MetadataResult<u64> {
+        let prepared: MetadataResult<(Inode, FileLayout, u64, bool)> = (|| {
             let mut inode = self
                 .storage
                 .get_inode(inode_id)?
@@ -272,16 +259,7 @@ impl AppRaftStateMachine {
                     }
                 };
             if expected_content_revision.checked_add(1) == Some(current_content_revision) && state_matches {
-                return Ok((
-                    inode,
-                    layout,
-                    FsOkResult {
-                        inode_id: Some(inode_id),
-                        content_revision: Some(current_content_revision),
-                        ..FsOkResult::default()
-                    },
-                    false,
-                ));
+                return Ok((inode, layout, current_content_revision, false));
             }
             if current_content_revision != expected_content_revision {
                 return Err(MetadataError::Again(format!(
@@ -289,16 +267,7 @@ impl AppRaftStateMachine {
                 )));
             }
             if state_matches {
-                return Ok((
-                    inode,
-                    layout,
-                    FsOkResult {
-                        inode_id: Some(inode_id),
-                        content_revision: Some(current_content_revision),
-                        ..FsOkResult::default()
-                    },
-                    false,
-                ));
+                return Ok((inode, layout, current_content_revision, false));
             }
 
             let mut extents_to_publish = match mode {
@@ -359,30 +328,16 @@ impl AppRaftStateMachine {
             inode
                 .attrs
                 .update_mtime_ctime(Self::mutation_timestamp(&inode, proposed_at_ms));
-            Ok((
-                inode,
-                layout,
-                FsOkResult {
-                    inode_id: Some(inode_id),
-                    content_revision: Some(content_revision),
-                    ..FsOkResult::default()
-                },
-                true,
-            ))
+            Ok((inode, layout, content_revision, true))
         })();
 
-        let (inode, layout, ok, changed) = match prepared {
-            Ok(prepared) => prepared,
-            Err(error @ MetadataError::ResourceExhausted(_)) => return Err(error),
-            Err(err) => return self.persist_fs_error(err, raft_state),
-        };
-        let result = FsCommandResult::Ok(ok);
+        let (inode, layout, content_revision, changed) = prepared?;
         if changed {
             self.storage.publish_file_atomic(&inode, layout, raft_state)?;
         } else {
             self.storage.commit_applied_state(raft_state)?;
         }
-        Ok(result)
+        Ok(content_revision)
     }
 }
 
@@ -393,9 +348,9 @@ mod tests {
     use crate::raft::state_machine::tests::*;
     use beryl_types::{InodeKind, MAX_FILE_EXTENTS};
 
-    fn expect_block_allocated(result: CommandResult) -> BlockId {
+    fn expect_block_allocated(result: ApplySuccess) -> BlockId {
         match result {
-            CommandResult::BlockAllocated(block_id) => block_id,
+            ApplySuccess::BlockAllocated(block_id) => block_id,
             other => panic!("unexpected apply response: {other:?}"),
         }
     }
@@ -557,7 +512,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(first, BlockId::new(inode_id, BlockIndex::new(0)));
-        expect_fs_ok(
+        expect_file_published(
             AppRaftStateMachine::new(Arc::clone(&storage))
                 .apply(Command::PublishFile {
                     proposed_at_ms: 1,
@@ -628,7 +583,7 @@ mod tests {
         let inode_id = InodeId::new(101);
         install_file_with_extents(&storage, InodeId::new(100), "file", inode_id, Vec::new(), 0);
 
-        let first = expect_fs_ok(
+        let first = expect_write_lease_acquired(
             sm.apply(Command::AcquireWriteLease {
                 proposed_at_ms: 1,
                 inode_id,
@@ -636,15 +591,14 @@ mod tests {
             })
             .unwrap(),
         );
-        assert_eq!(first.lease_epoch, Some(2));
+        assert_eq!(first, (inode_id, 2));
 
-        expect_fs_rejection(
+        expect_apply_rejection(
             sm.apply(Command::AcquireWriteLease {
                 proposed_at_ms: 2,
                 inode_id,
                 expected_lease_epoch: 1,
-            })
-            .unwrap(),
+            }),
             ApplyRejectionKind::Again,
         );
         let inode = storage.get_inode(inode_id).unwrap().unwrap();
@@ -672,7 +626,7 @@ mod tests {
             mode: PublishMode::ReplaceIfUnchanged,
         };
 
-        let ended = expect_fs_ok(
+        let ended = expect_write_lease_ended(
             sm.apply(Command::EndWriteLease {
                 proposed_at_ms: 1,
                 inode_id,
@@ -680,8 +634,8 @@ mod tests {
             })
             .unwrap(),
         );
-        assert_eq!(ended.lease_epoch, Some(2));
-        let replayed_end = expect_fs_ok(
+        assert_eq!(ended, (inode_id, 2));
+        let replayed_end = expect_write_lease_ended(
             sm.apply(Command::EndWriteLease {
                 proposed_at_ms: 3,
                 inode_id,
@@ -689,9 +643,9 @@ mod tests {
             })
             .unwrap(),
         );
-        assert_eq!(replayed_end.lease_epoch, Some(2));
-        expect_fs_rejection(
-            sm.apply(publish).unwrap(),
+        assert_eq!(replayed_end, (inode_id, 2));
+        expect_apply_rejection(
+            sm.apply(publish),
             ApplyRejectionKind::LeaseFenced { expected: 2, got: 1 },
         );
         assert_eq!(storage.get_inode(inode_id).unwrap().unwrap().attrs.size, 0);
@@ -705,7 +659,7 @@ mod tests {
         let inode_id = InodeId::new(105);
         install_file_with_extents(&storage, InodeId::new(100), "file", inode_id, Vec::new(), 0);
 
-        expect_fs_ok(
+        expect_file_published(
             sm.apply(Command::PublishFile {
                 proposed_at_ms: 1,
                 inode_id,
@@ -718,7 +672,7 @@ mod tests {
             })
             .unwrap(),
         );
-        let ended = expect_fs_ok(
+        let ended = expect_write_lease_ended(
             sm.apply(Command::EndWriteLease {
                 proposed_at_ms: 2,
                 inode_id,
@@ -727,7 +681,7 @@ mod tests {
             .unwrap(),
         );
 
-        assert_eq!(ended.lease_epoch, Some(2));
+        assert_eq!(ended, (inode_id, 2));
         let inode = storage.get_inode(inode_id).unwrap().unwrap();
         assert_eq!(inode.attrs.size, 1024);
         let InodeData::File {
@@ -760,12 +714,12 @@ mod tests {
             mode: PublishMode::ReplaceIfUnchanged,
         };
 
-        let first = expect_fs_ok(sm.apply(command.clone()).unwrap());
-        let replay = expect_fs_ok(sm.apply(command).unwrap());
-        assert_eq!(first.content_revision, Some(1));
-        assert_eq!(replay.content_revision, first.content_revision);
+        let first = expect_file_published(sm.apply(command.clone()).unwrap());
+        let replay = expect_file_published(sm.apply(command).unwrap());
+        assert_eq!(first, (inode_id, 1));
+        assert_eq!(replay, first);
 
-        expect_fs_rejection(
+        expect_apply_rejection(
             sm.apply(Command::PublishFile {
                 proposed_at_ms: 11,
                 inode_id,
@@ -775,8 +729,7 @@ mod tests {
                 expected_file_size: 0,
                 lease_epoch: 1,
                 mode: PublishMode::ReplaceIfUnchanged,
-            })
-            .unwrap(),
+            }),
             ApplyRejectionKind::Again,
         );
         assert_eq!(storage.get_inode(inode_id).unwrap().unwrap().attrs.size, 1024);
@@ -797,7 +750,7 @@ mod tests {
             1024,
         );
 
-        let result = expect_fs_ok(
+        let result = expect_file_published(
             sm.apply(Command::PublishFile {
                 proposed_at_ms: 10,
                 inode_id,
@@ -810,9 +763,9 @@ mod tests {
             })
             .unwrap(),
         );
-        assert_eq!(result.content_revision, Some(1));
+        assert_eq!(result, (inode_id, 1));
 
-        expect_fs_rejection(
+        expect_apply_rejection(
             sm.apply(Command::PublishFile {
                 proposed_at_ms: 11,
                 inode_id,
@@ -822,8 +775,7 @@ mod tests {
                 expected_file_size: 1024,
                 lease_epoch: 1,
                 mode: PublishMode::AppendIfUnchanged,
-            })
-            .unwrap(),
+            }),
             ApplyRejectionKind::Again,
         );
 
@@ -837,9 +789,9 @@ mod tests {
             lease_epoch: 1,
             mode: PublishMode::AppendIfUnchanged,
         };
-        let second = expect_fs_ok(sm.apply(second_append.clone()).unwrap());
-        let replay = expect_fs_ok(sm.apply(second_append).unwrap());
-        assert_eq!(second.content_revision, Some(2));
-        assert_eq!(replay.content_revision, second.content_revision);
+        let second = expect_file_published(sm.apply(second_append.clone()).unwrap());
+        let replay = expect_file_published(sm.apply(second_append).unwrap());
+        assert_eq!(second, (inode_id, 2));
+        assert_eq!(replay, second);
     }
 }

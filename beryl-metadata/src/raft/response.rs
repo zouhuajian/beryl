@@ -10,23 +10,46 @@ use beryl_types::layout::FileLayout;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Application-level response propagated from the state machine to the proposer.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) enum CommandResult {
-    /// Filesystem command result with deterministic rejection fidelity.
-    Fs(FsCommandResult),
+/// Result produced for one durably applied metadata Raft entry.
+///
+/// `Err(ApplyRejection)` is a deterministic application rejection whose log
+/// entry and applied index have committed. Infrastructure and invariant
+/// failures are returned separately as [`FatalApplyError`] and never enter
+/// this response.
+pub(crate) type RaftApplyResult = Result<ApplySuccess, ApplyRejection>;
+
+/// Successful outcome of applying one metadata Raft entry.
+///
+/// Application commands use operation-specific variants so required response
+/// fields cannot be omitted or combined with fields from another operation.
+/// `RaftEntryApplied` is reserved for OpenRaft blank and membership entries,
+/// which require one response value but have no metadata command payload.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) enum ApplySuccess {
     /// Root mount created or confirmed by namespace bootstrap.
     MountUpserted(crate::mount::MountEntry),
-    /// Durable worker descriptor accepted by the authority state.
-    WorkerUpserted(WorkerId),
+    /// Requested directory path exists with these persisted attributes.
+    DirectoryEnsured { inode_id: InodeId, attrs: FileAttrs },
+    /// File inode and its authoritative layout were created atomically.
+    FileCreated { inode_id: InodeId, layout: FileLayout },
+    /// The exact namespace delete mutation committed.
+    DeleteApplied,
+    /// The exact namespace rename mutation committed.
+    RenameApplied,
+    /// Durable write-lease authority advanced to this epoch.
+    WriteLeaseAcquired { inode_id: InodeId, lease_epoch: u64 },
     /// Durable block ordinal allocated for one active write lease.
     BlockAllocated(BlockId),
-    /// Deterministic application rejection committed by the state machine.
-    Rejected(ApplyRejection),
-    /// Explicitly empty result.
-    None,
+    /// Durable write-lease authority ended at this fencing epoch.
+    WriteLeaseEnded { inode_id: InodeId, lease_epoch: u64 },
+    /// File visibility committed at this content revision.
+    FilePublished { inode_id: InodeId, content_revision: u64 },
+    /// Durable worker descriptor accepted by the authority state.
+    WorkerUpserted(WorkerId),
     /// Bounded progress made by one internal detached-root mutation.
     DetachedRootsReclaimed(DetachedRootReclaimResult),
+    /// OpenRaft blank or membership entry durably applied without an application command.
+    RaftEntryApplied,
 }
 
 /// Deterministic progress counters returned to the leader-only reclaimer.
@@ -39,7 +62,7 @@ pub(crate) struct DetachedRootReclaimResult {
 }
 
 /// Recoverable error kinds that may be committed as deterministic apply results.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum ApplyRejectionKind {
     NotFound,
     AlreadyExists,
@@ -58,7 +81,7 @@ pub(crate) enum ApplyRejectionKind {
 }
 
 /// Recoverable application failure returned through Raft.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ApplyRejection {
     pub kind: ApplyRejectionKind,
     pub message: String,
@@ -171,6 +194,7 @@ impl FatalApplyError {
         Self(error)
     }
 
+    #[cfg(test)]
     pub(crate) fn into_inner(self) -> MetadataError {
         self.0
     }
@@ -178,26 +202,6 @@ impl FatalApplyError {
     pub(crate) fn as_inner(&self) -> &MetadataError {
         &self.0
     }
-}
-
-/// Filesystem apply result returned synchronously via Raft.
-///
-/// Rejections carry the same metadata-domain fact used by every other Raft
-/// command. They never contain transport policy or platform errno values.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum FsCommandResult {
-    Ok(FsOkResult),
-    Err(ApplyRejection),
-}
-
-/// Successful FS command payload (minimal for now; extensible).
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub(crate) struct FsOkResult {
-    pub inode_id: Option<InodeId>,
-    pub content_revision: Option<u64>,
-    pub attrs: Option<FileAttrs>,
-    pub layout: Option<FileLayout>,
-    pub lease_epoch: Option<u64>,
 }
 
 #[cfg(test)]

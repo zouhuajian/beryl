@@ -3,10 +3,11 @@
 
 //! Durable namespace creation, rename, and delete operations.
 
+use super::command::unexpected_raft_apply_success;
 use super::{validate_active_write_layout, Freshness, FsResult, MetadataFileSystem, RequestContext};
-use crate::error::MetadataError;
+use crate::error::{MetadataError, MetadataResult};
 use crate::observe;
-use crate::raft::{Command, FsCommandResult};
+use crate::raft::{ApplySuccess, Command};
 use beryl_types::fs::{FileAttrs, InodeId};
 use beryl_types::layout::FileLayout;
 use std::sync::atomic::Ordering;
@@ -178,44 +179,19 @@ impl MetadataFileSystem {
             Ok(routed) => routed,
             Err(err) => return Err(err),
         };
-        let result = match self.propose_fs_write_command(command).await {
+        let result = match self
+            .propose_fs_write_command(command, |success| match success {
+                ApplySuccess::DirectoryEnsured { inode_id, attrs } => Ok(CreateDirectoryOutput { inode_id, attrs }),
+                unexpected => Err(unexpected_raft_apply_success("CreateDirectory", unexpected)),
+            })
+            .await
+        {
             Ok(result) => result,
             Err(err) => {
                 return self.failure_from_error(ctx, err, Some(routed.group_name.clone()), Some(routed.mount_epoch));
             }
         };
-        match result {
-            FsCommandResult::Ok(ok) => {
-                let Some(inode_id) = ok.inode_id else {
-                    return self.failure_from_error(
-                        ctx,
-                        MetadataError::Internal("CreateDirectory succeeded without inode_id".to_string()),
-                        Some(routed.group_name.clone()),
-                        Some(routed.mount_epoch),
-                    );
-                };
-                let Some(attrs) = ok.attrs else {
-                    return self.failure_from_error(
-                        ctx,
-                        MetadataError::Internal("CreateDirectory succeeded without frozen attrs".to_string()),
-                        Some(routed.group_name.clone()),
-                        Some(routed.mount_epoch),
-                    );
-                };
-                self.success(
-                    ctx,
-                    CreateDirectoryOutput { inode_id, attrs },
-                    Some(routed.group_name),
-                    Some(routed.mount_epoch),
-                )
-            }
-            FsCommandResult::Err(rejection) => self.failure_from_error(
-                ctx,
-                rejection.into_metadata_error(),
-                Some(routed.group_name),
-                Some(routed.mount_epoch),
-            ),
-        }
+        self.success(ctx, result, Some(routed.group_name), Some(routed.mount_epoch))
     }
 
     /// Resolve and commit a rename under exclusive namespace-topology admission.
@@ -455,12 +431,12 @@ impl MetadataFileSystem {
             }
         }
 
-        let result = match self.propose_fs_write_command(command).await {
-            Ok(result) => result,
-            Err(err) => {
-                return self.failure_from_error(request_ctx, err, Some(ctx.group_name.clone()), Some(ctx.mount_epoch));
-            }
-        };
+        let result = self
+            .propose_fs_write_command(command, |success| match success {
+                ApplySuccess::RenameApplied => Ok(()),
+                unexpected => Err(unexpected_raft_apply_success("Rename", unexpected)),
+            })
+            .await;
 
         self.rename_result(request_ctx, &ctx, result)
     }
@@ -469,18 +445,13 @@ impl MetadataFileSystem {
         &self,
         request_ctx: &RequestContext,
         ctx: &super::RoutedFsWriteCtx,
-        result: FsCommandResult,
+        result: MetadataResult<()>,
     ) -> FsResult<()> {
         match result {
-            FsCommandResult::Ok(_) => {
-                self.success(request_ctx, (), Some(ctx.group_name.clone()), Some(ctx.mount_epoch))
+            Ok(()) => self.success(request_ctx, (), Some(ctx.group_name.clone()), Some(ctx.mount_epoch)),
+            Err(error) => {
+                self.failure_from_error(request_ctx, error, Some(ctx.group_name.clone()), Some(ctx.mount_epoch))
             }
-            FsCommandResult::Err(rejection) => self.failure_from_error(
-                request_ctx,
-                rejection.into_metadata_error(),
-                Some(ctx.group_name.clone()),
-                Some(ctx.mount_epoch),
-            ),
         }
     }
 }
@@ -610,13 +581,19 @@ impl MetadataFileSystem {
         };
 
         let result = match self
-            .propose_fs_write_command(Command::CreateFile {
-                proposed_at_ms: crate::raft::proposal_timestamp_ms(),
-                parent_inode_id,
-                name,
-                attrs,
-                layout,
-            })
+            .propose_fs_write_command(
+                Command::CreateFile {
+                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+                    parent_inode_id,
+                    name,
+                    attrs,
+                    layout,
+                },
+                |success| match success {
+                    ApplySuccess::FileCreated { inode_id, layout } => Ok(CreatedFileOutput { inode_id, layout }),
+                    unexpected => Err(unexpected_raft_apply_success("CreateFile", unexpected)),
+                },
+            )
             .await
         {
             Ok(result) => result,
@@ -625,28 +602,7 @@ impl MetadataFileSystem {
             }
         };
 
-        match result {
-            FsCommandResult::Ok(ok) => match (ok.inode_id, ok.layout) {
-                (Some(inode_id), Some(layout)) => self.success(
-                    request_ctx,
-                    CreatedFileOutput { inode_id, layout },
-                    Some(ctx.group_name.clone()),
-                    Some(ctx.mount_epoch),
-                ),
-                _ => self.failure_from_error(
-                    request_ctx,
-                    MetadataError::Internal("CreateFile returned an incomplete command result".to_string()),
-                    Some(ctx.group_name.clone()),
-                    Some(ctx.mount_epoch),
-                ),
-            },
-            FsCommandResult::Err(rejection) => self.failure_from_error(
-                request_ctx,
-                rejection.into_metadata_error(),
-                Some(ctx.group_name.clone()),
-                Some(ctx.mount_epoch),
-            ),
-        }
+        self.success(request_ctx, result, Some(ctx.group_name.clone()), Some(ctx.mount_epoch))
     }
 }
 
@@ -791,12 +747,12 @@ impl MetadataFileSystem {
             recursive,
         };
 
-        let result = match self.propose_fs_write_command(command).await {
-            Ok(result) => result,
-            Err(err) => {
-                return self.failure_from_error(request_ctx, err, Some(ctx.group_name.clone()), Some(ctx.mount_epoch));
-            }
-        };
+        let result = self
+            .propose_fs_write_command(command, |success| match success {
+                ApplySuccess::DeleteApplied => Ok(()),
+                unexpected => Err(unexpected_raft_apply_success("Delete", unexpected)),
+            })
+            .await;
         self.delete_result(request_ctx, &ctx, result)
     }
 
@@ -812,18 +768,13 @@ impl MetadataFileSystem {
         &self,
         request_ctx: &RequestContext,
         ctx: &super::RoutedFsWriteCtx,
-        result: FsCommandResult,
+        result: MetadataResult<()>,
     ) -> FsResult<()> {
         match result {
-            FsCommandResult::Ok(_) => {
-                self.success(request_ctx, (), Some(ctx.group_name.clone()), Some(ctx.mount_epoch))
+            Ok(()) => self.success(request_ctx, (), Some(ctx.group_name.clone()), Some(ctx.mount_epoch)),
+            Err(error) => {
+                self.failure_from_error(request_ctx, error, Some(ctx.group_name.clone()), Some(ctx.mount_epoch))
             }
-            FsCommandResult::Err(rejection) => self.failure_from_error(
-                request_ctx,
-                rejection.into_metadata_error(),
-                Some(ctx.group_name.clone()),
-                Some(ctx.mount_epoch),
-            ),
         }
     }
 }

@@ -22,7 +22,7 @@ pub(crate) use command::{
 };
 pub(crate) use node::AppRaftNode;
 pub(crate) use read_view::{MetadataReadView, RoutingDelta};
-pub(crate) use response::{CommandResult, DetachedRootReclaimResult, FsCommandResult};
+pub(crate) use response::{ApplySuccess, DetachedRootReclaimResult};
 pub(crate) use state_machine::AppRaftStateMachine;
 pub(crate) use storage::{RocksDBStorage, StorageIdentity};
 pub(crate) use types::AppMetadataRaftState;

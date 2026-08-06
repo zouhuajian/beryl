@@ -18,7 +18,7 @@ pub(crate) struct MetadataRaftTypeConfig;
 
 impl RaftTypeConfig for MetadataRaftTypeConfig {
     type D = crate::raft::command::Command;
-    type R = crate::raft::response::CommandResult;
+    type R = crate::raft::response::RaftApplyResult;
     type NodeId = u64;
     type Node = MetadataNode;
     type Entry = openraft::Entry<Self>;

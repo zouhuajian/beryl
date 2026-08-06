@@ -51,8 +51,8 @@ impl AppRaftStateMachine {
         mut attrs: FileAttrs,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<FsCommandResult> {
-        let prepared: MetadataResult<(InodeAllocation, Inode, Inode, FsOkResult)> = (|| {
+    ) -> MetadataResult<(InodeId, FileAttrs)> {
+        let prepared: MetadataResult<(InodeAllocation, Inode, Inode)> = (|| {
             // Check parent exists and is a directory
             let parent_inode = self
                 .storage
@@ -91,21 +91,11 @@ impl AppRaftStateMachine {
             let mut updated_parent = parent_inode.clone();
             updated_parent.attrs = parent_attrs;
 
-            Ok(FsOkResult {
-                inode_id: Some(inode_id),
-                content_revision: None,
-                attrs: Some(inode.attrs.clone()),
-                layout: None,
-                lease_epoch: None,
-            })
-            .map(|ok| (allocation, inode, updated_parent, ok))
+            Ok((allocation, inode, updated_parent))
         })();
 
-        let (allocation, inode, updated_parent, ok) = match prepared {
-            Ok(prepared) => prepared,
-            Err(err) => return self.persist_fs_error(err, raft_state),
-        };
-        let result = FsCommandResult::Ok(ok);
+        let (allocation, inode, updated_parent) = prepared?;
+        let result = (inode.inode_id, inode.attrs.clone());
         self.storage
             .create_dir_atomic(allocation, parent_inode_id, &name, &inode, &updated_parent, raft_state)?;
         Ok(result)
@@ -120,26 +110,23 @@ impl AppRaftStateMachine {
         attrs: FileAttrs,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<FsCommandResult> {
+    ) -> MetadataResult<(InodeId, FileAttrs)> {
         if components.is_empty() || components.iter().any(|component| component.is_empty()) {
-            return self.persist_fs_error(
-                MetadataError::InvalidArgument("CreateDirectory requires non-empty path components".to_string()),
-                raft_state,
-            );
+            return Err(MetadataError::InvalidArgument(
+                "CreateDirectory requires non-empty path components".to_string(),
+            ));
         }
         let mut parent = match self.storage.get_inode(root_inode_id)? {
             Some(inode) if inode.kind.is_dir() => inode,
             Some(_) => {
-                return self.persist_fs_error(
-                    MetadataError::NotDir(format!("Root is not a directory: {root_inode_id}")),
-                    raft_state,
-                );
+                return Err(MetadataError::NotDir(format!(
+                    "Root is not a directory: {root_inode_id}"
+                )));
             }
             None => {
-                return self.persist_fs_error(
-                    MetadataError::NotFound(format!("Root inode not found: {root_inode_id}")),
-                    raft_state,
-                );
+                return Err(MetadataError::NotFound(format!(
+                    "Root inode not found: {root_inode_id}"
+                )));
             }
         };
         let mut allocation = self.storage.prepare_inode_allocation()?;
@@ -151,16 +138,14 @@ impl AppRaftStateMachine {
                 let child = match self.storage.get_inode(child_inode_id)? {
                     Some(inode) if inode.kind.is_dir() => inode,
                     Some(_) => {
-                        return self.persist_fs_error(
-                            MetadataError::NotDir(format!("Path component is not a directory: {name}")),
-                            raft_state,
-                        );
+                        return Err(MetadataError::NotDir(format!(
+                            "Path component is not a directory: {name}"
+                        )));
                     }
                     None => {
-                        return self.persist_fs_error(
-                            MetadataError::NotFound(format!("Target inode not found: {child_inode_id}")),
-                            raft_state,
-                        );
+                        return Err(MetadataError::NotFound(format!(
+                            "Target inode not found: {child_inode_id}"
+                        )));
                     }
                 };
                 parent = child;
@@ -188,13 +173,7 @@ impl AppRaftStateMachine {
             parent = child;
         }
 
-        let result = FsCommandResult::Ok(FsOkResult {
-            inode_id: Some(parent.inode_id),
-            content_revision: None,
-            attrs: Some(parent.attrs.clone()),
-            layout: None,
-            lease_epoch: None,
-        });
+        let result = (parent.inode_id, parent.attrs.clone());
         if entries.is_empty() {
             self.storage.commit_applied_state(raft_state)?;
         } else {
@@ -215,15 +194,12 @@ impl AppRaftStateMachine {
         layout: FileLayout,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<FsCommandResult> {
+    ) -> MetadataResult<InodeId> {
         if self.storage.get_dentry(parent_inode_id, &name)?.is_some() {
-            return self.persist_fs_error(
-                MetadataError::AlreadyExists(format!("File already exists: {name}")),
-                raft_state,
-            );
+            return Err(MetadataError::AlreadyExists(format!("File already exists: {name}")));
         }
 
-        let prepared: MetadataResult<(InodeAllocation, Inode, Inode, FsOkResult)> = (|| {
+        let prepared: MetadataResult<(InodeAllocation, Inode, Inode)> = (|| {
             // Check parent exists and is a directory
             let parent_inode = self
                 .storage
@@ -254,21 +230,11 @@ impl AppRaftStateMachine {
             let mut updated_parent = parent_inode.clone();
             updated_parent.attrs = parent_attrs;
 
-            Ok(FsOkResult {
-                inode_id: Some(inode_id),
-                content_revision: None,
-                attrs: Some(inode.attrs.clone()),
-                layout: Some(layout),
-                lease_epoch: None,
-            })
-            .map(|ok| (allocation, inode, updated_parent, ok))
+            Ok((allocation, inode, updated_parent))
         })();
 
-        let (allocation, inode, updated_parent, ok) = match prepared {
-            Ok(prepared) => prepared,
-            Err(err) => return self.persist_fs_error(err, raft_state),
-        };
-        let result = FsCommandResult::Ok(ok);
+        let (allocation, inode, updated_parent) = prepared?;
+        let inode_id = inode.inode_id;
         self.storage.create_file_atomic(
             allocation,
             parent_inode_id,
@@ -278,7 +244,7 @@ impl AppRaftStateMachine {
             layout,
             raft_state,
         )?;
-        Ok(result)
+        Ok(inode_id)
     }
 
     /// Revalidate one bounded mount-relative Delete command and apply its target-specific mutation.
@@ -299,32 +265,25 @@ impl AppRaftStateMachine {
         recursive: bool,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<FsCommandResult> {
-        let (parent_inode_id, name, child_inode) = match self.resolve_delete_target(
+    ) -> MetadataResult<()> {
+        let (parent_inode_id, name, child_inode) = self.resolve_delete_target(
             mount_id,
             expected_mount_epoch,
             mount_root_inode_id,
             &relative_components,
-        ) {
-            Ok(target) => target,
-            Err(error) => return self.persist_fs_error(error, raft_state),
-        };
+        )?;
         if child_inode.inode_id != expected_inode_id {
-            return self.persist_fs_error(
-                MetadataError::Again(format!(
-                    "delete target changed for {name}: expected {expected_inode_id}, current {}",
-                    child_inode.inode_id
-                )),
-                raft_state,
-            );
+            return Err(MetadataError::Again(format!(
+                "delete target changed for {name}: expected {expected_inode_id}, current {}",
+                child_inode.inode_id
+            )));
         }
 
         if child_inode.kind.is_dir() {
             if expected_file_lease_epoch.is_some() {
-                return self.persist_fs_error(
-                    MetadataError::Again("delete target lease precondition changed".to_string()),
-                    raft_state,
-                );
+                return Err(MetadataError::Again(
+                    "delete target lease precondition changed".to_string(),
+                ));
             }
             if recursive {
                 self.apply_detach_directory(parent_inode_id, name, child_inode.inode_id, proposed_at_ms, raft_state)
@@ -337,12 +296,9 @@ impl AppRaftStateMachine {
                 _ => None,
             };
             if current_file_lease_epoch != expected_file_lease_epoch {
-                return self.persist_fs_error(
-                    MetadataError::Again(format!(
-                        "delete target lease precondition changed: expected {expected_file_lease_epoch:?}, current {current_file_lease_epoch:?}"
-                    )),
-                    raft_state,
-                );
+                return Err(MetadataError::Again(format!(
+                    "delete target lease precondition changed: expected {expected_file_lease_epoch:?}, current {current_file_lease_epoch:?}"
+                )));
             }
             self.apply_unlink(parent_inode_id, name, proposed_at_ms, raft_state)
         }
@@ -509,7 +465,7 @@ impl AppRaftStateMachine {
         name: String,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<FsCommandResult> {
+    ) -> MetadataResult<()> {
         let prepared: MetadataResult<PreparedUnlink> = (|| {
             // Get dentry
             let child_inode_id = self
@@ -562,17 +518,13 @@ impl AppRaftStateMachine {
                 InodeData::Dir => return Err(MetadataError::IsDir(format!("Cannot unlink directory: {}", name))),
             }
 
-            Ok(FsOkResult::default()).map(|ok| (child_inode_id, updated_parent, ok))
+            Ok((child_inode_id, updated_parent))
         })();
 
-        let (child_inode_id, updated_parent, ok) = match prepared {
-            Ok(prepared) => prepared,
-            Err(err) => return self.persist_fs_error(err, raft_state),
-        };
-        let result = FsCommandResult::Ok(ok);
+        let (child_inode_id, updated_parent) = prepared?;
         self.storage
             .delete_file_atomic(parent_inode_id, &name, child_inode_id, &updated_parent, raft_state)?;
-        Ok(result)
+        Ok(())
     }
 
     /// Apply empty-directory delete command.
@@ -582,8 +534,8 @@ impl AppRaftStateMachine {
         name: String,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<FsCommandResult> {
-        let prepared: MetadataResult<(InodeId, Inode, FsOkResult)> = (|| {
+    ) -> MetadataResult<()> {
+        let prepared: MetadataResult<(InodeId, Inode)> = (|| {
             // Get dentry
             let child_inode_id = self
                 .storage
@@ -619,17 +571,13 @@ impl AppRaftStateMachine {
             let mut updated_parent = parent_inode.clone();
             updated_parent.attrs = parent_attrs;
 
-            Ok(FsOkResult::default()).map(|ok| (child_inode_id, updated_parent, ok))
+            Ok((child_inode_id, updated_parent))
         })();
 
-        let (child_inode_id, updated_parent, ok) = match prepared {
-            Ok(prepared) => prepared,
-            Err(err) => return self.persist_fs_error(err, raft_state),
-        };
-        let result = FsCommandResult::Ok(ok);
+        let (child_inode_id, updated_parent) = prepared?;
         self.storage
             .delete_empty_dir_atomic(parent_inode_id, &name, child_inode_id, &updated_parent, raft_state)?;
-        Ok(result)
+        Ok(())
     }
 
     /// Atomically hide a recursive-delete root and make it reclaimable.
@@ -640,7 +588,7 @@ impl AppRaftStateMachine {
         root_inode_id: InodeId,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<FsCommandResult> {
+    ) -> MetadataResult<()> {
         let prepared: MetadataResult<(Inode, DetachedRoot)> = (|| {
             let current_root_inode_id = self
                 .storage
@@ -698,11 +646,7 @@ impl AppRaftStateMachine {
             ))
         })();
 
-        let (updated_parent, detached_root) = match prepared {
-            Ok(prepared) => prepared,
-            Err(err) => return self.persist_fs_error(err, raft_state),
-        };
-        let result = FsCommandResult::Ok(FsOkResult::default());
+        let (updated_parent, detached_root) = prepared?;
         self.storage.detach_directory_atomic(
             parent_inode_id,
             &name,
@@ -711,7 +655,7 @@ impl AppRaftStateMachine {
             detached_root,
             raft_state,
         )?;
-        Ok(result)
+        Ok(())
     }
 
     /// Apply Rename command (atomic within mount).
@@ -729,7 +673,7 @@ impl AppRaftStateMachine {
         flags: u32,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<FsCommandResult> {
+    ) -> MetadataResult<()> {
         let prepared: MetadataResult<PreparedRename> = (|| {
             // Get source dentry
             let src_inode_id = self
@@ -856,11 +800,7 @@ impl AppRaftStateMachine {
             })
         })();
 
-        let prepared = match prepared {
-            Ok(prepared) => prepared,
-            Err(err) => return self.persist_fs_error(err, raft_state),
-        };
-        let result = FsCommandResult::Ok(FsOkResult::default());
+        let prepared = prepared?;
         self.storage.rename_atomic(
             RenameAtomicUpdate {
                 src_parent_inode_id,
@@ -881,7 +821,7 @@ impl AppRaftStateMachine {
             raft_state,
         )?;
 
-        Ok(result)
+        Ok(())
     }
 
     fn prepare_rename_overwrite_target_cleanup(
@@ -923,89 +863,6 @@ impl AppRaftStateMachine {
                 Ok(PreparedRenameOverwrite { inode_id: dst_inode_id })
             }
         }
-    }
-
-    /// Apply SetAttr command.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn apply_set_attr(
-        &self,
-        inode_id: InodeId,
-        mask: u32,
-        new_attrs: FileAttrs,
-        proposed_at_ms: u64,
-        raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<FsCommandResult> {
-        let prepared: MetadataResult<(Inode, FsOkResult)> = (|| {
-            let mut inode = self
-                .storage
-                .get_inode(inode_id)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {}", inode_id)))?;
-
-            let now_ms = Self::mutation_timestamp(&inode, proposed_at_ms);
-            let size_changes_visible_file_state =
-                inode.kind.is_file() && mask & 1 != 0 && new_attrs.size != inode.attrs.size;
-
-            // Apply mask: only update fields specified by mask
-            // Bit flags: 1=size, 2=mode, 4=uid, 8=gid, 16=atime, 32=mtime
-            if mask & 1 != 0 {
-                inode.attrs.size = new_attrs.size;
-            }
-            if mask & 2 != 0 {
-                inode.attrs.mode = new_attrs.mode;
-            }
-            if mask & 4 != 0 {
-                inode.attrs.uid = new_attrs.uid;
-            }
-            if mask & 8 != 0 {
-                inode.attrs.gid = new_attrs.gid;
-            }
-            if mask & 16 != 0 {
-                inode.attrs.atime_ms = new_attrs.atime_ms;
-            }
-            if mask & 32 != 0 {
-                inode.attrs.mtime_ms = new_attrs.mtime_ms;
-            }
-
-            // Always update ctime
-            inode.attrs.ctime_ms = now_ms;
-
-            let content_revision = if size_changes_visible_file_state {
-                match &mut inode.data {
-                    InodeData::File {
-                        extents,
-                        content_revision,
-                        ..
-                    } => {
-                        let next = Self::next_content_revision(inode_id, *content_revision)?;
-                        for extent in extents.iter_mut() {
-                            extent.content_revision = Some(next);
-                        }
-                        *content_revision = Some(next);
-                        Some(next)
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            Ok((
-                inode,
-                FsOkResult {
-                    inode_id: Some(inode_id),
-                    content_revision,
-                    ..FsOkResult::default()
-                },
-            ))
-        })();
-
-        let (inode, ok) = match prepared {
-            Ok(prepared) => prepared,
-            Err(err) => return self.persist_fs_error(err, raft_state),
-        };
-        let result = FsCommandResult::Ok(ok);
-        self.storage.put_inode_atomic(&inode, raft_state)?;
-        Ok(result)
     }
 }
 
@@ -1061,8 +918,8 @@ mod tests {
         }
     }
 
-    fn create_file(sm: &AppRaftStateMachine, parent_inode_id: InodeId, name: &str) -> FsOkResult {
-        expect_fs_ok(
+    fn create_file(sm: &AppRaftStateMachine, parent_inode_id: InodeId, name: &str) -> InodeId {
+        expect_file_created(
             sm.apply(Command::CreateFile {
                 proposed_at_ms: 1,
                 parent_inode_id,
@@ -1072,6 +929,7 @@ mod tests {
             })
             .unwrap(),
         )
+        .0
     }
 
     fn assert_delete_rejection_preserves_directory(
@@ -1082,7 +940,7 @@ mod tests {
         command: Command,
         expected_rejection: ApplyRejectionKind,
     ) {
-        expect_fs_rejection(sm.apply(command).unwrap(), expected_rejection);
+        expect_apply_rejection(sm.apply(command), expected_rejection);
         assert_eq!(
             storage.get_dentry(parent_inode_id, "target").unwrap(),
             Some(directory_inode_id)
@@ -1095,22 +953,20 @@ mod tests {
     fn create_file_persists_namespace_inode_and_layout() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
 
-        let created = create_file(&sm, parent_inode_id, "file");
-        let inode_id = created.inode_id.unwrap();
+        let inode_id = create_file(&sm, parent_inode_id, "file");
 
         assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), Some(inode_id));
         assert_eq!(storage.get_inode(inode_id).unwrap().unwrap().inode_id, inode_id);
         assert_eq!(storage.get_layout(inode_id).unwrap(), FileLayout::new(4096, 4096, 1));
 
-        expect_fs_rejection(
+        expect_apply_rejection(
             sm.apply(Command::CreateFile {
                 proposed_at_ms: 2,
                 parent_inode_id,
                 name: "file".to_string(),
                 attrs: FileAttrs::new(),
                 layout: FileLayout::new(8192, 8192, 1),
-            })
-            .unwrap(),
+            }),
             ApplyRejectionKind::AlreadyExists,
         );
     }
@@ -1184,8 +1040,8 @@ mod tests {
             recursive: true,
         };
 
-        let first = expect_fs_ok(sm.apply(command.clone()).unwrap()).inode_id.unwrap();
-        let second = expect_fs_ok(sm.apply(command).unwrap()).inode_id.unwrap();
+        let first = expect_directory_ensured(sm.apply(command.clone()).unwrap()).0;
+        let second = expect_directory_ensured(sm.apply(command).unwrap()).0;
 
         assert_eq!(first, second);
         let a = storage.get_dentry(parent_inode_id, "a").unwrap().unwrap();
@@ -1195,12 +1051,12 @@ mod tests {
     #[test]
     fn delete_rejects_a_same_name_replacement_before_mutating_it() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
-        let original = create_file(&sm, parent_inode_id, "target").inode_id.unwrap();
-        let replacement = create_file(&sm, parent_inode_id, "replacement").inode_id.unwrap();
+        let original = create_file(&sm, parent_inode_id, "target");
+        let replacement = create_file(&sm, parent_inode_id, "replacement");
         storage.put_dentry(parent_inode_id, "target", replacement).unwrap();
 
-        expect_fs_rejection(
-            sm.apply(delete_command("target", original, Some(0), false)).unwrap(),
+        expect_apply_rejection(
+            sm.apply(delete_command("target", original, Some(0), false)),
             ApplyRejectionKind::Again,
         );
 
@@ -1214,10 +1070,8 @@ mod tests {
     #[test]
     fn delete_rejects_mount_root_key_identity_mismatch_without_path_deviation() {
         let (_dir, storage, sm, mount_root_inode_id) = test_state();
-        let visible = create_file(&sm, mount_root_inode_id, "target");
-        let diverted = create_file(&sm, mount_root_inode_id, "diverted");
-        let visible_inode_id = visible.inode_id.unwrap();
-        let diverted_inode_id = diverted.inode_id.unwrap();
+        let visible_inode_id = create_file(&sm, mount_root_inode_id, "target");
+        let diverted_inode_id = create_file(&sm, mount_root_inode_id, "diverted");
         let diverted_parent_inode_id = InodeId::new(20);
         storage
             .put_dentry(diverted_parent_inode_id, "target", diverted_inode_id)
@@ -1254,7 +1108,7 @@ mod tests {
     #[test]
     fn delete_rejects_intermediate_key_identity_mismatch_without_path_deviation() {
         let (_dir, storage, sm, mount_root_inode_id) = test_state();
-        let outer_inode_id = expect_fs_ok(
+        let outer_inode_id = expect_directory_ensured(
             sm.apply(Command::CreateDirectory {
                 proposed_at_ms: 1,
                 root_inode_id: mount_root_inode_id,
@@ -1264,12 +1118,9 @@ mod tests {
             })
             .unwrap(),
         )
-        .inode_id
-        .unwrap();
-        let visible = create_file(&sm, outer_inode_id, "target");
-        let diverted = create_file(&sm, outer_inode_id, "diverted");
-        let visible_inode_id = visible.inode_id.unwrap();
-        let diverted_inode_id = diverted.inode_id.unwrap();
+        .0;
+        let visible_inode_id = create_file(&sm, outer_inode_id, "target");
+        let diverted_inode_id = create_file(&sm, outer_inode_id, "diverted");
         let diverted_parent_inode_id = InodeId::new(200);
         storage
             .put_dentry(diverted_parent_inode_id, "target", diverted_inode_id)
@@ -1315,7 +1166,7 @@ mod tests {
     #[test]
     fn delete_rejects_stale_mount_and_target_fencing_without_mutation() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
-        let directory = expect_fs_ok(
+        let directory = expect_directory_ensured(
             sm.apply(Command::CreateDirectory {
                 proposed_at_ms: 1,
                 root_inode_id: parent_inode_id,
@@ -1325,8 +1176,7 @@ mod tests {
             })
             .unwrap(),
         )
-        .inode_id
-        .unwrap();
+        .0;
         let stale_commands = [
             Command::Delete {
                 proposed_at_ms: 2,
@@ -1366,7 +1216,7 @@ mod tests {
     #[test]
     fn delete_rejects_invalid_components_without_mutation() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
-        let directory = expect_fs_ok(
+        let directory = expect_directory_ensured(
             sm.apply(Command::CreateDirectory {
                 proposed_at_ms: 1,
                 root_inode_id: parent_inode_id,
@@ -1376,8 +1226,7 @@ mod tests {
             })
             .unwrap(),
         )
-        .inode_id
-        .unwrap();
+        .0;
         let invalid_components = [
             Vec::new(),
             vec![String::new()],
@@ -1412,10 +1261,10 @@ mod tests {
     #[test]
     fn rename_rejects_destination_changes_before_mutating_namespace() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
-        let source = create_file(&sm, parent_inode_id, "source").inode_id.unwrap();
-        let replacement = create_file(&sm, parent_inode_id, "destination").inode_id.unwrap();
+        let source = create_file(&sm, parent_inode_id, "source");
+        let replacement = create_file(&sm, parent_inode_id, "destination");
 
-        expect_fs_rejection(
+        expect_apply_rejection(
             sm.apply(Command::Rename {
                 proposed_at_ms: 2,
                 src_parent_inode_id: parent_inode_id,
@@ -1426,8 +1275,7 @@ mod tests {
                 expected_dst_inode_id: None,
                 expected_dst_lease_epoch: None,
                 flags: 0,
-            })
-            .unwrap(),
+            }),
             ApplyRejectionKind::Again,
         );
 
@@ -1441,10 +1289,10 @@ mod tests {
     #[test]
     fn rename_noreplace_is_decided_atomically_in_apply() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
-        let source = create_file(&sm, parent_inode_id, "source").inode_id.unwrap();
-        let destination = create_file(&sm, parent_inode_id, "destination").inode_id.unwrap();
+        let source = create_file(&sm, parent_inode_id, "source");
+        let destination = create_file(&sm, parent_inode_id, "destination");
 
-        expect_fs_rejection(
+        expect_apply_rejection(
             sm.apply(Command::Rename {
                 proposed_at_ms: 2,
                 src_parent_inode_id: parent_inode_id,
@@ -1455,8 +1303,7 @@ mod tests {
                 expected_dst_inode_id: Some(destination),
                 expected_dst_lease_epoch: Some(0),
                 flags: 0x1,
-            })
-            .unwrap(),
+            }),
             ApplyRejectionKind::AlreadyExists,
         );
         assert_eq!(storage.get_dentry(parent_inode_id, "source").unwrap(), Some(source));
@@ -1468,15 +1315,15 @@ mod tests {
         let source = create_file(&sm, parent_inode_id, "source");
         let destination = create_file(&sm, parent_inode_id, "destination");
 
-        expect_fs_ok(
+        expect_rename_applied(
             sm.apply(Command::Rename {
                 proposed_at_ms: 2,
                 src_parent_inode_id: parent_inode_id,
                 src_name: "source".to_string(),
-                expected_src_inode_id: source.inode_id.unwrap(),
+                expected_src_inode_id: source,
                 dst_parent_inode_id: parent_inode_id,
                 dst_name: "destination".to_string(),
-                expected_dst_inode_id: destination.inode_id,
+                expected_dst_inode_id: Some(destination),
                 expected_dst_lease_epoch: Some(0),
                 flags: 0,
             })
@@ -1486,19 +1333,16 @@ mod tests {
         assert_eq!(storage.get_dentry(parent_inode_id, "source").unwrap(), None);
         assert_eq!(
             storage.get_dentry(parent_inode_id, "destination").unwrap(),
-            source.inode_id
+            Some(source)
         );
-        assert_eq!(storage.get_inode(destination.inode_id.unwrap()).unwrap(), None);
-        assert!(storage
-            .get_layout_optional(destination.inode_id.unwrap())
-            .unwrap()
-            .is_none());
+        assert_eq!(storage.get_inode(destination).unwrap(), None);
+        assert!(storage.get_layout_optional(destination).unwrap().is_none());
     }
 
     #[test]
     fn recursive_delete_atomically_detaches_root_without_removing_descendants() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
-        let directory = expect_fs_ok(
+        let directory = expect_directory_ensured(
             sm.apply(Command::CreateDirectory {
                 proposed_at_ms: 1,
                 root_inode_id: parent_inode_id,
@@ -1508,16 +1352,15 @@ mod tests {
             })
             .unwrap(),
         )
-        .inode_id
-        .unwrap();
+        .0;
         let file = create_file(&sm, directory, "file");
 
-        expect_fs_ok(sm.apply(delete_command("dir", directory, None, true)).unwrap());
+        expect_delete_applied(sm.apply(delete_command("dir", directory, None, true)).unwrap());
 
         assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), None);
         assert!(storage.get_inode(directory).unwrap().is_some());
-        assert!(storage.get_inode(file.inode_id.unwrap()).unwrap().is_some());
-        assert!(storage.get_layout(file.inode_id.unwrap()).is_ok());
+        assert!(storage.get_inode(file).unwrap().is_some());
+        assert!(storage.get_layout(file).is_ok());
         assert_eq!(
             storage.get_detached_root(directory).unwrap(),
             Some(DetachedRoot {
@@ -1530,7 +1373,7 @@ mod tests {
     #[test]
     fn recursive_delete_rejects_directory_layout_before_detach() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
-        let directory = expect_fs_ok(
+        let directory = expect_directory_ensured(
             sm.apply(Command::CreateDirectory {
                 proposed_at_ms: 1,
                 root_inode_id: parent_inode_id,
@@ -1540,8 +1383,7 @@ mod tests {
             })
             .unwrap(),
         )
-        .inode_id
-        .unwrap();
+        .0;
         let parent_before = storage.get_inode(parent_inode_id).unwrap().unwrap();
         let directory_before = storage.get_inode(directory).unwrap().unwrap();
         let layout = FileLayout::new(4096, 4096, 1);
@@ -1569,7 +1411,7 @@ mod tests {
     #[test]
     fn stale_delete_cannot_mutate_a_parent_after_it_is_detached() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
-        let inner = expect_fs_ok(
+        let inner = expect_directory_ensured(
             sm.apply(Command::CreateDirectory {
                 proposed_at_ms: 1,
                 root_inode_id: parent_inode_id,
@@ -1579,13 +1421,12 @@ mod tests {
             })
             .unwrap(),
         )
-        .inode_id
-        .unwrap();
+        .0;
         let outer = storage.get_dentry(parent_inode_id, "outer").unwrap().unwrap();
         let stale_inner_delete = delete_path_command(vec!["outer".to_string(), "inner".to_string()], inner, None, true);
 
-        expect_fs_ok(sm.apply(delete_command("outer", outer, None, true)).unwrap());
-        expect_fs_rejection(sm.apply(stale_inner_delete).unwrap(), ApplyRejectionKind::NotFound);
+        expect_delete_applied(sm.apply(delete_command("outer", outer, None, true)).unwrap());
+        expect_apply_rejection(sm.apply(stale_inner_delete), ApplyRejectionKind::NotFound);
 
         assert_eq!(storage.get_dentry(outer, "inner").unwrap(), Some(inner));
         assert!(storage.get_detached_root(outer).unwrap().is_some());
@@ -1595,7 +1436,7 @@ mod tests {
     #[test]
     fn recursive_delete_rejects_nested_mount_before_detach() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
-        let directory = expect_fs_ok(
+        let directory = expect_directory_ensured(
             sm.apply(Command::CreateDirectory {
                 proposed_at_ms: 1,
                 root_inode_id: parent_inode_id,
@@ -1605,8 +1446,7 @@ mod tests {
             })
             .unwrap(),
         )
-        .inode_id
-        .unwrap();
+        .0;
         storage
             .put_mount(&crate::mount::MountEntry {
                 mount_id: MountId::new(2),
@@ -1620,8 +1460,8 @@ mod tests {
             })
             .unwrap();
 
-        expect_fs_rejection(
-            sm.apply(delete_command("dir", directory, None, true)).unwrap(),
+        expect_apply_rejection(
+            sm.apply(delete_command("dir", directory, None, true)),
             ApplyRejectionKind::CrossMountRename,
         );
 
@@ -1632,10 +1472,9 @@ mod tests {
     #[test]
     fn delete_rejects_a_lease_acquired_after_preflight() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
-        let file = create_file(&sm, parent_inode_id, "target");
-        let inode_id = file.inode_id.unwrap();
+        let inode_id = create_file(&sm, parent_inode_id, "target");
 
-        expect_fs_ok(
+        expect_write_lease_acquired(
             sm.apply(Command::AcquireWriteLease {
                 proposed_at_ms: 2,
                 inode_id,
@@ -1643,8 +1482,8 @@ mod tests {
             })
             .unwrap(),
         );
-        expect_fs_rejection(
-            sm.apply(delete_command("target", inode_id, Some(0), false)).unwrap(),
+        expect_apply_rejection(
+            sm.apply(delete_command("target", inode_id, Some(0), false)),
             ApplyRejectionKind::Again,
         );
 
@@ -1654,17 +1493,15 @@ mod tests {
     #[test]
     fn delete_that_linearizes_first_prevents_later_lease_acquisition() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
-        let file = create_file(&sm, parent_inode_id, "target");
-        let inode_id = file.inode_id.unwrap();
+        let inode_id = create_file(&sm, parent_inode_id, "target");
 
-        expect_fs_ok(sm.apply(delete_command("target", inode_id, Some(0), false)).unwrap());
-        expect_fs_rejection(
+        expect_delete_applied(sm.apply(delete_command("target", inode_id, Some(0), false)).unwrap());
+        expect_apply_rejection(
             sm.apply(Command::AcquireWriteLease {
                 proposed_at_ms: 3,
                 inode_id,
                 expected_lease_epoch: 0,
-            })
-            .unwrap(),
+            }),
             ApplyRejectionKind::NotFound,
         );
 
@@ -1675,7 +1512,7 @@ mod tests {
     #[test]
     fn recursive_delete_does_not_scan_descendant_lease_epochs() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
-        let directory = expect_fs_ok(
+        let directory = expect_directory_ensured(
             sm.apply(Command::CreateDirectory {
                 proposed_at_ms: 1,
                 root_inode_id: parent_inode_id,
@@ -1685,11 +1522,10 @@ mod tests {
             })
             .unwrap(),
         )
-        .inode_id
-        .unwrap();
-        let file_id = create_file(&sm, directory, "file").inode_id.unwrap();
+        .0;
+        let file_id = create_file(&sm, directory, "file");
 
-        expect_fs_ok(
+        expect_write_lease_acquired(
             sm.apply(Command::AcquireWriteLease {
                 proposed_at_ms: 2,
                 inode_id: file_id,
@@ -1697,7 +1533,7 @@ mod tests {
             })
             .unwrap(),
         );
-        expect_fs_ok(sm.apply(delete_command("dir", directory, None, true)).unwrap());
+        expect_delete_applied(sm.apply(delete_command("dir", directory, None, true)).unwrap());
 
         assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), None);
         assert_eq!(storage.get_dentry(directory, "file").unwrap(), Some(file_id));
@@ -1707,10 +1543,10 @@ mod tests {
     #[test]
     fn overwrite_rename_rejects_a_destination_lease_acquired_after_preflight() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
-        let source = create_file(&sm, parent_inode_id, "source").inode_id.unwrap();
-        let destination = create_file(&sm, parent_inode_id, "destination").inode_id.unwrap();
+        let source = create_file(&sm, parent_inode_id, "source");
+        let destination = create_file(&sm, parent_inode_id, "destination");
 
-        expect_fs_ok(
+        expect_write_lease_acquired(
             sm.apply(Command::AcquireWriteLease {
                 proposed_at_ms: 2,
                 inode_id: destination,
@@ -1718,7 +1554,7 @@ mod tests {
             })
             .unwrap(),
         );
-        expect_fs_rejection(
+        expect_apply_rejection(
             sm.apply(Command::Rename {
                 proposed_at_ms: 3,
                 src_parent_inode_id: parent_inode_id,
@@ -1729,8 +1565,7 @@ mod tests {
                 expected_dst_inode_id: Some(destination),
                 expected_dst_lease_epoch: Some(0),
                 flags: 0,
-            })
-            .unwrap(),
+            }),
             ApplyRejectionKind::Again,
         );
 
@@ -1744,10 +1579,10 @@ mod tests {
     #[test]
     fn overwrite_rename_that_linearizes_first_prevents_a_lease_on_the_replaced_inode() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
-        let source = create_file(&sm, parent_inode_id, "source").inode_id.unwrap();
-        let destination = create_file(&sm, parent_inode_id, "destination").inode_id.unwrap();
+        let source = create_file(&sm, parent_inode_id, "source");
+        let destination = create_file(&sm, parent_inode_id, "destination");
 
-        expect_fs_ok(
+        expect_rename_applied(
             sm.apply(Command::Rename {
                 proposed_at_ms: 2,
                 src_parent_inode_id: parent_inode_id,
@@ -1761,13 +1596,12 @@ mod tests {
             })
             .unwrap(),
         );
-        expect_fs_rejection(
+        expect_apply_rejection(
             sm.apply(Command::AcquireWriteLease {
                 proposed_at_ms: 3,
                 inode_id: destination,
                 expected_lease_epoch: 0,
-            })
-            .unwrap(),
+            }),
             ApplyRejectionKind::NotFound,
         );
 

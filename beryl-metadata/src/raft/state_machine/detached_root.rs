@@ -353,7 +353,7 @@ mod tests {
             max_entries,
             max_batch_bytes,
         })? {
-            CommandResult::DetachedRootsReclaimed(result) => Ok(result),
+            ApplySuccess::DetachedRootsReclaimed(result) => Ok(result),
             other => panic!("unexpected reclaim response: {other:?}"),
         }
     }

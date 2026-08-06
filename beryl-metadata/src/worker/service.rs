@@ -12,7 +12,7 @@ use crate::error::{to_rpc_error, MetadataError, MetadataResult};
 use crate::maintenance::BlockCleanupCoordinator;
 use crate::observe;
 use crate::raft::Command;
-use crate::raft::{AppRaftNode, CommandResult};
+use crate::raft::{AppRaftNode, ApplySuccess};
 use crate::service::extract_and_inject_context;
 use ::beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RpcErrorDetail, WorkerErrorKind};
 use ::beryl_common::header::ResponseHeader;
@@ -567,7 +567,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             };
 
             let accepted_worker_id = match self.raft_node.propose(command).await {
-                Ok(CommandResult::WorkerUpserted(worker_id)) => worker_id,
+                Ok(ApplySuccess::WorkerUpserted(worker_id)) => worker_id,
                 Ok(other) => {
                     return self.metadata_error_response(
                         &req.header,
