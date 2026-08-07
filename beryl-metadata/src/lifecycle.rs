@@ -18,7 +18,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 const METADATA_MARKER_FILE: &str = "metadata.marker.json";
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -418,7 +418,7 @@ fn read_marker(path: &std::path::Path) -> MetadataResult<MetadataStorageMarker> 
         .map_err(|err| MetadataError::Internal(format!("failed to read metadata marker {}: {err}", path.display())))?;
     serde_json::from_str(&raw).map_err(|err| {
         MetadataError::InvalidArgument(format!(
-            "metadata marker {} is malformed: {err}; old marker format unsupported, reformat metadata storage",
+            "metadata marker {} is malformed or unsupported: {err}; reformat metadata storage",
             path.display()
         ))
     })

@@ -18,7 +18,7 @@ use super::identity::{resolve_existing_worker_id, resolve_worker_id};
 
 const WORKER_STORAGE_INFO_FILE: &str = "worker.storage.json";
 const WORKER_STORAGE_INFO_TEMP_SUFFIX: &str = ".tmp";
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -153,7 +153,7 @@ fn read_info(path: &Path) -> Result<WorkerStorageInfo, WorkerError> {
     })?;
     serde_json::from_str(&raw).map_err(|err| {
         WorkerError::InvalidArgument(format!(
-            "worker storage info {} is malformed: {err}; old worker storage info format unsupported, clean storage or use future migration command",
+            "worker storage info {} is malformed or unsupported: {err}; clean worker storage before starting",
             path.display()
         ))
     })

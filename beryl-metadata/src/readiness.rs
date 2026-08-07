@@ -191,7 +191,7 @@ async fn wait_for_root_ready_inner(inputs: RootReadyInputs) -> MetadataResult<()
         {
             if existing.root_inode_id != ROOT_INODE_ID {
                 return Err(MetadataError::InvalidArgument(format!(
-                    "root inode invariant violated: expected inode_id={}, got {}. storage must be migrated or wiped",
+                    "root inode invariant violated: expected inode_id={}, got {}; clean and reformat metadata storage",
                     ROOT_INODE_ID.as_raw(),
                     existing.root_inode_id.as_raw()
                 )));

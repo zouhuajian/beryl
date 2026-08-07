@@ -62,7 +62,7 @@ const CF_RAFT_SNAPSHOT: &str = "raft_snapshot"; // Raft snapshots
 const ROCKSDB_SCHEMA_VERSION_KEY: &[u8] = b"rocksdb_schema_version";
 const STORAGE_IDENTITY_KEY: &[u8] = b"storage_identity";
 const RAFT_STATE_KEY: &[u8] = b"raft_state";
-pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 10;
+pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 1;
 const NEXT_INODE_ID_KEY: &[u8] = b"next_inode_id";
 
 fn durable_raft_write_options() -> WriteOptions {
