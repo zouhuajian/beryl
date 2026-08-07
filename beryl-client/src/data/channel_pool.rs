@@ -59,9 +59,9 @@ impl GrpcWorkerChannelPool {
 
     pub(super) fn from_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> Self {
         Self::new_with_cooldown_ms(
-            config.channel_pool.worker_channel_pool_enabled,
-            config.channel_pool.worker_channel_pool_max_per_worker,
-            config.channel_pool.worker_endpoint_cooldown_ms,
+            config.connections.worker_enabled,
+            config.connections.worker_max_per_worker,
+            config.connections.worker_failure_cooldown_ms,
             metrics,
         )
     }

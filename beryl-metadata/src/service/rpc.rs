@@ -17,7 +17,7 @@ use super::wire::{
 };
 use super::MetadataFileSystem;
 use super::MsyncHandler;
-use crate::config::{ListStatusConfig, MAX_LIST_STATUS_PAGE_SIZE};
+use crate::config::{NamespaceListConfig, MAX_LIST_STATUS_PAGE_SIZE};
 use crate::error::{to_rpc_error, MetadataError};
 use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use beryl_proto::metadata::*;
@@ -67,7 +67,7 @@ impl_header_response!(
 pub struct MetadataFileSystemServiceImpl {
     filesystem: Arc<MetadataFileSystem>,
     msync: Option<MsyncHandler>,
-    list_status: ListStatusConfig,
+    list_status: NamespaceListConfig,
 }
 
 macro_rules! response_with_header {
@@ -98,7 +98,7 @@ impl MetadataFileSystemServiceImpl {
     pub(crate) fn new(
         filesystem: Arc<MetadataFileSystem>,
         msync: Option<MsyncHandler>,
-        list_status: ListStatusConfig,
+        list_status: NamespaceListConfig,
     ) -> Self {
         Self {
             filesystem,
@@ -842,7 +842,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{ListStatusConfig, RaftConfig, MAX_LIST_STATUS_PAGE_SIZE};
+    use crate::config::{NamespaceListConfig, RaftConfig, MAX_LIST_STATUS_PAGE_SIZE};
     use crate::mount::{DataIoPolicy, MountEntry, MountKind, MountTable, ROOT_INODE_ID};
     use crate::raft::{
         AppRaftNode, AppRaftStateMachine, Command, RocksDBStorage, MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES,
@@ -1032,7 +1032,7 @@ mod tests {
             mount_prefix,
             data_io_policy,
             readiness_gate,
-            ListStatusConfig::default(),
+            NamespaceListConfig::default(),
         )
     }
 
@@ -1040,7 +1040,7 @@ mod tests {
         mount_prefix: &str,
         data_io_policy: DataIoPolicy,
         readiness_gate: Option<Arc<RootReadinessGate>>,
-        list_status: ListStatusConfig,
+        list_status: NamespaceListConfig,
     ) -> PathTestEnv {
         let temp_dir = TempDir::new().expect("create temp dir");
         let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).expect("open rocksdb"));
@@ -1212,7 +1212,7 @@ mod tests {
             readiness_gate: None,
         }));
         let msync = Some(MsyncHandler::new(Arc::clone(&raft_node), owner_group_name));
-        let service = MetadataFileSystemServiceImpl::new(filesystem, msync, ListStatusConfig::default());
+        let service = MetadataFileSystemServiceImpl::new(filesystem, msync, NamespaceListConfig::default());
 
         PathTestEnv {
             _temp_dir: temp_dir,
@@ -1228,7 +1228,7 @@ mod tests {
     }
 
     fn worker_manager_for_write_targets() -> Arc<WorkerManager> {
-        let manager = Arc::new(WorkerManager::new(60));
+        let manager = Arc::new(WorkerManager::new(60_000));
         for raw in 1..=3 {
             let worker_id = WorkerId::new(raw);
             let endpoint = format!("127.0.0.1:{}", 9000 + raw);
@@ -1424,7 +1424,7 @@ mod tests {
             "/mnt/test",
             DataIoPolicy::Allow,
             None,
-            ListStatusConfig::try_new(2, 3).unwrap(),
+            NamespaceListConfig::try_new(2, 3).unwrap(),
         );
         put_list_children(&env, &["a", "b", "c"]);
 
@@ -1500,7 +1500,7 @@ mod tests {
             "/mnt/test",
             DataIoPolicy::Allow,
             None,
-            ListStatusConfig::try_new(2, 3).unwrap(),
+            NamespaceListConfig::try_new(2, 3).unwrap(),
         );
 
         let response = FileSystemServiceProto::list_status(
@@ -1530,7 +1530,7 @@ mod tests {
     #[tokio::test]
     async fn list_status_compiled_ceiling_cannot_be_bypassed() {
         let env =
-            build_env_with_list_status_config("/mnt/test", DataIoPolicy::Allow, None, ListStatusConfig::default());
+            build_env_with_list_status_config("/mnt/test", DataIoPolicy::Allow, None, NamespaceListConfig::default());
 
         let response = FileSystemServiceProto::list_status(
             &env.service,

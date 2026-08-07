@@ -5,14 +5,14 @@
 //!
 //! This example demonstrates:
 //! - Initializing observability with production-style flat JSON logging
-//! - Prometheus metrics endpoint
+//! - Prometheus metrics served by the process HTTP service
 //! - Tracing spans
 //! - Mock transport and UFS operations
 
-use beryl_common::observe::config::{
-    LogConfig, MetricsConfig, ObservabilityConfig, PrometheusConfig, ResourceConfig, ServiceInfo,
-};
+use beryl_common::observe::config::{LogConfig, ObservabilityConfig, ResourceConfig, ServiceInfo};
 use beryl_common::observe::init_observability;
+use beryl_common::service_http::spawn_service_http;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -23,12 +23,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             level: "info,beryl_common=info,tonic=warn,tower=warn,h2=warn".to_string(),
             format: "json".to_string(),
             output: "stdout".to_string(),
-        },
-        metrics: MetricsConfig {
-            prometheus: PrometheusConfig {
-                bind: "0.0.0.0:9090".to_string(),
-                path: "/metrics".to_string(),
-            },
         },
         resource: ResourceConfig {
             service_name: Some("observability-demo".to_string()),
@@ -49,7 +43,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Initialize observability
-    let _guard = init_observability(&config, service_info)?;
+    let guard = init_observability(&config, service_info)?;
+    let _http = spawn_service_http("0.0.0.0:9090".parse()?, guard.prometheus_handle(), Arc::new(|| true))?;
 
     tracing::info!("Observability demo started");
     tracing::info!("Prometheus metrics available at http://localhost:9090/metrics");

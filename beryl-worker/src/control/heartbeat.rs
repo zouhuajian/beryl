@@ -69,6 +69,7 @@ pub struct MetadataHeartbeatLoop {
     control_identity: ControlIdentity,
     heartbeat_seq: Mutex<HashMap<(GroupName, WorkerRunId), u64>>,
     cleanup: BlockCleanupExecutor,
+    interval: Duration,
 }
 
 impl MetadataHeartbeatLoop {
@@ -82,6 +83,21 @@ impl MetadataHeartbeatLoop {
         state: Arc<RegistrationSet>,
         cleanup: BlockCleanupExecutor,
     ) -> Result<Self, HeartbeatError> {
+        Self::with_interval(config, descriptor, state, cleanup, Duration::from_secs(1))
+    }
+
+    pub fn with_interval(
+        config: WorkerRegistrationConfig,
+        descriptor: RegistrationDescriptor,
+        state: Arc<RegistrationSet>,
+        cleanup: BlockCleanupExecutor,
+        interval: Duration,
+    ) -> Result<Self, HeartbeatError> {
+        if interval.is_zero() {
+            return Err(HeartbeatError::InvalidConfig(
+                "heartbeat interval must be greater than zero".to_string(),
+            ));
+        }
         config
             .validate()
             .map_err(|err| HeartbeatError::InvalidConfig(err.message))?;
@@ -89,7 +105,7 @@ impl MetadataHeartbeatLoop {
         for endpoint in &config.endpoints {
             endpoints.push(
                 Endpoint::from_shared(endpoint.clone())
-                    .map_err(|err| HeartbeatError::InvalidConfig(format!("worker.metadata.endpoints: {err}")))?,
+                    .map_err(|err| HeartbeatError::InvalidConfig(format!("beryl.worker.metadata.addresses: {err}")))?,
             );
         }
         Ok(Self {
@@ -100,6 +116,7 @@ impl MetadataHeartbeatLoop {
             control_identity: ControlIdentity::new_local(),
             heartbeat_seq: Mutex::new(HashMap::new()),
             cleanup,
+            interval,
         })
     }
 
@@ -240,7 +257,7 @@ impl MetadataHeartbeatLoop {
         endpoint: Endpoint,
         request: HeartbeatRequestProto,
     ) -> Result<HeartbeatPeerOutcome, HeartbeatError> {
-        let timeout = Duration::from_millis(self.config.register_timeout_ms);
+        let timeout = Duration::from_millis(self.config.request_timeout_ms);
         let channel = time::timeout(timeout, endpoint.connect())
             .await
             .map_err(|_| HeartbeatError::Retryable("metadata heartbeat connect timed out".to_string()))?
@@ -256,7 +273,7 @@ impl MetadataHeartbeatLoop {
     }
 
     async fn run(self, registrar: Arc<MetadataRegistrar>, store: Option<Arc<StoreDirs>>) {
-        let mut interval = time::interval(Duration::from_millis(1_000));
+        let mut interval = time::interval(self.interval);
         loop {
             interval.tick().await;
             if self.state.registration(&self.config.group_name).is_none() {

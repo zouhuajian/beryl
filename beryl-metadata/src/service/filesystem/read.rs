@@ -930,7 +930,7 @@ mod tests {
         let inode_id = InodeId::new(480);
         let block_id = BlockId::new(inode_id, BlockIndex::new(0));
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         for (raw, endpoint) in [(2, "127.0.0.2:9102"), (1, "127.0.0.1:9101")] {
             let worker_id = WorkerId::new(raw);
             worker_manager
@@ -1079,9 +1079,9 @@ mod tests {
             let block_id = BlockId::new(inode_id, BlockIndex::new(0));
             let worker_id = WorkerId::new(1);
             let worker_manager = Arc::new(WorkerManager::new(if matches!(case, Case::ExpiredWorker) {
-                1
+                1_000
             } else {
-                60
+                60_000
             }));
 
             if !matches!(case, Case::MissingReport) {
@@ -1230,7 +1230,7 @@ mod tests {
         let block_id = BlockId::new(inode_id, BlockIndex::new(0));
         let worker_id = WorkerId::new(1);
         let builder = filesystem_builder_without_mount();
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let fallback_group = group_name("root");
 
         worker_manager
@@ -1305,7 +1305,7 @@ mod tests {
         let worker_id = WorkerId::new(1);
         let worker_run_id: beryl_types::WorkerRunId = "550e8400-e29b-41d4-a716-446655440052".parse().unwrap();
         let builder = filesystem_builder_with_mount(mount_id, 9, &served_group);
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
 
         worker_manager
             .register_worker_run(

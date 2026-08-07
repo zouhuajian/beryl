@@ -1,61 +1,57 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-# Beryl metadata baseline. Run with:
-# beryl-metadata format --config conf/metadata.yaml
-# beryl-metadata start --config conf/metadata.yaml
+# Beryl Metadata baseline.
 
-cluster.id: "local-beryl"
+# -------------------- Cluster identity --------------------
+beryl.cluster.id: "local-beryl"
 
-# Metadata RPC service.
-metadata.rpc.addr: "0.0.0.0"
-metadata.rpc.port: 18080
+# -------------------- Network endpoints --------------------
+beryl.metadata.host: "127.0.0.1"
+beryl.metadata.bind-host: "0.0.0.0"
+beryl.metadata.rpc.port: 18080
+beryl.metadata.http.port: 18081
 
-# Metadata persistent state root. RocksDB state, Raft log/state, and snapshot
-# metadata live under this directory.
-metadata.storage.dir: "data/metadata"
+# -------------------- Storage --------------------
+beryl.metadata.storage.dir: "data/metadata"
 
-# Single-group metadata authority baseline.
-metadata.group.name: "root"
+# -------------------- Namespace listing --------------------
+beryl.metadata.namespace.list.default-page-size: 1000
+beryl.metadata.namespace.list.max-page-size: 10000
 
-# Raft identity for the configured authority group. Cluster mode parses but is
-# not a supported startup mode yet.
-metadata.raft.node_id: 1
-metadata.raft.mode: "single"
+# -------------------- Namespace deletion --------------------
+beryl.metadata.namespace.delete.interval: 1s
+beryl.metadata.namespace.delete.batch.max-roots: 64
+beryl.metadata.namespace.delete.batch.max-entries: 256
+beryl.metadata.namespace.delete.batch.max-size: 1MiB
+beryl.metadata.namespace.delete.retry.initial-backoff: 1s
+beryl.metadata.namespace.delete.retry.max-backoff: 1min
 
-# Public ListStatus pages are server-bounded; clients continue with next_cursor.
-metadata.list_status.default_page_size: 1000
-metadata.list_status.max_page_size: 10000
+# -------------------- Block cleanup --------------------
+beryl.metadata.block.cleanup.enabled: true
+beryl.metadata.block.cleanup.interval: 30s
+beryl.metadata.block.cleanup.grace-period: 5min
+beryl.metadata.block.cleanup.scan-limit: 10000
+beryl.metadata.block.cleanup.queue-capacity: 10000
+beryl.metadata.block.cleanup.batch-size: 32
+beryl.metadata.block.cleanup.retry.initial-backoff: 1s
+beryl.metadata.block.cleanup.retry.max-backoff: 1min
 
-# Worker cleanup execution is enabled; set false only as an operational kill switch.
-metadata.cleanup.dispatch_enabled: true
-metadata.cleanup.max_commands_per_heartbeat: 32
-metadata.cleanup.retry_initial_backoff_ms: 1000
-metadata.cleanup.retry_max_backoff_ms: 60000
+# -------------------- Startup --------------------
+beryl.metadata.startup.retry.initial-backoff: 200ms
+beryl.metadata.startup.retry.max-backoff: 5s
+beryl.metadata.startup.warn-after: 1min
+beryl.metadata.startup.timeout: 2min
+beryl.metadata.startup.fail-fast: false
 
-# Leader-only bounded reclamation for durable detached namespace roots.
-metadata.detached_root_reclamation.scan_interval_ms: 1000
-metadata.detached_root_reclamation.max_candidates: 64
-metadata.detached_root_reclamation.max_entries: 256
-metadata.detached_root_reclamation.max_batch_bytes: 1048576
-metadata.detached_root_reclamation.retry_initial_backoff_ms: 1000
-metadata.detached_root_reclamation.retry_max_backoff_ms: 60000
+# -------------------- Write leases --------------------
+beryl.metadata.write-lease.timeout: 1min
 
-# Root mount readiness backoff.
-metadata.bootstrap.root_ready_initial_backoff_ms: 200
-metadata.bootstrap.root_ready_max_backoff_ms: 5000
-metadata.bootstrap.root_ready_warn_after_ms: 60000
+# -------------------- Worker liveness --------------------
+beryl.metadata.worker.liveness.timeout: 1min
+beryl.metadata.worker.liveness.scan-interval: 30s
 
-# Metadata repair queue policy.
-metadata.repair.max_queue_size: 10000
-metadata.repair.max_attempts: 3
-metadata.repair.inflight_timeout_ms: 300000
-metadata.repair.initial_backoff_ms: 1000
-metadata.repair.max_backoff_ms: 60000
-metadata.repair.worker_inflight_limit: 4
-
-observe.log.format: compact
-observe.log.output: stderr
-observe.log.level: "info,beryl_metadata=info,beryl_worker=info,beryl_common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"
-observe.metrics.prometheus.bind: "127.0.0.1:18081"
-observe.metrics.prometheus.path: "/metrics"
+# -------------------- Logging --------------------
+beryl.logging.format: compact
+beryl.logging.output: stderr
+beryl.logging.level: "info,beryl_metadata=info,beryl_worker=info,beryl_common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"

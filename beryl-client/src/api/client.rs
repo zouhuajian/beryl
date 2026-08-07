@@ -271,8 +271,8 @@ mod tests {
         assert_ne!(first_id.as_raw(), 0);
         assert_ne!(second_id.as_raw(), 0);
         assert_ne!(first_id, second_id);
-        assert_eq!(first.runtime.executor.client_name(), "default_client");
-        assert_eq!(second.runtime.executor.client_name(), "default_client");
+        assert_eq!(first.runtime.executor.client_name(), "default-client");
+        assert_eq!(second.runtime.executor.client_name(), "default-client");
     }
 
     #[tokio::test(start_paused = true)]
@@ -2712,21 +2712,20 @@ mod tests {
         );
 
         let mut flat = beryl_common::FlatConfig::new();
-        flat.set("client.name", "prod_ns01");
+        flat.set("beryl.client.name", "prod-ns01");
         let config = ClientConfig::from_flat(flat).expect("config");
         let named_client = FsClient::try_new(config).expect("named client");
 
         assert!(!named_client.runtime.executor.client_id().is_zero());
-        assert_eq!(named_client.runtime.executor.client_name(), "prod_ns01");
+        assert_eq!(named_client.runtime.executor.client_name(), "prod-ns01");
     }
 
     #[test]
-    fn try_new_uses_group_scoped_metadata_targets() {
+    fn try_new_uses_configured_metadata_addresses() {
         let mut flat = beryl_common::FlatConfig::new();
-        flat.set("client.metadata.group.names", "analytics");
-        flat.set("client.metadata.group.analytics.endpoints", "10.0.1.1:18080");
-        let config = ClientConfig::from_flat(flat).expect("group-scoped metadata config");
+        flat.set("beryl.client.metadata.addresses", vec!["10.0.1.1:18080".to_string()]);
+        let config = ClientConfig::from_flat(flat).expect("metadata address config");
 
-        FsClient::try_new(config).expect("client should use group-scoped metadata config");
+        FsClient::try_new(config).expect("client should use configured Metadata address");
     }
 }

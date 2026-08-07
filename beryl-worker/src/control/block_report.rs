@@ -96,6 +96,7 @@ pub struct MetadataBlockReportLoop {
     store: Arc<StoreDirs>,
     core: Arc<WorkerCore>,
     options: BlockReportOptions,
+    interval: Duration,
     control_identity: ControlIdentity,
     baselines: Mutex<HashMap<GroupName, ReportBaseline>>,
 }
@@ -119,9 +120,26 @@ impl MetadataBlockReportLoop {
         core: Arc<WorkerCore>,
         options: BlockReportOptions,
     ) -> Result<Self, BlockReportError> {
+        Self::with_options_and_interval(config, descriptor, state, store, core, options, Duration::from_secs(1))
+    }
+
+    pub fn with_options_and_interval(
+        config: WorkerRegistrationConfig,
+        descriptor: RegistrationDescriptor,
+        state: Arc<RegistrationSet>,
+        store: Arc<StoreDirs>,
+        core: Arc<WorkerCore>,
+        options: BlockReportOptions,
+        interval: Duration,
+    ) -> Result<Self, BlockReportError> {
         config
             .validate()
             .map_err(|err| BlockReportError::InvalidConfig(err.message))?;
+        if interval.is_zero() {
+            return Err(BlockReportError::InvalidConfig(
+                "block report interval must be greater than zero".to_string(),
+            ));
+        }
         if options.full_max_blocks_per_batch == 0 {
             return Err(BlockReportError::InvalidConfig(
                 "full_max_blocks_per_batch must be greater than zero".to_string(),
@@ -148,8 +166,9 @@ impl MetadataBlockReportLoop {
         let mut endpoints = Vec::with_capacity(config.endpoints.len());
         for endpoint in &config.endpoints {
             endpoints.push(
-                Endpoint::from_shared(endpoint.clone())
-                    .map_err(|err| BlockReportError::InvalidConfig(format!("worker.metadata.endpoints: {err}")))?,
+                Endpoint::from_shared(endpoint.clone()).map_err(|err| {
+                    BlockReportError::InvalidConfig(format!("beryl.worker.metadata.addresses: {err}"))
+                })?,
             );
         }
 
@@ -161,6 +180,7 @@ impl MetadataBlockReportLoop {
             store,
             core,
             options,
+            interval,
             control_identity: ControlIdentity::new_local(),
             baselines: Mutex::new(HashMap::new()),
         })
@@ -537,7 +557,7 @@ impl MetadataBlockReportLoop {
         report_seq: u64,
         blocks: &[BlockReportBlockProto],
     ) -> Result<BlockReportPeerOutcome, BlockReportError> {
-        let timeout = Duration::from_millis(self.config.register_timeout_ms);
+        let timeout = Duration::from_millis(self.config.request_timeout_ms);
         let channel = time::timeout(timeout, endpoint.connect())
             .await
             .map_err(|_| BlockReportError::Retryable("metadata block report connect timed out".to_string()))?
@@ -591,7 +611,7 @@ impl MetadataBlockReportLoop {
         delta_seq: u64,
         deltas: &[BlockReportDeltaProto],
     ) -> Result<BlockReportPeerOutcome, BlockReportError> {
-        let timeout = Duration::from_millis(self.config.register_timeout_ms);
+        let timeout = Duration::from_millis(self.config.request_timeout_ms);
         let channel = time::timeout(timeout, endpoint.connect())
             .await
             .map_err(|_| BlockReportError::Retryable("metadata delta report connect timed out".to_string()))?
@@ -623,7 +643,7 @@ impl MetadataBlockReportLoop {
     /// Every wake-up re-evaluates baseline validity; an invalid or missing
     /// baseline always selects a full report instead of silently skipping work.
     async fn run(self) {
-        let mut interval = time::interval(Duration::from_millis(1_000));
+        let mut interval = time::interval(self.interval);
         loop {
             tokio::select! {
                 _ = interval.tick() => {}

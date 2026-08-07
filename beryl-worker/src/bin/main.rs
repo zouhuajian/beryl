@@ -8,10 +8,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use beryl_common::observe::{init_observability, ServiceInfo};
+use beryl_common::service_http::spawn_service_http;
 use beryl_worker::{
     config::WorkerConfig,
     control::{
-        prepare_worker_start, BlockCleanupExecutor, BlockCleanupOptions, MetadataBlockReportLoop,
+        prepare_worker_start, BlockCleanupExecutor, BlockCleanupOptions, BlockReportOptions, MetadataBlockReportLoop,
         MetadataHeartbeatLoop, MetadataRegistrar, RegistrationSet,
     },
     net, observe,
@@ -40,7 +41,7 @@ async fn main() -> Result<()> {
         instance_id: format!("worker-{}", std::process::id()),
         node_name: Some(format!("worker-node-{}", std::process::id())),
     };
-    let _obs_guard = init_observability(&obs_config, service_info)
+    let obs_guard = init_observability(&obs_config, service_info)
         .map_err(|e| anyhow::anyhow!("Failed to initialize observability: {}", e))?;
     observe::record_worker_started("worker", env!("CARGO_PKG_VERSION"));
     observe::set_worker_registered(false);
@@ -48,13 +49,13 @@ async fn main() -> Result<()> {
     info!(
         event = "worker_data_service_starting",
         rpc_bind = %config.rpc_bind,
-        rpc_advertised_endpoint = %config.rpc_advertised_endpoint,
+        rpc_address = %config.rpc_address(),
+        http_bind = %config.http_addr(),
         rpc_max_inflight = config.rpc_max_inflight,
         default_frame_size = config.default_frame_size,
         max_frame_size = config.max_frame_size,
         store_dirs = config.store.dirs.len(),
         store_reserve_space_bytes = config.store.reserve_space_bytes,
-        store_selection_policy = %config.store.selection_policy,
         store_check_interval_ms = config.store.check_interval_ms,
         net_listeners = config.net.listeners.len(),
         "starting worker data service"
@@ -71,6 +72,14 @@ async fn main() -> Result<()> {
     }
 
     let registration_state = Arc::new(RegistrationSet::new());
+    let readiness_state = Arc::clone(&registration_state);
+    let readiness_group = config.metadata.group_name.clone();
+    let http = spawn_service_http(
+        config.http_addr(),
+        obs_guard.prometheus_handle(),
+        Arc::new(move || readiness_state.is_ready(&readiness_group)),
+    )
+    .context("Failed to start Worker HTTP service")?;
     let descriptor = MetadataRegistrar::descriptor_from_config(&config, worker_id)
         .context("Failed to build worker registration descriptor")?;
     let block_report_descriptor = descriptor.clone();
@@ -96,14 +105,20 @@ async fn main() -> Result<()> {
     let cleanup = BlockCleanupExecutor::start(
         Arc::clone(&core),
         Arc::clone(&registration_state),
-        BlockCleanupOptions::default(),
+        BlockCleanupOptions {
+            max_pending: config.block_cleanup.queue_capacity,
+            max_concurrent: config.block_cleanup.concurrency,
+            retry_initial_backoff: Duration::from_millis(config.block_cleanup.retry_initial_backoff_ms),
+            retry_max_backoff: Duration::from_millis(config.block_cleanup.retry_max_backoff_ms),
+        },
     )
     .context("Failed to create worker block cleanup executor")?;
-    let heartbeat = MetadataHeartbeatLoop::new(
+    let heartbeat = MetadataHeartbeatLoop::with_interval(
         config.metadata.clone(),
         block_report_descriptor.clone(),
         Arc::clone(&registration_state),
         cleanup,
+        Duration::from_millis(config.heartbeat_interval_ms),
     )
     .context("Failed to create worker metadata heartbeat loop")?;
 
@@ -114,20 +129,26 @@ async fn main() -> Result<()> {
         .await
         .context("Worker metadata registration failed")?;
     let _heartbeat_handle = heartbeat.spawn_with_registrar_and_store(Arc::clone(&registrar), Arc::clone(&block_store));
-    let block_report = MetadataBlockReportLoop::new(
+    let block_report = MetadataBlockReportLoop::with_options_and_interval(
         config.metadata.clone(),
         block_report_descriptor,
         Arc::clone(&registration_state),
         block_store,
         Arc::clone(&core),
+        BlockReportOptions {
+            full_max_blocks_per_batch: config.block_report_batch_size,
+            delta_max_entries_per_batch: config.block_report_batch_size,
+        },
+        Duration::from_millis(config.block_report_interval_ms),
     )
     .context("Failed to create worker block report loop")?;
     let _block_report_handle = block_report.spawn();
 
-    if let Err(error) = net::server::serve_worker_data_with_registration(&config.net, core, registration_state)
+    let result = net::server::serve_worker_data_with_registration(&config.net, core, registration_state)
         .await
-        .context("Worker data service server failed")
-    {
+        .context("Worker data service server failed");
+    http.abort();
+    if let Err(error) = result {
         error!(%error, "Worker RPC server failed");
         return Err(error);
     }
@@ -192,8 +213,8 @@ mod tests {
 
     #[test]
     fn valid_worker_start_command_parses() {
-        let start = parse(&["start", "--config", "conf/local/worker.yaml"]).unwrap();
-        assert_eq!(start.config_path.as_deref(), Some("conf/local/worker.yaml"));
+        let start = parse(&["start", "--config", "conf/worker.yaml"]).unwrap();
+        assert_eq!(start.config_path.as_deref(), Some("conf/worker.yaml"));
 
         let default_start = parse(&[]).unwrap();
         assert!(default_start.config_path.is_none());
@@ -226,17 +247,19 @@ mod tests {
             &config_path,
             format!(
                 r#"
-worker.rpc.bind: "127.0.0.1:9090"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.store.dirs.hdd0.path: "{}"
-worker.store.dirs.hdd0.tier: HDD
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-observe.log.format: json
-observe.log.output: stdout
-observe.log.level: "warn"
-observe.metrics.prometheus.bind: "127.0.0.1:19091"
-observe.metrics.prometheus.path: "/metrics"
+beryl.worker.bind-host: 127.0.0.1
+beryl.worker.rpc.port: 19090
+beryl.worker.http.port: 19091
+beryl.worker.storage.dirs:
+  hdd0:
+    path: "{}"
+    tier: hdd
+    capacity: 10GiB
+beryl.worker.metadata.addresses:
+  - 127.0.0.1:18080
+beryl.logging.format: json
+beryl.logging.output: stdout
+beryl.logging.level: "warn"
 "#,
                 store_path.display()
             ),
@@ -249,12 +272,12 @@ observe.metrics.prometheus.path: "/metrics"
 
         assert_eq!(config.observability.log.format, "json");
         assert_eq!(config.observability.log.output, "stdout");
-        assert_eq!(config.observability.metrics.prometheus.bind, "127.0.0.1:19091");
+        assert_eq!(config.http_addr(), "127.0.0.1:19091".parse().unwrap());
     }
 
     #[test]
     fn worker_config_path_requires_explicit_config_flag() {
-        let err = parse(&["conf/local/worker.yaml"])
+        let err = parse(&["conf/worker.yaml"])
             .err()
             .expect("positional worker config path must fail");
         assert!(err.to_string().contains("--config"));

@@ -11,8 +11,8 @@ use beryl_client::{ClientConfig, FsClient};
 use beryl_common::observe::ObservabilityConfig;
 use beryl_common::FlatConfig;
 use beryl_metadata::config::{
-    BootstrapConfig, CleanupConfig, DetachedRootReclamationConfig, MetadataAuthorityConfig, MetadataConfig, RaftConfig,
-    WorkerConfig,
+    BlockCleanupConfig, MetadataAuthorityConfig, MetadataConfig, NamespaceDeleteConfig, RaftConfig, StartupConfig,
+    WorkerLivenessConfig,
 };
 use beryl_metadata::lifecycle::format_metadata_storage;
 use beryl_metadata::lifecycle::prepare_metadata_start;
@@ -20,7 +20,8 @@ use beryl_metadata::runtime::{build_authority, build_filesystem_service, build_r
 use beryl_metadata::worker::WorkerManager;
 use beryl_types::{GroupName, Tier, WorkerId, WorkerRunId};
 use beryl_worker::config::{
-    StoreDirConfig, WorkerConfig as WorkerServiceConfig, WorkerRegistrationConfig, WorkerStoreConfig,
+    StoreDirConfig, WorkerBlockCleanupConfig, WorkerConfig as WorkerServiceConfig, WorkerRegistrationConfig,
+    WorkerStoreConfig,
 };
 use beryl_worker::control::{
     prepare_worker_start, BlockCleanupExecutor, BlockCleanupOptions, MetadataBlockReportLoop, MetadataHeartbeatLoop,
@@ -94,13 +95,13 @@ impl TestCluster {
 
         let mut metadata_config = metadata_config(temp_state.metadata_dir(), metadata_addr, group_name.clone())?;
         if let Some(reclaim_grace_ms) = reclaim_grace_ms {
-            metadata_config.cleanup.scan_interval_ms = 20;
-            metadata_config.cleanup.reclaim_grace_ms = reclaim_grace_ms;
-            metadata_config.cleanup.retry_initial_backoff_ms = 20;
-            metadata_config.cleanup.retry_max_backoff_ms = 100;
+            metadata_config.block_cleanup.scan_interval_ms = 20;
+            metadata_config.block_cleanup.reclaim_grace_ms = reclaim_grace_ms;
+            metadata_config.block_cleanup.retry_initial_backoff_ms = 20;
+            metadata_config.block_cleanup.retry_max_backoff_ms = 100;
         }
         if let Some(max_replicas_per_scan) = max_replicas_per_scan {
-            metadata_config.cleanup.max_replicas_per_scan = max_replicas_per_scan;
+            metadata_config.block_cleanup.max_replicas_per_scan = max_replicas_per_scan;
         }
         format_metadata_storage(&metadata_config).await?;
         let (metadata_server, worker_manager) =
@@ -364,8 +365,8 @@ impl TestCluster {
 
     async fn start_metadata_child(&mut self, executable: &std::path::Path) -> TestResult<()> {
         let metrics_port = PortReservation::reserve_localhost().await?;
-        let metrics_addr = metrics_port.addr();
-        let config_path = self.write_metadata_process_config(metrics_addr)?;
+        let http_addr = metrics_port.addr();
+        let config_path = self.write_metadata_process_config(http_addr)?;
         drop(metrics_port);
         self.metadata_process = Some(MetadataProcessInstance::start(executable, &config_path)?);
         if let Err(error) = readiness::wait_for_metadata_filesystem(&self.client).await {
@@ -585,48 +586,43 @@ impl TestCluster {
         Ok(())
     }
 
-    fn write_metadata_process_config(&self, metrics_addr: SocketAddr) -> TestResult<std::path::PathBuf> {
+    fn write_metadata_process_config(&self, http_addr: SocketAddr) -> TestResult<std::path::PathBuf> {
         let config_path = self._temp_state.root().join("metadata-process.yaml");
         let storage_dir = self.metadata_config.storage_dir.to_string_lossy();
         let config = format!(
-            r#"cluster.id: {cluster_id:?}
-metadata.group.name: {group_name:?}
-metadata.storage.dir: {storage_dir:?}
-metadata.rpc.addr: {rpc_addr:?}
-metadata.rpc.port: {rpc_port}
-metadata.raft.mode: "single"
-metadata.raft.node_id: 1
-metadata.cleanup.scan_interval_ms: {cleanup_scan_interval_ms}
-metadata.cleanup.reclaim_grace_ms: {cleanup_reclaim_grace_ms}
-metadata.cleanup.max_replicas_per_scan: {cleanup_max_replicas_per_scan}
-metadata.cleanup.max_candidates: {cleanup_max_candidates}
-metadata.cleanup.dispatch_enabled: {cleanup_dispatch_enabled}
-metadata.cleanup.max_commands_per_heartbeat: {cleanup_max_commands_per_heartbeat}
-metadata.cleanup.retry_initial_backoff_ms: {cleanup_retry_initial_backoff_ms}
-metadata.cleanup.retry_max_backoff_ms: {cleanup_retry_max_backoff_ms}
-metadata.bootstrap.ready.timeout_ms: 10000
-metadata.bootstrap.ready.warn_after_ms: 1000
-metadata.bootstrap.ready.fail_fast: false
-observe.log.format: "compact"
-observe.log.output: "stderr"
-observe.log.level: "warn,openraft=warn"
-observe.metrics.prometheus.bind: {metrics_addr:?}
-observe.metrics.prometheus.path: "/metrics"
+            r#"beryl.cluster.id: {cluster_id:?}
+beryl.metadata.host: {rpc_host:?}
+beryl.metadata.bind-host: {rpc_host:?}
+beryl.metadata.rpc.port: {rpc_port}
+beryl.metadata.http.port: {http_port}
+beryl.metadata.storage.dir: {storage_dir:?}
+beryl.metadata.block.cleanup.enabled: {cleanup_enabled}
+beryl.metadata.block.cleanup.interval: {cleanup_scan_interval_ms}ms
+beryl.metadata.block.cleanup.grace-period: {cleanup_reclaim_grace_ms}ms
+beryl.metadata.block.cleanup.scan-limit: {cleanup_max_replicas_per_scan}
+beryl.metadata.block.cleanup.queue-capacity: {cleanup_max_candidates}
+beryl.metadata.block.cleanup.batch-size: {cleanup_max_commands_per_heartbeat}
+beryl.metadata.block.cleanup.retry.initial-backoff: {cleanup_retry_initial_backoff_ms}ms
+beryl.metadata.block.cleanup.retry.max-backoff: {cleanup_retry_max_backoff_ms}ms
+beryl.metadata.startup.timeout: 10s
+beryl.metadata.startup.warn-after: 1s
+beryl.logging.format: "compact"
+beryl.logging.output: "stderr"
+beryl.logging.level: "warn,openraft=warn"
 "#,
             cluster_id = self.metadata_config.cluster_id,
-            group_name = self.group_name.as_str(),
             storage_dir = storage_dir,
-            rpc_addr = self.metadata_addr.ip().to_string(),
+            rpc_host = self.metadata_addr.ip().to_string(),
             rpc_port = self.metadata_addr.port(),
-            cleanup_scan_interval_ms = self.metadata_config.cleanup.scan_interval_ms,
-            cleanup_reclaim_grace_ms = self.metadata_config.cleanup.reclaim_grace_ms,
-            cleanup_max_replicas_per_scan = self.metadata_config.cleanup.max_replicas_per_scan,
-            cleanup_max_candidates = self.metadata_config.cleanup.max_candidates,
-            cleanup_dispatch_enabled = self.metadata_config.cleanup.dispatch_enabled,
-            cleanup_max_commands_per_heartbeat = self.metadata_config.cleanup.max_commands_per_heartbeat,
-            cleanup_retry_initial_backoff_ms = self.metadata_config.cleanup.retry_initial_backoff_ms,
-            cleanup_retry_max_backoff_ms = self.metadata_config.cleanup.retry_max_backoff_ms,
-            metrics_addr = metrics_addr.to_string(),
+            http_port = http_addr.port(),
+            cleanup_scan_interval_ms = self.metadata_config.block_cleanup.scan_interval_ms,
+            cleanup_reclaim_grace_ms = self.metadata_config.block_cleanup.reclaim_grace_ms,
+            cleanup_max_replicas_per_scan = self.metadata_config.block_cleanup.max_replicas_per_scan,
+            cleanup_max_candidates = self.metadata_config.block_cleanup.max_candidates,
+            cleanup_enabled = self.metadata_config.block_cleanup.enabled,
+            cleanup_max_commands_per_heartbeat = self.metadata_config.block_cleanup.max_commands_per_heartbeat,
+            cleanup_retry_initial_backoff_ms = self.metadata_config.block_cleanup.retry_initial_backoff_ms,
+            cleanup_retry_max_backoff_ms = self.metadata_config.block_cleanup.retry_max_backoff_ms,
         );
         std::fs::write(&config_path, config)?;
         Ok(config_path)
@@ -699,7 +695,7 @@ async fn start_metadata_instance(
     let authority = build_authority(metadata_config)
         .await
         .map_err(|err| io::Error::other(err.to_string()))?;
-    let worker_manager = Arc::new(WorkerManager::new(60));
+    let worker_manager = Arc::new(WorkerManager::new(metadata_config.worker_liveness.heartbeat_timeout_ms));
     worker_manager.reset_worker_soft_state();
     worker_manager.load_registered_workers(authority.registered_workers()?)?;
     let readiness_state = build_readiness(metadata_config, &authority).await;
@@ -787,15 +783,18 @@ fn metadata_config(
 ) -> TestResult<MetadataConfig> {
     Ok(MetadataConfig {
         cluster_id: CLUSTER_ID.to_string(),
-        rpc_addr,
+        host: rpc_addr.ip().to_string(),
+        bind_host: rpc_addr.ip(),
+        rpc_port: rpc_addr.port(),
+        http_port: rpc_addr.port().saturating_add(1),
         storage_dir,
         raft: RaftConfig::default(),
         authority: MetadataAuthorityConfig { group_name },
-        list_status: Default::default(),
-        cleanup: CleanupConfig::default(),
-        detached_root_reclamation: DetachedRootReclamationConfig::default(),
-        worker: WorkerConfig::default(),
-        bootstrap: BootstrapConfig {
+        namespace_list: Default::default(),
+        block_cleanup: BlockCleanupConfig::default(),
+        namespace_delete: NamespaceDeleteConfig::default(),
+        worker_liveness: WorkerLivenessConfig::default(),
+        startup: StartupConfig {
             root_readiness: beryl_metadata::RootReadinessConfig {
                 initial_backoff_ms: 10,
                 max_backoff_ms: 100,
@@ -804,6 +803,7 @@ fn metadata_config(
                 fail_fast: false,
             },
         },
+        write_lease_timeout_ms: 60_000,
         observability: observability_config()?,
     })
 }
@@ -825,12 +825,14 @@ fn worker_config(
             capacity_bytes: 64 * 1024 * 1024,
         },
     );
-    let rpc_endpoint = format!("http://{rpc_addr}");
     let config = WorkerServiceConfig {
         cluster_id: CLUSTER_ID.to_string(),
+        host: rpc_addr.ip().to_string(),
+        bind_host: rpc_addr.ip(),
+        rpc_port: rpc_addr.port(),
+        http_port: rpc_addr.port().saturating_add(1),
         identity_path,
         rpc_bind: rpc_addr.to_string(),
-        rpc_advertised_endpoint: rpc_endpoint,
         rpc_max_inflight: 100,
         default_frame_size: 1024 * 1024,
         max_frame_size: 4 * 1024 * 1024,
@@ -838,17 +840,20 @@ fn worker_config(
         store: WorkerStoreConfig {
             dirs,
             reserve_space_bytes: 0,
-            selection_policy: "round_robin".to_string(),
             check_interval_ms: 30_000,
         },
         net: WorkerNetConfig::grpc_from_rpc(rpc_addr.to_string(), 100, 4 * 1024 * 1024),
         metadata: WorkerRegistrationConfig {
             group_name,
             endpoints: vec![format!("http://{metadata_addr}")],
-            register_timeout_ms: 2_000,
-            register_retry_initial_backoff_ms: 10,
-            register_retry_max_backoff_ms: 100,
+            request_timeout_ms: 2_000,
+            retry_initial_backoff_ms: 10,
+            retry_max_backoff_ms: 100,
         },
+        heartbeat_interval_ms: 1_000,
+        block_report_interval_ms: 1_000,
+        block_report_batch_size: 1_000,
+        block_cleanup: WorkerBlockCleanupConfig::default(),
         observability: observability_config()?,
     };
     config.validate()?;
@@ -857,23 +862,18 @@ fn worker_config(
 
 fn client_for(metadata_addr: SocketAddr, group_name: GroupName) -> TestResult<FsClient> {
     let mut flat = FlatConfig::new();
-    flat.set("client.name", "local_crud_e2e");
-    flat.set("client.metadata.group.names", group_name.as_str());
-    flat.set(
-        &format!("client.metadata.group.{}.endpoints", group_name.as_str()),
-        metadata_addr.to_string(),
-    );
-    flat.set("client.retry.max_attempts", 3i64);
-    flat.set("client.operation.timeout_ms", 2_000i64);
+    assert_eq!(group_name.as_str(), "root");
+    flat.set("beryl.client.name", "local-crud-e2e");
+    flat.set("beryl.client.metadata.addresses", vec![metadata_addr.to_string()]);
+    flat.set("beryl.client.request.max-attempts", 3i64);
+    flat.set("beryl.client.request.timeout", "2s");
     Ok(FsClient::try_new(ClientConfig::from_flat(flat)?)?)
 }
 
 fn observability_config() -> Result<ObservabilityConfig, beryl_common::CommonError> {
     let mut flat = FlatConfig::new();
-    flat.set("observe.log.format", "compact");
-    flat.set("observe.log.output", "stderr");
-    flat.set("observe.log.level", "warn");
-    flat.set("observe.metrics.prometheus.bind", "127.0.0.1:0");
-    flat.set("observe.metrics.prometheus.path", "/metrics");
+    flat.set("beryl.logging.format", "compact");
+    flat.set("beryl.logging.output", "stderr");
+    flat.set("beryl.logging.level", "warn");
     ObservabilityConfig::from_flat(&flat)
 }

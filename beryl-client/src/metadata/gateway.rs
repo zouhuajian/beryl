@@ -141,8 +141,8 @@ impl GrpcMetadataGateway {
     /// Create a lazily connecting metadata gateway from client config.
     pub(crate) fn new_lazy_with_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> ClientResult<Self> {
         Self::new_lazy_with_pool_options(
-            config.channel_pool.metadata_channel_pool_enabled,
-            config.channel_pool.metadata_channel_pool_max_per_group,
+            config.connections.metadata_enabled,
+            config.connections.metadata_max_per_group,
             metrics,
         )
     }

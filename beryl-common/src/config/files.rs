@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Configuration file loading.
+//! Configuration file loading for dotted keys with scalar or structured values.
 
 use crate::config::flat::FlatConfig;
 use crate::error::{CommonError, CommonErrorKind};
@@ -9,9 +9,9 @@ use serde_yaml::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use tracing::{info, warn};
+use tracing::info;
 
-/// Load configuration from a YAML file with flat dotted keys.
+/// Load configuration from a YAML file whose top-level keys use dotted names.
 pub fn load_from_yaml_file<P: AsRef<Path>>(path: P) -> Result<FlatConfig, CommonError> {
     let path = path.as_ref();
     info!(path = %path.display(), "loading config from YAML file");
@@ -52,26 +52,6 @@ fn flat_mapping(value: Value) -> Result<BTreeMap<String, Value>, CommonError> {
             _ => continue,
         };
 
-        if matches!(val, Value::Mapping(_)) {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!(
-                    "nested YAML config is not supported; use flat keys such as observe.log.format instead of {key_str}"
-                ),
-            ));
-        }
-
-        if let Value::Sequence(entries) = &val
-            && entries.iter().any(|entry| matches!(entry, Value::Mapping(_)))
-        {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!(
-                    "nested YAML config is not supported; use flat keys such as observe.log.format instead of {key_str}"
-                ),
-            ));
-        }
-
         result.insert(key_str, val);
     }
 
@@ -86,14 +66,9 @@ fn flat_mapping(value: Value) -> Result<BTreeMap<String, Value>, CommonError> {
 pub fn load_merged(default: FlatConfig, yaml_path: Option<&Path>) -> Result<FlatConfig, CommonError> {
     let mut config = default;
 
-    // Load from YAML file
     if let Some(path) = yaml_path {
-        if path.exists() {
-            let file_config = load_from_yaml_file(path)?;
-            config.merge(file_config);
-        } else {
-            warn!(path = %path.display(), "config file does not exist, skipping");
-        }
+        let file_config = load_from_yaml_file(path)?;
+        config.merge(file_config);
     }
 
     Ok(config)
@@ -110,50 +85,41 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("test_config_flat.yaml");
         let mut file = File::create(&path).unwrap();
-        writeln!(file, "metadata.rpc.port: 8080").unwrap();
-        writeln!(file, "worker.rpc.max_inflight: 100").unwrap();
-        writeln!(file, "observe.log.format: compact").unwrap();
-        writeln!(file, "observe.metrics.prometheus.path: /metrics").unwrap();
+        writeln!(file, "beryl.metadata.rpc.port: 8080").unwrap();
+        writeln!(file, "beryl.worker.rpc.max-concurrent-requests: 100").unwrap();
+        writeln!(file, "beryl.logging.format: compact").unwrap();
         drop(file);
 
         let config = load_from_yaml_file(&path).unwrap();
-        assert_eq!(config.get_i64("metadata.rpc.port"), Some(8080));
-        assert_eq!(config.get_i64("worker.rpc.max_inflight"), Some(100));
-        assert_eq!(config.get_str("observe.log.format"), Some("compact".to_string()));
-        assert_eq!(
-            config.get_str("observe.metrics.prometheus.path"),
-            Some("/metrics".to_string())
-        );
+        assert_eq!(config.get_i64("beryl.metadata.rpc.port"), Some(8080));
+        assert_eq!(config.get_i64("beryl.worker.rpc.max-concurrent-requests"), Some(100));
+        assert_eq!(config.get_str("beryl.logging.format"), Some("compact".to_string()));
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn test_reject_nested_observe_yaml() {
+    fn structured_values_are_preserved() {
         let dir = std::env::temp_dir();
-        let path = dir.join("test_config_nested_observe.yaml");
+        let path = dir.join("test_config_structured_value.yaml");
         let mut file = File::create(&path).unwrap();
-        writeln!(file, "observe:").unwrap();
-        writeln!(file, "  log:").unwrap();
-        writeln!(file, "    format: compact").unwrap();
+        writeln!(file, "beryl.worker.storage.dirs:").unwrap();
+        writeln!(file, "  hdd0:").unwrap();
+        writeln!(file, "    path: /tmp/hdd0").unwrap();
         drop(file);
 
-        let err = load_from_yaml_file(&path).unwrap_err();
-        assert!(err.message.contains("flat keys"), "{err:?}");
+        let config = load_from_yaml_file(&path).unwrap();
+        assert!(config.get_mapping("beryl.worker.storage.dirs").is_some());
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn test_reject_nested_non_observe_yaml() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_config_nested_metadata.yaml");
-        let mut file = File::create(&path).unwrap();
-        writeln!(file, "metadata:").unwrap();
-        writeln!(file, "  rpc:").unwrap();
-        writeln!(file, "    port: 8080").unwrap();
-        drop(file);
+    fn explicit_missing_config_path_is_an_io_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("client-site.yaml");
 
-        let err = load_from_yaml_file(&path).unwrap_err();
-        assert!(err.message.contains("flat keys"), "{err:?}");
-        let _ = std::fs::remove_file(&path);
+        let error = load_merged(FlatConfig::new(), Some(&missing)).unwrap_err();
+
+        assert_eq!(error.kind, CommonErrorKind::Io);
+        assert!(error.message.contains(&missing.display().to_string()));
     }
 }

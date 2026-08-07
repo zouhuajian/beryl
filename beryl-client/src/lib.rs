@@ -38,6 +38,6 @@ pub use api::{BlockFormatId, DirectoryEntry, DirectoryListing, FileAttrs, FileSt
 pub use api::{CreateOptions, FileReader, FileWriter, FsClient};
 pub use api::{DeleteOptions, ListOptions};
 pub use config::ClientConfig;
-pub use config::{ChannelPoolConfig, RetryConfig, WriteLeaseConfig};
+pub use config::{ConnectionConfig, RetryConfig, WriteLeaseConfig};
 pub use error::{ClientActionError, ClientError, ClientResult};
 pub use metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics, NoopClientMetrics};

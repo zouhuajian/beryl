@@ -26,12 +26,12 @@ fn load_identity(path: &Path) -> Result<WorkerId, RegistrationError> {
     read_identity(path).map_err(|error| match error {
         IdentityFileError::Io(error) if error.kind() == ErrorKind::NotFound => {
             RegistrationError::InvalidConfig(format!(
-                "worker.identity.path {} is missing; worker start cannot recreate identity for existing WorkerStorageInfo",
+                "beryl.worker.identity-file {} is missing; worker start cannot recreate identity for existing WorkerStorageInfo",
                 path.display()
             ))
         }
         IdentityFileError::Io(error) => RegistrationError::InvalidConfig(format!(
-            "failed to read worker.identity.path {}: {error}",
+            "failed to read beryl.worker.identity-file {}: {error}",
             path.display()
         )),
         IdentityFileError::Malformed(message) => RegistrationError::InvalidConfig(message),
@@ -48,7 +48,7 @@ fn load_or_create_identity(path: &Path) -> Result<WorkerId, RegistrationError> {
     if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         fs::create_dir_all(parent).map_err(|error| {
             RegistrationError::InvalidConfig(format!(
-                "failed to create worker.identity.path parent {}: {error}",
+                "failed to create beryl.worker.identity-file parent {}: {error}",
                 parent.display()
             ))
         })?;
@@ -62,20 +62,20 @@ fn load_or_create_identity(path: &Path) -> Result<WorkerId, RegistrationError> {
         Err(error) if error.kind() == ErrorKind::AlreadyExists => return load_or_create_identity(path),
         Err(error) => {
             return Err(RegistrationError::InvalidConfig(format!(
-                "failed to create worker.identity.path {}: {error}",
+                "failed to create beryl.worker.identity-file {}: {error}",
                 path.display()
             )))
         }
     };
     file.write_all(payload.as_bytes()).map_err(|error| {
         RegistrationError::InvalidConfig(format!(
-            "failed to write worker.identity.path {}: {error}",
+            "failed to write beryl.worker.identity-file {}: {error}",
             path.display()
         ))
     })?;
     file.sync_all().map_err(|error| {
         RegistrationError::InvalidConfig(format!(
-            "failed to fsync worker.identity.path {}: {error}",
+            "failed to fsync beryl.worker.identity-file {}: {error}",
             path.display()
         ))
     })?;
@@ -89,13 +89,13 @@ fn read_identity(path: &Path) -> Result<WorkerId, IdentityFileError> {
     let value = raw.trim();
     if value.is_empty() {
         return Err(IdentityFileError::Malformed(format!(
-            "worker.identity.path {} is empty",
+            "beryl.worker.identity-file {} is empty",
             path.display()
         )));
     }
     let uuid = Uuid::parse_str(value).map_err(|error| {
         IdentityFileError::Malformed(format!(
-            "worker.identity.path {} must contain a UUID: {error}",
+            "beryl.worker.identity-file {} must contain a UUID: {error}",
             path.display()
         ))
     })?;
@@ -114,13 +114,13 @@ fn sync_parent(path: &Path) -> Result<(), RegistrationError> {
     };
     let parent_file = OpenOptions::new().read(true).open(parent).map_err(|error| {
         RegistrationError::InvalidConfig(format!(
-            "failed to open worker.identity.path parent {} for fsync: {error}",
+            "failed to open beryl.worker.identity-file parent {} for fsync: {error}",
             parent.display()
         ))
     })?;
     parent_file.sync_all().map_err(|error| {
         RegistrationError::InvalidConfig(format!(
-            "failed to fsync worker.identity.path parent {}: {error}",
+            "failed to fsync beryl.worker.identity-file parent {}: {error}",
             parent.display()
         ))
     })

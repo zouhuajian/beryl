@@ -1,23 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Lost-worker cleanup and affected-block repair scheduling.
+//! Lost-worker cleanup.
 
 use crate::error::MetadataResult;
-use crate::maintenance::repair::{RepairPlanner, RepairPolicy, RepairQueue};
 use crate::raft::AppRaftNode;
 use crate::worker::WorkerManager;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Dependencies for lost-worker cleanup.
 pub struct LostWorkerCleanupDeps {
     pub raft_node: Arc<AppRaftNode>,
     pub worker_manager: Arc<WorkerManager>,
-    pub repair_queue: Arc<RepairQueue>,
-    pub repair_planner: Arc<RepairPlanner>,
-    pub repair_policy: RepairPolicy,
 }
 
 /// Summary for one lost-worker cleanup scan.
@@ -25,18 +21,12 @@ pub struct LostWorkerCleanupDeps {
 pub struct LostWorkerCleanupOutcome {
     pub removed_workers: usize,
     pub affected_blocks: usize,
-    pub repair_tasks_enqueued: usize,
-    pub enqueue_failures: usize,
-    pub skipped_dead_workers: usize,
 }
 
-/// Scans worker soft-state for dead workers and schedules affected block repair.
+/// Removes expired worker soft state and records the affected block count.
 pub struct LostWorkerCleanupService {
     raft_node: Arc<AppRaftNode>,
     worker_manager: Arc<WorkerManager>,
-    repair_queue: Arc<RepairQueue>,
-    repair_planner: Arc<RepairPlanner>,
-    repair_policy: RepairPolicy,
 }
 
 impl LostWorkerCleanupService {
@@ -44,9 +34,6 @@ impl LostWorkerCleanupService {
         Self {
             raft_node: deps.raft_node,
             worker_manager: deps.worker_manager,
-            repair_queue: deps.repair_queue,
-            repair_planner: deps.repair_planner,
-            repair_policy: deps.repair_policy,
         }
     }
 
@@ -78,33 +65,7 @@ impl LostWorkerCleanupService {
             );
             outcome.removed_workers += 1;
             outcome.affected_blocks += affected_blocks.len();
-
-            let live_workers_after = self.worker_manager.list_live_workers_in_group(&dead_worker.group_name);
-            for block_id in affected_blocks {
-                let current_locations = self
-                    .worker_manager
-                    .get_block_locations(&dead_worker.group_name, block_id);
-                let replication_factor = self.repair_policy.default_replication_factor;
-                let actions = self.repair_planner.plan_replication(
-                    block_id,
-                    &current_locations,
-                    replication_factor,
-                    &live_workers_after,
-                );
-                for action in actions {
-                    let task = action.into_task();
-                    if let Err(e) = self.repair_queue.enqueue(task) {
-                        outcome.enqueue_failures += 1;
-                        warn!(
-                            block_id = %block_id,
-                            error = %e,
-                            "Failed to enqueue replication task after worker removal"
-                        );
-                    } else {
-                        outcome.repair_tasks_enqueued += 1;
-                    }
-                }
-            }
+            // TODO: schedule repairs for affected blocks after replication is implemented end to end.
         }
 
         Ok(outcome)
@@ -114,7 +75,6 @@ impl LostWorkerCleanupService {
 #[cfg(test)]
 mod tests {
     use crate::maintenance::lost_worker::{LostWorkerCleanupDeps, LostWorkerCleanupService};
-    use crate::maintenance::repair::{RepairPlanner, RepairPolicy, RepairQueue};
     use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
     use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerInfo, WorkerManager};
     use crate::MountTable;
@@ -233,61 +193,34 @@ mod tests {
             .unwrap();
     }
 
-    fn service(
-        raft_node: Arc<AppRaftNode>,
-        worker_manager: Arc<WorkerManager>,
-        repair_queue: Arc<RepairQueue>,
-    ) -> LostWorkerCleanupService {
-        service_with_policy(raft_node, worker_manager, repair_queue, RepairPolicy::default())
-    }
-
-    fn service_with_policy(
-        raft_node: Arc<AppRaftNode>,
-        worker_manager: Arc<WorkerManager>,
-        repair_queue: Arc<RepairQueue>,
-        repair_policy: RepairPolicy,
-    ) -> LostWorkerCleanupService {
-        let repair_planner = Arc::new(RepairPlanner::new());
+    fn service(raft_node: Arc<AppRaftNode>, worker_manager: Arc<WorkerManager>) -> LostWorkerCleanupService {
         LostWorkerCleanupService::new(LostWorkerCleanupDeps {
             raft_node,
             worker_manager,
-            repair_queue,
-            repair_planner,
-            repair_policy,
         })
     }
 
     #[tokio::test]
-    async fn dead_worker_removed_and_affected_blocks_planned() {
+    async fn dead_worker_removed_and_affected_blocks_recorded() {
         let dir = TempDir::new().unwrap();
         let raft_node = test_raft(&dir, true).await;
-        let worker_manager = Arc::new(WorkerManager::new(1));
-        let repair_queue = Arc::new(RepairQueue::new(100));
+        let worker_manager = Arc::new(WorkerManager::new(1_000));
         let source = WorkerId::new(1);
-        let target_a = WorkerId::new(2);
-        let target_b = WorkerId::new(3);
         let dead = WorkerId::new(4);
         let block_id = BlockId::new(InodeId::new(11), BlockIndex::new(0));
         live_worker(&worker_manager, dead);
         publish_report(&worker_manager, dead, 1, vec![block_id]);
         tokio::time::sleep(tokio::time::Duration::from_millis(1_100)).await;
         live_worker(&worker_manager, source);
-        live_worker(&worker_manager, target_a);
-        live_worker(&worker_manager, target_b);
         publish_report(&worker_manager, source, 1, vec![block_id]);
 
-        let outcome = service(
-            Arc::clone(&raft_node),
-            Arc::clone(&worker_manager),
-            Arc::clone(&repair_queue),
-        )
-        .run_once()
-        .await
-        .unwrap();
+        let outcome = service(Arc::clone(&raft_node), Arc::clone(&worker_manager))
+            .run_once()
+            .await
+            .unwrap();
 
         assert_eq!(outcome.removed_workers, 1);
         assert_eq!(outcome.affected_blocks, 1);
-        assert_eq!(outcome.repair_tasks_enqueued, 2);
         assert!(worker_manager.get_worker_blocks(&group_name("root"), dead).is_empty());
         assert!(worker_manager.get_registration(&group_name("root"), dead).is_none());
         assert!(worker_manager.get_worker(&group_name("root"), dead).is_none());
@@ -301,48 +234,33 @@ mod tests {
             worker_manager.get_block_locations(&group_name("root"), block_id),
             vec![source]
         );
-        assert_eq!(repair_queue.len_pending(), 2);
-
-        let second_outcome = service(
-            Arc::clone(&raft_node),
-            Arc::clone(&worker_manager),
-            Arc::clone(&repair_queue),
-        )
-        .run_once()
-        .await
-        .unwrap();
+        let second_outcome = service(Arc::clone(&raft_node), Arc::clone(&worker_manager))
+            .run_once()
+            .await
+            .unwrap();
 
         assert_eq!(second_outcome.removed_workers, 0);
         assert_eq!(second_outcome.affected_blocks, 0);
-        assert_eq!(second_outcome.repair_tasks_enqueued, 0);
-        assert_eq!(repair_queue.len_pending(), 2);
     }
 
     #[tokio::test]
     async fn persisted_descriptor_without_runtime_is_not_a_dead_worker_after_reload() {
         let dir = TempDir::new().unwrap();
         let raft_node = test_raft(&dir, true).await;
-        let worker_manager = Arc::new(WorkerManager::new(1));
-        let repair_queue = Arc::new(RepairQueue::new(100));
+        let worker_manager = Arc::new(WorkerManager::new(1_000));
         let group_name_value = group_name("root");
         let worker_id = WorkerId::new(9);
         worker_manager
             .load_registered_workers(vec![persisted_worker(group_name_value.clone(), worker_id)])
             .unwrap();
 
-        let outcome = service(
-            Arc::clone(&raft_node),
-            Arc::clone(&worker_manager),
-            Arc::clone(&repair_queue),
-        )
-        .run_once()
-        .await
-        .unwrap();
+        let outcome = service(Arc::clone(&raft_node), Arc::clone(&worker_manager))
+            .run_once()
+            .await
+            .unwrap();
 
         assert_eq!(outcome.removed_workers, 0);
         assert_eq!(outcome.affected_blocks, 0);
-        assert_eq!(outcome.repair_tasks_enqueued, 0);
-        assert_eq!(repair_queue.len_pending(), 0);
         assert!(worker_manager.get_descriptor(&group_name_value, worker_id).is_some());
         assert!(worker_manager.get_registration(&group_name_value, worker_id).is_none());
         assert!(worker_manager.list_registered_workers().is_empty());
@@ -352,96 +270,37 @@ mod tests {
     async fn no_dead_worker_is_noop() {
         let dir = TempDir::new().unwrap();
         let raft_node = test_raft(&dir, true).await;
-        let worker_manager = Arc::new(WorkerManager::new(1));
-        let repair_queue = Arc::new(RepairQueue::new(100));
+        let worker_manager = Arc::new(WorkerManager::new(1_000));
         live_worker(&worker_manager, WorkerId::new(1));
 
-        let outcome = service(
-            Arc::clone(&raft_node),
-            Arc::clone(&worker_manager),
-            Arc::clone(&repair_queue),
-        )
-        .run_once()
-        .await
-        .unwrap();
+        let outcome = service(Arc::clone(&raft_node), Arc::clone(&worker_manager))
+            .run_once()
+            .await
+            .unwrap();
 
         assert_eq!(outcome.removed_workers, 0);
         assert_eq!(outcome.affected_blocks, 0);
-        assert_eq!(outcome.repair_tasks_enqueued, 0);
-        assert_eq!(repair_queue.len_pending(), 0);
-    }
-
-    #[tokio::test]
-    async fn dead_worker_cleanup_uses_repair_policy_default_replication_factor() {
-        let dir = TempDir::new().unwrap();
-        let raft_node = test_raft(&dir, true).await;
-        let worker_manager = Arc::new(WorkerManager::new(1));
-        let repair_queue = Arc::new(RepairQueue::new(100));
-        let source = WorkerId::new(1);
-        let target_a = WorkerId::new(2);
-        let target_b = WorkerId::new(3);
-        let dead = WorkerId::new(4);
-        let block_id = BlockId::new(InodeId::new(13), BlockIndex::new(0));
-        live_worker(&worker_manager, dead);
-        publish_report(&worker_manager, dead, 1, vec![block_id]);
-        tokio::time::sleep(tokio::time::Duration::from_millis(1_100)).await;
-        live_worker(&worker_manager, source);
-        live_worker(&worker_manager, target_a);
-        live_worker(&worker_manager, target_b);
-        publish_report(&worker_manager, source, 1, vec![block_id]);
-
-        let outcome = service_with_policy(
-            Arc::clone(&raft_node),
-            Arc::clone(&worker_manager),
-            Arc::clone(&repair_queue),
-            RepairPolicy {
-                default_replication_factor: 2,
-            },
-        )
-        .run_once()
-        .await
-        .unwrap();
-
-        assert_eq!(outcome.removed_workers, 1);
-        assert_eq!(outcome.affected_blocks, 1);
-        assert_eq!(outcome.repair_tasks_enqueued, 1);
-        let mut records = repair_queue.poll_for_worker(target_a, 1);
-        records.extend(repair_queue.poll_for_worker(target_b, 1));
-        assert_eq!(records.len(), 1);
-        match records.remove(0).task {
-            crate::maintenance::repair::RepairTask::Replicate { replication_factor, .. } => {
-                assert_eq!(replication_factor, Some(2))
-            }
-            other => panic!("expected replicate task, got {other:?}"),
-        }
     }
 
     #[tokio::test]
     async fn nonleader_lost_worker_cleanup_is_noop() {
         let dir = TempDir::new().unwrap();
         let raft_node = test_raft(&dir, false).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let repair_queue = Arc::new(RepairQueue::new(100));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let dead = WorkerId::new(1);
         let block_id = BlockId::new(InodeId::new(12), BlockIndex::new(0));
         live_worker(&worker_manager, dead);
         publish_report(&worker_manager, dead, 1, vec![block_id]);
 
-        let outcome = service(
-            Arc::clone(&raft_node),
-            Arc::clone(&worker_manager),
-            Arc::clone(&repair_queue),
-        )
-        .run_once()
-        .await
-        .unwrap();
+        let outcome = service(Arc::clone(&raft_node), Arc::clone(&worker_manager))
+            .run_once()
+            .await
+            .unwrap();
 
         assert_eq!(outcome.removed_workers, 0);
-        assert_eq!(outcome.skipped_dead_workers, 0);
         assert_eq!(
             worker_manager.get_worker_blocks(&group_name("root"), dead),
             vec![block_id]
         );
-        assert_eq!(repair_queue.len_pending(), 0);
     }
 }

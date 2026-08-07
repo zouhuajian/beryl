@@ -1223,7 +1223,7 @@ mod tests {
             .unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
 
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
         let mount_table = builder.mount_table();
         let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;

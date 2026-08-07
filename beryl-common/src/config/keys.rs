@@ -7,20 +7,12 @@
 //! observability. Module-specific keys, defaults, and validation belong to the
 //! owning module's typed config.
 
-/// Observability logging configuration keys.
-pub mod observe_log {
+/// Process logging configuration keys.
+pub mod logging {
     /// EnvFilter directive string.
-    pub const LEVEL: &str = "observe.log.level";
+    pub const LEVEL: &str = "beryl.logging.level";
     /// Log format: "compact" or "json".
-    pub const FORMAT: &str = "observe.log.format";
+    pub const FORMAT: &str = "beryl.logging.format";
     /// Log output stream: "stderr" or "stdout".
-    pub const OUTPUT: &str = "observe.log.output";
-}
-
-/// Observability metrics configuration keys.
-pub mod observe_metrics {
-    /// Prometheus bind address (format: "host:port").
-    pub const PROMETHEUS_BIND: &str = "observe.metrics.prometheus.bind";
-    /// HTTP path for Prometheus metrics.
-    pub const PROMETHEUS_PATH: &str = "observe.metrics.prometheus.path";
+    pub const OUTPUT: &str = "beryl.logging.output";
 }

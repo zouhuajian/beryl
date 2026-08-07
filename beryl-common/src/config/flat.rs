@@ -123,31 +123,36 @@ impl FlatConfig {
         })
     }
 
-    /// Get bytes (size in bytes, supports "1KB", "1MB", etc.).
+    /// Get a duration from an integer millisecond value or a value with a unit.
+    ///
+    /// Supported units are `ms`, `s`, `min`, `h`, and `d`.
+    pub fn get_duration(&self, key: &str) -> Option<Duration> {
+        self.data.get(key).and_then(parse_duration)
+    }
+
+    /// Get bytes from an integer or a human-readable binary size.
     pub fn get_bytes(&self, key: &str) -> Option<usize> {
-        self.data.get(key).and_then(|v| {
-            match v {
-                Value::Number(n) => n.as_i64().and_then(|v| if v >= 0 { Some(v as usize) } else { None }),
-                Value::String(s) => {
-                    // Parse "1KB", "1MB", etc.
-                    let s = s.trim().to_uppercase();
-                    if s.ends_with("KB") {
-                        s[..s.len() - 2].trim().parse::<usize>().ok().map(|v| v * 1024)
-                    } else if s.ends_with("MB") {
-                        s[..s.len() - 2].trim().parse::<usize>().ok().map(|v| v * 1024 * 1024)
-                    } else if s.ends_with("GB") {
-                        s[..s.len() - 2]
-                            .trim()
-                            .parse::<usize>()
-                            .ok()
-                            .map(|v| v * 1024 * 1024 * 1024)
-                    } else {
-                        s.parse().ok()
-                    }
-                }
-                _ => None,
-            }
+        self.data.get(key).and_then(parse_bytes)
+    }
+
+    /// Get a YAML sequence containing only scalar strings.
+    pub fn get_string_list(&self, key: &str) -> Option<Vec<String>> {
+        self.data.get(key).and_then(|value| match value {
+            Value::Sequence(values) => values
+                .iter()
+                .map(|value| match value {
+                    Value::String(value) => Some(value.clone()),
+                    Value::Number(value) => Some(value.to_string()),
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
         })
+    }
+
+    /// Get a structured YAML mapping value.
+    pub fn get_mapping(&self, key: &str) -> Option<&serde_yaml::Mapping> {
+        self.data.get(key).and_then(Value::as_mapping)
     }
 
     /// Get a sub-configuration with the given prefix.
@@ -225,6 +230,64 @@ impl FlatConfig {
     }
 }
 
+fn parse_duration(value: &Value) -> Option<Duration> {
+    match value {
+        Value::Number(number) => number.as_u64().map(Duration::from_millis),
+        Value::String(raw) => {
+            let raw = raw.trim().to_ascii_lowercase();
+            let (number, multiplier) = if let Some(number) = raw.strip_suffix("ms") {
+                (number, 1)
+            } else if let Some(number) = raw.strip_suffix("min") {
+                (number, 60_000)
+            } else if let Some(number) = raw.strip_suffix('s') {
+                (number, 1_000)
+            } else if let Some(number) = raw.strip_suffix('h') {
+                (number, 60 * 60_000)
+            } else if let Some(number) = raw.strip_suffix('d') {
+                (number, 24 * 60 * 60_000)
+            } else {
+                return raw.parse::<u64>().ok().map(Duration::from_millis);
+            };
+            number
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .and_then(|number| number.checked_mul(multiplier))
+                .map(Duration::from_millis)
+        }
+        _ => None,
+    }
+}
+
+fn parse_bytes(value: &Value) -> Option<usize> {
+    match value {
+        Value::Number(number) => number.as_u64().and_then(|value| usize::try_from(value).ok()),
+        Value::String(raw) => {
+            let normalized = raw.trim().to_ascii_uppercase();
+            let units = [
+                ("GIB", 1024usize.pow(3)),
+                ("MIB", 1024usize.pow(2)),
+                ("KIB", 1024usize),
+                ("GB", 1024usize.pow(3)),
+                ("MB", 1024usize.pow(2)),
+                ("KB", 1024usize),
+                ("B", 1usize),
+            ];
+            for (suffix, multiplier) in units {
+                if let Some(number) = normalized.strip_suffix(suffix) {
+                    return number
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|number| number.checked_mul(multiplier));
+                }
+            }
+            normalized.parse().ok()
+        }
+        _ => None,
+    }
+}
+
 impl Default for FlatConfig {
     fn default() -> Self {
         Self::new()
@@ -258,6 +321,11 @@ impl IntoYamlValue for i64 {
 impl IntoYamlValue for u64 {
     fn into_yaml_value(self) -> Value {
         Value::Number(Number::from(self))
+    }
+}
+impl IntoYamlValue for Vec<String> {
+    fn into_yaml_value(self) -> Value {
+        Value::Sequence(self.into_iter().map(Value::String).collect())
     }
 }
 
@@ -300,16 +368,19 @@ mod tests {
     fn test_sub() {
         let mut config = FlatConfig::new();
         config.insert(
-            "metadata.rpc.port".to_string(),
+            "beryl.metadata.rpc.port".to_string(),
             Value::Number(serde_yaml::Number::from(8080)),
         );
-        config.insert("metadata.rpc.host".to_string(), Value::String("localhost".to_string()));
         config.insert(
-            "worker.rpc.bind".to_string(),
+            "beryl.metadata.rpc.host".to_string(),
+            Value::String("localhost".to_string()),
+        );
+        config.insert(
+            "beryl.worker.rpc.bind".to_string(),
             Value::String("127.0.0.1:9090".to_string()),
         );
 
-        let sub = config.sub("metadata.rpc");
+        let sub = config.sub("beryl.metadata.rpc");
         assert_eq!(sub.get_i64("port"), Some(8080));
         assert_eq!(sub.get_str("host"), Some("localhost".to_string()));
         assert_eq!(sub.get_str("kind"), None); // Not in sub

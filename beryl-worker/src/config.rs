@@ -1,46 +1,70 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Worker configuration for the current data service.
+//! Worker process configuration.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::net::IpAddr;
+use std::collections::{BTreeMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use beryl_common::config::ServerConfig;
+use beryl_common::config::{FlatConfig, ServerConfig};
 use beryl_common::error::{CommonError, CommonErrorKind};
+use beryl_common::observe::config::{LogConfig, ResourceConfig};
 use beryl_common::observe::ObservabilityConfig;
 use beryl_types::{GroupName, Tier};
+use serde_yaml::{Mapping, Value};
 use tonic::transport::Endpoint;
 use tracing::info;
 
 use crate::net::config::WorkerNetConfig;
 use crate::net::protocol::WorkerNetProtocol;
 
-/// Worker metadata registration configuration.
+const CLUSTER_ID: &str = "beryl.cluster.id";
+const HOST: &str = "beryl.worker.host";
+const BIND_HOST: &str = "beryl.worker.bind-host";
+const RPC_PORT: &str = "beryl.worker.rpc.port";
+const HTTP_PORT: &str = "beryl.worker.http.port";
+const IDENTITY_FILE: &str = "beryl.worker.identity-file";
+const RPC_MAX_CONCURRENT_REQUESTS: &str = "beryl.worker.rpc.max-concurrent-requests";
+const STREAM_FRAME_SIZE: &str = "beryl.worker.stream.frame-size";
+const STREAM_MAX_FRAME_SIZE: &str = "beryl.worker.stream.max-frame-size";
+const STREAM_IDLE_TIMEOUT: &str = "beryl.worker.stream.idle-timeout";
+const STORAGE_DIRS: &str = "beryl.worker.storage.dirs";
+const STORAGE_RESERVED_SPACE: &str = "beryl.worker.storage.reserved-space";
+const STORAGE_CHECK_INTERVAL: &str = "beryl.worker.storage.check-interval";
+const METADATA_ADDRESSES: &str = "beryl.worker.metadata.addresses";
+const METADATA_REQUEST_TIMEOUT: &str = "beryl.worker.metadata.request-timeout";
+const METADATA_RETRY_INITIAL_BACKOFF: &str = "beryl.worker.metadata.retry.initial-backoff";
+const METADATA_RETRY_MAX_BACKOFF: &str = "beryl.worker.metadata.retry.max-backoff";
+const HEARTBEAT_INTERVAL: &str = "beryl.worker.heartbeat.interval";
+const BLOCK_REPORT_INTERVAL: &str = "beryl.worker.block.report.interval";
+const BLOCK_REPORT_BATCH_SIZE: &str = "beryl.worker.block.report.batch-size";
+const BLOCK_CLEANUP_QUEUE_CAPACITY: &str = "beryl.worker.block.cleanup.queue-capacity";
+const BLOCK_CLEANUP_CONCURRENCY: &str = "beryl.worker.block.cleanup.concurrency";
+const BLOCK_CLEANUP_RETRY_INITIAL_BACKOFF: &str = "beryl.worker.block.cleanup.retry.initial-backoff";
+const BLOCK_CLEANUP_RETRY_MAX_BACKOFF: &str = "beryl.worker.block.cleanup.retry.max-backoff";
+
+/// Worker-to-Metadata request and retry configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkerRegistrationConfig {
-    /// Stable metadata group name registered by this worker process.
+    /// Internal identity for the one supported metadata group.
     pub group_name: GroupName,
-    /// Metadata service endpoints used by worker registration, heartbeat, and block report.
-    /// The first endpoint may be used as the initial registration target.
+    /// Tonic endpoint URIs derived from configured `host:port` addresses.
     pub endpoints: Vec<String>,
-    /// Per-attempt registration timeout shared by startup registration and heartbeat RPCs.
-    pub register_timeout_ms: u64,
-    /// Initial retry backoff after retryable registration failures.
-    pub register_retry_initial_backoff_ms: u64,
-    /// Maximum retry backoff after retryable registration failures.
-    pub register_retry_max_backoff_ms: u64,
+    /// Timeout shared by registration, heartbeat, and block report RPCs.
+    pub request_timeout_ms: u64,
+    pub retry_initial_backoff_ms: u64,
+    pub retry_max_backoff_ms: u64,
 }
 
 impl Default for WorkerRegistrationConfig {
     fn default() -> Self {
         Self {
-            group_name: GroupName::parse("root").expect("default group name is valid"),
+            group_name: GroupName::parse("root").expect("the supported metadata group is valid"),
             endpoints: vec!["http://127.0.0.1:18080".to_string()],
-            register_timeout_ms: 5_000,
-            register_retry_initial_backoff_ms: 200,
-            register_retry_max_backoff_ms: 5_000,
+            request_timeout_ms: 5_000,
+            retry_initial_backoff_ms: 200,
+            retry_max_backoff_ms: 5_000,
         }
     }
 }
@@ -56,7 +80,6 @@ pub struct StoreDirConfig {
 pub struct WorkerStoreConfig {
     pub dirs: BTreeMap<String, StoreDirConfig>,
     pub reserve_space_bytes: u64,
-    pub selection_policy: String,
     pub check_interval_ms: u64,
 }
 
@@ -74,136 +97,174 @@ impl Default for WorkerStoreConfig {
         Self {
             dirs,
             reserve_space_bytes: 1024 * 1024 * 1024,
-            selection_policy: "round_robin".to_string(),
             check_interval_ms: 30_000,
         }
     }
 }
 
-/// Worker configuration.
+/// Bounded local execution of Metadata-authorized block cleanup commands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerBlockCleanupConfig {
+    pub queue_capacity: usize,
+    pub concurrency: usize,
+    pub retry_initial_backoff_ms: u64,
+    pub retry_max_backoff_ms: u64,
+}
+
+impl Default for WorkerBlockCleanupConfig {
+    fn default() -> Self {
+        Self {
+            queue_capacity: 1_024,
+            concurrency: 4,
+            retry_initial_backoff_ms: 100,
+            retry_max_backoff_ms: 30_000,
+        }
+    }
+}
+
+/// Configuration consumed by one Worker process.
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
-    /// Cluster identity validated against local worker storage marker.
     pub cluster_id: String,
-    /// Local persisted worker identity file.
+    /// Host published to Metadata and clients.
+    pub host: String,
+    /// Local interface shared by Worker listeners.
+    pub bind_host: IpAddr,
+    pub rpc_port: u16,
+    pub http_port: u16,
     pub identity_path: PathBuf,
-    /// RPC server bind address.
+    /// Derived RPC bind address retained by the network runtime.
     pub rpc_bind: String,
-    /// Routable gRPC data endpoint registered with metadata.
-    pub rpc_advertised_endpoint: String,
-    /// Maximum concurrent RPC requests per gRPC connection.
     pub rpc_max_inflight: usize,
-    /// Transport frame payload size negotiated at stream open.
-    /// This controls network batching and does not define StorageChunk size.
     pub default_frame_size: u32,
-    /// Upper bound for negotiated transport frame payload size.
     pub max_frame_size: u32,
-    /// Idle timeout for runtime stream state.
     pub stream_idle_timeout_ms: u64,
-    /// Worker-local block store configuration.
     pub store: WorkerStoreConfig,
-    /// Worker-owned service-specific network configuration.
     pub net: WorkerNetConfig,
-    /// Worker metadata registration configuration.
     pub metadata: WorkerRegistrationConfig,
-    /// Shared observability configuration.
+    pub heartbeat_interval_ms: u64,
+    pub block_report_interval_ms: u64,
+    pub block_report_batch_size: usize,
+    pub block_cleanup: WorkerBlockCleanupConfig,
     pub observability: ObservabilityConfig,
 }
 
 impl WorkerConfig {
-    /// Load worker configuration from a YAML file.
-    pub fn load<P: AsRef<Path>>(config_path: P) -> Result<Self, CommonError> {
-        let server_config = ServerConfig::load(config_path)?;
-        Self::from_server_config(&server_config)
+    pub fn rpc_address(&self) -> String {
+        format_host_port(&self.host, self.rpc_port)
     }
 
-    /// Create worker configuration from the repository-wide config shape.
+    pub fn rpc_address_parts(&self) -> (String, u32) {
+        (self.host.clone(), u32::from(self.rpc_port))
+    }
+
+    pub fn http_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.bind_host, self.http_port)
+    }
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        let bind_host = "0.0.0.0".parse().expect("default bind host is valid");
+        let rpc_bind = SocketAddr::new(bind_host, 19090).to_string();
+        Self {
+            cluster_id: "local-beryl".to_string(),
+            host: "127.0.0.1".to_string(),
+            bind_host,
+            rpc_port: 19090,
+            http_port: 19091,
+            identity_path: PathBuf::from("data/worker/worker.identity"),
+            rpc_bind: rpc_bind.clone(),
+            rpc_max_inflight: 100,
+            default_frame_size: 1024 * 1024,
+            max_frame_size: 4 * 1024 * 1024,
+            stream_idle_timeout_ms: 60_000,
+            store: WorkerStoreConfig::default(),
+            net: WorkerNetConfig::grpc_from_rpc(rpc_bind, 100, 4 * 1024 * 1024),
+            metadata: WorkerRegistrationConfig::default(),
+            heartbeat_interval_ms: 1_000,
+            block_report_interval_ms: 1_000,
+            block_report_batch_size: 1_000,
+            block_cleanup: WorkerBlockCleanupConfig::default(),
+            observability: ObservabilityConfig {
+                log: LogConfig {
+                    format: "compact".to_string(),
+                    output: "stderr".to_string(),
+                    level: "info".to_string(),
+                },
+                resource: ResourceConfig::default(),
+            },
+        }
+    }
+}
+
+impl WorkerConfig {
+    /// Load Worker configuration from one YAML file.
+    pub fn load<P: AsRef<Path>>(config_path: P) -> Result<Self, CommonError> {
+        Self::from_server_config(&ServerConfig::load(config_path)?)
+    }
+
+    /// Build typed Worker configuration from shared YAML mechanics.
     pub fn from_server_config(server_config: &ServerConfig) -> Result<Self, CommonError> {
-        let worker_sub = server_config.as_flat().sub("worker");
         let flat = server_config.as_flat();
-        let default_cluster_id = "local-beryl".to_string();
-        let default_identity_path = PathBuf::from("data/worker/worker.identity");
-        let default_rpc_bind = "0.0.0.0:9090".to_string();
-        let default_rpc_max_inflight = 100usize;
-        let default_frame_size = 1024 * 1024;
-        let default_max_frame_size = 4 * 1024 * 1024;
-        let default_stream_idle_timeout_ms = 60_000u64;
-        let default_store = WorkerStoreConfig::default();
-        let metadata_defaults = WorkerRegistrationConfig::default();
+        let defaults = Self::default();
 
-        let cluster_id = Self::root_str_or(flat, "cluster.id", &default_cluster_id)?;
-        let identity_path = Self::path_or(&worker_sub, "identity.path", default_identity_path)?;
-        let rpc_bind = Self::str_or(&worker_sub, "rpc.bind", &default_rpc_bind, "worker.rpc.bind")?;
-        let observability = ObservabilityConfig::from_flat(flat)?;
-        let rpc_advertised_endpoint = worker_sub
-            .get_str("rpc.advertised_endpoint")
-            .ok_or_else(|| invalid_config("worker.rpc.advertised_endpoint", "must be present and be a string"))?;
-        if worker_sub.contains_key("rpc.advertised_endpoint") && rpc_advertised_endpoint.trim().is_empty() {
-            return Err(invalid_config("worker.rpc.advertised_endpoint", "must not be empty"));
-        }
-        let rpc_max_inflight = Self::usize_or(
-            &worker_sub,
-            "rpc.max_inflight",
-            default_rpc_max_inflight,
-            "worker.rpc.max_inflight",
-        )?;
-        let default_frame_size = Self::bytes_u32(
-            &worker_sub,
-            "default_frame_size",
-            default_frame_size,
-            "worker.default_frame_size",
-        )?;
-        let max_frame_size = Self::bytes_u32(
-            &worker_sub,
-            "max_frame_size",
-            default_max_frame_size,
-            "worker.max_frame_size",
-        )?;
-        if worker_sub.contains_key("window_bytes") {
-            return Err(invalid_config("worker.window_bytes", "is no longer supported"));
-        }
-        let stream_idle_timeout_ms = Self::usize_or(
-            &worker_sub,
-            "stream.idle_timeout_ms",
-            default_stream_idle_timeout_ms as usize,
-            "worker.stream.idle_timeout_ms",
-        )? as u64;
-        let store = parse_store_config(&worker_sub, &default_store)?;
-        let endpoints = metadata_endpoints(&worker_sub, &metadata_defaults)?;
-        let group_name = Self::str_or(
-            &worker_sub,
-            "metadata.group.name",
-            metadata_defaults.group_name.as_str(),
-            "worker.metadata.group.name",
-        )?;
-        let metadata = WorkerRegistrationConfig {
-            group_name: parse_group_name("worker.metadata.group.name", group_name)?,
-            endpoints,
-            register_timeout_ms: Self::usize_or(
-                &worker_sub,
-                "metadata.register_timeout_ms",
-                metadata_defaults.register_timeout_ms as usize,
-                "worker.metadata.register_timeout_ms",
-            )? as u64,
-            register_retry_initial_backoff_ms: Self::usize_or(
-                &worker_sub,
-                "metadata.register_retry_initial_backoff_ms",
-                metadata_defaults.register_retry_initial_backoff_ms as usize,
-                "worker.metadata.register_retry_initial_backoff_ms",
-            )? as u64,
-            register_retry_max_backoff_ms: Self::usize_or(
-                &worker_sub,
-                "metadata.register_retry_max_backoff_ms",
-                metadata_defaults.register_retry_max_backoff_ms as usize,
-                "worker.metadata.register_retry_max_backoff_ms",
-            )? as u64,
+        let cluster_id = string_or(flat, CLUSTER_ID, &defaults.cluster_id)?;
+        let host = string_or(flat, HOST, &defaults.host)?;
+        let bind_host = string_or(flat, BIND_HOST, &defaults.bind_host.to_string())?
+            .parse::<IpAddr>()
+            .map_err(|_| invalid_config(BIND_HOST, "must be an IP address"))?;
+        let rpc_port = port_or(flat, RPC_PORT, defaults.rpc_port)?;
+        let http_port = port_or(flat, HTTP_PORT, defaults.http_port)?;
+        let identity_path = PathBuf::from(string_or(
+            flat,
+            IDENTITY_FILE,
+            defaults.identity_path.to_str().unwrap(),
+        )?);
+        let rpc_max_inflight = positive_usize_or(flat, RPC_MAX_CONCURRENT_REQUESTS, defaults.rpc_max_inflight)?;
+        let default_frame_size = bytes_u32_or(flat, STREAM_FRAME_SIZE, defaults.default_frame_size)?;
+        let max_frame_size = bytes_u32_or(flat, STREAM_MAX_FRAME_SIZE, defaults.max_frame_size)?;
+        let stream_idle_timeout_ms = duration_ms_or(flat, STREAM_IDLE_TIMEOUT, defaults.stream_idle_timeout_ms)?;
+        let store = parse_store_config(flat, &defaults.store)?;
+        let metadata = parse_metadata_config(flat, &defaults.metadata)?;
+        let heartbeat_interval_ms = duration_ms_or(flat, HEARTBEAT_INTERVAL, defaults.heartbeat_interval_ms)?;
+        let block_report_interval_ms = duration_ms_or(flat, BLOCK_REPORT_INTERVAL, defaults.block_report_interval_ms)?;
+        let block_report_batch_size =
+            positive_usize_or(flat, BLOCK_REPORT_BATCH_SIZE, defaults.block_report_batch_size)?;
+        let cleanup_defaults = WorkerBlockCleanupConfig::default();
+        let block_cleanup = WorkerBlockCleanupConfig {
+            queue_capacity: positive_usize_or(flat, BLOCK_CLEANUP_QUEUE_CAPACITY, cleanup_defaults.queue_capacity)?,
+            concurrency: positive_usize_or(flat, BLOCK_CLEANUP_CONCURRENCY, cleanup_defaults.concurrency)?,
+            retry_initial_backoff_ms: duration_ms_or(
+                flat,
+                BLOCK_CLEANUP_RETRY_INITIAL_BACKOFF,
+                cleanup_defaults.retry_initial_backoff_ms,
+            )?,
+            retry_max_backoff_ms: duration_ms_or(
+                flat,
+                BLOCK_CLEANUP_RETRY_MAX_BACKOFF,
+                cleanup_defaults.retry_max_backoff_ms,
+            )?,
         };
-
+        if block_cleanup.retry_max_backoff_ms < block_cleanup.retry_initial_backoff_ms {
+            return Err(invalid_config(
+                BLOCK_CLEANUP_RETRY_MAX_BACKOFF,
+                "must not be smaller than the initial backoff",
+            ));
+        }
+        let rpc_bind = SocketAddr::new(bind_host, rpc_port).to_string();
+        if rpc_port == http_port {
+            return Err(invalid_config(HTTP_PORT, "must differ from the RPC port"));
+        }
+        let observability = ObservabilityConfig::from_flat(flat)?;
         let config = Self {
             cluster_id,
+            host,
+            bind_host,
+            rpc_port,
+            http_port,
             identity_path,
             rpc_bind: rpc_bind.clone(),
-            rpc_advertised_endpoint,
             rpc_max_inflight,
             default_frame_size,
             max_frame_size,
@@ -211,334 +272,147 @@ impl WorkerConfig {
             store,
             net: WorkerNetConfig::grpc_from_rpc(rpc_bind, rpc_max_inflight, max_frame_size),
             metadata,
+            heartbeat_interval_ms,
+            block_report_interval_ms,
+            block_report_batch_size,
+            block_cleanup,
             observability,
         };
-
         config.validate()?;
 
         info!(
-            identity_path = ?config.identity_path,
+            host = %config.host,
             rpc_bind = %config.rpc_bind,
-            metrics_bind = %config.observability.metrics.prometheus.bind,
-            rpc_advertised_endpoint = %config.rpc_advertised_endpoint,
-            rpc_max_inflight = config.rpc_max_inflight,
-            default_frame_size = config.default_frame_size,
-            max_frame_size = config.max_frame_size,
+            http_bind = %config.http_addr(),
             store_dirs = config.store.dirs.len(),
-            store_reserve_space_bytes = config.store.reserve_space_bytes,
-            store_selection_policy = %config.store.selection_policy,
-            store_check_interval_ms = config.store.check_interval_ms,
-            net_listeners = config.net.listeners.len(),
-            metadata_endpoints = ?config.metadata.endpoints,
-            metadata_group_name = %config.metadata.group_name,
-            register_timeout_ms = config.metadata.register_timeout_ms,
-            register_retry_initial_backoff_ms = config.metadata.register_retry_initial_backoff_ms,
-            register_retry_max_backoff_ms = config.metadata.register_retry_max_backoff_ms,
+            metadata_addresses = ?config.metadata.endpoints,
             "Worker configuration loaded"
         );
-
         Ok(config)
     }
 
-    /// Validate shape-only constraints without touching local storage.
+    /// Validate direct safety constraints without touching local storage.
     pub fn validate(&self) -> Result<(), CommonError> {
         if self.cluster_id.trim().is_empty() {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                "cluster.id must not be empty",
-            ));
+            return Err(invalid_config(CLUSTER_ID, "must not be empty"));
         }
-
+        validate_public_host(HOST, &self.host)?;
         if self.identity_path.as_os_str().is_empty() {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                "worker.identity.path must not be empty",
+            return Err(invalid_config(IDENTITY_FILE, "must not be empty"));
+        }
+        if self.default_frame_size == 0 || self.default_frame_size > self.max_frame_size {
+            return Err(invalid_config(
+                STREAM_FRAME_SIZE,
+                "must be positive and not exceed the maximum frame size",
             ));
         }
-
-        if self.rpc_bind.parse::<std::net::SocketAddr>().is_err() {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!("invalid worker.rpc.bind address: {}", self.rpc_bind),
+        if self.block_report_batch_size > beryl_types::MAX_REPORT_ENTRIES {
+            return Err(invalid_config(
+                BLOCK_REPORT_BATCH_SIZE,
+                "exceeds the shared block-report protocol maximum",
             ));
         }
-
-        self.rpc_advertised_endpoint_parts()?;
-
-        if self.rpc_max_inflight == 0 {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                "worker.rpc.max_inflight must be greater than zero",
+        if self.block_cleanup.concurrency > self.block_cleanup.queue_capacity {
+            return Err(invalid_config(
+                BLOCK_CLEANUP_CONCURRENCY,
+                "must not exceed the cleanup queue capacity",
             ));
         }
-
-        if self.default_frame_size == 0 {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                "worker.default_frame_size must be greater than zero",
-            ));
-        }
-
-        if self.max_frame_size == 0 {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                "worker.max_frame_size must be greater than zero",
-            ));
-        }
-
-        if self.default_frame_size > self.max_frame_size {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!(
-                    "worker.default_frame_size ({}) must be <= worker.max_frame_size ({})",
-                    self.default_frame_size, self.max_frame_size
-                ),
-            ));
-        }
-
-        if self.stream_idle_timeout_ms == 0 {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                "worker.stream.idle_timeout_ms must be greater than zero",
-            ));
-        }
-
         validate_store_config(self)?;
-
         self.metadata.validate()?;
-
         if self.net.listeners.is_empty() {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                "worker.net.listeners must not be empty",
-            ));
+            return Err(invalid_config(RPC_PORT, "must create a Worker RPC listener"));
         }
-
         for listener in &self.net.listeners {
-            if listener.protocol == WorkerNetProtocol::Grpc && listener.bind.parse::<std::net::SocketAddr>().is_err() {
-                return Err(CommonError::new(
-                    CommonErrorKind::InvalidArgument,
-                    format!("invalid worker gRPC listener bind address: {}", listener.bind),
-                ));
-            }
-            if listener.max_inflight == 0 {
-                return Err(CommonError::new(
-                    CommonErrorKind::InvalidArgument,
-                    "worker.net.listeners.max_inflight must be greater than zero",
-                ));
-            }
-            if listener.max_frame_size == 0 {
-                return Err(CommonError::new(
-                    CommonErrorKind::InvalidArgument,
-                    "worker.net.listeners.max_frame_size must be greater than zero",
-                ));
+            if listener.protocol == WorkerNetProtocol::Grpc && listener.bind.parse::<SocketAddr>().is_err() {
+                return Err(invalid_config(BIND_HOST, "does not form a valid RPC bind address"));
             }
         }
-
         Ok(())
-    }
-
-    /// Return the host and port that registration advertises to metadata.
-    pub fn rpc_advertised_endpoint_parts(&self) -> Result<(String, u32), CommonError> {
-        parse_advertised_endpoint(&self.rpc_advertised_endpoint)
-    }
-
-    fn str_or(
-        flat: &beryl_common::config::FlatConfig,
-        key: &str,
-        fallback: &str,
-        field_name: &'static str,
-    ) -> Result<String, CommonError> {
-        if let Some(value) = flat.get_str(key) {
-            return Ok(value);
-        }
-        if flat.contains_key(key) {
-            return Err(invalid_config(field_name, "must be a string"));
-        }
-        Ok(fallback.to_string())
-    }
-
-    fn root_str_or(
-        flat: &beryl_common::config::FlatConfig,
-        key: &'static str,
-        fallback: &str,
-    ) -> Result<String, CommonError> {
-        if let Some(value) = flat.get_str(key) {
-            return Ok(value);
-        }
-        if flat.contains_key(key) {
-            return Err(invalid_config(key, "must be a string"));
-        }
-        Ok(fallback.to_string())
-    }
-
-    fn path_or(flat: &beryl_common::config::FlatConfig, key: &str, fallback: PathBuf) -> Result<PathBuf, CommonError> {
-        if let Some(value) = flat.get_str(key) {
-            return Ok(PathBuf::from(value));
-        }
-        if flat.contains_key(key) {
-            return Err(invalid_config("worker.identity.path", "must be a string"));
-        }
-        Ok(fallback)
-    }
-
-    fn usize_or(
-        flat: &beryl_common::config::FlatConfig,
-        key: &str,
-        fallback: usize,
-        field_name: &'static str,
-    ) -> Result<usize, CommonError> {
-        if let Some(value) = flat.get_usize(key) {
-            return Ok(value);
-        }
-        if flat.contains_key(key) {
-            return Err(invalid_config(field_name, "must be a non-negative integer"));
-        }
-        Ok(fallback)
-    }
-
-    fn bytes_u32(
-        flat: &beryl_common::config::FlatConfig,
-        key: &str,
-        fallback: u32,
-        field_name: &'static str,
-    ) -> Result<u32, CommonError> {
-        match flat.get_bytes(key) {
-            Some(value) => u32::try_from(value).map_err(|_| {
-                CommonError::new(
-                    CommonErrorKind::InvalidArgument,
-                    format!("{field_name} exceeds u32 byte size"),
-                )
-            }),
-            None if flat.contains_key(key) => Err(invalid_config(field_name, "must be a byte size")),
-            None => Ok(fallback),
-        }
-    }
-
-    fn bytes_u64(
-        flat: &beryl_common::config::FlatConfig,
-        key: &str,
-        fallback: u64,
-        field_name: &'static str,
-    ) -> Result<u64, CommonError> {
-        match flat.get_bytes(key) {
-            Some(value) => u64::try_from(value).map_err(|_| invalid_config(field_name, "exceeds u64 byte size")),
-            None if flat.contains_key(key) => Err(invalid_config(field_name, "must be a byte size")),
-            None => Ok(fallback),
-        }
     }
 }
 
-fn parse_store_config(
-    flat: &beryl_common::config::FlatConfig,
-    defaults: &WorkerStoreConfig,
-) -> Result<WorkerStoreConfig, CommonError> {
+fn parse_metadata_config(
+    flat: &FlatConfig,
+    defaults: &WorkerRegistrationConfig,
+) -> Result<WorkerRegistrationConfig, CommonError> {
+    let addresses = if flat.contains_key(METADATA_ADDRESSES) {
+        flat.get_string_list(METADATA_ADDRESSES)
+            .ok_or_else(|| invalid_config(METADATA_ADDRESSES, "must be a list of host:port addresses"))?
+    } else {
+        vec!["127.0.0.1:18080".to_string()]
+    };
+    if addresses.is_empty() || addresses.iter().any(|address| address.trim().is_empty()) {
+        return Err(invalid_config(
+            METADATA_ADDRESSES,
+            "must contain at least one non-empty address",
+        ));
+    }
+    let endpoints = addresses
+        .into_iter()
+        .map(|address| normalize_endpoint(&address))
+        .collect();
+    let config = WorkerRegistrationConfig {
+        group_name: GroupName::parse("root").expect("the supported metadata group is valid"),
+        endpoints,
+        request_timeout_ms: duration_ms_or(flat, METADATA_REQUEST_TIMEOUT, defaults.request_timeout_ms)?,
+        retry_initial_backoff_ms: duration_ms_or(
+            flat,
+            METADATA_RETRY_INITIAL_BACKOFF,
+            defaults.retry_initial_backoff_ms,
+        )?,
+        retry_max_backoff_ms: duration_ms_or(flat, METADATA_RETRY_MAX_BACKOFF, defaults.retry_max_backoff_ms)?,
+    };
+    config.validate()?;
+    Ok(config)
+}
+
+fn normalize_endpoint(address: &str) -> String {
+    if address.starts_with("http://") || address.starts_with("https://") {
+        address.to_string()
+    } else {
+        format!("http://{address}")
+    }
+}
+
+fn parse_store_config(flat: &FlatConfig, defaults: &WorkerStoreConfig) -> Result<WorkerStoreConfig, CommonError> {
+    let dirs = match flat.get_mapping(STORAGE_DIRS) {
+        Some(dirs) => parse_store_dirs(dirs)?,
+        None if flat.contains_key(STORAGE_DIRS) => {
+            return Err(invalid_config(STORAGE_DIRS, "must be a mapping keyed by directory id"));
+        }
+        None => defaults.dirs.clone(),
+    };
     Ok(WorkerStoreConfig {
-        dirs: parse_store_dirs(flat)?,
-        reserve_space_bytes: WorkerConfig::bytes_u64(
-            flat,
-            "store.reserve_space",
-            defaults.reserve_space_bytes,
-            "worker.store.reserve_space",
-        )?,
-        selection_policy: WorkerConfig::str_or(
-            flat,
-            "store.selection_policy",
-            &defaults.selection_policy,
-            "worker.store.selection_policy",
-        )?,
-        check_interval_ms: WorkerConfig::usize_or(
-            flat,
-            "store.check_interval_ms",
-            defaults.check_interval_ms as usize,
-            "worker.store.check_interval_ms",
-        )? as u64,
+        dirs,
+        reserve_space_bytes: bytes_u64_or(flat, STORAGE_RESERVED_SPACE, defaults.reserve_space_bytes)?,
+        check_interval_ms: duration_ms_or(flat, STORAGE_CHECK_INTERVAL, defaults.check_interval_ms)?,
     })
 }
 
-fn parse_store_dirs(flat: &beryl_common::config::FlatConfig) -> Result<BTreeMap<String, StoreDirConfig>, CommonError> {
-    if flat.contains_key("store.dirs") {
-        return Err(invalid_config(
-            "worker.store.dirs",
-            "must use worker.store.dirs.<dir_id>.path/tier/capacity",
-        ));
+fn parse_store_dirs(mapping: &Mapping) -> Result<BTreeMap<String, StoreDirConfig>, CommonError> {
+    if mapping.is_empty() {
+        return Err(invalid_config(STORAGE_DIRS, "must not be empty"));
     }
-
-    let keys = flat.keys_with_prefix("store.dirs");
-    if keys.is_empty() {
-        return Err(invalid_config("worker.store.dirs", "must be present and non-empty"));
-    }
-
-    let mut ids = BTreeSet::new();
-    for key in keys {
-        let rest = key.strip_prefix("store.dirs.").ok_or_else(|| {
+    let mut dirs = BTreeMap::new();
+    for (id, value) in mapping {
+        let id = id
+            .as_str()
+            .filter(|id| !id.trim().is_empty() && *id == id.trim())
+            .ok_or_else(|| invalid_config(STORAGE_DIRS, "contains an invalid directory id"))?;
+        let fields = value
+            .as_mapping()
+            .ok_or_else(|| invalid_config(STORAGE_DIRS, "entries must be mappings"))?;
+        let path = mapping_string(fields, "path")?;
+        let tier = Tier::parse(mapping_string(fields, "tier")?.to_ascii_uppercase()).map_err(|error| {
             CommonError::new(
                 CommonErrorKind::InvalidArgument,
-                format!("worker.{key} must use worker.store.dirs.<dir_id>.<field>"),
+                format!("{STORAGE_DIRS}.{id}.tier {error}"),
             )
         })?;
-        let (id, field) = rest.split_once('.').ok_or_else(|| {
-            CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!("worker.{key} must use worker.store.dirs.<dir_id>.<field>"),
-            )
-        })?;
-        if id.is_empty() || id.trim() != id {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!("worker.{key} has an invalid store dir id"),
-            ));
-        }
-        if field.contains('.') {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!("worker.{key} has an unsupported nested store dir field"),
-            ));
-        }
-        match field {
-            "path" | "tier" | "capacity" => {}
-            "id" => {
-                return Err(CommonError::new(
-                    CommonErrorKind::InvalidArgument,
-                    format!("worker.{key} is unsupported; dir id must come from the key segment"),
-                ));
-            }
-            _ => {
-                return Err(CommonError::new(
-                    CommonErrorKind::InvalidArgument,
-                    format!("worker.{key} is unsupported"),
-                ));
-            }
-        }
-        ids.insert(id.to_string());
-    }
-
-    if ids.is_empty() {
-        return Err(invalid_config("worker.store.dirs", "must be non-empty"));
-    }
-
-    let mut out = BTreeMap::new();
-    for id in ids {
-        let path_key = format!("store.dirs.{id}.path");
-        let tier_key = format!("store.dirs.{id}.tier");
-        let capacity_key = format!("store.dirs.{id}.capacity");
-        let path = required_store_str(flat, &path_key, format!("worker.{path_key}"))?;
-        let tier_raw = required_store_str(flat, &tier_key, format!("worker.{tier_key}"))?;
-        let tier = Tier::parse(&tier_raw).map_err(|err| {
-            CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!("worker.store.dirs.{id}.tier {err}"),
-            )
-        })?;
-        let capacity_bytes = required_store_bytes(flat, &capacity_key, format!("worker.{capacity_key}"))?;
-        if capacity_bytes == 0 {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!("worker.store.dirs.{id}.capacity must be greater than zero"),
-            ));
-        }
-        out.insert(
-            id,
+        let capacity_bytes = mapping_bytes(fields, "capacity")?;
+        dirs.insert(
+            id.to_string(),
             StoreDirConfig {
                 path: PathBuf::from(path),
                 tier,
@@ -546,751 +420,209 @@ fn parse_store_dirs(flat: &beryl_common::config::FlatConfig) -> Result<BTreeMap<
             },
         );
     }
-    Ok(out)
+    Ok(dirs)
 }
 
-fn required_store_str(
-    flat: &beryl_common::config::FlatConfig,
-    field: &str,
-    display_key: String,
-) -> Result<String, CommonError> {
-    let value = flat.get_str(field).ok_or_else(|| {
-        CommonError::new(
-            CommonErrorKind::InvalidArgument,
-            format!("{display_key} must be present"),
-        )
-    })?;
-    if value.trim().is_empty() {
-        return Err(CommonError::new(
-            CommonErrorKind::InvalidArgument,
-            format!("{display_key} must not be empty"),
-        ));
-    }
-    Ok(value)
+fn mapping_string(mapping: &Mapping, field: &'static str) -> Result<String, CommonError> {
+    mapping
+        .get(Value::String(field.to_string()))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| invalid_config(STORAGE_DIRS, "entries require non-empty path, tier, and capacity"))
 }
 
-fn required_store_bytes(
-    flat: &beryl_common::config::FlatConfig,
-    field: &str,
-    display_key: String,
-) -> Result<u64, CommonError> {
-    let value = flat.get_bytes(field).ok_or_else(|| {
-        CommonError::new(
-            CommonErrorKind::InvalidArgument,
-            format!("{display_key} must be a byte size"),
-        )
-    })?;
-    u64::try_from(value).map_err(|_| {
-        CommonError::new(
-            CommonErrorKind::InvalidArgument,
-            format!("{display_key} exceeds u64 byte size"),
-        )
-    })
+fn mapping_bytes(mapping: &Mapping, field: &'static str) -> Result<u64, CommonError> {
+    let value = mapping
+        .get(Value::String(field.to_string()))
+        .ok_or_else(|| invalid_config(STORAGE_DIRS, "entries require non-empty path, tier, and capacity"))?;
+    let mut flat = FlatConfig::new();
+    flat.insert(field.to_string(), value.clone());
+    let bytes = flat
+        .get_bytes(field)
+        .filter(|bytes| *bytes != 0)
+        .ok_or_else(|| invalid_config(STORAGE_DIRS, "capacity must be a positive size"))?;
+    u64::try_from(bytes).map_err(|_| invalid_config(STORAGE_DIRS, "capacity is too large"))
 }
 
 fn validate_store_config(config: &WorkerConfig) -> Result<(), CommonError> {
     if config.store.dirs.is_empty() {
-        return Err(invalid_config("worker.store.dirs", "must be non-empty"));
+        return Err(invalid_config(STORAGE_DIRS, "must not be empty"));
     }
     let mut paths = HashSet::new();
-    for (id, dir) in &config.store.dirs {
-        if id.trim().is_empty() || id.trim() != id {
-            return Err(invalid_config(
-                "worker.store.dirs.<dir_id>",
-                "must be a non-empty segment",
-            ));
-        }
-        if dir.path.as_os_str().is_empty() {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!("worker.store.dirs.{id}.path must not be empty"),
-            ));
+    for dir in config.store.dirs.values() {
+        if dir.path.as_os_str().is_empty() || dir.capacity_bytes == 0 {
+            return Err(invalid_config(STORAGE_DIRS, "contains an empty path or capacity"));
         }
         if !paths.insert(dir.path.clone()) {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!("worker.store.dirs duplicate path: {}", dir.path.display()),
-            ));
+            return Err(invalid_config(STORAGE_DIRS, "contains duplicate paths"));
         }
-        if dir.capacity_bytes == 0 {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!("worker.store.dirs.{id}.capacity must be greater than zero"),
-            ));
-        }
-    }
-    if config.store.selection_policy != "round_robin" {
-        return Err(CommonError::new(
-            CommonErrorKind::InvalidArgument,
-            "worker.store.selection_policy must be round_robin; balanced is TODO(store)".to_string(),
-        ));
-    }
-    if config.store.check_interval_ms == 0 {
-        return Err(invalid_config(
-            "worker.store.check_interval_ms",
-            "must be greater than zero",
-        ));
     }
     Ok(())
 }
 
 impl WorkerRegistrationConfig {
-    /// Validate worker metadata registration config without opening a connection.
     pub fn validate(&self) -> Result<(), CommonError> {
         if self.endpoints.is_empty() {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                "worker.metadata.endpoints must not be empty",
-            ));
+            return Err(invalid_config(METADATA_ADDRESSES, "must not be empty"));
         }
-
         for endpoint in &self.endpoints {
-            if endpoint.is_empty() {
-                return Err(CommonError::new(
-                    CommonErrorKind::InvalidArgument,
-                    "worker.metadata.endpoints entries must not be empty",
-                ));
-            }
-            if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
-                return Err(CommonError::new(
-                    CommonErrorKind::InvalidArgument,
-                    "worker.metadata.endpoints entries must include http:// or https:// scheme",
-                ));
-            }
-            Endpoint::from_shared(endpoint.clone()).map_err(|err| {
-                CommonError::new(
-                    CommonErrorKind::InvalidArgument,
-                    format!("worker.metadata.endpoints entry must be a valid tonic endpoint URI: {err}"),
-                )
-            })?;
+            Endpoint::from_shared(endpoint.clone())
+                .map_err(|_| invalid_config(METADATA_ADDRESSES, "contains an invalid address"))?;
         }
-
-        if self.register_timeout_ms == 0 {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                "worker.metadata.register_timeout_ms must be greater than zero",
+        if self.request_timeout_ms == 0
+            || self.retry_initial_backoff_ms == 0
+            || self.retry_max_backoff_ms < self.retry_initial_backoff_ms
+        {
+            return Err(invalid_config(
+                METADATA_REQUEST_TIMEOUT,
+                "requires positive timeout and ordered retry backoff",
             ));
         }
-
-        if self.register_retry_initial_backoff_ms == 0 {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                "worker.metadata.register_retry_initial_backoff_ms must be greater than zero",
-            ));
-        }
-
-        if self.register_retry_max_backoff_ms == 0 {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                "worker.metadata.register_retry_max_backoff_ms must be greater than zero",
-            ));
-        }
-
-        if self.register_retry_max_backoff_ms < self.register_retry_initial_backoff_ms {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!(
-                    "worker.metadata.register_retry_max_backoff_ms ({}) must be >= worker.metadata.register_retry_initial_backoff_ms ({})",
-                    self.register_retry_max_backoff_ms, self.register_retry_initial_backoff_ms
-                ),
-            ));
-        }
-
         Ok(())
     }
+}
+
+fn string_or(flat: &FlatConfig, key: &'static str, default: &str) -> Result<String, CommonError> {
+    if !flat.contains_key(key) {
+        return Ok(default.to_string());
+    }
+    flat.get_str(key).ok_or_else(|| invalid_config(key, "must be a string"))
+}
+
+fn port_or(flat: &FlatConfig, key: &'static str, default: u16) -> Result<u16, CommonError> {
+    if !flat.contains_key(key) {
+        return Ok(default);
+    }
+    let value = flat
+        .get_i64(key)
+        .ok_or_else(|| invalid_config(key, "must be an integer"))?;
+    u16::try_from(value)
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| invalid_config(key, "must be in range 1-65535"))
+}
+
+fn positive_usize_or(flat: &FlatConfig, key: &'static str, default: usize) -> Result<usize, CommonError> {
+    if !flat.contains_key(key) {
+        return Ok(default);
+    }
+    flat.get_usize(key)
+        .filter(|value| *value != 0)
+        .ok_or_else(|| invalid_config(key, "must be greater than zero"))
+}
+
+fn duration_ms_or(flat: &FlatConfig, key: &'static str, default: u64) -> Result<u64, CommonError> {
+    if !flat.contains_key(key) {
+        return Ok(default);
+    }
+    let duration = flat
+        .get_duration(key)
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| invalid_config(key, "must be a positive duration"))?;
+    u64::try_from(duration.as_millis()).map_err(|_| invalid_config(key, "is too large"))
+}
+
+fn bytes_u32_or(flat: &FlatConfig, key: &'static str, default: u32) -> Result<u32, CommonError> {
+    if !flat.contains_key(key) {
+        return Ok(default);
+    }
+    let bytes = flat
+        .get_bytes(key)
+        .ok_or_else(|| invalid_config(key, "must be a size such as 1MiB"))?;
+    u32::try_from(bytes).map_err(|_| invalid_config(key, "is too large"))
+}
+
+fn bytes_u64_or(flat: &FlatConfig, key: &'static str, default: u64) -> Result<u64, CommonError> {
+    if !flat.contains_key(key) {
+        return Ok(default);
+    }
+    flat.get_bytes(key)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| invalid_config(key, "must be a size such as 1GiB"))
 }
 
 fn invalid_config(key: &'static str, detail: &'static str) -> CommonError {
     CommonError::new(CommonErrorKind::InvalidArgument, format!("{key} {detail}"))
 }
 
-fn parse_group_name(key: &'static str, raw: String) -> Result<GroupName, CommonError> {
-    GroupName::parse(raw).map_err(|err| CommonError::new(CommonErrorKind::InvalidArgument, format!("{key} {err}")))
+fn validate_public_host(key: &'static str, host: &str) -> Result<(), CommonError> {
+    if host.is_empty() || host != host.trim() || host.chars().any(char::is_whitespace) {
+        return Err(invalid_config(key, "must be a host or IP without whitespace"));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return if ip.is_unspecified() {
+            Err(invalid_config(key, "must be a routable host or IP"))
+        } else {
+            Ok(())
+        };
+    }
+    if host.contains("://") || host.contains([':', '/', '\\']) {
+        return Err(invalid_config(key, "must not include a scheme, port, or path"));
+    }
+    Ok(())
 }
 
-fn metadata_endpoints(
-    worker_sub: &beryl_common::config::FlatConfig,
-    defaults: &WorkerRegistrationConfig,
-) -> Result<Vec<String>, CommonError> {
-    if let Some(endpoints) = worker_sub.get_str("metadata.endpoints") {
-        return parse_csv_endpoints(endpoints);
+fn format_host_port(host: &str, port: u16) -> String {
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => format!("[{host}]:{port}"),
+        _ => format!("{host}:{port}"),
     }
-    if worker_sub.contains_key("metadata.endpoints") {
-        return Err(invalid_config("worker.metadata.endpoints", "must be a string"));
-    }
-    Ok(defaults.endpoints.clone())
-}
-
-fn parse_csv_endpoints(value: String) -> Result<Vec<String>, CommonError> {
-    let endpoints: Vec<String> = value
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(ToOwned::to_owned)
-        .collect();
-    if endpoints.is_empty() {
-        return Err(invalid_config(
-            "worker.metadata.endpoints",
-            "must contain at least one endpoint",
-        ));
-    }
-    Ok(endpoints)
-}
-
-fn parse_advertised_endpoint(value: &str) -> Result<(String, u32), CommonError> {
-    if value.is_empty() {
-        return Err(CommonError::new(
-            CommonErrorKind::InvalidArgument,
-            "worker.rpc.advertised_endpoint must not be empty",
-        ));
-    }
-
-    if !(value.starts_with("http://") || value.starts_with("https://")) {
-        return Err(CommonError::new(
-            CommonErrorKind::InvalidArgument,
-            "worker.rpc.advertised_endpoint must include http:// or https:// scheme",
-        ));
-    }
-
-    let endpoint = Endpoint::from_shared(value.to_string()).map_err(|err| {
-        CommonError::new(
-            CommonErrorKind::InvalidArgument,
-            format!("worker.rpc.advertised_endpoint must be a valid tonic endpoint URI: {err}"),
-        )
-    })?;
-    let uri = endpoint.uri();
-    let raw_host = uri.host().ok_or_else(|| {
-        CommonError::new(
-            CommonErrorKind::InvalidArgument,
-            "worker.rpc.advertised_endpoint must include a host",
-        )
-    })?;
-    let host = raw_host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(raw_host);
-    if host.is_empty() {
-        return Err(CommonError::new(
-            CommonErrorKind::InvalidArgument,
-            "worker.rpc.advertised_endpoint host must not be empty",
-        ));
-    }
-    if host.parse::<IpAddr>().is_ok_and(|ip| ip.is_unspecified()) {
-        return Err(CommonError::new(
-            CommonErrorKind::InvalidArgument,
-            "worker.rpc.advertised_endpoint must not use a wildcard host",
-        ));
-    }
-    let port = uri.port_u16().ok_or_else(|| {
-        CommonError::new(
-            CommonErrorKind::InvalidArgument,
-            "worker.rpc.advertised_endpoint must include a port",
-        )
-    })?;
-
-    Ok((host.to_string(), u32::from(port)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::protocol::WorkerNetProtocol;
-    use std::fs;
-    use tempfile::TempDir;
 
-    fn test_worker_config() -> WorkerConfig {
-        WorkerConfig {
-            cluster_id: "local-beryl".to_string(),
-            identity_path: PathBuf::from("data/worker/worker.identity"),
-            rpc_bind: "0.0.0.0:9090".to_string(),
-            rpc_advertised_endpoint: "http://127.0.0.1:9090".to_string(),
-            rpc_max_inflight: 100,
-            default_frame_size: 1024 * 1024,
-            max_frame_size: 4 * 1024 * 1024,
-            stream_idle_timeout_ms: 60_000,
-            store: WorkerStoreConfig::default(),
-            net: WorkerNetConfig::grpc_from_rpc("0.0.0.0:9090".to_string(), 100, 4 * 1024 * 1024),
-            metadata: WorkerRegistrationConfig::default(),
-            observability: test_observability_config(),
-        }
+    fn base_flat() -> FlatConfig {
+        let mut flat = FlatConfig::new();
+        flat.set("beryl.logging.format", "compact");
+        flat.set("beryl.logging.output", "stderr");
+        flat.set("beryl.logging.level", "info");
+        flat
     }
 
-    fn test_observability_config() -> ObservabilityConfig {
-        let mut flat = beryl_common::config::FlatConfig::new();
-        flat.set("observe.log.format", "compact");
-        flat.set("observe.log.output", "stderr");
-        flat.set(
-            "observe.log.level",
-            "info,beryl_metadata=info,beryl_worker=info,beryl_common=info,openraft=warn,tonic=warn,tower=warn,h2=warn",
+    #[test]
+    fn target_config_loads_network_storage_and_background_limits() {
+        let mut flat = base_flat();
+        flat.set(HOST, "worker-01");
+        flat.set(BIND_HOST, "127.0.0.1");
+        flat.set(RPC_PORT, 29090i64);
+        flat.set(HTTP_PORT, 29091i64);
+        flat.set(HEARTBEAT_INTERVAL, "2s");
+        flat.set(BLOCK_REPORT_BATCH_SIZE, 500i64);
+        flat.insert(
+            STORAGE_DIRS.to_string(),
+            serde_yaml::from_str::<Value>("hdd0:\n  path: /tmp/hdd0\n  tier: hdd\n  capacity: 2GiB\n").unwrap(),
         );
-        flat.set("observe.metrics.prometheus.bind", "127.0.0.1:19091");
-        flat.set("observe.metrics.prometheus.path", "/metrics");
-        ObservabilityConfig::from_flat(&flat).expect("test observe config")
-    }
-
-    fn with_test_observe_yaml(config: impl AsRef<str>) -> String {
-        format!(
-            "{}\n{}",
-            config.as_ref().trim_end(),
-            r#"
-observe.log.format: compact
-observe.log.output: stderr
-observe.log.level: "info,beryl_metadata=info,beryl_worker=info,beryl_common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"
-observe.metrics.prometheus.bind: "127.0.0.1:19091"
-observe.metrics.prometheus.path: "/metrics"
-"#
-            .trim_start()
-        )
-    }
-
-    fn load_test_config(config: impl AsRef<str>) -> Result<WorkerConfig, CommonError> {
-        let temp_dir = TempDir::new().expect("temp config dir");
-        let config_path = temp_dir.path().join("worker.yaml");
-        fs::write(&config_path, with_test_observe_yaml(config)).expect("write worker config");
-        WorkerConfig::load(&config_path)
-    }
-
-    #[test]
-    fn test_load_real_worker_config() {
-        let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("worker lives under workspace root")
-            .join("conf/worker.yaml");
-
-        let config = WorkerConfig::load(&config_path)
-            .unwrap_or_else(|err| panic!("Failed to load {}: {err:?}", config_path.display()));
-
-        let hdd0 = config.store.dirs.get("hdd0").expect("hdd0 store dir");
-        assert_eq!(hdd0.path, PathBuf::from("data/worker/hdd0"));
-        assert_eq!(hdd0.tier, beryl_types::Tier::Hdd);
-        assert_eq!(config.identity_path, PathBuf::from("data/worker/worker.identity"));
-        assert_eq!(config.rpc_bind, "0.0.0.0:9090");
-        assert_eq!(config.rpc_advertised_endpoint, "http://127.0.0.1:9090");
-        assert_eq!(config.observability.metrics.prometheus.bind, "127.0.0.1:19091");
-    }
-
-    #[test]
-    fn loads_default_config() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("worker.yaml");
-        fs::write(
-            &config_path,
-            with_test_observe_yaml(
-                r#"
-worker.rpc.bind: "127.0.0.1:9090"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.store.dirs.hdd0.path: "/tmp/beryl-worker/hdd0"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.store.reserve_space: "1GB"
-worker.store.selection_policy: "round_robin"
-worker.store.check_interval_ms: 30000
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-"#,
-            ),
-        )
-        .unwrap();
-
-        let config = WorkerConfig::load(&config_path).unwrap();
-
-        assert_eq!(config.rpc_bind, "127.0.0.1:9090");
-        assert_eq!(config.identity_path, PathBuf::from("data/worker/worker.identity"));
-        assert_eq!(config.rpc_max_inflight, 100);
-        assert_eq!(config.default_frame_size, 1024 * 1024);
-        assert_eq!(config.max_frame_size, 4 * 1024 * 1024);
-        assert_eq!(config.stream_idle_timeout_ms, 60_000);
-        let hdd0 = config.store.dirs.get("hdd0").unwrap();
-        assert_eq!(config.store.dirs.len(), 1);
-        assert_eq!(hdd0.path, PathBuf::from("/tmp/beryl-worker/hdd0"));
-        assert_eq!(hdd0.tier, beryl_types::Tier::Hdd);
-        assert_eq!(hdd0.capacity_bytes, 10 * 1024 * 1024 * 1024);
-        assert_eq!(config.store.reserve_space_bytes, 1024 * 1024 * 1024);
-        assert_eq!(config.store.selection_policy, "round_robin");
-        assert_eq!(config.store.check_interval_ms, 30_000);
-        assert_eq!(config.rpc_advertised_endpoint, "http://127.0.0.1:9090");
-        assert_eq!(config.metadata.group_name.as_str(), "root");
-        assert_eq!(config.metadata.endpoints, vec!["http://127.0.0.1:18080"]);
-        assert_eq!(config.metadata.register_timeout_ms, 5_000);
-        assert_eq!(config.metadata.register_retry_initial_backoff_ms, 200);
-        assert_eq!(config.metadata.register_retry_max_backoff_ms, 5_000);
-        assert_eq!(config.net.listeners.len(), 1);
-        assert_eq!(config.net.listeners[0].protocol, WorkerNetProtocol::Grpc);
-        assert_eq!(config.net.listeners[0].bind, "127.0.0.1:9090");
-        assert_eq!(config.net.listeners[0].max_inflight, 100);
-    }
-
-    #[test]
-    fn observability_loads_from_flat_config_only() {
-        let mut flat = ServerConfig::default().as_flat().clone();
-        flat.set("worker.rpc.advertised_endpoint", "http://127.0.0.1:9090");
-        flat.set("worker.store.dirs.hdd0.path", "/tmp/beryl-worker/hdd0");
-        flat.set("worker.store.dirs.hdd0.tier", "HDD");
-        flat.set("worker.store.dirs.hdd0.capacity", "10GB");
-        flat.set("observe.log.format", "json");
-        flat.set("observe.log.output", "stdout");
-        flat.set("observe.log.level", "warn");
-        flat.set("observe.metrics.prometheus.bind", "127.0.0.1:19091");
-        flat.set("observe.metrics.prometheus.path", "/metrics");
+        flat.insert(
+            METADATA_ADDRESSES.to_string(),
+            Value::Sequence(vec![Value::String("metadata:18080".to_string())]),
+        );
 
         let config = WorkerConfig::from_server_config(&ServerConfig::from_flat(flat)).unwrap();
 
-        assert_eq!(config.observability.log.format, "json");
-        assert_eq!(config.observability.log.output, "stdout");
-        assert_eq!(config.observability.metrics.prometheus.bind, "127.0.0.1:19091");
+        assert_eq!(config.rpc_address(), "worker-01:29090");
+        assert_eq!(config.rpc_bind, "127.0.0.1:29090");
+        assert_eq!(config.http_addr(), "127.0.0.1:29091".parse().unwrap());
+        assert_eq!(config.metadata.group_name.as_str(), "root");
+        assert_eq!(config.metadata.endpoints, vec!["http://metadata:18080"]);
+        assert_eq!(config.heartbeat_interval_ms, 2_000);
+        assert_eq!(config.block_report_batch_size, 500);
+        assert_eq!(config.store.dirs["hdd0"].tier, Tier::Hdd);
     }
 
     #[test]
-    fn loads_current_worker_knobs() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("worker.yaml");
-        fs::write(
-            &config_path,
-            with_test_observe_yaml(
-                r#"
-worker.identity.path: "/tmp/beryl-worker.identity"
-worker.rpc.bind: "127.0.0.1:9091"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:19091"
-worker.rpc.max_inflight: 8
-worker.default_frame_size: 4096
-worker.max_frame_size: 8192
-worker.stream.idle_timeout_ms: 500
-worker.store.dirs.ssd0.path: "/tmp/beryl-worker/ssd0"
-worker.store.dirs.ssd0.tier: "SSD"
-worker.store.dirs.ssd0.capacity: "12MB"
-worker.store.dirs.hdd0.path: "/tmp/beryl-worker/hdd0"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "34MB"
-worker.store.reserve_space: "2MB"
-worker.store.selection_policy: "round_robin"
-worker.store.check_interval_ms: 2500
-worker.metadata.group.name: "analytics"
-worker.metadata.endpoints: "http://127.0.0.1:18080,http://127.0.0.1:18081"
-worker.metadata.register_timeout_ms: 2500
-worker.metadata.register_retry_initial_backoff_ms: 25
-worker.metadata.register_retry_max_backoff_ms: 250
-"#,
-            ),
-        )
-        .unwrap();
+    fn invalid_active_frame_and_address_values_are_rejected() {
+        let mut flat = base_flat();
+        flat.set(STREAM_FRAME_SIZE, "8MiB");
+        flat.set(STREAM_MAX_FRAME_SIZE, "4MiB");
+        assert!(WorkerConfig::from_server_config(&ServerConfig::from_flat(flat)).is_err());
 
-        let config = WorkerConfig::load(&config_path).unwrap();
-
-        assert_eq!(config.identity_path, PathBuf::from("/tmp/beryl-worker.identity"));
-        assert_eq!(config.rpc_bind, "127.0.0.1:9091");
-        assert_eq!(config.rpc_max_inflight, 8);
-        assert_eq!(config.default_frame_size, 4096);
-        assert_eq!(config.max_frame_size, 8192);
-        assert_eq!(config.stream_idle_timeout_ms, 500);
-        let ssd0 = config.store.dirs.get("ssd0").unwrap();
-        let hdd0 = config.store.dirs.get("hdd0").unwrap();
-        assert_eq!(config.store.dirs.len(), 2);
-        assert_eq!(ssd0.path, PathBuf::from("/tmp/beryl-worker/ssd0"));
-        assert_eq!(ssd0.tier, beryl_types::Tier::Ssd);
-        assert_eq!(ssd0.capacity_bytes, 12 * 1024 * 1024);
-        assert_eq!(hdd0.path, PathBuf::from("/tmp/beryl-worker/hdd0"));
-        assert_eq!(hdd0.tier, beryl_types::Tier::Hdd);
-        assert_eq!(hdd0.capacity_bytes, 34 * 1024 * 1024);
-        assert_eq!(config.store.reserve_space_bytes, 2 * 1024 * 1024);
-        assert_eq!(config.store.selection_policy, "round_robin");
-        assert_eq!(config.store.check_interval_ms, 2_500);
-        assert_eq!(config.rpc_advertised_endpoint, "http://127.0.0.1:19091");
-        assert_eq!(config.metadata.group_name.as_str(), "analytics");
-        assert_eq!(
-            config.metadata.endpoints,
-            vec!["http://127.0.0.1:18080", "http://127.0.0.1:18081"]
-        );
-        assert_eq!(config.metadata.register_timeout_ms, 2_500);
-        assert_eq!(config.metadata.register_retry_initial_backoff_ms, 25);
-        assert_eq!(config.metadata.register_retry_max_backoff_ms, 250);
-        assert_eq!(config.net.listeners[0].bind, "127.0.0.1:9091");
-        assert_eq!(config.net.listeners[0].max_inflight, 8);
-    }
-
-    #[test]
-    fn rejects_empty_worker_net_listeners() {
-        let mut config = test_worker_config();
-        config.net.listeners.clear();
-
-        let error = config.validate().unwrap_err();
-
-        assert!(error.message.contains("net.listeners"));
-    }
-
-    #[test]
-    fn rejects_invalid_frame_size_order() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("worker.yaml");
-        fs::write(
-            &config_path,
-            with_test_observe_yaml(
-                r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.store.dirs.hdd0.path: "/tmp/beryl-worker/hdd0"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.default_frame_size: 8192
-worker.max_frame_size: 4096
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-"#,
-            ),
-        )
-        .unwrap();
-
-        let error = WorkerConfig::load(&config_path).unwrap_err();
-
-        assert!(error.message.contains("must be <="));
-    }
-
-    #[test]
-    fn rejects_removed_window_bytes_config() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("worker.yaml");
-        fs::write(
-            &config_path,
-            with_test_observe_yaml(
-                r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.window_bytes: 8192
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-"#,
-            ),
-        )
-        .unwrap();
-
-        let error = WorkerConfig::load(&config_path).unwrap_err();
-
-        assert!(error.message.contains("worker.window_bytes"));
-        assert!(error.message.contains("no longer supported"));
-    }
-
-    #[test]
-    fn rejects_wrong_type_current_worker_knobs() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("worker.yaml");
-        fs::write(
-            &config_path,
-            with_test_observe_yaml(
-                r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.rpc.max_inflight: false
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-"#,
-            ),
-        )
-        .unwrap();
-
-        let error = WorkerConfig::load(&config_path).unwrap_err();
-
-        assert!(error.message.contains("worker.rpc.max_inflight"));
-    }
-
-    #[test]
-    fn rejects_invalid_store_configurations() {
-        let cases = [
-            ("missing dirs", "", "worker.store.dirs"),
-            ("empty dirs", "worker.store.dirs: []", "worker.store.dirs"),
-            (
-                "missing path",
-                r#"worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB""#,
-                "path",
-            ),
-            (
-                "missing tier",
-                r#"worker.store.dirs.hdd0.path: "/tmp/a"
-worker.store.dirs.hdd0.capacity: "10GB""#,
-                "tier",
-            ),
-            (
-                "missing capacity",
-                r#"worker.store.dirs.hdd0.path: "/tmp/a"
-worker.store.dirs.hdd0.tier: "HDD""#,
-                "capacity",
-            ),
-            (
-                "old id field",
-                r#"worker.store.dirs.hdd0.id: "old"
-worker.store.dirs.hdd0.path: "/tmp/a"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB""#,
-                "id",
-            ),
-            (
-                "zero capacity",
-                r#"worker.store.dirs.hdd0.path: "/tmp/a"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "0""#,
-                "capacity",
-            ),
-            (
-                "bad tier",
-                r#"worker.store.dirs.hdd0.path: "/tmp/a"
-worker.store.dirs.hdd0.tier: "TAPE"
-worker.store.dirs.hdd0.capacity: "10GB""#,
-                "tier",
-            ),
-            (
-                "duplicate path",
-                r#"worker.store.dirs.hdd0.path: "/tmp/a"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.store.dirs.hdd1.path: "/tmp/a"
-worker.store.dirs.hdd1.tier: "HDD"
-worker.store.dirs.hdd1.capacity: "10GB""#,
-                "duplicate path",
-            ),
-            (
-                "empty id",
-                r#"worker.store.dirs..path: "/tmp/a"
-worker.store.dirs..tier: "HDD"
-worker.store.dirs..capacity: "10GB""#,
-                "invalid store dir id",
-            ),
-            (
-                "unsupported selection policy",
-                r#"worker.store.dirs.hdd0.path: "/tmp/a"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.store.selection_policy: "balanced"
-worker.store.check_interval_ms: 30000"#,
-                "worker.store.selection_policy",
-            ),
-            (
-                "zero check interval",
-                r#"worker.store.dirs.hdd0.path: "/tmp/a"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.store.selection_policy: "round_robin"
-worker.store.check_interval_ms: 0"#,
-                "worker.store.check_interval_ms",
-            ),
-        ];
-
-        for (case, store_config, expected) in cases {
-            let error = load_test_config(format!(
-                r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-{store_config}
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-"#
-            ))
-            .expect_err("invalid store config must fail");
-
-            assert!(
-                error.message.contains(expected),
-                "{case} expected {expected:?}, got {}",
-                error.message
-            );
-        }
-    }
-
-    #[test]
-    fn uses_default_worker_metadata_endpoints_when_absent() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("worker.yaml");
-        fs::write(
-            &config_path,
-            with_test_observe_yaml(
-                r#"
-worker.rpc.bind: "127.0.0.1:9090"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.store.dirs.hdd0.path: "/tmp/beryl-worker/hdd0"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-"#,
-            ),
-        )
-        .unwrap();
-
-        let config = WorkerConfig::load(&config_path).unwrap();
-
-        assert_eq!(config.metadata.endpoints, WorkerRegistrationConfig::default().endpoints);
-    }
-
-    #[test]
-    fn rejects_invalid_worker_metadata_endpoints() {
-        for endpoints in [" , ", "127.0.0.1:18080"] {
-            let error = load_test_config(format!(
-                r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.store.dirs.hdd0.path: "/tmp/beryl-worker/hdd0"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.metadata.endpoints: "{endpoints}"
-"#
-            ))
-            .expect_err("empty or non-URL metadata endpoint must fail");
-
-            assert!(error.message.contains("worker.metadata.endpoints"));
-        }
-    }
-
-    #[test]
-    fn rejects_missing_or_wildcard_worker_rpc_advertised_endpoint() {
-        for (case, advertised_config, expected) in [
-            ("missing", "", "worker.rpc.advertised_endpoint"),
-            (
-                "IPv4 wildcard",
-                r#"worker.rpc.advertised_endpoint: "http://0.0.0.0:9090""#,
-                "wildcard",
-            ),
-            (
-                "IPv6 wildcard",
-                r#"worker.rpc.advertised_endpoint: "http://[::]:9090""#,
-                "wildcard",
-            ),
-        ] {
-            let error = load_test_config(format!(
-                r#"
-worker.rpc.bind: "0.0.0.0:9090"
-{advertised_config}
-worker.store.dirs.hdd0.path: "/tmp/beryl-worker/hdd0"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-"#
-            ))
-            .expect_err("missing or wildcard advertised endpoint must fail");
-
-            assert!(
-                error.message.contains("worker.rpc.advertised_endpoint"),
-                "case {case}: {}",
-                error.message
-            );
-            assert!(error.message.contains(expected), "case {case}: {}", error.message);
-        }
-    }
-
-    #[test]
-    fn rejects_invalid_worker_metadata_register_timing() {
-        for (timing_config, expected) in [
-            (
-                "worker.metadata.register_timeout_ms: 0",
-                "worker.metadata.register_timeout_ms",
-            ),
-            (
-                "worker.metadata.register_retry_initial_backoff_ms: 0",
-                "worker.metadata.register_retry_initial_backoff_ms",
-            ),
-            (
-                "worker.metadata.register_retry_initial_backoff_ms: 500\n\
-                 worker.metadata.register_retry_max_backoff_ms: 100",
-                "worker.metadata.register_retry_max_backoff_ms",
-            ),
-        ] {
-            let error = load_test_config(format!(
-                r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.store.dirs.hdd0.path: "/tmp/beryl-worker/hdd0"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-{timing_config}
-"#
-            ))
-            .expect_err("invalid registration timing must fail");
-
-            assert!(error.message.contains(expected), "{}", error.message);
+        for host in ["0.0.0.0", " worker-01", "http://worker-01", "worker-01:19090"] {
+            let mut flat = base_flat();
+            flat.set(HOST, host);
+            assert!(WorkerConfig::from_server_config(&ServerConfig::from_flat(flat)).is_err());
         }
     }
 }

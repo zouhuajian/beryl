@@ -3,44 +3,32 @@
 
 //! Observability configuration structures.
 
-use crate::config::{
-    FlatConfig,
-    keys::{observe_log, observe_metrics},
-};
+use crate::config::{FlatConfig, keys::logging};
 use crate::error::{CommonError, CommonErrorKind};
 use serde::{Deserialize, Serialize};
 
-/// Observability configuration loaded from flat `observe.*` file keys.
+/// Process observability configuration loaded from shared logging keys.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ObservabilityConfig {
     /// Logging configuration.
     pub log: LogConfig,
-    /// Metrics configuration.
-    pub metrics: MetricsConfig,
     /// Resource attributes.
     pub resource: ResourceConfig,
 }
 
 impl ObservabilityConfig {
-    /// Parse the shared flat `observe.*` configuration model.
+    /// Parse the shared logging configuration model.
     pub fn from_flat(flat: &FlatConfig) -> Result<Self, CommonError> {
         let config = Self {
             log: LogConfig {
-                format: required_str(flat, observe_log::FORMAT)?,
-                output: required_str(flat, observe_log::OUTPUT)?,
-                level: required_str(flat, observe_log::LEVEL)?,
-            },
-            metrics: MetricsConfig {
-                prometheus: PrometheusConfig {
-                    bind: required_str(flat, observe_metrics::PROMETHEUS_BIND)?,
-                    path: required_str(flat, observe_metrics::PROMETHEUS_PATH)?,
-                },
+                format: required_str(flat, logging::FORMAT)?,
+                output: required_str(flat, logging::OUTPUT)?,
+                level: required_str(flat, logging::LEVEL)?,
             },
             resource: ResourceConfig::default(),
         };
 
         validate_log_config(&config.log)?;
-        validate_metrics_config(&config.metrics)?;
         Ok(config)
     }
 }
@@ -54,22 +42,6 @@ pub struct LogConfig {
     pub output: String,
     /// EnvFilter directive string.
     pub level: String,
-}
-
-/// Metrics configuration.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MetricsConfig {
-    /// Prometheus configuration.
-    pub prometheus: PrometheusConfig,
-}
-
-/// Prometheus configuration.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PrometheusConfig {
-    /// Bind address (e.g., "127.0.0.1:18081").
-    pub bind: String,
-    /// Metrics path (e.g., "/metrics").
-    pub path: String,
 }
 
 /// Resource attributes configuration.
@@ -117,24 +89,11 @@ fn required_str(flat: &FlatConfig, key: &'static str) -> Result<String, CommonEr
 fn validate_log_config(config: &LogConfig) -> Result<(), CommonError> {
     match config.format.as_str() {
         "compact" | "json" => {}
-        _ => return Err(invalid_config(observe_log::FORMAT, "must be compact or json")),
+        _ => return Err(invalid_config(logging::FORMAT, "must be compact or json")),
     }
     match config.output.as_str() {
         "stderr" | "stdout" => {}
-        _ => return Err(invalid_config(observe_log::OUTPUT, "must be stderr or stdout")),
-    }
-    Ok(())
-}
-
-fn validate_metrics_config(config: &MetricsConfig) -> Result<(), CommonError> {
-    config.prometheus.bind.parse::<std::net::SocketAddr>().map_err(|err| {
-        CommonError::new(
-            CommonErrorKind::InvalidArgument,
-            format!("Invalid {}: {err}", observe_metrics::PROMETHEUS_BIND),
-        )
-    })?;
-    if !config.prometheus.path.starts_with('/') {
-        return Err(invalid_config(observe_metrics::PROMETHEUS_PATH, "must start with /"));
+        _ => return Err(invalid_config(logging::OUTPUT, "must be stderr or stdout")),
     }
     Ok(())
 }
@@ -156,9 +115,9 @@ mod tests {
     fn minimal_observe_config_requires_file_values() {
         let flat = FlatConfig::new();
 
-        let err = ObservabilityConfig::from_flat(&flat).expect_err("missing observe.* file values must fail");
+        let err = ObservabilityConfig::from_flat(&flat).expect_err("missing logging values must fail");
 
-        assert!(err.message.contains("observe.log.format"), "{err:?}");
+        assert!(err.message.contains(logging::FORMAT), "{err:?}");
     }
 
     #[test]
@@ -168,18 +127,11 @@ mod tests {
         assert_eq!(config.log.format, "compact");
         assert_eq!(config.log.output, "stderr");
         assert_eq!(config.log.level, TEST_LEVEL);
-        assert_eq!(config.metrics.prometheus.bind, "127.0.0.1:18081");
-        assert_eq!(config.metrics.prometheus.path, "/metrics");
     }
 
     #[test]
     fn invalid_values_are_rejected() {
-        let cases = [
-            ("observe.log.format", "pretty"),
-            ("observe.log.output", "file"),
-            ("observe.metrics.prometheus.bind", "127.0.0.1:70000"),
-            ("observe.metrics.prometheus.path", "metrics"),
-        ];
+        let cases = [(logging::FORMAT, "pretty"), (logging::OUTPUT, "file")];
 
         for (key, value) in cases {
             let mut flat = minimal_observe_flat();
@@ -192,11 +144,9 @@ mod tests {
 
     fn minimal_observe_flat() -> FlatConfig {
         let mut flat = FlatConfig::new();
-        flat.set(observe_log::FORMAT, "compact");
-        flat.set(observe_log::OUTPUT, "stderr");
-        flat.set(observe_log::LEVEL, TEST_LEVEL);
-        flat.set(observe_metrics::PROMETHEUS_BIND, "127.0.0.1:18081");
-        flat.set(observe_metrics::PROMETHEUS_PATH, "/metrics");
+        flat.set(logging::FORMAT, "compact");
+        flat.set(logging::OUTPUT, "stderr");
+        flat.set(logging::LEVEL, TEST_LEVEL);
         flat
     }
 }

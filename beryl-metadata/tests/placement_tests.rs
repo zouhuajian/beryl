@@ -303,14 +303,3 @@ fn write_uses_layout_replication_and_prefers_caller_locality() {
         vec![WorkerId::new(2)]
     );
 }
-
-#[test]
-fn repair_is_inert() {
-    let group = group_name("g11");
-    let req = request(&group, PlacementOp::Repair, block(77, 0));
-
-    let plan = PlacementPlanner.plan(&req, &[]);
-
-    assert_eq!(plan.status, PlacementStatus::Unsupported);
-    assert!(plan.workers.is_empty());
-}

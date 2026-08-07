@@ -64,7 +64,7 @@ mod tests {
     fn register_worker_apply_replaces_durable_descriptor_without_publishing_live_run() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let worker_manager = Arc::new(crate::worker::WorkerManager::new(60));
+        let worker_manager = Arc::new(crate::worker::WorkerManager::new(60_000));
         let sm = AppRaftStateMachine::new(Arc::clone(&storage));
         let worker_id = WorkerId::new(760);
 
@@ -102,7 +102,7 @@ mod tests {
     fn register_worker_apply_is_independent_of_same_run_live_descriptor() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let worker_manager = Arc::new(crate::worker::WorkerManager::new(60));
+        let worker_manager = Arc::new(crate::worker::WorkerManager::new(60_000));
         let sm = AppRaftStateMachine::new(Arc::clone(&storage));
         let endpoint_worker_id = WorkerId::new(762);
         let protocol_worker_id = WorkerId::new(763);
@@ -207,7 +207,7 @@ mod tests {
     fn register_worker_apply_accepts_live_endpoint_replacement() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let worker_manager = Arc::new(crate::worker::WorkerManager::new(60));
+        let worker_manager = Arc::new(crate::worker::WorkerManager::new(60_000));
         let sm = AppRaftStateMachine::new(Arc::clone(&storage));
         let worker_id = WorkerId::new(766);
         let first_run_id: beryl_types::WorkerRunId = "550e8400-e29b-41d4-a716-446655440040".parse().unwrap();
@@ -306,7 +306,7 @@ mod tests {
             worker_id
         );
 
-        let reloaded_manager = Arc::new(crate::worker::WorkerManager::new(60));
+        let reloaded_manager = Arc::new(crate::worker::WorkerManager::new(60_000));
         let reloaded_sm = AppRaftStateMachine::new(Arc::clone(&storage));
         reloaded_manager
             .load_registered_workers(storage.list_workers().unwrap())
@@ -381,7 +381,7 @@ mod tests {
     fn register_worker_apply_does_not_publish_live_worker_state() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let worker_manager = Arc::new(crate::worker::WorkerManager::new(60));
+        let worker_manager = Arc::new(crate::worker::WorkerManager::new(60_000));
         let sm = AppRaftStateMachine::new(Arc::clone(&storage));
         let worker_id = WorkerId::new(762);
         let first_group = group_name("root");

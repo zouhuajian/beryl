@@ -18,7 +18,7 @@ fn prepare_start_descriptor(config: &WorkerConfig) -> Result<(), String> {
         .map_err(|err| err.to_string())
 }
 
-fn write_config(dir: &TempDir, cluster_id: &str, group_name: &str) -> std::path::PathBuf {
+fn write_config(dir: &TempDir, cluster_id: &str, _group_name: &str) -> std::path::PathBuf {
     let worker_dir = dir.path().join("worker");
     let store_dir = worker_dir.join("hdd0");
     let identity_path = worker_dir.join("worker.identity");
@@ -27,23 +27,23 @@ fn write_config(dir: &TempDir, cluster_id: &str, group_name: &str) -> std::path:
         &config_path,
         format!(
             r#"
-cluster.id: "{cluster_id}"
-worker.identity.path: "{}"
-worker.store.dirs.hdd0.path: "{}"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.store.reserve_space: "1GB"
-worker.store.selection_policy: "round_robin"
-worker.store.check_interval_ms: 30000
-worker.rpc.bind: "127.0.0.1:0"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:19090"
-worker.metadata.group.name: "{group_name}"
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-observe.log.format: compact
-observe.log.output: stderr
-observe.log.level: "info,beryl_metadata=info,beryl_worker=info,beryl_common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"
-observe.metrics.prometheus.bind: "127.0.0.1:19091"
-observe.metrics.prometheus.path: "/metrics"
+beryl.cluster.id: "{cluster_id}"
+beryl.worker.host: "127.0.0.1"
+beryl.worker.bind-host: "127.0.0.1"
+beryl.worker.rpc.port: 19090
+beryl.worker.http.port: 19091
+beryl.worker.identity-file: "{}"
+beryl.worker.storage.dirs:
+  hdd0:
+    path: "{}"
+    tier: hdd
+    capacity: 10GiB
+beryl.worker.storage.reserved-space: 1GiB
+beryl.worker.metadata.addresses:
+  - "127.0.0.1:18080"
+beryl.logging.format: compact
+beryl.logging.output: stderr
+beryl.logging.level: "info,beryl_metadata=info,beryl_worker=info,beryl_common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"
 "#,
             identity_path.display(),
             store_dir.display()
@@ -114,7 +114,7 @@ fn worker_start_refuses_existing_info_with_missing_identity_without_recreating_i
 
     let err = prepare_worker_start(&config).unwrap_err();
 
-    assert!(err.to_string().contains("worker.identity.path"));
+    assert!(err.to_string().contains("beryl.worker.identity-file"));
     assert!(!config.identity_path.exists());
 }
 
@@ -130,7 +130,7 @@ fn worker_start_refuses_malformed_identity_without_rewriting_it() {
 
     let err = prepare_start_descriptor(&config).unwrap_err();
 
-    assert!(err.contains("worker.identity.path"));
+    assert!(err.contains("beryl.worker.identity-file"));
     assert!(err.contains("must contain a UUID"));
     assert_eq!(std::fs::read(worker_storage_info_path(&config)).unwrap(), info_before);
     assert_eq!(std::fs::read(&config.identity_path).unwrap(), identity_before);
@@ -284,7 +284,7 @@ fn worker_start_refuses_non_empty_unknown_store_dirs_without_creating_identity()
     let err = prepare_worker_start(&config).unwrap_err();
     let message = err.to_string();
 
-    assert!(message.contains("worker.store.dirs"));
+    assert!(message.contains("beryl.worker.storage.dirs"));
     assert!(message.contains("WorkerStorageInfo is missing"));
     assert!(!worker_storage_info_path(&config).exists());
     assert!(!config.identity_path.exists());
@@ -303,31 +303,4 @@ fn worker_registration_descriptor_uses_resolved_worker_id_and_group_name() {
     assert_eq!(descriptor.worker_id, worker_id);
     assert_eq!(descriptor.group_name.as_str(), "root");
     assert!(!config.identity_path.exists());
-}
-
-#[test]
-fn group_name_validation_accepts_valid_names_and_rejects_invalid_names() {
-    for group_name in ["root", "default", "analytics", "tenant-a", "hot_cache", "group.1"] {
-        let dir = TempDir::new().unwrap();
-        let config_path = write_config(&dir, "cluster-a", group_name);
-        let config = WorkerConfig::load(&config_path).unwrap();
-        assert_eq!(config.metadata.group_name.as_str(), group_name);
-    }
-
-    for group_name in [
-        "",
-        " ",
-        "Root",
-        "ROOT",
-        "root/prod",
-        "root prod",
-        "-root",
-        "root/",
-        "a234567890123456789012345678901234567890123456789012345678901234",
-    ] {
-        let dir = TempDir::new().unwrap();
-        let config_path = write_config(&dir, "cluster-a", group_name);
-        let err = WorkerConfig::load(&config_path).unwrap_err();
-        assert!(err.message.contains("worker.metadata.group.name"));
-    }
 }
