@@ -56,9 +56,12 @@ fn group_name() -> GroupName {
 fn test_worker_config() -> WorkerConfig {
     WorkerConfig {
         cluster_id: "local-beryl".to_string(),
+        host: "127.0.0.1".to_string(),
+        bind_host: "0.0.0.0".parse().unwrap(),
+        rpc_port: 9090,
+        http_port: 9091,
         identity_path: std::path::PathBuf::from("data/worker/worker.identity"),
         rpc_bind: "0.0.0.0:9090".to_string(),
-        rpc_advertised_endpoint: "http://127.0.0.1:9090".to_string(),
         rpc_max_inflight: 100,
         default_frame_size: 1024 * 1024,
         max_frame_size: 4 * 1024 * 1024,
@@ -66,20 +69,22 @@ fn test_worker_config() -> WorkerConfig {
         store: beryl_worker::config::WorkerStoreConfig::default(),
         net: WorkerNetConfig::grpc_from_rpc("0.0.0.0:9090".to_string(), 100, 4 * 1024 * 1024),
         metadata: WorkerRegistrationConfig::default(),
+        heartbeat_interval_ms: 1_000,
+        block_report_interval_ms: 1_000,
+        block_report_batch_size: 1_000,
+        block_cleanup: beryl_worker::config::WorkerBlockCleanupConfig::default(),
         observability: test_observability_config(),
     }
 }
 
 fn test_observability_config() -> beryl_common::observe::ObservabilityConfig {
     let mut flat = beryl_common::config::FlatConfig::new();
-    flat.set("observe.log.format", "compact");
-    flat.set("observe.log.output", "stderr");
+    flat.set("beryl.logging.format", "compact");
+    flat.set("beryl.logging.output", "stderr");
     flat.set(
-        "observe.log.level",
+        "beryl.logging.level",
         "info,beryl_metadata=info,beryl_worker=info,beryl_common=info,openraft=warn,tonic=warn,tower=warn,h2=warn",
     );
-    flat.set("observe.metrics.prometheus.bind", "127.0.0.1:19091");
-    flat.set("observe.metrics.prometheus.path", "/metrics");
     beryl_common::observe::ObservabilityConfig::from_flat(&flat).expect("test observe config")
 }
 
@@ -371,9 +376,9 @@ fn test_registration_config(endpoint: String) -> WorkerRegistrationConfig {
     WorkerRegistrationConfig {
         group_name: group_name(),
         endpoints: vec![endpoint],
-        register_timeout_ms: 1_000,
-        register_retry_initial_backoff_ms: 1,
-        register_retry_max_backoff_ms: 1,
+        request_timeout_ms: 1_000,
+        retry_initial_backoff_ms: 1,
+        retry_max_backoff_ms: 1,
     }
 }
 
@@ -609,10 +614,10 @@ async fn registrar_rejects_worker_run_id_mismatch() {
 }
 
 #[test]
-fn descriptor_from_config_uses_advertised_endpoint_not_bind() {
+fn descriptor_from_config_uses_public_host_and_rpc_port() {
     let mut config = test_worker_config();
     config.rpc_bind = "0.0.0.0:9090".to_string();
-    config.rpc_advertised_endpoint = "http://127.0.0.1:19090".to_string();
+    config.rpc_port = 19090;
     config.net =
         WorkerNetConfig::grpc_from_rpc(config.rpc_bind.clone(), config.rpc_max_inflight, config.max_frame_size);
 

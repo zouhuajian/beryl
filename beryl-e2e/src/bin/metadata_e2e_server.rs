@@ -14,6 +14,6 @@ async fn main() -> Result<(), DynError> {
         .nth(1)
         .ok_or("metadata-e2e-server requires a config path")?;
     let config = Arc::new(MetadataConfig::load(config_path)?);
-    let _observability = init_observability(config.as_ref())?;
-    MetadataServer::build(config).await?.serve().await
+    let observability = init_observability(config.as_ref())?;
+    MetadataServer::build(config).await?.serve(observability).await
 }

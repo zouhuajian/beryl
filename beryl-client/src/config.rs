@@ -7,7 +7,7 @@ use beryl_common::{ClientConfig as CommonClientConfig, CommonError, FlatConfig};
 use beryl_types::GroupName;
 use std::path::Path;
 
-pub const DEFAULT_CLIENT_NAME: &str = "default_client";
+pub const DEFAULT_CLIENT_NAME: &str = "default-client";
 pub const DEFAULT_OPERATION_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_WRITE_LEASE_RENEW_BEFORE_EXPIRY_MS: u64 = 30_000;
 pub const DEFAULT_WORKER_ENDPOINT_COOLDOWN_MS: u64 = 1_000;
@@ -23,9 +23,9 @@ pub struct ClientConfig {
     pub retry: RetryConfig,
     /// Client-side write lease renewal policy.
     pub write_lease: WriteLeaseConfig,
-    /// Channel/client pool configuration.
-    pub channel_pool: ChannelPoolConfig,
-    /// Configured metadata owner groups and their bootstrap endpoints.
+    /// Metadata and Worker connection reuse configuration.
+    pub connections: ConnectionConfig,
+    /// Bootstrap endpoints for the single supported metadata group.
     pub metadata_groups: Vec<MetadataGroupConfig>,
 }
 
@@ -38,19 +38,19 @@ pub struct MetadataGroupConfig {
     pub endpoints: Vec<String>,
 }
 
-/// Channel/client pool configuration.
+/// Metadata and Worker connection reuse configuration.
 #[derive(Clone, Debug)]
-pub struct ChannelPoolConfig {
-    /// Enable metadata channel/client reuse.
-    pub metadata_channel_pool_enabled: bool,
-    /// Maximum cached metadata channels per group.
-    pub metadata_channel_pool_max_per_group: usize,
-    /// Enable worker channel/client reuse.
-    pub worker_channel_pool_enabled: bool,
+pub struct ConnectionConfig {
+    /// Enable Metadata connection reuse.
+    pub metadata_enabled: bool,
+    /// Maximum cached Metadata connections per group.
+    pub metadata_max_per_group: usize,
+    /// Enable Worker connection reuse.
+    pub worker_enabled: bool,
     /// Maximum cached worker channels per worker identity.
-    pub worker_channel_pool_max_per_worker: usize,
+    pub worker_max_per_worker: usize,
     /// Cooldown duration after transient worker endpoint failures.
-    pub worker_endpoint_cooldown_ms: u64,
+    pub worker_failure_cooldown_ms: u64,
 }
 
 /// Retry configuration.
@@ -96,14 +96,14 @@ impl Default for WriteLeaseConfig {
     }
 }
 
-impl Default for ChannelPoolConfig {
+impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
-            metadata_channel_pool_enabled: true,
-            metadata_channel_pool_max_per_group: 1,
-            worker_channel_pool_enabled: true,
-            worker_channel_pool_max_per_worker: 1,
-            worker_endpoint_cooldown_ms: DEFAULT_WORKER_ENDPOINT_COOLDOWN_MS,
+            metadata_enabled: true,
+            metadata_max_per_group: 1,
+            worker_enabled: true,
+            worker_max_per_worker: 1,
+            worker_failure_cooldown_ms: DEFAULT_WORKER_ENDPOINT_COOLDOWN_MS,
         }
     }
 }
@@ -133,16 +133,15 @@ impl ClientConfig {
 
         let retry = retry_config_from_flat(&flat)?;
         let write_lease = write_lease_config_from_flat(&flat)?;
-        let channel_pool = channel_pool_config_from_flat(&flat)?;
-
-        let metadata_groups = parse_metadata_groups(&flat)?;
+        let connections = connection_config_from_flat(&flat)?;
+        let metadata_groups = parse_metadata_endpoints(&flat)?;
 
         Ok(Self {
             inner: CommonClientConfig::from_flat(flat),
             client_name,
             retry,
             write_lease,
-            channel_pool,
+            connections,
             metadata_groups,
         })
     }
@@ -159,133 +158,95 @@ impl ClientConfig {
 }
 
 fn client_name_from_flat(flat: &FlatConfig) -> Result<String, CommonError> {
-    if !flat.contains_key("client.name") {
+    const KEY: &str = "beryl.client.name";
+    if !flat.contains_key(KEY) {
         return Ok(DEFAULT_CLIENT_NAME.to_string());
     }
     let name = flat
-        .get_str("client.name")
-        .ok_or_else(|| invalid_config("client.name", "must be a string"))?;
+        .get_str(KEY)
+        .ok_or_else(|| invalid_config(KEY, "must be a string"))?;
     if name.trim().is_empty() {
-        return Err(invalid_config("client.name", "must not be blank"));
+        return Err(invalid_config(KEY, "must not be blank"));
     }
     Ok(name)
 }
 
-fn channel_pool_config_from_flat(flat: &FlatConfig) -> Result<ChannelPoolConfig, CommonError> {
-    let config = ChannelPoolConfig {
-        metadata_channel_pool_enabled: get_bool_or(
+fn connection_config_from_flat(flat: &FlatConfig) -> Result<ConnectionConfig, CommonError> {
+    let defaults = ConnectionConfig::default();
+    let config = ConnectionConfig {
+        metadata_enabled: get_bool_or(
             flat,
-            "client.channel_pool.metadata.enabled",
-            ChannelPoolConfig::default().metadata_channel_pool_enabled,
+            "beryl.client.metadata.connections.enabled",
+            defaults.metadata_enabled,
         )?,
-        metadata_channel_pool_max_per_group: get_usize_or_strict(
+        metadata_max_per_group: get_usize_or_strict(
             flat,
-            "client.channel_pool.metadata.max_per_group",
-            ChannelPoolConfig::default().metadata_channel_pool_max_per_group,
+            "beryl.client.metadata.connections.max",
+            defaults.metadata_max_per_group,
         )?,
-        worker_channel_pool_enabled: get_bool_or(
+        worker_enabled: get_bool_or(flat, "beryl.client.worker.connections.enabled", defaults.worker_enabled)?,
+        worker_max_per_worker: get_usize_or_strict(
             flat,
-            "client.channel_pool.worker.enabled",
-            ChannelPoolConfig::default().worker_channel_pool_enabled,
+            "beryl.client.worker.connections.max-per-worker",
+            defaults.worker_max_per_worker,
         )?,
-        worker_channel_pool_max_per_worker: get_usize_or_strict(
+        worker_failure_cooldown_ms: get_duration_ms_or(
             flat,
-            "client.channel_pool.worker.max_per_worker",
-            ChannelPoolConfig::default().worker_channel_pool_max_per_worker,
-        )?,
-        worker_endpoint_cooldown_ms: get_u64_or_strict(
-            flat,
-            "client.channel_pool.worker.endpoint_cooldown_ms",
-            ChannelPoolConfig::default().worker_endpoint_cooldown_ms,
+            "beryl.client.worker.connections.failure-cooldown",
+            defaults.worker_failure_cooldown_ms,
         )?,
     };
-    if config.metadata_channel_pool_max_per_group == 0 {
+    if config.metadata_max_per_group == 0 {
         return Err(invalid_config(
-            "client.channel_pool.metadata.max_per_group",
+            "beryl.client.metadata.connections.max",
             "must be greater than zero",
         ));
     }
-    if config.worker_channel_pool_max_per_worker == 0 {
+    if config.worker_max_per_worker == 0 {
         return Err(invalid_config(
-            "client.channel_pool.worker.max_per_worker",
+            "beryl.client.worker.connections.max-per-worker",
+            "must be greater than zero",
+        ));
+    }
+    if config.worker_failure_cooldown_ms == 0 {
+        return Err(invalid_config(
+            "beryl.client.worker.connections.failure-cooldown",
             "must be greater than zero",
         ));
     }
     Ok(config)
 }
 
-fn parse_metadata_groups(flat: &FlatConfig) -> Result<Vec<MetadataGroupConfig>, CommonError> {
-    let group_names = if let Some(groups_str) = flat.get_str("client.metadata.group.names") {
-        let groups = groups_str
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(GroupName::parse)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| {
-                CommonError::new(
-                    beryl_common::CommonErrorKind::InvalidArgument,
-                    format!("invalid client.metadata.group.names: {err}"),
-                )
-            })?;
-        if groups.is_empty() {
-            return Err(CommonError::new(
-                beryl_common::CommonErrorKind::InvalidArgument,
-                "client.metadata.group.names must contain at least one group name",
-            ));
-        }
-        groups
+fn parse_metadata_endpoints(flat: &FlatConfig) -> Result<Vec<MetadataGroupConfig>, CommonError> {
+    const KEY: &str = "beryl.client.metadata.addresses";
+    let endpoints = if flat.contains_key(KEY) {
+        flat.get_string_list(KEY)
+            .ok_or_else(|| invalid_config(KEY, "must be a list of addresses"))?
     } else {
-        vec![GroupName::parse("root").expect("default group name is valid")]
+        vec!["127.0.0.1:18080".to_string()]
     };
-
-    let explicit_group_names = flat.get_str("client.metadata.group.names").is_some();
-    group_names
-        .into_iter()
-        .map(|group_name| {
-            let key = format!("client.metadata.group.{}.endpoints", group_name.as_str());
-            let endpoints = match flat.get_str(&key) {
-                Some(raw) => {
-                    let endpoints = raw
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(ToOwned::to_owned)
-                        .collect::<Vec<_>>();
-                    if endpoints.is_empty() {
-                        return Err(CommonError::new(
-                            beryl_common::CommonErrorKind::InvalidArgument,
-                            format!("{key} must be configured and non-empty"),
-                        ));
-                    }
-                    endpoints
-                }
-                None if !explicit_group_names && group_name.as_str() == "root" => {
-                    vec!["127.0.0.1:18080".to_string()]
-                }
-                None => {
-                    return Err(CommonError::new(
-                        beryl_common::CommonErrorKind::InvalidArgument,
-                        format!("{key} must be configured and non-empty"),
-                    ));
-                }
-            };
-            Ok(MetadataGroupConfig { group_name, endpoints })
-        })
-        .collect()
+    if endpoints.is_empty() || endpoints.iter().any(|endpoint| endpoint.trim().is_empty()) {
+        return Err(invalid_config(KEY, "must contain at least one non-empty address"));
+    }
+    Ok(vec![MetadataGroupConfig {
+        group_name: GroupName::parse("root").expect("the supported metadata group is valid"),
+        endpoints,
+    }])
 }
 
 fn retry_config_from_flat(flat: &FlatConfig) -> Result<RetryConfig, CommonError> {
-    reject_removed_retry_keys(flat)?;
     let defaults = RetryConfig::default();
-    let max_attempts = get_usize_or_strict(flat, "client.retry.max_attempts", defaults.max_attempts)?;
+    let max_attempts = get_usize_or_strict(flat, "beryl.client.request.max-attempts", defaults.max_attempts)?;
     if max_attempts == 0 {
-        return Err(invalid_config("client.retry.max_attempts", "must be greater than zero"));
+        return Err(invalid_config(
+            "beryl.client.request.max-attempts",
+            "must be greater than zero",
+        ));
     }
-    let operation_timeout_ms = get_u64_or_strict(flat, "client.operation.timeout_ms", defaults.operation_timeout_ms)?;
+    let operation_timeout_ms = get_duration_ms_or(flat, "beryl.client.request.timeout", defaults.operation_timeout_ms)?;
     if operation_timeout_ms == 0 {
         return Err(invalid_config(
-            "client.operation.timeout_ms",
+            "beryl.client.request.timeout",
             "must be greater than zero",
         ));
     }
@@ -295,34 +256,19 @@ fn retry_config_from_flat(flat: &FlatConfig) -> Result<RetryConfig, CommonError>
     })
 }
 
-fn reject_removed_retry_keys(flat: &FlatConfig) -> Result<(), CommonError> {
-    for key in [
-        "client.retry.max_retry_attempts",
-        "client.refresh.max_attempts",
-        "client.backoff.initial_ms",
-        "client.backoff.max_ms",
-        "client.backoff.multiplier",
-    ] {
-        if flat.contains_key(key) {
-            return Err(invalid_config(key, "is no longer supported"));
-        }
-    }
-    Ok(())
-}
-
 fn write_lease_config_from_flat(flat: &FlatConfig) -> Result<WriteLeaseConfig, CommonError> {
     let defaults = WriteLeaseConfig::default();
     let config = WriteLeaseConfig {
-        auto_renew: get_bool_or(flat, "client.write_lease.auto_renew", defaults.auto_renew)?,
-        renew_before_expiry_ms: get_u64_or_strict(
+        auto_renew: get_bool_or(flat, "beryl.client.write-lease.auto-renew", defaults.auto_renew)?,
+        renew_before_expiry_ms: get_duration_ms_or(
             flat,
-            "client.write_lease.renew_before_expiry_ms",
+            "beryl.client.write-lease.renew-before-expiry",
             defaults.renew_before_expiry_ms,
         )?,
     };
     if config.renew_before_expiry_ms == 0 {
         return Err(invalid_config(
-            "client.write_lease.renew_before_expiry_ms",
+            "beryl.client.write-lease.renew-before-expiry",
             "must be greater than zero",
         ));
     }
@@ -337,32 +283,31 @@ fn get_usize_or_strict(flat: &FlatConfig, key: &'static str, default: usize) -> 
     }
 }
 
-fn get_u64_or_strict(flat: &FlatConfig, key: &'static str, default: u64) -> Result<u64, CommonError> {
-    match get_i64_or_strict(flat, key)? {
-        Some(value) if value >= 0 => Ok(value as u64),
-        Some(_) => Err(invalid_config(key, "must be non-negative")),
-        None => Ok(default),
+fn get_duration_ms_or(flat: &FlatConfig, key: &'static str, default: u64) -> Result<u64, CommonError> {
+    if !flat.contains_key(key) {
+        return Ok(default);
     }
+    let duration = flat
+        .get_duration(key)
+        .ok_or_else(|| invalid_config(key, "must be a duration such as 500ms or 30s"))?;
+    u64::try_from(duration.as_millis()).map_err(|_| invalid_config(key, "is too large"))
 }
 
 fn get_i64_or_strict(flat: &FlatConfig, key: &'static str) -> Result<Option<i64>, CommonError> {
-    if let Some(value) = flat.get_i64(key) {
-        return Ok(Some(value));
+    if !flat.contains_key(key) {
+        return Ok(None);
     }
-    if flat.get_str(key).is_some() {
-        return Err(invalid_config(key, "must be an integer"));
-    }
-    Ok(None)
+    flat.get_i64(key)
+        .map(Some)
+        .ok_or_else(|| invalid_config(key, "must be an integer"))
 }
 
 fn get_bool_or(flat: &FlatConfig, key: &'static str, default: bool) -> Result<bool, CommonError> {
-    if let Some(value) = flat.get_bool(key) {
-        return Ok(value);
+    if !flat.contains_key(key) {
+        return Ok(default);
     }
-    if flat.get_str(key).is_some() {
-        return Err(invalid_config(key, "must be a boolean"));
-    }
-    Ok(default)
+    flat.get_bool(key)
+        .ok_or_else(|| invalid_config(key, "must be a boolean"))
 }
 
 fn invalid_config(key: &'static str, detail: impl Into<String>) -> CommonError {
@@ -375,142 +320,53 @@ fn invalid_config(key: &'static str, detail: impl Into<String>) -> CommonError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_yaml::Value;
 
     #[test]
-    fn default_config_has_bounded_retry_and_deadline() {
+    fn defaults_cover_the_supported_single_group_client() {
         let config = ClientConfig::default();
+        assert_eq!(config.client_name(), "default-client");
         assert_eq!(config.retry.max_attempts(), 3);
         assert_eq!(config.retry.operation_timeout_ms, DEFAULT_OPERATION_TIMEOUT_MS);
-        assert!(config.write_lease.auto_renew);
-        assert_eq!(
-            config.write_lease.renew_before_expiry_ms,
-            DEFAULT_WRITE_LEASE_RENEW_BEFORE_EXPIRY_MS
-        );
-        assert!(config.channel_pool.metadata_channel_pool_enabled);
-        assert_eq!(config.channel_pool.metadata_channel_pool_max_per_group, 1);
-        assert!(config.channel_pool.worker_channel_pool_enabled);
-        assert_eq!(config.channel_pool.worker_channel_pool_max_per_worker, 1);
-        assert_eq!(
-            config.channel_pool.worker_endpoint_cooldown_ms,
-            DEFAULT_WORKER_ENDPOINT_COOLDOWN_MS
-        );
+        assert_eq!(config.metadata_groups.len(), 1);
+        assert_eq!(config.metadata_groups[0].group_name.as_str(), "root");
     }
 
     #[test]
-    fn client_name_defaults_preserves_nonblank_and_rejects_blank() {
-        assert_eq!(ClientConfig::default().client_name(), DEFAULT_CLIENT_NAME);
-
-        let mut named = FlatConfig::new();
-        named.set("client.name", " prod_ns01 ");
-        let config = ClientConfig::from_flat(named).expect("client name config");
-
-        assert_eq!(config.client_name(), " prod_ns01 ");
-
-        let mut blank = FlatConfig::new();
-        blank.set("client.name", "   ");
-        let err = ClientConfig::from_flat(blank).expect_err("blank client name must fail");
-
-        assert!(err.to_string().contains("client.name"));
-    }
-
-    #[test]
-    fn current_retry_and_deadline_keys_are_loaded() {
+    fn target_config_loads_typed_values() {
         let mut flat = FlatConfig::new();
-        flat.set("client.retry.max_attempts", 5i64);
-        flat.set("client.operation.timeout_ms", 7_000i64);
-        let config = ClientConfig::from_flat(flat).expect("retry config");
+        flat.set("beryl.client.name", "batch-reader");
+        flat.insert(
+            "beryl.client.metadata.addresses".to_string(),
+            Value::Sequence(vec![Value::String("metadata:18080".to_string())]),
+        );
+        flat.set("beryl.client.request.timeout", "7s");
+        flat.set("beryl.client.request.max-attempts", 5i64);
+        flat.set("beryl.client.metadata.connections.max", 2i64);
+        flat.set("beryl.client.metadata.connections.enabled", false);
+        flat.set("beryl.client.worker.connections.max-per-worker", 3i64);
+        flat.set("beryl.client.worker.connections.failure-cooldown", "2s");
+        flat.set("beryl.client.write-lease.auto-renew", false);
+        flat.set("beryl.client.write-lease.renew-before-expiry", "12s");
+
+        let config = ClientConfig::from_flat(flat).expect("target client config");
+
+        assert_eq!(config.client_name(), "batch-reader");
+        assert_eq!(config.metadata_groups[0].endpoints, vec!["metadata:18080"]);
         assert_eq!(config.retry.max_attempts(), 5);
         assert_eq!(config.retry.operation_timeout_ms, 7_000);
+        assert_eq!(config.connections.metadata_max_per_group, 2);
+        assert!(!config.connections.metadata_enabled);
+        assert_eq!(config.connections.worker_max_per_worker, 3);
+        assert_eq!(config.connections.worker_failure_cooldown_ms, 2_000);
+        assert!(!config.write_lease.auto_renew);
+        assert_eq!(config.write_lease.renew_before_expiry_ms, 12_000);
     }
 
     #[test]
-    fn channel_pool_config_is_loaded_from_flat_config() {
+    fn invalid_active_values_are_rejected() {
         let mut flat = FlatConfig::new();
-        flat.set("client.channel_pool.metadata.enabled", false);
-        flat.set("client.channel_pool.metadata.max_per_group", 2i64);
-        flat.set("client.channel_pool.worker.enabled", false);
-        flat.set("client.channel_pool.worker.max_per_worker", 3i64);
-        flat.set("client.channel_pool.worker.endpoint_cooldown_ms", 4_000i64);
-
-        let config = ClientConfig::from_flat(flat).expect("channel pool config");
-
-        assert!(!config.channel_pool.metadata_channel_pool_enabled);
-        assert_eq!(config.channel_pool.metadata_channel_pool_max_per_group, 2);
-        assert!(!config.channel_pool.worker_channel_pool_enabled);
-        assert_eq!(config.channel_pool.worker_channel_pool_max_per_worker, 3);
-        assert_eq!(config.channel_pool.worker_endpoint_cooldown_ms, 4_000);
-    }
-
-    #[test]
-    fn invalid_client_config_values_are_rejected() {
-        for key in [
-            "client.channel_pool.metadata.max_per_group",
-            "client.channel_pool.worker.max_per_worker",
-        ] {
-            let mut flat = FlatConfig::new();
-            flat.set(key, 0i64);
-            let err = ClientConfig::from_flat(flat).expect_err("invalid pool config must fail");
-            assert!(err.to_string().contains(key));
-        }
-
-        let mut flat = FlatConfig::new();
-        flat.set("client.metadata.group.names", "root,analytics");
-        flat.set("client.metadata.group.root.endpoints", "a,b");
-        let err = ClientConfig::from_flat(flat).expect_err("missing group endpoints must fail");
-        assert!(err.to_string().contains("client.metadata.group.analytics.endpoints"));
-
-        for key in ["client.retry.max_attempts", "client.operation.timeout_ms"] {
-            let mut flat = FlatConfig::new();
-            flat.set(key, 0i64);
-            let err = ClientConfig::from_flat(flat).expect_err("zero value must fail");
-            assert!(err.to_string().contains(key));
-        }
-
-        for key in [
-            "client.retry.max_retry_attempts",
-            "client.refresh.max_attempts",
-            "client.backoff.initial_ms",
-            "client.backoff.max_ms",
-            "client.backoff.multiplier",
-        ] {
-            let mut flat = FlatConfig::new();
-            flat.set(key, 1i64);
-            let err = ClientConfig::from_flat(flat).expect_err("removed key must fail");
-            assert!(err.to_string().contains(key));
-        }
-
-        for key in [
-            "client.write_lease.renew_before_expiry_ms",
-            "client.channel_pool.worker.endpoint_cooldown_ms",
-        ] {
-            let mut flat = FlatConfig::new();
-            flat.set(key, -1i64);
-            let err = ClientConfig::from_flat(flat).expect_err("negative value must fail");
-            assert!(err.to_string().contains(key));
-        }
-
-        let mut flat = FlatConfig::new();
-        flat.set("client.write_lease.renew_before_expiry_ms", 0i64);
-        let err = ClientConfig::from_flat(flat).expect_err("zero lease renewal threshold must fail");
-        assert!(err.to_string().contains("client.write_lease.renew_before_expiry_ms"));
-    }
-
-    #[test]
-    fn metadata_groups_parse_group_scoped_endpoints() {
-        let mut flat = FlatConfig::new();
-        flat.set("client.metadata.group.names", "root,analytics");
-        flat.set("client.metadata.group.root.endpoints", "a,b");
-        flat.set("client.metadata.group.analytics.endpoints", "c,d");
-
-        let config = ClientConfig::from_flat(flat).expect("metadata group endpoint config");
-
-        assert_eq!(config.metadata_groups.len(), 2);
-        assert_eq!(config.metadata_groups[0].group_name, GroupName::parse("root").unwrap());
-        assert_eq!(config.metadata_groups[0].endpoints, vec!["a", "b"]);
-        assert_eq!(
-            config.metadata_groups[1].group_name,
-            GroupName::parse("analytics").unwrap()
-        );
-        assert_eq!(config.metadata_groups[1].endpoints, vec!["c", "d"]);
+        flat.set("beryl.client.request.timeout", "0s");
+        assert!(ClientConfig::from_flat(flat).is_err());
     }
 }

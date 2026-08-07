@@ -69,10 +69,12 @@ impl MetadataRegistrar {
         let registration_endpoint = config
             .endpoints
             .first()
-            .ok_or_else(|| RegistrationError::InvalidConfig("worker.metadata.endpoints must not be empty".into()))?
+            .ok_or_else(|| {
+                RegistrationError::InvalidConfig("beryl.worker.metadata.addresses must not be empty".into())
+            })?
             .clone();
         let endpoint = Endpoint::from_shared(registration_endpoint)
-            .map_err(|err| RegistrationError::InvalidConfig(format!("worker.metadata.endpoints: {err}")))?;
+            .map_err(|err| RegistrationError::InvalidConfig(format!("beryl.worker.metadata.addresses: {err}")))?;
         Ok(Self {
             config,
             descriptor,
@@ -94,9 +96,7 @@ impl MetadataRegistrar {
             .ok_or_else(|| {
                 RegistrationError::InvalidConfig("worker registration requires a gRPC data listener".into())
             })?;
-        let (endpoint_host, endpoint_port) = config
-            .rpc_advertised_endpoint_parts()
-            .map_err(|err| RegistrationError::InvalidConfig(err.message))?;
+        let (endpoint_host, endpoint_port) = config.rpc_address_parts();
 
         Ok(RegistrationDescriptor {
             group_name: config.metadata.group_name.clone(),
@@ -104,7 +104,7 @@ impl MetadataRegistrar {
             worker_run_id: WorkerRunId::new(),
             endpoint_host,
             endpoint_port,
-            advertised_endpoint: config.rpc_advertised_endpoint.clone(),
+            advertised_endpoint: config.rpc_address(),
             worker_net_protocol: listener.protocol,
         })
     }
@@ -115,7 +115,7 @@ impl MetadataRegistrar {
     }
 
     async fn register_once_with_op(&self, op: &ControlOp) -> Result<Registration, RegistrationError> {
-        let timeout = Duration::from_millis(self.config.register_timeout_ms);
+        let timeout = Duration::from_millis(self.config.request_timeout_ms);
         let channel = self.connect(timeout).await?;
         let mut client = MetadataWorkerServiceProtoClient::new(channel);
         let request = self.build_request(op);
@@ -136,8 +136,8 @@ impl MetadataRegistrar {
         S: Future<Output = ()> + Send,
     {
         tokio::pin!(shutdown);
-        let mut backoff = Duration::from_millis(self.config.register_retry_initial_backoff_ms);
-        let max_backoff = Duration::from_millis(self.config.register_retry_max_backoff_ms);
+        let mut backoff = Duration::from_millis(self.config.retry_initial_backoff_ms);
+        let max_backoff = Duration::from_millis(self.config.retry_max_backoff_ms);
         let op = self.control_identity.new_op();
         loop {
             match self.register_once_with_op(&op).await {

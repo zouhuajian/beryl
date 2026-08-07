@@ -25,7 +25,7 @@ impl ClientMetrics for RecordingMetrics {
 #[tokio::test]
 async fn fs_client_accepts_public_metrics_sink() {
     let mut flat = beryl_common::FlatConfig::new();
-    flat.set("client.metadata.group.root.endpoints", "http://[invalid");
+    flat.set("beryl.client.metadata.addresses", vec!["http://[invalid".to_string()]);
     let config = ClientConfig::from_flat(flat).expect("client config");
     let metrics = Arc::new(RecordingMetrics::default());
     let client = FsClient::try_new_with_metrics(config, metrics.clone()).expect("client");

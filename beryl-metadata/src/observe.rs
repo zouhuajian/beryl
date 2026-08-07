@@ -62,8 +62,6 @@ pub(crate) const METADATA_DETACHED_ROOT_RECLAIM_LOGICAL_BYTES_TOTAL: &str =
     "metadata_detached_root_reclaim_logical_bytes_total";
 pub(crate) const METADATA_DETACHED_ROOT_RECLAIM_DURATION_SECONDS: &str =
     "metadata_detached_root_reclaim_duration_seconds";
-pub(crate) const METADATA_REPAIR_QUEUE_DEPTH: &str = "metadata_repair_queue_depth";
-pub(crate) const METADATA_REPAIR_ATTEMPTS_TOTAL: &str = "metadata_repair_attempts_total";
 
 pub(crate) fn record_metadata_started(service: &str, version: &str) {
     metrics::gauge!(METADATA_UP).set(1.0);
@@ -324,19 +322,6 @@ pub(crate) fn record_detached_root_reclaim_pass(
     }
 }
 
-pub(crate) fn set_repair_queue_depth(depth: usize) {
-    metrics::gauge!(METADATA_REPAIR_QUEUE_DEPTH).set(depth as f64);
-}
-
-pub(crate) fn record_repair_attempt(status: &str, error_kind: &str) {
-    metrics::counter!(
-        METADATA_REPAIR_ATTEMPTS_TOTAL,
-        "status" => status.to_string(),
-        "error_kind" => error_kind.to_string()
-    )
-    .increment(1);
-}
-
 pub(crate) fn metadata_error_kind(error: &MetadataError) -> &'static str {
     match error {
         MetadataError::NotFound(_) => "not_found",
@@ -454,7 +439,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn metadata_metric_contract_names() -> [&'static str; 49] {
+    fn metadata_metric_contract_names() -> [&'static str; 47] {
         [
             METADATA_UP,
             METADATA_BUILD_INFO,
@@ -503,8 +488,6 @@ mod tests {
             METADATA_DETACHED_ROOT_RECLAIM_ENTRIES_TOTAL,
             METADATA_DETACHED_ROOT_RECLAIM_LOGICAL_BYTES_TOTAL,
             METADATA_DETACHED_ROOT_RECLAIM_DURATION_SECONDS,
-            METADATA_REPAIR_QUEUE_DEPTH,
-            METADATA_REPAIR_ATTEMPTS_TOTAL,
         ]
     }
 
@@ -576,8 +559,6 @@ mod tests {
             "metadata_detached_root_reclaim_entries_total",
             "metadata_detached_root_reclaim_logical_bytes_total",
             "metadata_detached_root_reclaim_duration_seconds",
-            "metadata_repair_queue_depth",
-            "metadata_repair_attempts_total",
         ];
 
         assert_eq!(names, expected);
@@ -625,7 +606,6 @@ mod tests {
             METADATA_CLEANUP_CANDIDATES,
             METADATA_CLEANUP_READY_CANDIDATES,
             METADATA_CLEANUP_OLDEST_CANDIDATE_AGE_SECONDS,
-            METADATA_REPAIR_QUEUE_DEPTH,
         ] {
             assert!(
                 !name.ends_with("_total"),
@@ -667,8 +647,6 @@ mod tests {
         record_cleanup_retry();
         set_detached_root_reclaim_candidates(1, true, 0.5);
         record_detached_root_reclaim_pass("applied", 1, 128, 0.001);
-        set_repair_queue_depth(0);
-        record_repair_attempt("ok", "none");
     }
 
     #[test]

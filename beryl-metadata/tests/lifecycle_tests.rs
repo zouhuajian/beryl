@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use beryl_metadata::config::{MetadataConfig, RaftMode};
+use beryl_metadata::config::MetadataConfig;
 use beryl_metadata::lifecycle::{
     format_metadata_storage, metadata_marker_path, prepare_metadata_start, FormatState, MetadataStorageMarker,
 };
@@ -14,21 +14,17 @@ fn write_config(dir: &TempDir, group_name: &str, raft_mode: &str) -> std::path::
         &config_path,
         format!(
             r#"
-cluster.id: "test-cluster"
-metadata.storage.dir: "{}"
-metadata.group.name: "{group_name}"
-metadata.raft.mode: "{raft_mode}"
-metadata.raft.node_id: 1
-metadata.rpc.addr: "127.0.0.1"
-metadata.rpc.port: 18080
-metadata.bootstrap.ready.timeout_ms: 2000
-metadata.bootstrap.ready.warn_after_ms: 10
-metadata.bootstrap.ready.fail_fast: true
-observe.log.format: compact
-observe.log.output: stderr
-observe.log.level: "info,beryl_metadata=info,beryl_worker=info,beryl_common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"
-observe.metrics.prometheus.bind: "127.0.0.1:18081"
-observe.metrics.prometheus.path: "/metrics"
+beryl.cluster.id: "test-cluster"
+beryl.metadata.storage.dir: "{}"
+beryl.metadata.host: "127.0.0.1"
+beryl.metadata.bind-host: "127.0.0.1"
+beryl.metadata.rpc.port: 18080
+beryl.metadata.http.port: 18081
+beryl.metadata.startup.timeout: 2s
+beryl.metadata.startup.warn-after: 10ms
+beryl.logging.format: compact
+beryl.logging.output: stderr
+beryl.logging.level: "info,beryl_metadata=info,beryl_worker=info,beryl_common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"
 "#,
             storage_dir.display()
         ),
@@ -189,7 +185,7 @@ async fn metadata_format_refuses_non_empty_markerless_storage() {
     let err = format_metadata_storage(&config).await.unwrap_err();
     let message = err.to_string();
 
-    assert!(message.contains("metadata.storage.dir"));
+    assert!(message.contains("beryl.metadata.storage.dir"));
     assert!(message.contains(&config.storage_dir.display().to_string()));
     assert!(message.contains("marker missing"));
     assert!(message.contains("clean the directory manually"));
@@ -234,13 +230,19 @@ async fn metadata_start_fails_when_marker_exists_without_rocksdb_state() {
 #[tokio::test]
 async fn metadata_start_fails_on_marker_config_mismatch() {
     let dir = TempDir::new().unwrap();
-    let first_config_path = write_config(&dir, "root", "single");
-    let first_config = MetadataConfig::load(&first_config_path).unwrap();
-    format_metadata_storage(&first_config).await.unwrap();
+    let config_path = write_config(&dir, "root", "single");
+    let config = MetadataConfig::load(&config_path).unwrap();
+    format_metadata_storage(&config).await.unwrap();
+    let mut marker: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(metadata_marker_path(&config)).unwrap()).unwrap();
+    marker["group_name"] = serde_json::Value::String("other".to_string());
+    std::fs::write(
+        metadata_marker_path(&config),
+        serde_json::to_vec_pretty(&marker).unwrap(),
+    )
+    .unwrap();
 
-    let second_config_path = write_config(&dir, "other", "single");
-    let second_config = MetadataConfig::load(&second_config_path).unwrap();
-    let err = prepare_metadata_start(&second_config).await.unwrap_err();
+    let err = prepare_metadata_start(&config).await.unwrap_err();
 
     assert!(err.to_string().contains("metadata marker mismatch"));
     assert!(err.to_string().contains("group_name"));
@@ -327,7 +329,7 @@ async fn metadata_start_rejects_format_v1_with_explicit_reformat_error() {
 }
 
 #[tokio::test]
-async fn metadata_start_recovers_formatted_storage_without_reformatting() {
+async fn metadata_start_preserves_format_identity_and_rejects_rpc_address_drift() {
     let dir = TempDir::new().unwrap();
     let config_path = write_config(&dir, "root", "single");
     let config = MetadataConfig::load(&config_path).unwrap();
@@ -337,18 +339,14 @@ async fn metadata_start_recovers_formatted_storage_without_reformatting() {
     prepare_metadata_start(&config).await.unwrap();
 
     assert_eq!(std::fs::read(metadata_marker_path(&config)).unwrap(), marker_before);
-}
 
-#[tokio::test]
-async fn metadata_cluster_mode_fails_as_unsupported() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "root", "cluster");
-    let config = MetadataConfig::load(&config_path).unwrap();
-    assert_eq!(config.raft.mode, RaftMode::Cluster);
-
-    let format_err = format_metadata_storage(&config).await.unwrap_err();
-    let start_err = prepare_metadata_start(&config).await.unwrap_err();
-
-    assert!(format_err.to_string().contains("cluster Raft mode is not implemented"));
-    assert!(start_err.to_string().contains("cluster Raft mode is not implemented"));
+    let mut drifted = config.clone();
+    drifted.rpc_port += 1;
+    let error = prepare_metadata_start(&drifted)
+        .await
+        .expect_err("start must preserve the format-time membership address");
+    assert!(
+        error.to_string().contains("format-time Raft membership address"),
+        "{error}"
+    );
 }

@@ -26,9 +26,9 @@ async fn main() -> Result<(), DynError> {
             Ok(())
         }
         MetadataAction::Start => {
-            let _observability = init_observability(config.as_ref())?;
+            let observability = init_observability(config.as_ref())?;
             let server = MetadataServer::build(config).await?;
-            server.serve().await
+            server.serve(observability).await
         }
     }
 }
@@ -111,13 +111,13 @@ mod tests {
 
     #[test]
     fn valid_metadata_commands_parse() {
-        let format = parse(&["format", "--config", "conf/local/metadata.yaml"]).unwrap();
+        let format = parse(&["format", "--config", "conf/metadata.yaml"]).unwrap();
         assert!(matches!(format.action, MetadataAction::Format));
-        assert_eq!(format.config_path.as_deref(), Some("conf/local/metadata.yaml"));
+        assert_eq!(format.config_path.as_deref(), Some("conf/metadata.yaml"));
 
-        let start = parse(&["start", "--config", "conf/local/metadata.yaml"]).unwrap();
+        let start = parse(&["start", "--config", "conf/metadata.yaml"]).unwrap();
         assert!(matches!(start.action, MetadataAction::Start));
-        assert_eq!(start.config_path.as_deref(), Some("conf/local/metadata.yaml"));
+        assert_eq!(start.config_path.as_deref(), Some("conf/metadata.yaml"));
 
         let default_start = parse(&[]).unwrap();
         assert!(matches!(default_start.action, MetadataAction::Start));
@@ -149,11 +149,12 @@ mod tests {
         fs::write(
             &config_path,
             r#"
-observe.log.format: json
-observe.log.output: stdout
-observe.log.level: "warn"
-observe.metrics.prometheus.bind: "127.0.0.1:19081"
-observe.metrics.prometheus.path: "/metrics"
+beryl.metadata.bind-host: 127.0.0.1
+beryl.metadata.rpc.port: 19080
+beryl.metadata.http.port: 19081
+beryl.logging.format: json
+beryl.logging.output: stdout
+beryl.logging.level: "warn"
 "#,
         )
         .unwrap();
@@ -163,12 +164,12 @@ observe.metrics.prometheus.path: "/metrics"
 
         assert_eq!(config.observability.log.format, "json");
         assert_eq!(config.observability.log.output, "stdout");
-        assert_eq!(config.observability.metrics.prometheus.bind, "127.0.0.1:19081");
+        assert_eq!(config.http_addr(), "127.0.0.1:19081".parse().unwrap());
     }
 
     #[test]
     fn metadata_config_path_requires_explicit_config_flag() {
-        let err = parse(&["conf/local/metadata.yaml"])
+        let err = parse(&["conf/metadata.yaml"])
             .err()
             .expect("positional metadata config path must fail");
         assert!(err.to_string().contains("--config"));

@@ -3,7 +3,7 @@
 
 //! Detection and scheduling of reported block replicas no longer referenced by metadata.
 
-use crate::config::CleanupConfig;
+use crate::config::BlockCleanupConfig;
 use crate::error::MetadataResult;
 use crate::observe;
 use crate::raft::{AppRaftNode, RocksDBStorage};
@@ -141,7 +141,7 @@ pub(crate) struct BlockCleanupCoordinator {
     reclaim_grace: Duration,
     max_replicas_per_scan: usize,
     max_candidates: usize,
-    dispatch_enabled: bool,
+    enabled: bool,
     max_commands_per_heartbeat: usize,
     retry_initial_backoff: Duration,
     retry_max_backoff: Duration,
@@ -159,7 +159,7 @@ impl BlockCleanupCoordinator {
         worker_manager: Arc<WorkerManager>,
         session_registry: Arc<SessionRegistry>,
         group_name: GroupName,
-        config: &CleanupConfig,
+        config: &BlockCleanupConfig,
     ) -> Self {
         Self {
             raft_node,
@@ -171,7 +171,7 @@ impl BlockCleanupCoordinator {
             reclaim_grace: Duration::from_millis(config.reclaim_grace_ms),
             max_replicas_per_scan: config.max_replicas_per_scan,
             max_candidates: config.max_candidates,
-            dispatch_enabled: config.dispatch_enabled,
+            enabled: config.enabled,
             max_commands_per_heartbeat: config.max_commands_per_heartbeat,
             retry_initial_backoff: Duration::from_millis(config.retry_initial_backoff_ms),
             retry_max_backoff: Duration::from_millis(config.retry_max_backoff_ms),
@@ -182,6 +182,10 @@ impl BlockCleanupCoordinator {
     /// Interval owned by this coordinator's cleanup observation loop.
     pub(crate) fn scan_interval(&self) -> Duration {
         self.scan_interval
+    }
+
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
     }
 
     /// Selects due cleanup commands for one accepted worker heartbeat.
@@ -197,7 +201,7 @@ impl BlockCleanupCoordinator {
         worker_run_id: WorkerRunId,
         now: Instant,
     ) -> Vec<BlockCleanupCommand> {
-        if !self.dispatch_enabled || group_name != &self.group_name {
+        if !self.enabled || group_name != &self.group_name {
             return Vec::new();
         }
         let Some(term) = self.current_leader_term() else {
@@ -305,6 +309,9 @@ impl BlockCleanupCoordinator {
     /// verification and absence-based retirement are committed only after the
     /// listing reaches EOF in the same leader term.
     pub(crate) async fn scan_once(&self) -> MetadataResult<()> {
+        if !self.enabled {
+            return Ok(());
+        }
         let Some(scan_term) = self.current_leader_term() else {
             self.state.lock().active_cycle = None;
             observe::record_cleanup_scan("not_leader");
@@ -664,13 +671,13 @@ mod tests {
         GroupName::parse("root").unwrap()
     }
 
-    fn cleanup_config() -> CleanupConfig {
-        CleanupConfig {
+    fn cleanup_config() -> BlockCleanupConfig {
+        BlockCleanupConfig {
             scan_interval_ms: 1_000,
             reclaim_grace_ms: 100,
             max_replicas_per_scan: 100,
             max_candidates: 100,
-            dispatch_enabled: false,
+            enabled: true,
             max_commands_per_heartbeat: 2,
             retry_initial_backoff_ms: 10,
             retry_max_backoff_ms: 40,
@@ -825,7 +832,7 @@ mod tests {
 
     async fn coordinator(
         dir: &TempDir,
-        config: CleanupConfig,
+        config: BlockCleanupConfig,
         leader: bool,
     ) -> (
         BlockCleanupCoordinator,
@@ -835,7 +842,7 @@ mod tests {
     ) {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let raft_node = test_raft(Arc::clone(&storage), leader).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let session_registry = Arc::new(SessionRegistry::default());
         let coordinator = BlockCleanupCoordinator::new(
             raft_node,
@@ -1306,7 +1313,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut config = cleanup_config();
         config.max_replicas_per_scan = 1;
-        config.dispatch_enabled = true;
+        config.enabled = true;
         config.reclaim_grace_ms = 0;
         let (coordinator, _storage, worker_manager, _sessions) = coordinator(&dir, config, true).await;
         let old_run: WorkerRunId = "550e8400-e29b-41d4-a716-446655440301".parse().unwrap();
@@ -1368,7 +1375,7 @@ mod tests {
     async fn report_change_after_classification_is_rejected_before_dispatch() {
         let dir = TempDir::new().unwrap();
         let mut config = cleanup_config();
-        config.dispatch_enabled = true;
+        config.enabled = true;
         config.reclaim_grace_ms = 0;
         let (coordinator, _storage, worker_manager, _sessions) = coordinator(&dir, config, true).await;
         let listed = replica(66, 0, 1);
@@ -1407,7 +1414,7 @@ mod tests {
     async fn cleanup_dispatch_revalidates_session_and_inode_authority() {
         let dir = TempDir::new().unwrap();
         let mut config = cleanup_config();
-        config.dispatch_enabled = true;
+        config.enabled = true;
         config.reclaim_grace_ms = 0;
         let (coordinator, storage, worker_manager, sessions) = coordinator(&dir, config, true).await;
         let session_started = replica(67, 0, 1);
@@ -1477,7 +1484,7 @@ mod tests {
     async fn cleanup_dispatch_requires_enablement_current_term_grace_and_retry_deadline() {
         let dir = TempDir::new().unwrap();
         let mut config = cleanup_config();
-        config.dispatch_enabled = true;
+        config.enabled = true;
         config.reclaim_grace_ms = 1;
         let retry_initial = Duration::from_millis(config.retry_initial_backoff_ms);
         let (coordinator, _storage, worker_manager, _sessions) = coordinator(&dir, config, true).await;
@@ -1556,7 +1563,9 @@ mod tests {
     #[tokio::test]
     async fn cleanup_dispatch_explicit_disablement_and_follower_state_return_no_commands() {
         let dir = TempDir::new().unwrap();
-        let (disabled, _storage, workers, _sessions) = coordinator(&dir, cleanup_config(), true).await;
+        let mut disabled_config = cleanup_config();
+        disabled_config.enabled = false;
+        let (disabled, _storage, workers, _sessions) = coordinator(&dir, disabled_config, true).await;
         let candidate = replica(71, 0, 19);
         publish_report(&workers, std::slice::from_ref(&candidate));
         let now = Instant::now();
@@ -1576,9 +1585,7 @@ mod tests {
             .is_empty());
 
         let follower_dir = TempDir::new().unwrap();
-        let mut enabled = cleanup_config();
-        enabled.dispatch_enabled = true;
-        let (follower, _storage, workers, _sessions) = coordinator(&follower_dir, enabled, false).await;
+        let (follower, _storage, workers, _sessions) = coordinator(&follower_dir, cleanup_config(), false).await;
         publish_report(&workers, std::slice::from_ref(&candidate));
         follower.state.lock().entries.insert(
             candidate.clone(),
@@ -1599,7 +1606,7 @@ mod tests {
     async fn cleanup_dispatch_is_bounded_fair_and_drops_candidates_after_report_or_run_change() {
         let dir = TempDir::new().unwrap();
         let mut config = cleanup_config();
-        config.dispatch_enabled = true;
+        config.enabled = true;
         config.reclaim_grace_ms = 1;
         config.max_commands_per_heartbeat = 2;
         config.retry_max_backoff_ms = config.retry_initial_backoff_ms;

@@ -112,14 +112,14 @@ The current product boundary is:
 | Metadata restart safety | Strong foundation | Active writes fail closed; durable state and snapshots are restored |
 | Worker restart convergence | Strong foundation | Registration and full report rebuild current locations |
 | Recursive namespace delete | In review | Bounded detach and detached-root reclamation are validated separately before landing |
-| Physical block cleanup | Functionally complete at small scale | Exact stamped commands and crash recovery; full scan stops progressing above its current listing limit |
+| Physical block cleanup | Strong foundation | Bounded paged scan cycles, exact stamped commands, and crash recovery |
 | Client retry semantics | Strong foundation | Response identity validation, freshness refresh, and explicit UnknownOutcome |
-| Large directory handling | Partial | Cursor exists, but zero limit means unbounded server response |
+| Large directory handling | Strong foundation | Cursor pagination with server-enforced default and maximum page sizes |
 | Large file metadata | Incomplete | PublishFile carries and rewrites the complete extent vector |
 | Block report scalability | Incomplete | Delta processing rebuilds full worker and global location state |
 | UFS read-through | Not implemented | Adapter-only boundary |
 | Admission and eviction | Not implemented | Capacity exhaustion is not a cache policy |
-| Replication and repair | Not implemented | Internal repair queue has no production execution or acknowledgement path |
+| Replication and repair | Not implemented | No production queue, transfer protocol, or acknowledgement surface |
 | Metadata high availability | Not implemented | Peer RPC is fail closed and cluster mode is rejected |
 | Security and tenancy | Development only | No productized mTLS, authentication, authorization, or quota |
 | Upgrade and backup | Development only | Schema mismatch requires reformat; no production migration or restore workflow |
@@ -145,28 +145,7 @@ Before this work is published:
 - Confirm restart continuation and deterministic apply under very small reclaim
   budgets.
 
-#### B. Cleanup loses progress above the replica scan limit
-
-Cleanup currently copies at most metadata.cleanup.max_replicas_per_scan Ready
-replicas. The default is 10,000. An incomplete listing clears candidates and
-skips classification.
-
-This behavior is fail closed but not live: a sufficiently large group can stop
-physical reclamation indefinitely.
-
-The replacement must:
-
-- Scan in stable pages.
-- Bind every page to the same leader term and cycle-start maximum Worker ID;
-  capture each Worker's block high watermark when first entering that Worker.
-- Commit candidate retirement only after a complete scan cycle.
-- Allow report churn during a weakly consistent traversal; exact worker run,
-  block, stamp, and Ready-state revalidation fences dispatch.
-- Discard the cycle when the leader term changes.
-- Bound page size, candidate memory, and per-pass work without stopping global
-  progress.
-
-#### C. Public and replicated inputs lack complete hard limits
+#### B. Public and replicated inputs lack complete hard limits
 
 The following paths need explicit server-side limits:
 
@@ -183,7 +162,7 @@ The following paths need explicit server-side limits:
 Transport defaults are not a stable product invariant. Limits must be explicit,
 versioned where they affect Raft apply, observable, and tested.
 
-#### D. Large file metadata remains unbounded
+#### C. Large file metadata remains unbounded
 
 PublishFile contains a complete vector of extents. Apply sorts, validates,
 clones, and rewrites the entire file inode. Read paths also clone and filter the
@@ -235,16 +214,7 @@ The target complexity is:
 - Full report: O(worker blocks plus changed location entries).
 - Worker expiry or new run: O(worker blocks), not O(all global blocks).
 
-#### C. Repair and rebalance code is not an active lifecycle
-
-Metadata starts lost-worker, rebalance, and repair-timeout loops and can enqueue
-repair tasks. Worker heartbeat only carries cleanup commands. No production
-caller polls repair tasks and no transfer or acknowledgement protocol exists.
-
-This is misleading production machinery. Remove or disable it until a complete
-ReplicaTransfer lifecycle exists.
-
-#### D. Large-file client APIs are convenience-buffered
+#### C. Large-file client APIs are convenience-buffered
 
 The client can buffer a complete configured block and read_all reserves memory
 for the complete file. These APIs are acceptable conveniences only when their
@@ -873,18 +843,15 @@ The next concrete work should be created in this order:
 
 1. CORE-001: Review and validate exact-path Delete apply.
 2. CORE-002: Land bounded Delete on a trusted release baseline.
-3. CORE-003: Add complete-cycle pagination to block cleanup.
-4. CORE-004: Add default and maximum ListStatus page sizes.
-5. CORE-005: Define hard block, report, commit, and Raft command limits.
+3. CORE-005: Define hard block, report, commit, and Raft command limits.
 
 ### P1
 
 1. CORE-101: Make delta block-report indexing incremental.
-2. CORE-102: Remove incomplete repair and rebalance production loops.
-3. CORE-103: Add paged extent storage and atomic revision switch.
-4. CORE-104: Add bounded streaming reads to the Rust client.
-5. CORE-105: Add Metadata inflight limits and load rejection.
-6. CORE-106: Repair documentation and macOS build bootstrap.
+2. CORE-103: Add paged extent storage and atomic revision switch.
+3. CORE-104: Add bounded streaming reads to the Rust client.
+4. CORE-105: Add Metadata inflight limits and load rejection.
+5. CORE-106: Repair documentation and macOS build bootstrap.
 
 ### P2
 

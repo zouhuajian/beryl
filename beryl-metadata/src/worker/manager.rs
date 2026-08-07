@@ -374,12 +374,12 @@ pub struct WorkerManager {
     /// Ready evidence is leader-local and reconstructable. The revision only
     /// wakes waiters so they can rebuild and revalidate a complete snapshot.
     publication_observation: watch::Sender<u64>,
-    /// Heartbeat timeout in seconds.
-    heartbeat_timeout_sec: u64,
+    /// Heartbeat timeout shared by RPC responses and all soft-state checks.
+    heartbeat_timeout_ms: u32,
 }
 
 impl WorkerManager {
-    pub fn new(heartbeat_timeout_sec: u64) -> Self {
+    pub fn new(heartbeat_timeout_ms: u32) -> Self {
         let (publication_observation, _) = watch::channel(0);
         Self {
             descriptors: Arc::new(RwLock::new(HashMap::new())),
@@ -389,7 +389,7 @@ impl WorkerManager {
             locations: Arc::new(RwLock::new(HashMap::new())),
             block_reports: Arc::new(RwLock::new(BTreeMap::new())),
             publication_observation,
-            heartbeat_timeout_sec,
+            heartbeat_timeout_ms,
         }
     }
 
@@ -398,13 +398,13 @@ impl WorkerManager {
             .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
-    /// Get heartbeat timeout in seconds.
-    pub fn heartbeat_timeout_sec(&self) -> u64 {
-        self.heartbeat_timeout_sec
+    /// Returns the exact timeout carried by heartbeat responses.
+    pub fn heartbeat_timeout_ms(&self) -> u32 {
+        self.heartbeat_timeout_ms
     }
 
     fn heartbeat_timeout(&self) -> Duration {
-        Duration::from_secs(self.heartbeat_timeout_sec)
+        Duration::from_millis(u64::from(self.heartbeat_timeout_ms))
     }
 
     /// Drops live registration and reconstructable report state on metadata restart.
@@ -1821,7 +1821,7 @@ impl WorkerManager {
     pub fn is_blockreport_converged(&self, now_ms: u64) -> BlockReportConvergenceSnapshot {
         const DEFAULT_THRESHOLD: f64 = 0.80;
 
-        let active_ttl_ms = self.heartbeat_timeout_sec * 1000;
+        let active_ttl_ms = u64::from(self.heartbeat_timeout_ms);
         self.blockreport_convergence_snapshot(now_ms, active_ttl_ms, DEFAULT_THRESHOLD)
     }
 }
@@ -1928,7 +1928,7 @@ mod tests {
 
     #[test]
     fn publication_ready_check_requires_current_live_exact_worker_evidence() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let group_name_value = group_name("g-publish");
         let worker_id = WorkerId::new(5);
         let run_id = report_run_id();
@@ -1975,7 +1975,7 @@ mod tests {
 
     #[test]
     fn publication_ready_check_rejects_run_stamp_endpoint_and_unreadable_conflicts() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let group_name_value = group_name("g-conflict");
         let worker_id = WorkerId::new(5);
         let run_id = report_run_id();
@@ -2049,7 +2049,7 @@ mod tests {
 
     #[tokio::test]
     async fn publication_observation_does_not_lose_report_before_wait() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let group_name_value = group_name("g-watch");
         let worker_id = WorkerId::new(5);
         let run_id = report_run_id();
@@ -2090,7 +2090,7 @@ mod tests {
 
     #[test]
     fn full_report_batches_publish_only_after_final_batch() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let group_name_value = group_name("g21");
         let worker_id = WorkerId::new(5);
         let run_id = report_run_id();
@@ -2122,7 +2122,7 @@ mod tests {
 
     #[test]
     fn ready_replica_pages_require_current_run_and_reach_eof_in_stable_order() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let local_group = group_name("g-ready");
         let other_group = group_name("g-other");
         let worker_id = WorkerId::new(15);
@@ -2219,7 +2219,7 @@ mod tests {
 
     #[test]
     fn ready_replica_pages_follow_full_and_delta_report_state() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let local_group = group_name("g-ready-report-state");
         let worker_id = WorkerId::new(16);
         let run_id = report_run_id();
@@ -2275,7 +2275,7 @@ mod tests {
 
     #[test]
     fn ready_replica_cursor_advances_past_a_nonready_worker() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let local_group = group_name("g-ready-workers");
         let receiving_worker = WorkerId::new(18);
         let ready_worker = WorkerId::new(19);
@@ -2322,7 +2322,7 @@ mod tests {
     fn ready_replica_pages_traverse_more_than_ten_thousand_blocks_during_other_worker_full_reports() {
         const BLOCK_COUNT: usize = 10_001;
         const PAGE_SIZE: usize = 1_000;
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let local_group = group_name("g-ready-large");
         let worker_id = WorkerId::new(17);
         let run_id = report_run_id();
@@ -2389,7 +2389,7 @@ mod tests {
 
     #[test]
     fn exact_ready_replica_check_tracks_report_and_run_changes() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let local_group = group_name("g-cleanup-ready");
         let worker_id = WorkerId::new(17);
         let run_id = report_run_id();
@@ -2482,7 +2482,7 @@ mod tests {
 
     #[test]
     fn final_full_report_marks_active_worker_converged() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let group_name_value = group_name("g22");
         let worker_id = WorkerId::new(6);
         let run_id = report_run_id();
@@ -2509,7 +2509,7 @@ mod tests {
 
     #[test]
     fn stale_full_report_seq_cannot_roll_back_published_view() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let group_name_value = group_name("g25");
         let worker_id = WorkerId::new(9);
         let run_id = report_run_id();
@@ -2538,7 +2538,7 @@ mod tests {
 
     #[test]
     fn full_report_rejects_sequence_run_and_registration_errors() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let group_name_value = group_name("g22");
         let worker_id = WorkerId::new(6);
         let run_id = report_run_id();
@@ -2575,7 +2575,7 @@ mod tests {
 
     #[test]
     fn delta_report_requires_ready_baseline_and_ordered_sequence() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let group_name_value = group_name("g23");
         let worker_id = WorkerId::new(7);
         let run_id = report_run_id();
@@ -2665,7 +2665,7 @@ mod tests {
 
     #[test]
     fn recreated_report_runtime_requires_full_report_again() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let group_name_value = group_name("g24");
         let worker_id = WorkerId::new(8);
         let run_id = report_run_id();
@@ -2714,7 +2714,7 @@ mod tests {
 
     #[test]
     fn soft_state_reset_clears_ready_report_authority() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let group_name_value = group_name("g-reset-report-state");
         let worker_id = WorkerId::new(9);
         let run_id = report_run_id();
@@ -2739,7 +2739,7 @@ mod tests {
 
     #[test]
     fn reported_block_locations_are_group_qualified() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let first_group = group_name("g31");
         let second_group = group_name("g32");
         let first_worker = WorkerId::new(10);
@@ -2806,7 +2806,7 @@ mod tests {
 
     #[test]
     fn worker_descriptor_runtime_and_liveness_are_group_scoped() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let worker_id = WorkerId::new(7);
         let first_group = group_name("g11");
         let second_group = group_name("g12");
@@ -2894,7 +2894,7 @@ mod tests {
 
     #[test]
     fn worker_run_registration_same_run_same_descriptor_is_idempotent() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let worker_id = WorkerId::new(1);
         let group_name_value = group_name("g1");
         let first_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440020".parse().unwrap();
@@ -2960,7 +2960,7 @@ mod tests {
                 "550e8400-e29b-41d4-a716-446655440022".parse().unwrap(),
             ),
         ] {
-            let manager = WorkerManager::new(60);
+            let manager = WorkerManager::new(60_000);
             let group_name_value = group_name("g1");
             register_live_report_worker(&manager, &group_name_value, worker_id, run_id);
             manager
@@ -3007,7 +3007,7 @@ mod tests {
 
     #[test]
     fn worker_run_registration_replaces_restart_and_resets_run_state() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let worker_id = WorkerId::new(4);
         let group_name_value = group_name("g1");
         let first_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440023".parse().unwrap();
@@ -3144,7 +3144,7 @@ mod tests {
 
     #[test]
     fn worker_run_registration_updates_endpoint_when_previous_run_is_not_live() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let worker_id = WorkerId::new(5);
         let group_name_value = group_name("g1");
         let first_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440025".parse().unwrap();
@@ -3183,7 +3183,7 @@ mod tests {
 
     #[test]
     fn worker_run_registration_rejects_live_endpoint_conflict() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let worker_id = WorkerId::new(6);
         let group_name_value = group_name("g1");
         let first_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440027".parse().unwrap();
@@ -3206,7 +3206,7 @@ mod tests {
 
     #[test]
     fn loading_persisted_workers_drops_live_run_registration() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let worker_id = WorkerId::new(1);
         let group_name_value = group_name("g1");
         let run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440030".parse().unwrap();
@@ -3271,7 +3271,7 @@ mod tests {
 
     #[test]
     fn worker_heartbeat_updates_live_state_without_moving_stale_seq_backward() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let group_name_value = group_name("g1");
         let worker_id = WorkerId::new(1);
         let run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440040".parse().unwrap();
@@ -3335,7 +3335,7 @@ mod tests {
 
     #[test]
     fn heartbeat_liveness_expiry_removes_runtime_but_keeps_registration() {
-        let manager = WorkerManager::new(1);
+        let manager = WorkerManager::new(1_000);
         let group_name_value = group_name("g1");
         let worker_id = WorkerId::new(1);
         let run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440041".parse().unwrap();
@@ -3384,7 +3384,7 @@ mod tests {
 
     #[test]
     fn remove_dead_worker_clears_runtime_state_but_keeps_descriptor() {
-        let manager = WorkerManager::new(60);
+        let manager = WorkerManager::new(60_000);
         let group_name_value = group_name("g1");
         let worker_id = WorkerId::new(1);
         let run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440042".parse().unwrap();

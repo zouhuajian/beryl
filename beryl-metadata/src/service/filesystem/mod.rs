@@ -825,7 +825,7 @@ mod tests {
     }
 
     pub(super) fn worker_manager_for_write_targets(group_name: &GroupName) -> Arc<WorkerManager> {
-        let manager = Arc::new(WorkerManager::new(60));
+        let manager = Arc::new(WorkerManager::new(60_000));
         for raw in 1..=3 {
             let worker_id = beryl_types::ids::WorkerId::new(raw);
             manager

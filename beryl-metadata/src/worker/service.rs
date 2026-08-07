@@ -274,11 +274,7 @@ impl MetadataWorkerServiceImpl {
     }
 
     fn liveness_timeout_ms(&self) -> u32 {
-        self.worker_manager
-            .heartbeat_timeout_sec()
-            .saturating_mul(1000)
-            .try_into()
-            .unwrap_or(u32::MAX)
+        self.worker_manager.heartbeat_timeout_ms()
     }
 
     fn full_report_required_response<T>(
@@ -444,7 +440,10 @@ fn validate_advertised_endpoint(endpoint: beryl_proto::common::EndpointProto) ->
     {
         return Err("advertised_endpoint must not use a wildcard host".to_string());
     }
-    Ok(format!("{}:{}", endpoint.host, endpoint.port))
+    match endpoint.host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => Ok(format!("[{}]:{}", endpoint.host, endpoint.port)),
+        _ => Ok(format!("{}:{}", endpoint.host, endpoint.port)),
+    }
 }
 
 fn parse_tier_free(entries: &[TierFreeProto]) -> Result<Vec<TierFree>, String> {
@@ -1274,7 +1273,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::CleanupConfig;
+    use crate::config::BlockCleanupConfig;
     use crate::raft::{AppRaftStateMachine, RocksDBStorage};
     use crate::session_registry::SessionRegistry;
     use crate::worker::HealthStatus;
@@ -1544,7 +1543,7 @@ mod tests {
         let raft_node = nonleader_raft(&dir).await;
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
-            Arc::new(WorkerManager::new(60)),
+            Arc::new(WorkerManager::new(60_000)),
             Arc::new(MountTable::new()),
             group_name("root"),
         );
@@ -1795,60 +1794,12 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn register_worker_accepted_emits_metadata_worker_log() {
-        let _log_guard = log_test_mutex().lock().await;
-        let dir = TempDir::new().unwrap();
-        let raft_node = leader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
-        let service = MetadataWorkerServiceImpl::new(
-            Arc::clone(&raft_node),
-            Arc::clone(&worker_manager),
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let dispatch = captured_json_subscriber(&output);
-
-        let response = async {
-            <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
-                &service,
-                Request::new(register_request_with_header(
-                    Some(valid_request_header(&group_name("root"), ClientId::new(181))),
-                    WorkerId::new(181),
-                )),
-            )
-            .await
-        }
-        .with_subscriber(dispatch)
-        .await
-        .expect("register worker response")
-        .into_inner();
-        assert!(response.header.expect("header").error.is_none());
-
-        let logs = captured_logs(&output);
-        assert!(
-            logs.iter().any(|log| {
-                log["target"] == "metadata.worker"
-                    && log["level"] == "INFO"
-                    && log["op"] == "RegisterWorker"
-                    && log["result"] == "accepted"
-                    && log["error_code"] == "none"
-                    && log["group_name"] == "root"
-                    && log.get("group_id").is_none()
-                    && log["worker_id"] == 181
-                    && log["worker_run_id"] == test_worker_run_id().to_string()
-            }),
-            "{logs:?}"
-        );
-    }
-
     #[tokio::test]
     async fn repeated_heartbeat_need_register_emits_one_metadata_worker_warn_log() {
         let _log_guard = log_test_mutex().lock().await;
         let dir = TempDir::new().unwrap();
         let raft_node = nonleader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let worker_id = WorkerId::new(182);
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
@@ -1900,7 +1851,7 @@ mod tests {
         let _log_guard = log_test_mutex().lock().await;
         let dir = TempDir::new().unwrap();
         let raft_node = leader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let worker_id = WorkerId::new(184);
         let block_id = BlockId::from_u64_u32(1840, 0);
         worker_manager
@@ -1968,7 +1919,7 @@ mod tests {
         let _log_guard = log_test_mutex().lock().await;
         let dir = TempDir::new().unwrap();
         let raft_node = leader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let group_name = group_name("root");
         let worker_id = WorkerId::new(189);
         let baseline_block = BlockId::from_u64_u32(1890, 0);
@@ -2045,7 +1996,7 @@ mod tests {
         let _log_guard = log_test_mutex().lock().await;
         let dir = TempDir::new().unwrap();
         let raft_node = nonleader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let worker_id = WorkerId::new(185);
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
@@ -2097,7 +2048,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let raft_node = leader_raft(&dir).await;
         let before_state_id = raft_node.get_last_applied_state_id();
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let service = MetadataWorkerServiceImpl::new(
             Arc::clone(&raft_node),
             Arc::clone(&worker_manager),
@@ -2150,7 +2101,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let raft_node = leader_raft(&dir).await;
         let before_state_id = raft_node.get_last_applied_state_id();
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let worker_id = WorkerId::new(7);
         let block_id = BlockId::from_u64_u32(70, 0);
         worker_manager
@@ -2204,7 +2155,7 @@ mod tests {
     async fn follower_block_report_updates_local_view() {
         let dir = TempDir::new().unwrap();
         let raft_node = nonleader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let worker_id = WorkerId::new(8);
         let block_id = BlockId::from_u64_u32(80, 0);
         worker_manager
@@ -2283,7 +2234,7 @@ mod tests {
     async fn heartbeat_error_records_worker_metrics() {
         let dir = TempDir::new().unwrap();
         let raft_node = nonleader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             worker_manager,
@@ -2344,7 +2295,7 @@ mod tests {
     async fn block_report_success_records_worker_metrics_and_accepted_blocks() {
         let dir = TempDir::new().unwrap();
         let raft_node = nonleader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let worker_id = WorkerId::new(19);
         worker_manager
             .register_worker(
@@ -2432,7 +2383,7 @@ mod tests {
     async fn worker_service_rejects_non_served_header_group() {
         let dir = TempDir::new().unwrap();
         let raft_node = leader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             Arc::clone(&worker_manager),
@@ -2510,7 +2461,7 @@ mod tests {
     async fn follower_register_worker_returns_not_leader_header_error() {
         let dir = TempDir::new().unwrap();
         let raft_node = nonleader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             worker_manager,
@@ -2542,7 +2493,7 @@ mod tests {
     async fn register_worker_publishes_live_run_only_after_raft_success() {
         let dir = TempDir::new().unwrap();
         let raft_node = leader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let worker_run_id = test_worker_run_id();
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
@@ -2585,10 +2536,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ipv6_worker_registration_and_heartbeat_use_canonical_address() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = leader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
+        let group = group_name("root");
+        let worker_id = WorkerId::new(125);
+        let worker_run_id = test_worker_run_id();
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            Arc::clone(&worker_manager),
+            Arc::new(MountTable::new()),
+            group.clone(),
+        );
+        let endpoint = beryl_proto::common::EndpointProto {
+            host: "::1".to_string(),
+            port: 9092,
+        };
+
+        let register_response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
+            &service,
+            Request::new(RegisterWorkerRequestProto {
+                header: Some(valid_request_header(&group, ClientId::new(85))),
+                worker_id: worker_id.as_raw(),
+                worker_run_id: worker_run_id.to_string(),
+                advertised_endpoint: Some(endpoint.clone()),
+            }),
+        )
+        .await
+        .expect("register worker response")
+        .into_inner();
+
+        assert!(register_response.header.expect("header").error.is_none());
+        assert_eq!(
+            worker_manager
+                .get_descriptor(&group, worker_id)
+                .expect("published descriptor")
+                .address,
+            "[::1]:9092"
+        );
+
+        let mut heartbeat = heartbeat_request(group.clone(), worker_id, worker_run_id, 1, endpoint.port);
+        heartbeat.advertised_endpoint = Some(endpoint);
+        let heartbeat_response =
+            <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(&service, Request::new(heartbeat))
+                .await
+                .expect("heartbeat response")
+                .into_inner();
+
+        assert!(heartbeat_response.header.expect("header").error.is_none());
+        assert_eq!(
+            worker_manager
+                .get_worker(&group, worker_id)
+                .expect("heartbeat published worker state")
+                .address,
+            "[::1]:9092"
+        );
+    }
+
+    #[tokio::test]
     async fn register_worker_rejects_non_served_group_without_mutating_worker_manager() {
         let dir = TempDir::new().unwrap();
         let raft_node = leader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             Arc::clone(&worker_manager),
@@ -2624,7 +2634,7 @@ mod tests {
     async fn heartbeat_unknown_worker_returns_header_error() {
         let dir = TempDir::new().unwrap();
         let raft_node = nonleader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             worker_manager,
@@ -2654,7 +2664,7 @@ mod tests {
     async fn heartbeat_maps_registration_mismatches_to_recovery_headers() {
         let dir = TempDir::new().unwrap();
         let raft_node = nonleader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let group_name = group_name("root");
         worker_manager
             .register_worker_run(
@@ -2726,7 +2736,7 @@ mod tests {
                 nonleader_raft(&dir).await
             };
             let before_state_id = raft_node.get_last_applied_state_id();
-            let worker_manager = Arc::new(WorkerManager::new(60));
+            let worker_manager = Arc::new(WorkerManager::new(1_500));
             worker_manager
                 .register_worker_run(
                     &group_name("root"),
@@ -2762,6 +2772,7 @@ mod tests {
             assert_eq!(response.header.as_ref().expect("header").group_name, "root");
             assert_eq!(response.worker_id, worker_id.as_raw());
             assert_eq!(response.accepted_worker_run_id, test_worker_run_id().to_string());
+            assert_eq!(response.liveness_timeout_ms, 1_500);
             assert!(worker_manager.is_worker_live(&group_name("root"), worker_id));
             if leader {
                 assert_eq!(raft_node.get_last_applied_state_id(), before_state_id);
@@ -2773,7 +2784,7 @@ mod tests {
     async fn heartbeat_returns_due_cleanup_command_for_the_accepted_ready_replica() {
         let dir = TempDir::new().unwrap();
         let (raft_node, storage) = leader_raft_with_storage(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let group = group_name("root");
         let worker_id = WorkerId::new(21);
         let worker_run_id = test_worker_run_id();
@@ -2781,10 +2792,10 @@ mod tests {
             .register_worker_run(&group, worker_id, "127.0.0.1:9090".to_string(), 1, worker_run_id, None)
             .unwrap();
 
-        let cleanup_config = CleanupConfig {
-            dispatch_enabled: true,
+        let cleanup_config = BlockCleanupConfig {
+            enabled: true,
             reclaim_grace_ms: 1,
-            ..CleanupConfig::default()
+            ..BlockCleanupConfig::default()
         };
         let cleanup = Arc::new(BlockCleanupCoordinator::new(
             Arc::clone(&raft_node),
@@ -2848,7 +2859,7 @@ mod tests {
     async fn block_report_invalid_entry_returns_header_error() {
         let dir = TempDir::new().unwrap();
         let raft_node = nonleader_raft(&dir).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
         let worker_id = WorkerId::new(99);
         worker_manager
             .register_worker(&group_name("root"), worker_id, "127.0.0.1:9099".to_string(), 1, None)

@@ -53,7 +53,7 @@ pub async fn format_metadata_storage(config: &MetadataConfig) -> MetadataResult<
     let marker_path = metadata_marker_path(config);
     std::fs::create_dir_all(&config.storage_dir).map_err(|err| {
         MetadataError::Internal(format!(
-            "failed to create metadata.storage.dir {}: {err}",
+            "failed to create beryl.metadata.storage.dir {}: {err}",
             config.storage_dir.display()
         ))
     })?;
@@ -75,8 +75,8 @@ pub async fn format_metadata_storage(config: &MetadataConfig) -> MetadataResult<
         .await?,
     );
 
-    raft_node.initialize_single_node(config.rpc_addr.to_string()).await?;
-    wait_for_single_node_leader(&raft_node, config.bootstrap.root_readiness.timeout_ms).await?;
+    raft_node.initialize_single_node(config.rpc_address()).await?;
+    wait_for_single_node_leader(&raft_node, config.startup.root_readiness.timeout_ms).await?;
 
     let group_name = config.authority.group_name.clone();
     let bootstrap_result = raft_node
@@ -92,7 +92,7 @@ pub async fn format_metadata_storage(config: &MetadataConfig) -> MetadataResult<
         storage: Some(Arc::clone(&storage)),
         namespace_owner_group_name: group_name.clone(),
         readiness_gate: Arc::new(RootReadinessGate::new(None)),
-        config: config.bootstrap.root_readiness.clone(),
+        config: config.startup.root_readiness.clone(),
         metrics: None,
         log_fields: RootReadinessLogFields {
             cluster_id: config.cluster_id.clone(),
@@ -129,9 +129,40 @@ pub async fn prepare_metadata_start(config: &MetadataConfig) -> MetadataResult<(
     }
     let storage = RocksDBStorage::open_existing_for_start(&config.storage_dir)?;
     storage.validate_storage_identity(&storage_identity(&marker))?;
+    validate_persisted_rpc_address(config, &storage)?;
     let mount_table = MountTable::load_from_storage(&storage)?;
     verify_root(&storage, &mount_table, &marker.group_name)?;
     storage.cleanup_unreferenced_generations()?;
+    Ok(())
+}
+
+/// Keeps the configured public RPC address bound to the durable Raft identity.
+///
+/// Updating membership requires an ordered Raft transition. The current
+/// single-node runtime does not implement that transition, so startup must
+/// reject an address that differs from the one committed during format.
+fn validate_persisted_rpc_address(config: &MetadataConfig, storage: &RocksDBStorage) -> MetadataResult<()> {
+    let raft_state = storage.load_raft_state()?;
+    let membership = raft_state.membership.membership();
+    let mut nodes = membership.nodes();
+    let Some((node_id, node)) = nodes.next() else {
+        return Err(MetadataError::InvalidArgument(
+            "formatted metadata storage has no Raft membership; reformat metadata storage".to_string(),
+        ));
+    };
+    if nodes.next().is_some() || *node_id != config.raft.node_id {
+        return Err(MetadataError::InvalidArgument(
+            "formatted Metadata Raft membership is not the supported single local node".to_string(),
+        ));
+    }
+
+    let configured = config.rpc_address();
+    if node.address != configured {
+        return Err(MetadataError::InvalidArgument(format!(
+            "configured Metadata RPC address {configured} differs from format-time Raft membership address {}; start with the format-time beryl.metadata.host and beryl.metadata.rpc.port values",
+            node.address
+        )));
+    }
     Ok(())
 }
 
@@ -151,7 +182,7 @@ fn acquire_format_lock(config: &MetadataConfig) -> MetadataResult<std::fs::File>
     let storage_name = config
         .storage_dir
         .file_name()
-        .ok_or_else(|| MetadataError::InvalidArgument("metadata.storage.dir must name a directory".to_string()))?
+        .ok_or_else(|| MetadataError::InvalidArgument("beryl.metadata.storage.dir must name a directory".to_string()))?
         .to_string_lossy();
     let lock_path = config
         .storage_dir
@@ -188,7 +219,7 @@ fn acquire_format_lock(config: &MetadataConfig) -> MetadataResult<std::fs::File>
 fn validate_format_config(config: &MetadataConfig) -> MetadataResult<()> {
     if config.cluster_id.trim().is_empty() {
         return Err(MetadataError::InvalidArgument(
-            "cluster.id must not be empty".to_string(),
+            "beryl.cluster.id must not be empty".to_string(),
         ));
     }
     if config.raft.mode == RaftMode::Cluster {
@@ -200,12 +231,12 @@ fn validate_format_config(config: &MetadataConfig) -> MetadataResult<()> {
     }
     if config.raft.node_id == 0 {
         return Err(MetadataError::InvalidArgument(
-            "metadata.raft.node_id must be greater than zero".to_string(),
+            "internal Metadata Raft node id must be greater than zero".to_string(),
         ));
     }
     if config.storage_dir.as_os_str().is_empty() {
         return Err(MetadataError::InvalidArgument(
-            "metadata.storage.dir must not be empty".to_string(),
+            "beryl.metadata.storage.dir must not be empty".to_string(),
         ));
     }
     Ok(())
@@ -346,25 +377,31 @@ fn storage_dir_has_entries(path: &std::path::Path) -> MetadataResult<bool> {
     }
     if !path.is_dir() {
         return Err(MetadataError::InvalidArgument(format!(
-            "metadata.storage.dir {} exists but is not a directory",
+            "beryl.metadata.storage.dir {} exists but is not a directory",
             path.display()
         )));
     }
     let mut entries = std::fs::read_dir(path).map_err(|err| {
-        MetadataError::Internal(format!("failed to read metadata.storage.dir {}: {err}", path.display()))
+        MetadataError::Internal(format!(
+            "failed to read beryl.metadata.storage.dir {}: {err}",
+            path.display()
+        ))
     })?;
     Ok(entries
         .next()
         .transpose()
         .map_err(|err| {
-            MetadataError::Internal(format!("failed to read metadata.storage.dir {}: {err}", path.display()))
+            MetadataError::Internal(format!(
+                "failed to read beryl.metadata.storage.dir {}: {err}",
+                path.display()
+            ))
         })?
         .is_some())
 }
 
 fn marker_missing_error(config: &MetadataConfig) -> MetadataError {
     MetadataError::InvalidArgument(format!(
-        "metadata.storage.dir {} is non-empty but metadata marker missing at {}; refusing to attach existing files to a new metadata identity; clean the directory manually before formatting",
+        "beryl.metadata.storage.dir {} is non-empty but metadata marker missing at {}; refusing to attach existing files to a new metadata identity; clean the directory manually before formatting",
         config.storage_dir.display(),
         metadata_marker_path(config).display()
     ))

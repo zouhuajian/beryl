@@ -69,7 +69,7 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
 - Admin and metadata-peer schemas are not active runtime services.
 - Multi-group metadata, multiple metadata leaders, and metadata peer RPC are future work.
 - Worker peer transfer and alternate worker transports such as QUIC or RDMA are future work.
-- Maintenance internals exist for safety and cleanup, but complete replication, repair, or rebalancing is not productized behavior.
+- Lost-worker cleanup records affected blocks but does not schedule replication, repair, or rebalancing.
 - POSIX, FUSE, and Hadoop compatibility are not implemented.
 
 ## Roadmap
@@ -80,7 +80,7 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
 - Complete recovery soak and controlled default enablement for resident-block reclamation.
 - Design UFS read-through/write-through integration without changing metadata-owned visibility.
 - Design multi-group metadata, metadata peer RPC, admin APIs, and ecosystem compatibility as future product work.
-- Treat complete replication, repair, and rebalancing as future lifecycle features, separate from current maintenance internals.
+- Design replication, repair, and rebalancing only as complete future lifecycles.
 
 ## Crates
 
@@ -97,7 +97,7 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
 - `beryl-metadata`
   - Namespace, layout, visibility, lease, worker registry, block location, freshness, and Raft/RocksDB authority.
   - Multi-group metadata remains future work.
-  - Maintenance internals do not make repair/rebalance a completed product behavior.
+  - Lost-worker cleanup retains the explicit boundary where a future repair lifecycle may begin.
 - `beryl-worker`
   - Local block storage and metadata-authorized data-plane execution.
   - Does not own namespace visibility or file layout decisions.
@@ -111,7 +111,7 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
 
 ## Quick Start
 
-Beryl requires local metadata and worker configuration. The repository provides default and local debug profiles.
+Beryl requires local metadata and worker configuration. The repository provides one local-ready default profile.
 
 Development checks:
 
@@ -122,7 +122,7 @@ make verify
 
 `make verify` runs the workspace format check, metadata check, compile check, clippy, and tests.
 
-Default one-metadata, one-worker startup:
+One-metadata, one-worker startup:
 
 ```bash
 beryl-metadata format --config conf/metadata.yaml
@@ -130,15 +130,8 @@ beryl-metadata start --config conf/metadata.yaml
 beryl-worker start --config conf/worker.yaml
 ```
 
-Local one-metadata, one-worker startup:
-
-```bash
-beryl-metadata format --config conf/local/metadata.yaml
-beryl-metadata start --config conf/local/metadata.yaml
-beryl-worker start --config conf/local/worker.yaml
-```
-
-The client reads `conf/client-site.yaml` or `conf/local/client-site.yaml` depending on caller configuration.
+The client reads `conf/client.yaml`. Deployments provide environment-specific
+configuration through an explicit `--config` path instead of repository profiles.
 
 ## Non-goals for Current Scope
 

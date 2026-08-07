@@ -79,7 +79,6 @@
 pub mod config;
 pub(crate) mod data_io;
 pub(crate) mod error;
-pub(crate) mod inflight_registry;
 pub mod inode_lease;
 pub mod lifecycle;
 pub mod maintenance;

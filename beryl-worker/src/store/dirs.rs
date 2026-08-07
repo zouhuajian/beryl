@@ -96,12 +96,12 @@ impl StoreDirs {
     ) -> StoreResult<Self> {
         if configs.is_empty() {
             return Err(WorkerError::InvalidArgument(
-                "worker.store.dirs must be non-empty".to_string(),
+                "beryl.worker.storage.dirs must be non-empty".to_string(),
             ));
         }
         if check_interval_ms == 0 {
             return Err(WorkerError::InvalidArgument(
-                "worker.store.check_interval_ms must be greater than zero".to_string(),
+                "beryl.worker.storage.check-interval must be greater than zero".to_string(),
             ));
         }
 
@@ -545,7 +545,7 @@ fn init_store_path(path: &Path) -> StoreResult<()> {
     fs::create_dir_all(path)?;
     if !path.is_dir() {
         return Err(WorkerError::InvalidArgument(format!(
-            "worker.store.dirs path {} is not a directory",
+            "beryl.worker.storage.dirs path {} is not a directory",
             path.display()
         )));
     }

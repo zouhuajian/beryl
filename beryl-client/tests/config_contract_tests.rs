@@ -1,21 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use beryl_client::{ClientConfig, FsClient};
 use beryl_types::GroupName;
 
 #[tokio::test]
-async fn repository_client_site_loads_bootstrap_contract() {
-    assert_client_bootstrap_contract(&repo_root().join("conf/client-site.yaml"));
-    assert_client_bootstrap_contract(&repo_root().join("conf/local/client-site.yaml"));
-}
+async fn repository_client_configs_load() {
+    let config = ClientConfig::load(repo_root().join("conf/client.yaml")).expect("client config loads");
 
-fn assert_client_bootstrap_contract(config_path: &Path) {
-    let config = ClientConfig::load(config_path).expect("client config loads");
-
-    assert_eq!(config.client_name(), "default_client");
+    assert_eq!(config.client_name(), "default-client");
     assert_eq!(config.metadata_groups.len(), 1);
     assert_eq!(config.metadata_groups[0].group_name, GroupName::parse("root").unwrap());
     assert_eq!(config.metadata_groups[0].endpoints, vec!["127.0.0.1:18080".to_string()]);

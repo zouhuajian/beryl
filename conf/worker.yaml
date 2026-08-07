@@ -1,37 +1,56 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-# Beryl worker baseline. Run with:
-# beryl-worker start --config conf/worker.yaml
+# Beryl Worker baseline.
 
-cluster.id: "local-beryl"
+# -------------------- Cluster identity --------------------
+beryl.cluster.id: "local-beryl"
 
-# Worker data service.
-worker.identity.path: "data/worker/worker.identity"
-worker.rpc.bind: "0.0.0.0:9090"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.rpc.max_inflight: 100
-worker.default_frame_size: "1MB"
-worker.max_frame_size: "4MB"
-worker.stream.idle_timeout_ms: 60000
+# -------------------- Worker identity --------------------
+beryl.worker.identity-file: "data/worker/worker.identity"
 
-# Worker local block store.
-worker.store.dirs.hdd0.path: "data/worker/hdd0"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.store.reserve_space: "1GB"
-worker.store.selection_policy: "round_robin"
-worker.store.check_interval_ms: 30000
+# -------------------- Network endpoints --------------------
+beryl.worker.host: "127.0.0.1"
+beryl.worker.bind-host: "0.0.0.0"
+beryl.worker.rpc.port: 19090
+beryl.worker.rpc.max-concurrent-requests: 100
+beryl.worker.http.port: 19091
 
-# Worker metadata registration, heartbeat, and block report.
-worker.metadata.group.name: "root"
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-worker.metadata.register_timeout_ms: 5000
-worker.metadata.register_retry_initial_backoff_ms: 200
-worker.metadata.register_retry_max_backoff_ms: 5000
+# -------------------- Metadata RPC --------------------
+beryl.worker.metadata.addresses:
+  - "127.0.0.1:18080"
+beryl.worker.metadata.request-timeout: 5s
+beryl.worker.metadata.retry.initial-backoff: 200ms
+beryl.worker.metadata.retry.max-backoff: 5s
 
-observe.log.format: compact
-observe.log.output: stderr
-observe.log.level: "info,beryl_metadata=info,beryl_worker=info,beryl_common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"
-observe.metrics.prometheus.bind: "127.0.0.1:19091"
-observe.metrics.prometheus.path: "/metrics"
+# -------------------- Heartbeat --------------------
+beryl.worker.heartbeat.interval: 1s
+
+# -------------------- Block reports --------------------
+beryl.worker.block.report.interval: 1s
+beryl.worker.block.report.batch-size: 1000
+
+# -------------------- Block cleanup --------------------
+beryl.worker.block.cleanup.queue-capacity: 1024
+beryl.worker.block.cleanup.concurrency: 4
+beryl.worker.block.cleanup.retry.initial-backoff: 100ms
+beryl.worker.block.cleanup.retry.max-backoff: 30s
+
+# -------------------- Streams --------------------
+beryl.worker.stream.frame-size: 1MiB
+beryl.worker.stream.max-frame-size: 4MiB
+beryl.worker.stream.idle-timeout: 1min
+
+# -------------------- Storage --------------------
+beryl.worker.storage.dirs:
+  hdd0:
+    path: "data/worker/hdd0"
+    tier: hdd
+    capacity: 10GiB
+beryl.worker.storage.reserved-space: 1GiB
+beryl.worker.storage.check-interval: 30s
+
+# -------------------- Logging --------------------
+beryl.logging.format: compact
+beryl.logging.output: stderr
+beryl.logging.level: "info,beryl_metadata=info,beryl_worker=info,beryl_common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"

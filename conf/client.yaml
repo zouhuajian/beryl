@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Beryl Contributors
+
+# Beryl native client baseline.
+
+# -------------------- Client identity --------------------
+beryl.client.name: "default-client"
+
+# -------------------- Metadata RPC --------------------
+beryl.client.metadata.addresses:
+  - "127.0.0.1:18080"
+beryl.client.metadata.connections.enabled: true
+beryl.client.metadata.connections.max: 1
+
+# -------------------- Worker RPC --------------------
+beryl.client.worker.connections.enabled: true
+beryl.client.worker.connections.max-per-worker: 1
+beryl.client.worker.connections.failure-cooldown: 1s
+
+# -------------------- Requests --------------------
+beryl.client.request.timeout: 30s
+beryl.client.request.max-attempts: 3
+
+# -------------------- Write leases --------------------
+beryl.client.write-lease.auto-renew: true
+beryl.client.write-lease.renew-before-expiry: 30s

@@ -69,7 +69,9 @@ pub fn prepare_worker_start(config: &WorkerConfig) -> Result<WorkerId, WorkerErr
 
 fn validate_start_config(config: &WorkerConfig) -> Result<(), WorkerError> {
     if config.cluster_id.trim().is_empty() {
-        return Err(WorkerError::InvalidArgument("cluster.id must not be empty".to_string()));
+        return Err(WorkerError::InvalidArgument(
+            "beryl.cluster.id must not be empty".to_string(),
+        ));
     }
     Ok(())
 }
@@ -110,13 +112,13 @@ fn storage_dir_has_entries(path: &Path) -> Result<bool, WorkerError> {
     }
     if !path.is_dir() {
         return Err(WorkerError::InvalidArgument(format!(
-            "worker.store.dirs path {} exists but is not a directory",
+            "beryl.worker.storage.dirs path {} exists but is not a directory",
             path.display()
         )));
     }
     let mut entries = fs::read_dir(path).map_err(|err| {
         WorkerError::Internal(format!(
-            "failed to read worker.store.dirs path {}: {err}",
+            "failed to read beryl.worker.storage.dirs path {}: {err}",
             path.display()
         ))
     })?;
@@ -125,7 +127,7 @@ fn storage_dir_has_entries(path: &Path) -> Result<bool, WorkerError> {
         .transpose()
         .map_err(|err| {
             WorkerError::Internal(format!(
-                "failed to read worker.store.dirs path {}: {err}",
+                "failed to read beryl.worker.storage.dirs path {}: {err}",
                 path.display()
             ))
         })?
@@ -134,7 +136,7 @@ fn storage_dir_has_entries(path: &Path) -> Result<bool, WorkerError> {
 
 fn info_missing_error(config: &WorkerConfig) -> WorkerError {
     WorkerError::InvalidArgument(format!(
-        "worker.store.dirs contains non-empty paths but WorkerStorageInfo is missing at {}; refusing to take over unknown local data",
+        "beryl.worker.storage.dirs contains non-empty paths but WorkerStorageInfo is missing at {}; refusing to take over unknown local data",
         worker_storage_info_path(config).display()
     ))
 }

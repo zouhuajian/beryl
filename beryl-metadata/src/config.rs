@@ -1,176 +1,156 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Metadata service configuration.
-//!
-//! Reads metadata configuration from server YAML files.
+//! Metadata process configuration.
 
 use crate::raft::{
     MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES, MAX_RECLAIM_DETACHED_ROOT_CANDIDATES, MAX_RECLAIM_DETACHED_ROOT_ENTRIES,
     MIN_RECLAIM_DETACHED_ROOT_BATCH_BYTES,
 };
 use crate::readiness::RootReadinessConfig;
-use beryl_common::config::ServerConfig;
+use beryl_common::config::{FlatConfig, ServerConfig};
 use beryl_common::error::{CommonError, CommonErrorKind};
+use beryl_common::observe::config::{LogConfig, ResourceConfig};
 use beryl_common::observe::ObservabilityConfig;
 use beryl_types::GroupName;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-const CLUSTER_ID: &str = "cluster.id";
-const METADATA_RPC_ADDR: &str = "metadata.rpc.addr";
-const METADATA_RPC_PORT: &str = "metadata.rpc.port";
-const METADATA_GROUP_NAME: &str = "metadata.group.name";
-const METADATA_STORAGE_DIR: &str = "metadata.storage.dir";
-const METADATA_RAFT_MODE: &str = "metadata.raft.mode";
-const METADATA_RAFT_NODE_ID: &str = "metadata.raft.node_id";
-const METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE: &str = "metadata.list_status.default_page_size";
-const METADATA_LIST_STATUS_MAX_PAGE_SIZE: &str = "metadata.list_status.max_page_size";
-const METADATA_CLEANUP_SCAN_INTERVAL_MS: &str = "metadata.cleanup.scan_interval_ms";
-const METADATA_CLEANUP_RECLAIM_GRACE_MS: &str = "metadata.cleanup.reclaim_grace_ms";
-const METADATA_CLEANUP_MAX_REPLICAS_PER_SCAN: &str = "metadata.cleanup.max_replicas_per_scan";
-const METADATA_CLEANUP_MAX_CANDIDATES: &str = "metadata.cleanup.max_candidates";
-const METADATA_CLEANUP_DISPATCH_ENABLED: &str = "metadata.cleanup.dispatch_enabled";
-const METADATA_CLEANUP_MAX_COMMANDS_PER_HEARTBEAT: &str = "metadata.cleanup.max_commands_per_heartbeat";
-const METADATA_CLEANUP_RETRY_INITIAL_BACKOFF_MS: &str = "metadata.cleanup.retry_initial_backoff_ms";
-const METADATA_CLEANUP_RETRY_MAX_BACKOFF_MS: &str = "metadata.cleanup.retry_max_backoff_ms";
-const METADATA_DETACHED_ROOT_RECLAIM_SCAN_INTERVAL_MS: &str = "metadata.detached_root_reclamation.scan_interval_ms";
-const METADATA_DETACHED_ROOT_RECLAIM_MAX_CANDIDATES: &str = "metadata.detached_root_reclamation.max_candidates";
-const METADATA_DETACHED_ROOT_RECLAIM_MAX_ENTRIES: &str = "metadata.detached_root_reclamation.max_entries";
-const METADATA_DETACHED_ROOT_RECLAIM_MAX_BATCH_BYTES: &str = "metadata.detached_root_reclamation.max_batch_bytes";
-const METADATA_DETACHED_ROOT_RECLAIM_RETRY_INITIAL_BACKOFF_MS: &str =
-    "metadata.detached_root_reclamation.retry_initial_backoff_ms";
-const METADATA_DETACHED_ROOT_RECLAIM_RETRY_MAX_BACKOFF_MS: &str =
-    "metadata.detached_root_reclamation.retry_max_backoff_ms";
-const METADATA_REPAIR_MAX_QUEUE_SIZE: &str = "metadata.repair.max_queue_size";
-const METADATA_REPAIR_MAX_ATTEMPTS: &str = "metadata.repair.max_attempts";
-const METADATA_REPAIR_INFLIGHT_TIMEOUT_MS: &str = "metadata.repair.inflight_timeout_ms";
-const METADATA_REPAIR_INITIAL_BACKOFF_MS: &str = "metadata.repair.initial_backoff_ms";
-const METADATA_REPAIR_MAX_BACKOFF_MS: &str = "metadata.repair.max_backoff_ms";
-const METADATA_REPAIR_WORKER_INFLIGHT_LIMIT: &str = "metadata.repair.worker_inflight_limit";
-const METADATA_BOOTSTRAP_ROOT_READY_INITIAL_BACKOFF_MS: &str = "metadata.bootstrap.root_ready_initial_backoff_ms";
-const METADATA_BOOTSTRAP_ROOT_READY_MAX_BACKOFF_MS: &str = "metadata.bootstrap.root_ready_max_backoff_ms";
-const METADATA_BOOTSTRAP_ROOT_READY_WARN_AFTER_MS: &str = "metadata.bootstrap.root_ready_warn_after_ms";
-const METADATA_BOOTSTRAP_READY_TIMEOUT_MS: &str = "metadata.bootstrap.ready.timeout_ms";
-const METADATA_BOOTSTRAP_READY_WARN_AFTER_MS: &str = "metadata.bootstrap.ready.warn_after_ms";
-const METADATA_BOOTSTRAP_READY_FAIL_FAST: &str = "metadata.bootstrap.ready.fail_fast";
+const CLUSTER_ID: &str = "beryl.cluster.id";
+const HOST: &str = "beryl.metadata.host";
+const BIND_HOST: &str = "beryl.metadata.bind-host";
+const RPC_PORT: &str = "beryl.metadata.rpc.port";
+const HTTP_PORT: &str = "beryl.metadata.http.port";
+const STORAGE_DIR: &str = "beryl.metadata.storage.dir";
+const LIST_DEFAULT_PAGE_SIZE: &str = "beryl.metadata.namespace.list.default-page-size";
+const LIST_MAX_PAGE_SIZE: &str = "beryl.metadata.namespace.list.max-page-size";
+const BLOCK_CLEANUP_ENABLED: &str = "beryl.metadata.block.cleanup.enabled";
+const BLOCK_CLEANUP_INTERVAL: &str = "beryl.metadata.block.cleanup.interval";
+const BLOCK_CLEANUP_GRACE_PERIOD: &str = "beryl.metadata.block.cleanup.grace-period";
+const BLOCK_CLEANUP_SCAN_LIMIT: &str = "beryl.metadata.block.cleanup.scan-limit";
+const BLOCK_CLEANUP_QUEUE_CAPACITY: &str = "beryl.metadata.block.cleanup.queue-capacity";
+const BLOCK_CLEANUP_BATCH_SIZE: &str = "beryl.metadata.block.cleanup.batch-size";
+const BLOCK_CLEANUP_RETRY_INITIAL_BACKOFF: &str = "beryl.metadata.block.cleanup.retry.initial-backoff";
+const BLOCK_CLEANUP_RETRY_MAX_BACKOFF: &str = "beryl.metadata.block.cleanup.retry.max-backoff";
+const NAMESPACE_DELETE_INTERVAL: &str = "beryl.metadata.namespace.delete.interval";
+const NAMESPACE_DELETE_MAX_ROOTS: &str = "beryl.metadata.namespace.delete.batch.max-roots";
+const NAMESPACE_DELETE_MAX_ENTRIES: &str = "beryl.metadata.namespace.delete.batch.max-entries";
+const NAMESPACE_DELETE_MAX_SIZE: &str = "beryl.metadata.namespace.delete.batch.max-size";
+const NAMESPACE_DELETE_RETRY_INITIAL_BACKOFF: &str = "beryl.metadata.namespace.delete.retry.initial-backoff";
+const NAMESPACE_DELETE_RETRY_MAX_BACKOFF: &str = "beryl.metadata.namespace.delete.retry.max-backoff";
+const STARTUP_INITIAL_BACKOFF: &str = "beryl.metadata.startup.retry.initial-backoff";
+const STARTUP_MAX_BACKOFF: &str = "beryl.metadata.startup.retry.max-backoff";
+const STARTUP_WARN_AFTER: &str = "beryl.metadata.startup.warn-after";
+const STARTUP_TIMEOUT: &str = "beryl.metadata.startup.timeout";
+const STARTUP_FAIL_FAST: &str = "beryl.metadata.startup.fail-fast";
+const WRITE_LEASE_TIMEOUT: &str = "beryl.metadata.write-lease.timeout";
+const WORKER_TIMEOUT: &str = "beryl.metadata.worker.liveness.timeout";
+const WORKER_SCAN_INTERVAL: &str = "beryl.metadata.worker.liveness.scan-interval";
 
 const DEFAULT_LIST_STATUS_PAGE_SIZE: u32 = 1_000;
 pub(crate) const MAX_LIST_STATUS_PAGE_SIZE: u32 = 10_000;
 
-/// Metadata service configuration.
+/// Configuration consumed by one Metadata process.
 #[derive(Clone, Debug)]
 pub struct MetadataConfig {
-    /// Cluster identity shared by local metadata and worker storage markers.
+    /// Cluster identity persisted in local storage markers.
     pub cluster_id: String,
-    /// RPC server address.
-    pub rpc_addr: SocketAddr,
-    /// Local directory for metadata persistent state.
+    /// Host published to clients and workers.
+    pub host: String,
+    /// Local interface shared by Metadata listeners.
+    pub bind_host: IpAddr,
+    /// RPC port published with `host` and bound with `bind_host`.
+    pub rpc_port: u16,
+    /// Process-owned HTTP port for metrics, health, and future APIs.
+    pub http_port: u16,
+    /// Local directory for authoritative Metadata state.
     pub storage_dir: PathBuf,
-    /// Raft configuration.
+    /// Internal single-node Raft configuration.
     pub raft: RaftConfig,
-    /// Metadata authority configuration.
+    /// Internal authority identity for the supported root group.
     pub authority: MetadataAuthorityConfig,
     /// Bounded public directory-listing policy.
-    pub list_status: ListStatusConfig,
-    /// Block cleanup detection and dispatch configuration.
-    pub cleanup: CleanupConfig,
-    /// Bounded detached namespace reclamation configuration.
-    pub detached_root_reclamation: DetachedRootReclamationConfig,
-    /// Worker/Repair configuration.
-    pub worker: WorkerConfig,
-    /// Readiness configuration.
-    pub bootstrap: BootstrapConfig,
-    /// Shared observability configuration.
+    pub namespace_list: NamespaceListConfig,
+    /// Physical Worker block cleanup policy.
+    pub block_cleanup: BlockCleanupConfig,
+    /// Post-detach namespace deletion policy.
+    pub namespace_delete: NamespaceDeleteConfig,
+    /// Worker liveness and soft-state cleanup policy.
+    pub worker_liveness: WorkerLivenessConfig,
+    /// Metadata startup readiness policy.
+    pub startup: StartupConfig,
+    /// Write lease expiry policy.
+    pub write_lease_timeout_ms: u64,
+    /// Shared logging and metrics recorder configuration.
     pub observability: ObservabilityConfig,
 }
 
-/// Bootstrap/readiness configuration.
+impl MetadataConfig {
+    /// Bind socket for the Metadata RPC service.
+    pub fn rpc_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.bind_host, self.rpc_port)
+    }
+
+    /// Address published to processes that connect to Metadata RPC.
+    pub fn rpc_address(&self) -> String {
+        format_host_port(&self.host, self.rpc_port)
+    }
+
+    /// Bind socket for the process-owned HTTP service.
+    pub fn http_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.bind_host, self.http_port)
+    }
+}
+
+/// Startup/readiness configuration.
 #[derive(Clone, Debug)]
-pub struct BootstrapConfig {
+pub struct StartupConfig {
     pub root_readiness: RootReadinessConfig,
 }
 
 /// Server-owned page-size policy for one public `ListStatus` response.
-///
-/// `default_page_size` resolves the wire value zero. `max_page_size` may make
-/// one deployment stricter, but it cannot exceed the compiled safety ceiling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ListStatusConfig {
-    /// Page size used when the request leaves `limit` at zero.
+pub struct NamespaceListConfig {
     default_page_size: u32,
-    /// Largest explicit page size accepted by this Metadata process.
     max_page_size: u32,
 }
 
-/// Block cleanup detection and dispatch configuration.
+/// Bounds detection and delivery of exact block cleanup commands.
 #[derive(Clone, Debug)]
-pub struct CleanupConfig {
-    /// Interval between scans.
+pub struct BlockCleanupConfig {
     pub scan_interval_ms: u64,
-    /// Time a replica must remain reclaimable before it is reported as ready.
     pub reclaim_grace_ms: u64,
-    /// Maximum number of Ready-replica positions visited in one scan page.
     pub max_replicas_per_scan: usize,
-    /// Maximum number of in-memory cleanup candidates.
     pub max_candidates: usize,
-    /// Whether heartbeats may return cleanup commands.
-    pub dispatch_enabled: bool,
-    /// Maximum cleanup commands returned by one heartbeat.
+    pub enabled: bool,
     pub max_commands_per_heartbeat: usize,
-    /// Initial retry delay after returning a cleanup command.
     pub retry_initial_backoff_ms: u64,
-    /// Maximum retry delay after repeated cleanup commands.
     pub retry_max_backoff_ms: u64,
 }
 
-/// Leader-only detached-root proposal and retry bounds.
+/// Bounds leader proposals that finish recursively deleted namespace trees.
 #[derive(Clone, Debug)]
-pub struct DetachedRootReclamationConfig {
-    /// Delay between successful or idle maintenance passes.
+pub struct NamespaceDeleteConfig {
     pub scan_interval_ms: u64,
-    /// Maximum marker candidates carried by one Raft command.
     pub max_candidates: u32,
-    /// Maximum namespace children removed by one Raft apply.
     pub max_entries: u32,
-    /// Maximum deterministic key/value bytes in one authority batch.
     pub max_batch_bytes: u32,
-    /// Initial delay after a failed proposal or authority read.
     pub retry_initial_backoff_ms: u64,
-    /// Maximum delay after repeated failures.
     pub retry_max_backoff_ms: u64,
 }
 
-/// Worker and repair configuration.
-#[derive(Clone, Debug, Default)]
-pub struct WorkerConfig {
-    /// Repair queue configuration.
-    pub repair: RepairConfig,
-}
-
-/// Repair queue configuration.
+/// Worker liveness policy owned by Metadata.
 #[derive(Clone, Debug)]
-pub struct RepairConfig {
-    /// Max queue size (default: 10000).
-    pub max_queue_size: usize,
-    /// Max attempts per task (default: 3).
-    pub max_attempts: u32,
-    /// Inflight timeout in milliseconds (default: 300000 = 5 minutes).
-    pub inflight_timeout_ms: u64,
-    /// Initial backoff in milliseconds (default: 1000 = 1 second).
-    pub initial_backoff_ms: u64,
-    /// Max backoff in milliseconds (default: 60000 = 1 minute).
-    pub max_backoff_ms: u64,
-    /// Worker inflight limit (default: 4).
-    pub worker_inflight_limit: usize,
+pub struct WorkerLivenessConfig {
+    /// Timeout returned by the heartbeat protocol and used by all liveness checks.
+    pub heartbeat_timeout_ms: u32,
+    pub scan_interval_ms: u64,
 }
 
-/// Raft configuration.
+/// Internal Raft configuration for the current single-node product boundary.
 #[derive(Clone, Debug)]
 pub struct RaftConfig {
-    /// Raft node ID.
     pub node_id: u64,
-    /// Raft startup mode for this metadata process.
     pub mode: RaftMode,
 }
 
@@ -178,16 +158,6 @@ pub struct RaftConfig {
 pub enum RaftMode {
     Single,
     Cluster,
-}
-
-impl RaftMode {
-    fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "single" => Some(Self::Single),
-            "cluster" => Some(Self::Cluster),
-            _ => None,
-        }
-    }
 }
 
 impl Default for RaftConfig {
@@ -199,42 +169,37 @@ impl Default for RaftConfig {
     }
 }
 
-/// Metadata authority group served by this runtime.
+/// Internal identity for the one supported metadata authority group.
 #[derive(Clone, Debug)]
 pub struct MetadataAuthorityConfig {
-    /// Stable identity for the metadata group served by this runtime.
     pub group_name: GroupName,
 }
 
 impl Default for MetadataAuthorityConfig {
     fn default() -> Self {
         Self {
-            group_name: GroupName::parse("root").expect("default group name is valid"),
+            group_name: GroupName::parse("root").expect("the supported metadata group is valid"),
         }
     }
 }
 
-impl Default for RepairConfig {
+impl Default for WorkerLivenessConfig {
     fn default() -> Self {
         Self {
-            max_queue_size: 10000,
-            max_attempts: 3,
-            inflight_timeout_ms: 300_000,
-            initial_backoff_ms: 1_000,
-            max_backoff_ms: 60_000,
-            worker_inflight_limit: 4,
+            heartbeat_timeout_ms: 60_000,
+            scan_interval_ms: 30_000,
         }
     }
 }
 
-impl Default for CleanupConfig {
+impl Default for BlockCleanupConfig {
     fn default() -> Self {
         Self {
             scan_interval_ms: 30_000,
             reclaim_grace_ms: 300_000,
             max_replicas_per_scan: 10_000,
             max_candidates: 10_000,
-            dispatch_enabled: true,
+            enabled: true,
             max_commands_per_heartbeat: 32,
             retry_initial_backoff_ms: 1_000,
             retry_max_backoff_ms: 60_000,
@@ -242,7 +207,7 @@ impl Default for CleanupConfig {
     }
 }
 
-impl Default for ListStatusConfig {
+impl Default for NamespaceListConfig {
     fn default() -> Self {
         Self {
             default_page_size: DEFAULT_LIST_STATUS_PAGE_SIZE,
@@ -251,32 +216,24 @@ impl Default for ListStatusConfig {
     }
 }
 
-impl ListStatusConfig {
-    /// Builds a valid directory-listing policy without permitting the compiled
-    /// safety ceiling to be bypassed by programmatic configuration.
+impl NamespaceListConfig {
     pub fn try_new(default_page_size: u32, max_page_size: u32) -> Result<Self, CommonError> {
         if default_page_size == 0 {
-            return Err(invalid_config(
-                METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE,
-                "must be greater than zero",
-            ));
+            return Err(invalid_config(LIST_DEFAULT_PAGE_SIZE, "must be greater than zero"));
         }
         if max_page_size == 0 {
-            return Err(invalid_config(
-                METADATA_LIST_STATUS_MAX_PAGE_SIZE,
-                "must be greater than zero",
-            ));
+            return Err(invalid_config(LIST_MAX_PAGE_SIZE, "must be greater than zero"));
         }
         if default_page_size > max_page_size {
             return Err(invalid_config(
-                METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE,
-                "must be less than or equal to metadata.list_status.max_page_size",
+                LIST_DEFAULT_PAGE_SIZE,
+                "must be less than or equal to the configured maximum",
             ));
         }
         if max_page_size > MAX_LIST_STATUS_PAGE_SIZE {
             return Err(invalid_config(
-                METADATA_LIST_STATUS_MAX_PAGE_SIZE,
-                "exceeds the compiled ListStatus page-size ceiling",
+                LIST_MAX_PAGE_SIZE,
+                "exceeds the compiled page-size ceiling",
             ));
         }
         Ok(Self {
@@ -285,18 +242,16 @@ impl ListStatusConfig {
         })
     }
 
-    /// Returns the page size used for a wire `limit` of zero.
     pub fn default_page_size(self) -> u32 {
         self.default_page_size
     }
 
-    /// Returns the deployment maximum, which never exceeds the compiled ceiling.
     pub fn max_page_size(self) -> u32 {
         self.max_page_size
     }
 }
 
-impl Default for DetachedRootReclamationConfig {
+impl Default for NamespaceDeleteConfig {
     fn default() -> Self {
         Self {
             scan_interval_ms: 1_000,
@@ -309,593 +264,374 @@ impl Default for DetachedRootReclamationConfig {
     }
 }
 
+impl Default for MetadataConfig {
+    fn default() -> Self {
+        let bind_host = "0.0.0.0".parse().expect("default bind host is valid");
+        Self {
+            cluster_id: "local-beryl".to_string(),
+            host: "127.0.0.1".to_string(),
+            bind_host,
+            rpc_port: 18080,
+            http_port: 18081,
+            storage_dir: PathBuf::from("data/metadata"),
+            raft: RaftConfig::default(),
+            authority: MetadataAuthorityConfig::default(),
+            namespace_list: NamespaceListConfig::default(),
+            block_cleanup: BlockCleanupConfig::default(),
+            namespace_delete: NamespaceDeleteConfig::default(),
+            worker_liveness: WorkerLivenessConfig::default(),
+            startup: StartupConfig {
+                root_readiness: RootReadinessConfig::default(),
+            },
+            write_lease_timeout_ms: 60_000,
+            observability: ObservabilityConfig {
+                log: LogConfig {
+                    format: "compact".to_string(),
+                    output: "stderr".to_string(),
+                    level: "info".to_string(),
+                },
+                resource: ResourceConfig::default(),
+            },
+        }
+    }
+}
+
 impl MetadataConfig {
     /// Load metadata configuration from a YAML file.
     pub fn load<P: AsRef<Path>>(config_path: P) -> Result<Self, CommonError> {
-        let server_config = ServerConfig::load(config_path)?;
-        Self::from_server_config(server_config)
+        Self::from_server_config(ServerConfig::load(config_path)?)
     }
 
-    /// Create from ServerConfig.
+    /// Build the typed Metadata configuration from shared YAML mechanics.
     pub fn from_server_config(server_config: ServerConfig) -> Result<Self, CommonError> {
         let flat = server_config.as_flat();
+        let defaults = Self::default();
 
-        let cluster_id = get_str_or(flat, CLUSTER_ID, "local-beryl")?;
+        let cluster_id = string_or(flat, CLUSTER_ID, &defaults.cluster_id)?;
         if cluster_id.trim().is_empty() {
             return Err(invalid_config(CLUSTER_ID, "must not be empty"));
         }
-
-        let rpc_addr = rpc_addr_from_config(flat)?;
+        let host = string_or(flat, HOST, &defaults.host)?;
+        validate_public_host(HOST, &host)?;
+        let bind_host = string_or(flat, BIND_HOST, &defaults.bind_host.to_string())?
+            .parse::<IpAddr>()
+            .map_err(|_| invalid_config(BIND_HOST, "must be an IP address"))?;
+        let rpc_port = port_or(flat, RPC_PORT, defaults.rpc_port)?;
+        let http_port = port_or(flat, HTTP_PORT, defaults.http_port)?;
+        if rpc_port == http_port {
+            return Err(invalid_config(HTTP_PORT, "must differ from the RPC port"));
+        }
+        let storage_dir = PathBuf::from(string_or(flat, STORAGE_DIR, defaults.storage_dir.to_str().unwrap())?);
         let observability = ObservabilityConfig::from_flat(flat)?;
-        let storage_dir = PathBuf::from(get_str_or(flat, METADATA_STORAGE_DIR, "data/metadata")?);
 
-        let raft_mode_raw = get_str_or(flat, METADATA_RAFT_MODE, "single")?;
-        let raft_mode = RaftMode::parse(&raft_mode_raw)
-            .ok_or_else(|| invalid_config(METADATA_RAFT_MODE, "must be single or cluster"))?;
-        let raft = RaftConfig {
-            node_id: get_positive_u64_or(flat, METADATA_RAFT_NODE_ID, 1)?,
-            mode: raft_mode,
-        };
-
-        let group_name_raw = get_str_or(flat, METADATA_GROUP_NAME, "root")?;
-        let authority = MetadataAuthorityConfig {
-            group_name: parse_group_name(METADATA_GROUP_NAME, group_name_raw)?,
-        };
-
-        let list_status = ListStatusConfig::try_new(
-            get_positive_u32_or(
-                flat,
-                METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE,
-                DEFAULT_LIST_STATUS_PAGE_SIZE,
-            )?,
-            get_positive_u32_or(flat, METADATA_LIST_STATUS_MAX_PAGE_SIZE, MAX_LIST_STATUS_PAGE_SIZE)?,
+        let namespace_list = NamespaceListConfig::try_new(
+            positive_u32_or(flat, LIST_DEFAULT_PAGE_SIZE, DEFAULT_LIST_STATUS_PAGE_SIZE)?,
+            positive_u32_or(flat, LIST_MAX_PAGE_SIZE, MAX_LIST_STATUS_PAGE_SIZE)?,
         )?;
 
-        let cleanup = CleanupConfig {
-            scan_interval_ms: get_positive_u64_or(flat, METADATA_CLEANUP_SCAN_INTERVAL_MS, 30_000)?,
-            reclaim_grace_ms: get_positive_u64_or(flat, METADATA_CLEANUP_RECLAIM_GRACE_MS, 300_000)?,
-            max_replicas_per_scan: get_positive_usize_or(flat, METADATA_CLEANUP_MAX_REPLICAS_PER_SCAN, 10_000)?,
-            max_candidates: get_positive_usize_or(flat, METADATA_CLEANUP_MAX_CANDIDATES, 10_000)?,
-            dispatch_enabled: get_bool_or(flat, METADATA_CLEANUP_DISPATCH_ENABLED, true)?,
-            max_commands_per_heartbeat: get_positive_usize_or(flat, METADATA_CLEANUP_MAX_COMMANDS_PER_HEARTBEAT, 32)?,
-            retry_initial_backoff_ms: get_positive_u64_or(flat, METADATA_CLEANUP_RETRY_INITIAL_BACKOFF_MS, 1_000)?,
-            retry_max_backoff_ms: get_positive_u64_or(flat, METADATA_CLEANUP_RETRY_MAX_BACKOFF_MS, 60_000)?,
+        let cleanup_defaults = BlockCleanupConfig::default();
+        let block_cleanup = BlockCleanupConfig {
+            scan_interval_ms: duration_ms_or(flat, BLOCK_CLEANUP_INTERVAL, cleanup_defaults.scan_interval_ms)?,
+            reclaim_grace_ms: duration_ms_or(flat, BLOCK_CLEANUP_GRACE_PERIOD, cleanup_defaults.reclaim_grace_ms)?,
+            max_replicas_per_scan: positive_usize_or(
+                flat,
+                BLOCK_CLEANUP_SCAN_LIMIT,
+                cleanup_defaults.max_replicas_per_scan,
+            )?,
+            max_candidates: positive_usize_or(flat, BLOCK_CLEANUP_QUEUE_CAPACITY, cleanup_defaults.max_candidates)?,
+            enabled: bool_or(flat, BLOCK_CLEANUP_ENABLED, cleanup_defaults.enabled)?,
+            max_commands_per_heartbeat: positive_usize_or(
+                flat,
+                BLOCK_CLEANUP_BATCH_SIZE,
+                cleanup_defaults.max_commands_per_heartbeat,
+            )?,
+            retry_initial_backoff_ms: duration_ms_or(
+                flat,
+                BLOCK_CLEANUP_RETRY_INITIAL_BACKOFF,
+                cleanup_defaults.retry_initial_backoff_ms,
+            )?,
+            retry_max_backoff_ms: duration_ms_or(
+                flat,
+                BLOCK_CLEANUP_RETRY_MAX_BACKOFF,
+                cleanup_defaults.retry_max_backoff_ms,
+            )?,
         };
-        if cleanup.retry_max_backoff_ms < cleanup.retry_initial_backoff_ms {
-            return Err(invalid_config(
-                METADATA_CLEANUP_RETRY_MAX_BACKOFF_MS,
-                "must be greater than or equal to metadata.cleanup.retry_initial_backoff_ms",
-            ));
-        }
+        ensure_backoff_order(
+            BLOCK_CLEANUP_RETRY_INITIAL_BACKOFF,
+            block_cleanup.retry_initial_backoff_ms,
+            BLOCK_CLEANUP_RETRY_MAX_BACKOFF,
+            block_cleanup.retry_max_backoff_ms,
+        )?;
+        let delete_defaults = NamespaceDeleteConfig::default();
+        let namespace_delete = NamespaceDeleteConfig {
+            scan_interval_ms: duration_ms_or(flat, NAMESPACE_DELETE_INTERVAL, delete_defaults.scan_interval_ms)?,
+            max_candidates: positive_u32_or(flat, NAMESPACE_DELETE_MAX_ROOTS, delete_defaults.max_candidates)?,
+            max_entries: positive_u32_or(flat, NAMESPACE_DELETE_MAX_ENTRIES, delete_defaults.max_entries)?,
+            max_batch_bytes: bytes_u32_or(flat, NAMESPACE_DELETE_MAX_SIZE, delete_defaults.max_batch_bytes)?,
+            retry_initial_backoff_ms: duration_ms_or(
+                flat,
+                NAMESPACE_DELETE_RETRY_INITIAL_BACKOFF,
+                delete_defaults.retry_initial_backoff_ms,
+            )?,
+            retry_max_backoff_ms: duration_ms_or(
+                flat,
+                NAMESPACE_DELETE_RETRY_MAX_BACKOFF,
+                delete_defaults.retry_max_backoff_ms,
+            )?,
+        };
+        validate_namespace_delete(&namespace_delete)?;
 
-        let detached_root_reclamation = DetachedRootReclamationConfig {
-            scan_interval_ms: get_positive_u64_or(flat, METADATA_DETACHED_ROOT_RECLAIM_SCAN_INTERVAL_MS, 1_000)?,
-            max_candidates: get_positive_u32_or(
-                flat,
-                METADATA_DETACHED_ROOT_RECLAIM_MAX_CANDIDATES,
-                MAX_RECLAIM_DETACHED_ROOT_CANDIDATES,
-            )?,
-            max_entries: get_positive_u32_or(
-                flat,
-                METADATA_DETACHED_ROOT_RECLAIM_MAX_ENTRIES,
-                MAX_RECLAIM_DETACHED_ROOT_ENTRIES,
-            )?,
-            max_batch_bytes: get_positive_u32_or(
-                flat,
-                METADATA_DETACHED_ROOT_RECLAIM_MAX_BATCH_BYTES,
-                MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES,
-            )?,
-            retry_initial_backoff_ms: get_positive_u64_or(
-                flat,
-                METADATA_DETACHED_ROOT_RECLAIM_RETRY_INITIAL_BACKOFF_MS,
-                1_000,
-            )?,
-            retry_max_backoff_ms: get_positive_u64_or(
-                flat,
-                METADATA_DETACHED_ROOT_RECLAIM_RETRY_MAX_BACKOFF_MS,
-                60_000,
-            )?,
+        let worker_defaults = WorkerLivenessConfig::default();
+        let heartbeat_timeout_ms =
+            duration_ms_or(flat, WORKER_TIMEOUT, u64::from(worker_defaults.heartbeat_timeout_ms))?;
+        let worker_liveness = WorkerLivenessConfig {
+            heartbeat_timeout_ms: u32::try_from(heartbeat_timeout_ms)
+                .map_err(|_| invalid_config(WORKER_TIMEOUT, "exceeds the heartbeat protocol maximum"))?,
+            scan_interval_ms: duration_ms_or(flat, WORKER_SCAN_INTERVAL, worker_defaults.scan_interval_ms)?,
         };
-        if detached_root_reclamation.max_candidates > MAX_RECLAIM_DETACHED_ROOT_CANDIDATES {
+        let readiness_defaults = RootReadinessConfig::default();
+        let startup = StartupConfig {
+            root_readiness: RootReadinessConfig {
+                initial_backoff_ms: duration_ms_or(
+                    flat,
+                    STARTUP_INITIAL_BACKOFF,
+                    readiness_defaults.initial_backoff_ms,
+                )?,
+                max_backoff_ms: duration_ms_or(flat, STARTUP_MAX_BACKOFF, readiness_defaults.max_backoff_ms)?,
+                warn_after_ms: duration_ms_or(flat, STARTUP_WARN_AFTER, readiness_defaults.warn_after_ms)?,
+                timeout_ms: duration_ms_or(flat, STARTUP_TIMEOUT, readiness_defaults.timeout_ms)?,
+                fail_fast: bool_or(flat, STARTUP_FAIL_FAST, readiness_defaults.fail_fast)?,
+            },
+        };
+        ensure_backoff_order(
+            STARTUP_INITIAL_BACKOFF,
+            startup.root_readiness.initial_backoff_ms,
+            STARTUP_MAX_BACKOFF,
+            startup.root_readiness.max_backoff_ms,
+        )?;
+        if startup.root_readiness.warn_after_ms > startup.root_readiness.timeout_ms {
             return Err(invalid_config(
-                METADATA_DETACHED_ROOT_RECLAIM_MAX_CANDIDATES,
-                "exceeds the replicated protocol maximum",
+                STARTUP_WARN_AFTER,
+                "must not exceed the startup timeout",
             ));
         }
-        if detached_root_reclamation.max_entries > MAX_RECLAIM_DETACHED_ROOT_ENTRIES {
-            return Err(invalid_config(
-                METADATA_DETACHED_ROOT_RECLAIM_MAX_ENTRIES,
-                "exceeds the replicated protocol maximum",
-            ));
-        }
-        if !(MIN_RECLAIM_DETACHED_ROOT_BATCH_BYTES..=MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES)
-            .contains(&detached_root_reclamation.max_batch_bytes)
-        {
-            return Err(invalid_config(
-                METADATA_DETACHED_ROOT_RECLAIM_MAX_BATCH_BYTES,
-                "is outside the replicated protocol byte range",
-            ));
-        }
-        if detached_root_reclamation.retry_max_backoff_ms < detached_root_reclamation.retry_initial_backoff_ms {
-            return Err(invalid_config(
-                METADATA_DETACHED_ROOT_RECLAIM_RETRY_MAX_BACKOFF_MS,
-                "must be greater than or equal to metadata.detached_root_reclamation.retry_initial_backoff_ms",
-            ));
-        }
+        let write_lease_timeout_ms = duration_ms_or(flat, WRITE_LEASE_TIMEOUT, defaults.write_lease_timeout_ms)?;
 
-        let repair = RepairConfig {
-            max_queue_size: get_positive_usize_or(flat, METADATA_REPAIR_MAX_QUEUE_SIZE, 10000)?,
-            max_attempts: get_positive_u32_or(flat, METADATA_REPAIR_MAX_ATTEMPTS, 3)?,
-            inflight_timeout_ms: get_positive_u64_or(flat, METADATA_REPAIR_INFLIGHT_TIMEOUT_MS, 300_000)?,
-            initial_backoff_ms: get_positive_u64_or(flat, METADATA_REPAIR_INITIAL_BACKOFF_MS, 1_000)?,
-            max_backoff_ms: get_positive_u64_or(flat, METADATA_REPAIR_MAX_BACKOFF_MS, 60_000)?,
-            worker_inflight_limit: get_positive_usize_or(flat, METADATA_REPAIR_WORKER_INFLIGHT_LIMIT, 4)?,
-        };
-        let worker = WorkerConfig { repair };
-
-        let root_readiness = RootReadinessConfig {
-            initial_backoff_ms: get_positive_u64_or(flat, METADATA_BOOTSTRAP_ROOT_READY_INITIAL_BACKOFF_MS, 200)?,
-            max_backoff_ms: get_positive_u64_or(flat, METADATA_BOOTSTRAP_ROOT_READY_MAX_BACKOFF_MS, 5_000)?,
-            warn_after_ms: get_positive_u64_or_any(
-                flat,
-                &[
-                    METADATA_BOOTSTRAP_READY_WARN_AFTER_MS,
-                    METADATA_BOOTSTRAP_ROOT_READY_WARN_AFTER_MS,
-                ],
-                60_000,
-            )?,
-            timeout_ms: get_positive_u64_or(flat, METADATA_BOOTSTRAP_READY_TIMEOUT_MS, 120_000)?,
-            fail_fast: get_bool_or(flat, METADATA_BOOTSTRAP_READY_FAIL_FAST, false)?,
-        };
-        let bootstrap = BootstrapConfig { root_readiness };
         Ok(Self {
             cluster_id,
-            rpc_addr,
+            host,
+            bind_host,
+            rpc_port,
+            http_port,
             storage_dir,
-            raft,
-            authority,
-            list_status,
-            cleanup,
-            detached_root_reclamation,
-            worker,
-            bootstrap,
+            raft: RaftConfig::default(),
+            authority: MetadataAuthorityConfig::default(),
+            namespace_list,
+            block_cleanup,
+            namespace_delete,
+            worker_liveness,
+            startup,
+            write_lease_timeout_ms,
             observability,
         })
     }
 }
 
-fn parse_group_name(key: &'static str, raw: String) -> Result<GroupName, CommonError> {
-    GroupName::parse(raw).map_err(|err| CommonError::new(CommonErrorKind::InvalidArgument, format!("{key} {err}")))
+fn validate_namespace_delete(config: &NamespaceDeleteConfig) -> Result<(), CommonError> {
+    if config.max_candidates > MAX_RECLAIM_DETACHED_ROOT_CANDIDATES {
+        return Err(invalid_config(
+            NAMESPACE_DELETE_MAX_ROOTS,
+            "exceeds the replicated protocol maximum",
+        ));
+    }
+    if config.max_entries > MAX_RECLAIM_DETACHED_ROOT_ENTRIES {
+        return Err(invalid_config(
+            NAMESPACE_DELETE_MAX_ENTRIES,
+            "exceeds the replicated protocol maximum",
+        ));
+    }
+    if !(MIN_RECLAIM_DETACHED_ROOT_BATCH_BYTES..=MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES)
+        .contains(&config.max_batch_bytes)
+    {
+        return Err(invalid_config(
+            NAMESPACE_DELETE_MAX_SIZE,
+            "is outside the replicated protocol size range",
+        ));
+    }
+    ensure_backoff_order(
+        NAMESPACE_DELETE_RETRY_INITIAL_BACKOFF,
+        config.retry_initial_backoff_ms,
+        NAMESPACE_DELETE_RETRY_MAX_BACKOFF,
+        config.retry_max_backoff_ms,
+    )
 }
 
-fn get_i64_if_present(flat: &beryl_common::config::FlatConfig, key: &'static str) -> Result<Option<i64>, CommonError> {
-    if let Some(value) = flat.get_i64(key) {
-        return Ok(Some(value));
+fn ensure_backoff_order(
+    _initial_key: &'static str,
+    initial: u64,
+    max_key: &'static str,
+    max: u64,
+) -> Result<(), CommonError> {
+    if max < initial {
+        return Err(invalid_config(max_key, "must not be smaller than the initial backoff"));
     }
-    if flat.contains_key(key) {
-        return Err(invalid_config(key, "must be an integer"));
-    }
-    Ok(None)
+    Ok(())
 }
 
-fn rpc_addr_from_config(flat: &beryl_common::config::FlatConfig) -> Result<SocketAddr, CommonError> {
-    let addr = get_str_or(flat, METADATA_RPC_ADDR, "0.0.0.0")?;
-    let port = match get_i64_if_present(flat, METADATA_RPC_PORT)?.unwrap_or(18080) {
-        port @ 1..=65535 => port as u16,
-        port => {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!("{METADATA_RPC_PORT} must be in range 1-65535, got {port}"),
-            ));
-        }
-    };
-    format!("{}:{}", addr, port).parse().map_err(|e| {
-        CommonError::new(
-            CommonErrorKind::InvalidArgument,
-            format!("Invalid metadata.rpc.addr/port: {}", e),
-        )
-    })
+fn string_or(flat: &FlatConfig, key: &'static str, default: &str) -> Result<String, CommonError> {
+    if !flat.contains_key(key) {
+        return Ok(default.to_string());
+    }
+    flat.get_str(key).ok_or_else(|| invalid_config(key, "must be a string"))
 }
 
-fn get_str_or(
-    flat: &beryl_common::config::FlatConfig,
-    key: &'static str,
-    default: &'static str,
-) -> Result<String, CommonError> {
-    if let Some(value) = flat.get_str(key) {
-        return Ok(value);
-    }
-    if flat.contains_key(key) {
-        return Err(invalid_config(key, "must be a string"));
-    }
-    Ok(default.to_string())
-}
-
-fn get_bool_or(flat: &beryl_common::config::FlatConfig, key: &'static str, default: bool) -> Result<bool, CommonError> {
-    if let Some(value) = flat.get_bool(key) {
-        return Ok(value);
-    }
-    if flat.contains_key(key) {
-        return Err(invalid_config(key, "must be a boolean"));
-    }
-    Ok(default)
-}
-
-fn get_u64_or(flat: &beryl_common::config::FlatConfig, key: &'static str, default: u64) -> Result<u64, CommonError> {
-    let Some(value) = get_i64_if_present(flat, key)? else {
+fn bool_or(flat: &FlatConfig, key: &'static str, default: bool) -> Result<bool, CommonError> {
+    if !flat.contains_key(key) {
         return Ok(default);
-    };
-    u64::try_from(value).map_err(|_| invalid_config(key, "must be non-negative"))
-}
-
-fn get_positive_u64_or(
-    flat: &beryl_common::config::FlatConfig,
-    key: &'static str,
-    default: u64,
-) -> Result<u64, CommonError> {
-    let value = get_u64_or(flat, key, default)?;
-    if value == 0 {
-        return Err(invalid_config(key, "must be greater than zero"));
     }
-    Ok(value)
+    flat.get_bool(key)
+        .ok_or_else(|| invalid_config(key, "must be a boolean"))
 }
 
-fn get_positive_u64_or_any(
-    flat: &beryl_common::config::FlatConfig,
-    keys: &[&'static str],
-    default: u64,
-) -> Result<u64, CommonError> {
-    for key in keys {
-        if flat.contains_key(key) {
-            let value = get_u64_or(flat, key, default)?;
-            if value == 0 {
-                return Err(invalid_config(key, "must be greater than zero"));
-            }
-            return Ok(value);
-        }
-    }
-    Ok(default)
-}
-
-fn get_positive_usize_or(
-    flat: &beryl_common::config::FlatConfig,
-    key: &'static str,
-    default: usize,
-) -> Result<usize, CommonError> {
-    let Some(value) = get_i64_if_present(flat, key)? else {
+fn port_or(flat: &FlatConfig, key: &'static str, default: u16) -> Result<u16, CommonError> {
+    if !flat.contains_key(key) {
         return Ok(default);
-    };
-    let value = usize::try_from(value).map_err(|_| invalid_config(key, "must fit usize"))?;
-    if value == 0 {
-        return Err(invalid_config(key, "must be greater than zero"));
     }
-    Ok(value)
+    let value = flat
+        .get_i64(key)
+        .ok_or_else(|| invalid_config(key, "must be an integer"))?;
+    u16::try_from(value)
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| invalid_config(key, "must be in range 1-65535"))
 }
 
-fn get_positive_u32_or(
-    flat: &beryl_common::config::FlatConfig,
-    key: &'static str,
-    default: u32,
-) -> Result<u32, CommonError> {
-    let Some(value) = get_i64_if_present(flat, key)? else {
+fn positive_u32_or(flat: &FlatConfig, key: &'static str, default: u32) -> Result<u32, CommonError> {
+    if !flat.contains_key(key) {
         return Ok(default);
-    };
-    let value = u32::try_from(value).map_err(|_| invalid_config(key, "must fit u32"))?;
-    if value == 0 {
-        return Err(invalid_config(key, "must be greater than zero"));
     }
-    Ok(value)
+    let value = flat
+        .get_i64(key)
+        .ok_or_else(|| invalid_config(key, "must be an integer"))?;
+    u32::try_from(value)
+        .ok()
+        .filter(|value| *value != 0)
+        .ok_or_else(|| invalid_config(key, "must be greater than zero and fit u32"))
+}
+
+fn positive_usize_or(flat: &FlatConfig, key: &'static str, default: usize) -> Result<usize, CommonError> {
+    if !flat.contains_key(key) {
+        return Ok(default);
+    }
+    let value = flat
+        .get_i64(key)
+        .ok_or_else(|| invalid_config(key, "must be an integer"))?;
+    usize::try_from(value)
+        .ok()
+        .filter(|value| *value != 0)
+        .ok_or_else(|| invalid_config(key, "must be greater than zero"))
+}
+
+fn duration_ms_or(flat: &FlatConfig, key: &'static str, default: u64) -> Result<u64, CommonError> {
+    if !flat.contains_key(key) {
+        return Ok(default);
+    }
+    let duration = flat
+        .get_duration(key)
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| invalid_config(key, "must be a positive duration"))?;
+    u64::try_from(duration.as_millis()).map_err(|_| invalid_config(key, "is too large"))
+}
+
+fn bytes_u32_or(flat: &FlatConfig, key: &'static str, default: u32) -> Result<u32, CommonError> {
+    if !flat.contains_key(key) {
+        return Ok(default);
+    }
+    let bytes = flat
+        .get_bytes(key)
+        .ok_or_else(|| invalid_config(key, "must be a size such as 1MiB"))?;
+    u32::try_from(bytes).map_err(|_| invalid_config(key, "is too large"))
 }
 
 fn invalid_config(key: &'static str, detail: &'static str) -> CommonError {
     CommonError::new(CommonErrorKind::InvalidArgument, format!("{key} {detail}"))
 }
 
+fn validate_public_host(key: &'static str, host: &str) -> Result<(), CommonError> {
+    if host.is_empty() || host != host.trim() || host.chars().any(char::is_whitespace) {
+        return Err(invalid_config(key, "must be a host or IP without whitespace"));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return if ip.is_unspecified() {
+            Err(invalid_config(key, "must be a routable host or IP"))
+        } else {
+            Ok(())
+        };
+    }
+    if host.contains("://") || host.contains([':', '/', '\\']) {
+        return Err(invalid_config(key, "must not include a scheme, port, or path"));
+    }
+    Ok(())
+}
+
+fn format_host_port(host: &str, port: u16) -> String {
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => format!("[{host}]:{port}"),
+        _ => format!("{host}:{port}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beryl_common::config::ServerConfig;
 
-    impl Default for MetadataConfig {
-        fn default() -> Self {
-            Self {
-                cluster_id: "local-beryl".to_string(),
-                rpc_addr: "0.0.0.0:18080".parse().unwrap(),
-                storage_dir: PathBuf::from("data/metadata"),
-                raft: RaftConfig::default(),
-                authority: MetadataAuthorityConfig::default(),
-                list_status: ListStatusConfig::default(),
-                cleanup: CleanupConfig::default(),
-                detached_root_reclamation: DetachedRootReclamationConfig::default(),
-                worker: WorkerConfig::default(),
-                bootstrap: BootstrapConfig {
-                    root_readiness: RootReadinessConfig::default(),
-                },
-                observability: test_observability_config(),
-            }
-        }
-    }
-
-    fn test_observability_config() -> ObservabilityConfig {
-        let mut flat = beryl_common::config::FlatConfig::new();
-        flat.set("observe.log.format", "compact");
-        flat.set("observe.log.output", "stderr");
-        flat.set(
-            "observe.log.level",
-            "info,beryl_metadata=info,beryl_worker=info,beryl_common=info,openraft=warn,tonic=warn,tower=warn,h2=warn",
-        );
-        flat.set("observe.metrics.prometheus.bind", "127.0.0.1:18081");
-        flat.set("observe.metrics.prometheus.path", "/metrics");
-        ObservabilityConfig::from_flat(&flat).expect("test observe config")
-    }
-
-    fn add_observe_config(flat: &mut beryl_common::config::FlatConfig) {
-        flat.set("observe.log.format", "compact");
-        flat.set("observe.log.output", "stderr");
-        flat.set(
-            "observe.log.level",
-            "info,beryl_metadata=info,beryl_worker=info,beryl_common=info,openraft=warn,tonic=warn,tower=warn,h2=warn",
-        );
-        flat.set("observe.metrics.prometheus.bind", "127.0.0.1:18081");
-        flat.set("observe.metrics.prometheus.path", "/metrics");
-    }
-
-    fn test_flat() -> beryl_common::config::FlatConfig {
-        let mut flat = ServerConfig::default().as_flat().clone();
-        add_observe_config(&mut flat);
+    fn base_flat() -> FlatConfig {
+        let mut flat = FlatConfig::new();
+        flat.set("beryl.logging.format", "compact");
+        flat.set("beryl.logging.output", "stderr");
+        flat.set("beryl.logging.level", "info");
         flat
     }
 
     #[test]
-    fn canonical_group_name_loads_from_metadata_group_name() {
-        let mut flat = test_flat();
-        flat.set("metadata.group.name", "root-prod");
-
-        let config = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap();
-        assert_eq!(config.authority.group_name.as_str(), "root-prod");
-    }
-
-    #[test]
-    fn observability_loads_from_flat_config_only() {
-        let mut flat = test_flat();
-        flat.set("observe.log.format", "json");
-        flat.set("observe.log.output", "stdout");
-        flat.set("observe.metrics.prometheus.bind", "127.0.0.1:19081");
+    fn target_config_loads_network_and_domain_values() {
+        let mut flat = base_flat();
+        flat.set(HOST, "metadata-01");
+        flat.set(BIND_HOST, "127.0.0.1");
+        flat.set(RPC_PORT, 28080i64);
+        flat.set(HTTP_PORT, 28081i64);
+        flat.set(BLOCK_CLEANUP_INTERVAL, "2s");
+        flat.set(NAMESPACE_DELETE_MAX_SIZE, "1MiB");
+        flat.set(WORKER_TIMEOUT, "1500ms");
+        flat.set(WRITE_LEASE_TIMEOUT, "90s");
 
         let config = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap();
 
-        assert_eq!(config.observability.log.format, "json");
-        assert_eq!(config.observability.log.output, "stdout");
-        assert_eq!(config.observability.metrics.prometheus.bind, "127.0.0.1:19081");
-    }
-
-    #[test]
-    fn invalid_group_name_is_rejected() {
-        for group_name in ["", "Root", "root/prod", "root prod", "-root"] {
-            let mut flat = test_flat();
-            flat.set("metadata.group.name", group_name);
-
-            let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
-            assert!(err.message.contains("metadata.group.name"));
-        }
-    }
-
-    #[test]
-    fn string_keys_reject_present_wrong_type_values() {
-        for key in [METADATA_RPC_ADDR, METADATA_STORAGE_DIR] {
-            let mut flat = test_flat();
-            flat.set(key, true);
-
-            let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
-
-            assert!(
-                err.message.contains(key),
-                "error for {key} should mention the offending key: {}",
-                err.message
-            );
-        }
-    }
-
-    #[test]
-    fn raft_mode_parses_single_and_cluster_only() {
-        for (raw, expected) in [("single", RaftMode::Single), ("cluster", RaftMode::Cluster)] {
-            let mut flat = test_flat();
-            flat.set("metadata.raft.mode", raw);
-
-            let config = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap();
-            assert_eq!(config.raft.mode, expected);
-        }
-
-        let mut flat = test_flat();
-        flat.set("metadata.raft.mode", "single_node");
-        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
-        assert!(err.message.contains("metadata.raft.mode"));
-    }
-
-    #[test]
-    fn absent_numeric_keys_use_metadata_defaults() {
-        let config = MetadataConfig::from_server_config(ServerConfig::from_flat(test_flat())).unwrap();
-
+        assert_eq!(config.rpc_address(), "metadata-01:28080");
+        assert_eq!(config.rpc_addr(), "127.0.0.1:28080".parse().unwrap());
+        assert_eq!(config.http_addr(), "127.0.0.1:28081".parse().unwrap());
+        assert_eq!(config.block_cleanup.scan_interval_ms, 2_000);
+        assert_eq!(config.namespace_delete.max_batch_bytes, 1024 * 1024);
+        assert_eq!(config.worker_liveness.heartbeat_timeout_ms, 1_500);
+        assert_eq!(config.write_lease_timeout_ms, 90_000);
+        assert_eq!(config.authority.group_name.as_str(), "root");
         assert_eq!(config.raft.node_id, 1);
-        assert_eq!(config.list_status, ListStatusConfig::default());
-        assert_eq!(config.cleanup.scan_interval_ms, 30_000);
-        assert_eq!(config.cleanup.reclaim_grace_ms, 300_000);
-        assert_eq!(config.cleanup.max_replicas_per_scan, 10_000);
-        assert_eq!(config.cleanup.max_candidates, 10_000);
-        assert!(config.cleanup.dispatch_enabled);
-        assert_eq!(config.cleanup.max_commands_per_heartbeat, 32);
-        assert_eq!(config.cleanup.retry_initial_backoff_ms, 1_000);
-        assert_eq!(config.cleanup.retry_max_backoff_ms, 60_000);
-        assert_eq!(config.detached_root_reclamation.scan_interval_ms, 1_000);
-        assert_eq!(
-            config.detached_root_reclamation.max_candidates,
-            MAX_RECLAIM_DETACHED_ROOT_CANDIDATES
-        );
-        assert_eq!(
-            config.detached_root_reclamation.max_entries,
-            MAX_RECLAIM_DETACHED_ROOT_ENTRIES
-        );
-        assert_eq!(
-            config.detached_root_reclamation.max_batch_bytes,
-            MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES
-        );
-        assert_eq!(config.detached_root_reclamation.retry_initial_backoff_ms, 1_000);
-        assert_eq!(config.detached_root_reclamation.retry_max_backoff_ms, 60_000);
-        assert_eq!(config.worker.repair.max_queue_size, 10000);
-        assert_eq!(config.worker.repair.max_attempts, 3);
-        assert_eq!(config.worker.repair.inflight_timeout_ms, 300_000);
-        assert_eq!(config.worker.repair.initial_backoff_ms, 1_000);
-        assert_eq!(config.worker.repair.max_backoff_ms, 60_000);
-        assert_eq!(config.worker.repair.worker_inflight_limit, 4);
-        assert_eq!(config.bootstrap.root_readiness.initial_backoff_ms, 200);
-        assert_eq!(config.bootstrap.root_readiness.max_backoff_ms, 5_000);
-        assert_eq!(config.bootstrap.root_readiness.warn_after_ms, 60_000);
     }
 
     #[test]
-    fn list_status_page_sizes_accept_a_stricter_server_policy() {
-        let mut flat = test_flat();
-        flat.set(METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE, 200_i64);
-        flat.set(METADATA_LIST_STATUS_MAX_PAGE_SIZE, 500_i64);
+    fn active_safety_bounds_are_enforced() {
+        let mut flat = base_flat();
+        flat.set(LIST_MAX_PAGE_SIZE, 20_000i64);
+        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
 
-        let config = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap();
+        let mut flat = base_flat();
+        flat.set(NAMESPACE_DELETE_MAX_SIZE, "2MiB");
+        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
 
-        assert_eq!(config.list_status, ListStatusConfig::try_new(200, 500).unwrap());
-    }
-
-    #[test]
-    fn list_status_programmatic_config_rejects_invalid_bounds() {
-        for (default_page_size, max_page_size, expected_key) in [
-            (0, 1, METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE),
-            (1, 0, METADATA_LIST_STATUS_MAX_PAGE_SIZE),
-            (2, 1, METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE),
-            (1, MAX_LIST_STATUS_PAGE_SIZE + 1, METADATA_LIST_STATUS_MAX_PAGE_SIZE),
-        ] {
-            let error = ListStatusConfig::try_new(default_page_size, max_page_size)
-                .expect_err("invalid programmatic ListStatus policy must fail");
-            assert!(error.message.contains(expected_key));
+        for host in [" metadata-01", "http://metadata-01", "metadata-01:18080"] {
+            let mut flat = base_flat();
+            flat.set(HOST, host);
+            assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
         }
-    }
-
-    #[test]
-    fn cleanup_dispatch_can_be_explicitly_disabled() {
-        let mut flat = test_flat();
-        flat.set(METADATA_CLEANUP_DISPATCH_ENABLED, false);
-
-        let config = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap();
-
-        assert!(!config.cleanup.dispatch_enabled);
-    }
-
-    #[test]
-    fn invalid_numeric_values_are_rejected() {
-        for port in [0i64, 70_000] {
-            let mut flat = test_flat();
-            flat.set(METADATA_RPC_PORT, port);
-            let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
-            assert!(err.message.contains(METADATA_RPC_PORT));
-        }
-
-        let mut non_integer_port = test_flat();
-        non_integer_port.set(METADATA_RPC_PORT, true);
-        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(non_integer_port)).unwrap_err();
-        assert!(err.message.contains(METADATA_RPC_PORT));
-
-        let positive_keys = [
-            METADATA_RAFT_NODE_ID,
-            METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE,
-            METADATA_LIST_STATUS_MAX_PAGE_SIZE,
-            METADATA_CLEANUP_SCAN_INTERVAL_MS,
-            METADATA_CLEANUP_RECLAIM_GRACE_MS,
-            METADATA_CLEANUP_MAX_REPLICAS_PER_SCAN,
-            METADATA_CLEANUP_MAX_CANDIDATES,
-            METADATA_CLEANUP_MAX_COMMANDS_PER_HEARTBEAT,
-            METADATA_CLEANUP_RETRY_INITIAL_BACKOFF_MS,
-            METADATA_CLEANUP_RETRY_MAX_BACKOFF_MS,
-            METADATA_DETACHED_ROOT_RECLAIM_SCAN_INTERVAL_MS,
-            METADATA_DETACHED_ROOT_RECLAIM_MAX_CANDIDATES,
-            METADATA_DETACHED_ROOT_RECLAIM_MAX_ENTRIES,
-            METADATA_DETACHED_ROOT_RECLAIM_MAX_BATCH_BYTES,
-            METADATA_DETACHED_ROOT_RECLAIM_RETRY_INITIAL_BACKOFF_MS,
-            METADATA_DETACHED_ROOT_RECLAIM_RETRY_MAX_BACKOFF_MS,
-            METADATA_REPAIR_MAX_QUEUE_SIZE,
-            METADATA_REPAIR_MAX_ATTEMPTS,
-            METADATA_REPAIR_INFLIGHT_TIMEOUT_MS,
-            METADATA_REPAIR_INITIAL_BACKOFF_MS,
-            METADATA_REPAIR_MAX_BACKOFF_MS,
-            METADATA_REPAIR_WORKER_INFLIGHT_LIMIT,
-            METADATA_BOOTSTRAP_ROOT_READY_INITIAL_BACKOFF_MS,
-            METADATA_BOOTSTRAP_ROOT_READY_MAX_BACKOFF_MS,
-            METADATA_BOOTSTRAP_ROOT_READY_WARN_AFTER_MS,
-        ];
-        for value in [-1i64, 0] {
-            for key in positive_keys {
-                let mut flat = test_flat();
-                flat.set(key, value);
-                let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
-                assert!(
-                    err.message.contains(key),
-                    "error for {key}={value} should mention the offending key: {}",
-                    err.message
-                );
-            }
-        }
-
-        let mut flat = test_flat();
-        flat.set(METADATA_REPAIR_MAX_ATTEMPTS, i64::from(u32::MAX) + 1);
-        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
-        assert!(err.message.contains(METADATA_REPAIR_MAX_ATTEMPTS));
-
-        let mut flat = test_flat();
-        flat.set(METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE, 101_i64);
-        flat.set(METADATA_LIST_STATUS_MAX_PAGE_SIZE, 100_i64);
-        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
-        assert!(err.message.contains(METADATA_LIST_STATUS_DEFAULT_PAGE_SIZE));
-
-        let mut flat = test_flat();
-        flat.set(
-            METADATA_LIST_STATUS_MAX_PAGE_SIZE,
-            i64::from(MAX_LIST_STATUS_PAGE_SIZE) + 1,
-        );
-        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
-        assert!(err.message.contains(METADATA_LIST_STATUS_MAX_PAGE_SIZE));
-
-        let mut flat = test_flat();
-        flat.set(METADATA_CLEANUP_RETRY_INITIAL_BACKOFF_MS, 100_i64);
-        flat.set(METADATA_CLEANUP_RETRY_MAX_BACKOFF_MS, 99_i64);
-        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
-        assert!(err.message.contains(METADATA_CLEANUP_RETRY_MAX_BACKOFF_MS));
-
-        for (key, value) in [
-            (
-                METADATA_DETACHED_ROOT_RECLAIM_MAX_CANDIDATES,
-                i64::from(MAX_RECLAIM_DETACHED_ROOT_CANDIDATES) + 1,
-            ),
-            (
-                METADATA_DETACHED_ROOT_RECLAIM_MAX_ENTRIES,
-                i64::from(MAX_RECLAIM_DETACHED_ROOT_ENTRIES) + 1,
-            ),
-            (
-                METADATA_DETACHED_ROOT_RECLAIM_MAX_BATCH_BYTES,
-                i64::from(MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES) + 1,
-            ),
-            (
-                METADATA_DETACHED_ROOT_RECLAIM_MAX_BATCH_BYTES,
-                i64::from(MIN_RECLAIM_DETACHED_ROOT_BATCH_BYTES) - 1,
-            ),
-        ] {
-            let mut flat = test_flat();
-            flat.set(key, value);
-            let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
-            assert!(err.message.contains(key));
-        }
-
-        let mut flat = test_flat();
-        flat.set(METADATA_DETACHED_ROOT_RECLAIM_RETRY_INITIAL_BACKOFF_MS, 100_i64);
-        flat.set(METADATA_DETACHED_ROOT_RECLAIM_RETRY_MAX_BACKOFF_MS, 99_i64);
-        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
-        assert!(err
-            .message
-            .contains(METADATA_DETACHED_ROOT_RECLAIM_RETRY_MAX_BACKOFF_MS));
     }
 }

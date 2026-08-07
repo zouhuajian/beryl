@@ -3,7 +3,7 @@
 
 //! Leader-only proposal of bounded detached-root authority mutations.
 
-use crate::config::DetachedRootReclamationConfig;
+use crate::config::NamespaceDeleteConfig;
 use crate::error::{MetadataError, MetadataResult};
 use crate::observe;
 use crate::raft::{AppRaftNode, ApplySuccess, Command, DetachedRootReclaimResult, RocksDBStorage};
@@ -28,7 +28,7 @@ pub(crate) enum DetachedRootReclaimPass {
 pub(crate) struct DetachedRootReclaimer {
     raft_node: Arc<AppRaftNode>,
     storage: Arc<RocksDBStorage>,
-    config: DetachedRootReclamationConfig,
+    config: NamespaceDeleteConfig,
     proposal: Mutex<()>,
 }
 
@@ -36,7 +36,7 @@ impl DetachedRootReclaimer {
     pub(crate) fn new(
         raft_node: Arc<AppRaftNode>,
         storage: Arc<RocksDBStorage>,
-        config: DetachedRootReclamationConfig,
+        config: NamespaceDeleteConfig,
     ) -> Self {
         Self {
             raft_node,
@@ -197,7 +197,7 @@ mod tests {
         let reclaimer = DetachedRootReclaimer::new(
             Arc::clone(&raft_node),
             Arc::clone(&storage),
-            DetachedRootReclamationConfig::default(),
+            NamespaceDeleteConfig::default(),
         );
         (storage, raft_node, reclaimer)
     }

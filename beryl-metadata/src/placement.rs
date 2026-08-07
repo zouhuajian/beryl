@@ -21,7 +21,6 @@ pub enum PlacementOp {
     Read,
     Load,
     Write,
-    Repair,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,7 +149,6 @@ impl PlacementPlanner {
             PlacementOp::Read => choose_read(req, workers),
             PlacementOp::Load => choose_live_targets(req, workers, 1, false),
             PlacementOp::Write => choose_live_targets(req, workers, req.target_replicas.max(1), true),
-            PlacementOp::Repair => plan(req, Vec::new(), PlacementStatus::Unsupported),
         }
     }
 }
