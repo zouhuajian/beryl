@@ -49,6 +49,15 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
 - Multi-group metadata is future work.
 - The internal writable namespace is rooted at `/`; `/local` has no special namespace semantics.
 
+## Internal Alpha Contract
+
+- The first internal release target is `v0.1.0-alpha.1`.
+- Metadata, Worker, and the Rust Client must come from the same release artifact.
+- The first alpha requires clean Metadata and Worker storage. Untagged development data is not migrated or supported.
+- Same-version stop, start, restart, and recovery are supported.
+- Mixed-version clusters, upgrade, downgrade, rollback, and cross-version storage compatibility are not supported.
+- The released runtime is the current single-Metadata resident-storage path; it does not provide UFS read-through, Metadata HA, or replication.
+
 ## What Works Today
 
 - Metadata format/start lifecycle and gRPC filesystem service.

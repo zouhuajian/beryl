@@ -201,40 +201,51 @@ fn worker_start_refuses_invalid_final_storage_info() {
     let config_path = write_config(&dir, "cluster-a", "root");
     let config = WorkerConfig::load(&config_path).unwrap();
     prepare_worker_start(&config).unwrap();
-    std::fs::write(worker_storage_info_path(&config), b"not-json").unwrap();
+    let info_path = worker_storage_info_path(&config);
+    let malformed_info = b"not-json";
+    std::fs::write(&info_path, malformed_info).unwrap();
 
     let err = prepare_worker_start(&config).unwrap_err();
     let message = err.to_string();
 
     assert!(message.contains("worker storage info"));
     assert!(message.contains("malformed"));
-    assert!(message.contains("clean storage"));
+    assert!(message.contains("clean worker storage"));
+    assert_eq!(std::fs::read(&info_path).unwrap(), malformed_info);
 }
 
 #[test]
-fn worker_start_rejects_storage_format_v1_without_rewriting_it() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "cluster-a", "root");
-    let config = WorkerConfig::load(&config_path).unwrap();
-    let worker_id = prepare_worker_start(&config).unwrap();
-    let info_path = worker_storage_info_path(&config);
-    let old_info = format!(
-        r#"{{
+fn worker_start_rejects_non_current_storage_versions_without_rewriting_them() {
+    for unsupported_version in [0, 2, u32::MAX] {
+        let dir = TempDir::new().unwrap();
+        let config_path = write_config(&dir, "cluster-a", "root");
+        let config = WorkerConfig::load(&config_path).unwrap();
+        let worker_id = prepare_worker_start(&config).unwrap();
+        let info_path = worker_storage_info_path(&config);
+        let unsupported_info = format!(
+            r#"{{
   "cluster_id": "cluster-a",
   "worker_id": {},
   "storage_uuid": "storage-a",
-  "format_version": 1,
+  "format_version": {},
   "created_at_ms": 1,
   "software_version": "test"
 }}"#,
-        worker_id.as_raw()
-    );
-    std::fs::write(&info_path, old_info.as_bytes()).unwrap();
+            worker_id.as_raw(),
+            unsupported_version
+        );
+        std::fs::write(&info_path, unsupported_info.as_bytes()).unwrap();
 
-    let error = prepare_worker_start(&config).unwrap_err();
+        let error = prepare_worker_start(&config).unwrap_err();
+        let message = error.to_string();
 
-    assert!(error.to_string().contains("format_version=1"));
-    assert_eq!(std::fs::read(&info_path).unwrap(), old_info.as_bytes());
+        assert!(
+            message.contains(&format!("format_version={unsupported_version}")),
+            "{message}"
+        );
+        assert!(message.contains("expected 1"), "{message}");
+        assert_eq!(std::fs::read(&info_path).unwrap(), unsupported_info.as_bytes());
+    }
 }
 
 #[test]
@@ -244,31 +255,26 @@ fn worker_storage_info_rejects_legacy_group_id_and_unknown_fields() {
         let config_path = write_config(&dir, "cluster-a", "root");
         let config = WorkerConfig::load(&config_path).unwrap();
         let worker_id = prepare_worker_start(&config).unwrap();
-        std::fs::write(
-            worker_storage_info_path(&config),
-            format!(
-                r#"{{
+        let info_path = worker_storage_info_path(&config);
+        let unsupported_info = format!(
+            r#"{{
   "cluster_id": "cluster-a",
   "worker_id": {},
   "storage_uuid": "storage-a",
-  "format_version": 2,
+  "format_version": 1,
   "created_at_ms": 1,
   "software_version": "test",
   "{extra_field}": 1
 }}"#,
-                worker_id.as_raw()
-            ),
-        )
-        .unwrap();
+            worker_id.as_raw()
+        );
+        std::fs::write(&info_path, unsupported_info.as_bytes()).unwrap();
 
         let err = prepare_worker_start(&config).unwrap_err();
         let message = err.to_string();
-        assert!(
-            message.contains("old worker storage info format unsupported"),
-            "{message}"
-        );
-        assert!(message.contains("clean storage"), "{message}");
-        assert!(message.contains("future migration command"), "{message}");
+        assert!(message.contains("malformed or unsupported"), "{message}");
+        assert!(message.contains("clean worker storage"), "{message}");
+        assert_eq!(std::fs::read(&info_path).unwrap(), unsupported_info.as_bytes());
     }
 }
 

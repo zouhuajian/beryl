@@ -178,9 +178,16 @@ fn open_generation_db(path: &Path, create_missing: bool) -> MetadataResult<Arc<D
     })?;
     match db.get_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY) {
         Ok(Some(raw)) => {
-            let stored: u64 = decode_from_slice(&raw, standard())
-                .map_err(|error| MetadataError::InvalidArgument(format!("invalid RocksDB schema version: {error}")))?
-                .0;
+            let (stored, bytes_read): (u64, usize) = decode_from_slice(&raw, standard()).map_err(|error| {
+                MetadataError::InvalidArgument(format!(
+                    "invalid RocksDB schema version: {error}; reformat metadata storage"
+                ))
+            })?;
+            if bytes_read != raw.len() {
+                return Err(MetadataError::InvalidArgument(
+                    "invalid RocksDB schema version: trailing bytes; reformat metadata storage".to_string(),
+                ));
+            }
             if stored != ROCKSDB_SCHEMA_VERSION {
                 return Err(MetadataError::InvalidArgument(format!(
                     "unsupported RocksDB schema version {stored}; expected {}; reformat metadata storage",
@@ -356,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_existing_schema_v1_store_requires_reformat() {
+    fn opening_existing_store_without_schema_version_requires_reformat() {
         let dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
         storage
@@ -369,7 +376,7 @@ mod tests {
         drop(storage);
 
         let error = match RocksDBStorage::open_existing_for_start(dir.path()) {
-            Ok(_) => panic!("schema v1 store must not open"),
+            Ok(_) => panic!("store without a schema version must not open"),
             Err(error) => error,
         };
 
@@ -378,47 +385,71 @@ mod tests {
     }
 
     #[test]
-    fn opening_previous_schema_requires_reformat() {
+    fn opening_non_current_schema_versions_requires_reformat_without_rewriting_them() {
+        for unsupported_version in [0, 2, 10, u64::MAX] {
+            let dir = TempDir::new().unwrap();
+            let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
+            drop(storage);
+
+            let generation_path = dir.path().join("generations/gen-000001");
+            let db = DB::open_cf_descriptors(&Options::default(), &generation_path, cf_descriptors()).unwrap();
+            let meta = db.cf_handle(CF_META).unwrap();
+            let unsupported = bincode::serde::encode_to_vec(unsupported_version, bincode::config::standard()).unwrap();
+            db.put_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY, &unsupported).unwrap();
+            drop(db);
+
+            let error = match RocksDBStorage::open_existing_for_start(dir.path()) {
+                Ok(_) => panic!("non-current schema store must not open"),
+                Err(error) => error,
+            };
+
+            assert!(
+                error.to_string().contains(&format!(
+                    "unsupported RocksDB schema version {unsupported_version}; expected {ROCKSDB_SCHEMA_VERSION}"
+                )),
+                "unexpected startup error: {error}"
+            );
+            assert!(
+                error.to_string().contains("reformat metadata storage"),
+                "unexpected startup error: {error}"
+            );
+
+            let db = DB::open_cf_descriptors(&Options::default(), generation_path, cf_descriptors()).unwrap();
+            let meta = db.cf_handle(CF_META).unwrap();
+            assert_eq!(
+                db.get_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY).unwrap().as_deref(),
+                Some(unsupported.as_slice())
+            );
+        }
+    }
+
+    #[test]
+    fn opening_malformed_schema_version_requires_reformat_without_rewriting_it() {
         let dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
         drop(storage);
 
         let generation_path = dir.path().join("generations/gen-000001");
-        let mut db = DB::open_cf_descriptors(&Options::default(), &generation_path, cf_descriptors()).unwrap();
+        let db = DB::open_cf_descriptors(&Options::default(), &generation_path, cf_descriptors()).unwrap();
         let meta = db.cf_handle(CF_META).unwrap();
-        let previous = bincode::serde::encode_to_vec(ROCKSDB_SCHEMA_VERSION - 1, bincode::config::standard()).unwrap();
-        db.put_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY, &previous).unwrap();
-        db.drop_cf(CF_DETACHED_ROOTS).unwrap();
+        let mut malformed = bincode::serde::encode_to_vec(ROCKSDB_SCHEMA_VERSION, bincode::config::standard()).unwrap();
+        malformed.push(0);
+        db.put_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY, &malformed).unwrap();
         drop(db);
 
         let error = match RocksDBStorage::open_existing_for_start(dir.path()) {
-            Ok(_) => panic!("previous schema store must not open without the current column families"),
+            Ok(_) => panic!("store with a malformed schema version must not open"),
             Err(error) => error,
         };
 
-        assert!(
-            error.to_string().contains(&format!(
-                "unsupported RocksDB schema version {}; expected {}",
-                ROCKSDB_SCHEMA_VERSION - 1,
-                ROCKSDB_SCHEMA_VERSION
-            )),
-            "unexpected startup error: {error}"
-        );
-        assert!(
-            error.to_string().contains("reformat metadata storage"),
-            "unexpected startup error: {error}"
-        );
+        assert!(error.to_string().contains("invalid RocksDB schema version"));
+        assert!(error.to_string().contains("reformat metadata storage"));
 
-        let previous_descriptors = CURRENT_CFS
-            .iter()
-            .filter(|name| **name != CF_DETACHED_ROOTS)
-            .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
-            .collect::<Vec<_>>();
-        let db = DB::open_cf_descriptors(&Options::default(), generation_path, previous_descriptors).unwrap();
+        let db = DB::open_cf_descriptors(&Options::default(), generation_path, cf_descriptors()).unwrap();
         let meta = db.cf_handle(CF_META).unwrap();
         assert_eq!(
             db.get_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY).unwrap().as_deref(),
-            Some(previous.as_slice())
+            Some(malformed.as_slice())
         );
     }
 

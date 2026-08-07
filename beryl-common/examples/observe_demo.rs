@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         resource: ResourceConfig {
             service_name: Some("observability-demo".to_string()),
-            service_version: Some("0.1.0".to_string()),
+            service_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             environment: Some("development".to_string()),
             instance_id: Some("demo-1".to_string()),
             node_name: Some("demo-node".to_string()),
@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let service_info = ServiceInfo {
         name: "observability-demo".to_string(),
-        version: "0.1.0".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
         environment: "development".to_string(),
         instance_id: "demo-1".to_string(),
         node_name: Some("demo-node".to_string()),

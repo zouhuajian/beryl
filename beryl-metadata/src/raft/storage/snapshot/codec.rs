@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Strict snapshot v2 framing for replicated metadata column families.
+//! Strict snapshot v1 framing for replicated metadata column families.
 
 use super::super::{ROCKSDB_SCHEMA_VERSION, STATE_CFS};
 use beryl_types::{GroupName, RaftLogId};
@@ -11,7 +11,7 @@ use std::io::{self, Read, Write};
 use thiserror::Error;
 
 const MAGIC: &[u8; 4] = b"BRYL";
-const SNAPSHOT_FORMAT_VERSION: u16 = 2;
+const SNAPSHOT_FORMAT_VERSION: u16 = 1;
 const TAG_CF_START: u8 = 1;
 const TAG_KV: u8 = 2;
 const TAG_CF_END: u8 = 3;
@@ -359,7 +359,7 @@ where
     })
 }
 
-/// Streaming snapshot v2 writer with fixed format and resource limits.
+/// Streaming snapshot v1 writer with fixed format and resource limits.
 pub(crate) struct SnapshotWriter<W> {
     writer: W,
     hasher: Sha256,
@@ -779,12 +779,14 @@ mod tests {
                 .contains("last applied")
         );
 
-        let mut wrong_version = encode_fixture(&expected, &state_cfs(), None, None);
-        wrong_version[MAGIC.len() + 1] = 3;
-        assert!(decode(&wrong_version, &expected)
-            .unwrap_err()
-            .to_string()
-            .contains("version"));
+        for unsupported_version in [0, 2, u16::MAX] {
+            let mut wrong_version = encode_fixture(&expected, &state_cfs(), None, None);
+            wrong_version[MAGIC.len()..MAGIC.len() + 2].copy_from_slice(&unsupported_version.to_be_bytes());
+            assert!(decode(&wrong_version, &expected)
+                .unwrap_err()
+                .to_string()
+                .contains("version"));
+        }
     }
 
     #[test]

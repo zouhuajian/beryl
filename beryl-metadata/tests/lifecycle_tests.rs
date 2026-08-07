@@ -49,7 +49,7 @@ fn marker_for(config: &MetadataConfig, state: FormatState) -> MetadataStorageMar
         group_name: config.authority.group_name.clone(),
         node_id: config.raft.node_id,
         storage_uuid: "test-storage".to_string(),
-        format_version: 2,
+        format_version: 1,
         created_at_ms: 1,
         software_version: "test".to_string(),
         bootstrap_client_id: "42".to_string(),
@@ -70,7 +70,7 @@ async fn metadata_format_creates_marker_without_group_id() {
     assert_eq!(marker.group_name.as_str(), "root");
     assert_eq!(marker.node_id, 1);
     assert_eq!(marker.state, FormatState::Ready);
-    assert_eq!(marker.format_version, 2);
+    assert_eq!(marker.format_version, 1);
     assert!(metadata_marker_path(&config).exists());
 
     let marker_json: serde_json::Value =
@@ -280,10 +280,9 @@ async fn metadata_marker_rejects_legacy_group_id_and_unknown_fields() {
         let config_path = write_config(&dir, "root", "single");
         let config = MetadataConfig::load(&config_path).unwrap();
         std::fs::create_dir_all(&config.storage_dir).unwrap();
-        std::fs::write(
-            metadata_marker_path(&config),
-            format!(
-                r#"{{
+        let marker_path = metadata_marker_path(&config);
+        let unsupported_marker = format!(
+            r#"{{
   "cluster_id": "test-cluster",
   "group_name": "root",
   "node_id": 1,
@@ -293,39 +292,43 @@ async fn metadata_marker_rejects_legacy_group_id_and_unknown_fields() {
   "software_version": "test",
   "{extra_field}": 1
 }}"#
-            ),
-        )
-        .unwrap();
+        );
+        std::fs::write(&marker_path, unsupported_marker.as_bytes()).unwrap();
 
         let err = prepare_metadata_start(&config).await.unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("old marker format unsupported"), "{message}");
+        assert!(message.contains("malformed or unsupported"), "{message}");
         assert!(message.contains("reformat metadata storage"), "{message}");
+        assert_eq!(std::fs::read(&marker_path).unwrap(), unsupported_marker.as_bytes());
     }
 }
 
 #[tokio::test]
-async fn metadata_start_rejects_format_v1_with_explicit_reformat_error() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "root", "single");
-    let config = MetadataConfig::load(&config_path).unwrap();
-    format_metadata_storage(&config).await.unwrap();
-    let mut marker: MetadataStorageMarker =
-        serde_json::from_slice(&std::fs::read(metadata_marker_path(&config)).unwrap()).unwrap();
-    marker.format_version = 1;
-    std::fs::write(
-        metadata_marker_path(&config),
-        serde_json::to_vec_pretty(&marker).unwrap(),
-    )
-    .unwrap();
+async fn metadata_start_rejects_non_current_marker_versions_without_rewriting_them() {
+    for unsupported_version in [0, 2, u32::MAX] {
+        let dir = TempDir::new().unwrap();
+        let config_path = write_config(&dir, "root", "single");
+        let config = MetadataConfig::load(&config_path).unwrap();
+        format_metadata_storage(&config).await.unwrap();
+        let marker_path = metadata_marker_path(&config);
+        let mut marker: MetadataStorageMarker = serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
+        marker.format_version = unsupported_version;
+        let unsupported_marker = serde_json::to_vec_pretty(&marker).unwrap();
+        std::fs::write(&marker_path, &unsupported_marker).unwrap();
 
-    let err = prepare_metadata_start(&config)
-        .await
-        .expect_err("format v1 must fail fast");
-    let message = err.to_string();
+        let err = prepare_metadata_start(&config)
+            .await
+            .expect_err("a non-current metadata marker must fail fast");
+        let message = err.to_string();
 
-    assert!(message.contains("format_version=1"), "{message}");
-    assert!(message.contains("reformat metadata storage"), "{message}");
+        assert!(
+            message.contains(&format!("format_version={unsupported_version}")),
+            "{message}"
+        );
+        assert!(message.contains("expected 1"), "{message}");
+        assert!(message.contains("reformat metadata storage"), "{message}");
+        assert_eq!(std::fs::read(&marker_path).unwrap(), unsupported_marker);
+    }
 }
 
 #[tokio::test]

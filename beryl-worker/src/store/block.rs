@@ -25,9 +25,9 @@ pub type StoreResult<T> = Result<T, WorkerError>;
 
 const BLOCK_META_MAGIC: [u8; 4] = *b"BRYL";
 const BLOCK_META_HEADER_LEN: usize = 20;
-const BLOCK_META_VERSION: u32 = 4;
+const BLOCK_META_VERSION: u32 = 1;
 const MAX_META_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
-const DELETING_MARKER_VERSION: u32 = 2;
+const DELETING_MARKER_VERSION: u32 = 1;
 
 /// Fixed little-endian header for a block metadata file.
 /// The header identifies the format and bounds the serialized payload.
@@ -2324,20 +2324,22 @@ mod tests {
     }
 
     #[test]
-    fn load_meta_rejects_previous_block_meta_version_without_rewriting_it() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        publish_default_block(&store, group_name_value, block_id);
-        let paths = store.paths(group_name_value, block_id);
-        overwrite_header_u32(&paths, 4, BLOCK_META_VERSION - 1);
-        let unsupported = fs::read(&paths.meta_path).expect("read unsupported meta");
+    fn load_meta_rejects_non_current_block_meta_versions_without_rewriting_them() {
+        for unsupported_version in [0, 2, 4, u32::MAX] {
+            let (_temp, store) = store();
+            let (group_name_value, block_id) = ids();
+            publish_default_block(&store, group_name_value, block_id);
+            let paths = store.paths(group_name_value, block_id);
+            overwrite_header_u32(&paths, 4, unsupported_version);
+            let unsupported = fs::read(&paths.meta_path).expect("read unsupported meta");
 
-        assert_corrupt(store.load_meta(group_name_value, block_id));
-        assert_eq!(
-            fs::read(&paths.meta_path).expect("read meta after rejection"),
-            unsupported,
-            "rejecting the previous block meta version must not rewrite it"
-        );
+            assert_corrupt(store.load_meta(group_name_value, block_id));
+            assert_eq!(
+                fs::read(&paths.meta_path).expect("read meta after rejection"),
+                unsupported,
+                "rejecting block meta version {unsupported_version} must not rewrite it"
+            );
+        }
     }
 
     #[test]
@@ -2948,37 +2950,45 @@ mod tests {
         publish_default_block(&store, group_name_value, block_id);
         let paths = store.paths(group_name_value, block_id);
         fs::create_dir_all(paths.deleting_marker_path.parent().expect("marker parent")).expect("create gc");
-        fs::write(&paths.deleting_marker_path, b"not-json").expect("write corrupt marker");
+        let corrupt_marker = b"not-json";
+        fs::write(&paths.deleting_marker_path, corrupt_marker).expect("write corrupt marker");
 
         assert_corrupt(store.recover_deleting_markers());
         assert!(paths.data_path.exists());
         assert!(paths.meta_path.exists());
+        assert_eq!(
+            fs::read(&paths.deleting_marker_path).expect("read corrupt marker after rejection"),
+            corrupt_marker
+        );
     }
 
     #[test]
-    fn startup_recovery_rejects_previous_deleting_marker_version() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        publish_default_block(&store, group_name_value, block_id);
-        let meta = store.load_meta(group_name_value, block_id).expect("ready meta");
-        let paths = store.paths(group_name_value, block_id);
-        fs::create_dir_all(paths.deleting_marker_path.parent().expect("marker parent")).expect("create gc");
-        let marker = DeletingMarker {
-            version: DELETING_MARKER_VERSION - 1,
-            group_name: group_name_value.as_str().to_string(),
-            block_id,
-            block_stamp: meta.visibility.block_stamp,
-            effective_len: meta.source.effective_len,
-        };
-        fs::write(
-            &paths.deleting_marker_path,
-            serde_json::to_vec(&marker).expect("encode previous marker"),
-        )
-        .expect("write previous marker");
+    fn startup_recovery_rejects_non_current_deleting_marker_versions() {
+        for unsupported_version in [0, 2, u32::MAX] {
+            let (_temp, store) = store();
+            let (group_name_value, block_id) = ids();
+            publish_default_block(&store, group_name_value, block_id);
+            let meta = store.load_meta(group_name_value, block_id).expect("ready meta");
+            let paths = store.paths(group_name_value, block_id);
+            fs::create_dir_all(paths.deleting_marker_path.parent().expect("marker parent")).expect("create gc");
+            let marker = DeletingMarker {
+                version: unsupported_version,
+                group_name: group_name_value.as_str().to_string(),
+                block_id,
+                block_stamp: meta.visibility.block_stamp,
+                effective_len: meta.source.effective_len,
+            };
+            let unsupported_marker = serde_json::to_vec(&marker).expect("encode unsupported marker");
+            fs::write(&paths.deleting_marker_path, &unsupported_marker).expect("write unsupported marker");
 
-        assert_corrupt(store.recover_deleting_markers());
-        assert!(paths.data_path.exists());
-        assert!(paths.meta_path.exists());
+            assert_corrupt(store.recover_deleting_markers());
+            assert!(paths.data_path.exists());
+            assert!(paths.meta_path.exists());
+            assert_eq!(
+                fs::read(&paths.deleting_marker_path).expect("read marker after rejection"),
+                unsupported_marker
+            );
+        }
     }
 
     #[test]

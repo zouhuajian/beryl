@@ -1853,7 +1853,7 @@ async fn startup_marker_recovery_precedes_first_full_block_report() {
     std::fs::write(
         &paths.deleting_marker_path,
         serde_json::to_vec(&serde_json::json!({
-            "version": 2,
+            "version": 1,
             "group_name": group_name().as_str(),
             "block_id": block_id(),
             "block_stamp": 101,
