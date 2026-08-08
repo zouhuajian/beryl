@@ -345,7 +345,7 @@ pub(super) fn validate_detached_root_records(db: &DB) -> MetadataResult<()> {
 
 fn missing_rocksdb_state_error(path: &Path, detail: &str) -> MetadataError {
     MetadataError::InvalidArgument(format!(
-        "metadata storage is formatted but RocksDB state is missing or corrupt at {}; {detail}; run `metadata format --config <path>` only on empty storage, or clean/reset manually",
+        "metadata storage is formatted but RocksDB state is missing or corrupt at {}; {detail}; run `beryl --conf-dir <dir> format metadata` only on empty storage, or clean/reset manually",
         path.display()
     ))
 }

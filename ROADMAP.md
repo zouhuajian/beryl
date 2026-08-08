@@ -1,8 +1,10 @@
 # Beryl Product and Engineering Roadmap
 
-Status: Proposed
+Status: Active
 
-Baseline: main at 2dae33e, 2026-07-31
+Baseline: main at fa81afa, 2026-08-07
+
+Current release target: internal `v0.1.0-alpha.1`
 
 Audience: maintainers, reviewers, product owner, and pilot workload owner
 
@@ -26,9 +28,14 @@ Product expansion must stop when its acceptance gate is not met.
 
 ## 2. Product Positioning
 
-Beryl should be positioned as a metadata-authorized, cross-engine data access
-cache between compute engines and remote data systems such as HDFS, S3, and
-OSS.
+Beryl's long-term product direction is a metadata-authorized, cross-engine data
+access cache between compute engines and remote data systems such as HDFS, S3,
+and OSS.
+
+The current releasable product is narrower: a single-Metadata, Rust-client,
+Metadata-authorized resident-storage system. The first internal alpha publishes
+that existing path as an explicit baseline. It must not claim UFS read-through,
+cache-miss refill, eviction, Metadata HA, or replication.
 
 The initial product hypothesis is intentionally narrow:
 
@@ -67,8 +74,8 @@ The supported runtime currently follows this path:
 5. Worker block reports reconstruct current physical observations in Metadata.
 6. Metadata publishes file content only after exact Ready evidence is observed
    and revalidated.
-7. Detached-root reclamation is durable and bounded; the companion recursive
-   delete change moves namespace visibility to atomic detach before reclamation.
+7. Recursive delete atomically detaches namespace visibility before durable,
+   bounded detached-root reclamation.
 
 ### 3.1 Authority boundaries
 
@@ -111,7 +118,7 @@ The current product boundary is:
 | Worker local lifecycle | Strong foundation | Staging, Ready publication, abort, sync, exact reclaim, and deletion-marker recovery |
 | Metadata restart safety | Strong foundation | Active writes fail closed; durable state and snapshots are restored |
 | Worker restart convergence | Strong foundation | Registration and full report rebuild current locations |
-| Recursive namespace delete | In review | Bounded detach and detached-root reclamation are validated separately before landing |
+| Recursive namespace delete | Strong foundation | Exact-path detach, bounded detached-root reclamation, and corrupt-authority fail-closed behavior are merged |
 | Physical block cleanup | Strong foundation | Bounded paged scan cycles, exact stamped commands, and crash recovery |
 | Client retry semantics | Strong foundation | Response identity validation, freshness refresh, and explicit UnknownOutcome |
 | Large directory handling | Strong foundation | Cursor pagination with server-enforced default and maximum page sizes |
@@ -122,57 +129,69 @@ The current product boundary is:
 | Replication and repair | Not implemented | No production queue, transfer protocol, or acknowledgement surface |
 | Metadata high availability | Not implemented | Peer RPC is fail closed and cluster mode is rejected |
 | Security and tenancy | Development only | No productized mTLS, authentication, authorization, or quota |
-| Upgrade and backup | Development only | Schema mismatch requires reformat; no production migration or restore workflow |
+| Process lifecycle | Incomplete | Metadata accepts SIGINT/SIGTERM but shutdown ownership is incomplete; Worker does not stop its production server and background loops through one bounded shutdown path |
+| Binary distribution | Not implemented | No versioned tarball, systemd units, checksum, or packaged-production-binary acceptance |
+| Upgrade and backup | Alpha clean-install only | Persistent formats fail closed on mismatch; no cross-version migration, rollback, or restore workflow |
 | Ecosystem integration | Not implemented | Rust-native API only |
 
 ## 5. Engineering Findings
 
 ### 5.1 Release-blocking or scale-blocking findings
 
-#### A. Bounded Delete needs a trusted release baseline
+#### A. Production process shutdown is not one owned lifecycle
 
-The companion bounded-delete change makes Delete carry a mount-relative path,
-mount identity, mount epoch, and expected inode identity. Raft apply re-resolves
-the path before mutation. This is the right authority direction because an
-admitted request must not mutate a subtree that was detached before apply.
+Metadata already receives SIGINT and SIGTERM, but production shutdown does not
+explicitly cancel and await every maintenance task or close the Raft runtime.
+Worker uses Ctrl-C only while registration is retrying; after registration its
+gRPC server, heartbeat, block-report, cleanup, and HTTP tasks have no shared
+bounded shutdown path.
 
-Before this work is published:
+Before the first tag:
 
-- Keep the feature in one repository-compliant, reviewable commit.
-- Independently review stale path, ancestor detach, rename, mount boundary, and
-  active-write behavior.
-- Run the full validation matrix.
-- Confirm restart continuation and deterministic apply under very small reclaim
-  budgets.
+- Both processes must transition readiness to false before draining.
+- New RPC work must stop while accepted work receives a bounded drain window.
+- Every long-lived task must have explicit cancellation and ownership.
+- Metadata must stop Raft and wait for its background tasks.
+- SIGINT and SIGTERM must exit successfully within the systemd stop timeout.
+- Same-version restart must recover visible data and current Worker locations.
 
-#### B. Public and replicated inputs lack complete hard limits
+#### B. The binary and compatibility contract is not release-ready
 
-The following paths need explicit server-side limits:
+The current binaries accept explicit YAML configuration, but do not expose a
+standard help/version contract or a side-effect-free configuration check. All
+workspace crates carry duplicated `0.1.0` versions, while internal pre-release
+persistent-format counters reflect discarded development history.
 
-- Directory listing page size.
-- Committed blocks in SyncWrite and CommitFile.
-- Extents in PublishFile.
-- Full and delta block-report entries.
-- Serialized Raft command bytes.
-- Block size and chunk size.
-- Convenience read size.
-- Active write sessions per client and per Metadata process.
-- Metadata RPC concurrency and queued work.
+The first release must establish:
 
-Transport defaults are not a stable product invariant. Limits must be explicit,
-versioned where they affect Raft apply, observable, and tested.
+- One lockstep workspace version: `0.1.0-alpha.1`.
+- One public `beryl` entry point with `--help`, `--version`, explicit role
+  commands, and side-effect-free `validate-conf`.
+- Version output containing package version, source revision, Rust version, and
+  build target.
+- Exact-release lockstep for Metadata, Worker, and Rust Client during alpha.
+- A clean-install compatibility policy with fail-closed persistent-format
+  checks.
+- One pre-release reset of current persistent-format and schema counters to
+  version 1, followed by monotonic changes after the first tag.
 
-#### C. Large file metadata remains unbounded
+#### C. No user artifact is tested end to end
 
-PublishFile contains a complete vector of extents. Apply sorts, validates,
-clones, and rewrites the entire file inode. Read paths also clone and filter the
-complete extent list.
+Workspace E2E tests exercise important runtime and recovery behavior, but they
+do not extract a release archive and launch both production binaries from it.
+The first release needs one black-box acceptance path that formats storage,
+starts production Metadata and Worker processes, performs Rust-client CRUD,
+restarts each process, verifies recovery, deletes data, and verifies the final
+state using only the extracted package.
 
-This makes Raft entry size, apply latency, inode value size, memory usage, and
-snapshot cost grow with file block count.
+#### D. Large-file behavior is bounded but intentionally scale-limited
 
-The immediate action is a hard extent limit. The durable solution is paged
-extent storage with an atomic visible revision switch.
+PublishFile still carries and rewrites a complete extent vector and `read_all`
+still reserves memory proportional to the requested file. Compiled limits now
+prevent unbounded requests and Raft entries, so paged extents and a stronger
+streaming API are no longer first-release blockers. They remain explicit
+limitations and become scheduled work only when a selected workload needs
+larger files or measurements show material cost.
 
 ### 5.2 High-priority maintainability and performance findings
 
@@ -241,24 +260,31 @@ caller limit.
 
 | Milestone | Outcome | Indicative duration | Gate |
 | --- | --- | --- | --- |
-| M0 Trusted Baseline | Current single-group behavior is reviewed, validated, and releasable | 1-2 weeks | Full correctness and CI matrix passes |
-| M1 Bounded Runtime | Requests, Raft work, reports, cleanup, and memory are explicitly bounded | 2-4 weeks | Scale tests show bounded progress |
-| M2 Efficient and Simple Core | Hot paths are incremental and incomplete lifecycle code is removed | 3-5 weeks | No O(global blocks) delta path; simpler production surface |
-| M3 Read-Through Cache Pilot | One real immutable/versioned workload uses safe UFS read-through | 8-12 weeks | Product Go/No-Go metrics pass |
+| M0 Trusted Baseline | Exact-path Delete and current single-group correctness are trusted | Completed | Correctness and recovery matrix passed |
+| M1 Bounded Runtime | Listing, cleanup, reports, layouts, RPC decoding, and Raft commands are bounded | Substantially completed | Existing scale and hard-limit tests pass |
+| R0 Internal `0.1.0-alpha.1` | Current resident-storage path becomes a versioned, installable, recoverable artifact | Current, 1-2 weeks | Extracted-package acceptance passes on Anolis 8 and Ubuntu |
+| R1 `0.1` Stabilization | Deployment, lifecycle, configuration, and recovery defects are fixed without feature expansion | Release-driven | Internal soak supports `0.1.0` Developer Preview |
+| T1 Evidence-Triggered Core Work | Report indexing, paged extents, streaming, and load shedding are pulled only by evidence | Unscheduled | A release workload or observed limit justifies each item |
+| R2 HDFS Read-Through Alpha | One immutable or snapshot-backed HDFS path completes exact-version cold-miss-to-read | After `0.1` baseline | HDFS correctness and restart gates pass |
+| R3 HDFS Cache Pilot | Admission, eviction, metrics, connector, and workload comparison validate product value | 8-12 weeks | Product Go/No-Go metrics pass |
 | M4 Production Readiness | HA, multiple replicas, security, migration, and operational recovery | 8-12+ weeks | Failure and upgrade gates pass |
 | M5 Evidence-Driven Scale-Out | Mount-level sharding and broader integration only when measured | Unscheduled | Single-group bottleneck is proven |
 
-Durations are planning ranges for a small focused team. M3 and later require a
-named workload owner and operational support.
+R0 publishes an internal artifact only. Normal pull-request, push, and merge
+validation must not build or retain release binaries; only an exact release tag
+may run the release build and package workflow. R2 and later require a named
+workload owner and operational support.
 
 ## 7. Milestone Plans
 
 ## M0: Trusted Baseline
 
+Status: Completed by the bounded recursive-delete and corrupt-authority work.
+
 ### Objective
 
-Turn the detached-root and bounded Delete work into a trusted baseline without
-mixing in unrelated refactoring.
+Preserve the trusted detached-root and bounded Delete baseline without mixing
+unrelated behavior into its authority path.
 
 ### Deliverables
 
@@ -302,6 +328,11 @@ Externally visible acceptance:
 
 ## M1: Bounded Single-Group Runtime
 
+Status: Substantially completed. Cleanup-cycle pagination, bounded listing,
+block/report/layout/Raft-command limits, and transport decoding limits are
+merged. Active-session and global Metadata load shedding remain evidence-driven
+follow-up work rather than R0 blockers.
+
 ### Objective
 
 Guarantee that every user request, report, Raft mutation, background pass, and
@@ -344,7 +375,174 @@ in-memory queue has an explicit upper bound while still making progress.
 - Command apply time and bytes are observable.
 - No configured local-only value changes deterministic Raft apply behavior.
 
-## M2: Efficient and Simple Core
+## R0: Internal `v0.1.0-alpha.1` Release Foundation
+
+### Objective
+
+Publish the current single-Metadata resident-storage path as Beryl's first
+internal, versioned, installable, operable, and recoverable artifact. R0 is a
+release-engineering and lifecycle milestone, not a UFS cache milestone.
+
+### Release identity and compatibility
+
+- Use `v0.1.0-alpha.1` as the Git tag and `0.1.0-alpha.1` as the lockstep
+  workspace package version.
+- Metadata, Worker, and Rust Client must come from the same exact alpha release.
+- The first alpha is clean-install only. Existing untagged development storage
+  is not migrated or supported.
+- Same-version stop/start, process restart, and data recovery are supported.
+- Cross-version mixed clusters, rolling upgrade, downgrade, and rollback are
+  not supported by `alpha.1`.
+- Beginning with the first tag, every persistent-format version is monotonic and
+  may change only with an explicit compatibility decision and tests.
+
+#### One-time pre-release version normalization
+
+Development-only version increments do not describe released compatibility.
+Before the first tag, reset the current supported persistent formats to one
+coherent version-1 baseline in a single incompatible cutover:
+
+| Version family | Development value at baseline | First-release value |
+| --- | ---: | ---: |
+| Metadata storage marker | 2 | 1 |
+| RocksDB schema | 10 | 1 |
+| Snapshot format | 2 | 1 |
+| Worker storage marker | 2 | 1 |
+| Worker block metadata | 4 | 1 |
+| Worker deleting marker | 2 | 1 |
+| Storage-generation manifest | 1 | 1 |
+| `BlockFormatId::FULL_EFFECTIVE` | 1 | 1 |
+
+The cutover must update focused previous/future/malformed-version tests and must
+require clean storage. Do not renumber protobuf field tags, protobuf enum
+values, Raft log identities, block stamps, epochs, or other values whose number
+is semantic identity rather than a local format revision.
+
+### Production process lifecycle
+
+- Introduce one explicit shutdown owner per process.
+- Handle SIGINT and SIGTERM before and after Worker registration.
+- Transition readiness to false before stopping new RPC work.
+- Drain accepted RPC work for a configured bounded interval.
+- Cancel and await HTTP, heartbeat, block-report, cleanup, maintenance, and
+  readiness tasks.
+- Stop and await the Metadata Raft runtime.
+- Exit successfully on a normal signal and preserve same-version restart
+  behavior.
+
+### Binary contract
+
+- Public commands are `beryl --help`, `beryl --version`, `beryl version`,
+  `beryl metadata`, `beryl worker`, `beryl format metadata`, and
+  `beryl validate-conf [metadata|worker]`.
+- The public binary resolves `<install-root>/conf` by default and accepts only
+  an explicit `--conf-dir <dir>` override.
+- Package-internal `beryl-metadata` and `beryl-worker` retain `--help`,
+  `--version`, and explicit `start`/`format`/`validate-conf --config <path>`
+  actions required by the public router.
+- Long-running role commands use process replacement so systemd PID and signal
+  ownership remain with Metadata or Worker.
+- Static configuration validation reads YAML and applies the same typed checks
+  as startup, but does not initialize observability, storage, networking,
+  signals, or asynchronous runtime tasks.
+- Version output includes package version, source revision, Rust version, and
+  build target from one shared build identity.
+- Stable nonzero exit on invalid config, incompatible storage, bind failure,
+  storage failure, or fatal registration failure.
+
+### Build and package target
+
+- Primary target: Anolis OS 8 on `x86_64`, GNU libc 2.28 baseline.
+- Secondary runtime validation: the available Ubuntu host.
+- Build target: `x86_64-unknown-linux-gnu`.
+- Build inside a pinned Anolis 8-compatible image with fixed Rust and protobuf
+  compiler inputs; do not build release binaries on a developer workstation or
+  `ubuntu-latest`.
+- Always build with `cargo build --release --locked`.
+
+The archive is internal and initially contains:
+
+```text
+beryl-0.1.0-alpha.1-x86_64-unknown-linux-gnu/
+  bin/beryl
+  libexec/beryl-metadata
+  libexec/beryl-worker
+  conf/metadata.yaml
+  conf/worker.yaml
+  conf/client.yaml
+  systemd/beryl-metadata.service
+  systemd/beryl-worker.service
+  docs/getting-started.md
+  docs/deployment.md
+  docs/operations.md
+  docs/compatibility.md
+  docs/known-limitations.md
+  LICENSE
+  README.md
+  VERSION
+```
+
+Publish the `.tar.gz` together with a SHA-256 checksum to the approved internal
+artifact location. Do not create a public GitHub Release.
+
+### Tag-only release pipeline
+
+- Pull requests and normal main pushes run validation but do not run
+  `cargo build --release`, package binaries, or upload a release artifact.
+- Only an exact `v*` tag starts the release build.
+- The workflow must reject a tag that does not equal the workspace version.
+- The workflow builds once, packages those exact outputs, extracts the archive,
+  and runs acceptance against the extracted production binaries.
+- Publishing happens only after acceptance succeeds.
+- Concurrent publication of the same release is prohibited.
+
+### Packaged-binary acceptance gate
+
+Run the following with one Metadata and one Worker, then repeat the relevant
+registration/read checks with one Metadata and two Workers:
+
+1. Verify checksum, archive structure, `--version`, and side-effect-free config
+   checks.
+2. Format Metadata, start both production processes, and wait for `/ready`.
+3. Use a Rust Client example pinned to the same tag to create, write, close,
+   stat, and read a multi-block file.
+4. Send SIGTERM to Metadata, require bounded successful exit, restart it, wait
+   for Worker re-registration/full-report convergence, and read existing data.
+5. Send SIGTERM to Worker, require bounded successful exit, restart it, wait for
+   full-report convergence, and read existing data.
+6. Delete the file, verify namespace absence and bounded physical cleanup,
+   restart both processes, and verify the final state.
+7. Install and repeat the smoke/restart path on Anolis 8 and Ubuntu.
+
+### Explicitly out of scope
+
+- UFS-backed reads or writes.
+- CLI-based filesystem CRUD; the release uses a runnable Rust Client example.
+- Public artifact publication.
+- Cross-version data migration, rolling upgrade, or rollback.
+- Metadata HA, replication, repair, rebalancing, TLS, authentication, or
+  authorization.
+- RPM, DEB, Docker, Helm, Kubernetes, macOS artifacts, documentation sites, or
+  benchmark dashboards.
+
+## R1: `0.1` Internal Stabilization
+
+### Objective
+
+Deploy `alpha.1`, operate it on the internal Anolis 8 and Ubuntu hosts, and use
+subsequent `0.1.0-alpha.N` releases only to correct installation, configuration,
+shutdown, recovery, observability, compatibility, and documentation defects.
+
+No ordinary feature work enters an `alpha.N` patch unless it is required to
+restore the published `0.1` contract. Promote `0.1.0` to Single-Metadata
+Developer Preview only after repeated packaged deployments and restart/recovery
+soak pass without unexplained data loss, stale visibility, or manual storage
+repair.
+
+## T1: Evidence-Triggered Efficient and Simple Core
+
+Status: Deferred. This work is not a prerequisite for R0 or R2 unless release
+evidence or the selected HDFS workload demonstrates a concrete limit.
 
 ### Objective
 
@@ -393,20 +591,23 @@ high-frequency paths proportional to changed data.
 - Large file reads do not require memory proportional to file size.
 - Existing visibility, fencing, and UnknownOutcome behavior remains unchanged.
 
-## M3: Read-Through Cache Pilot
+## R2: HDFS Read-Through Alpha
 
 ### Objective
 
-Validate Beryl as a real cross-engine cache on one named read-heavy workload.
-This milestone is a product experiment, not a general platform release.
+Complete one safe, user-visible HDFS cold-miss-to-Worker-read vertical slice
+without making admission, eviction, or transparent ecosystem integration a
+prerequisite for the first HDFS alpha.
 
 ### Scope
 
-- One backing system, selected from the target workload. HDFS is the preferred
-  first candidate for an HDFS-centered deployment.
-- Immutable datasets or a backend with a strong version token.
-- One transparent integration.
-- Read-through and eviction only.
+- HDFS is the selected first backing system.
+- Only immutable HDFS paths or HDFS Snapshot paths with sufficient exact-version
+  evidence are eligible. Modification time and length alone are insufficient
+  for overwriteable paths.
+- The supported entry point remains the Rust Client.
+- Read-through and exact-version refill only; the selected test dataset must fit
+  within an explicit bounded cache budget.
 - Internal Beryl writes remain a separate supported path.
 
 ### Proposed feature design
@@ -451,6 +652,31 @@ version.
 - Metadata restart: resident locations remain unavailable until registration
   and a current full report converge.
 - No verified backing version: no stale fallback.
+
+### R2 acceptance gate
+
+- `Cold miss -> Metadata authorization -> Worker HDFS fill -> Ready report ->
+  Metadata location -> Rust Client read` passes end to end.
+- Concurrent misses for the same exact version and range are coalesced or
+  rejected with bounded work; they do not create uncontrolled duplicate fills.
+- Zero wrong-version or unexplained stale reads under HDFS mutation, fill
+  interruption, Worker restart, Metadata restart, and resident corruption.
+- Every failed miss either refills the same verified version or returns an
+  explicit error.
+- Internal resident Beryl data remains separate from recoverable HDFS-backed
+  cache data.
+- The HDFS path is tested through packaged production binaries before the R2
+  internal tag is published.
+
+## R3: HDFS Cache Pilot
+
+### Objective
+
+Add bounded cache lifecycle policy, measurements, and one transparent HDFS
+integration, then decide from a replayable workload whether Beryl provides
+enough value to continue as a cross-engine cache product.
+
+### Deliverables
 
 #### Admission and eviction
 
@@ -615,14 +841,15 @@ added before this gate.
 
 | Crate | Near-term work | Later work | Must not own |
 | --- | --- | --- | --- |
-| beryl-types | Shared hard limits and validated value types | Backing-file and replica-transfer values with real producers and consumers | Runtime policy |
-| beryl-common | Resource-limit mechanics and authenticated header support | Shared TLS and observability mechanics | Metadata, Worker, or cache policy |
-| beryl-proto | Bounded current RPC fields and validation | UFS fill, replica transfer, and peer RPC only with active endpoints | Retry, placement, or authority policy |
-| beryl-metadata | Cleanup pagination, command bounds, report index, extent pages | UFS version authority, HA, replica authority, sharding | Worker byte execution |
-| beryl-worker | Bounded control path and reclaim module | UFS fill, eviction, replica transfer | Namespace visibility |
-| beryl-client | Streaming, explicit allocation limits, stable retries | Cache-miss orchestration and one ecosystem integration | Direct authority bypass |
-| beryl-ufs | Freeze broad expansion; select one backend for pilot | Additional backends after pilot evidence | Cache admission, visibility, or retry policy |
-| beryl-e2e | Delete closure, scale bounds, cleanup progress | UFS, HA, replica, security, upgrade, and fault matrix | Production test hooks |
+| beryl-cli | Public binary contract, installed layout, role process replacement, and aggregate config validation | New concrete operational commands only when a supported workflow needs them | Role runtime policy, daemonization, or process supervision |
+| beryl-types | Preserve current hard limits; normalize only true pre-release format IDs | Backing-file and replica-transfer values with real producers and consumers | Runtime policy |
+| beryl-common | Shared build identity and cancellable process-service mechanics only when concretely reused | Shared TLS and observability mechanics | Metadata, Worker, or cache policy |
+| beryl-proto | Preserve current bounded RPC contracts | HDFS fill, replica transfer, and peer RPC only with active endpoints | Retry, placement, or authority policy |
+| beryl-metadata | Version/config CLI, owned graceful shutdown, version-1 clean-install baseline | HDFS version authority, report index, extent pages, HA, sharding | Worker byte execution |
+| beryl-worker | Version/config CLI, owned graceful shutdown, version-1 clean-install baseline | HDFS fill, eviction, replica transfer | Namespace visibility |
+| beryl-client | Runnable same-tag CRUD example and release compatibility documentation | HDFS miss orchestration, streaming, one ecosystem integration | Direct authority bypass |
+| beryl-ufs | Keep adapter-only for R0; prepare the selected HDFS implementation for R2 | Additional backends only after HDFS pilot evidence | Cache admission, visibility, or retry policy |
+| beryl-e2e | Extracted-package production-process acceptance and signal/restart coverage | HDFS, HA, replica, security, upgrade, and fault matrix | Production test hooks |
 
 ## 9. Refactoring Plan
 
@@ -643,6 +870,10 @@ Recommended sequence:
    concrete.
 
 ### 9.2 Maintenance simplification
+
+Status: Completed for the pre-release baseline. Unsupported repair, rebalance,
+and timeout production scaffolding has been removed; lost-worker observation,
+detached-root reclamation, and exact block cleanup remain.
 
 Recommended sequence:
 
@@ -710,6 +941,10 @@ tests.
 
 Maintain black-box suites for:
 
+- Metadata and Worker production binaries extracted from the release archive.
+- SIGINT/SIGTERM readiness transition, bounded drain, clean exit, and
+  same-version restart.
+- One-Metadata/one-Worker and one-Metadata/two-Worker packaged deployment.
 - Local CRUD and multi-block files.
 - Ready-before-visible.
 - Metadata restart at every write stage.
@@ -751,15 +986,34 @@ improvement alone is not a product result.
 
 ### 10.5 CI evolution
 
-Keep the current formatting, check, clippy, and workspace test job. Add stages
-only when their capability becomes active:
+Use two deliberately different paths:
 
-- Focused crate tests for changed crates.
-- E2E restart matrix.
-- Feature matrix for selected UFS backend.
-- Schema migration test.
-- Security configuration test.
-- Scheduled fault and soak jobs.
+#### Validation CI
+
+- Pull requests and main pushes run formatting, workspace metadata, check,
+  clippy, workspace tests, and E2E tests with the locked dependency graph.
+- Validation may compile test code as required, but it must not run the release
+  profile, create a distributable archive, or upload a release binary.
+- Pin the runner version, Rust toolchain, protobuf compiler, action revisions,
+  permissions, timeouts, and concurrency behavior.
+- Keep one Linux validation platform until a supported capability requires a
+  matrix.
+
+#### Tag release CI
+
+- Only an exact version tag runs `cargo build --release --locked`.
+- Build in the pinned Anolis 8-compatible environment and validate execution on
+  Anolis 8 plus Ubuntu.
+- Validate tag/workspace/build-reported version equality.
+- Package the exact build outputs once, generate SHA-256, extract the archive,
+  and run production-binary acceptance.
+- Upload only to the approved internal artifact destination after all gates
+  pass; do not create a public GitHub Release.
+- Add HDFS feature/acceptance jobs only when R2 becomes active.
+
+Schema migration, security configuration, scheduled fault/soak, multi-platform
+artifacts, and public release publication are added only when their supported
+capability exists.
 
 ## 11. Observability and SLO Inputs
 
@@ -799,13 +1053,16 @@ Before setting production SLOs, expose the measurements needed to define them.
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
+| Worker or Metadata exits without owned cancellation | Abrupt termination, incomplete drain, or non-deterministic restart | R0 lifecycle owner, SIGINT/SIGTERM production-process tests, bounded systemd stop timeout |
+| Binary is built on a newer Ubuntu/glibc baseline | CI success but failure on internal Anolis nodes | Build on pinned Anolis 8-compatible glibc 2.28 baseline; execute on Anolis and Ubuntu |
+| Development version counters are mistaken for released compatibility history | Confusing first-release support and migrations | One clean-install reset to version 1 before the first tag; monotonic decisions afterward |
+| Source tests pass but the archive is incomplete or unusable | Internal users receive an untested artifact | Extracted-package production-binary acceptance before internal publication |
+| Unauthenticated services are exposed outside a trusted network | Unauthorized data access | Internal-only alpha, safe local defaults, explicit trusted-network limitation; security is required before broader deployment |
 | UFS version is weak or ambiguous | Stale or wrong data | Pilot immutable data; require strong version identity |
 | Eviction precedes recoverability | Permanent data loss | Evict only verified UFS-backed or replicated blocks |
-| Full report and cleanup scans grow without pagination | Metadata memory or cleanup stall | Leader-term-bound keyset pagination with positional Worker/block high watermarks and exact dispatch revalidation |
 | Delta report keeps full rebuild behavior | Metadata lock and CPU saturation | Incremental BlockReportIndex |
 | Extents remain inline | Large Raft entries and long apply stalls | Hard cap followed by paged extent revision |
-| Repair placeholder is mistaken for availability | False operational confidence | Remove incomplete production loops |
-| HA is built before product proof | High cost without user value | M3 Go/No-Go before M4 |
+| HA is built before product proof | High cost without user value | R3 Go/No-Go before M4 |
 | Multi-group design expands authority complexity | Cross-group correctness failures | Prove single-group bottleneck first |
 | Security is deferred into production | Unauthorized data access | Treat M4 security as release gate |
 | Test count is mistaken for scale proof | Undetected production failure | Add fault, scale, soak, and workload evidence |
@@ -820,6 +1077,10 @@ Every milestone should be delivered as small, reviewable pull requests:
 - Independent read-only review for destructive, visibility, recovery, and
   concurrency changes.
 - Full validation once at milestone closure.
+- No release-profile binary or distributable archive on ordinary push or merge;
+  the exact version tag is the only release-build trigger.
+- Internal publication consumes the already accepted archive and never rebuilds
+  a second artifact.
 - Explicit list of commands not run.
 - No production claim based only on passing tests.
 
@@ -839,38 +1100,82 @@ commits.
 
 The next concrete work should be created in this order:
 
-### P0
+### P0: `v0.1.0-alpha.1` functional release blockers
 
-1. CORE-001: Review and validate exact-path Delete apply.
-2. CORE-002: Land bounded Delete on a trusted release baseline.
-3. CORE-005: Define hard block, report, commit, and Raft command limits.
+1. REL-001: Establish workspace `0.1.0-alpha.1` lockstep versioning and the
+   internal Single-Metadata resident-storage product contract.
+2. REL-002: Apply the clean-install version-1 normalization to Metadata marker,
+   RocksDB schema, snapshot, Worker storage, block metadata, and deleting marker;
+   update all focused compatibility tests.
+3. REL-003: Implement owned, bounded SIGINT/SIGTERM shutdown for Metadata and
+   Worker, including readiness transition, task cancellation, Raft shutdown,
+   and successful same-version restart.
+4. REL-004: Add the public `beryl` entry point, shared build-version output,
+   explicit internal role commands, and side-effect-free aggregate
+   `validate-conf`.
+5. REL-005: Add the same-tag runnable Rust Client CRUD example used by both
+   documentation and release acceptance.
 
-### P1
+### P1: Tag-only build, package, and internal release
 
-1. CORE-101: Make delta block-report indexing incremental.
-2. CORE-103: Add paged extent storage and atomic revision switch.
-3. CORE-104: Add bounded streaming reads to the Rust client.
-4. CORE-105: Add Metadata inflight limits and load rejection.
-5. CORE-106: Repair documentation and macOS build bootstrap.
+1. REL-101: Define the pinned Anolis 8/x86_64/glibc 2.28 build environment and
+   `cargo build --release --locked` entry point.
+2. REL-102: Add one deterministic tarball layout, systemd units, VERSION
+   manifest, and SHA-256 generation.
+3. REL-103: Add extracted-package acceptance using production Metadata and
+   Worker binaries for 1+1 and 1+2 topologies.
+4. CI-104: Keep PR/main validation artifact-free; add no release build to normal
+   push or merge.
+5. CI-105: Add exact-tag validation, build-once/package-once acceptance, and
+   internal artifact publication without a public GitHub Release.
+6. DOC-106: Publish Getting Started, Deployment, Operations, Compatibility, and
+   Known Limitations with trusted-network and clean-install warnings.
+7. REL-107: Tag `v0.1.0-alpha.1`, deploy the accepted archive to Anolis 8 and
+   Ubuntu, record results, and declare the internal release complete.
 
-### P2
+### P2: `0.1.0-alpha.N` stabilization
 
-1. CACHE-201: Select one pilot workload and backend.
-2. CACHE-202: Define BackingFileVersion and immutable mount semantics.
-3. CACHE-203: Implement Worker UFS fill to staging and Ready.
-4. CACHE-204: Implement miss coordination and refill.
-5. CACHE-205: Implement disk-watermark admission and exact eviction.
-6. CACHE-206: Add cache and backend-savings metrics.
-7. CACHE-207: Implement one transparent ecosystem connector.
-8. CACHE-208: Run replayable direct-backend and competitor comparison.
+1. Fix only defects exposed by packaged installation, process lifecycle,
+   configuration, observability, restart, recovery, or documentation.
+2. Starting with `alpha.2`, test forward upgrade and rollback from the previous
+   tagged alpha only if a migration is intentionally introduced.
+3. Promote `0.1.0` only after repeated deployment and soak pass; do not add UFS
+   merely to change the version label.
 
-### P3
+### P3: Next feature release, HDFS Read-Through Alpha
+
+1. CACHE-201: Name the HDFS pilot workload and select immutable or HDFS Snapshot
+   paths with authoritative version evidence.
+2. CACHE-202: Define HDFS BackingFileVersion and read-only External Mount
+   semantics owned by Metadata.
+3. CACHE-203: Implement exact-version Worker HDFS fill into staging, validation,
+   Ready publication, bounded concurrency, and interruption recovery.
+4. CACHE-204: Implement Metadata miss coordination, duplicate-fill coalescing,
+   exact-version refill, report convergence, and Rust Client read.
+5. Publish the first R2 internal alpha only when the complete cold-miss-to-read
+   chain passes packaged-binary restart and corruption tests.
+
+### P4: HDFS cache pilot and evidence-triggered core work
+
+1. CACHE-205: Implement disk-watermark admission and exact eviction without
+   risking internal single-replica data.
+2. CACHE-206: Add hit/miss, backend-byte/request, fill, version-mismatch, and
+   eviction metrics.
+3. CACHE-207: Implement one Hadoop FileSystem scheme connector.
+4. CACHE-208: Run the same replayable trace against direct HDFS and the relevant
+   mature alternative.
+5. Pull CORE-101 incremental reports, CORE-103 paged extents, CORE-104 streaming,
+   or CORE-105 load shedding only when R0 operations or the HDFS workload proves
+   a concrete need.
+
+### P5: Later production capabilities
 
 1. HA-301: Implement three-node peer RPC and membership.
 2. HA-302: Validate leader change, snapshot install, and rolling restart.
 3. DATA-303: Implement exact ReplicaTransfer.
 4. DATA-304: Implement multi-replica write and read availability.
-5. SEC-305: Implement mTLS, identity, authorization, and quota.
+5. SEC-305: Implement mTLS, identity, authorization, and quota before broader
+   network deployment.
 6. OPS-306: Implement schema migration, backup, and restore.
 7. OPS-307: Complete fault and soak qualification.
 
@@ -878,16 +1183,27 @@ The next concrete work should be created in this order:
 
 The required sequence is:
 
-1. Trust the current single-group correctness baseline.
-2. Bound every request and background lifecycle.
-3. Make report and metadata hot paths incremental.
-4. Remove code that claims an incomplete lifecycle.
-5. Solve large-file metadata and streaming.
-6. Validate one read-through cache workload.
-7. Continue only when correctness and value gates pass.
-8. Add HA, replicas, security, and upgrade operations.
-9. Add metadata sharding only after measurement proves it is necessary.
+1. Freeze the current resident-storage product boundary for an internal alpha.
+2. Normalize unreleased persistent-format counters to version 1 under the
+   agreed clean-install cutover.
+3. Complete owned process shutdown, binary/config contracts, and same-version
+   restart recovery.
+4. Build a release artifact only from an exact tag in the pinned Anolis 8
+   environment.
+5. Accept the extracted package with production binaries on Anolis 8 and Ubuntu,
+   then publish it internally as `v0.1.0-alpha.1`.
+6. Use `0.1.0-alpha.N` for deployment and recovery corrections, not ordinary
+   feature expansion.
+7. Build the next feature release as one exact-version HDFS cold-miss-to-read
+   vertical slice.
+8. Add HDFS admission, eviction, metrics, and a connector only after that slice
+   is correct; continue only when the workload value gate passes.
+9. Pull core performance/refactoring work from measured need rather than making
+   it a standing prerequisite.
+10. Add HA, replicas, security, migration, and sharding only behind their stated
+    product and operational gates.
 
-This sequence keeps Beryl focused on its strongest differentiator: a small,
-explicit authority model that can support a reliable cache without silently
-serving stale, ambiguous, or unauthorized data.
+This sequence gives Beryl a real release baseline before HDFS integration while
+preserving its strongest differentiator: a small, explicit authority model that
+can support a reliable cache without silently serving stale, ambiguous, or
+unauthorized data.

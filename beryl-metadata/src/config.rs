@@ -8,7 +8,7 @@ use crate::raft::{
     MIN_RECLAIM_DETACHED_ROOT_BATCH_BYTES,
 };
 use crate::readiness::RootReadinessConfig;
-use beryl_common::config::{FlatConfig, ServerConfig};
+use beryl_common::config::{keys::logging, FlatConfig, ServerConfig};
 use beryl_common::error::{CommonError, CommonErrorKind};
 use beryl_common::observe::config::{LogConfig, ResourceConfig};
 use beryl_common::observe::ObservabilityConfig;
@@ -47,6 +47,44 @@ const WRITE_LEASE_TIMEOUT: &str = "beryl.metadata.write-lease.timeout";
 const SHUTDOWN_TIMEOUT: &str = "beryl.metadata.shutdown.timeout";
 const WORKER_TIMEOUT: &str = "beryl.metadata.worker.liveness.timeout";
 const WORKER_SCAN_INTERVAL: &str = "beryl.metadata.worker.liveness.scan-interval";
+
+/// Complete public key set consumed by one Metadata configuration file.
+const KNOWN_KEYS: &[&str] = &[
+    CLUSTER_ID,
+    HOST,
+    BIND_HOST,
+    RPC_PORT,
+    HTTP_PORT,
+    STORAGE_DIR,
+    LIST_DEFAULT_PAGE_SIZE,
+    LIST_MAX_PAGE_SIZE,
+    BLOCK_CLEANUP_ENABLED,
+    BLOCK_CLEANUP_INTERVAL,
+    BLOCK_CLEANUP_GRACE_PERIOD,
+    BLOCK_CLEANUP_SCAN_LIMIT,
+    BLOCK_CLEANUP_QUEUE_CAPACITY,
+    BLOCK_CLEANUP_BATCH_SIZE,
+    BLOCK_CLEANUP_RETRY_INITIAL_BACKOFF,
+    BLOCK_CLEANUP_RETRY_MAX_BACKOFF,
+    NAMESPACE_DELETE_INTERVAL,
+    NAMESPACE_DELETE_MAX_ROOTS,
+    NAMESPACE_DELETE_MAX_ENTRIES,
+    NAMESPACE_DELETE_MAX_SIZE,
+    NAMESPACE_DELETE_RETRY_INITIAL_BACKOFF,
+    NAMESPACE_DELETE_RETRY_MAX_BACKOFF,
+    STARTUP_INITIAL_BACKOFF,
+    STARTUP_MAX_BACKOFF,
+    STARTUP_WARN_AFTER,
+    STARTUP_TIMEOUT,
+    STARTUP_FAIL_FAST,
+    WRITE_LEASE_TIMEOUT,
+    SHUTDOWN_TIMEOUT,
+    WORKER_TIMEOUT,
+    WORKER_SCAN_INTERVAL,
+    logging::FORMAT,
+    logging::OUTPUT,
+    logging::LEVEL,
+];
 
 const DEFAULT_LIST_STATUS_PAGE_SIZE: u32 = 1_000;
 pub(crate) const MAX_LIST_STATUS_PAGE_SIZE: u32 = 10_000;
@@ -312,6 +350,7 @@ impl MetadataConfig {
     /// Build the typed Metadata configuration from shared YAML mechanics.
     pub fn from_server_config(server_config: ServerConfig) -> Result<Self, CommonError> {
         let flat = server_config.as_flat();
+        flat.ensure_only_known_keys(KNOWN_KEYS)?;
         let defaults = Self::default();
 
         let cluster_id = string_or(flat, CLUSTER_ID, &defaults.cluster_id)?;
@@ -644,5 +683,16 @@ mod tests {
             flat.set(HOST, host);
             assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
         }
+    }
+
+    #[test]
+    fn unknown_metadata_key_is_rejected() {
+        let mut flat = base_flat();
+        flat.set("beryl.metadata.rpc.prt", 18080i64);
+
+        let error = MetadataConfig::from_server_config(ServerConfig::from_flat(flat))
+            .expect_err("unknown Metadata key must fail");
+
+        assert!(error.message.contains("beryl.metadata.rpc.prt"));
     }
 }

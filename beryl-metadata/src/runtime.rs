@@ -411,14 +411,6 @@ async fn wait_for_readiness_failure(failure: oneshot::Receiver<crate::MetadataEr
     }
 }
 
-/// Loads metadata configuration from the configured path.
-pub fn load_config() -> Result<Arc<MetadataConfig>, DynError> {
-    let config_path = std::env::var("BERYL_CONFIG").unwrap_or_else(|_| "conf/metadata.yaml".to_string());
-    let config = Arc::new(MetadataConfig::load(&config_path)?);
-
-    Ok(config)
-}
-
 /// Initializes process-wide observability after configuration has been loaded.
 pub fn init_observability(config: &MetadataConfig) -> Result<Observability, DynError> {
     let obs_config = config.observability.clone();

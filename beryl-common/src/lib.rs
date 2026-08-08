@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
 pub mod audit;
+pub mod build_info;
 pub mod config;
 pub mod error;
 pub mod grpc_server;

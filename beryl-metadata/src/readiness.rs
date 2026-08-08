@@ -288,13 +288,13 @@ async fn wait_for_root_ready_inner(inputs: RootReadyInputs) -> MetadataResult<()
                 storage_dir = %log_fields.storage_dir,
                 elapsed_ms = start.elapsed().as_millis(),
                 attempts,
-                hint = "run metadata format for unformatted local storage; check raft mode, node id, and root mount state",
+                hint = "run `beryl --conf-dir <dir> format metadata` for unformatted local storage; check raft mode, node id, and root mount state",
                 "Root mount still not ready"
             );
         }
         if start.elapsed() >= Duration::from_millis(config.timeout_ms) {
             let message = format!(
-                "metadata root readiness timed out: reason={}, cluster_id={}, group_name={}, node_id={}, storage_dir={}, elapsed_ms={}, hint=run metadata format or inspect raft/root initialization",
+                "metadata root readiness timed out: reason={}, cluster_id={}, group_name={}, node_id={}, storage_dir={}, elapsed_ms={}, hint=run `beryl --conf-dir <dir> format metadata` or inspect raft/root initialization",
                 reason.as_str(),
                 log_fields.cluster_id,
                 log_fields.group_name,

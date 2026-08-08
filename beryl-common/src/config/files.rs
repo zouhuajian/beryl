@@ -46,10 +46,11 @@ fn flat_mapping(value: Value) -> Result<BTreeMap<String, Value>, CommonError> {
     };
 
     for (key, val) in map {
-        let key_str = match key {
-            Value::String(s) => s,
-            Value::Number(n) => n.to_string(),
-            _ => continue,
+        let Value::String(key_str) = key else {
+            return Err(CommonError::new(
+                CommonErrorKind::InvalidArgument,
+                "config keys must be strings",
+            ));
         };
 
         result.insert(key_str, val);
@@ -121,5 +122,17 @@ mod tests {
 
         assert_eq!(error.kind, CommonErrorKind::Io);
         assert!(error.message.contains(&missing.display().to_string()));
+    }
+
+    #[test]
+    fn non_string_config_keys_are_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("invalid.yaml");
+        std::fs::write(&path, "1: value\n").unwrap();
+
+        let error = load_from_yaml_file(&path).expect_err("numeric config key must fail");
+
+        assert_eq!(error.kind, CommonErrorKind::InvalidArgument);
+        assert!(error.message.contains("keys must be strings"));
     }
 }
