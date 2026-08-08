@@ -199,7 +199,7 @@ async fn metadata_start_fails_without_marker() {
 
     let err = prepare_metadata_start(&config).await.unwrap_err();
 
-    assert!(err.to_string().contains("metadata format --config"));
+    assert!(err.to_string().contains("beryl --conf-dir <dir> format metadata"));
     assert!(!metadata_marker_path(&config).exists());
 }
 

@@ -1,211 +1,179 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Metadata service main entry point.
+//! Metadata service process entry point.
 
+use std::ffi::OsString;
+use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use beryl_common::build_info::BUILD_INFO;
 use beryl_common::termination::TerminationSignal;
 use beryl_metadata::lifecycle::format_metadata_storage;
 use beryl_metadata::runtime::{init_observability, DynError, MetadataServer};
 use beryl_metadata::MetadataConfig;
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
-#[tokio::main]
-async fn main() -> Result<(), DynError> {
-    let command = MetadataCommand::parse(std::env::args().skip(1))?;
+/// Internal Metadata process protocol used by the packaged `beryl` CLI.
+#[derive(Debug, Parser)]
+#[command(
+    name = "beryl-metadata",
+    about = "Run or maintain the Beryl Metadata process",
+    subcommand_required = true,
+    arg_required_else_help = true
+)]
+struct MetadataCli {
+    #[command(subcommand)]
+    command: MetadataCommand,
+}
 
-    match command.action {
-        MetadataAction::Format => {
-            let config = command.load_config()?;
-            let marker = format_metadata_storage(config.as_ref()).await?;
-            tracing::info!(
-                cluster_id = %marker.cluster_id,
-                group_name = %marker.group_name,
-                node_id = marker.node_id,
-                "Metadata storage formatted"
-            );
-            Ok(())
-        }
-        MetadataAction::Start => {
-            let mut termination = TerminationSignal::install()?.monitor();
-            let config = match command.load_config() {
-                Ok(config) => config,
-                Err(error) => {
-                    termination.shutdown().await?;
-                    return Err(error);
-                }
-            };
-            if termination.is_cancelled() {
-                let signal = termination.recv().await?;
-                tracing::info!(?signal, "Shutdown signal received during Metadata startup");
-                return Ok(());
-            }
-            let observability = match init_observability(config.as_ref()) {
-                Ok(observability) => observability,
-                Err(error) => {
-                    termination.shutdown().await?;
-                    return Err(error);
-                }
-            };
-            let server = match MetadataServer::build(config, termination.cancellation_token()).await {
-                Ok(Some(server)) => server,
-                Ok(None) => {
-                    let signal = termination.recv().await?;
-                    tracing::info!(?signal, "Shutdown signal received during Metadata startup");
-                    return Ok(());
-                }
-                Err(error) => {
-                    termination.shutdown().await?;
-                    return Err(error);
-                }
-            };
-            let result = server.serve(observability, &mut termination).await;
+/// Explicit Metadata actions; none may infer a config path or default to start.
+#[derive(Debug, Subcommand)]
+enum MetadataCommand {
+    /// Start the Metadata process in the foreground.
+    Start {
+        /// Metadata YAML configuration file.
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+    },
+    /// Initialize empty Metadata storage described by the configuration.
+    Format {
+        /// Metadata YAML configuration file.
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+    },
+    /// Validate configuration without opening storage, binding ports, or starting tasks.
+    ValidateConf {
+        /// Metadata YAML configuration file.
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+    },
+}
+
+fn main() -> Result<(), DynError> {
+    let cli = parse_cli(std::env::args_os());
+
+    match cli.command {
+        MetadataCommand::Start { config } => run_async(start_metadata(config)),
+        MetadataCommand::Format { config } => run_async(format_metadata(config)),
+        MetadataCommand::ValidateConf { config } => validate_metadata_config(config),
+    }
+}
+
+/// Builds the asynchronous runtime only for actions that own process or storage lifecycle.
+fn run_async(future: impl Future<Output = Result<(), DynError>>) -> Result<(), DynError> {
+    tokio::runtime::Runtime::new()?.block_on(future)
+}
+
+/// Starts Metadata while preserving its bounded shutdown lifecycle.
+async fn start_metadata(config_path: PathBuf) -> Result<(), DynError> {
+    let mut termination = TerminationSignal::install()?.monitor();
+    let config = match MetadataConfig::load(config_path) {
+        Ok(config) => Arc::new(config),
+        Err(error) => {
             termination.shutdown().await?;
-            result
+            return Err(error.into());
         }
+    };
+    if termination.is_cancelled() {
+        let signal = termination.recv().await?;
+        tracing::info!(?signal, "Shutdown signal received during Metadata startup");
+        return Ok(());
     }
-}
-
-#[derive(Clone, Copy)]
-enum MetadataAction {
-    Format,
-    Start,
-}
-
-struct MetadataCommand {
-    action: MetadataAction,
-    config_path: Option<String>,
-}
-
-impl MetadataCommand {
-    fn parse<I>(args: I) -> Result<Self, DynError>
-    where
-        I: IntoIterator<Item = String>,
-    {
-        let mut args = args.into_iter().peekable();
-        let mut action = MetadataAction::Start;
-        if let Some(first) = args.peek().cloned() {
-            match first.as_str() {
-                "format" => {
-                    args.next();
-                    action = MetadataAction::Format;
-                }
-                "start" => {
-                    args.next();
-                    action = MetadataAction::Start;
-                }
-                _ if first.starts_with('-') => {}
-                _ if looks_like_path(&first) => {
-                    return Err(format!("metadata config path must be passed with --config: {first}").into());
-                }
-                _ => return Err(format!("unsupported metadata command: {first}").into()),
-            }
+    let observability = match init_observability(config.as_ref()) {
+        Ok(observability) => observability,
+        Err(error) => {
+            termination.shutdown().await?;
+            return Err(error);
         }
-
-        let mut config_path = None;
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--config" => {
-                    let Some(path) = args.next() else {
-                        return Err("--config requires a path".into());
-                    };
-                    config_path = Some(path);
-                }
-                "--force" => return Err("--force is not supported; clean the metadata directory manually".into()),
-                _ => return Err(format!("unknown metadata argument: {arg}").into()),
-            }
+    };
+    let server = match MetadataServer::build(config, termination.cancellation_token()).await {
+        Ok(Some(server)) => server,
+        Ok(None) => {
+            let signal = termination.recv().await?;
+            tracing::info!(?signal, "Shutdown signal received during Metadata startup");
+            return Ok(());
         }
-
-        Ok(Self { action, config_path })
-    }
-
-    fn load_config(&self) -> Result<Arc<MetadataConfig>, DynError> {
-        let config_path = self
-            .config_path
-            .clone()
-            .or_else(|| std::env::var("BERYL_CONFIG").ok())
-            .unwrap_or_else(|| "conf/metadata.yaml".to_string());
-        Ok(Arc::new(MetadataConfig::load(config_path)?))
-    }
+        Err(error) => {
+            termination.shutdown().await?;
+            return Err(error);
+        }
+    };
+    let result = server.serve(observability, &mut termination).await;
+    termination.shutdown().await?;
+    result
 }
 
-fn looks_like_path(value: &str) -> bool {
-    value.contains('/') || value.ends_with(".yaml") || value.ends_with(".yml") || value.ends_with(".toml")
+/// Formats only Metadata storage and preserves its existing fail-closed checks.
+async fn format_metadata(config_path: PathBuf) -> Result<(), DynError> {
+    let config = MetadataConfig::load(config_path)?;
+    let marker = format_metadata_storage(&config).await?;
+    println!(
+        "Metadata storage formatted: cluster={}, group={}, node={}",
+        marker.cluster_id, marker.group_name, marker.node_id
+    );
+    Ok(())
+}
+
+/// Runs exactly the static loader used by startup and performs no runtime initialization.
+fn validate_metadata_config(config_path: PathBuf) -> Result<(), DynError> {
+    MetadataConfig::load(&config_path)?;
+    println!("Metadata configuration is valid: {}", config_path.display());
+    Ok(())
+}
+
+/// Parses process arguments and lets clap terminate for help, version, or usage errors.
+fn parse_cli<I, T>(args: I) -> MetadataCli
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    try_parse_cli(args).unwrap_or_else(|error| error.exit())
+}
+
+fn try_parse_cli<I, T>(args: I) -> Result<MetadataCli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let version = BUILD_INFO.version_details();
+    let matches = MetadataCli::command()
+        .version(version.clone())
+        .long_version(version)
+        .try_get_matches_from(args)?;
+    MetadataCli::from_arg_matches(&matches)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::TempDir;
 
-    fn parse(args: &[&str]) -> Result<MetadataCommand, DynError> {
-        MetadataCommand::parse(args.iter().map(|arg| arg.to_string()))
+    #[test]
+    fn explicit_metadata_commands_parse() {
+        let start = try_parse_cli(["beryl-metadata", "start", "--config", "conf/metadata.yaml"]).unwrap();
+        assert!(matches!(
+            start.command,
+            MetadataCommand::Start { config }
+                if config.as_path() == std::path::Path::new("conf/metadata.yaml")
+        ));
+
+        let format = try_parse_cli(["beryl-metadata", "format", "--config", "conf/metadata.yaml"]).unwrap();
+        assert!(matches!(format.command, MetadataCommand::Format { .. }));
+
+        let validate = try_parse_cli(["beryl-metadata", "validate-conf", "--config", "conf/metadata.yaml"]).unwrap();
+        assert!(matches!(validate.command, MetadataCommand::ValidateConf { .. }));
     }
 
     #[test]
-    fn valid_metadata_commands_parse() {
-        let format = parse(&["format", "--config", "conf/metadata.yaml"]).unwrap();
-        assert!(matches!(format.action, MetadataAction::Format));
-        assert_eq!(format.config_path.as_deref(), Some("conf/metadata.yaml"));
-
-        let start = parse(&["start", "--config", "conf/metadata.yaml"]).unwrap();
-        assert!(matches!(start.action, MetadataAction::Start));
-        assert_eq!(start.config_path.as_deref(), Some("conf/metadata.yaml"));
-
-        let default_start = parse(&[]).unwrap();
-        assert!(matches!(default_start.action, MetadataAction::Start));
-        assert!(default_start.config_path.is_none());
-    }
-
-    #[test]
-    fn metadata_observe_cli_overrides_are_rejected() {
-        for flag in [
-            "--observe-profile",
-            "--log-level",
-            "--log-format",
-            "--log-output",
-            "--metrics-bind",
-            "--metrics-path",
-            "--trace-enabled",
+    fn missing_action_or_config_is_a_usage_error() {
+        for args in [
+            &["beryl-metadata"][..],
+            &["beryl-metadata", "start"][..],
+            &["beryl-metadata", "conf/metadata.yaml"][..],
         ] {
-            let err = parse(&["start", flag, "value"])
-                .err()
-                .expect("observe CLI override must fail");
-            assert!(err.to_string().contains("unknown metadata argument"), "{flag}: {err}");
+            let error = try_parse_cli(args.iter().copied()).expect_err("incomplete command must fail");
+            assert_eq!(error.exit_code(), 2);
         }
-    }
-
-    #[test]
-    fn metadata_startup_load_uses_file_observe_values() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("metadata.yaml");
-        fs::write(
-            &config_path,
-            r#"
-beryl.metadata.bind-host: 127.0.0.1
-beryl.metadata.rpc.port: 19080
-beryl.metadata.http.port: 19081
-beryl.logging.format: json
-beryl.logging.output: stdout
-beryl.logging.level: "warn"
-"#,
-        )
-        .unwrap();
-
-        let command = parse(&["start", "--config", config_path.to_str().unwrap()]).unwrap();
-        let config = command.load_config().unwrap();
-
-        assert_eq!(config.observability.log.format, "json");
-        assert_eq!(config.observability.log.output, "stdout");
-        assert_eq!(config.http_addr(), "127.0.0.1:19081".parse().unwrap());
-    }
-
-    #[test]
-    fn metadata_config_path_requires_explicit_config_flag() {
-        let err = parse(&["conf/metadata.yaml"])
-            .err()
-            .expect("positional metadata config path must fail");
-        assert!(err.to_string().contains("--config"));
     }
 }

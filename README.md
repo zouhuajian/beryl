@@ -93,6 +93,10 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
 
 ## Crates
 
+- `beryl-cli`
+  - Public `beryl` command, installed layout resolution, and package-internal
+    process routing.
+  - Does not link Metadata or Worker runtime policy.
 - `beryl-types`
   - Stable domain and value types shared by crates used in the current runtime.
   - Includes IDs, layout values, block values, epochs, and watermarks at the domain level.
@@ -131,16 +135,30 @@ make verify
 
 `make verify` runs the workspace format check, metadata check, compile check, clippy, and tests.
 
-One-metadata, one-worker startup:
+Validate and format an installed one-Metadata, one-Worker deployment once:
 
 ```bash
-beryl-metadata format --config conf/metadata.yaml
-beryl-metadata start --config conf/metadata.yaml
-beryl-worker start --config conf/worker.yaml
+bin/beryl validate-conf
+bin/beryl format metadata
 ```
 
-The client reads `conf/client.yaml`. Deployments provide environment-specific
-configuration through an explicit `--config` path instead of repository profiles.
+Then run the two foreground processes from separate systemd units or terminals:
+
+```bash
+# Metadata unit or terminal
+bin/beryl metadata
+
+# Worker unit or terminal
+bin/beryl worker
+```
+
+The installed CLI resolves `conf/metadata.yaml` and `conf/worker.yaml` relative
+to the archive root. Deployments use one explicit override, for example
+`beryl --conf-dir /etc/beryl metadata`. Source-checkout development may invoke
+the package-internal role binaries with explicit `start`/`format` and
+`--config <file>` arguments.
+
+The client reads `conf/client.yaml`.
 
 ## Non-goals for Current Scope
 

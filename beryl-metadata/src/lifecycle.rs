@@ -114,7 +114,7 @@ pub async fn prepare_metadata_start(config: &MetadataConfig) -> MetadataResult<(
     let marker_path = metadata_marker_path(config);
     if !marker_path.exists() {
         return Err(MetadataError::InvalidArgument(format!(
-            "metadata storage is unformatted at {}; run `metadata format --config <path>` before start",
+            "metadata storage is unformatted at {}; run `beryl --conf-dir <dir> format metadata` before start",
             config.storage_dir.display()
         )));
     }
@@ -123,7 +123,7 @@ pub async fn prepare_metadata_start(config: &MetadataConfig) -> MetadataResult<(
     validate_marker(config, &marker)?;
     if marker.state != FormatState::Ready {
         return Err(MetadataError::InvalidArgument(
-            "metadata format is incomplete (marker state is formatting); rerun `metadata format`, not `metadata start`"
+            "metadata format is incomplete (marker state is formatting); rerun `beryl --conf-dir <dir> format metadata`, not `beryl metadata`"
                 .to_string(),
         ));
     }

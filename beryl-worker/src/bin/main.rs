@@ -3,10 +3,14 @@
 
 //! Worker main entry point.
 
+use std::ffi::OsString;
+use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use beryl_common::build_info::BUILD_INFO;
 use beryl_common::observe::{init_observability, ServiceInfo};
 use beryl_common::service_http::{spawn_service_http, ServiceHttpHandle};
 use beryl_common::termination::{TerminationMonitor, TerminationSignal};
@@ -20,21 +24,61 @@ use beryl_worker::{
     store::dirs::StoreDirs,
     WorkerCore,
 };
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let command = WorkerCommand::parse(std::env::args().skip(1))?;
+/// Internal Worker process protocol used by the packaged `beryl` CLI.
+#[derive(Debug, Parser)]
+#[command(
+    name = "beryl-worker",
+    about = "Run or validate the Beryl Worker process",
+    subcommand_required = true,
+    arg_required_else_help = true
+)]
+struct WorkerCli {
+    #[command(subcommand)]
+    command: WorkerCommand,
+}
+
+/// Explicit Worker actions; none may infer a config path or default to start.
+#[derive(Debug, Subcommand)]
+enum WorkerCommand {
+    /// Start the Worker process in the foreground.
+    Start {
+        /// Worker YAML configuration file.
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+    },
+    /// Validate configuration without touching storage or contacting Metadata.
+    ValidateConf {
+        /// Worker YAML configuration file.
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+    },
+}
+
+fn main() -> Result<()> {
+    let cli = parse_cli(std::env::args_os());
+
+    match cli.command {
+        WorkerCommand::Start { config } => run_async(start_worker(config)),
+        WorkerCommand::ValidateConf { config } => validate_worker_config(config),
+    }
+}
+
+/// Builds the asynchronous runtime only for the action that owns Worker lifecycle.
+fn run_async(future: impl Future<Output = Result<()>>) -> Result<()> {
+    tokio::runtime::Runtime::new()?.block_on(future)
+}
+
+/// Starts Worker while preserving its bounded shutdown lifecycle.
+async fn start_worker(config_path: PathBuf) -> Result<()> {
     let mut termination = TerminationSignal::install()
         .context("Failed to install Worker termination handlers")?
         .monitor();
-    let config_path = command
-        .config_path
-        .clone()
-        .unwrap_or_else(|| "conf/worker.yaml".to_string());
 
     let config = match WorkerConfig::load(&config_path).context("Failed to load worker configuration") {
         Ok(config) => config,
@@ -47,6 +91,13 @@ async fn main() -> Result<()> {
     let result = run_worker(config, &mut termination).await;
     termination.shutdown().await.context("Worker termination task failed")?;
     result
+}
+
+/// Runs exactly the static loader used by startup and performs no runtime initialization.
+fn validate_worker_config(config_path: PathBuf) -> Result<()> {
+    WorkerConfig::load(&config_path).context("Failed to validate Worker configuration")?;
+    println!("Worker configuration is valid: {}", config_path.display());
+    Ok(())
 }
 
 /// Owns every long-lived Worker service from startup through bounded shutdown.
@@ -372,130 +423,54 @@ async fn stop_task_until<T>(task: Option<JoinHandle<T>>, deadline: Instant) -> R
     }
 }
 
-struct WorkerCommand {
-    config_path: Option<String>,
+/// Parses process arguments and lets clap terminate for help, version, or usage errors.
+fn parse_cli<I, T>(args: I) -> WorkerCli
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    try_parse_cli(args).unwrap_or_else(|error| error.exit())
 }
 
-impl WorkerCommand {
-    fn parse<I>(args: I) -> Result<Self>
-    where
-        I: IntoIterator<Item = String>,
-    {
-        let mut args = args.into_iter().peekable();
-        if let Some(first) = args.peek().cloned() {
-            match first.as_str() {
-                "start" => {
-                    args.next();
-                }
-                _ if first.starts_with('-') => {}
-                _ if looks_like_path(&first) => {
-                    anyhow::bail!("worker config path must be passed with --config: {first}");
-                }
-                _ => anyhow::bail!("unsupported worker command: {first}"),
-            }
-        }
-
-        let mut config_path = None;
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--config" => {
-                    let Some(path) = args.next() else {
-                        anyhow::bail!("--config requires a path");
-                    };
-                    config_path = Some(path);
-                }
-                "--force" => anyhow::bail!("--force is not supported for worker start"),
-                _ => anyhow::bail!("unknown worker argument: {arg}"),
-            }
-        }
-
-        Ok(Self { config_path })
-    }
-}
-
-fn looks_like_path(value: &str) -> bool {
-    value.contains('/') || value.ends_with(".yaml") || value.ends_with(".yml") || value.ends_with(".toml")
+fn try_parse_cli<I, T>(args: I) -> Result<WorkerCli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let version = BUILD_INFO.version_details();
+    let matches = WorkerCli::command()
+        .version(version.clone())
+        .long_version(version)
+        .try_get_matches_from(args)?;
+    WorkerCli::from_arg_matches(&matches)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::TempDir;
 
-    fn parse(args: &[&str]) -> Result<WorkerCommand> {
-        WorkerCommand::parse(args.iter().map(|arg| arg.to_string()))
+    #[test]
+    fn explicit_worker_commands_parse() {
+        let start = try_parse_cli(["beryl-worker", "start", "--config", "conf/worker.yaml"]).unwrap();
+        assert!(matches!(
+            start.command,
+            WorkerCommand::Start { config }
+                if config.as_path() == std::path::Path::new("conf/worker.yaml")
+        ));
+
+        let validate = try_parse_cli(["beryl-worker", "validate-conf", "--config", "conf/worker.yaml"]).unwrap();
+        assert!(matches!(validate.command, WorkerCommand::ValidateConf { .. }));
     }
 
     #[test]
-    fn valid_worker_start_command_parses() {
-        let start = parse(&["start", "--config", "conf/worker.yaml"]).unwrap();
-        assert_eq!(start.config_path.as_deref(), Some("conf/worker.yaml"));
-
-        let default_start = parse(&[]).unwrap();
-        assert!(default_start.config_path.is_none());
-    }
-
-    #[test]
-    fn worker_observe_cli_overrides_are_rejected() {
-        for flag in [
-            "--observe-profile",
-            "--log-level",
-            "--log-format",
-            "--log-output",
-            "--metrics-bind",
-            "--metrics-path",
-            "--trace-enabled",
+    fn missing_action_or_config_is_a_usage_error() {
+        for args in [
+            &["beryl-worker"][..],
+            &["beryl-worker", "start"][..],
+            &["beryl-worker", "conf/worker.yaml"][..],
         ] {
-            let err = parse(&["start", flag, "value"])
-                .err()
-                .expect("observe CLI override must fail");
-            assert!(err.to_string().contains("unknown worker argument"), "{flag}: {err}");
+            let error = try_parse_cli(args.iter().copied()).expect_err("incomplete command must fail");
+            assert_eq!(error.exit_code(), 2);
         }
-    }
-
-    #[test]
-    fn worker_startup_load_uses_file_observe_values() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("worker.yaml");
-        let store_path = temp_dir.path().join("hdd0");
-        fs::write(
-            &config_path,
-            format!(
-                r#"
-beryl.worker.bind-host: 127.0.0.1
-beryl.worker.rpc.port: 19090
-beryl.worker.http.port: 19091
-beryl.worker.storage.dirs:
-  hdd0:
-    path: "{}"
-    tier: hdd
-    capacity: 10GiB
-beryl.worker.metadata.addresses:
-  - 127.0.0.1:18080
-beryl.logging.format: json
-beryl.logging.output: stdout
-beryl.logging.level: "warn"
-"#,
-                store_path.display()
-            ),
-        )
-        .unwrap();
-
-        let command = parse(&["start", "--config", config_path.to_str().unwrap()]).unwrap();
-        let config_path = command.config_path.as_deref().expect("config path");
-        let config = WorkerConfig::load(config_path).unwrap();
-
-        assert_eq!(config.observability.log.format, "json");
-        assert_eq!(config.observability.log.output, "stdout");
-        assert_eq!(config.http_addr(), "127.0.0.1:19091".parse().unwrap());
-    }
-
-    #[test]
-    fn worker_config_path_requires_explicit_config_flag() {
-        let err = parse(&["conf/worker.yaml"])
-            .err()
-            .expect("positional worker config path must fail");
-        assert!(err.to_string().contains("--config"));
     }
 }

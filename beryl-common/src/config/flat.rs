@@ -228,6 +228,17 @@ impl FlatConfig {
     pub fn contains_key(&self, key: &str) -> bool {
         self.data.contains_key(key)
     }
+
+    /// Rejects the first key not owned by the typed configuration consumer.
+    pub fn ensure_only_known_keys(&self, known_keys: &[&str]) -> Result<(), CommonError> {
+        if let Some(key) = self.data.keys().find(|key| !known_keys.contains(&key.as_str())) {
+            return Err(CommonError::new(
+                CommonErrorKind::InvalidArgument,
+                format!("unknown config key: {key}"),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn parse_duration(value: &Value) -> Option<Duration> {
@@ -397,5 +408,19 @@ mod tests {
         assert_eq!(redacted.get_str("password"), Some("***".to_string()));
         assert_eq!(redacted.get_str("api_key"), Some("***".to_string()));
         assert_eq!(redacted.get_str("normal_name"), Some("value".to_string()));
+    }
+
+    #[test]
+    fn known_key_validation_reports_unknown_input() {
+        let mut config = FlatConfig::new();
+        config.set("beryl.logging.level", "info");
+        config.set("beryl.logging.levle", "debug");
+
+        let error = config
+            .ensure_only_known_keys(&["beryl.logging.level"])
+            .expect_err("unknown key must fail");
+
+        assert_eq!(error.kind, CommonErrorKind::InvalidArgument);
+        assert!(error.message.contains("beryl.logging.levle"));
     }
 }

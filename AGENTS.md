@@ -64,6 +64,8 @@ capabilities.
 
 ## Crate Ownership
 
+- `beryl-cli`: public command contract, installed layout resolution, and
+  package-internal process routing.
 - `beryl-types`: stable domain and value types.
 - `beryl-common`: shared errors, headers, config mechanics, retry/time helpers,
   and observability utilities.
@@ -80,6 +82,8 @@ capabilities.
 
 Production dependency direction must remain clean:
 
+- `beryl-cli` must not production-depend on `beryl-metadata` or
+  `beryl-worker`.
 - `beryl-client` must not production-depend on `beryl-metadata` or
   `beryl-worker`.
 - `beryl-worker` must not production-depend on `beryl-metadata` or
