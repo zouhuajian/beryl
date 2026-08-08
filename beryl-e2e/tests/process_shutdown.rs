@@ -8,6 +8,7 @@ use beryl_e2e::{data::deterministic_bytes, TestCluster};
 use bytes::Bytes;
 use std::ffi::CString;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tonic_health::pb::health_client::HealthClient;
@@ -63,11 +64,11 @@ async fn metadata_signals_before_config_load_exit_cleanly() {
         let config_path = temp.path().join("startup.yaml");
         let c_path = CString::new(config_path.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-        let mut child = Command::new(executable)
+        let child = Command::new(executable)
             .arg(&config_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .expect("start Metadata before config load");
@@ -81,6 +82,9 @@ async fn metadata_signals_before_config_load_exit_cleanly() {
 
         let pid = child.id().expect("Metadata startup process id");
         assert_eq!(unsafe { libc::kill(pid as i32, signal) }, 0);
+        // Keep configuration loading blocked until the process has had a
+        // bounded opportunity to publish the delivered signal to its monitor.
+        tokio::time::sleep(Duration::from_millis(250)).await;
         let storage_dir = temp.path().join("metadata");
         let config = format!(
             "beryl.cluster.id: startup-signal\n\
@@ -100,13 +104,15 @@ async fn metadata_signals_before_config_load_exit_cleanly() {
             .expect("complete Metadata startup config");
         drop(config_writer);
 
-        let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+        let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
             .await
             .expect("Metadata startup signal shutdown must be bounded")
             .expect("wait for Metadata startup process");
         assert!(
-            status.success(),
-            "Metadata startup signal must exit successfully: {status}"
+            output.status.success(),
+            "Metadata startup signal must exit successfully: {}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }
