@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use beryl_types::ids::StreamId;
-use tokio::sync::RwLock;
+use parking_lot::RwLock;
 
 use crate::data::core::StreamContext;
 use crate::data::core::StreamMode;
@@ -111,7 +111,6 @@ impl StreamManager {
         );
         self.streams
             .write()
-            .await
             .insert(state.context.stream_id, ActiveStream::new(state, None))
             .map(|active| active.state)
     }
@@ -125,30 +124,24 @@ impl StreamManager {
         );
         self.streams
             .write()
-            .await
             .insert(state.context.stream_id, ActiveStream::new(state, Some(read_pin)))
             .map(|active| active.state)
     }
 
     pub async fn get(&self, stream_id: StreamId) -> Option<StreamState> {
-        self.streams
-            .read()
-            .await
-            .get(&stream_id)
-            .map(|active| active.state.clone())
+        self.streams.read().get(&stream_id).map(|active| active.state.clone())
     }
 
     /// Snapshots stream state while retaining a read pin for the current call.
     pub(crate) async fn get_for_read(&self, stream_id: StreamId) -> Option<(StreamState, Option<ReadPin>)> {
         self.streams
             .read()
-            .await
             .get(&stream_id)
             .map(|active| (active.state.clone(), active._read_pin.clone()))
     }
 
     pub async fn touch(&self, stream_id: StreamId) -> bool {
-        let mut streams = self.streams.write().await;
+        let mut streams = self.streams.write();
         if let Some(active) = streams.get_mut(&stream_id) {
             active.state.last_activity = Instant::now();
             true
@@ -158,7 +151,7 @@ impl StreamManager {
     }
 
     pub async fn update_cursor(&self, stream_id: StreamId, cursor: u64) -> bool {
-        let mut streams = self.streams.write().await;
+        let mut streams = self.streams.write();
         if let Some(active) = streams.get_mut(&stream_id) {
             active.state.cursor = cursor;
             active.state.last_activity = Instant::now();
@@ -169,7 +162,7 @@ impl StreamManager {
     }
 
     pub async fn ack(&self, stream_id: StreamId, seq: u64) -> bool {
-        let mut streams = self.streams.write().await;
+        let mut streams = self.streams.write();
         if let Some(active) = streams.get_mut(&stream_id) {
             active.state.last_acked_seq = active.state.last_acked_seq.max(seq);
             active.state.last_activity = Instant::now();
@@ -180,7 +173,7 @@ impl StreamManager {
     }
 
     pub async fn mark_written(&self, stream_id: StreamId, written_through: u64) -> bool {
-        let mut streams = self.streams.write().await;
+        let mut streams = self.streams.write();
         if let Some(active) = streams.get_mut(&stream_id) {
             active.state.written_through = active.state.written_through.max(written_through);
             active.state.last_activity = Instant::now();
@@ -191,7 +184,7 @@ impl StreamManager {
     }
 
     pub async fn advance_write_progress(&self, stream_id: StreamId, seq: u64, written_through: u64) -> bool {
-        let mut streams = self.streams.write().await;
+        let mut streams = self.streams.write();
         if let Some(active) = streams.get_mut(&stream_id) {
             active.state.cursor = written_through;
             active.state.last_acked_seq = seq;
@@ -204,11 +197,16 @@ impl StreamManager {
     }
 
     pub async fn remove(&self, stream_id: StreamId) -> Option<StreamState> {
-        self.streams.write().await.remove(&stream_id).map(|active| active.state)
+        self.remove_now(stream_id)
+    }
+
+    /// Removes one stream synchronously so cancellation cleanup never detaches.
+    pub(crate) fn remove_now(&self, stream_id: StreamId) -> Option<StreamState> {
+        self.streams.write().remove(&stream_id).map(|active| active.state)
     }
 
     pub async fn active_count(&self) -> usize {
-        self.streams.read().await.len()
+        self.streams.read().len()
     }
 
     pub(crate) const fn idle_timeout(&self) -> Duration {
@@ -219,7 +217,7 @@ impl StreamManager {
     /// reclamation forever. In-progress reads retain a cloned pin until return.
     pub(crate) async fn cleanup_idle_read_streams(&self) -> usize {
         let now = Instant::now();
-        let mut streams = self.streams.write().await;
+        let mut streams = self.streams.write();
         let before = streams.len();
         streams.retain(|_, active| {
             active.state.context.mode != StreamMode::Read || !active.state.is_idle(self.idle_timeout, now)
@@ -229,7 +227,7 @@ impl StreamManager {
 
     pub async fn cleanup_idle_streams(&self) -> usize {
         let now = Instant::now();
-        let mut streams = self.streams.write().await;
+        let mut streams = self.streams.write();
         let before = streams.len();
         streams.retain(|_, active| !active.state.is_idle(self.idle_timeout, now));
         before - streams.len()

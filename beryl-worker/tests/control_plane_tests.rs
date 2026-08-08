@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
 use std::collections::{BTreeMap, VecDeque};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,14 +25,16 @@ use beryl_types::layout::BlockFormatId;
 use beryl_types::{GroupName, Tier, TierFree, WorkerRunId, MAX_REPORT_ENTRIES};
 use bytes::Bytes;
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, Command};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 use beryl_worker::config::{StoreDirConfig, WorkerConfig, WorkerRegistrationConfig};
 use beryl_worker::control::{
-    BlockCleanupExecutor, BlockCleanupOptions, BlockReportError, BlockReportOptions, HeartbeatError, HeartbeatSnapshot,
-    MetadataBlockReportLoop, MetadataHeartbeatLoop, MetadataRegistrar, Registration, RegistrationDescriptor,
-    RegistrationSet,
+    BlockCleanupExecutor, BlockCleanupOptions, BlockCleanupRuntime, BlockReportError, BlockReportOptions,
+    HeartbeatError, HeartbeatSnapshot, MetadataBlockReportLoop, MetadataHeartbeatLoop, MetadataRegistrar, Registration,
+    RegistrationDescriptor, RegistrationSet,
 };
 use beryl_worker::net::config::WorkerNetConfig;
 use beryl_worker::net::protocol::WorkerNetProtocol;
@@ -73,6 +76,7 @@ fn test_worker_config() -> WorkerConfig {
         block_report_interval_ms: 1_000,
         block_report_batch_size: 1_000,
         block_cleanup: beryl_worker::config::WorkerBlockCleanupConfig::default(),
+        shutdown_timeout_ms: 30_000,
         observability: test_observability_config(),
     }
 }
@@ -90,6 +94,7 @@ fn test_observability_config() -> beryl_common::observe::ObservabilityConfig {
 
 #[derive(Clone)]
 enum MockRegisterReply {
+    Echo,
     Ok { worker_id: u64, worker_run_id: WorkerRunId },
     HeaderErrorWithAcceptedBody { worker_id: u64, worker_run_id: WorkerRunId },
     HeaderError(RpcErrorDetail),
@@ -150,6 +155,11 @@ impl MetadataWorkerServiceProto for MockMetadataWorkerService {
             .expect("mock register reply");
 
         match reply {
+            MockRegisterReply::Echo => Ok(Response::new(RegisterWorkerResponseProto {
+                header: Some(response_header_from_request(&request, None)),
+                worker_id: request.worker_id,
+                accepted_worker_run_id: request.worker_run_id,
+            })),
             MockRegisterReply::Ok {
                 worker_id,
                 worker_run_id,
@@ -428,14 +438,15 @@ fn test_worker_core(store: Arc<StoreDirs>) -> Arc<WorkerCore> {
     Arc::new(WorkerCore::with_local_store(1024, 1024, Duration::from_secs(60), store))
 }
 
-fn test_cleanup_executor(state: Arc<RegistrationSet>) -> BlockCleanupExecutor {
+fn test_cleanup_executor(state: Arc<RegistrationSet>) -> (BlockCleanupExecutor, BlockCleanupRuntime) {
     let core = Arc::new(WorkerCore::with_options(
         1024,
         1024,
         Duration::from_secs(60),
         std::env::temp_dir().join(format!("beryl-cleanup-test-{}", uuid::Uuid::new_v4())),
     ));
-    BlockCleanupExecutor::start(core, state, BlockCleanupOptions::default()).expect("cleanup executor")
+    let runtime = BlockCleanupRuntime::start(core, state, BlockCleanupOptions::default()).expect("cleanup executor");
+    (runtime.executor(), runtime)
 }
 
 fn publish_ready_block_for(
@@ -511,6 +522,256 @@ async fn wait_for_block_report_delta(
     })
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for {expected_op:?} delta for {expected_block_id}"));
+}
+
+#[cfg(unix)]
+struct WorkerProcess {
+    child: Child,
+}
+
+#[cfg(unix)]
+impl WorkerProcess {
+    fn start(config_path: &std::path::Path) -> Self {
+        let child = Command::new(env!("CARGO_BIN_EXE_beryl-worker"))
+            .arg("start")
+            .arg("--config")
+            .arg(config_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start Worker process");
+        Self { child }
+    }
+
+    fn send_signal(&self, signal: i32) {
+        let pid = self.child.id().expect("Worker process id");
+        assert_eq!(unsafe { libc::kill(pid as i32, signal) }, 0);
+    }
+
+    async fn wait_successfully(mut self) {
+        let status = tokio::time::timeout(Duration::from_secs(5), self.child.wait())
+            .await
+            .expect("Worker process shutdown must be bounded")
+            .expect("wait for Worker process");
+        assert!(status.success(), "Worker process must exit successfully: {status}");
+    }
+
+    async fn signal_and_wait(self, signal: i32) {
+        self.send_signal(signal);
+        self.wait_successfully().await;
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_worker_http_status(address: std::net::SocketAddr, path: &str, status: &[u8]) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(mut stream) = tokio::net::TcpStream::connect(address).await {
+                let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+                stream.write_all(request.as_bytes()).await.ok();
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).await.ok();
+                if response.starts_with(status) {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Worker HTTP status must become available");
+}
+
+#[cfg(unix)]
+async fn request_http_keep_alive(stream: &mut tokio::net::TcpStream, path: &str) -> Vec<u8> {
+    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.expect("write HTTP request");
+    let mut response = Vec::new();
+    loop {
+        let mut chunk = [0u8; 1024];
+        let count = stream.read(&mut chunk).await.expect("read HTTP response");
+        assert_ne!(count, 0, "HTTP connection closed before a complete response");
+        response.extend_from_slice(&chunk[..count]);
+        let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let body_start = header_end + 4;
+        let headers = std::str::from_utf8(&response[..header_end]).expect("HTTP response headers are UTF-8");
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().expect("valid content length"))
+                })
+            })
+            .expect("HTTP response has content length");
+        if response.len() >= body_start + content_length {
+            response.truncate(body_start + content_length);
+            return response;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn worker_process_config(endpoint: &str) -> (TempDir, std::path::PathBuf, std::net::SocketAddr, WorkerConfig) {
+    let temp = TempDir::new().expect("worker process tempdir");
+    let rpc_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve Worker RPC port");
+    let rpc_addr = rpc_listener.local_addr().unwrap();
+    let http_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve Worker HTTP port");
+    let http_addr = http_listener.local_addr().unwrap();
+    let identity_path = temp.path().join("worker.identity");
+    let store_path = temp.path().join("hdd0");
+    let config_path = temp.path().join("worker.yaml");
+    let config_yaml = format!(
+        r#"beryl.cluster.id: "process-shutdown"
+beryl.worker.identity-file: {identity_path:?}
+beryl.worker.host: "127.0.0.1"
+beryl.worker.bind-host: "127.0.0.1"
+beryl.worker.rpc.port: {rpc_port}
+beryl.worker.rpc.max-concurrent-requests: 16
+beryl.worker.http.port: {http_port}
+beryl.worker.metadata.addresses: [{endpoint:?}]
+beryl.worker.metadata.request-timeout: 1s
+beryl.worker.metadata.retry.initial-backoff: 10ms
+beryl.worker.metadata.retry.max-backoff: 100ms
+beryl.worker.heartbeat.interval: 20ms
+beryl.worker.block.report.interval: 20ms
+beryl.worker.block.report.batch-size: 100
+beryl.worker.block.cleanup.queue-capacity: 16
+beryl.worker.block.cleanup.concurrency: 2
+beryl.worker.block.cleanup.retry.initial-backoff: 10ms
+beryl.worker.block.cleanup.retry.max-backoff: 100ms
+beryl.worker.stream.frame-size: 1KiB
+beryl.worker.stream.max-frame-size: 4KiB
+beryl.worker.stream.idle-timeout: 5s
+beryl.worker.storage.dirs:
+  hdd0:
+    path: {store_path:?}
+    tier: hdd
+    capacity: 64MiB
+beryl.worker.storage.reserved-space: 1MiB
+beryl.worker.storage.check-interval: 1s
+beryl.worker.shutdown.timeout: 200ms
+beryl.logging.format: compact
+beryl.logging.output: stderr
+beryl.logging.level: warn
+"#,
+        identity_path = identity_path.to_string_lossy(),
+        store_path = store_path.to_string_lossy(),
+        rpc_port = rpc_addr.port(),
+        http_port = http_addr.port(),
+    );
+    std::fs::write(&config_path, config_yaml).expect("write Worker process config");
+    drop(rpc_listener);
+    drop(http_listener);
+    let config = WorkerConfig::load(&config_path).expect("load Worker process config");
+    (temp, config_path, http_addr, config)
+}
+
+#[cfg(unix)]
+async fn wait_for_full_report_count(mock: &MockMetadataState, block_id: BlockId, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let count = mock
+                .block_report_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| {
+                    let Some(block_report_request_proto::Report::Full(full)) = request.report.as_ref() else {
+                        return false;
+                    };
+                    full.blocks.iter().any(|block| {
+                        block
+                            .block_id
+                            .is_some_and(|reported| BlockId::try_from(reported) == Ok(block_id))
+                    })
+                })
+                .count();
+            if count >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Worker must report recovered Ready block");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_signals_exit_cleanly_and_restart_reports_current_blocks() {
+    let (endpoint, mock, metadata_shutdown) =
+        start_mock_metadata(vec![MockRegisterReply::Echo, MockRegisterReply::Echo]).await;
+    let (_temp, config_path, http_addr, config) = worker_process_config(&endpoint);
+    beryl_worker::control::prepare_worker_start(&config).expect("format Worker storage");
+    let store = StoreDirs::open(
+        config.store.dirs.clone(),
+        config.store.reserve_space_bytes,
+        config.store.check_interval_ms,
+    )
+    .expect("open Worker process store");
+    let ready_block = block_id();
+    publish_ready_block_for(&store, group_name(), ready_block, payload(), 101);
+    drop(store);
+
+    let first = WorkerProcess::start(&config_path);
+    wait_for_worker_http_status(http_addr, "/ready", b"HTTP/1.1 200").await;
+    wait_for_full_report_count(&mock, ready_block, 1).await;
+    let mut held_connection = tokio::net::TcpStream::connect(http_addr)
+        .await
+        .expect("open accepted HTTP connection");
+    held_connection
+        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n")
+        .await
+        .unwrap();
+    let mut readiness_connection = tokio::net::TcpStream::connect(http_addr)
+        .await
+        .expect("open readiness connection before shutdown");
+    let ready_response = request_http_keep_alive(&mut readiness_connection, "/ready").await;
+    assert!(ready_response.starts_with(b"HTTP/1.1 200"));
+    first.send_signal(libc::SIGTERM);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let response = request_http_keep_alive(&mut readiness_connection, "/ready").await;
+            if response.starts_with(b"HTTP/1.1 503") {
+                return;
+            }
+            assert!(response.starts_with(b"HTTP/1.1 200"));
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("readiness must close before accepted HTTP work drains");
+    first.wait_successfully().await;
+    drop(held_connection);
+    drop(readiness_connection);
+
+    let second = WorkerProcess::start(&config_path);
+    wait_for_worker_http_status(http_addr, "/ready", b"HTTP/1.1 200").await;
+    wait_for_full_report_count(&mock, ready_block, 2).await;
+    second.signal_and_wait(libc::SIGINT).await;
+
+    let registrations = mock.requests.lock().unwrap();
+    assert_eq!(registrations.len(), 2);
+    assert_ne!(registrations[0].worker_run_id, registrations[1].worker_run_id);
+    metadata_shutdown.send(()).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_signals_before_registration_exit_cleanly() {
+    let (_temp, config_path, http_addr, config) = worker_process_config("http://127.0.0.1:1");
+    beryl_worker::control::prepare_worker_start(&config).expect("format Worker storage");
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        let process = WorkerProcess::start(&config_path);
+        wait_for_worker_http_status(http_addr, "/health", b"HTTP/1.1 200").await;
+        wait_for_worker_http_status(http_addr, "/ready", b"HTTP/1.1 503").await;
+        process.signal_and_wait(signal).await;
+    }
 }
 
 #[tokio::test]
@@ -757,6 +1018,7 @@ async fn heartbeat_sends_registered_identity_to_all_configured_peers() {
         worker_run_id,
         advertised_endpoint: "http://127.0.0.1:9090".to_string(),
     });
+    let (cleanup, _cleanup_runtime) = test_cleanup_executor(Arc::clone(&state));
     let heartbeat = MetadataHeartbeatLoop::new(
         WorkerRegistrationConfig {
             endpoints: vec![endpoint_a.clone(), endpoint_b.clone()],
@@ -764,7 +1026,7 @@ async fn heartbeat_sends_registered_identity_to_all_configured_peers() {
         },
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
-        test_cleanup_executor(Arc::clone(&state)),
+        cleanup,
     )
     .expect("heartbeat loop");
 
@@ -833,11 +1095,12 @@ async fn heartbeat_sends_zero_capacity_when_store_report_has_failed_dir() {
         worker_run_id,
         advertised_endpoint: "http://127.0.0.1:9090".to_string(),
     });
+    let (cleanup, _cleanup_runtime) = test_cleanup_executor(Arc::clone(&state));
     let heartbeat = MetadataHeartbeatLoop::new(
         test_registration_config(endpoint),
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
-        test_cleanup_executor(Arc::clone(&state)),
+        cleanup,
     )
     .expect("heartbeat loop");
     let temp = TempDir::new().expect("tempdir");
@@ -882,11 +1145,12 @@ async fn heartbeat_ticks_reuse_runtime_client_id_with_new_call_id() {
         worker_run_id,
         advertised_endpoint: "http://127.0.0.1:9090".to_string(),
     });
+    let (cleanup, _cleanup_runtime) = test_cleanup_executor(Arc::clone(&state));
     let heartbeat = MetadataHeartbeatLoop::new(
         test_registration_config(endpoint),
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
-        test_cleanup_executor(Arc::clone(&state)),
+        cleanup,
     )
     .expect("heartbeat loop");
 
@@ -941,7 +1205,7 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_remove() {
     let store = report_store(&temp);
     publish_ready_block_for(store.as_ref(), group_name(), block_id(), payload(), 101);
     let core = test_worker_core(Arc::clone(&store));
-    let cleanup = BlockCleanupExecutor::start(
+    let cleanup_runtime = BlockCleanupRuntime::start(
         Arc::clone(&core),
         Arc::clone(&state),
         BlockCleanupOptions {
@@ -952,6 +1216,7 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_remove() {
         },
     )
     .expect("cleanup executor");
+    let cleanup = cleanup_runtime.executor();
     let heartbeat = MetadataHeartbeatLoop::new(
         test_registration_config(endpoint.clone()),
         test_registration_descriptor(worker_run_id),
@@ -1067,11 +1332,12 @@ fn latest_delta_has(
 async fn heartbeat_without_registration_sends_no_requests() {
     let (endpoint, mock, shutdown) = start_mock_metadata_with_heartbeat(Vec::new()).await;
     let state = Arc::new(RegistrationSet::new());
+    let (cleanup, _cleanup_runtime) = test_cleanup_executor(Arc::clone(&state));
     let heartbeat = MetadataHeartbeatLoop::new(
         test_registration_config(endpoint),
         test_registration_descriptor(test_worker_run_id()),
         Arc::clone(&state),
-        test_cleanup_executor(Arc::clone(&state)),
+        cleanup,
     )
     .expect("heartbeat loop");
 
@@ -1102,6 +1368,7 @@ async fn single_heartbeat_peer_failure_does_not_clear_ready_lease() {
         advertised_endpoint: "http://127.0.0.1:9090".to_string(),
     });
     state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
+    let (cleanup, _cleanup_runtime) = test_cleanup_executor(Arc::clone(&state));
     let heartbeat = MetadataHeartbeatLoop::new(
         WorkerRegistrationConfig {
             endpoints: vec![endpoint_a.clone(), endpoint_b.clone()],
@@ -1109,7 +1376,7 @@ async fn single_heartbeat_peer_failure_does_not_clear_ready_lease() {
         },
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
-        test_cleanup_executor(Arc::clone(&state)),
+        cleanup,
     )
     .expect("heartbeat loop");
 
@@ -1143,11 +1410,12 @@ async fn need_register_heartbeat_responses_clear_registration() {
             worker_run_id,
             advertised_endpoint: "http://127.0.0.1:9090".to_string(),
         });
+        let (cleanup, _cleanup_runtime) = test_cleanup_executor(Arc::clone(&state));
         let heartbeat = MetadataHeartbeatLoop::new(
             test_registration_config(endpoint),
             test_registration_descriptor(worker_run_id),
             Arc::clone(&state),
-            test_cleanup_executor(Arc::clone(&state)),
+            cleanup,
         )
         .expect("heartbeat loop");
 
@@ -1181,11 +1449,12 @@ async fn heartbeat_refresh_metadata_recovery_does_not_clear_registration() {
         advertised_endpoint: "http://127.0.0.1:9090".to_string(),
     });
     state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
+    let (cleanup, _cleanup_runtime) = test_cleanup_executor(Arc::clone(&state));
     let heartbeat = MetadataHeartbeatLoop::new(
         test_registration_config(endpoint),
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
-        test_cleanup_executor(Arc::clone(&state)),
+        cleanup,
     )
     .expect("heartbeat loop");
 
@@ -1219,11 +1488,12 @@ async fn worker_run_mismatch_heartbeat_response_clears_registration_for_recovery
         advertised_endpoint: "http://127.0.0.1:9090".to_string(),
     });
     state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
+    let (cleanup, _cleanup_runtime) = test_cleanup_executor(Arc::clone(&state));
     let heartbeat = MetadataHeartbeatLoop::new(
         test_registration_config(endpoint.clone()),
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
-        test_cleanup_executor(Arc::clone(&state)),
+        cleanup,
     )
     .expect("heartbeat loop");
     let registrar = MetadataRegistrar::new(
@@ -1280,11 +1550,12 @@ async fn heartbeat_header_error_is_rejected() {
         worker_run_id,
         advertised_endpoint: "http://127.0.0.1:9090".to_string(),
     });
+    let (cleanup, _cleanup_runtime) = test_cleanup_executor(Arc::clone(&state));
     let heartbeat = MetadataHeartbeatLoop::new(
         test_registration_config(endpoint),
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
-        test_cleanup_executor(state),
+        cleanup,
     )
     .expect("heartbeat loop");
 
@@ -1316,11 +1587,12 @@ async fn heartbeat_rejects_malformed_cleanup_command() {
         worker_run_id,
         advertised_endpoint: "http://127.0.0.1:9090".to_string(),
     });
+    let (cleanup, _cleanup_runtime) = test_cleanup_executor(Arc::clone(&state));
     let heartbeat = MetadataHeartbeatLoop::new(
         test_registration_config(endpoint),
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
-        test_cleanup_executor(state),
+        cleanup,
     )
     .expect("heartbeat loop");
 

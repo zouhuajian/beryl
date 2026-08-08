@@ -13,6 +13,7 @@ bytes = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 

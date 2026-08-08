@@ -11,7 +11,7 @@ use crate::raft::{AppRaftNode, RocksDBStorage};
 use beryl_types::GroupName;
 use parking_lot::RwLock;
 use rand::Rng;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -47,6 +47,7 @@ pub enum RootNotReadyReason {
     NotLeader,
     RootMountMissing,
     RootMountOwnerMismatch,
+    Shutdown,
 }
 
 impl RootNotReadyReason {
@@ -58,6 +59,7 @@ impl RootNotReadyReason {
             Self::NotLeader => "NotLeader",
             Self::RootMountMissing => "RootMountMissing",
             Self::RootMountOwnerMismatch => "RootMountOwnerMismatch",
+            Self::Shutdown => "Shutdown",
         }
     }
 }
@@ -88,8 +90,13 @@ impl RootReadinessLogFields {
     }
 }
 
+/// Sticky authority gate shared by filesystem RPCs and process readiness.
+///
+/// Ready transitions hold the state lock through atomic publication, while a
+/// shutdown flag permanently rejects later startup observations.
 pub struct RootReadinessGate {
     ready: AtomicUsize,
+    shutting_down: AtomicBool,
     state: RwLock<RootReadinessState>,
     notify: Notify,
     metrics: Option<Arc<MetadataMetrics>>,
@@ -103,6 +110,7 @@ impl RootReadinessGate {
         }
         Self {
             ready: AtomicUsize::new(0),
+            shutting_down: AtomicBool::new(false),
             state: RwLock::new(RootReadinessState::Starting),
             notify: Notify::new(),
             metrics,
@@ -114,7 +122,11 @@ impl RootReadinessGate {
     }
 
     pub fn set_ready(&self) {
-        *self.state.write() = RootReadinessState::Ready;
+        let mut state = self.state.write();
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        *state = RootReadinessState::Ready;
         if self.ready.swap(1, Ordering::Release) == 0 {
             if let Some(metrics) = &self.metrics {
                 metrics.root_ready.store(1, Ordering::Relaxed);
@@ -122,10 +134,30 @@ impl RootReadinessGate {
             }
             self.notify.notify_waiters();
         }
+        drop(state);
     }
 
     pub fn set_not_ready(&self, reason: RootNotReadyReason) {
-        *self.state.write() = RootReadinessState::NotReady(reason);
+        let mut state = self.state.write();
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        *state = RootReadinessState::NotReady(reason);
+        self.ready.store(0, Ordering::Release);
+        if let Some(metrics) = &self.metrics {
+            metrics.root_ready.store(0, Ordering::Relaxed);
+            observe::record_root_ready(false);
+        }
+        drop(state);
+    }
+
+    /// Permanently closes readiness before the process begins draining RPCs.
+    ///
+    /// The state is sticky so a concurrent startup watcher cannot publish
+    /// readiness again after shutdown has started.
+    pub fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        *self.state.write() = RootReadinessState::NotReady(RootNotReadyReason::Shutdown);
         self.ready.store(0, Ordering::Release);
         if let Some(metrics) = &self.metrics {
             metrics.root_ready.store(0, Ordering::Relaxed);
@@ -432,5 +464,18 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("RaftUninitialized"));
         assert!(message.contains("root readiness timed out"));
+    }
+
+    #[test]
+    fn shutdown_readiness_is_sticky_against_late_startup_updates() {
+        let gate = RootReadinessGate::new(None);
+        gate.set_ready();
+
+        gate.begin_shutdown();
+        gate.set_ready();
+        gate.set_not_ready(RootNotReadyReason::NotLeader);
+
+        assert!(!gate.is_ready());
+        assert_eq!(gate.state(), RootReadinessState::NotReady(RootNotReadyReason::Shutdown));
     }
 }

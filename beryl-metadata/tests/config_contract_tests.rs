@@ -13,6 +13,7 @@ fn repository_metadata_configs_define_runtime_contract() {
     assert_eq!(config.block_cleanup.scan_interval_ms, 30_000);
     assert_eq!(config.block_cleanup.reclaim_grace_ms, 300_000);
     assert_eq!(config.startup.root_readiness.timeout_ms, 120_000);
+    assert_eq!(config.shutdown_timeout_ms, 30_000);
     assert_eq!(config.rpc_port, 18080);
     assert_eq!(config.http_port, 18081);
 }

@@ -24,12 +24,14 @@ metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 
 # HTTP server for Prometheus endpoint
-tokio = { workspace = true, features = ["rt", "net", "sync", "fs", "io-util"] }
+tokio = { workspace = true, features = ["rt", "net", "sync", "fs", "io-util", "signal"] }
+tokio-util = { workspace = true, features = ["rt"] }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 http = { workspace = true }
 tonic = { workspace = true }
+tower = { workspace = true, features = ["limit"] }
 
 [features]
 default = ["prometheus"]

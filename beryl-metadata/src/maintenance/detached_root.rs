@@ -10,6 +10,7 @@ use crate::raft::{AppRaftNode, ApplySuccess, Command, DetachedRootReclaimResult,
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 /// Outcome of one maintenance pass before the service chooses its next delay.
@@ -47,13 +48,17 @@ impl DetachedRootReclaimer {
     }
 
     /// Run the single proposal loop with bounded exponential error backoff.
-    pub(crate) async fn run(self: Arc<Self>) {
+    pub(crate) async fn run(self: Arc<Self>, shutdown: CancellationToken) {
         let scan_interval = Duration::from_millis(self.config.scan_interval_ms);
         let retry_initial = Duration::from_millis(self.config.retry_initial_backoff_ms);
         let retry_max = Duration::from_millis(self.config.retry_max_backoff_ms);
         let mut retry_delay = retry_initial;
         loop {
-            let delay = match self.reclaim_once().await {
+            let delay = match tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                result = self.reclaim_once() => result,
+            } {
                 Ok(_) => {
                     retry_delay = retry_initial;
                     scan_interval
@@ -65,7 +70,11 @@ impl DetachedRootReclaimer {
                     current
                 }
             };
-            tokio::time::sleep(delay).await;
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(delay) => {}
+            }
         }
     }
 

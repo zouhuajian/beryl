@@ -43,6 +43,7 @@ const BLOCK_CLEANUP_QUEUE_CAPACITY: &str = "beryl.worker.block.cleanup.queue-cap
 const BLOCK_CLEANUP_CONCURRENCY: &str = "beryl.worker.block.cleanup.concurrency";
 const BLOCK_CLEANUP_RETRY_INITIAL_BACKOFF: &str = "beryl.worker.block.cleanup.retry.initial-backoff";
 const BLOCK_CLEANUP_RETRY_MAX_BACKOFF: &str = "beryl.worker.block.cleanup.retry.max-backoff";
+const SHUTDOWN_TIMEOUT: &str = "beryl.worker.shutdown.timeout";
 
 /// Worker-to-Metadata request and retry configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,6 +147,8 @@ pub struct WorkerConfig {
     pub block_report_interval_ms: u64,
     pub block_report_batch_size: usize,
     pub block_cleanup: WorkerBlockCleanupConfig,
+    /// Graceful RPC/background drain interval before remaining work is cancelled.
+    pub shutdown_timeout_ms: u64,
     pub observability: ObservabilityConfig,
 }
 
@@ -186,6 +189,7 @@ impl Default for WorkerConfig {
             block_report_interval_ms: 1_000,
             block_report_batch_size: 1_000,
             block_cleanup: WorkerBlockCleanupConfig::default(),
+            shutdown_timeout_ms: 30_000,
             observability: ObservabilityConfig {
                 log: LogConfig {
                     format: "compact".to_string(),
@@ -231,6 +235,7 @@ impl WorkerConfig {
         let block_report_interval_ms = duration_ms_or(flat, BLOCK_REPORT_INTERVAL, defaults.block_report_interval_ms)?;
         let block_report_batch_size =
             positive_usize_or(flat, BLOCK_REPORT_BATCH_SIZE, defaults.block_report_batch_size)?;
+        let shutdown_timeout_ms = duration_ms_or(flat, SHUTDOWN_TIMEOUT, defaults.shutdown_timeout_ms)?;
         let cleanup_defaults = WorkerBlockCleanupConfig::default();
         let block_cleanup = WorkerBlockCleanupConfig {
             queue_capacity: positive_usize_or(flat, BLOCK_CLEANUP_QUEUE_CAPACITY, cleanup_defaults.queue_capacity)?,
@@ -276,6 +281,7 @@ impl WorkerConfig {
             block_report_interval_ms,
             block_report_batch_size,
             block_cleanup,
+            shutdown_timeout_ms,
             observability,
         };
         config.validate()?;
@@ -591,6 +597,7 @@ mod tests {
         flat.set(HTTP_PORT, 29091i64);
         flat.set(HEARTBEAT_INTERVAL, "2s");
         flat.set(BLOCK_REPORT_BATCH_SIZE, 500i64);
+        flat.set(SHUTDOWN_TIMEOUT, "20s");
         flat.insert(
             STORAGE_DIRS.to_string(),
             serde_yaml::from_str::<Value>("hdd0:\n  path: /tmp/hdd0\n  tier: hdd\n  capacity: 2GiB\n").unwrap(),
@@ -609,6 +616,7 @@ mod tests {
         assert_eq!(config.metadata.endpoints, vec!["http://metadata:18080"]);
         assert_eq!(config.heartbeat_interval_ms, 2_000);
         assert_eq!(config.block_report_batch_size, 500);
+        assert_eq!(config.shutdown_timeout_ms, 20_000);
         assert_eq!(config.store.dirs["hdd0"].tier, Tier::Hdd);
     }
 

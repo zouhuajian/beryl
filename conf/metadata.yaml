@@ -44,6 +44,9 @@ beryl.metadata.startup.warn-after: 1min
 beryl.metadata.startup.timeout: 2min
 beryl.metadata.startup.fail-fast: false
 
+# -------------------- Shutdown --------------------
+beryl.metadata.shutdown.timeout: 30s
+
 # -------------------- Write leases --------------------
 beryl.metadata.write-lease.timeout: 1min
 

@@ -8,30 +8,57 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use beryl_common::observe::{init_observability, ServiceInfo};
-use beryl_common::service_http::spawn_service_http;
+use beryl_common::service_http::{spawn_service_http, ServiceHttpHandle};
+use beryl_common::termination::{TerminationMonitor, TerminationSignal};
 use beryl_worker::{
     config::WorkerConfig,
     control::{
-        prepare_worker_start, BlockCleanupExecutor, BlockCleanupOptions, BlockReportOptions, MetadataBlockReportLoop,
+        prepare_worker_start, BlockCleanupOptions, BlockCleanupRuntime, BlockReportOptions, MetadataBlockReportLoop,
         MetadataHeartbeatLoop, MetadataRegistrar, RegistrationSet,
     },
     net, observe,
     store::dirs::StoreDirs,
     WorkerCore,
 };
+use tokio::task::{JoinError, JoinHandle};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let command = WorkerCommand::parse(std::env::args().skip(1))?;
+    let mut termination = TerminationSignal::install()
+        .context("Failed to install Worker termination handlers")?
+        .monitor();
     let config_path = command
         .config_path
         .clone()
         .unwrap_or_else(|| "conf/worker.yaml".to_string());
 
-    let config = WorkerConfig::load(&config_path).context("Failed to load worker configuration")?;
+    let config = match WorkerConfig::load(&config_path).context("Failed to load worker configuration") {
+        Ok(config) => config,
+        Err(error) => {
+            termination.shutdown().await.context("Worker termination task failed")?;
+            return Err(error);
+        }
+    };
 
+    let result = run_worker(config, &mut termination).await;
+    termination.shutdown().await.context("Worker termination task failed")?;
+    result
+}
+
+/// Owns every long-lived Worker service from startup through bounded shutdown.
+///
+/// Readiness is closed before RPC drain. Background control-plane and cleanup
+/// tasks are then cancelled and awaited under the configured process timeout.
+async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) -> Result<()> {
     let worker_id = prepare_worker_start(&config).context("Worker storage start validation failed")?;
+    if termination.is_cancelled() {
+        log_startup_signal(termination).await?;
+        return Ok(());
+    }
 
     let obs_config = config.observability.clone();
     let service_info = ServiceInfo {
@@ -45,6 +72,10 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to initialize observability: {}", e))?;
     observe::record_worker_started("worker", env!("CARGO_PKG_VERSION"));
     observe::set_worker_registered(false);
+    if termination.is_cancelled() {
+        log_startup_signal(termination).await?;
+        return Ok(());
+    }
 
     info!(
         event = "worker_data_service_starting",
@@ -80,29 +111,57 @@ async fn main() -> Result<()> {
         Arc::new(move || readiness_state.is_ready(&readiness_group)),
     )
     .context("Failed to start Worker HTTP service")?;
-    let descriptor = MetadataRegistrar::descriptor_from_config(&config, worker_id)
-        .context("Failed to build worker registration descriptor")?;
+    if termination.is_cancelled() {
+        registration_state.begin_shutdown();
+        let signal_result = log_startup_signal(termination).await;
+        shutdown_worker_start(http, None, config.shutdown_timeout_ms).await?;
+        signal_result?;
+        return Ok(());
+    }
+    let descriptor = match MetadataRegistrar::descriptor_from_config(&config, worker_id) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            registration_state.begin_shutdown();
+            shutdown_worker_start(http, None, config.shutdown_timeout_ms).await?;
+            return Err(error).context("Failed to build worker registration descriptor");
+        }
+    };
     let block_report_descriptor = descriptor.clone();
-    let registrar = Arc::new(
-        MetadataRegistrar::new(config.metadata.clone(), descriptor, Arc::clone(&registration_state))
-            .context("Failed to create worker metadata registrar")?,
-    );
+    let registrar = match MetadataRegistrar::new(config.metadata.clone(), descriptor, Arc::clone(&registration_state)) {
+        Ok(registrar) => Arc::new(registrar),
+        Err(error) => {
+            registration_state.begin_shutdown();
+            shutdown_worker_start(http, None, config.shutdown_timeout_ms).await?;
+            return Err(error).context("Failed to create worker metadata registrar");
+        }
+    };
 
-    let block_store = Arc::new(
-        StoreDirs::open(
-            config.store.dirs.clone(),
-            config.store.reserve_space_bytes,
-            config.store.check_interval_ms,
-        )
-        .context("Failed to initialize worker store dirs")?,
-    );
+    let block_store = match StoreDirs::open(
+        config.store.dirs.clone(),
+        config.store.reserve_space_bytes,
+        config.store.check_interval_ms,
+    ) {
+        Ok(block_store) => Arc::new(block_store),
+        Err(error) => {
+            registration_state.begin_shutdown();
+            shutdown_worker_start(http, None, config.shutdown_timeout_ms).await?;
+            return Err(error).context("Failed to initialize worker store dirs");
+        }
+    };
+    if termination.is_cancelled() {
+        registration_state.begin_shutdown();
+        let signal_result = log_startup_signal(termination).await;
+        shutdown_worker_start(http, None, config.shutdown_timeout_ms).await?;
+        signal_result?;
+        return Ok(());
+    }
     let core = Arc::new(WorkerCore::with_local_store(
         config.default_frame_size,
         config.max_frame_size,
         Duration::from_millis(config.stream_idle_timeout_ms),
         block_store.clone(),
     ));
-    let cleanup = BlockCleanupExecutor::start(
+    let cleanup = match BlockCleanupRuntime::start(
         Arc::clone(&core),
         Arc::clone(&registration_state),
         BlockCleanupOptions {
@@ -111,49 +170,206 @@ async fn main() -> Result<()> {
             retry_initial_backoff: Duration::from_millis(config.block_cleanup.retry_initial_backoff_ms),
             retry_max_backoff: Duration::from_millis(config.block_cleanup.retry_max_backoff_ms),
         },
-    )
-    .context("Failed to create worker block cleanup executor")?;
-    let heartbeat = MetadataHeartbeatLoop::with_interval(
+    ) {
+        Ok(cleanup) => cleanup,
+        Err(error) => {
+            registration_state.begin_shutdown();
+            shutdown_worker_start(http, None, config.shutdown_timeout_ms).await?;
+            return Err(error).context("Failed to create worker block cleanup executor");
+        }
+    };
+    let heartbeat = match MetadataHeartbeatLoop::with_interval(
         config.metadata.clone(),
         block_report_descriptor.clone(),
         Arc::clone(&registration_state),
-        cleanup,
+        cleanup.executor(),
         Duration::from_millis(config.heartbeat_interval_ms),
-    )
-    .context("Failed to create worker metadata heartbeat loop")?;
-
-    registrar
-        .register_with_retry(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
-        .context("Worker metadata registration failed")?;
-    let _heartbeat_handle = heartbeat.spawn_with_registrar_and_store(Arc::clone(&registrar), Arc::clone(&block_store));
-    let block_report = MetadataBlockReportLoop::with_options_and_interval(
+    ) {
+        Ok(heartbeat) => heartbeat,
+        Err(error) => {
+            registration_state.begin_shutdown();
+            shutdown_worker_start(http, Some(cleanup), config.shutdown_timeout_ms).await?;
+            return Err(error).context("Failed to create worker metadata heartbeat loop");
+        }
+    };
+    let block_report = match MetadataBlockReportLoop::with_options_and_interval(
         config.metadata.clone(),
         block_report_descriptor,
         Arc::clone(&registration_state),
-        block_store,
+        Arc::clone(&block_store),
         Arc::clone(&core),
         BlockReportOptions {
             full_max_blocks_per_batch: config.block_report_batch_size,
             delta_max_entries_per_batch: config.block_report_batch_size,
         },
         Duration::from_millis(config.block_report_interval_ms),
-    )
-    .context("Failed to create worker block report loop")?;
-    let _block_report_handle = block_report.spawn();
+    ) {
+        Ok(block_report) => block_report,
+        Err(error) => {
+            registration_state.begin_shutdown();
+            shutdown_worker_start(http, Some(cleanup), config.shutdown_timeout_ms).await?;
+            return Err(error).context("Failed to create worker block report loop");
+        }
+    };
 
-    let result = net::server::serve_worker_data_with_registration(&config.net, core, registration_state)
-        .await
-        .context("Worker data service server failed");
-    http.abort();
-    if let Err(error) = result {
-        error!(%error, "Worker RPC server failed");
-        return Err(error);
+    if termination.is_cancelled() {
+        registration_state.begin_shutdown();
+        let signal_result = log_startup_signal(termination).await;
+        shutdown_worker_start(http, Some(cleanup), config.shutdown_timeout_ms).await?;
+        signal_result?;
+        return Ok(());
     }
 
+    let registration = tokio::select! {
+        biased;
+        signal = termination.recv() => {
+            let signal_result = signal.context("Worker termination task failed");
+            if let Ok(signal) = &signal_result {
+                info!(?signal, "Shutdown signal received before Worker registration completed");
+            }
+            registration_state.begin_shutdown();
+            shutdown_worker_start(http, Some(cleanup), config.shutdown_timeout_ms).await?;
+            signal_result?;
+            return Ok(());
+        }
+        result = registrar.register_with_retry(std::future::pending::<()>()) => {
+            result.context("Worker metadata registration failed")?
+        }
+    };
+    info!(
+        group_name = %registration.group_name,
+        worker_id = registration.worker_id.as_raw(),
+        worker_run_id = %registration.worker_run_id,
+        "Worker metadata registration completed"
+    );
+
+    let mut rpc = match net::server::spawn_worker_data_with_registration(
+        &config.net,
+        Arc::clone(&core),
+        Arc::clone(&registration_state),
+    ) {
+        Ok(rpc) => rpc,
+        Err(error) => {
+            registration_state.begin_shutdown();
+            shutdown_worker_start(http, Some(cleanup), config.shutdown_timeout_ms).await?;
+            return Err(error).context("Failed to start Worker data service");
+        }
+    };
+
+    let background_shutdown = CancellationToken::new();
+    let heartbeat_handle = heartbeat.spawn_with_registrar_and_store_until_shutdown(
+        Arc::clone(&registrar),
+        Arc::clone(&block_store),
+        background_shutdown.child_token(),
+    );
+    let block_report_handle = block_report.spawn_until_shutdown(background_shutdown.child_token());
+
+    let mut stop_error = None;
+    tokio::select! {
+        biased;
+        signal = termination.recv() => {
+            match signal {
+                Ok(signal) => info!(?signal, "Shutdown signal received"),
+                Err(error) => stop_error = Some(error.into()),
+            }
+        }
+        result = rpc.wait() => {
+            stop_error = Some(match result {
+                Ok(()) => anyhow::anyhow!("Worker RPC server stopped unexpectedly"),
+                Err(error) => error.into(),
+            });
+        }
+    }
+
+    registration_state.begin_shutdown();
+    background_shutdown.cancel();
+    let deadline = Instant::now() + Duration::from_millis(config.shutdown_timeout_ms);
+    let (rpc_result, heartbeat_result, block_report_result, cleanup_result, http_result) = tokio::join!(
+        rpc.shutdown_until(deadline),
+        stop_task_until(Some(heartbeat_handle), deadline),
+        stop_task_until(Some(block_report_handle), deadline),
+        cleanup.shutdown_until(deadline),
+        http.shutdown_until(deadline),
+    );
+
+    let rpc_forced = rpc_result.as_ref().copied().unwrap_or(false);
+    let heartbeat_forced = heartbeat_result.as_ref().is_ok_and(|result| result.1);
+    let block_report_forced = block_report_result.as_ref().is_ok_and(|result| result.1);
+    let cleanup_forced = cleanup_result.as_ref().copied().unwrap_or(false);
+    let http_forced = http_result.as_ref().copied().unwrap_or(false);
+    if rpc_forced || heartbeat_forced || block_report_forced || cleanup_forced || http_forced {
+        tracing::warn!(
+            rpc_forced,
+            heartbeat_forced,
+            block_report_forced,
+            cleanup_forced,
+            http_forced,
+            timeout_ms = config.shutdown_timeout_ms,
+            "Worker forced remaining work after the graceful drain deadline"
+        );
+    }
+
+    rpc_result.context("Worker data service task failed")?;
+    heartbeat_result.context("Worker heartbeat task failed")?;
+    block_report_result.context("Worker block report task failed")?;
+    cleanup_result.context("Worker cleanup shutdown failed")?;
+    http_result.context("Worker HTTP shutdown failed")?;
+    if let Some(error) = stop_error {
+        error!(%error, "Worker server stopped unexpectedly");
+        return Err(error);
+    }
     Ok(())
+}
+
+async fn log_startup_signal(termination: &mut TerminationMonitor) -> Result<()> {
+    let signal = termination.recv().await.context("Worker termination task failed")?;
+    info!(?signal, "Shutdown signal received during Worker startup");
+    Ok(())
+}
+
+/// Reclaims the subset of Worker services constructed before registration.
+async fn shutdown_worker_start(
+    http: ServiceHttpHandle,
+    cleanup: Option<BlockCleanupRuntime>,
+    timeout_ms: u64,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let cleanup_shutdown = async move {
+        match cleanup {
+            Some(cleanup) => cleanup.shutdown_until(deadline).await,
+            None => Ok(false),
+        }
+    };
+    let (cleanup_result, http_result) = tokio::join!(cleanup_shutdown, http.shutdown_until(deadline));
+    let cleanup_forced = cleanup_result.context("Worker cleanup shutdown failed")?;
+    let http_forced = http_result.context("Worker HTTP shutdown failed")?;
+    if cleanup_forced || http_forced {
+        tracing::warn!(
+            cleanup_forced,
+            http_forced,
+            timeout_ms,
+            "Worker forced startup work after the drain deadline"
+        );
+    }
+    Ok(())
+}
+
+/// Gracefully drains an owned task, then explicitly aborts and awaits it.
+async fn stop_task_until<T>(task: Option<JoinHandle<T>>, deadline: Instant) -> Result<(Option<T>, bool), JoinError> {
+    let Some(mut task) = task else {
+        return Ok((None, false));
+    };
+    match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(result) => result.map(|output| (Some(output), false)),
+        Err(_) => {
+            task.abort();
+            match task.await {
+                Ok(output) => Ok((Some(output), true)),
+                Err(error) if error.is_cancelled() => Ok((None, true)),
+                Err(error) => Err(error),
+            }
+        }
+    }
 }
 
 struct WorkerCommand {

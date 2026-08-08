@@ -44,6 +44,7 @@ const STARTUP_WARN_AFTER: &str = "beryl.metadata.startup.warn-after";
 const STARTUP_TIMEOUT: &str = "beryl.metadata.startup.timeout";
 const STARTUP_FAIL_FAST: &str = "beryl.metadata.startup.fail-fast";
 const WRITE_LEASE_TIMEOUT: &str = "beryl.metadata.write-lease.timeout";
+const SHUTDOWN_TIMEOUT: &str = "beryl.metadata.shutdown.timeout";
 const WORKER_TIMEOUT: &str = "beryl.metadata.worker.liveness.timeout";
 const WORKER_SCAN_INTERVAL: &str = "beryl.metadata.worker.liveness.scan-interval";
 
@@ -81,6 +82,11 @@ pub struct MetadataConfig {
     pub startup: StartupConfig,
     /// Write lease expiry policy.
     pub write_lease_timeout_ms: u64,
+    /// Graceful RPC/background drain interval before remaining work is cancelled.
+    ///
+    /// Raft shutdown is always awaited afterward, so the deployment stop
+    /// budget must also include authority-close time.
+    pub shutdown_timeout_ms: u64,
     /// Shared logging and metrics recorder configuration.
     pub observability: ObservabilityConfig,
 }
@@ -284,6 +290,7 @@ impl Default for MetadataConfig {
                 root_readiness: RootReadinessConfig::default(),
             },
             write_lease_timeout_ms: 60_000,
+            shutdown_timeout_ms: 30_000,
             observability: ObservabilityConfig {
                 log: LogConfig {
                     format: "compact".to_string(),
@@ -416,6 +423,7 @@ impl MetadataConfig {
             ));
         }
         let write_lease_timeout_ms = duration_ms_or(flat, WRITE_LEASE_TIMEOUT, defaults.write_lease_timeout_ms)?;
+        let shutdown_timeout_ms = duration_ms_or(flat, SHUTDOWN_TIMEOUT, defaults.shutdown_timeout_ms)?;
 
         Ok(Self {
             cluster_id,
@@ -432,6 +440,7 @@ impl MetadataConfig {
             worker_liveness,
             startup,
             write_lease_timeout_ms,
+            shutdown_timeout_ms,
             observability,
         })
     }
@@ -604,6 +613,7 @@ mod tests {
         flat.set(NAMESPACE_DELETE_MAX_SIZE, "1MiB");
         flat.set(WORKER_TIMEOUT, "1500ms");
         flat.set(WRITE_LEASE_TIMEOUT, "90s");
+        flat.set(SHUTDOWN_TIMEOUT, "20s");
 
         let config = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap();
 
@@ -614,6 +624,7 @@ mod tests {
         assert_eq!(config.namespace_delete.max_batch_bytes, 1024 * 1024);
         assert_eq!(config.worker_liveness.heartbeat_timeout_ms, 1_500);
         assert_eq!(config.write_lease_timeout_ms, 90_000);
+        assert_eq!(config.shutdown_timeout_ms, 20_000);
         assert_eq!(config.authority.group_name.as_str(), "root");
         assert_eq!(config.raft.node_id, 1);
     }

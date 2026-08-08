@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
+use beryl_common::grpc_server::{spawn_grpc_server, GrpcServerHandle};
 
 use crate::control::RegistrationSet;
 use crate::data::core::WorkerCore;
@@ -13,20 +14,18 @@ use crate::net::config::WorkerNetConfig;
 
 pub mod grpc;
 
-/// Serve worker data-plane RPCs after metadata registration, with an active readiness guard.
-pub async fn serve_worker_data_with_registration(
+/// Binds the Worker data plane under the process-owned connection tracker.
+pub fn spawn_worker_data_with_registration(
     config: &WorkerNetConfig,
     core: Arc<WorkerCore>,
     registration_state: Arc<RegistrationSet>,
-) -> anyhow::Result<()> {
-    serve_worker_data_inner(config, core, registration_state).await
+) -> anyhow::Result<GrpcServerHandle> {
+    let (bind, max_inflight) = grpc_listener(config)?;
+    let routes = grpc::worker_data_routes(core, registration_state);
+    spawn_grpc_server(bind, routes, Some(max_inflight)).context("failed to bind Worker gRPC listener")
 }
 
-async fn serve_worker_data_inner(
-    config: &WorkerNetConfig,
-    core: Arc<WorkerCore>,
-    registration_state: Arc<RegistrationSet>,
-) -> anyhow::Result<()> {
+fn grpc_listener(config: &WorkerNetConfig) -> anyhow::Result<(std::net::SocketAddr, usize)> {
     if config.listeners.is_empty() {
         bail!("worker net listeners must not be empty");
     }
@@ -39,5 +38,5 @@ async fn serve_worker_data_inner(
         .bind
         .parse()
         .with_context(|| format!("invalid worker gRPC listener bind address: {}", listener.bind))?;
-    grpc::serve_grpc_worker_data_with_registration(bind, listener.max_inflight, core, registration_state).await
+    Ok((bind, listener.max_inflight))
 }

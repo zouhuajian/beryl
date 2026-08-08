@@ -10,7 +10,10 @@ use std::time::Duration;
 use beryl_common::error::rpc::{ErrorKind, WorkerErrorKind};
 use beryl_types::{BlockId, GroupName, WorkerId, WorkerRunId};
 use tokio::sync::{mpsc, Semaphore};
+use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::control::{Registration, RegistrationSet};
@@ -86,17 +89,85 @@ pub struct BlockCleanupExecutor {
     sender: mpsc::Sender<CleanupReplicaKey>,
 }
 
-impl BlockCleanupExecutor {
-    /// Starts the process-local cleanup executor on the current Tokio runtime.
-    ///
-    /// The executor deliberately has no durable queue: metadata rediscovers
-    /// remaining Ready replicas from block reports after worker restart. This
-    /// method fails only when the configured queue or retry bounds are invalid.
+/// Owned task lifecycle for the Worker block cleanup executor.
+///
+/// The executor is cloned into heartbeat handling, while this value remains
+/// with the process shutdown owner so queued and retrying reclamation work is
+/// cancelled and awaited before local storage is dropped.
+pub struct BlockCleanupRuntime {
+    executor: BlockCleanupExecutor,
+    shutdown: CancellationToken,
+    force: CancellationToken,
+    task: Option<JoinHandle<()>>,
+}
+
+impl BlockCleanupRuntime {
+    /// Starts cleanup with an explicit process-owned task handle.
     pub fn start(
         core: Arc<WorkerCore>,
         registrations: Arc<RegistrationSet>,
         options: BlockCleanupOptions,
     ) -> Result<Self, WorkerError> {
+        let (executor, receiver) = BlockCleanupExecutor::build(core, registrations, options)?;
+        let shutdown = CancellationToken::new();
+        let force = CancellationToken::new();
+        let task = tokio::spawn(run_executor(
+            Arc::clone(&executor.inner),
+            receiver,
+            shutdown.clone(),
+            force.clone(),
+        ));
+        Ok(Self {
+            executor,
+            shutdown,
+            force,
+            task: Some(task),
+        })
+    }
+
+    /// Returns the command sink shared with authenticated heartbeat handling.
+    pub fn executor(&self) -> BlockCleanupExecutor {
+        self.executor.clone()
+    }
+
+    /// Drains cleanup until `deadline`, then aborts and awaits the executor.
+    ///
+    /// Returns `true` when the process owner had to force cancellation.
+    pub async fn shutdown_until(mut self, deadline: Instant) -> Result<bool, tokio::task::JoinError> {
+        self.shutdown.cancel();
+        let Some(mut task) = self.task.take() else {
+            return Ok(false);
+        };
+        match tokio::time::timeout_at(deadline, &mut task).await {
+            Ok(result) => {
+                result?;
+                Ok(false)
+            }
+            Err(_) => {
+                self.force.cancel();
+                task.await?;
+                Ok(true)
+            }
+        }
+    }
+}
+
+impl Drop for BlockCleanupRuntime {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        self.force.cancel();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl BlockCleanupExecutor {
+    fn build(
+        core: Arc<WorkerCore>,
+        registrations: Arc<RegistrationSet>,
+        options: BlockCleanupOptions,
+    ) -> Result<(Self, mpsc::Receiver<CleanupReplicaKey>), WorkerError> {
         validate_options(&options)?;
         let (sender, receiver) = mpsc::channel(options.max_pending);
         let inner = Arc::new(BlockCleanupInner {
@@ -106,8 +177,7 @@ impl BlockCleanupExecutor {
             options,
             pending: Mutex::new(HashMap::new()),
         });
-        tokio::spawn(run_executor(Arc::clone(&inner), receiver));
-        Ok(Self { inner, sender })
+        Ok((Self { inner, sender }, receiver))
     }
 
     /// Enqueues authenticated commands bound to one accepted worker run.
@@ -159,19 +229,30 @@ impl BlockCleanupExecutor {
 
 /// Drains the bounded command channel and owns all process-local cleanup tasks.
 ///
-/// Closing the channel aborts active tasks and clears transient bookkeeping;
+/// Graceful shutdown stops admission and drains active tasks until forced;
 /// any undeleted replica remains discoverable through a later block report.
-async fn run_executor(inner: Arc<BlockCleanupInner>, mut receiver: mpsc::Receiver<CleanupReplicaKey>) {
+async fn run_executor(
+    inner: Arc<BlockCleanupInner>,
+    mut receiver: mpsc::Receiver<CleanupReplicaKey>,
+    shutdown: CancellationToken,
+    force: CancellationToken,
+) {
     let mut tasks = JoinSet::new();
     loop {
         tokio::select! {
+            biased;
+            _ = force.cancelled() => {
+                finish_executor(&inner, &mut tasks, true).await;
+                return;
+            }
+            _ = shutdown.cancelled() => {
+                receiver.close();
+                finish_executor_until_forced(&inner, &mut tasks, force).await;
+                return;
+            }
             command = receiver.recv() => {
                 let Some(key) = command else {
-                    tasks.abort_all();
-                    while tasks.join_next().await.is_some() {}
-                    inner.pending.lock().expect("cleanup state poisoned").clear();
-                    observe::set_cleanup_queue_depth(0);
-                    observe::set_cleanup_reclaiming(0);
+                    finish_executor_until_forced(&inner, &mut tasks, force).await;
                     return;
                 };
                 tasks.spawn(run_cleanup_task(Arc::clone(&inner), key));
@@ -183,6 +264,32 @@ async fn run_executor(inner: Arc<BlockCleanupInner>, mut receiver: mpsc::Receive
             }
         }
     }
+}
+
+/// Waits for active cleanup tasks while retaining a force-cancel path for the process deadline.
+async fn finish_executor_until_forced(inner: &BlockCleanupInner, tasks: &mut JoinSet<()>, force: CancellationToken) {
+    while !tasks.is_empty() {
+        tokio::select! {
+            biased;
+            _ = force.cancelled() => {
+                finish_executor(inner, tasks, true).await;
+                return;
+            }
+            _ = tasks.join_next() => {}
+        }
+    }
+    finish_executor(inner, tasks, false).await;
+}
+
+/// Reaps every cleanup task and clears queue metrics before the executor returns.
+async fn finish_executor(inner: &BlockCleanupInner, tasks: &mut JoinSet<()>, abort: bool) {
+    if abort {
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+    inner.pending.lock().expect("cleanup state poisoned").clear();
+    observe::set_cleanup_queue_depth(0);
+    observe::set_cleanup_reclaiming(0);
 }
 
 /// Reclaims one exact replica while its worker registration remains current.
@@ -344,6 +451,7 @@ fn validate_options(options: &BlockCleanupOptions) -> Result<(), WorkerError> {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Deref;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
@@ -673,18 +781,109 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn owned_runtime_cancels_retrying_cleanup_work() {
+        let run_id = WorkerRunId::new();
+        let registrations = registered(run_id);
+        let store = Arc::new(ControlledStore::new(ReclaimBehavior::Fail, Duration::ZERO, 101));
+        let core = Arc::new(WorkerCore::with_local_store(
+            1_024,
+            1_024,
+            Duration::from_secs(60),
+            store.clone(),
+        ));
+        let runtime = BlockCleanupRuntime::start(
+            core,
+            registrations,
+            BlockCleanupOptions {
+                max_pending: 2,
+                max_concurrent: 1,
+                retry_initial_backoff: Duration::from_secs(30),
+                retry_max_backoff: Duration::from_secs(30),
+            },
+        )
+        .unwrap();
+        runtime
+            .executor()
+            .enqueue(&registration(run_id), [command(test_block_id(1), 101)]);
+        wait_for(|| store.calls.load(Ordering::SeqCst) == 1).await;
+
+        let forced = tokio::time::timeout(Duration::from_secs(1), runtime.shutdown_until(Instant::now()))
+            .await
+            .expect("cleanup shutdown must cancel retry backoff")
+            .unwrap();
+        assert!(forced);
+    }
+
+    #[tokio::test]
+    async fn shutdown_deadline_forces_and_awaits_retrying_cleanup_work() {
+        let run_id = WorkerRunId::new();
+        let registrations = registered(run_id);
+        let store = Arc::new(ControlledStore::new(ReclaimBehavior::Fail, Duration::ZERO, 101));
+        let core = Arc::new(WorkerCore::with_local_store(
+            1_024,
+            1_024,
+            Duration::from_secs(60),
+            store.clone(),
+        ));
+        let runtime = BlockCleanupRuntime::start(
+            core,
+            registrations,
+            BlockCleanupOptions {
+                max_pending: 2,
+                max_concurrent: 1,
+                retry_initial_backoff: Duration::from_secs(30),
+                retry_max_backoff: Duration::from_secs(30),
+            },
+        )
+        .unwrap();
+        let executor = runtime.executor();
+        executor.enqueue(&registration(run_id), [command(test_block_id(1), 101)]);
+        wait_for(|| store.calls.load(Ordering::SeqCst) == 1).await;
+
+        let forced = runtime
+            .shutdown_until(Instant::now() + Duration::from_millis(20))
+            .await
+            .unwrap();
+
+        assert!(forced);
+        assert!(executor
+            .inner
+            .pending
+            .lock()
+            .expect("cleanup state poisoned")
+            .is_empty());
+    }
+
+    struct TestExecutor {
+        executor: BlockCleanupExecutor,
+        _runtime: BlockCleanupRuntime,
+    }
+
+    impl Deref for TestExecutor {
+        type Target = BlockCleanupExecutor;
+
+        fn deref(&self) -> &Self::Target {
+            &self.executor
+        }
+    }
+
     fn executor(
         store: Arc<ControlledStore>,
         registrations: Arc<RegistrationSet>,
         options: BlockCleanupOptions,
-    ) -> BlockCleanupExecutor {
+    ) -> TestExecutor {
         let core = Arc::new(WorkerCore::with_local_store(
             1_024,
             1_024,
             Duration::from_secs(60),
             store,
         ));
-        BlockCleanupExecutor::start(core, registrations, options).expect("start cleanup executor")
+        let runtime = BlockCleanupRuntime::start(core, registrations, options).expect("start cleanup executor");
+        TestExecutor {
+            executor: runtime.executor(),
+            _runtime: runtime,
+        }
     }
 
     fn registered(run_id: WorkerRunId) -> Arc<RegistrationSet> {

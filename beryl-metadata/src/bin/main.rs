@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use beryl_common::termination::TerminationSignal;
 use beryl_metadata::lifecycle::format_metadata_storage;
 use beryl_metadata::runtime::{init_observability, DynError, MetadataServer};
 use beryl_metadata::MetadataConfig;
@@ -12,10 +13,10 @@ use beryl_metadata::MetadataConfig;
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
     let command = MetadataCommand::parse(std::env::args().skip(1))?;
-    let config = command.load_config()?;
 
     match command.action {
         MetadataAction::Format => {
+            let config = command.load_config()?;
             let marker = format_metadata_storage(config.as_ref()).await?;
             tracing::info!(
                 cluster_id = %marker.cluster_id,
@@ -26,13 +27,46 @@ async fn main() -> Result<(), DynError> {
             Ok(())
         }
         MetadataAction::Start => {
-            let observability = init_observability(config.as_ref())?;
-            let server = MetadataServer::build(config).await?;
-            server.serve(observability).await
+            let mut termination = TerminationSignal::install()?.monitor();
+            let config = match command.load_config() {
+                Ok(config) => config,
+                Err(error) => {
+                    termination.shutdown().await?;
+                    return Err(error);
+                }
+            };
+            if termination.is_cancelled() {
+                let signal = termination.recv().await?;
+                tracing::info!(?signal, "Shutdown signal received during Metadata startup");
+                return Ok(());
+            }
+            let observability = match init_observability(config.as_ref()) {
+                Ok(observability) => observability,
+                Err(error) => {
+                    termination.shutdown().await?;
+                    return Err(error);
+                }
+            };
+            let server = match MetadataServer::build(config, termination.cancellation_token()).await {
+                Ok(Some(server)) => server,
+                Ok(None) => {
+                    let signal = termination.recv().await?;
+                    tracing::info!(?signal, "Shutdown signal received during Metadata startup");
+                    return Ok(());
+                }
+                Err(error) => {
+                    termination.shutdown().await?;
+                    return Err(error);
+                }
+            };
+            let result = server.serve(observability, &mut termination).await;
+            termination.shutdown().await?;
+            result
         }
     }
 }
 
+#[derive(Clone, Copy)]
 enum MetadataAction {
     Format,
     Start,

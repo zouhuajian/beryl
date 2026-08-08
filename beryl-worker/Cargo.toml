@@ -17,6 +17,7 @@ beryl-common = { path = "../beryl-common" }
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 
@@ -30,6 +31,7 @@ metrics = { workspace = true }
 
 # Utilities
 bytes = { workspace = true }
+parking_lot = { workspace = true }
 prost = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 serde = { workspace = true }
