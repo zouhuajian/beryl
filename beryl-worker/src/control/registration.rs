@@ -4,7 +4,7 @@
 //! Worker metadata registration state.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,7 @@ pub struct Registration {
 pub struct RegistrationSet {
     registrations: RwLock<HashMap<GroupName, RegistrationLease>>,
     next_registration_epoch: AtomicU64,
+    shutting_down: AtomicBool,
 }
 
 /// Registration identity, lifecycle epoch, and current heartbeat lease.
@@ -49,11 +50,15 @@ impl RegistrationSet {
     ///
     /// The epoch changes even when worker identity and run are unchanged.
     pub fn record_registered(&self, registration: Registration) {
+        let mut registrations = self.registrations.write().expect("registration state poisoned");
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
         let previous_epoch = self
             .next_registration_epoch
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |epoch| epoch.checked_add(1))
             .expect("worker registration epoch exhausted");
-        self.registrations.write().expect("registration state poisoned").insert(
+        registrations.insert(
             registration.group_name.clone(),
             RegistrationLease {
                 registration,
@@ -65,14 +70,27 @@ impl RegistrationSet {
     }
 
     pub fn record_heartbeat_success(&self, group_name: &GroupName, lease_duration: Duration) {
-        if let Some(entry) = self
-            .registrations
-            .write()
-            .expect("registration state poisoned")
-            .get_mut(group_name)
-        {
+        let mut registrations = self.registrations.write().expect("registration state poisoned");
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(entry) = registrations.get_mut(group_name) {
             entry.heartbeat_deadline = Some(Instant::now() + lease_duration);
         }
+    }
+
+    /// Permanently closes process readiness before Worker RPC drain begins.
+    ///
+    /// Registrations remain available to already accepted work, but their
+    /// heartbeat leases are removed and late control-plane responses cannot
+    /// make the process ready again.
+    pub fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        let mut registrations = self.registrations.write().expect("registration state poisoned");
+        for registration in registrations.values_mut() {
+            registration.heartbeat_deadline = None;
+        }
+        observe::set_worker_registered(false);
     }
 
     pub fn mark_not_ready(&self, group_name: &GroupName) {
@@ -106,6 +124,9 @@ impl RegistrationSet {
     ///
     /// An expired or absent heartbeat lease is not report-ready.
     pub(crate) fn ready_registration(&self, group_name: &GroupName) -> Option<(Registration, u64)> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return None;
+        }
         self.registrations
             .read()
             .expect("registration state poisoned")
@@ -123,6 +144,9 @@ impl RegistrationSet {
     }
 
     pub fn is_ready(&self, group_name: &GroupName) -> bool {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return false;
+        }
         self.registrations
             .read()
             .expect("registration state poisoned")
@@ -133,6 +157,9 @@ impl RegistrationSet {
     }
 
     pub fn is_any_ready(&self) -> bool {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return false;
+        }
         self.registrations
             .read()
             .expect("registration state poisoned")
@@ -180,6 +207,22 @@ mod tests {
         });
 
         assert_eq!(*recorder.values.lock().expect("gauge values poisoned"), vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn shutdown_readiness_is_sticky_against_late_control_responses() {
+        let group_name = test_group_name();
+        let state = RegistrationSet::new();
+        state.record_registered(test_registration(group_name.clone()));
+        state.record_heartbeat_success(&group_name, Duration::from_secs(30));
+        assert!(state.is_ready(&group_name));
+
+        state.begin_shutdown();
+        state.record_registered(test_registration(group_name.clone()));
+        state.record_heartbeat_success(&group_name, Duration::from_secs(30));
+
+        assert!(!state.is_ready(&group_name));
+        assert!(state.registration(&group_name).is_some());
     }
 
     fn test_group_name() -> GroupName {

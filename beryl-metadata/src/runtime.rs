@@ -11,16 +11,20 @@ use crate::service::{MetadataFileSystem, MetadataFileSystemDeps, MetadataFileSys
 use crate::state::RaftStateStore;
 use crate::worker::{MetadataWorkerServiceImpl, WorkerBackgroundHandle, WorkerManager};
 use crate::{observe, MetadataConfig, MountTable};
+use beryl_common::grpc_server::spawn_grpc_server;
 use beryl_common::observe::{init_observability as init_common_observability, ObservabilityGuard, ServiceInfo};
 use beryl_common::service_http::spawn_service_http;
+use beryl_common::termination::TerminationMonitor;
 use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProtoServer;
 use beryl_proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProtoServer;
 use beryl_types::GroupName;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::signal;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tonic::transport as tonic_net;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+use tonic::service::Routes;
 use tonic_health::pb::health_server::HealthServer;
 use tonic_health::server::{HealthReporter, HealthService};
 use tracing::info;
@@ -87,7 +91,7 @@ pub struct WorkerBackground {
 pub struct Maintenance {
     cleanup: Arc<BlockCleanupCoordinator>,
     _maintenance_service: Arc<MaintenanceService>,
-    _maintenance_handle: MaintenanceHandle,
+    maintenance_handle: MaintenanceHandle,
 }
 
 /// Readiness gate, watcher task, and health service state.
@@ -99,7 +103,9 @@ pub struct Readiness {
 /// Root readiness task handle and gate retained for request guards.
 pub struct ReadinessHandle {
     gate: Arc<RootReadinessGate>,
-    _watcher: JoinHandle<()>,
+    health_reporter: HealthReporter,
+    watcher: Option<JoinHandle<()>>,
+    fatal: Option<oneshot::Receiver<crate::MetadataError>>,
 }
 
 /// Services registered on the tonic server.
@@ -112,8 +118,69 @@ pub struct RpcServices {
 /// Long-lived handles retained by `serve()` for the server lifetime.
 pub struct RuntimeHandles {
     _worker_background: WorkerBackground,
-    _maintenance: Maintenance,
-    _readiness: ReadinessHandle,
+    maintenance: Maintenance,
+    readiness: ReadinessHandle,
+}
+
+impl ReadinessHandle {
+    /// Closes readiness and prevents the startup watcher from racing it open.
+    async fn begin_shutdown(&mut self) {
+        self.gate.begin_shutdown();
+        if let Some(watcher) = self.watcher.take() {
+            watcher.abort();
+            if let Err(error) = watcher.await {
+                if !error.is_cancelled() {
+                    tracing::warn!(%error, "Root readiness watcher terminated unexpectedly");
+                }
+            }
+        }
+        self.health_reporter
+            .set_not_serving::<FileSystemServiceProtoServer<MetadataFileSystemServiceImpl>>()
+            .await;
+    }
+
+    /// Transfers the single fail-fast readiness receiver to the server event loop.
+    fn take_fatal(&mut self) -> oneshot::Receiver<crate::MetadataError> {
+        self.fatal.take().expect("readiness failure receiver is owned")
+    }
+}
+
+impl Drop for ReadinessHandle {
+    fn drop(&mut self) {
+        self.gate.begin_shutdown();
+        if let Some(watcher) = self.watcher.take() {
+            watcher.abort();
+        }
+    }
+}
+
+impl Maintenance {
+    /// Cancels and awaits all Metadata maintenance loops without a deadline.
+    async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
+        self.maintenance_handle.shutdown().await
+    }
+
+    /// Drains Metadata maintenance loops until the shared process deadline.
+    async fn shutdown_until(self, deadline: Instant) -> Result<bool, tokio::task::JoinError> {
+        self.maintenance_handle.shutdown_until(deadline).await
+    }
+}
+
+impl RuntimeHandles {
+    /// Publishes not-ready state before any listener begins draining.
+    async fn begin_shutdown(&mut self) {
+        self.readiness.begin_shutdown().await;
+    }
+
+    /// Cancels and awaits Metadata-owned background loops.
+    async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
+        self.maintenance.shutdown().await
+    }
+
+    /// Drains Metadata-owned background loops until the shared process deadline.
+    async fn shutdown_until(self, deadline: Instant) -> Result<bool, tokio::task::JoinError> {
+        self.maintenance.shutdown_until(deadline).await
+    }
 }
 
 impl WorkerRuntime {
@@ -164,54 +231,183 @@ impl MetadataServer {
     ///
     /// Filesystem writes and cleanup observation share one session registry so
     /// the coordinator sees the same active-write authority as the RPC path.
-    pub async fn build(config: Arc<MetadataConfig>) -> Result<Self, DynError> {
-        crate::lifecycle::prepare_metadata_start(config.as_ref()).await?;
+    pub async fn build(
+        config: Arc<MetadataConfig>,
+        startup_shutdown: CancellationToken,
+    ) -> Result<Option<Self>, DynError> {
+        tokio::select! {
+            _ = startup_shutdown.cancelled() => return Ok(None),
+            result = crate::lifecycle::prepare_metadata_start(config.as_ref()) => result?,
+        }
+        if startup_shutdown.is_cancelled() {
+            return Ok(None);
+        }
         let authority = build_authority(config.as_ref()).await?;
-        let worker = build_worker_runtime(&authority, config.worker_liveness.heartbeat_timeout_ms)?;
-        let readiness = build_readiness(config.as_ref(), &authority).await;
+        if startup_shutdown.is_cancelled() {
+            authority.shutdown().await?;
+            return Ok(None);
+        }
+        let worker = match build_worker_runtime(&authority, config.worker_liveness.heartbeat_timeout_ms) {
+            Ok(worker) => worker,
+            Err(error) => {
+                authority.shutdown().await?;
+                return Err(error);
+            }
+        };
+        let mut readiness = build_readiness(config.as_ref(), &authority).await;
+        if startup_shutdown.is_cancelled() {
+            readiness.handle.begin_shutdown().await;
+            authority.shutdown().await?;
+            return Ok(None);
+        }
         let session_registry = Arc::new(crate::session_registry::SessionRegistry::default());
-        let filesystem = build_filesystem_service_with_sessions(
+        let filesystem = match build_filesystem_service_with_sessions(
             config.as_ref(),
             &authority,
             Arc::clone(&worker.manager),
             Arc::clone(&session_registry),
             &readiness,
         )
-        .await?;
+        .await
+        {
+            Ok(filesystem) => filesystem,
+            Err(error) => {
+                readiness.handle.begin_shutdown().await;
+                authority.shutdown().await?;
+                return Err(error);
+            }
+        };
         let maintenance = build_maintenance(config.as_ref(), &authority, &worker, &readiness, session_registry).await;
         let worker_service = worker.service(&authority, Arc::clone(&maintenance.cleanup));
         let worker_background = build_worker_background(&worker, &worker_service);
         let (services, handles) =
             compose_services(filesystem, worker_service, readiness, worker_background, maintenance);
 
-        Ok(Self {
+        let mut server = Self {
             config,
             authority,
             worker,
             services,
             handles,
-        })
+        };
+        if startup_shutdown.is_cancelled() {
+            server.handles.begin_shutdown().await;
+            server.handles.shutdown().await?;
+            server.authority.shutdown().await?;
+            return Ok(None);
+        }
+
+        Ok(Some(server))
     }
 
     /// Runs the registered RPC services while retaining runtime handles.
-    pub async fn serve(self, observability: Observability) -> Result<(), DynError> {
+    pub async fn serve(
+        self,
+        observability: Observability,
+        termination: &mut TerminationMonitor,
+    ) -> Result<(), DynError> {
         let Self {
             config,
             authority,
             worker,
             services,
-            handles,
+            mut handles,
         } = self;
-        let readiness_gate = Arc::clone(&handles._readiness.gate);
-        let http = spawn_service_http(
+        let readiness_gate = Arc::clone(&handles.readiness.gate);
+        let http = match spawn_service_http(
             config.http_addr(),
             observability.observability_guard.prometheus_handle(),
             Arc::new(move || readiness_gate.is_ready()),
-        )?;
-        let _keep_alive = (authority, worker, observability);
-        let result = serve(config.as_ref(), services, handles).await;
-        http.abort();
-        result
+        ) {
+            Ok(http) => http,
+            Err(error) => {
+                handles.begin_shutdown().await;
+                handles.shutdown().await?;
+                authority.shutdown().await?;
+                return Err(Box::new(error));
+            }
+        };
+        let routes = Routes::new(
+            FileSystemServiceProtoServer::new(services.filesystem).max_decoding_message_size(MAX_REQUEST_SIZE),
+        )
+        .add_service(MetadataWorkerServiceProtoServer::new(services.worker).max_decoding_message_size(MAX_REQUEST_SIZE))
+        .add_service(services.health);
+        let mut rpc = match spawn_grpc_server(config.rpc_addr(), routes, None) {
+            Ok(rpc) => rpc,
+            Err(error) => {
+                handles.begin_shutdown().await;
+                let deadline = Instant::now() + Duration::from_millis(config.shutdown_timeout_ms);
+                let (background_result, http_result) =
+                    tokio::join!(handles.shutdown_until(deadline), http.shutdown_until(deadline),);
+                let raft_result = authority.shutdown().await;
+                background_result.map_err(|error| Box::new(error) as DynError)?;
+                http_result.map_err(|error| Box::new(error) as DynError)?;
+                raft_result.map_err(|error| Box::new(error) as DynError)?;
+                return Err(Box::new(error));
+            }
+        };
+        info!(addr = %rpc.local_addr(), "Listening on (path/filesystem + worker services)");
+        let readiness_failure = handles.readiness.take_fatal();
+        let mut stop_error = None;
+        tokio::select! {
+            signal = termination.recv() => {
+                match signal {
+                    Ok(signal) => info!(?signal, "Shutdown signal received"),
+                    Err(error) => stop_error = Some(Box::new(error) as DynError),
+                }
+            }
+            result = rpc.wait() => {
+                stop_error = Some(match result {
+                    Ok(()) => "Metadata RPC server stopped unexpectedly".into(),
+                    Err(error) => Box::new(error) as DynError,
+                });
+            }
+            error = wait_for_readiness_failure(readiness_failure) => {
+                stop_error = Some(Box::new(error) as DynError);
+            }
+        }
+
+        handles.begin_shutdown().await;
+        let deadline = Instant::now() + Duration::from_millis(config.shutdown_timeout_ms);
+        let (rpc_result, background_result, http_result) = tokio::join!(
+            rpc.shutdown_until(deadline),
+            handles.shutdown_until(deadline),
+            http.shutdown_until(deadline),
+        );
+        let raft_result = authority.shutdown().await;
+        let _keep_alive = (worker, observability);
+
+        let rpc_forced = rpc_result.as_ref().copied().unwrap_or(false);
+        let background_forced = background_result.as_ref().copied().unwrap_or(false);
+        let http_forced = http_result.as_ref().copied().unwrap_or(false);
+        if rpc_forced || background_forced || http_forced {
+            tracing::warn!(
+                rpc_forced,
+                background_forced,
+                http_forced,
+                timeout_ms = config.shutdown_timeout_ms,
+                "Metadata forced remaining work after the graceful drain deadline"
+            );
+        }
+
+        rpc_result.map_err(|error| Box::new(error) as DynError)?;
+        background_result.map_err(|error| Box::new(error) as DynError)?;
+        http_result.map_err(|error| Box::new(error) as DynError)?;
+        raft_result.map_err(|error| Box::new(error) as DynError)?;
+        if let Some(error) = stop_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+/// Waits only for a configured fail-fast readiness error.
+///
+/// Normal watcher completion closes the channel and must not stop the server.
+async fn wait_for_readiness_failure(failure: oneshot::Receiver<crate::MetadataError>) -> crate::MetadataError {
+    match failure.await {
+        Ok(error) => error,
+        Err(_) => std::future::pending().await,
     }
 }
 
@@ -338,7 +534,7 @@ pub(crate) async fn build_maintenance(
     Maintenance {
         cleanup,
         _maintenance_service: maintenance_service,
-        _maintenance_handle: maintenance_handle,
+        maintenance_handle,
     }
 }
 
@@ -357,6 +553,8 @@ pub async fn build_readiness(config: &MetadataConfig, authority: &MetadataAuthor
         .set_not_serving::<FileSystemServiceProtoServer<MetadataFileSystemServiceImpl>>()
         .await;
     let health_service = HealthServer::new(HealthService::from_health_reporter(health_reporter.clone()));
+    let watcher_health_reporter = health_reporter.clone();
+    let (fatal_sender, fatal_receiver) = oneshot::channel();
 
     let readiness_config = config.startup.root_readiness.clone();
     let readiness_gate_clone = Arc::clone(&readiness_gate);
@@ -386,14 +584,14 @@ pub async fn build_readiness(config: &MetadataConfig, authority: &MetadataAuthor
         .await;
         match result {
             Ok(()) => {
-                health_reporter
+                watcher_health_reporter
                     .set_serving::<FileSystemServiceProtoServer<MetadataFileSystemServiceImpl>>()
                     .await;
             }
             Err(err) => {
                 tracing::error!(error = %err, "Root readiness watcher failed");
                 if fail_fast {
-                    std::process::exit(1);
+                    let _ = fatal_sender.send(err);
                 }
             }
         }
@@ -403,7 +601,9 @@ pub async fn build_readiness(config: &MetadataConfig, authority: &MetadataAuthor
         health_service,
         handle: ReadinessHandle {
             gate: readiness_gate,
-            _watcher: readiness_watcher,
+            health_reporter,
+            watcher: Some(readiness_watcher),
+            fatal: Some(fatal_receiver),
         },
     }
 }
@@ -490,61 +690,24 @@ pub fn compose_services(
         },
         RuntimeHandles {
             _worker_background: worker_background,
-            _maintenance: maintenance,
-            _readiness: readiness,
+            maintenance,
+            readiness,
         },
     )
-}
-
-/// Registers the filesystem, worker, and health services and holds runtime handles.
-pub async fn serve(config: &MetadataConfig, services: RpcServices, _handles: RuntimeHandles) -> Result<(), DynError> {
-    let addr = config.rpc_addr();
-    info!(addr = %addr, "Listening on (path/filesystem + worker services)");
-    tonic_net::Server::builder()
-        .add_service(FileSystemServiceProtoServer::new(services.filesystem).max_decoding_message_size(MAX_REQUEST_SIZE))
-        .add_service(MetadataWorkerServiceProtoServer::new(services.worker).max_decoding_message_size(MAX_REQUEST_SIZE))
-        .add_service(services.health)
-        .serve_with_shutdown(addr, shutdown_signal())
-        .await?;
-
-    Ok(())
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-
-    info!("Shutdown signal received");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{BlockCleanupConfig, MetadataAuthorityConfig, RaftConfig, StartupConfig, WorkerLivenessConfig};
+    use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
     use crate::raft::Command;
     use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction};
     use beryl_common::header::{RequestHeader, ResponseHeader};
     use beryl_proto::common::BlockIdProto;
     use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
     use beryl_proto::metadata::{CommitFileRequestProto, CommittedBlockProto, MsyncRequestProto, MsyncResponseProto};
-    use beryl_types::ids::WorkerId;
+    use beryl_types::ids::{MountId, WorkerId};
     use beryl_types::{ClientId, GroupName, GroupStateWatermark, RaftLogId, MAX_FILE_EXTENTS};
     use prost::Message;
     use std::time::Duration;
@@ -707,6 +870,7 @@ mod tests {
                 root_readiness: crate::readiness::RootReadinessConfig::default(),
             },
             write_lease_timeout_ms: 60_000,
+            shutdown_timeout_ms: 30_000,
             observability: test_observability_config(),
         }
     }
@@ -757,6 +921,49 @@ mod tests {
             .get_registration(&authority.group_name, worker_id)
             .is_none());
     }
+
+    #[tokio::test]
+    async fn fail_fast_readiness_returns_to_lifecycle_owner_before_raft_shutdown() {
+        let dir = TempDir::new().unwrap();
+        let authority = test_authority(&dir).await;
+        authority
+            .mount_table
+            .upsert(MountEntry {
+                mount_id: MountId::new(1),
+                mount_prefix: ROOT_MOUNT_PREFIX.to_string(),
+                mount_kind: MountKind::Internal,
+                ufs_uri: None,
+                data_io_policy: DataIoPolicy::Allow,
+                mount_epoch: 2,
+                namespace_owner_group_name: GroupName::parse("other").unwrap(),
+                root_inode_id: ROOT_INODE_ID,
+            })
+            .unwrap();
+        let mut config = test_config();
+        config.startup.root_readiness = crate::readiness::RootReadinessConfig {
+            initial_backoff_ms: 1,
+            max_backoff_ms: 1,
+            warn_after_ms: 1,
+            timeout_ms: 5,
+            fail_fast: true,
+        };
+        let mut readiness = build_readiness(&config, &authority).await;
+        let fatal = readiness.handle.take_fatal();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), fatal)
+            .await
+            .expect("readiness failure must be bounded")
+            .expect("lifecycle owner must receive readiness failure");
+
+        assert!(
+            error.to_string().contains("root mount owner group mismatch"),
+            "unexpected readiness error: {error}"
+        );
+        readiness.handle.begin_shutdown().await;
+        assert!(!readiness.handle.gate.is_ready());
+        authority.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn msync_success_on_leader_returns_authoritative_watermark() {
         let dir = TempDir::new().unwrap();

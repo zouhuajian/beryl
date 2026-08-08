@@ -16,7 +16,7 @@ mod registration;
 mod storage;
 
 pub use block_report::{BlockReportError, BlockReportOptions, BlockReportRound, MetadataBlockReportLoop};
-pub use cleanup::{BlockCleanupCommand, BlockCleanupExecutor, BlockCleanupOptions};
+pub use cleanup::{BlockCleanupCommand, BlockCleanupExecutor, BlockCleanupOptions, BlockCleanupRuntime};
 pub use heartbeat::{HeartbeatError, HeartbeatRound, HeartbeatSnapshot, MetadataHeartbeatLoop};
 pub use registrar::{MetadataRegistrar, RegistrationDescriptor, RegistrationError};
 pub use registration::{Registration, RegistrationSet};

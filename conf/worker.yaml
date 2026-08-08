@@ -50,6 +50,9 @@ beryl.worker.storage.dirs:
 beryl.worker.storage.reserved-space: 1GiB
 beryl.worker.storage.check-interval: 30s
 
+# -------------------- Shutdown --------------------
+beryl.worker.shutdown.timeout: 30s
+
 # -------------------- Logging --------------------
 beryl.logging.format: compact
 beryl.logging.output: stderr

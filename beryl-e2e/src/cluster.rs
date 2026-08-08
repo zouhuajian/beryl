@@ -24,7 +24,7 @@ use beryl_worker::config::{
     WorkerStoreConfig,
 };
 use beryl_worker::control::{
-    prepare_worker_start, BlockCleanupExecutor, BlockCleanupOptions, MetadataBlockReportLoop, MetadataHeartbeatLoop,
+    prepare_worker_start, BlockCleanupOptions, BlockCleanupRuntime, MetadataBlockReportLoop, MetadataHeartbeatLoop,
     MetadataRegistrar,
 };
 use beryl_worker::net::config::WorkerNetConfig;
@@ -40,6 +40,7 @@ use crate::TestResult;
 
 const GROUP_NAME: &str = "root";
 const CLUSTER_ID: &str = "local-beryl-e2e";
+const TEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct TestCluster {
     _temp_state: TempState,
@@ -57,8 +58,10 @@ pub struct TestCluster {
     background_block_report: Option<tokio::task::JoinHandle<()>>,
     heartbeat: MetadataHeartbeatLoop,
     block_store: Arc<StoreDirs>,
+    worker_cleanup: Option<BlockCleanupRuntime>,
     metadata_server: MetadataServiceInstance,
     metadata_process: Option<MetadataProcessInstance>,
+    metadata_process_http_addr: Option<SocketAddr>,
     worker_server: WorkerServiceInstance,
     additional_workers: Vec<StartedWorkerService>,
 }
@@ -147,8 +150,10 @@ impl TestCluster {
             background_block_report: None,
             heartbeat: worker.heartbeat,
             block_store: worker.block_store,
+            worker_cleanup: worker.cleanup,
             metadata_server,
             metadata_process: None,
+            metadata_process_http_addr: None,
             worker_server: worker.worker_server,
             additional_workers: Vec::new(),
         };
@@ -198,6 +203,11 @@ impl TestCluster {
 
     pub fn metadata_endpoint(&self) -> String {
         format!("http://{}", self.metadata_addr)
+    }
+
+    /// Returns the HTTP endpoint owned by the current external Metadata process.
+    pub fn metadata_process_http_addr(&self) -> Option<SocketAddr> {
+        self.metadata_process_http_addr
     }
 
     pub fn ready_block_count(&self) -> TestResult<usize> {
@@ -291,7 +301,13 @@ impl TestCluster {
 
     pub async fn restart_worker_until_heartbeat(&mut self) -> TestResult<()> {
         self.stop_background_block_reports().await;
+        self.registration_state.begin_shutdown();
         self.worker_server.shutdown().await?;
+        if let Some(cleanup) = self.worker_cleanup.take() {
+            cleanup
+                .shutdown_until(tokio::time::Instant::now() + TEST_SHUTDOWN_TIMEOUT)
+                .await?;
+        }
         let listener = TcpListener::bind(self.worker_addr).await?;
         let worker = start_worker_instance(&self.worker_config, listener)?;
         let worker_id = worker.worker_id;
@@ -302,6 +318,7 @@ impl TestCluster {
         self.block_report = worker.block_report;
         self.heartbeat = worker.heartbeat;
         self.block_store = worker.block_store;
+        self.worker_cleanup = worker.cleanup;
         self.worker_server = worker.worker_server;
 
         self.registrar.register_once().await?;
@@ -363,12 +380,34 @@ impl TestCluster {
         result
     }
 
+    /// Gracefully restarts the full Metadata process on the same durable state.
+    #[cfg(unix)]
+    pub async fn restart_metadata_process_after_signal(
+        &mut self,
+        executable: &std::path::Path,
+        signal: i32,
+    ) -> TestResult<()> {
+        let restart_background = self.background_block_report.is_some();
+        self.stop_background_block_reports().await;
+        let process = self
+            .metadata_process
+            .take()
+            .ok_or("metadata child process is not running")?;
+        process.signal_and_wait(signal).await?;
+        let result = self.start_metadata_child(executable).await;
+        if restart_background && result.is_ok() {
+            self.start_background_block_reports();
+        }
+        result
+    }
+
     async fn start_metadata_child(&mut self, executable: &std::path::Path) -> TestResult<()> {
         let metrics_port = PortReservation::reserve_localhost().await?;
         let http_addr = metrics_port.addr();
         let config_path = self.write_metadata_process_config(http_addr)?;
         drop(metrics_port);
         self.metadata_process = Some(MetadataProcessInstance::start(executable, &config_path)?);
+        self.metadata_process_http_addr = Some(http_addr);
         if let Err(error) = readiness::wait_for_metadata_filesystem(&self.client).await {
             if let Some(mut process) = self.metadata_process.take() {
                 process.abort();
@@ -551,9 +590,21 @@ impl TestCluster {
     pub async fn shutdown(&mut self) -> TestResult<()> {
         self.stop_background_block_reports().await;
         for worker in &mut self.additional_workers {
+            worker.registration_state.begin_shutdown();
             worker.worker_server.shutdown().await?;
+            if let Some(cleanup) = worker.cleanup.take() {
+                cleanup
+                    .shutdown_until(tokio::time::Instant::now() + TEST_SHUTDOWN_TIMEOUT)
+                    .await?;
+            }
         }
+        self.registration_state.begin_shutdown();
         self.worker_server.shutdown().await?;
+        if let Some(cleanup) = self.worker_cleanup.take() {
+            cleanup
+                .shutdown_until(tokio::time::Instant::now() + TEST_SHUTDOWN_TIMEOUT)
+                .await?;
+        }
         if let Some(process) = self.metadata_process.take() {
             process.kill().await?;
         } else {
@@ -606,6 +657,7 @@ beryl.metadata.block.cleanup.retry.initial-backoff: {cleanup_retry_initial_backo
 beryl.metadata.block.cleanup.retry.max-backoff: {cleanup_retry_max_backoff_ms}ms
 beryl.metadata.startup.timeout: 10s
 beryl.metadata.startup.warn-after: 1s
+beryl.metadata.shutdown.timeout: 200ms
 beryl.logging.format: "compact"
 beryl.logging.output: "stderr"
 beryl.logging.level: "warn,openraft=warn"
@@ -708,7 +760,8 @@ async fn start_metadata_instance(
     .await
     .map_err(|err| io::Error::other(err.to_string()))?;
     let worker_control = authority.worker_service(Arc::clone(&worker_manager));
-    let metadata_server = MetadataServiceInstance::start(listener, filesystem, worker_control, authority);
+    let metadata_server =
+        MetadataServiceInstance::start(listener, filesystem, worker_control, readiness_state, authority);
     Ok((metadata_server, worker_manager))
 }
 
@@ -719,6 +772,7 @@ struct StartedWorkerService {
     block_report: Arc<MetadataBlockReportLoop>,
     heartbeat: MetadataHeartbeatLoop,
     block_store: Arc<StoreDirs>,
+    cleanup: Option<BlockCleanupRuntime>,
     worker_server: WorkerServiceInstance,
 }
 
@@ -746,7 +800,7 @@ fn start_worker_instance(
         Duration::from_millis(worker_config.stream_idle_timeout_ms),
         Arc::clone(&block_store) as Arc<dyn beryl_worker::store::block::LocalBlockStore + Send + Sync>,
     ));
-    let cleanup = BlockCleanupExecutor::start(
+    let cleanup = BlockCleanupRuntime::start(
         Arc::clone(&worker_core),
         Arc::clone(&registration_state),
         BlockCleanupOptions::default(),
@@ -755,7 +809,7 @@ fn start_worker_instance(
         worker_config.metadata.clone(),
         descriptor.clone(),
         Arc::clone(&registration_state),
-        cleanup,
+        cleanup.executor(),
     )?;
     let block_report = Arc::new(MetadataBlockReportLoop::new(
         worker_config.metadata.clone(),
@@ -772,6 +826,7 @@ fn start_worker_instance(
         block_report,
         heartbeat,
         block_store,
+        cleanup: Some(cleanup),
         worker_server,
     })
 }
@@ -804,6 +859,7 @@ fn metadata_config(
             },
         },
         write_lease_timeout_ms: 60_000,
+        shutdown_timeout_ms: 30_000,
         observability: observability_config()?,
     })
 }
@@ -854,6 +910,7 @@ fn worker_config(
         block_report_interval_ms: 1_000,
         block_report_batch_size: 1_000,
         block_cleanup: WorkerBlockCleanupConfig::default(),
+        shutdown_timeout_ms: 30_000,
         observability: observability_config()?,
     };
     config.validate()?;

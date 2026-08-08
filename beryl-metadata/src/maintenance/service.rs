@@ -10,10 +10,13 @@ use crate::worker::WorkerManager;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 /// Maintenance background task handles.
 pub struct MaintenanceHandle {
+    shutdown: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -21,6 +24,69 @@ impl MaintenanceHandle {
     /// Returns the number of background maintenance loops owned by this handle.
     pub fn task_count(&self) -> usize {
         self.tasks.len()
+    }
+
+    /// Cancels and awaits every maintenance loop owned by Metadata.
+    pub async fn shutdown(mut self) -> Result<(), tokio::task::JoinError> {
+        self.shutdown.cancel();
+        let mut first_error = None;
+        for task in self.tasks.drain(..) {
+            if let Err(error) = task.await {
+                first_error.get_or_insert(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Drains maintenance loops until `deadline`, then aborts and awaits them.
+    ///
+    /// Returns `true` when forced cancellation was required. A task panic is
+    /// still reported after every remaining task has been reclaimed.
+    pub async fn shutdown_until(mut self, deadline: Instant) -> Result<bool, tokio::task::JoinError> {
+        self.shutdown.cancel();
+        let mut forced = false;
+        let mut first_error = None;
+        for mut task in self.tasks.drain(..) {
+            if forced {
+                task.abort();
+            } else {
+                match tokio::time::timeout_at(deadline, &mut task).await {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(error)) => {
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
+                    Err(_) => {
+                        forced = true;
+                        task.abort();
+                    }
+                }
+            }
+
+            match task.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(forced),
+        }
+    }
+}
+
+impl Drop for MaintenanceHandle {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
     }
 }
 
@@ -57,17 +123,23 @@ impl MaintenanceService {
     /// Starts detached namespace cleanup and the worker convergence loops.
     pub(crate) fn start(&self) -> MaintenanceHandle {
         let mut tasks = Vec::with_capacity(3);
+        let shutdown = CancellationToken::new();
 
         let detached_root_reclaimer = Arc::clone(&self.detached_root_reclaimer);
-        tasks.push(tokio::spawn(detached_root_reclaimer.run()));
+        tasks.push(tokio::spawn(detached_root_reclaimer.run(shutdown.child_token())));
 
         if self.cleanup.enabled() {
             let cleanup = Arc::clone(&self.cleanup);
             let scan_interval = cleanup.scan_interval();
+            let task_shutdown = shutdown.child_token();
             tasks.push(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(scan_interval);
                 loop {
-                    interval.tick().await;
+                    tokio::select! {
+                        biased;
+                        _ = task_shutdown.cancelled() => return,
+                        _ = interval.tick() => {}
+                    }
                     if let Err(error) = cleanup.scan_once().await {
                         error!(task = "block_cleanup", %error, "Block cleanup scan failed");
                     }
@@ -80,10 +152,15 @@ impl MaintenanceService {
             worker_manager: Arc::clone(&self.worker_manager),
         }));
         let scan_interval = self.lost_worker_cleanup_interval;
+        let task_shutdown = shutdown.child_token();
         tasks.push(tokio::spawn(async move {
             let mut interval = tokio::time::interval(scan_interval);
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    biased;
+                    _ = task_shutdown.cancelled() => return,
+                    _ = interval.tick() => {}
+                }
                 if let Err(error) = lost_worker.run_once().await {
                     error!(task = "lost_worker_cleanup", %error, "Lost-worker cleanup task failed");
                 }
@@ -91,6 +168,6 @@ impl MaintenanceService {
         }));
 
         info!(task_count = tasks.len(), "Maintenance service started");
-        MaintenanceHandle { tasks }
+        MaintenanceHandle { shutdown, tasks }
     }
 }

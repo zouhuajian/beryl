@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{path::Path, process::Stdio};
 
-use beryl_metadata::runtime::MetadataAuthority;
+use beryl_metadata::runtime::{MetadataAuthority, Readiness};
 use beryl_metadata::service::MetadataFileSystemServiceImpl;
 use beryl_metadata::worker::MetadataWorkerServiceImpl;
 use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProtoServer;
@@ -24,10 +24,15 @@ use tonic::transport::Server;
 
 use crate::TestResult;
 
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Process stop budget used by lifecycle acceptance tests.
+///
+/// This intentionally exceeds the configured 200 ms RPC/background drain so
+/// Metadata still has time to explicitly close and await its Raft authority.
+const PROCESS_STOP_BUDGET: Duration = Duration::from_secs(5);
 
 pub struct MetadataServiceInstance {
     handle: ServerHandle,
+    readiness: Option<Readiness>,
     authority: Option<MetadataAuthority>,
 }
 
@@ -36,6 +41,7 @@ impl MetadataServiceInstance {
         listener: TcpListener,
         filesystem: MetadataFileSystemServiceImpl,
         worker: MetadataWorkerServiceImpl,
+        readiness: Readiness,
         authority: MetadataAuthority,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -51,11 +57,13 @@ impl MetadataServiceInstance {
         });
         Self {
             handle: ServerHandle::new(shutdown_tx, task),
+            readiness: Some(readiness),
             authority: Some(authority),
         }
     }
 
     pub async fn shutdown(&mut self) -> TestResult<()> {
+        drop(self.readiness.take());
         self.handle.shutdown().await?;
         if let Some(authority) = self.authority.take() {
             authority.shutdown().await?;
@@ -65,6 +73,7 @@ impl MetadataServiceInstance {
 
     pub fn abort(&mut self) {
         self.handle.abort();
+        self.readiness.take();
         self.authority.take();
     }
 }
@@ -92,6 +101,28 @@ impl MetadataProcessInstance {
         let status = self.child.wait().await?;
         if status.success() {
             return Err("metadata process exited successfully instead of being killed".into());
+        }
+        Ok(())
+    }
+
+    /// Delivers one Unix termination signal and requires a bounded clean exit.
+    #[cfg(unix)]
+    pub async fn signal_and_wait(mut self, signal: i32) -> TestResult<()> {
+        let pid = self.child.id().ok_or("metadata process has no operating-system pid")?;
+        let result = unsafe { libc::kill(pid as i32, signal) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let status = match timeout(PROCESS_STOP_BUDGET, self.child.wait()).await {
+            Ok(status) => status?,
+            Err(_) => {
+                let _ = self.child.start_kill();
+                let _ = self.child.wait().await;
+                return Err("metadata process graceful shutdown timed out".into());
+            }
+        };
+        if !status.success() {
+            return Err(format!("metadata process exited unsuccessfully after signal: {status}").into());
         }
         Ok(())
     }
@@ -149,7 +180,7 @@ impl ServerHandle {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        match timeout(SHUTDOWN_TIMEOUT, &mut self.task).await {
+        match timeout(PROCESS_STOP_BUDGET, &mut self.task).await {
             Ok(result) => result?,
             Err(_) => {
                 self.task.abort();

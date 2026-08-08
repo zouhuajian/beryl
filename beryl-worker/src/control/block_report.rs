@@ -20,6 +20,7 @@ use beryl_proto::metadata::{
 use beryl_types::{BlockId, GroupName};
 use thiserror::Error;
 use tokio::time;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Endpoint;
 use tonic::Code;
 use tracing::{debug, warn};
@@ -187,7 +188,12 @@ impl MetadataBlockReportLoop {
     }
 
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move { self.run().await })
+        self.spawn_until_shutdown(CancellationToken::new())
+    }
+
+    /// Starts block reporting under the process shutdown token.
+    pub fn spawn_until_shutdown(self, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move { self.run(shutdown).await })
     }
 
     /// Returns whether the current live registration has an accepted
@@ -642,29 +648,38 @@ impl MetadataBlockReportLoop {
     ///
     /// Every wake-up re-evaluates baseline validity; an invalid or missing
     /// baseline always selects a full report instead of silently skipping work.
-    async fn run(self) {
+    async fn run(self, shutdown: CancellationToken) {
         let mut interval = time::interval(self.interval);
         loop {
             tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
                 _ = interval.tick() => {}
                 _ = self.store.wait_for_block_report_change() => {}
                 _ = self.core.wait_for_block_report_change() => {}
             }
-            if self.has_delta_baseline(&self.config.group_name) {
-                match self.send_delta_once().await {
-                    Ok(round) if round.full_report_required => {
-                        if let Err(error) = self.send_full_once().await {
-                            warn!(%error, "Worker full block report recovery failed");
+            let report = async {
+                if self.has_delta_baseline(&self.config.group_name) {
+                    match self.send_delta_once().await {
+                        Ok(round) if round.full_report_required => {
+                            if let Err(error) = self.send_full_once().await {
+                                warn!(%error, "Worker full block report recovery failed");
+                            }
                         }
+                        Ok(_) => {}
+                        Err(error) => warn!(%error, "Worker delta block report round failed"),
                     }
-                    Ok(_) => {}
-                    Err(error) => warn!(%error, "Worker delta block report round failed"),
+                } else {
+                    match self.send_full_once().await {
+                        Ok(_) => {}
+                        Err(error) => warn!(%error, "Worker full block report round failed"),
+                    }
                 }
-            } else {
-                match self.send_full_once().await {
-                    Ok(_) => {}
-                    Err(error) => warn!(%error, "Worker full block report round failed"),
-                }
+            };
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                _ = report => {}
             }
         }
     }

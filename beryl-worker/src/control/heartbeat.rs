@@ -4,7 +4,6 @@
 //! Worker-to-metadata heartbeat fanout.
 
 use std::collections::HashMap;
-use std::future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,6 +18,7 @@ use beryl_proto::metadata::{
 use beryl_types::{GroupName, TierFree, WorkerRunId};
 use thiserror::Error;
 use tokio::time;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Endpoint;
 use tonic::Code;
 use tracing::{debug, info, warn};
@@ -121,7 +121,16 @@ impl MetadataHeartbeatLoop {
     }
 
     pub fn spawn_with_registrar(self, registrar: Arc<MetadataRegistrar>) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move { self.run(registrar, None).await })
+        self.spawn_with_registrar_until_shutdown(registrar, CancellationToken::new())
+    }
+
+    /// Starts the heartbeat loop under the process shutdown token.
+    pub fn spawn_with_registrar_until_shutdown(
+        self,
+        registrar: Arc<MetadataRegistrar>,
+        shutdown: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move { self.run(registrar, None, shutdown).await })
     }
 
     pub fn spawn_with_registrar_and_store(
@@ -129,7 +138,17 @@ impl MetadataHeartbeatLoop {
         registrar: Arc<MetadataRegistrar>,
         store: Arc<StoreDirs>,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move { self.run(registrar, Some(store)).await })
+        self.spawn_with_registrar_and_store_until_shutdown(registrar, store, CancellationToken::new())
+    }
+
+    /// Starts store-backed heartbeat reporting under the process shutdown token.
+    pub fn spawn_with_registrar_and_store_until_shutdown(
+        self,
+        registrar: Arc<MetadataRegistrar>,
+        store: Arc<StoreDirs>,
+        shutdown: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move { self.run(registrar, Some(store), shutdown).await })
     }
 
     /// Sends one heartbeat round and enqueues commands from accepted responses.
@@ -272,12 +291,16 @@ impl MetadataHeartbeatLoop {
         classify_heartbeat_response(&request, response)
     }
 
-    async fn run(self, registrar: Arc<MetadataRegistrar>, store: Option<Arc<StoreDirs>>) {
+    async fn run(self, registrar: Arc<MetadataRegistrar>, store: Option<Arc<StoreDirs>>, shutdown: CancellationToken) {
         let mut interval = time::interval(self.interval);
         loop {
-            interval.tick().await;
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                _ = interval.tick() => {}
+            }
             if self.state.registration(&self.config.group_name).is_none() {
-                match registrar.register_with_retry(future::pending::<()>()).await {
+                match registrar.register_with_retry(shutdown.clone().cancelled_owned()).await {
                     Ok(registration) => {
                         info!(
                             group_name = %registration.group_name,
@@ -287,6 +310,9 @@ impl MetadataHeartbeatLoop {
                         );
                     }
                     Err(error) => {
+                        if shutdown.is_cancelled() {
+                            return;
+                        }
                         warn!(%error, "Worker metadata re-registration failed in heartbeat loop");
                         continue;
                     }
@@ -307,7 +333,12 @@ impl MetadataHeartbeatLoop {
                 None => HeartbeatSnapshot::default(),
             };
 
-            match self.send_once(snapshot).await {
+            let heartbeat = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                result = self.send_once(snapshot) => result,
+            };
+            match heartbeat {
                 Ok(round) if round.needs_register => {
                     warn!("Metadata heartbeat requested worker registration");
                 }

@@ -3,13 +3,11 @@
 
 //! gRPC WorkerDataService adapter and server entry point.
 
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Context;
 use beryl_proto::common::{ClientInfoProto, ErrorDetailProto};
 use beryl_proto::convert::require_worker_run_id;
 use beryl_proto::worker::worker_data_service_server::{WorkerDataService, WorkerDataServiceServer};
@@ -20,7 +18,7 @@ use beryl_proto::worker::{
     SyncCommittedBlockRequestProto, SyncCommittedBlockResponseProto, WriteStreamRequestProto, WriteStreamResponseProto,
 };
 use futures::{stream, Stream, StreamExt};
-use tonic::transport as tonic_net;
+use tonic::service::Routes;
 use tonic::{Request, Response, Status};
 
 use crate::control::RegistrationSet;
@@ -223,6 +221,10 @@ impl ReadStreamState {
     }
 }
 
+/// Releases a read stream synchronously when its response future is cancelled.
+///
+/// Synchronous removal prevents a detached cleanup task from outliving the
+/// process-owned gRPC request tracker during forced shutdown.
 struct ReadStreamCleanup {
     core: Arc<WorkerCore>,
     stream_id: beryl_types::StreamId,
@@ -234,12 +236,8 @@ impl Drop for ReadStreamCleanup {
         if self.done.load(Ordering::Acquire) {
             return;
         }
-        let core = Arc::clone(&self.core);
-        let stream_id = self.stream_id;
         self.done.store(true, Ordering::Release);
-        tokio::spawn(async move {
-            core.stream_manager().remove(stream_id).await;
-        });
+        self.core.stream_manager().remove_now(self.stream_id);
     }
 }
 
@@ -677,27 +675,10 @@ fn parse_group_name(value: &str) -> Result<GroupName, WorkerError> {
     GroupName::parse(value).map_err(|err| WorkerError::InvalidArgument(format!("group_name invalid: {err}")))
 }
 
-pub async fn serve_grpc_worker_data_with_registration(
-    bind: SocketAddr,
-    max_inflight: usize,
-    core: Arc<WorkerCore>,
-    registration_state: Arc<RegistrationSet>,
-) -> anyhow::Result<()> {
+/// Builds the Worker data-plane routes retained by the process-owned listener.
+pub fn worker_data_routes(core: Arc<WorkerCore>, registration_state: Arc<RegistrationSet>) -> Routes {
     let service = WorkerDataServiceImpl::new(core, registration_state);
-    serve_grpc_worker_data_with_service(bind, max_inflight, service).await
-}
-
-async fn serve_grpc_worker_data_with_service(
-    bind: SocketAddr,
-    max_inflight: usize,
-    service: WorkerDataServiceImpl,
-) -> anyhow::Result<()> {
-    tonic_net::Server::builder()
-        .concurrency_limit_per_connection(max_inflight)
-        .add_service(WorkerDataServiceServer::new(service))
-        .serve(bind)
-        .await
-        .context("worker gRPC data server failed")
+    Routes::new(WorkerDataServiceServer::new(service))
 }
 
 #[cfg(test)]
