@@ -126,6 +126,10 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
 
 Beryl requires local metadata and worker configuration. The repository provides one local-ready default profile.
 
+For an extracted Linux release package, follow [OPERATIONS.md](OPERATIONS.md).
+The packaged `install.sh` performs a validated clean installation but does not
+format persistent storage or start services.
+
 Development checks:
 
 ```bash

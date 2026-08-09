@@ -197,7 +197,10 @@ for package_input in \
     "${repo_root}/release/systemd/beryl-metadata.service" \
     "${repo_root}/release/systemd/beryl-worker.service" \
     "${repo_root}/release/logrotate/beryl" \
+    "${repo_root}/release/tmpfiles/beryl.conf" \
+    "${repo_root}/release/install.sh" \
     "${repo_root}/LICENSE" \
+    "${repo_root}/OPERATIONS.md" \
     "${repo_root}/README.md"; do
     [[ -f ${package_input} && ! -L ${package_input} ]] \
         || die "package input is not a regular file: ${package_input}"
@@ -260,7 +263,8 @@ install -d -m 0755 \
     "${stage_root}/libexec" \
     "${stage_root}/conf" \
     "${stage_root}/systemd" \
-    "${stage_root}/logrotate"
+    "${stage_root}/logrotate" \
+    "${stage_root}/tmpfiles"
 install -m 0755 "${artifacts_dir}/beryl" "${stage_root}/bin/beryl"
 install -m 0755 "${artifacts_dir}/beryl-metadata" "${stage_root}/libexec/beryl-metadata"
 install -m 0755 "${artifacts_dir}/beryl-worker" "${stage_root}/libexec/beryl-worker"
@@ -274,7 +278,10 @@ install -m 0644 \
     "${repo_root}/release/systemd/beryl-worker.service" \
     "${stage_root}/systemd/beryl-worker.service"
 install -m 0644 "${repo_root}/release/logrotate/beryl" "${stage_root}/logrotate/beryl"
+install -m 0644 "${repo_root}/release/tmpfiles/beryl.conf" "${stage_root}/tmpfiles/beryl.conf"
+install -m 0755 "${repo_root}/release/install.sh" "${stage_root}/install.sh"
 install -m 0644 "${repo_root}/LICENSE" "${stage_root}/LICENSE"
+install -m 0644 "${repo_root}/OPERATIONS.md" "${stage_root}/OPERATIONS.md"
 install -m 0644 "${repo_root}/README.md" "${stage_root}/README.md"
 
 cat >"${stage_root}/VERSION" <<EOF
@@ -329,6 +336,7 @@ podman run --rm \
 expected_archive_list=$(cat <<EOF
 ${archive_root}/
 ${archive_root}/LICENSE
+${archive_root}/OPERATIONS.md
 ${archive_root}/README.md
 ${archive_root}/VERSION
 ${archive_root}/bin/
@@ -337,6 +345,7 @@ ${archive_root}/conf/
 ${archive_root}/conf/client.yaml
 ${archive_root}/conf/metadata.yaml
 ${archive_root}/conf/worker.yaml
+${archive_root}/install.sh
 ${archive_root}/libexec/
 ${archive_root}/libexec/beryl-metadata
 ${archive_root}/libexec/beryl-worker
@@ -345,6 +354,8 @@ ${archive_root}/logrotate/beryl
 ${archive_root}/systemd/
 ${archive_root}/systemd/beryl-metadata.service
 ${archive_root}/systemd/beryl-worker.service
+${archive_root}/tmpfiles/
+${archive_root}/tmpfiles/beryl.conf
 EOF
 )
 actual_archive_list=$(
