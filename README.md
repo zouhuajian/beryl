@@ -160,6 +160,17 @@ the package-internal role binaries with explicit `start`/`format` and
 
 The client reads `conf/client.yaml`.
 
+Run the Rust Client CRUD example from the same checkout or release tag as the
+running Metadata and Worker:
+
+```bash
+cargo run --locked -p beryl-client --example crud -- conf/client.yaml
+```
+
+The example creates, writes, stats, reads, verifies, and deletes one multi-block
+file through the public Rust Client API. See
+[beryl-client/README.md](beryl-client/README.md#runnable-crud-example).
+
 ## Non-goals for Current Scope
 
 - Alluxio full feature parity.
