@@ -98,18 +98,21 @@ manifest_value() {
 manifest_version=$(manifest_value manifest_version) || die "VERSION has no unique manifest_version"
 product=$(manifest_value product) || die "VERSION has no unique product"
 version=$(manifest_value version) || die "VERSION has no unique version"
+release_tag=$(manifest_value release_tag) || die "VERSION has no unique release_tag"
 target=$(manifest_value target) || die "VERSION has no unique target"
 source_revision=$(manifest_value source_revision) || die "VERSION has no unique source_revision"
 beryl_sha=$(manifest_value beryl_sha256) || die "VERSION has no unique beryl_sha256"
 metadata_sha=$(manifest_value beryl_metadata_sha256) || die "VERSION has no unique beryl_metadata_sha256"
 worker_sha=$(manifest_value beryl_worker_sha256) || die "VERSION has no unique beryl_worker_sha256"
-readonly manifest_version product version target source_revision
+readonly manifest_version product version release_tag target source_revision
 readonly beryl_sha metadata_sha worker_sha
 
 [[ ${manifest_version} == "1" ]] || die "unsupported manifest version: ${manifest_version}"
 [[ ${product} == "beryl" ]] || die "package product is not beryl: ${product}"
 [[ ${target} == "x86_64-unknown-linux-gnu" ]] || die "unsupported package target: ${target}"
 [[ ${version} =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]] || die "invalid package version: ${version}"
+[[ ${release_tag} == "unreleased" || ${release_tag} == "v${version}" ]] \
+    || die "release tag does not match package version: ${release_tag}"
 [[ ${source_revision} =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]] || die "invalid source revision"
 for digest in "${beryl_sha}" "${metadata_sha}" "${worker_sha}"; do
     [[ ${digest} =~ ^[0-9a-f]{64}$ ]] || die "VERSION contains an invalid binary SHA-256"

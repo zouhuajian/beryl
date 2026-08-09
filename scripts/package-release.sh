@@ -99,6 +99,8 @@ source_date_epoch=$(metadata_value source_date_epoch) \
     || die "build environment has no unique source_date_epoch"
 version=$(metadata_value version) \
     || die "build environment has no unique version"
+release_tag=$(metadata_value release_tag) \
+    || die "build environment has no unique release_tag"
 target=$(metadata_value target) \
     || die "build environment has no unique target"
 builder_os=$(metadata_value builder_os) \
@@ -127,7 +129,7 @@ beryl_worker_sha=$(metadata_value beryl_worker_sha256) \
     || die "build environment has no unique beryl_worker_sha256"
 builder_rpms_sha=$(metadata_value builder_rpms_sha256) \
     || die "build environment has no unique builder_rpms_sha256"
-readonly source_revision source_date_epoch version target builder_os
+readonly source_revision source_date_epoch version release_tag target builder_os
 readonly builder_image_id base_image rust_release rustup_release protoc_release
 readonly containerfile_sha repository_definition_sha cargo_lock_sha builder_rpms_sha
 readonly beryl_sha beryl_metadata_sha beryl_worker_sha
@@ -138,6 +140,14 @@ readonly beryl_sha beryl_metadata_sha beryl_worker_sha
     || die "source_date_epoch is not a Unix timestamp"
 [[ ${version} =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]] \
     || die "version cannot be used in an archive name: ${version}"
+if [[ ${release_tag} != "unreleased" ]]; then
+    [[ ${release_tag} == "v${version}" ]] \
+        || die "release tag does not match build version: ${release_tag}"
+    [[ $(git -C "${repo_root}" cat-file -t "refs/tags/${release_tag}" 2>/dev/null) == "tag" ]] \
+        || die "release tag is not annotated: ${release_tag}"
+    [[ $(git -C "${repo_root}" rev-parse "refs/tags/${release_tag}^{commit}") == "${source_revision}" ]] \
+        || die "release tag does not point to the build source revision"
+fi
 [[ ${target} == "${RELEASE_TARGET}" ]] \
     || die "build target is not ${RELEASE_TARGET}: ${target}"
 [[ ${builder_os} =~ ^anolis-8\.[0-9]+$ ]] \
@@ -288,6 +298,7 @@ cat >"${stage_root}/VERSION" <<EOF
 manifest_version=1
 product=beryl
 version=${version}
+release_tag=${release_tag}
 target=${target}
 source_revision=${source_revision}
 source_date_epoch=${source_date_epoch}

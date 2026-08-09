@@ -25,20 +25,25 @@ require_command() {
 
 usage() {
     cat <<EOF
-Usage: $(basename -- "$0") [--check-host]
+Usage: $(basename -- "$0") [--check-host | --require-tag]
 
 Build Beryl release binaries in the pinned Anolis ${BUILDER_OS_VERSION} builder.
 
-  --check-host  Validate the Anolis 8 rootless Podman host, then exit.
+  --check-host   Validate the Anolis 8 rootless Podman host, then exit.
+  --require-tag  Require an annotated v<workspace-version> tag at HEAD.
 EOF
 }
 
 mode="build"
+require_tag=0
 case ${1:-} in
     "")
         ;;
     --check-host)
         mode="check-host"
+        ;;
+    --require-tag)
+        require_tag=1
         ;;
     --help|-h)
         usage
@@ -147,6 +152,17 @@ workspace_version=$(
 [[ -n ${workspace_version} ]] || die "cannot resolve workspace package version"
 readonly workspace_version
 
+release_tag=unreleased
+if [[ ${require_tag} -eq 1 ]]; then
+    expected_tag="v${workspace_version}"
+    [[ $(git -C "${repo_root}" cat-file -t "refs/tags/${expected_tag}" 2>/dev/null) == "tag" ]] \
+        || die "release tag must be annotated: ${expected_tag}"
+    [[ $(git -C "${repo_root}" rev-parse "refs/tags/${expected_tag}^{commit}") == "${source_revision}" ]] \
+        || die "release tag ${expected_tag} does not point to HEAD"
+    release_tag=${expected_tag}
+fi
+readonly release_tag
+
 containerfile_sha=$(sha256sum "${containerfile}" | awk '{print $1}')
 repository_definition_sha=$(sha256sum "${repository_definition}" | awk '{print $1}')
 cargo_lock_sha=$(sha256sum "${repo_root}/Cargo.lock" | awk '{print $1}')
@@ -226,7 +242,7 @@ readonly builder_protoc
 builder_key=${builder_image_id#sha256:}
 builder_key=${builder_key:0:16}
 readonly builder_key
-readonly build_root="${repo_root}/target/anolis8-release/${source_revision}/${builder_key}"
+readonly build_root="${repo_root}/target/anolis8-release/${source_revision}/${builder_key}/${release_tag}"
 readonly cargo_target_dir="${build_root}/cargo-target"
 readonly cargo_home="${repo_root}/target/anolis8-cargo-home"
 readonly artifacts_dir="${build_root}/artifacts"
@@ -338,6 +354,7 @@ cat >"${build_root}/build-environment.txt" <<EOF
 source_revision=${source_revision}
 source_date_epoch=${source_date_epoch}
 version=${workspace_version}
+release_tag=${release_tag}
 target=${RELEASE_TARGET}
 builder_os=${builder_os}
 builder_image_id=${builder_image_id}
@@ -381,6 +398,8 @@ builder_rpms_sha=$(sha256sum "${build_root}/builder-rpms.txt" | awk '{print $1}'
 printf 'builder_rpms_sha256=%s\n' "${builder_rpms_sha}" >>"${build_root}/build-environment.txt"
 
 printf '\nRelease build completed successfully.\n'
+printf 'Release tag: %s\n' "${release_tag}"
+printf 'Build root: %s\n' "${build_root}"
 printf 'Artifacts: %s\n' "${artifacts_dir}"
 printf 'Build environment: %s\n' "${build_root}/build-environment.txt"
 printf 'Build host: %s\n' "${build_root}/build-host.txt"
