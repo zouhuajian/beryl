@@ -2,7 +2,7 @@
 
 Status: Active
 
-Baseline: main at fa81afa, 2026-08-07
+Baseline: release branch at e9e8d2e, 2026-08-09
 
 Current release target: internal `v0.1.0-alpha.1`
 
@@ -129,8 +129,8 @@ The current product boundary is:
 | Replication and repair | Not implemented | No production queue, transfer protocol, or acknowledgement surface |
 | Metadata high availability | Not implemented | Peer RPC is fail closed and cluster mode is rejected |
 | Security and tenancy | Development only | No productized mTLS, authentication, authorization, or quota |
-| Process lifecycle | Incomplete | Metadata accepts SIGINT/SIGTERM but shutdown ownership is incomplete; Worker does not stop its production server and background loops through one bounded shutdown path |
-| Binary distribution | Not implemented | No versioned tarball, systemd units, checksum, or packaged-production-binary acceptance |
+| Process lifecycle | Implemented | Metadata and Worker use owned bounded SIGINT/SIGTERM shutdown and pass same-version restart validation |
+| Binary distribution | Implemented | Pinned Anolis build, deterministic tarball, VERSION, checksum, systemd installation, and packaged 1+1 acceptance pass |
 | Upgrade and backup | Alpha clean-install only | Persistent formats fail closed on mismatch; no cross-version migration, rollback, or restore workflow |
 | Ecosystem integration | Not implemented | Rust-native API only |
 
@@ -138,15 +138,14 @@ The current product boundary is:
 
 ### 5.1 Release-blocking or scale-blocking findings
 
-#### A. Production process shutdown is not one owned lifecycle
+#### A. Production process shutdown is one owned lifecycle
 
-Metadata already receives SIGINT and SIGTERM, but production shutdown does not
-explicitly cancel and await every maintenance task or close the Raft runtime.
-Worker uses Ctrl-C only while registration is retrying; after registration its
-gRPC server, heartbeat, block-report, cleanup, and HTTP tasks have no shared
-bounded shutdown path.
+Metadata and Worker now transition readiness, stop admission, drain accepted
+work, cancel and await owned tasks, and exit within the systemd stop timeout.
+Same-version restart acceptance preserves visible data and current Worker
+locations.
 
-Before the first tag:
+First-tag acceptance proves:
 
 - Both processes must transition readiness to false before draining.
 - New RPC work must stop while accepted work receives a bounded drain window.
@@ -155,14 +154,13 @@ Before the first tag:
 - SIGINT and SIGTERM must exit successfully within the systemd stop timeout.
 - Same-version restart must recover visible data and current Worker locations.
 
-#### B. The binary and compatibility contract is not release-ready
+#### B. The binary and compatibility contract is release-ready
 
-The current binaries accept explicit YAML configuration, but do not expose a
-standard help/version contract or a side-effect-free configuration check. All
-workspace crates carry duplicated `0.1.0` versions, while internal pre-release
-persistent-format counters reflect discarded development history.
+The public binary exposes help, version, role routing, format, and side-effect-
+free configuration validation. The workspace uses one alpha version, and the
+first-release persistent formats use the agreed clean-install baseline.
 
-The first release must establish:
+The implemented first-release contract establishes:
 
 - One lockstep workspace version: `0.1.0-alpha.1`.
 - One public `beryl` entry point with `--help`, `--version`, explicit role
@@ -175,14 +173,11 @@ The first release must establish:
 - One pre-release reset of current persistent-format and schema counters to
   version 1, followed by monotonic changes after the first tag.
 
-#### C. No user artifact is tested end to end
+#### C. The packaged user artifact is tested end to end
 
-Workspace E2E tests exercise important runtime and recovery behavior, but they
-do not extract a release archive and launch both production binaries from it.
-The first release needs one black-box acceptance path that formats storage,
-starts production Metadata and Worker processes, performs Rust-client CRUD,
-restarts each process, verifies recovery, deletes data, and verifies the final
-state using only the extracted package.
+The extracted Anolis package has passed checksum, installation, configuration,
+systemd, readiness, Rust-client CRUD, Metadata restart, Worker restart, delete,
+and physical-cleanup validation with one Metadata and one Worker.
 
 #### D. Large-file behavior is bounded but intentionally scale-limited
 
@@ -262,7 +257,7 @@ caller limit.
 | --- | --- | --- | --- |
 | M0 Trusted Baseline | Exact-path Delete and current single-group correctness are trusted | Completed | Correctness and recovery matrix passed |
 | M1 Bounded Runtime | Listing, cleanup, reports, layouts, RPC decoding, and Raft commands are bounded | Substantially completed | Existing scale and hard-limit tests pass |
-| R0 Internal `0.1.0-alpha.1` | Current resident-storage path becomes a versioned, installable, recoverable artifact | Current, 1-2 weeks | Extracted-package acceptance passes on Anolis 8 and Ubuntu |
+| R0 Internal `0.1.0-alpha.1` | Current resident-storage path becomes a versioned, installable, recoverable artifact | Current | Extracted-package acceptance passes on Anolis 8 with one Metadata and one Worker |
 | R1 `0.1` Stabilization | Deployment, lifecycle, configuration, and recovery defects are fixed without feature expansion | Release-driven | Internal soak supports `0.1.0` Developer Preview |
 | T1 Evidence-Triggered Core Work | Report indexing, paged extents, streaming, and load shedding are pulled only by evidence | Unscheduled | A release workload or observed limit justifies each item |
 | R2 HDFS Read-Through Alpha | One immutable or snapshot-backed HDFS path completes exact-version cold-miss-to-read | After `0.1` baseline | HDFS correctness and restart gates pass |
@@ -453,7 +448,8 @@ is semantic identity rather than a local format revision.
 ### Build and package target
 
 - Primary target: Anolis OS 8 on `x86_64`, GNU libc 2.28 baseline.
-- Secondary runtime validation: the available Ubuntu host.
+- Additional distribution validation is deferred until another host becomes a
+  supported release target.
 - Build target: `x86_64-unknown-linux-gnu`.
 - Build inside a pinned Anolis 8-compatible image with fixed Rust and protobuf
   compiler inputs; do not build release binaries on a developer workstation or
@@ -470,13 +466,12 @@ beryl-0.1.0-alpha.1-x86_64-unknown-linux-gnu/
   conf/metadata.yaml
   conf/worker.yaml
   conf/client.yaml
+  install.sh
   systemd/beryl-metadata.service
   systemd/beryl-worker.service
-  docs/getting-started.md
-  docs/deployment.md
-  docs/operations.md
-  docs/compatibility.md
-  docs/known-limitations.md
+  logrotate/beryl
+  tmpfiles/beryl.conf
+  OPERATIONS.md
   LICENSE
   README.md
   VERSION
@@ -498,8 +493,7 @@ artifact location. Do not create a public GitHub Release.
 
 ### Packaged-binary acceptance gate
 
-Run the following with one Metadata and one Worker, then repeat the relevant
-registration/read checks with one Metadata and two Workers:
+Run the following with one Metadata and one Worker:
 
 1. Verify checksum, archive structure, `--version`, and side-effect-free config
    checks.
@@ -512,7 +506,7 @@ registration/read checks with one Metadata and two Workers:
    full-report convergence, and read existing data.
 6. Delete the file, verify namespace absence and bounded physical cleanup,
    restart both processes, and verify the final state.
-7. Install and repeat the smoke/restart path on Anolis 8 and Ubuntu.
+7. Install and repeat the smoke/restart path on the Anolis 8 release host.
 
 ### Explicitly out of scope
 
@@ -529,7 +523,7 @@ registration/read checks with one Metadata and two Workers:
 
 ### Objective
 
-Deploy `alpha.1`, operate it on the internal Anolis 8 and Ubuntu hosts, and use
+Deploy `alpha.1`, operate it on the internal Anolis 8 host, and use
 subsequent `0.1.0-alpha.N` releases only to correct installation, configuration,
 shutdown, recovery, observability, compatibility, and documentation defects.
 
@@ -999,16 +993,17 @@ Use two deliberately different paths:
 - Keep one Linux validation platform until a supported capability requires a
   matrix.
 
-#### Tag release CI
+#### Tag release procedure
 
 - Only an exact version tag runs `cargo build --release --locked`.
-- Build in the pinned Anolis 8-compatible environment and validate execution on
-  Anolis 8 plus Ubuntu.
+- Build and validate execution in the pinned Anolis 8-compatible environment.
 - Validate tag/workspace/build-reported version equality.
 - Package the exact build outputs once, generate SHA-256, extract the archive,
   and run production-binary acceptance.
 - Upload only to the approved internal artifact destination after all gates
   pass; do not create a public GitHub Release.
+- A hosted workflow is not required for the first internal release; add one
+  when an approved Anolis runner and internal artifact destination are available.
 - Add HDFS feature/acceptance jobs only when R2 becomes active.
 
 Schema migration, security configuration, scheduled fault/soak, multi-platform
@@ -1054,7 +1049,7 @@ Before setting production SLOs, expose the measurements needed to define them.
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
 | Worker or Metadata exits without owned cancellation | Abrupt termination, incomplete drain, or non-deterministic restart | R0 lifecycle owner, SIGINT/SIGTERM production-process tests, bounded systemd stop timeout |
-| Binary is built on a newer Ubuntu/glibc baseline | CI success but failure on internal Anolis nodes | Build on pinned Anolis 8-compatible glibc 2.28 baseline; execute on Anolis and Ubuntu |
+| Binary is built on a newer host/glibc baseline | Build success but failure on internal Anolis nodes | Build and execute on the pinned Anolis 8-compatible glibc 2.28 baseline |
 | Development version counters are mistaken for released compatibility history | Confusing first-release support and migrations | One clean-install reset to version 1 before the first tag; monotonic decisions afterward |
 | Source tests pass but the archive is incomplete or unusable | Internal users receive an untested artifact | Extracted-package production-binary acceptance before internal publication |
 | Unauthenticated services are exposed outside a trusted network | Unauthorized data access | Internal-only alpha, safe local defaults, explicit trusted-network limitation; security is required before broader deployment |
@@ -1122,16 +1117,16 @@ The next concrete work should be created in this order:
    `cargo build --release --locked` entry point.
 2. REL-102: Add one deterministic tarball layout, systemd units, VERSION
    manifest, and SHA-256 generation.
-3. REL-103: Add extracted-package acceptance using production Metadata and
-   Worker binaries for 1+1 and 1+2 topologies.
+3. REL-103: Accept the extracted package using one production Metadata and one
+   production Worker on Anolis 8.
 4. CI-104: Keep PR/main validation artifact-free; add no release build to normal
    push or merge.
-5. CI-105: Add exact-tag validation, build-once/package-once acceptance, and
-   internal artifact publication without a public GitHub Release.
+5. CI-105: Enforce an annotated exact-version tag for the Anolis release build,
+   then publish the accepted artifact internally without a public GitHub Release.
 6. DOC-106: Publish Getting Started, Deployment, Operations, Compatibility, and
    Known Limitations with trusted-network and clean-install warnings.
-7. REL-107: Tag `v0.1.0-alpha.1`, deploy the accepted archive to Anolis 8 and
-   Ubuntu, record results, and declare the internal release complete.
+7. REL-107: Tag `v0.1.0-alpha.1`, deploy the accepted archive to Anolis 8,
+   record results, and declare the internal release complete.
 
 ### P2: `0.1.0-alpha.N` stabilization
 
@@ -1190,7 +1185,7 @@ The required sequence is:
    restart recovery.
 4. Build a release artifact only from an exact tag in the pinned Anolis 8
    environment.
-5. Accept the extracted package with production binaries on Anolis 8 and Ubuntu,
+5. Accept the extracted package with production binaries on Anolis 8,
    then publish it internally as `v0.1.0-alpha.1`.
 6. Use `0.1.0-alpha.N` for deployment and recovery corrections, not ordinary
    feature expansion.
