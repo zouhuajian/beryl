@@ -329,6 +329,11 @@ for binary in beryl beryl-metadata beryl-worker; do
         "/artifacts/${binary}" --version >/dev/null
 done
 
+beryl_sha=$(sha256sum "${artifacts_dir}/beryl" | awk '{print $1}')
+beryl_metadata_sha=$(sha256sum "${artifacts_dir}/beryl-metadata" | awk '{print $1}')
+beryl_worker_sha=$(sha256sum "${artifacts_dir}/beryl-worker" | awk '{print $1}')
+readonly beryl_sha beryl_metadata_sha beryl_worker_sha
+
 cat >"${build_root}/build-environment.txt" <<EOF
 source_revision=${source_revision}
 source_date_epoch=${source_date_epoch}
@@ -338,11 +343,15 @@ builder_os=${builder_os}
 builder_image_id=${builder_image_id}
 builder_image_tag=${builder_image_tag}
 base_image=${base_image}
+rust_release=${builder_rust}
 rustup_release=${builder_rustup}
 protoc_release=${builder_protoc}
 containerfile_sha256=${containerfile_sha}
 repository_definition_sha256=${repository_definition_sha}
 cargo_lock_sha256=${cargo_lock_sha}
+beryl_sha256=${beryl_sha}
+beryl_metadata_sha256=${beryl_metadata_sha}
+beryl_worker_sha256=${beryl_worker_sha}
 EOF
 
 podman run --rm \

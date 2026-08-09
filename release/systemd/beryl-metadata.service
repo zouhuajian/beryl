@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Beryl Contributors
+
+[Unit]
+Description=Beryl Metadata
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=beryl
+Group=beryl
+WorkingDirectory=/var/lib/beryl
+StateDirectory=beryl
+StateDirectoryMode=0750
+LogsDirectory=beryl
+LogsDirectoryMode=0750
+
+ExecStartPre=/opt/beryl/bin/beryl --conf-dir /etc/beryl validate-conf metadata
+ExecStart=/opt/beryl/bin/beryl --conf-dir /etc/beryl metadata
+
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=60s
+SendSIGKILL=yes
+
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/beryl
+ReadWritePaths=/var/log/beryl
+
+StandardOutput=append:/var/log/beryl/metadata.log
+StandardError=append:/var/log/beryl/metadata.log
+
+[Install]
+WantedBy=multi-user.target
