@@ -1,0 +1,110 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Beryl Contributors
+
+# The amd64 manifest behind the official OpenAnolis anolisos:8.8 image. A
+# platform-specific digest prevents an arm64 builder from being selected by the
+# host implicitly. The OpenAnolis registry is used because it serves this exact
+# digest directly to the supported Anolis build host.
+# The release host may run a later Anolis 8 minor version; binaries are built
+# against this older fixed userspace to preserve the glibc 2.28 baseline.
+FROM registry.openanolis.cn/openanolis/anolisos@sha256:694dbff92c79e7d48ff0adfaba8a1fbaacf5500c33fed5a51da0a311c8728123
+
+LABEL org.opencontainers.image.title="Beryl Anolis 8 release builder" \
+      org.opencontainers.image.description="Pinned x86_64 builder for Beryl release binaries" \
+      org.beryl.release.base-image="registry.openanolis.cn/openanolis/anolisos@sha256:694dbff92c79e7d48ff0adfaba8a1fbaacf5500c33fed5a51da0a311c8728123" \
+      org.beryl.release.builder-os="anolis-8.8" \
+      org.beryl.release.target="x86_64-unknown-linux-gnu" \
+      org.beryl.release.rust="1.95.0" \
+      org.beryl.release.rustup="1.28.2" \
+      org.beryl.release.protoc="21.12"
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Use the Anolis 8.8 repositories that correspond to the immutable base image.
+# The installed RPM inventory is captured for every Beryl build.
+RUN rm -f /etc/yum.repos.d/*.repo
+COPY anolis-8.8.repo /etc/yum.repos.d/beryl-anolis-8.8.repo
+
+RUN dnf -y --setopt=install_weak_deps=False install \
+        autoconf \
+        automake \
+        binutils \
+        ca-certificates \
+        clang \
+        clang-devel \
+        cmake \
+        curl \
+        file \
+        findutils \
+        gcc \
+        gcc-c++ \
+        git \
+        gzip \
+        libtool \
+        make \
+        patch \
+        perl \
+        pkgconf-pkg-config \
+        tar \
+        unzip \
+        which \
+        xz \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+ENV RUSTUP_HOME=/opt/rustup \
+    RUSTUP_INIT_SKIP_PATH_CHECK=yes \
+    RUSTUP_AUTO_INSTALL=0 \
+    CARGO_INCREMENTAL=0 \
+    PATH=/opt/cargo/bin:/opt/protoc-21.12/bin:${PATH} \
+    RUSTFLAGS="-C target-cpu=x86-64" \
+    CFLAGS="-O2 -pipe -march=x86-64 -mtune=generic" \
+    CXXFLAGS="-O2 -pipe -march=x86-64 -mtune=generic"
+
+# rustup-init is versioned and checksum-verified. Rust itself is installed by
+# exact release number, and rustup verifies the release component checksums.
+RUN curl --fail --location --silent --show-error --retry 3 \
+        --output /tmp/rustup-init \
+        https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
+    && echo "20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c  /tmp/rustup-init" \
+        | sha256sum --check --strict \
+    && chmod 0755 /tmp/rustup-init \
+    && CARGO_HOME=/opt/cargo /tmp/rustup-init \
+        -y \
+        --no-modify-path \
+        --profile minimal \
+        --default-toolchain none \
+    && CARGO_HOME=/opt/cargo rustup set auto-self-update disable \
+    && CARGO_HOME=/opt/cargo rustup toolchain install 1.95.0 \
+        --no-self-update \
+        --profile minimal \
+        --component clippy \
+        --component rustfmt \
+        --target x86_64-unknown-linux-gnu \
+    && CARGO_HOME=/opt/cargo rustup default 1.95.0 \
+    && CARGO_HOME=/opt/cargo rustup set auto-install disable \
+    && rm -f /tmp/rustup-init
+
+# protoc 21.12 is new enough for proto3 optional fields and matches the
+# compiler already used by the repository's validated development setup.
+RUN curl --fail --location --silent --show-error --retry 3 \
+        --output /tmp/protoc.zip \
+        https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-linux-x86_64.zip \
+    && echo "3a4c1e5f2516c639d3079b1586e703fc7bcfa2136d58bda24d1d54f949c315e8  /tmp/protoc.zip" \
+        | sha256sum --check --strict \
+    && mkdir -p /opt/protoc-21.12 \
+    && unzip -q /tmp/protoc.zip -d /opt/protoc-21.12 \
+    && rm -f /tmp/protoc.zip
+
+RUN test "$(uname -m)" = "x86_64" \
+    && grep -Eq '^ID="?anolis"?$' /etc/os-release \
+    && grep -Eq '^VERSION_ID="?8\.8"?$' /etc/os-release \
+    && test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28" \
+    && rustup --version | grep -Eq '^rustup 1\.28\.2 ' \
+    && rustc --version --verbose \
+    && cargo --version \
+    && test "$(protoc --version)" = "libprotoc 3.21.12"
+
+WORKDIR /workspace
+
+CMD ["/bin/bash"]
