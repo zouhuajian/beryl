@@ -25,6 +25,26 @@ The Rust native API is the client interface used today. It supports core operati
 
 `FsClient::delete` requires `DeleteOptions`, which currently controls recursive namespace deletion. Physical reclamation remains asynchronous and uses the Metadata cleanup grace period.
 
+## Runnable CRUD Example
+
+Build the example from the same checkout or release tag as the deployed
+Metadata and Worker. With both services ready and `conf/client.yaml` pointing
+at the client-reachable Metadata endpoint, and with every Worker advertising an
+address reachable by that client, run a complete disposable CRUD roundtrip:
+
+```bash
+cargo run --locked -p beryl-client --example crud -- conf/client.yaml
+```
+
+The optional positional argument is the client configuration path and defaults
+to `conf/client.yaml`. The example creates `/examples/rust-client-crud.bin`,
+writes deterministic data spanning multiple blocks, checks stat and read
+results, then deletes the file. It exits nonzero on any failure or mismatch.
+
+This example intentionally demonstrates only the public Client API. Starting,
+restarting, and validating packaged Metadata and Worker processes belongs to
+the release acceptance workflow rather than this source example.
+
 ## Not in Current Scope
 
 - POSIX API.
