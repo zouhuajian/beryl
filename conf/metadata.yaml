@@ -10,6 +10,9 @@ beryl.cluster.id: "local-beryl"
 beryl.metadata.host: "127.0.0.1"
 beryl.metadata.bind-host: "0.0.0.0"
 beryl.metadata.rpc.port: 18080
+beryl.metadata.rpc.max-concurrent-requests: 64
+beryl.metadata.rpc.max-concurrent-requests-per-connection: 16
+beryl.metadata.rpc.reserved-control-requests: 8
 beryl.metadata.http.port: 18081
 
 # -------------------- Storage --------------------

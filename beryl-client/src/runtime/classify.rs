@@ -6,6 +6,7 @@
 use crate::error::ClientError;
 use crate::rpc_error::ClientAction;
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RpcErrorDetail};
+use beryl_common::header::{HEADER_PRE_HANDLER_REJECTION, PRE_HANDLER_REJECTION_RPC_CONCURRENCY};
 
 /// Runtime error classification used by the metadata executor.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,12 +85,28 @@ pub(crate) fn classify_error(err: &ClientError) -> ErrorClass {
 
 fn classify_action(action: &ClientAction) -> ErrorClass {
     match action {
+        ClientAction::TransportFail { status } if is_pre_handler_concurrency_rejection(status) => {
+            ErrorClass::ServerRetry
+        }
         ClientAction::TransportFail { status } if is_retryable_transport(status) => ErrorClass::RetryableTransport,
         ClientAction::TransportFail { .. } => ErrorClass::Fatal,
         ClientAction::Retry { .. } => ErrorClass::ServerRetry,
         ClientAction::Refresh { rpc_error, .. } => classify_refresh_action(rpc_error),
         ClientAction::Fail { rpc_error } => classify_fail_action(rpc_error),
     }
+}
+
+/// Identifies a definite pre-handler rejection that is safe to replay.
+///
+/// Unmarked resource exhaustion remains a transport failure because its
+/// side-effect outcome cannot be inferred from the status code alone.
+fn is_pre_handler_concurrency_rejection(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::ResourceExhausted
+        && status
+            .metadata()
+            .get(HEADER_PRE_HANDLER_REJECTION)
+            .and_then(|value| value.to_str().ok())
+            == Some(PRE_HANDLER_REJECTION_RPC_CONCURRENCY)
 }
 
 fn classify_refresh_action(rpc_error: &RpcErrorDetail) -> ErrorClass {
@@ -138,6 +155,16 @@ mod tests {
     use crate::error::ClientError;
     use crate::rpc_error::ClientAction;
     use beryl_common::error::rpc::{ErrorKind, RecoveryAction, RefreshHint as RpcRefreshHint, RpcErrorDetail};
+    use tonic::metadata::{MetadataMap, MetadataValue};
+
+    fn pre_handler_concurrency_rejection(code: tonic::Code) -> ClientError {
+        let mut metadata = MetadataMap::new();
+        metadata.insert(
+            HEADER_PRE_HANDLER_REJECTION,
+            MetadataValue::from_static(PRE_HANDLER_REJECTION_RPC_CONCURRENCY),
+        );
+        ClientError::from(tonic::Status::with_metadata(code, "overloaded", metadata))
+    }
 
     #[test]
     fn refresh_action_uses_rpc_error_kind_for_refresh_class() {
@@ -164,6 +191,27 @@ mod tests {
         let classified = classify_error(&err);
 
         assert_eq!(classified, ErrorClass::RetryableTransport);
+    }
+
+    #[test]
+    fn pre_handler_concurrency_rejection_retries_without_transport_failure() {
+        let err = pre_handler_concurrency_rejection(tonic::Code::ResourceExhausted);
+
+        assert_eq!(classify_error(&err), ErrorClass::ServerRetry);
+    }
+
+    #[test]
+    fn unmarked_resource_exhaustion_remains_transport_failure() {
+        let err = ClientError::from(tonic::Status::resource_exhausted("unclassified overload"));
+
+        assert_eq!(classify_error(&err), ErrorClass::RetryableTransport);
+    }
+
+    #[test]
+    fn pre_handler_marker_only_changes_resource_exhaustion_classification() {
+        let err = pre_handler_concurrency_rejection(tonic::Code::Unavailable);
+
+        assert_eq!(classify_error(&err), ErrorClass::RetryableTransport);
     }
 
     #[test]

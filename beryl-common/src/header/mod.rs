@@ -25,5 +25,5 @@
 mod codec;
 mod types;
 
-pub use codec::RequestHeaderCodec;
+pub use codec::{HEADER_PRE_HANDLER_REJECTION, PRE_HANDLER_REJECTION_RPC_CONCURRENCY, RequestHeaderCodec};
 pub use types::*;

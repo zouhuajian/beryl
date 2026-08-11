@@ -10,6 +10,7 @@ use crate::raft::{
 use crate::readiness::RootReadinessConfig;
 use beryl_common::config::{keys::logging, FlatConfig, ServerConfig};
 use beryl_common::error::{CommonError, CommonErrorKind};
+use beryl_common::grpc_server::MAX_GRPC_CONCURRENT_REQUESTS;
 use beryl_common::observe::config::{LogConfig, ResourceConfig};
 use beryl_common::observe::ObservabilityConfig;
 use beryl_types::GroupName;
@@ -20,6 +21,9 @@ const CLUSTER_ID: &str = "beryl.cluster.id";
 const HOST: &str = "beryl.metadata.host";
 const BIND_HOST: &str = "beryl.metadata.bind-host";
 const RPC_PORT: &str = "beryl.metadata.rpc.port";
+const RPC_MAX_CONCURRENT_REQUESTS: &str = "beryl.metadata.rpc.max-concurrent-requests";
+const RPC_MAX_CONCURRENT_REQUESTS_PER_CONNECTION: &str = "beryl.metadata.rpc.max-concurrent-requests-per-connection";
+const RPC_RESERVED_CONTROL_REQUESTS: &str = "beryl.metadata.rpc.reserved-control-requests";
 const HTTP_PORT: &str = "beryl.metadata.http.port";
 const STORAGE_DIR: &str = "beryl.metadata.storage.dir";
 const LIST_DEFAULT_PAGE_SIZE: &str = "beryl.metadata.namespace.list.default-page-size";
@@ -54,6 +58,9 @@ const KNOWN_KEYS: &[&str] = &[
     HOST,
     BIND_HOST,
     RPC_PORT,
+    RPC_MAX_CONCURRENT_REQUESTS,
+    RPC_MAX_CONCURRENT_REQUESTS_PER_CONNECTION,
+    RPC_RESERVED_CONTROL_REQUESTS,
     HTTP_PORT,
     STORAGE_DIR,
     LIST_DEFAULT_PAGE_SIZE,
@@ -100,6 +107,8 @@ pub struct MetadataConfig {
     pub bind_host: IpAddr,
     /// RPC port published with `host` and bound with `bind_host`.
     pub rpc_port: u16,
+    /// Immediate inbound RPC concurrency policy.
+    pub rpc_concurrency: MetadataRpcConcurrencyConfig,
     /// Process-owned HTTP port for metrics, health, and future APIs.
     pub http_port: u16,
     /// Local directory for authoritative Metadata state.
@@ -127,6 +136,17 @@ pub struct MetadataConfig {
     pub shutdown_timeout_ms: u64,
     /// Shared logging and metrics recorder configuration.
     pub observability: ObservabilityConfig,
+}
+
+/// Metadata RPC concurrency bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataRpcConcurrencyConfig {
+    /// Maximum active Metadata RPCs across all client and Worker connections.
+    pub max_concurrent_requests: usize,
+    /// Maximum active Metadata RPCs from one HTTP/2 connection.
+    pub max_concurrent_requests_per_connection: usize,
+    /// Capacity protected from filesystem RPCs for Worker and health traffic.
+    pub reserved_control_requests: usize,
 }
 
 impl MetadataConfig {
@@ -260,6 +280,16 @@ impl Default for NamespaceListConfig {
     }
 }
 
+impl Default for MetadataRpcConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests: 64,
+            max_concurrent_requests_per_connection: 16,
+            reserved_control_requests: 8,
+        }
+    }
+}
+
 impl NamespaceListConfig {
     pub fn try_new(default_page_size: u32, max_page_size: u32) -> Result<Self, CommonError> {
         if default_page_size == 0 {
@@ -316,6 +346,7 @@ impl Default for MetadataConfig {
             host: "127.0.0.1".to_string(),
             bind_host,
             rpc_port: 18080,
+            rpc_concurrency: MetadataRpcConcurrencyConfig::default(),
             http_port: 18081,
             storage_dir: PathBuf::from("data/metadata"),
             raft: RaftConfig::default(),
@@ -367,6 +398,25 @@ impl MetadataConfig {
         if rpc_port == http_port {
             return Err(invalid_config(HTTP_PORT, "must differ from the RPC port"));
         }
+        let rpc_concurrency_defaults = MetadataRpcConcurrencyConfig::default();
+        let rpc_concurrency = MetadataRpcConcurrencyConfig {
+            max_concurrent_requests: positive_usize_or(
+                flat,
+                RPC_MAX_CONCURRENT_REQUESTS,
+                rpc_concurrency_defaults.max_concurrent_requests,
+            )?,
+            max_concurrent_requests_per_connection: positive_usize_or(
+                flat,
+                RPC_MAX_CONCURRENT_REQUESTS_PER_CONNECTION,
+                rpc_concurrency_defaults.max_concurrent_requests_per_connection,
+            )?,
+            reserved_control_requests: positive_usize_or(
+                flat,
+                RPC_RESERVED_CONTROL_REQUESTS,
+                rpc_concurrency_defaults.reserved_control_requests,
+            )?,
+        };
+        validate_rpc_concurrency(&rpc_concurrency)?;
         let storage_dir = PathBuf::from(string_or(flat, STORAGE_DIR, defaults.storage_dir.to_str().unwrap())?);
         let observability = ObservabilityConfig::from_flat(flat)?;
 
@@ -469,6 +519,7 @@ impl MetadataConfig {
             host,
             bind_host,
             rpc_port,
+            rpc_concurrency,
             http_port,
             storage_dir,
             raft: RaftConfig::default(),
@@ -483,6 +534,29 @@ impl MetadataConfig {
             observability,
         })
     }
+}
+
+/// Preserves the capacity relationships required by the raw gRPC concurrency layer.
+fn validate_rpc_concurrency(config: &MetadataRpcConcurrencyConfig) -> Result<(), CommonError> {
+    if config.max_concurrent_requests > MAX_GRPC_CONCURRENT_REQUESTS {
+        return Err(invalid_config(
+            RPC_MAX_CONCURRENT_REQUESTS,
+            "exceeds the runtime semaphore maximum",
+        ));
+    }
+    if config.max_concurrent_requests_per_connection > config.max_concurrent_requests {
+        return Err(invalid_config(
+            RPC_MAX_CONCURRENT_REQUESTS_PER_CONNECTION,
+            "must not exceed the server-wide maximum",
+        ));
+    }
+    if config.reserved_control_requests >= config.max_concurrent_requests {
+        return Err(invalid_config(
+            RPC_RESERVED_CONTROL_REQUESTS,
+            "must be smaller than the server-wide maximum",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_namespace_delete(config: &NamespaceDeleteConfig) -> Result<(), CommonError> {
@@ -647,6 +721,9 @@ mod tests {
         flat.set(HOST, "metadata-01");
         flat.set(BIND_HOST, "127.0.0.1");
         flat.set(RPC_PORT, 28080i64);
+        flat.set(RPC_MAX_CONCURRENT_REQUESTS, 32i64);
+        flat.set(RPC_MAX_CONCURRENT_REQUESTS_PER_CONNECTION, 8i64);
+        flat.set(RPC_RESERVED_CONTROL_REQUESTS, 4i64);
         flat.set(HTTP_PORT, 28081i64);
         flat.set(BLOCK_CLEANUP_INTERVAL, "2s");
         flat.set(NAMESPACE_DELETE_MAX_SIZE, "1MiB");
@@ -658,6 +735,14 @@ mod tests {
 
         assert_eq!(config.rpc_address(), "metadata-01:28080");
         assert_eq!(config.rpc_addr(), "127.0.0.1:28080".parse().unwrap());
+        assert_eq!(
+            config.rpc_concurrency,
+            MetadataRpcConcurrencyConfig {
+                max_concurrent_requests: 32,
+                max_concurrent_requests_per_connection: 8,
+                reserved_control_requests: 4,
+            }
+        );
         assert_eq!(config.http_addr(), "127.0.0.1:28081".parse().unwrap());
         assert_eq!(config.block_cleanup.scan_interval_ms, 2_000);
         assert_eq!(config.namespace_delete.max_batch_bytes, 1024 * 1024);
@@ -683,6 +768,34 @@ mod tests {
             flat.set(HOST, host);
             assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
         }
+
+        let mut flat = base_flat();
+        flat.set(RPC_MAX_CONCURRENT_REQUESTS, 8i64);
+        flat.set(RPC_MAX_CONCURRENT_REQUESTS_PER_CONNECTION, 9i64);
+        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
+
+        let mut flat = base_flat();
+        flat.set(RPC_MAX_CONCURRENT_REQUESTS, 8i64);
+        flat.set(RPC_RESERVED_CONTROL_REQUESTS, 8i64);
+        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
+
+        let mut flat = base_flat();
+        flat.set(RPC_RESERVED_CONTROL_REQUESTS, 0i64);
+        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
+
+        let mut flat = base_flat();
+        flat.set(
+            RPC_MAX_CONCURRENT_REQUESTS,
+            i64::try_from(MAX_GRPC_CONCURRENT_REQUESTS).unwrap(),
+        );
+        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_ok());
+
+        let mut flat = base_flat();
+        flat.set(
+            RPC_MAX_CONCURRENT_REQUESTS,
+            i64::try_from(MAX_GRPC_CONCURRENT_REQUESTS + 1).unwrap(),
+        );
+        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
     }
 
     #[test]

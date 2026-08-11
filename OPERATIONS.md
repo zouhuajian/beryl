@@ -141,6 +141,21 @@ sudo /opt/beryl/bin/beryl --conf-dir /etc/beryl validate-conf worker
 If both role configurations change, stop Worker, restart Metadata and wait for
 Metadata readiness, then start Worker and wait for Worker readiness.
 
+Metadata RPC concurrency is configured with three restart-only values:
+
+- `beryl.metadata.rpc.max-concurrent-requests` bounds all active Metadata RPCs.
+- `beryl.metadata.rpc.max-concurrent-requests-per-connection` prevents one
+  HTTP/2 connection from consuming the service-wide limit.
+- `beryl.metadata.rpc.reserved-control-requests` keeps part of the service-wide
+  capacity unavailable to filesystem RPCs so Worker and gRPC health traffic
+  can still make progress.
+
+Requests beyond either boundary are rejected immediately with gRPC
+`ResourceExhausted`; they are not queued or passed to a Metadata handler. Keep
+the per-connection value at or below the service-wide value and the control
+reserve below the service-wide value. The shipped defaults are `64`, `16`, and
+`8`, respectively.
+
 The current alpha supports clean installation and same-version restart only.
 Do not perform an in-place upgrade, downgrade, mixed-version deployment, or
 rollback with these procedures.
@@ -192,6 +207,9 @@ Useful Metadata signals:
 - `metadata_worker_live`, worker registration, heartbeat, and block-report
   counters
 - filesystem and RPC request totals and duration histograms
+- `grpc_server_requests_inflight` and
+  `grpc_server_concurrency_rejections_total`, labeled by traffic class and limit
+  scope
 - cleanup candidates, commands, retries, anomalies, and reclaim progress
 
 Useful Worker signals:
