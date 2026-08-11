@@ -11,7 +11,9 @@ use crate::service::{MetadataFileSystem, MetadataFileSystemDeps, MetadataFileSys
 use crate::state::RaftStateStore;
 use crate::worker::{MetadataWorkerServiceImpl, WorkerBackgroundHandle, WorkerManager};
 use crate::{observe, MetadataConfig, MountTable};
-use beryl_common::grpc_server::spawn_grpc_server;
+use beryl_common::grpc_server::{
+    spawn_grpc_server_with_concurrency_limits, GrpcRequestConcurrencyConfig, RpcRequestClass,
+};
 use beryl_common::observe::{init_observability as init_common_observability, ObservabilityGuard, ServiceInfo};
 use beryl_common::service_http::spawn_service_http;
 use beryl_common::termination::TerminationMonitor;
@@ -24,6 +26,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tonic::server::NamedService;
 use tonic::service::Routes;
 use tonic_health::pb::health_server::HealthServer;
 use tonic_health::server::{HealthReporter, HealthService};
@@ -39,6 +42,24 @@ const MAX_REQUEST_SIZE: usize = 4 * 1024 * 1024;
 pub type DynError = Box<dyn std::error::Error>;
 
 type MetadataHealthServer = HealthServer<HealthService>;
+
+/// Classifies raw gRPC paths without decoding request bodies.
+///
+/// Unknown services remain regular traffic so only explicitly named internal
+/// control services can consume reserved capacity.
+fn classify_metadata_rpc(path: &str) -> RpcRequestClass {
+    let service_name = path
+        .strip_prefix('/')
+        .and_then(|path| path.split_once('/'))
+        .map(|(service, _)| service);
+    if service_name == Some(<MetadataWorkerServiceProtoServer<MetadataWorkerServiceImpl> as NamedService>::NAME)
+        || service_name == Some(<MetadataHealthServer as NamedService>::NAME)
+    {
+        RpcRequestClass::Control
+    } else {
+        RpcRequestClass::Regular
+    }
+}
 
 /// Keeps the tracing and metrics provider alive for the process lifetime.
 pub struct Observability {
@@ -332,7 +353,18 @@ impl MetadataServer {
         )
         .add_service(MetadataWorkerServiceProtoServer::new(services.worker).max_decoding_message_size(MAX_REQUEST_SIZE))
         .add_service(services.health);
-        let mut rpc = match spawn_grpc_server(config.rpc_addr(), routes, None) {
+        let rpc_concurrency = config.rpc_concurrency;
+        let mut rpc = match spawn_grpc_server_with_concurrency_limits(
+            config.rpc_addr(),
+            routes,
+            GrpcRequestConcurrencyConfig {
+                server_name: "metadata",
+                max_concurrent_requests: rpc_concurrency.max_concurrent_requests,
+                max_concurrent_requests_per_connection: rpc_concurrency.max_concurrent_requests_per_connection,
+                reserved_control_requests: rpc_concurrency.reserved_control_requests,
+                classify: classify_metadata_rpc,
+            },
+        ) {
             Ok(rpc) => rpc,
             Err(error) => {
                 handles.begin_shutdown().await;
@@ -731,6 +763,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rpc_concurrency_reserves_capacity_only_for_worker_and_health() {
+        assert_eq!(
+            classify_metadata_rpc(&format!(
+                "/{}/Heartbeat",
+                <MetadataWorkerServiceProtoServer<MetadataWorkerServiceImpl> as NamedService>::NAME
+            )),
+            RpcRequestClass::Control
+        );
+        assert_eq!(
+            classify_metadata_rpc(&format!("/{}/Check", <MetadataHealthServer as NamedService>::NAME)),
+            RpcRequestClass::Control
+        );
+        assert_eq!(
+            classify_metadata_rpc(&format!(
+                "/{}/GetStatus",
+                <FileSystemServiceProtoServer<MetadataFileSystemServiceImpl> as NamedService>::NAME
+            )),
+            RpcRequestClass::Regular
+        );
+        assert_eq!(classify_metadata_rpc("/unknown.Service/Call"), RpcRequestClass::Regular);
+    }
+
     async fn test_authority(dir: &TempDir) -> MetadataAuthority {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::load_from_storage(storage.as_ref()).unwrap());
@@ -848,6 +903,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             bind_host: "127.0.0.1".parse().unwrap(),
             rpc_port: 18080,
+            rpc_concurrency: Default::default(),
             http_port: 18081,
             storage_dir: std::path::PathBuf::from("data/metadata"),
             raft: RaftConfig::default(),

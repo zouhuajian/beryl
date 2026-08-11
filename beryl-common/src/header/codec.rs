@@ -20,6 +20,10 @@ pub const HEADER_TRACESTATE: &str = "tracestate";
 pub const HEADER_BAGGAGE: &str = "baggage";
 pub const HEADER_DEADLINE_MS: &str = "x-deadline-ms";
 pub const HEADER_GRPC_TIMEOUT: &str = "grpc-timeout";
+/// Identifies a request rejected before any gRPC handler executes.
+pub const HEADER_PRE_HANDLER_REJECTION: &str = "beryl-pre-handler-rejection";
+/// Marker value for pre-handler request-concurrency rejection.
+pub const PRE_HANDLER_REJECTION_RPC_CONCURRENCY: &str = "rpc-concurrency";
 
 /// Codec for RequestHeader header encoding/decoding.
 pub struct RequestHeaderCodec;
