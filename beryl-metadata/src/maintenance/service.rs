@@ -6,6 +6,7 @@
 use super::lost_worker::{LostWorkerCleanupDeps, LostWorkerCleanupService};
 use super::{BlockCleanupCoordinator, DetachedRootReclaimer};
 use crate::raft::AppRaftNode;
+use crate::session_registry::SessionRegistry;
 use crate::worker::WorkerManager;
 use std::sync::Arc;
 use std::time::Duration;
@@ -90,13 +91,15 @@ impl Drop for MaintenanceHandle {
     }
 }
 
-/// Starts the current worker-state convergence tasks.
+/// Owns Metadata background cleanup and convergence tasks.
 pub struct MaintenanceService {
     raft_node: Arc<AppRaftNode>,
     worker_manager: Arc<WorkerManager>,
     cleanup: Arc<BlockCleanupCoordinator>,
     detached_root_reclaimer: Arc<DetachedRootReclaimer>,
     lost_worker_cleanup_interval: Duration,
+    session_registry: Arc<SessionRegistry>,
+    session_expiry_interval: Duration,
 }
 
 impl MaintenanceService {
@@ -110,6 +113,8 @@ impl MaintenanceService {
         cleanup: Arc<BlockCleanupCoordinator>,
         detached_root_reclaimer: Arc<DetachedRootReclaimer>,
         lost_worker_cleanup_interval: Duration,
+        session_registry: Arc<SessionRegistry>,
+        session_expiry_interval: Duration,
     ) -> Self {
         Self {
             raft_node,
@@ -117,13 +122,33 @@ impl MaintenanceService {
             cleanup,
             detached_root_reclaimer,
             lost_worker_cleanup_interval,
+            session_registry,
+            session_expiry_interval,
         }
     }
 
-    /// Starts detached namespace cleanup and the worker convergence loops.
+    /// Starts bounded write-session, namespace, block, and worker cleanup loops.
     pub(crate) fn start(&self) -> MaintenanceHandle {
-        let mut tasks = Vec::with_capacity(3);
+        let mut tasks = Vec::with_capacity(4);
         let shutdown = CancellationToken::new();
+
+        let session_registry = Arc::clone(&self.session_registry);
+        let scan_interval = self.session_expiry_interval;
+        let task_shutdown = shutdown.child_token();
+        tasks.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(scan_interval);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = task_shutdown.cancelled() => return,
+                    _ = interval.tick() => {}
+                }
+                let retired = session_registry.retire_expired_batch();
+                if retired > 0 {
+                    info!(task = "write_session_expiry", retired, "Expired write sessions retired");
+                }
+            }
+        }));
 
         let detached_root_reclaimer = Arc::clone(&self.detached_root_reclaimer);
         tasks.push(tokio::spawn(detached_root_reclaimer.run(shutdown.child_token())));

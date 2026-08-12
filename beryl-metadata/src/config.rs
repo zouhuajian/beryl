@@ -133,7 +133,7 @@ pub struct MetadataConfig {
     pub worker_liveness: WorkerLivenessConfig,
     /// Metadata startup readiness policy.
     pub startup: StartupConfig,
-    /// Write lease expiry policy.
+    /// Leader-local write-session expiry policy.
     pub write_lease_timeout_ms: u64,
     /// Graceful RPC/background drain interval before remaining work is cancelled.
     ///
@@ -155,12 +155,12 @@ pub struct MetadataRpcConcurrencyConfig {
     pub reserved_control_requests: usize,
 }
 
-/// Bounds pending and installed write sessions owned by one Metadata leader.
+/// Bounds opening and active write sessions owned by one Metadata leader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MetadataWriteSessionLimitsConfig {
-    /// Maximum pending plus installed sessions across all clients.
+    /// Maximum opening plus active sessions across all clients.
     pub max_active: usize,
-    /// Maximum pending plus installed sessions attributed to one client ID.
+    /// Maximum opening plus active sessions attributed to one client ID.
     pub max_active_per_client: usize,
 }
 

@@ -1761,7 +1761,7 @@ mod tests {
                 &request_context(),
                 env.inode_id,
                 vec![env.inode_id],
-                crate::inode_lease::WriteMode::Write,
+                crate::session_registry::WriteMode::Write,
                 Freshness::default(),
             )
             .await
@@ -1826,7 +1826,7 @@ mod tests {
                 &request_context(),
                 env.inode_id,
                 vec![env.inode_id],
-                crate::inode_lease::WriteMode::Write,
+                crate::session_registry::WriteMode::Write,
                 Freshness::default(),
             )
             .await

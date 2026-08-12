@@ -11,7 +11,6 @@ mod read;
 mod write;
 
 use crate::error::{to_rpc_error, MetadataError, MetadataResult};
-use crate::inode_lease::LeaseManager;
 use crate::metrics::MetadataMetrics;
 use crate::mount::MountTable;
 use crate::path_resolver::{MountContext, PathResolver, ResolvedPath};
@@ -151,14 +150,9 @@ fn missing_resolved_target_error(resolved: &ResolvedPath) -> MetadataError {
 }
 
 impl MetadataFileSystem {
-    /// Return whether one exact file still has the authoritative leader-local lease.
-    ///
-    /// Any session whose mirrored epoch is no longer active is retired before
-    /// consulting the lease manager.
+    /// Return whether one exact file has a non-expired opening or active session.
     fn has_active_write(&self, inode_id: InodeId) -> bool {
-        self.session_registry
-            .remove_inactive_for_inode(inode_id, self.lease_manager.as_ref());
-        self.lease_manager.has_active_lease(inode_id)
+        self.session_registry.has_active_write(inode_id)
     }
 
     /// Return whether an inode is or contains a non-expired leader-local write session.
@@ -175,7 +169,6 @@ pub(crate) struct MetadataFileSystemDeps {
     pub(crate) storage: Arc<RocksDBStorage>,
     pub(crate) raft_node: Option<Arc<AppRaftNode>>,
     pub(crate) session_registry: Arc<SessionRegistry>,
-    pub(crate) lease_manager: Arc<LeaseManager>,
     pub(crate) worker_manager: Option<Arc<WorkerManager>>,
     pub(crate) metrics: Option<Arc<MetadataMetrics>>,
     pub(crate) readiness_gate: Option<Arc<RootReadinessGate>>,
@@ -205,7 +198,6 @@ pub(crate) struct MetadataFileSystem {
     metrics: Option<Arc<MetadataMetrics>>,
     session_registry: Arc<SessionRegistry>,
     worker_manager: Option<Arc<WorkerManager>>,
-    lease_manager: Arc<LeaseManager>,
 }
 
 impl MetadataFileSystem {
@@ -227,7 +219,6 @@ impl MetadataFileSystem {
             metrics: deps.metrics,
             session_registry: deps.session_registry,
             worker_manager: deps.worker_manager,
-            lease_manager: deps.lease_manager,
         }
     }
 
@@ -479,7 +470,6 @@ mod tests {
     pub(super) struct TestFilesystem {
         filesystem: MetadataFileSystem,
         session_registry: Arc<SessionRegistry>,
-        lease_manager: Arc<LeaseManager>,
         _storage_dir: Option<TempDir>,
     }
 
@@ -503,10 +493,6 @@ mod tests {
             Arc::clone(&self.session_registry)
         }
 
-        pub(super) fn lease_manager(&self) -> Arc<LeaseManager> {
-            Arc::clone(&self.lease_manager)
-        }
-
         pub(super) fn mount_table(&self) -> Arc<MountTable> {
             Arc::clone(&self.filesystem.mount_table)
         }
@@ -521,7 +507,6 @@ mod tests {
         storage: Option<Arc<RocksDBStorage>>,
         raft_node: Option<Arc<AppRaftNode>>,
         session_registry: Option<Arc<SessionRegistry>>,
-        lease_manager: Option<Arc<LeaseManager>>,
         worker_manager: Option<Arc<WorkerManager>>,
         state_store: Option<Arc<dyn StateStore>>,
     }
@@ -533,7 +518,6 @@ mod tests {
                 storage: None,
                 raft_node: None,
                 session_registry: None,
-                lease_manager: None,
                 worker_manager: None,
                 state_store: None,
             }
@@ -555,11 +539,6 @@ mod tests {
 
         pub(super) fn with_worker_manager(mut self, worker_manager: Arc<WorkerManager>) -> Self {
             self.worker_manager = Some(worker_manager);
-            self
-        }
-
-        pub(super) fn with_lease_manager(mut self, lease_manager: Arc<LeaseManager>) -> Self {
-            self.lease_manager = Some(lease_manager);
             self
         }
 
@@ -585,14 +564,12 @@ mod tests {
             let session_registry = self
                 .session_registry
                 .unwrap_or_else(|| Arc::new(SessionRegistry::default()));
-            let lease_manager = self.lease_manager.unwrap_or_else(|| Arc::new(LeaseManager::default()));
             let filesystem = MetadataFileSystem::new(MetadataFileSystemDeps {
                 state_store: self.state_store.unwrap_or_else(|| Arc::new(MemoryStateStore::new())),
                 mount_table: self.mount_table,
                 storage,
                 raft_node: self.raft_node,
                 session_registry: Arc::clone(&session_registry),
-                lease_manager: Arc::clone(&lease_manager),
                 worker_manager: self.worker_manager,
                 metrics: None,
                 readiness_gate: None,
@@ -601,7 +578,6 @@ mod tests {
             TestFilesystem {
                 filesystem,
                 session_registry,
-                lease_manager,
                 _storage_dir: storage_dir,
             }
         }
@@ -904,10 +880,7 @@ mod tests {
         ancestor_inode_ids: Vec<InodeId>,
     ) {
         let writer = ClientId::new(7);
-        let (lease_epoch, expires_at_ms) = filesystem
-            .lease_manager()
-            .try_acquire(inode_id, writer, crate::inode_lease::WriteMode::Write, None)
-            .expect("lease acquired");
+        let lease_epoch = 1;
         let block_id = BlockId::new(inode_id, BlockIndex::new(0));
         let target = WriteTarget {
             block_id,
@@ -926,24 +899,20 @@ mod tests {
             tier: beryl_types::Tier::Hdd,
         };
         let session_registry = filesystem.session_registry();
-        let reservation = session_registry.reserve_session(writer).expect("session capacity");
-        session_registry
-            .install_reserved_session(
-                reservation,
-                crate::session_registry::CreateSessionInput {
-                    inode_id,
-                    mount_id,
-                    lease_epoch,
-                    base_size: 0,
-                    content_revision: 0,
-                    mode: crate::inode_lease::WriteMode::Write,
-                    open_client_id: writer,
-                    layout: FileLayout::new(64, 64, 1),
-                    expires_at_ms,
-                    ancestor_inode_ids,
-                },
-            )
-            .expect("session created");
+        let opening = session_registry
+            .begin_session(crate::session_registry::BeginSessionInput {
+                inode_id,
+                mount_id,
+                current_lease_epoch: Some(0),
+                base_size: 0,
+                content_revision: 0,
+                mode: crate::session_registry::WriteMode::Write,
+                open_client_id: writer,
+                layout: FileLayout::new(64, 64, 1),
+                ancestor_inode_ids,
+            })
+            .expect("session capacity");
+        opening.activate(lease_epoch).expect("session created");
         filesystem
             .session_registry()
             .install_issued_target(inode_id, lease_epoch, None, Some(64), target)
@@ -1008,8 +977,8 @@ mod tests {
                     .expect("active write session")
                     .mode
                 {
-                    crate::inode_lease::WriteMode::Write => crate::raft::PublishMode::ReplaceIfUnchanged,
-                    crate::inode_lease::WriteMode::Append => crate::raft::PublishMode::AppendIfUnchanged,
+                    crate::session_registry::WriteMode::Write => crate::raft::PublishMode::ReplaceIfUnchanged,
+                    crate::session_registry::WriteMode::Append => crate::raft::PublishMode::AppendIfUnchanged,
                 },
             )
             .await

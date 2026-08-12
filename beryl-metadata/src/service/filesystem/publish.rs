@@ -165,8 +165,8 @@ impl MetadataFileSystem {
 
     fn publish_mode_for_session(session: &crate::session_registry::WriteSession) -> PublishMode {
         match session.mode {
-            crate::inode_lease::WriteMode::Write => PublishMode::ReplaceIfUnchanged,
-            crate::inode_lease::WriteMode::Append => PublishMode::AppendIfUnchanged,
+            crate::session_registry::WriteMode::Write => PublishMode::ReplaceIfUnchanged,
+            crate::session_registry::WriteMode::Append => PublishMode::AppendIfUnchanged,
         }
     }
 
@@ -681,8 +681,8 @@ impl MetadataFileSystem {
                 .expect_err("session_terminal_failure always returns Err"));
         }
         if self
-            .lease_manager
-            .validate_lease(current.inode_id, current.lease_epoch)
+            .session_registry
+            .validate_session(current.inode_id, current.lease_epoch)
             .is_err()
         {
             return Err(self
@@ -819,8 +819,8 @@ impl MetadataFileSystem {
             );
         }
         if self
-            .lease_manager
-            .validate_lease(session.inode_id, lease_epoch)
+            .session_registry
+            .validate_session(session.inode_id, lease_epoch)
             .is_err()
         {
             return self.session_terminal_failure(
@@ -1113,8 +1113,8 @@ impl MetadataFileSystem {
 
         if sorted.is_empty() {
             let expected_final_size = match session.mode {
-                crate::inode_lease::WriteMode::Append => session.base_size,
-                crate::inode_lease::WriteMode::Write => 0,
+                crate::session_registry::WriteMode::Append => session.base_size,
+                crate::session_registry::WriteMode::Write => 0,
             };
             if intent.final_size != expected_final_size {
                 return Err(MetadataError::InvalidArgument(format!(
@@ -1126,7 +1126,7 @@ impl MetadataFileSystem {
         }
 
         match session.mode {
-            crate::inode_lease::WriteMode::Append => {
+            crate::session_registry::WriteMode::Append => {
                 let mut expected_offset = session.base_size;
                 for block in &sorted {
                     if block.file_offset != expected_offset {
@@ -1144,7 +1144,7 @@ impl MetadataFileSystem {
                     )));
                 }
             }
-            crate::inode_lease::WriteMode::Write => {
+            crate::session_registry::WriteMode::Write => {
                 let mut expected_offset = 0;
                 for block in &sorted {
                     if block.file_offset != expected_offset {
@@ -1199,9 +1199,7 @@ impl MetadataFileSystem {
                 let (group_name, mount_epoch, route_epoch) = self
                     .completed_publish_hints(ctx, freshness, mount_id, "CommitFile")
                     .await?;
-                if let Some(session) = self.session_registry.remove_session_if_epoch(inode_id, lease_epoch) {
-                    self.lease_manager.release(session.inode_id, session.lease_epoch);
-                }
+                self.session_registry.remove_session_if_epoch(inode_id, lease_epoch);
                 return self.success_with_route_epoch(
                     ctx,
                     CloseWriteOutput {
@@ -1267,8 +1265,8 @@ impl MetadataFileSystem {
             );
         }
         if self
-            .lease_manager
-            .validate_lease(session.inode_id, lease_epoch)
+            .session_registry
+            .validate_session(session.inode_id, lease_epoch)
             .is_err()
         {
             return self.session_terminal_failure(
@@ -1370,7 +1368,6 @@ impl MetadataFileSystem {
             }
         }
 
-        self.lease_manager.release(session.inode_id, session.lease_epoch);
         self.session_registry.remove_session_if_epoch(inode_id, lease_epoch);
 
         self.success_with_route_epoch(
@@ -1399,7 +1396,7 @@ mod tests {
                 &request_context(),
                 env.inode_id,
                 vec![env.inode_id],
-                crate::inode_lease::WriteMode::Write,
+                crate::session_registry::WriteMode::Write,
                 Freshness::default(),
             )
             .await
@@ -1504,7 +1501,7 @@ mod tests {
                 &request_context(),
                 env.inode_id,
                 vec![env.inode_id],
-                crate::inode_lease::WriteMode::Write,
+                crate::session_registry::WriteMode::Write,
                 Freshness::default(),
             )
             .await
@@ -1547,7 +1544,7 @@ mod tests {
                 &request_context(),
                 env.inode_id,
                 vec![env.inode_id],
-                crate::inode_lease::WriteMode::Write,
+                crate::session_registry::WriteMode::Write,
                 Freshness::default(),
             )
             .await
@@ -1595,7 +1592,7 @@ mod tests {
                 &request_context(),
                 env.inode_id,
                 vec![env.inode_id],
-                crate::inode_lease::WriteMode::Write,
+                crate::session_registry::WriteMode::Write,
                 Freshness::default(),
             )
             .await
@@ -1651,7 +1648,7 @@ mod tests {
                 &request_context(),
                 env.inode_id,
                 vec![env.inode_id],
-                crate::inode_lease::WriteMode::Write,
+                crate::session_registry::WriteMode::Write,
                 Freshness::default(),
             )
             .await
@@ -1707,7 +1704,7 @@ mod tests {
                 &request_context(),
                 env.inode_id,
                 vec![env.inode_id],
-                crate::inode_lease::WriteMode::Write,
+                crate::session_registry::WriteMode::Write,
                 Freshness::default(),
             )
             .await
@@ -1761,7 +1758,7 @@ mod tests {
                 &request_context(),
                 env.inode_id,
                 vec![env.inode_id],
-                crate::inode_lease::WriteMode::Write,
+                crate::session_registry::WriteMode::Write,
                 Freshness::default(),
             )
             .await
@@ -1872,47 +1869,6 @@ mod tests {
         assert_eq!(
             failure.error.kind,
             ErrorKind::Metadata(MetadataErrorKind::SessionInvalid)
-        );
-        assert!(matches!(
-            failure.error.recovery,
-            RecoveryAction::ReopenWriteSession { .. }
-        ));
-        assert_eq!(stored_content_revision(&env.storage, env.inode_id), None);
-    }
-
-    #[tokio::test]
-    async fn lease_released_during_ready_wait_prevents_publication() {
-        let env = write_flow_env(0).await;
-        let (open, target) = open_write_with_target(&env).await;
-        let ctx = request_context();
-        let commit = env.filesystem.close_write_session(
-            &ctx,
-            PresentedWriteHandle {
-                inode_id: open.inode_id,
-                lease_epoch: open.lease_epoch,
-            },
-            target_intent(&target, open.base_size),
-            Freshness::default(),
-            open.content_revision,
-            PublishMode::ReplaceIfUnchanged,
-        );
-        tokio::pin!(commit);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut commit)
-                .await
-                .is_err(),
-            "CommitFile must wait for Ready"
-        );
-        env.filesystem.lease_manager().release(env.inode_id, open.lease_epoch);
-        publish_env_write_target(&env, &target, 1);
-
-        let failure = tokio::time::timeout(Duration::from_secs(2), &mut commit)
-            .await
-            .expect("lease change must wake and finish publication")
-            .expect_err("a released lease must fail closed");
-        assert_eq!(
-            failure.error.kind,
-            ErrorKind::Metadata(MetadataErrorKind::SessionExpired)
         );
         assert!(matches!(
             failure.error.recovery,
@@ -2052,7 +2008,7 @@ mod tests {
                 &request_context(),
                 env.inode_id,
                 vec![env.inode_id],
-                crate::inode_lease::WriteMode::Write,
+                crate::session_registry::WriteMode::Write,
                 Freshness::default(),
             )
             .await
@@ -2108,7 +2064,7 @@ mod tests {
                 &request_context(),
                 deleting_env.inode_id,
                 vec![deleting_env.inode_id],
-                crate::inode_lease::WriteMode::Write,
+                crate::session_registry::WriteMode::Write,
                 Freshness::default(),
             )
             .await
@@ -2163,7 +2119,7 @@ mod tests {
                 &request_context(),
                 env.inode_id,
                 vec![env.inode_id],
-                crate::inode_lease::WriteMode::Write,
+                crate::session_registry::WriteMode::Write,
                 Freshness::default(),
             )
             .await

@@ -38,6 +38,8 @@ use tracing::info;
 /// prevents protobuf decoding from allocating an arbitrarily large request
 /// before service handlers can enforce those limits.
 const MAX_REQUEST_SIZE: usize = 4 * 1024 * 1024;
+/// Period between bounded leader-local write-session expiry passes.
+const WRITE_SESSION_EXPIRY_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 
 pub type DynError = Box<dyn std::error::Error>;
 
@@ -285,6 +287,7 @@ impl MetadataServer {
         let session_registry = Arc::new(crate::session_registry::SessionRegistry::new(
             write_sessions.max_active,
             write_sessions.max_active_per_client,
+            config.write_lease_timeout_ms,
         ));
         let filesystem = match build_filesystem_service_with_sessions(
             config.as_ref(),
@@ -541,7 +544,7 @@ pub(crate) async fn build_maintenance(
         Arc::clone(&authority.raft_node),
         Arc::clone(&authority.storage),
         Arc::clone(&worker.manager),
-        session_registry,
+        Arc::clone(&session_registry),
         authority.group_name.clone(),
         &config.block_cleanup,
     ));
@@ -556,6 +559,8 @@ pub(crate) async fn build_maintenance(
         Arc::clone(&cleanup),
         detached_root_reclaimer,
         Duration::from_millis(config.worker_liveness.scan_interval_ms),
+        session_registry,
+        WRITE_SESSION_EXPIRY_SCAN_INTERVAL,
     ));
     let maintenance_handle = maintenance_service.start();
 
@@ -656,6 +661,7 @@ pub async fn build_filesystem_service(
         Arc::new(crate::session_registry::SessionRegistry::new(
             config.write_session_limits.max_active,
             config.write_session_limits.max_active_per_client,
+            config.write_lease_timeout_ms,
         )),
         readiness,
     )
@@ -673,17 +679,12 @@ async fn build_filesystem_service_with_sessions(
     session_registry: Arc<crate::session_registry::SessionRegistry>,
     readiness: &Readiness,
 ) -> Result<MetadataFileSystemServiceImpl, DynError> {
-    let lease_manager = Arc::new(crate::inode_lease::LeaseManager::new(
-        config.write_lease_timeout_ms,
-        10_000,
-    ));
     let filesystem = Arc::new(MetadataFileSystem::new(MetadataFileSystemDeps {
         state_store: Arc::clone(&authority.state_store),
         mount_table: Arc::clone(&authority.mount_table),
         storage: Arc::clone(&authority.storage),
         raft_node: Some(Arc::clone(&authority.raft_node)),
         session_registry,
-        lease_manager,
         worker_manager: Some(worker_manager),
         metrics: Some(Arc::clone(&authority.metadata_metrics)),
         readiness_gate: Some(readiness.gate()),
@@ -874,7 +875,6 @@ mod tests {
             storage,
             raft_node: Some(Arc::clone(&raft_node)),
             session_registry: Arc::new(crate::session_registry::SessionRegistry::default()),
-            lease_manager: Arc::new(crate::inode_lease::LeaseManager::default()),
             worker_manager: None,
             metrics: None,
             readiness_gate: None,
