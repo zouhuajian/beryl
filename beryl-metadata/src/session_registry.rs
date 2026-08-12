@@ -8,6 +8,7 @@
 //! registry only stores continuation state needed to continue an admitted write.
 
 use crate::inode_lease::{LeaseManager, WriteMode};
+use crate::observe;
 use beryl_types::fs::InodeId;
 use beryl_types::ids::MountId;
 use beryl_types::{BlockId, BlockShape, ClientId, FileLayout, WriteTarget};
@@ -71,13 +72,52 @@ struct IssuedTarget {
     target: WriteTarget,
 }
 
-/// In-memory, leader-local registry of write sessions and admission indexes.
+/// In-memory, leader-local registry of write sessions and capacity indexes.
 ///
 /// One lock protects the primary session map and every derived inode,
 /// ancestor, and expiry index so readers never observe a partially updated
 /// session lifecycle.
 pub struct SessionRegistry {
     state: RwLock<SessionRegistryState>,
+    max_sessions: usize,
+    max_sessions_per_client: usize,
+}
+
+/// Capacity boundary that rejected one write-session reservation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteSessionLimit {
+    /// Process-wide pending plus installed session capacity.
+    Global,
+    /// Pending plus installed capacity attributed to one client ID.
+    PerClient,
+}
+
+impl WriteSessionLimit {
+    /// Stable low-cardinality label used by capacity metrics and logs.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::PerClient => "per_client",
+        }
+    }
+}
+
+/// Exact reason why a write session could not reserve leader-local capacity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WriteSessionLimitExceeded {
+    pub(crate) limit: WriteSessionLimit,
+    pub(crate) maximum: usize,
+}
+
+/// Pending write-session capacity held across local lease acquisition and Raft proposal.
+///
+/// The reservation borrows its registry, so dropping an `OpenWrite` future
+/// releases pending capacity synchronously without a detached cleanup task.
+#[must_use = "dropping the reservation releases pending write-session capacity"]
+pub(crate) struct WriteSessionReservation<'a> {
+    registry: &'a SessionRegistry,
+    client_id: ClientId,
+    armed: bool,
 }
 
 /// Primary write-session state and all indexes that must change atomically with it.
@@ -85,7 +125,11 @@ pub struct SessionRegistry {
 struct SessionRegistryState {
     /// At most one active session exists for one inode.
     sessions: HashMap<InodeId, WriteSession>,
-    /// Bounded, subtree-size-independent admission state for every ancestor of an open file.
+    /// Requests that reserved capacity but have not installed a session.
+    pending_sessions: usize,
+    /// Pending plus installed sessions attributed to each client ID.
+    occupied_sessions_by_client: HashMap<ClientId, usize>,
+    /// Bounded, subtree-size-independent activity state for every ancestor of an open file.
     ancestor_activity: HashMap<InodeId, AncestorWriteActivity>,
     /// Sessions ordered by mirrored lease expiry for amortized cleanup.
     sessions_by_expiry: BTreeSet<(u64, InodeId)>,
@@ -100,24 +144,102 @@ struct AncestorWriteActivity {
 }
 
 impl SessionRegistry {
-    /// Create one leader-local session for an inode.
-    pub fn create_session(&self, input: CreateSessionInput) -> Result<WriteSession, String> {
-        self.create_session_at(input, current_time_ms())
+    /// Create an empty leader-local registry with fixed process limits.
+    pub(crate) fn new(max_sessions: usize, max_sessions_per_client: usize) -> Self {
+        assert!(max_sessions > 0, "global write-session limit must be positive");
+        assert!(
+            max_sessions_per_client > 0 && max_sessions_per_client <= max_sessions,
+            "per-client write-session limit must be positive and not exceed the global limit"
+        );
+        observe::set_write_sessions(0, 0);
+        Self {
+            state: RwLock::new(SessionRegistryState::default()),
+            max_sessions,
+            max_sessions_per_client,
+        }
     }
 
-    /// Create a session using one explicit expiry-observation time.
+    /// Reserve one global and per-client slot without waiting or allocating durable state.
+    pub(crate) fn reserve_session(
+        &self,
+        client_id: ClientId,
+    ) -> Result<WriteSessionReservation<'_>, WriteSessionLimitExceeded> {
+        self.reserve_session_at(client_id, current_time_ms())
+    }
+
+    /// Reserve capacity after retiring one bounded batch at an explicit time.
+    fn reserve_session_at(
+        &self,
+        client_id: ClientId,
+        now_ms: u64,
+    ) -> Result<WriteSessionReservation<'_>, WriteSessionLimitExceeded> {
+        let mut state = self.state.write();
+        Self::retire_expired_sessions(&mut state, now_ms);
+        let occupied = state.sessions.len().saturating_add(state.pending_sessions);
+        if occupied >= self.max_sessions {
+            observe::record_write_session_rejected(WriteSessionLimit::Global.label());
+            return Err(WriteSessionLimitExceeded {
+                limit: WriteSessionLimit::Global,
+                maximum: self.max_sessions,
+            });
+        }
+        let client_occupied = state
+            .occupied_sessions_by_client
+            .get(&client_id)
+            .copied()
+            .unwrap_or_default();
+        if client_occupied >= self.max_sessions_per_client {
+            observe::record_write_session_rejected(WriteSessionLimit::PerClient.label());
+            return Err(WriteSessionLimitExceeded {
+                limit: WriteSessionLimit::PerClient,
+                maximum: self.max_sessions_per_client,
+            });
+        }
+
+        state.pending_sessions += 1;
+        *state.occupied_sessions_by_client.entry(client_id).or_default() += 1;
+        observe::set_write_sessions(state.pending_sessions, state.sessions.len());
+        Ok(WriteSessionReservation {
+            registry: self,
+            client_id,
+            armed: true,
+        })
+    }
+
+    /// Atomically convert one pending reservation into an installed session.
     ///
-    /// Expired conflicts are retired before uniqueness and ancestor-chain
-    /// invariants are checked.
-    fn create_session_at(&self, input: CreateSessionInput, now_ms: u64) -> Result<WriteSession, String> {
+    /// The caller must already have acquired the exact local lease and durable
+    /// fencing epoch stored in `input`. Any error leaves the reservation armed,
+    /// so its Drop path returns pending capacity.
+    pub(crate) fn install_reserved_session(
+        &self,
+        reservation: WriteSessionReservation<'_>,
+        input: CreateSessionInput,
+    ) -> Result<WriteSession, String> {
+        self.install_reserved_session_at(reservation, input, current_time_ms())
+    }
+
+    /// Install a reserved session using one explicit expiry-observation time.
+    fn install_reserved_session_at(
+        &self,
+        mut reservation: WriteSessionReservation<'_>,
+        input: CreateSessionInput,
+        now_ms: u64,
+    ) -> Result<WriteSession, String> {
+        if !std::ptr::eq(self, reservation.registry) {
+            return Err("write session reservation belongs to another registry".to_string());
+        }
+        if input.open_client_id != reservation.client_id {
+            return Err("write session reservation client mismatch".to_string());
+        }
+        Self::validate_ancestor_chain(input.inode_id, &input.ancestor_inode_ids)?;
+
         let mut state = self.state.write();
         Self::retire_expired_sessions(&mut state, now_ms);
         Self::retire_expired_session_for_inode(&mut state, input.inode_id, now_ms);
         if state.sessions.contains_key(&input.inode_id) {
             return Err("inode already has an active write session".to_string());
         }
-        Self::validate_ancestor_chain(input.inode_id, &input.ancestor_inode_ids)?;
-
         let session = WriteSession {
             inode_id: input.inode_id,
             mount_id: input.mount_id,
@@ -146,6 +268,12 @@ impl SessionRegistry {
             .sessions_by_expiry
             .insert((session.expires_at_ms, session.inode_id));
         state.sessions.insert(input.inode_id, session.clone());
+        state.pending_sessions = state
+            .pending_sessions
+            .checked_sub(1)
+            .expect("installed write session must own one pending reservation");
+        reservation.armed = false;
+        observe::set_write_sessions(state.pending_sessions, state.sessions.len());
         Ok(session)
     }
 
@@ -415,9 +543,60 @@ impl SessionRegistry {
 
     /// Remove one primary session and every derived index entry under the state lock.
     fn remove_session(state: &mut SessionRegistryState, inode_id: InodeId) -> Option<WriteSession> {
+        let client_id = state.sessions.get(&inode_id)?.open_client_id;
+        assert!(
+            state
+                .occupied_sessions_by_client
+                .get(&client_id)
+                .copied()
+                .unwrap_or_default()
+                > 0,
+            "installed write session must own one client capacity slot"
+        );
         let session = state.sessions.remove(&inode_id)?;
         Self::remove_from_indexes(state, &session);
+        Self::decrement_client_occupancy(state, session.open_client_id);
+        observe::set_write_sessions(state.pending_sessions, state.sessions.len());
         Some(session)
+    }
+
+    /// Return one pending reservation without touching installed sessions.
+    fn release_pending_reservation(&self, client_id: ClientId) {
+        let mut state = self.state.write();
+        let client_count = state
+            .occupied_sessions_by_client
+            .get(&client_id)
+            .copied()
+            .unwrap_or_default();
+        if state.pending_sessions == 0 || client_count == 0 {
+            tracing::error!(
+                client_id = %client_id,
+                pending_sessions = state.pending_sessions,
+                client_sessions = client_count,
+                "write session reservation accounting is missing; retaining capacity"
+            );
+            return;
+        }
+        state.pending_sessions -= 1;
+        Self::decrement_client_occupancy(&mut state, client_id);
+        observe::set_write_sessions(state.pending_sessions, state.sessions.len());
+    }
+
+    /// Decrement one pending-or-installed client slot and remove empty keys.
+    fn decrement_client_occupancy(state: &mut SessionRegistryState, client_id: ClientId) {
+        let remove_client = {
+            let count = state
+                .occupied_sessions_by_client
+                .get_mut(&client_id)
+                .expect("validated write-session client occupancy must exist");
+            *count = count
+                .checked_sub(1)
+                .expect("validated write-session client occupancy must be positive");
+            *count == 0
+        };
+        if remove_client {
+            state.occupied_sessions_by_client.remove(&client_id);
+        }
     }
 
     /// Remove the exact inode, global-expiry, and ancestor-expiry entries for a session.
@@ -483,6 +662,15 @@ impl SessionRegistry {
     }
 }
 
+impl Drop for WriteSessionReservation<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry.release_pending_reservation(self.client_id);
+            self.armed = false;
+        }
+    }
+}
+
 fn current_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -492,9 +680,8 @@ fn current_time_ms() -> u64 {
 
 impl Default for SessionRegistry {
     fn default() -> Self {
-        Self {
-            state: RwLock::new(SessionRegistryState::default()),
-        }
+        let config = crate::config::MetadataWriteSessionLimitsConfig::default();
+        Self::new(config.max_active, config.max_active_per_client)
     }
 }
 
@@ -540,6 +727,24 @@ mod tests {
         }
     }
 
+    fn install_session(registry: &SessionRegistry, input: CreateSessionInput) -> Result<WriteSession, String> {
+        let reservation = registry
+            .reserve_session(input.open_client_id)
+            .map_err(|exceeded| format!("write session rejected by {} limit", exceeded.limit.label()))?;
+        registry.install_reserved_session(reservation, input)
+    }
+
+    fn install_session_at(
+        registry: &SessionRegistry,
+        input: CreateSessionInput,
+        now_ms: u64,
+    ) -> Result<WriteSession, String> {
+        let reservation = registry
+            .reserve_session_at(input.open_client_id, now_ms)
+            .map_err(|exceeded| format!("write session rejected by {} limit", exceeded.limit.label()))?;
+        registry.install_reserved_session_at(reservation, input, now_ms)
+    }
+
     fn issue_target(
         registry: &SessionRegistry,
         inode_id: InodeId,
@@ -559,12 +764,127 @@ mod tests {
     }
 
     #[test]
+    fn pending_and_installed_sessions_share_global_capacity() {
+        let registry = SessionRegistry::new(2, 2);
+        install_session(&registry, create_input(InodeId::new(1))).unwrap();
+        let pending = registry.reserve_session(ClientId::new(1)).unwrap();
+
+        let rejection = match registry.reserve_session(ClientId::new(2)) {
+            Ok(_) => panic!("global capacity must reject limit plus one"),
+            Err(rejection) => rejection,
+        };
+        assert_eq!(
+            rejection,
+            WriteSessionLimitExceeded {
+                limit: WriteSessionLimit::Global,
+                maximum: 2,
+            }
+        );
+
+        drop(pending);
+        let replacement = registry.reserve_session(ClientId::new(2)).unwrap();
+        drop(replacement);
+        assert!(registry.remove_session_if_epoch(InodeId::new(1), 7).is_some());
+        let state = registry.state.read();
+        assert_eq!(state.pending_sessions, 0);
+        assert!(state.sessions.is_empty());
+        assert!(state.occupied_sessions_by_client.is_empty());
+    }
+
+    #[test]
+    fn per_client_capacity_does_not_block_another_client() {
+        let registry = SessionRegistry::new(3, 1);
+        install_session(&registry, create_input(InodeId::new(1))).unwrap();
+
+        let rejection = match registry.reserve_session(ClientId::new(1)) {
+            Ok(_) => panic!("per-client capacity must reject limit plus one"),
+            Err(rejection) => rejection,
+        };
+        assert_eq!(
+            rejection,
+            WriteSessionLimitExceeded {
+                limit: WriteSessionLimit::PerClient,
+                maximum: 1,
+            }
+        );
+        let other_client = registry.reserve_session(ClientId::new(2)).unwrap();
+        drop(other_client);
+    }
+
+    #[test]
+    fn dropped_or_invalid_reservations_restore_capacity() {
+        let registry = SessionRegistry::new(1, 1);
+        let pending = registry.reserve_session(ClientId::new(1)).unwrap();
+        drop(pending);
+
+        let reservation = registry.reserve_session(ClientId::new(1)).unwrap();
+        let mut mismatched = create_input(InodeId::new(1));
+        mismatched.open_client_id = ClientId::new(2);
+        assert_eq!(
+            registry.install_reserved_session(reservation, mismatched).unwrap_err(),
+            "write session reservation client mismatch"
+        );
+
+        let replacement = registry.reserve_session(ClientId::new(1)).unwrap();
+        drop(replacement);
+        let state = registry.state.read();
+        assert_eq!(state.pending_sessions, 0);
+        assert!(state.occupied_sessions_by_client.is_empty());
+    }
+
+    #[test]
+    fn concurrent_reservations_never_exceed_global_capacity() {
+        let registry = std::sync::Arc::new(SessionRegistry::new(4, 4));
+        let contender_count = 16;
+        let start = std::sync::Arc::new(std::sync::Barrier::new(contender_count + 1));
+        let release = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let mut joins = Vec::new();
+
+        for _ in 0..contender_count {
+            let registry = std::sync::Arc::clone(&registry);
+            let start = std::sync::Arc::clone(&start);
+            let release = std::sync::Arc::clone(&release);
+            let result_tx = result_tx.clone();
+            joins.push(std::thread::spawn(move || {
+                start.wait();
+                let reservation = registry.reserve_session(ClientId::new(1));
+                result_tx.send(reservation.is_ok()).unwrap();
+                if let Ok(reservation) = reservation {
+                    let (released, wake) = &*release;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                    drop(reservation);
+                }
+            }));
+        }
+        drop(result_tx);
+        start.wait();
+        let reserved = (0..contender_count)
+            .filter(|_| result_rx.recv().expect("reservation result"))
+            .count();
+        assert_eq!(reserved, 4);
+
+        let (released, wake) = &*release;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+        for join in joins {
+            join.join().unwrap();
+        }
+        let state = registry.state.read();
+        assert_eq!(state.pending_sessions, 0);
+        assert!(state.occupied_sessions_by_client.is_empty());
+    }
+
+    #[test]
     fn one_inode_has_at_most_one_active_session() {
         let registry = SessionRegistry::default();
         let inode_id = InodeId::new(10);
-        registry.create_session(create_input(inode_id)).unwrap();
+        install_session(&registry, create_input(inode_id)).unwrap();
 
-        assert!(registry.create_session(create_input(inode_id)).is_err());
+        assert!(install_session(&registry, create_input(inode_id)).is_err());
         assert_eq!(registry.get_session(inode_id).unwrap().lease_epoch, 7);
         assert!(registry.remove_session_if_epoch(inode_id, 7).is_some());
         assert!(registry.get_session(inode_id).is_none());
@@ -574,11 +894,11 @@ mod tests {
     fn delayed_cleanup_cannot_remove_a_newer_session() {
         let registry = SessionRegistry::default();
         let inode_id = InodeId::new(20);
-        registry.create_session(create_input(inode_id)).unwrap();
+        install_session(&registry, create_input(inode_id)).unwrap();
         registry.remove_session_if_epoch(inode_id, 7).unwrap();
         let mut replacement = create_input(inode_id);
         replacement.lease_epoch = 8;
-        registry.create_session(replacement).unwrap();
+        install_session(&registry, replacement).unwrap();
 
         assert!(registry.remove_session_if_epoch(inode_id, 7).is_none());
         assert_eq!(registry.get_session(inode_id).unwrap().lease_epoch, 8);
@@ -596,8 +916,8 @@ mod tests {
         let mut second = create_input(second_handle);
         second.ancestor_inode_ids = vec![root_inode_id, directory_inode_id, second.inode_id];
 
-        registry.create_session(first).unwrap();
-        registry.create_session(second).unwrap();
+        install_session(&registry, first).unwrap();
+        install_session(&registry, second).unwrap();
         assert!(registry.has_active_write_under(root_inode_id));
         assert!(registry.has_active_write_under(directory_inode_id));
         assert!(registry.has_active_write_under(InodeId::new(first_handle.as_raw())));
@@ -621,7 +941,7 @@ mod tests {
         input.expires_at_ms = 0;
         input.ancestor_inode_ids = vec![root_inode_id, input.inode_id];
 
-        registry.create_session(input).unwrap();
+        install_session(&registry, input).unwrap();
 
         assert!(!registry.has_active_write_under(root_inode_id));
         assert!(!registry.has_active_write_under(InodeId::new(inode_id.as_raw())));
@@ -639,7 +959,7 @@ mod tests {
         let mut input = create_input(inode_id);
         input.expires_at_ms = 1;
         input.ancestor_inode_ids = vec![root_inode_id, input.inode_id];
-        registry.create_session_at(input, 0).unwrap();
+        install_session_at(&registry, input, 0).unwrap();
 
         registry
             .update_expiration(inode_id, 7, u64::MAX)
@@ -672,8 +992,8 @@ mod tests {
         active.expires_at_ms = current_time_ms().saturating_add(10_000);
         active.ancestor_inode_ids = vec![root_inode_id, active.inode_id];
 
-        registry.create_session(expired).unwrap();
-        registry.create_session(active).unwrap();
+        install_session(&registry, expired).unwrap();
+        install_session(&registry, active).unwrap();
         {
             let state = registry.state.read();
             assert_eq!(state.sessions.len(), 1);
@@ -694,14 +1014,14 @@ mod tests {
 
     #[test]
     fn expiry_sweep_is_bounded_and_queries_ignore_residual_expired_entries() {
-        let registry = SessionRegistry::default();
         let historical_expired_count = 4_096;
+        let registry = SessionRegistry::new(historical_expired_count + 1, historical_expired_count + 1);
         let residual_expired_count = MAX_EXPIRED_SESSION_RETIREMENTS_PER_CALL * 2 + 3;
         for raw in 1..=historical_expired_count {
             let inode_id = InodeId::new(raw as u64);
             let mut input = create_input(inode_id);
             input.expires_at_ms = 10;
-            registry.create_session_at(input, 0).unwrap();
+            install_session_at(&registry, input, 0).unwrap();
         }
         for raw in 1..=(historical_expired_count - residual_expired_count) {
             registry.remove_session_if_epoch(InodeId::new(raw as u64), 7).unwrap();
@@ -710,7 +1030,7 @@ mod tests {
         let mut active = create_input(active_inode_id);
         active.expires_at_ms = 20;
         active.ancestor_inode_ids = vec![active_inode_id];
-        registry.create_session_at(active, 0).unwrap();
+        install_session_at(&registry, active, 0).unwrap();
 
         assert!(registry.has_active_write_under_at(active_inode_id, 11));
         {
@@ -759,7 +1079,7 @@ mod tests {
         let root_inode_id = InodeId::new(1);
         let mut input = create_input(inode_id);
         input.ancestor_inode_ids = vec![root_inode_id, input.inode_id];
-        old_registry.create_session(input).unwrap();
+        install_session(&old_registry, input).unwrap();
         assert!(old_registry.has_active_write_under(root_inode_id));
 
         let new_registry = SessionRegistry::default();
@@ -770,7 +1090,7 @@ mod tests {
     fn add_block_replays_by_predecessor_without_advancing() {
         let registry = SessionRegistry::default();
         let inode_id = InodeId::new(11);
-        registry.create_session(create_input(inode_id)).unwrap();
+        install_session(&registry, create_input(inode_id)).unwrap();
 
         assert!(registry
             .lookup_issued_target(inode_id, 7, None, Some(32))
@@ -792,7 +1112,7 @@ mod tests {
     fn concurrent_duplicate_add_block_installs_one_target_and_returns_one_result() {
         let registry = std::sync::Arc::new(SessionRegistry::default());
         let inode_id = InodeId::new(15);
-        registry.create_session(create_input(inode_id)).unwrap();
+        install_session(&registry, create_input(inode_id)).unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
 
         let mut joins = Vec::new();
@@ -821,7 +1141,7 @@ mod tests {
     fn add_block_rejects_payload_drift_and_stale_lease_epoch() {
         let registry = SessionRegistry::default();
         let inode_id = InodeId::new(12);
-        registry.create_session(create_input(inode_id)).unwrap();
+        install_session(&registry, create_input(inode_id)).unwrap();
         issue_target(&registry, inode_id, None, 32, 0, 0, 1);
 
         assert!(registry.lookup_issued_target(inode_id, 7, None, Some(64)).is_err());
@@ -833,7 +1153,7 @@ mod tests {
     fn add_block_rejects_a_gap_in_the_predecessor_chain() {
         let registry = SessionRegistry::default();
         let inode_id = InodeId::new(13);
-        registry.create_session(create_input(inode_id)).unwrap();
+        install_session(&registry, create_input(inode_id)).unwrap();
         let unknown = BlockId::new(inode_id, BlockIndex::new(99));
 
         assert!(registry
@@ -847,7 +1167,7 @@ mod tests {
     fn new_target_uses_next_content_revision_while_replay_keeps_original_stamp() {
         let registry = SessionRegistry::default();
         let inode_id = InodeId::new(14);
-        registry.create_session(create_input(inode_id)).unwrap();
+        install_session(&registry, create_input(inode_id)).unwrap();
 
         let first = issue_target(&registry, inode_id, None, 32, 0, 0, 1);
         assert_eq!(first.block_stamp, 1);
@@ -869,7 +1189,7 @@ mod tests {
     fn add_block_completion_cannot_install_a_target_from_an_old_revision() {
         let registry = SessionRegistry::default();
         let inode_id = InodeId::new(16);
-        registry.create_session(create_input(inode_id)).unwrap();
+        install_session(&registry, create_input(inode_id)).unwrap();
         let first = issue_target(&registry, inode_id, None, 32, 0, 0, 1);
         registry
             .update_published_state(inode_id, 7, 1, 32)

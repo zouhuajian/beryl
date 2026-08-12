@@ -15,6 +15,10 @@ beryl.metadata.rpc.max-concurrent-requests-per-connection: 16
 beryl.metadata.rpc.reserved-control-requests: 8
 beryl.metadata.http.port: 18081
 
+# -------------------- Write-session limits --------------------
+beryl.metadata.write-session.max-active: 1024
+beryl.metadata.write-session.max-active-per-client: 64
+
 # -------------------- Storage --------------------
 beryl.metadata.storage.dir: "data/metadata"
 

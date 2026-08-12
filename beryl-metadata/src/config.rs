@@ -24,6 +24,8 @@ const RPC_PORT: &str = "beryl.metadata.rpc.port";
 const RPC_MAX_CONCURRENT_REQUESTS: &str = "beryl.metadata.rpc.max-concurrent-requests";
 const RPC_MAX_CONCURRENT_REQUESTS_PER_CONNECTION: &str = "beryl.metadata.rpc.max-concurrent-requests-per-connection";
 const RPC_RESERVED_CONTROL_REQUESTS: &str = "beryl.metadata.rpc.reserved-control-requests";
+const WRITE_SESSION_MAX_ACTIVE: &str = "beryl.metadata.write-session.max-active";
+const WRITE_SESSION_MAX_ACTIVE_PER_CLIENT: &str = "beryl.metadata.write-session.max-active-per-client";
 const HTTP_PORT: &str = "beryl.metadata.http.port";
 const STORAGE_DIR: &str = "beryl.metadata.storage.dir";
 const LIST_DEFAULT_PAGE_SIZE: &str = "beryl.metadata.namespace.list.default-page-size";
@@ -61,6 +63,8 @@ const KNOWN_KEYS: &[&str] = &[
     RPC_MAX_CONCURRENT_REQUESTS,
     RPC_MAX_CONCURRENT_REQUESTS_PER_CONNECTION,
     RPC_RESERVED_CONTROL_REQUESTS,
+    WRITE_SESSION_MAX_ACTIVE,
+    WRITE_SESSION_MAX_ACTIVE_PER_CLIENT,
     HTTP_PORT,
     STORAGE_DIR,
     LIST_DEFAULT_PAGE_SIZE,
@@ -109,6 +113,8 @@ pub struct MetadataConfig {
     pub rpc_port: u16,
     /// Immediate inbound RPC concurrency policy.
     pub rpc_concurrency: MetadataRpcConcurrencyConfig,
+    /// Leader-local write-session capacity limits.
+    pub write_session_limits: MetadataWriteSessionLimitsConfig,
     /// Process-owned HTTP port for metrics, health, and future APIs.
     pub http_port: u16,
     /// Local directory for authoritative Metadata state.
@@ -147,6 +153,15 @@ pub struct MetadataRpcConcurrencyConfig {
     pub max_concurrent_requests_per_connection: usize,
     /// Capacity protected from filesystem RPCs for Worker and health traffic.
     pub reserved_control_requests: usize,
+}
+
+/// Bounds pending and installed write sessions owned by one Metadata leader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataWriteSessionLimitsConfig {
+    /// Maximum pending plus installed sessions across all clients.
+    pub max_active: usize,
+    /// Maximum pending plus installed sessions attributed to one client ID.
+    pub max_active_per_client: usize,
 }
 
 impl MetadataConfig {
@@ -290,6 +305,15 @@ impl Default for MetadataRpcConcurrencyConfig {
     }
 }
 
+impl Default for MetadataWriteSessionLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_active: 1_024,
+            max_active_per_client: 64,
+        }
+    }
+}
+
 impl NamespaceListConfig {
     pub fn try_new(default_page_size: u32, max_page_size: u32) -> Result<Self, CommonError> {
         if default_page_size == 0 {
@@ -347,6 +371,7 @@ impl Default for MetadataConfig {
             bind_host,
             rpc_port: 18080,
             rpc_concurrency: MetadataRpcConcurrencyConfig::default(),
+            write_session_limits: MetadataWriteSessionLimitsConfig::default(),
             http_port: 18081,
             storage_dir: PathBuf::from("data/metadata"),
             raft: RaftConfig::default(),
@@ -417,6 +442,16 @@ impl MetadataConfig {
             )?,
         };
         validate_rpc_concurrency(&rpc_concurrency)?;
+        let write_session_defaults = MetadataWriteSessionLimitsConfig::default();
+        let write_session_limits = MetadataWriteSessionLimitsConfig {
+            max_active: positive_usize_or(flat, WRITE_SESSION_MAX_ACTIVE, write_session_defaults.max_active)?,
+            max_active_per_client: positive_usize_or(
+                flat,
+                WRITE_SESSION_MAX_ACTIVE_PER_CLIENT,
+                write_session_defaults.max_active_per_client,
+            )?,
+        };
+        validate_write_session_limits(&write_session_limits)?;
         let storage_dir = PathBuf::from(string_or(flat, STORAGE_DIR, defaults.storage_dir.to_str().unwrap())?);
         let observability = ObservabilityConfig::from_flat(flat)?;
 
@@ -520,6 +555,7 @@ impl MetadataConfig {
             bind_host,
             rpc_port,
             rpc_concurrency,
+            write_session_limits,
             http_port,
             storage_dir,
             raft: RaftConfig::default(),
@@ -554,6 +590,17 @@ fn validate_rpc_concurrency(config: &MetadataRpcConcurrencyConfig) -> Result<(),
         return Err(invalid_config(
             RPC_RESERVED_CONTROL_REQUESTS,
             "must be smaller than the server-wide maximum",
+        ));
+    }
+    Ok(())
+}
+
+/// Preserves the relationship between global and per-client write-session limits.
+fn validate_write_session_limits(config: &MetadataWriteSessionLimitsConfig) -> Result<(), CommonError> {
+    if config.max_active_per_client > config.max_active {
+        return Err(invalid_config(
+            WRITE_SESSION_MAX_ACTIVE_PER_CLIENT,
+            "must not exceed the global write-session maximum",
         ));
     }
     Ok(())
@@ -724,6 +771,8 @@ mod tests {
         flat.set(RPC_MAX_CONCURRENT_REQUESTS, 32i64);
         flat.set(RPC_MAX_CONCURRENT_REQUESTS_PER_CONNECTION, 8i64);
         flat.set(RPC_RESERVED_CONTROL_REQUESTS, 4i64);
+        flat.set(WRITE_SESSION_MAX_ACTIVE, 256i64);
+        flat.set(WRITE_SESSION_MAX_ACTIVE_PER_CLIENT, 16i64);
         flat.set(HTTP_PORT, 28081i64);
         flat.set(BLOCK_CLEANUP_INTERVAL, "2s");
         flat.set(NAMESPACE_DELETE_MAX_SIZE, "1MiB");
@@ -741,6 +790,13 @@ mod tests {
                 max_concurrent_requests: 32,
                 max_concurrent_requests_per_connection: 8,
                 reserved_control_requests: 4,
+            }
+        );
+        assert_eq!(
+            config.write_session_limits,
+            MetadataWriteSessionLimitsConfig {
+                max_active: 256,
+                max_active_per_client: 16,
             }
         );
         assert_eq!(config.http_addr(), "127.0.0.1:28081".parse().unwrap());
@@ -795,6 +851,11 @@ mod tests {
             RPC_MAX_CONCURRENT_REQUESTS,
             i64::try_from(MAX_GRPC_CONCURRENT_REQUESTS + 1).unwrap(),
         );
+        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
+
+        let mut flat = base_flat();
+        flat.set(WRITE_SESSION_MAX_ACTIVE, 8i64);
+        flat.set(WRITE_SESSION_MAX_ACTIVE_PER_CLIENT, 9i64);
         assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
     }
 

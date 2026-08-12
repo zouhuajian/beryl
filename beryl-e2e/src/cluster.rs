@@ -842,6 +842,7 @@ fn metadata_config(
         bind_host: rpc_addr.ip(),
         rpc_port: rpc_addr.port(),
         rpc_concurrency: Default::default(),
+        write_session_limits: Default::default(),
         http_port: rpc_addr.port().saturating_add(1),
         storage_dir,
         raft: RaftConfig::default(),

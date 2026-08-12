@@ -520,6 +520,7 @@ mod tests {
         mount_table: Arc<MountTable>,
         storage: Option<Arc<RocksDBStorage>>,
         raft_node: Option<Arc<AppRaftNode>>,
+        session_registry: Option<Arc<SessionRegistry>>,
         lease_manager: Option<Arc<LeaseManager>>,
         worker_manager: Option<Arc<WorkerManager>>,
         state_store: Option<Arc<dyn StateStore>>,
@@ -531,6 +532,7 @@ mod tests {
                 mount_table,
                 storage: None,
                 raft_node: None,
+                session_registry: None,
                 lease_manager: None,
                 worker_manager: None,
                 state_store: None,
@@ -561,6 +563,11 @@ mod tests {
             self
         }
 
+        pub(super) fn with_session_registry(mut self, session_registry: Arc<SessionRegistry>) -> Self {
+            self.session_registry = Some(session_registry);
+            self
+        }
+
         pub(super) fn with_state_store(mut self, state_store: Arc<dyn StateStore>) -> Self {
             self.state_store = Some(state_store);
             self
@@ -575,7 +582,9 @@ mod tests {
                     (storage, Some(storage_dir))
                 }
             };
-            let session_registry = Arc::new(SessionRegistry::default());
+            let session_registry = self
+                .session_registry
+                .unwrap_or_else(|| Arc::new(SessionRegistry::default()));
             let lease_manager = self.lease_manager.unwrap_or_else(|| Arc::new(LeaseManager::default()));
             let filesystem = MetadataFileSystem::new(MetadataFileSystemDeps {
                 state_store: self.state_store.unwrap_or_else(|| Arc::new(MemoryStateStore::new())),
@@ -916,20 +925,24 @@ mod tests {
             block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
             tier: beryl_types::Tier::Hdd,
         };
-        filesystem
-            .session_registry()
-            .create_session(crate::session_registry::CreateSessionInput {
-                inode_id,
-                mount_id,
-                lease_epoch,
-                base_size: 0,
-                content_revision: 0,
-                mode: crate::inode_lease::WriteMode::Write,
-                open_client_id: writer,
-                layout: FileLayout::new(64, 64, 1),
-                expires_at_ms,
-                ancestor_inode_ids,
-            })
+        let session_registry = filesystem.session_registry();
+        let reservation = session_registry.reserve_session(writer).expect("session capacity");
+        session_registry
+            .install_reserved_session(
+                reservation,
+                crate::session_registry::CreateSessionInput {
+                    inode_id,
+                    mount_id,
+                    lease_epoch,
+                    base_size: 0,
+                    content_revision: 0,
+                    mode: crate::inode_lease::WriteMode::Write,
+                    open_client_id: writer,
+                    layout: FileLayout::new(64, 64, 1),
+                    expires_at_ms,
+                    ancestor_inode_ids,
+                },
+            )
             .expect("session created");
         filesystem
             .session_registry()

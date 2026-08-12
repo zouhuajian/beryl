@@ -67,6 +67,10 @@ pub enum MetadataError {
     #[error("resource exhausted: {0}")]
     ResourceExhausted(String),
 
+    /// Transient leader-local write-session capacity exhaustion.
+    #[error("write-session limit exceeded: {0}")]
+    WriteSessionLimitExceeded(String),
+
     /// Lease fenced: expected epoch >= {expected}, got {got}.
     #[error("lease fenced: expected epoch >= {expected}, got {got}")]
     LeaseFenced { expected: u64, got: u64 },
@@ -171,6 +175,11 @@ fn map_shared_rpc_error(err: MetadataError) -> Result<RpcErrorDetail, MetadataEr
             Some(1000),
             format!("service unavailable: {}", msg),
         )),
+        MetadataError::WriteSessionLimitExceeded(msg) => Ok(RpcErrorDetail::retry(
+            ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted),
+            None,
+            format!("write-session limit exceeded: {msg}"),
+        )),
         MetadataError::ResourceExhausted(msg) => Ok(RpcErrorDetail::fail(
             ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted),
             format!("resource exhausted: {}", msg),
@@ -242,6 +251,7 @@ fn map_rpc_application_error(err: MetadataError) -> RpcErrorDetail {
         | MetadataError::FullReportRequired(_)
         | MetadataError::LeaseFenced { .. }
         | MetadataError::ResourceExhausted(_)
+        | MetadataError::WriteSessionLimitExceeded(_)
         | MetadataError::ServiceUnavailable(_) => unreachable!("shared metadata errors must be mapped earlier"),
     }
 }
@@ -355,5 +365,15 @@ mod tests {
 
         assert_eq!(error.kind, ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted));
         assert_eq!(error.recovery, RecoveryAction::Fail);
+    }
+
+    #[test]
+    fn write_session_limit_exceeded_is_retryable_resource_exhaustion() {
+        let error = to_rpc_error(MetadataError::WriteSessionLimitExceeded(
+            "global limit 1024 reached".to_string(),
+        ));
+
+        assert_eq!(error.kind, ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted));
+        assert_eq!(error.recovery, RecoveryAction::Retry { after_ms: None });
     }
 }

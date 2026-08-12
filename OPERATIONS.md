@@ -156,6 +156,17 @@ the per-connection value at or below the service-wide value and the control
 reserve below the service-wide value. The shipped defaults are `64`, `16`, and
 `8`, respectively.
 
+Write-session limits are also restart-only:
+
+- `beryl.metadata.write-session.max-active` bounds pending plus installed
+  write sessions across the Metadata leader.
+- `beryl.metadata.write-session.max-active-per-client` bounds the same states
+  attributed to one client ID. Client IDs are fairness keys, not authenticated
+  tenant identities.
+
+Excess `OpenWrite` calls fail before local lease acquisition or a Raft proposal.
+The shipped defaults are `1024` globally and `64` per client.
+
 The current alpha supports clean installation and same-version restart only.
 Do not perform an in-place upgrade, downgrade, mixed-version deployment, or
 rollback with these procedures.
