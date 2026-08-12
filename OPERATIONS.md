@@ -167,6 +167,19 @@ Write-session limits are also restart-only:
 Excess `OpenWrite` calls fail before an opening can submit a Raft proposal.
 The shipped defaults are `1024` globally and `64` per client.
 
+Write-target limits are restart-only and count both AddBlock requests pending
+allocation and targets already issued to active sessions:
+
+- `beryl.metadata.write-target.max-outstanding` bounds pending plus issued
+  targets across the Metadata process.
+- `beryl.metadata.write-target.max-outstanding-per-session` bounds the same
+  target states for one active write session.
+
+Existing predecessor replay does not consume another target slot. New
+limit-plus-one requests fail before `AllocateBlock` is proposed through Raft.
+The shipped defaults are `65536` globally and `10000` per session. The
+per-session value cannot exceed the compiled file extent maximum.
+
 The current alpha supports clean installation and same-version restart only.
 Do not perform an in-place upgrade, downgrade, mixed-version deployment, or
 rollback with these procedures.
@@ -220,6 +233,8 @@ Useful Metadata signals:
 - filesystem and RPC request totals and duration histograms
 - `metadata_write_sessions`, labeled by `state=opening|active`, plus
   write-session capacity rejections and expired-session retirements
+- `metadata_write_targets`, labeled by `state=pending|issued`, plus
+  write-target capacity rejections by global or per-session scope
 - `grpc_server_requests_inflight` and
   `grpc_server_concurrency_rejections_total`, labeled by traffic class and limit
   scope

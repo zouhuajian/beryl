@@ -19,6 +19,10 @@ beryl.metadata.http.port: 18081
 beryl.metadata.write-session.max-active: 1024
 beryl.metadata.write-session.max-active-per-client: 64
 
+# -------------------- Write-target limits --------------------
+beryl.metadata.write-target.max-outstanding: 65536
+beryl.metadata.write-target.max-outstanding-per-session: 10000
+
 # -------------------- Storage --------------------
 beryl.metadata.storage.dir: "data/metadata"
 

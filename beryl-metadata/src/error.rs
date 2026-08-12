@@ -71,6 +71,10 @@ pub enum MetadataError {
     #[error("write-session limit exceeded: {0}")]
     WriteSessionLimitExceeded(String),
 
+    /// Transient process-wide pending plus issued write-target exhaustion.
+    #[error("global write-target limit exceeded: {0}")]
+    GlobalWriteTargetLimitExceeded(String),
+
     /// Lease fenced: expected epoch >= {expected}, got {got}.
     #[error("lease fenced: expected epoch >= {expected}, got {got}")]
     LeaseFenced { expected: u64, got: u64 },
@@ -180,6 +184,11 @@ fn map_shared_rpc_error(err: MetadataError) -> Result<RpcErrorDetail, MetadataEr
             None,
             format!("write-session limit exceeded: {msg}"),
         )),
+        MetadataError::GlobalWriteTargetLimitExceeded(msg) => Ok(RpcErrorDetail::retry(
+            ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted),
+            None,
+            format!("global write-target limit exceeded: {msg}"),
+        )),
         MetadataError::ResourceExhausted(msg) => Ok(RpcErrorDetail::fail(
             ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted),
             format!("resource exhausted: {}", msg),
@@ -252,6 +261,7 @@ fn map_rpc_application_error(err: MetadataError) -> RpcErrorDetail {
         | MetadataError::LeaseFenced { .. }
         | MetadataError::ResourceExhausted(_)
         | MetadataError::WriteSessionLimitExceeded(_)
+        | MetadataError::GlobalWriteTargetLimitExceeded(_)
         | MetadataError::ServiceUnavailable(_) => unreachable!("shared metadata errors must be mapped earlier"),
     }
 }
@@ -371,6 +381,16 @@ mod tests {
     fn write_session_limit_exceeded_is_retryable_resource_exhaustion() {
         let error = to_rpc_error(MetadataError::WriteSessionLimitExceeded(
             "global limit 1024 reached".to_string(),
+        ));
+
+        assert_eq!(error.kind, ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted));
+        assert_eq!(error.recovery, RecoveryAction::Retry { after_ms: None });
+    }
+
+    #[test]
+    fn global_write_target_limit_exceeded_is_retryable_resource_exhaustion() {
+        let error = to_rpc_error(MetadataError::GlobalWriteTargetLimitExceeded(
+            "global limit 65536 reached".to_string(),
         ));
 
         assert_eq!(error.kind, ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted));

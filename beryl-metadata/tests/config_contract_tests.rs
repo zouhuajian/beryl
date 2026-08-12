@@ -18,6 +18,8 @@ fn repository_metadata_configs_define_runtime_contract() {
     assert_eq!(config.http_port, 18081);
     assert_eq!(config.write_session_limits.max_active, 1024);
     assert_eq!(config.write_session_limits.max_active_per_client, 64);
+    assert_eq!(config.write_target_limits.max_outstanding, 65_536);
+    assert_eq!(config.write_target_limits.max_outstanding_per_session, 10_000);
 }
 
 fn repo_root() -> PathBuf {

@@ -11,8 +11,8 @@ use beryl_client::{ClientConfig, FsClient};
 use beryl_common::observe::ObservabilityConfig;
 use beryl_common::FlatConfig;
 use beryl_metadata::config::{
-    BlockCleanupConfig, MetadataAuthorityConfig, MetadataConfig, NamespaceDeleteConfig, RaftConfig, StartupConfig,
-    WorkerLivenessConfig,
+    BlockCleanupConfig, MetadataAuthorityConfig, MetadataConfig, MetadataWriteTargetLimitsConfig,
+    NamespaceDeleteConfig, RaftConfig, StartupConfig, WorkerLivenessConfig,
 };
 use beryl_metadata::lifecycle::format_metadata_storage;
 use beryl_metadata::lifecycle::prepare_metadata_start;
@@ -69,6 +69,19 @@ pub struct TestCluster {
 impl TestCluster {
     pub async fn start() -> TestResult<Self> {
         Self::start_with_cleanup_options(None, None).await
+    }
+
+    /// Starts an isolated cluster whose next external Metadata process uses low target limits.
+    pub async fn start_with_write_target_limits(
+        max_outstanding: usize,
+        max_outstanding_per_session: usize,
+    ) -> TestResult<Self> {
+        let mut cluster = Self::start().await?;
+        cluster.metadata_config.write_target_limits = MetadataWriteTargetLimitsConfig {
+            max_outstanding,
+            max_outstanding_per_session,
+        };
+        Ok(cluster)
     }
 
     /// Starts a cluster with short cleanup timing for lifecycle tests.
@@ -647,6 +660,8 @@ beryl.metadata.bind-host: {rpc_host:?}
 beryl.metadata.rpc.port: {rpc_port}
 beryl.metadata.http.port: {http_port}
 beryl.metadata.storage.dir: {storage_dir:?}
+beryl.metadata.write-target.max-outstanding: {write_target_max_outstanding}
+beryl.metadata.write-target.max-outstanding-per-session: {write_target_max_outstanding_per_session}
 beryl.metadata.block.cleanup.enabled: {cleanup_enabled}
 beryl.metadata.block.cleanup.interval: {cleanup_scan_interval_ms}ms
 beryl.metadata.block.cleanup.grace-period: {cleanup_reclaim_grace_ms}ms
@@ -667,6 +682,9 @@ beryl.logging.level: "warn,openraft=warn"
             rpc_host = self.metadata_addr.ip().to_string(),
             rpc_port = self.metadata_addr.port(),
             http_port = http_addr.port(),
+            write_target_max_outstanding = self.metadata_config.write_target_limits.max_outstanding,
+            write_target_max_outstanding_per_session =
+                self.metadata_config.write_target_limits.max_outstanding_per_session,
             cleanup_scan_interval_ms = self.metadata_config.block_cleanup.scan_interval_ms,
             cleanup_reclaim_grace_ms = self.metadata_config.block_cleanup.reclaim_grace_ms,
             cleanup_max_replicas_per_scan = self.metadata_config.block_cleanup.max_replicas_per_scan,
@@ -843,6 +861,7 @@ fn metadata_config(
         rpc_port: rpc_addr.port(),
         rpc_concurrency: Default::default(),
         write_session_limits: Default::default(),
+        write_target_limits: Default::default(),
         http_port: rpc_addr.port().saturating_add(1),
         storage_dir,
         raft: RaftConfig::default(),

@@ -13,7 +13,7 @@ use beryl_common::error::{CommonError, CommonErrorKind};
 use beryl_common::grpc_server::MAX_GRPC_CONCURRENT_REQUESTS;
 use beryl_common::observe::config::{LogConfig, ResourceConfig};
 use beryl_common::observe::ObservabilityConfig;
-use beryl_types::GroupName;
+use beryl_types::{GroupName, MAX_FILE_EXTENTS};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
@@ -26,6 +26,8 @@ const RPC_MAX_CONCURRENT_REQUESTS_PER_CONNECTION: &str = "beryl.metadata.rpc.max
 const RPC_RESERVED_CONTROL_REQUESTS: &str = "beryl.metadata.rpc.reserved-control-requests";
 const WRITE_SESSION_MAX_ACTIVE: &str = "beryl.metadata.write-session.max-active";
 const WRITE_SESSION_MAX_ACTIVE_PER_CLIENT: &str = "beryl.metadata.write-session.max-active-per-client";
+const WRITE_TARGET_MAX_OUTSTANDING: &str = "beryl.metadata.write-target.max-outstanding";
+const WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION: &str = "beryl.metadata.write-target.max-outstanding-per-session";
 const HTTP_PORT: &str = "beryl.metadata.http.port";
 const STORAGE_DIR: &str = "beryl.metadata.storage.dir";
 const LIST_DEFAULT_PAGE_SIZE: &str = "beryl.metadata.namespace.list.default-page-size";
@@ -65,6 +67,8 @@ const KNOWN_KEYS: &[&str] = &[
     RPC_RESERVED_CONTROL_REQUESTS,
     WRITE_SESSION_MAX_ACTIVE,
     WRITE_SESSION_MAX_ACTIVE_PER_CLIENT,
+    WRITE_TARGET_MAX_OUTSTANDING,
+    WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION,
     HTTP_PORT,
     STORAGE_DIR,
     LIST_DEFAULT_PAGE_SIZE,
@@ -115,6 +119,8 @@ pub struct MetadataConfig {
     pub rpc_concurrency: MetadataRpcConcurrencyConfig,
     /// Leader-local write-session capacity limits.
     pub write_session_limits: MetadataWriteSessionLimitsConfig,
+    /// Leader-local pending plus issued write-target capacity limits.
+    pub write_target_limits: MetadataWriteTargetLimitsConfig,
     /// Process-owned HTTP port for metrics, health, and future APIs.
     pub http_port: u16,
     /// Local directory for authoritative Metadata state.
@@ -162,6 +168,15 @@ pub struct MetadataWriteSessionLimitsConfig {
     pub max_active: usize,
     /// Maximum opening plus active sessions attributed to one client ID.
     pub max_active_per_client: usize,
+}
+
+/// Bounds pending and issued write targets retained by one Metadata leader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataWriteTargetLimitsConfig {
+    /// Maximum targets retained across every active write session.
+    pub max_outstanding: usize,
+    /// Maximum targets retained by one active write session.
+    pub max_outstanding_per_session: usize,
 }
 
 impl MetadataConfig {
@@ -314,6 +329,15 @@ impl Default for MetadataWriteSessionLimitsConfig {
     }
 }
 
+impl Default for MetadataWriteTargetLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_outstanding: 65_536,
+            max_outstanding_per_session: MAX_FILE_EXTENTS,
+        }
+    }
+}
+
 impl NamespaceListConfig {
     pub fn try_new(default_page_size: u32, max_page_size: u32) -> Result<Self, CommonError> {
         if default_page_size == 0 {
@@ -372,6 +396,7 @@ impl Default for MetadataConfig {
             rpc_port: 18080,
             rpc_concurrency: MetadataRpcConcurrencyConfig::default(),
             write_session_limits: MetadataWriteSessionLimitsConfig::default(),
+            write_target_limits: MetadataWriteTargetLimitsConfig::default(),
             http_port: 18081,
             storage_dir: PathBuf::from("data/metadata"),
             raft: RaftConfig::default(),
@@ -452,6 +477,20 @@ impl MetadataConfig {
             )?,
         };
         validate_write_session_limits(&write_session_limits)?;
+        let write_target_defaults = MetadataWriteTargetLimitsConfig::default();
+        let write_target_limits = MetadataWriteTargetLimitsConfig {
+            max_outstanding: positive_usize_or(
+                flat,
+                WRITE_TARGET_MAX_OUTSTANDING,
+                write_target_defaults.max_outstanding,
+            )?,
+            max_outstanding_per_session: positive_usize_or(
+                flat,
+                WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION,
+                write_target_defaults.max_outstanding_per_session,
+            )?,
+        };
+        validate_write_target_limits(&write_target_limits)?;
         let storage_dir = PathBuf::from(string_or(flat, STORAGE_DIR, defaults.storage_dir.to_str().unwrap())?);
         let observability = ObservabilityConfig::from_flat(flat)?;
 
@@ -556,6 +595,7 @@ impl MetadataConfig {
             rpc_port,
             rpc_concurrency,
             write_session_limits,
+            write_target_limits,
             http_port,
             storage_dir,
             raft: RaftConfig::default(),
@@ -601,6 +641,23 @@ fn validate_write_session_limits(config: &MetadataWriteSessionLimitsConfig) -> R
         return Err(invalid_config(
             WRITE_SESSION_MAX_ACTIVE_PER_CLIENT,
             "must not exceed the global write-session maximum",
+        ));
+    }
+    Ok(())
+}
+
+/// Preserves the relationship between global, per-session, and file extent limits.
+fn validate_write_target_limits(config: &MetadataWriteTargetLimitsConfig) -> Result<(), CommonError> {
+    if config.max_outstanding_per_session > config.max_outstanding {
+        return Err(invalid_config(
+            WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION,
+            "must not exceed the global write-target maximum",
+        ));
+    }
+    if config.max_outstanding_per_session > MAX_FILE_EXTENTS {
+        return Err(invalid_config(
+            WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION,
+            "must not exceed the compiled file extent maximum",
         ));
     }
     Ok(())
@@ -773,6 +830,8 @@ mod tests {
         flat.set(RPC_RESERVED_CONTROL_REQUESTS, 4i64);
         flat.set(WRITE_SESSION_MAX_ACTIVE, 256i64);
         flat.set(WRITE_SESSION_MAX_ACTIVE_PER_CLIENT, 16i64);
+        flat.set(WRITE_TARGET_MAX_OUTSTANDING, 4096i64);
+        flat.set(WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION, 1024i64);
         flat.set(HTTP_PORT, 28081i64);
         flat.set(BLOCK_CLEANUP_INTERVAL, "2s");
         flat.set(NAMESPACE_DELETE_MAX_SIZE, "1MiB");
@@ -797,6 +856,13 @@ mod tests {
             MetadataWriteSessionLimitsConfig {
                 max_active: 256,
                 max_active_per_client: 16,
+            }
+        );
+        assert_eq!(
+            config.write_target_limits,
+            MetadataWriteTargetLimitsConfig {
+                max_outstanding: 4096,
+                max_outstanding_per_session: 1024,
             }
         );
         assert_eq!(config.http_addr(), "127.0.0.1:28081".parse().unwrap());
@@ -856,6 +922,18 @@ mod tests {
         let mut flat = base_flat();
         flat.set(WRITE_SESSION_MAX_ACTIVE, 8i64);
         flat.set(WRITE_SESSION_MAX_ACTIVE_PER_CLIENT, 9i64);
+        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
+
+        let mut flat = base_flat();
+        flat.set(WRITE_TARGET_MAX_OUTSTANDING, 8i64);
+        flat.set(WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION, 9i64);
+        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
+
+        let mut flat = base_flat();
+        flat.set(
+            WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION,
+            i64::try_from(MAX_FILE_EXTENTS + 1).unwrap(),
+        );
         assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
     }
 

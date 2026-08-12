@@ -913,10 +913,14 @@ mod tests {
             })
             .expect("session capacity");
         opening.activate(lease_epoch).expect("session created");
-        filesystem
-            .session_registry()
-            .install_issued_target(inode_id, lease_epoch, None, Some(64), target)
-            .expect("target installed");
+        let target_reservation = match session_registry
+            .begin_add_block(inode_id, lease_epoch, None, Some(64))
+            .expect("target capacity")
+        {
+            crate::session_registry::BeginAddBlock::Reserved(reservation) => reservation,
+            crate::session_registry::BeginAddBlock::Replay(_) => panic!("new target must reserve capacity"),
+        };
+        target_reservation.complete(target).expect("target installed");
     }
 
     pub(super) fn committed_block(block_id: BlockId, file_offset: u64, len: u64) -> CommittedBlock {

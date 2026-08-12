@@ -158,6 +158,7 @@ impl ApplyRejection {
             | MetadataError::StaleState(_)
             | MetadataError::FullReportRequired(_)
             | MetadataError::WriteSessionLimitExceeded(_)
+            | MetadataError::GlobalWriteTargetLimitExceeded(_)
             | MetadataError::Internal(_)
             | MetadataError::ServiceUnavailable(_)) => return Err(FatalApplyError(fatal)),
         };

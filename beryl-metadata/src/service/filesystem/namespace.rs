@@ -957,7 +957,7 @@ mod tests {
         let group_name_value = group_name("g17");
         let parent_inode_id = ROOT_INODE_ID;
         let inode_id = InodeId::new(651);
-        let session_registry = Arc::new(crate::session_registry::SessionRegistry::new(10, 10, 5));
+        let session_registry = Arc::new(crate::session_registry::SessionRegistry::new(10, 10, 100, 100, 5));
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
             .with_session_registry(Arc::clone(&session_registry));
         let mount_table = builder.mount_table();
@@ -1203,7 +1203,7 @@ mod tests {
         let parent_inode_id = InodeId::new(660);
         let source_inode_id = InodeId::new(661);
         let target_inode_id = InodeId::new(662);
-        let session_registry = Arc::new(crate::session_registry::SessionRegistry::new(10, 10, 5));
+        let session_registry = Arc::new(crate::session_registry::SessionRegistry::new(10, 10, 100, 100, 5));
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
             .with_session_registry(Arc::clone(&session_registry));
         let mount_table = builder.mount_table();
