@@ -10,10 +10,10 @@ use super::{
     RequestContext,
 };
 use crate::error::MetadataError;
-use crate::inode_lease::{LeaseAcquisitionId, LeaseError, LeaseManager, WriteMode};
 use crate::observe;
 use crate::placement::{PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus};
 use crate::raft::ApplySuccess;
+use crate::session_registry::{BeginSessionError, BeginSessionInput, WriteMode, WriteOpeningError, WriteSessionError};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
 use beryl_common::header::CallerContextFields;
 use beryl_types::fs::InodeId;
@@ -57,46 +57,6 @@ pub(crate) struct AbortFileWriteArgs {
 pub(crate) struct RenewLeaseArgs {
     pub(crate) handle: PresentedWriteHandle,
     pub(crate) freshness: Freshness,
-}
-
-/// Releases one newly acquired local lease unless session installation succeeds.
-///
-/// `OpenWrite` crosses a cancellable Raft await after local lease acquisition.
-/// Keeping this guard armed ensures cancellation and every early return release
-/// only the exact local acquisition without touching a replacement lease that
-/// happens to reuse the same not-yet-durable fencing epoch.
-struct AcquiredLeaseRollback<'a> {
-    lease_manager: &'a LeaseManager,
-    inode_id: InodeId,
-    acquisition_id: LeaseAcquisitionId,
-    armed: bool,
-}
-
-impl<'a> AcquiredLeaseRollback<'a> {
-    /// Arm rollback for one exact leader-local lease.
-    fn new(lease_manager: &'a LeaseManager, inode_id: InodeId, acquisition_id: LeaseAcquisitionId) -> Self {
-        Self {
-            lease_manager,
-            inode_id,
-            acquisition_id,
-            armed: true,
-        }
-    }
-
-    /// Transfer lease lifecycle ownership to the installed write session.
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for AcquiredLeaseRollback<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.lease_manager
-                .release_acquisition(self.inode_id, self.acquisition_id);
-            self.armed = false;
-        }
-    }
 }
 
 impl MetadataFileSystem {
@@ -195,10 +155,10 @@ impl MetadataFileSystem {
         result
     }
 
-    /// Renew a write lease while excluding topology-changing Rename/Delete operations.
+    /// Renew an active write session while excluding topology-changing operations.
     ///
-    /// The shared topology guard keeps the leader-local lease renewal and every
-    /// mirrored session expiry update within one namespace admission interval.
+    /// The shared topology guard keeps ownership validation and every session
+    /// expiry index update within one namespace admission interval.
     pub(crate) async fn renew_lease(&self, ctx: &RequestContext, args: RenewLeaseArgs) -> FsResult<RenewLeaseOutput> {
         if let Some(failure) = self.session_write_admission_failure(ctx, args.handle.inode_id).await {
             return self.failure_from_admission(failure);
@@ -326,7 +286,6 @@ impl MetadataFileSystem {
             Ok(()) => {}
             Err(err) => return self.failure_from_error(ctx, err, group_name, mount_epoch),
         }
-        self.lease_manager.release(session.inode_id, lease_epoch);
         self.session_registry.remove_session_if_epoch(inode_id, lease_epoch);
 
         self.success_with_route_epoch(ctx, (), group_name, mount_epoch, route_epoch)
@@ -383,34 +342,31 @@ impl MetadataFileSystem {
             );
         }
 
-        let expires_at_ms = match self
-            .lease_manager
-            .renew(session.inode_id, lease_epoch, ctx.caller.client.client_id)
-        {
-            Ok(expires) => expires,
-            Err(_) => {
-                return self.session_terminal_failure(
-                    ctx,
-                    ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
-                    format!("lease renewal rejected for inode_id={inode_id}; write lease expired",),
-                    group_name,
-                    mount_epoch,
-                );
-            }
-        };
-        if let Err(message) = self
-            .session_registry
-            .update_expiration(inode_id, lease_epoch, expires_at_ms)
-        {
-            self.lease_manager.release(session.inode_id, lease_epoch);
-            return self.session_terminal_failure(
-                ctx,
-                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
-                message,
-                group_name,
-                mount_epoch,
-            );
-        }
+        let expires_at_ms =
+            match self
+                .session_registry
+                .renew_session(session.inode_id, lease_epoch, ctx.caller.client.client_id)
+            {
+                Ok(expires_at_ms) => expires_at_ms,
+                Err(WriteSessionError::Expired) => {
+                    return self.session_terminal_failure(
+                        ctx,
+                        ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
+                        format!("lease renewal rejected for inode_id={inode_id}; write lease expired",),
+                        group_name,
+                        mount_epoch,
+                    );
+                }
+                Err(error) => {
+                    return self.session_terminal_failure(
+                        ctx,
+                        ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                        format!("write session renewal rejected for inode_id={inode_id}: {error:?}"),
+                        group_name,
+                        mount_epoch,
+                    );
+                }
+            };
 
         let route_epoch = match self.authoritative_route_epoch().await {
             Ok(route_epoch) => Some(route_epoch),
@@ -425,7 +381,7 @@ impl MetadataFileSystem {
         )
     }
 
-    /// Reserve session capacity, acquire a local lease, persist fencing, and install the session.
+    /// Install an opening, persist its fencing epoch, and atomically activate it.
     ///
     /// `ancestor_inode_ids` must be the bounded mount-root-to-file chain
     /// captured while namespace topology is stable.
@@ -434,7 +390,7 @@ impl MetadataFileSystem {
         ctx: &RequestContext,
         inode_id: InodeId,
         ancestor_inode_ids: Vec<InodeId>,
-        mode: crate::inode_lease::WriteMode,
+        mode: WriteMode,
         freshness: Freshness,
     ) -> FsResult<OpenWriteOutput> {
         let caller_ctx = &ctx.caller;
@@ -524,11 +480,29 @@ impl MetadataFileSystem {
             _ => None,
         };
 
-        self.session_registry
-            .remove_inactive_for_inode(inode_id, self.lease_manager.as_ref());
-        let session_reservation = match self.session_registry.reserve_session(caller_ctx.client.client_id) {
-            Ok(reservation) => reservation,
-            Err(rejection) => {
+        let opening = match self.session_registry.begin_session(BeginSessionInput {
+            inode_id,
+            mount_id: inode.mount_id,
+            current_lease_epoch,
+            base_size,
+            content_revision: current_content_revision.unwrap_or(0),
+            mode,
+            open_client_id: caller_ctx.client.client_id,
+            layout,
+            ancestor_inode_ids,
+        }) {
+            Ok(opening) => opening,
+            Err(BeginSessionError::Busy) => {
+                return self.failure_from_error(
+                    ctx,
+                    MetadataError::Busy(format!(
+                        "File already has an opening or active write session: {inode_id}"
+                    )),
+                    group_name,
+                    mount_epoch,
+                );
+            }
+            Err(BeginSessionError::LimitExceeded(rejection)) => {
                 return self.failure_from_error(
                     ctx,
                     MetadataError::WriteSessionLimitExceeded(format!(
@@ -540,24 +514,7 @@ impl MetadataFileSystem {
                     mount_epoch,
                 );
             }
-        };
-
-        let acquired_lease = match self.lease_manager.try_acquire_with_identity(
-            inode_id,
-            caller_ctx.client.client_id,
-            mode,
-            current_lease_epoch,
-        ) {
-            Ok(result) => result,
-            Err(LeaseError::Active) => {
-                return self.failure_from_error(
-                    ctx,
-                    MetadataError::Busy(format!("File already has an active write lease: {}", inode_id)),
-                    group_name,
-                    mount_epoch,
-                );
-            }
-            Err(LeaseError::EpochExhausted) => {
+            Err(BeginSessionError::LeaseEpochExhausted) => {
                 return self.failure_from_error(
                     ctx,
                     MetadataError::ResourceExhausted(format!("write lease epoch exhausted for inode {inode_id}")),
@@ -565,29 +522,24 @@ impl MetadataFileSystem {
                     mount_epoch,
                 );
             }
-            Err(LeaseError::AcquisitionIdExhausted) => {
+            Err(BeginSessionError::OpeningIdExhausted) => {
                 return self.failure_from_error(
                     ctx,
-                    MetadataError::ResourceExhausted("leader-local lease acquisition identity exhausted".to_string()),
+                    MetadataError::ResourceExhausted("leader-local write opening identity exhausted".to_string()),
                     group_name,
                     mount_epoch,
                 );
             }
-            Err(error) => {
+            Err(BeginSessionError::InvalidAncestorChain) => {
                 return self.failure_from_error(
                     ctx,
-                    MetadataError::Internal(format!(
-                        "unexpected lease acquisition failure for inode {inode_id}: {error:?}"
-                    )),
+                    MetadataError::Internal("validated write session ancestor chain was rejected".to_string()),
                     group_name,
                     mount_epoch,
                 );
             }
         };
-        let lease_epoch = acquired_lease.lease_epoch;
-        let expires_at_ms = acquired_lease.expires_at_ms;
-        let mut lease_rollback =
-            AcquiredLeaseRollback::new(self.lease_manager.as_ref(), inode_id, acquired_lease.acquisition_id);
+        let lease_epoch = opening.proposed_lease_epoch();
 
         let lease_result = self
             .propose_fs_write_command(
@@ -612,32 +564,28 @@ impl MetadataFileSystem {
             }
         }
 
-        let session = match self.session_registry.install_reserved_session(
-            session_reservation,
-            crate::session_registry::CreateSessionInput {
-                inode_id,
-                mount_id: inode.mount_id,
-                lease_epoch,
-                base_size,
-                content_revision: current_content_revision.unwrap_or(0),
-                mode,
-                open_client_id: caller_ctx.client.client_id,
-                layout,
-                expires_at_ms,
-                ancestor_inode_ids,
-            },
-        ) {
+        let session = match opening.activate(lease_epoch) {
             Ok(result) => result,
-            Err(message) => {
+            Err(WriteOpeningError::Expired | WriteOpeningError::NotCurrent) => {
+                return self.session_terminal_failure(
+                    ctx,
+                    ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
+                    format!("write opening expired before activation for inode_id={inode_id}"),
+                    group_name,
+                    mount_epoch,
+                );
+            }
+            Err(WriteOpeningError::LeaseEpochMismatch { expected, got }) => {
                 return self.failure_from_error(
                     ctx,
-                    MetadataError::Internal(format!("failed to install reserved write session: {message}")),
+                    MetadataError::Internal(format!(
+                        "write opening epoch mismatch after Raft apply for inode_id={inode_id}: expected {expected}, got {got}"
+                    )),
                     group_name,
                     mount_epoch,
                 );
             }
         };
-        lease_rollback.disarm();
 
         self.success_with_route_epoch(ctx, open_write_output(&session), group_name, mount_epoch, route_epoch)
     }
@@ -703,8 +651,8 @@ impl MetadataFileSystem {
             );
         }
         if self
-            .lease_manager
-            .validate_lease(session.inode_id, lease_epoch)
+            .session_registry
+            .validate_session(session.inode_id, lease_epoch)
             .is_err()
         {
             return self.session_terminal_failure(
@@ -870,8 +818,8 @@ impl MetadataFileSystem {
             tier,
         };
         if self
-            .lease_manager
-            .validate_lease(session.inode_id, lease_epoch)
+            .session_registry
+            .validate_session(session.inode_id, lease_epoch)
             .is_err()
         {
             return self.session_terminal_failure(
@@ -958,7 +906,7 @@ impl MetadataFileSystem {
         result
     }
 
-    /// Resolve the path, acquire its local lease and persisted fencing epoch, and index its ancestors.
+    /// Resolve the path, install an opening, persist fencing, and index its ancestors.
     ///
     /// The shared guard spans resolution, Raft fencing-epoch acquisition, session
     /// creation, and the final topology safety predicate.
@@ -1001,9 +949,8 @@ impl MetadataFileSystem {
     /// Revalidate the complete path identity before exposing a new write session.
     ///
     /// A previously submitted topology mutation may still apply after its RPC
-    /// task is canceled and its guard is dropped. Any mismatch releases the
-    /// local lease, removes only the matching session epoch, and returns
-    /// `EAGAIN`.
+    /// task is canceled and its guard is dropped. Any mismatch removes only
+    /// the matching active session epoch and returns `EAGAIN`.
     fn finish_open_write(
         &self,
         ctx: &RequestContext,
@@ -1021,7 +968,6 @@ impl MetadataFileSystem {
                 && current.ancestor_inode_ids == resolved.ancestor_inode_ids
         });
         if !topology_unchanged {
-            self.lease_manager.release(inode_id, opened.payload.lease_epoch);
             self.session_registry
                 .remove_session_if_epoch(opened.payload.inode_id, opened.payload.lease_epoch);
             return self.failure_from_error(
@@ -1050,61 +996,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn acquired_lease_rollback_releases_only_its_exact_acquisition_while_armed() {
-        let lease_manager = LeaseManager::new(60_000, 10_000);
-        let rolled_back_inode_id = InodeId::new(1);
-        let retained_inode_id = InodeId::new(2);
-        let client_id = ClientId::new(7);
-        let rolled_back = lease_manager
-            .try_acquire_with_identity(rolled_back_inode_id, client_id, WriteMode::Write, None)
-            .unwrap();
-        {
-            let _rollback =
-                AcquiredLeaseRollback::new(&lease_manager, rolled_back_inode_id, rolled_back.acquisition_id);
-        }
-        assert!(lease_manager.get_active_lease(rolled_back_inode_id).is_none());
-
-        let retained = lease_manager
-            .try_acquire_with_identity(retained_inode_id, client_id, WriteMode::Write, None)
-            .unwrap();
-        {
-            let mut rollback = AcquiredLeaseRollback::new(&lease_manager, retained_inode_id, retained.acquisition_id);
-            rollback.disarm();
-        }
-        assert_eq!(
-            lease_manager
-                .get_active_lease(retained_inode_id)
-                .expect("disarmed lease")
-                .lease_epoch,
-            retained.lease_epoch
-        );
-        lease_manager.release(retained_inode_id, retained.lease_epoch);
-
-        let replacement_manager = LeaseManager::new(0, 10_000);
-        let replacement_inode_id = InodeId::new(3);
-        let first = replacement_manager
-            .try_acquire_with_identity(replacement_inode_id, client_id, WriteMode::Write, None)
-            .unwrap();
-        let stale_rollback =
-            AcquiredLeaseRollback::new(&replacement_manager, replacement_inode_id, first.acquisition_id);
-        let replacement = replacement_manager
-            .try_acquire_with_identity(replacement_inode_id, client_id, WriteMode::Write, None)
-            .unwrap();
-        assert_eq!(replacement.lease_epoch, first.lease_epoch);
-
-        drop(stale_rollback);
-
-        let active_replacement = replacement_manager
-            .get_active_lease(replacement_inode_id)
-            .expect("stale rollback must preserve the replacement acquisition");
-        assert_eq!(active_replacement.lease_epoch, replacement.lease_epoch);
-        assert_eq!(active_replacement.owner_client_id, client_id);
-        replacement_manager.release_acquisition(replacement_inode_id, replacement.acquisition_id);
-    }
-
     #[tokio::test]
-    async fn session_limit_plus_one_rejects_before_lease_acquisition_and_raft_proposal() {
+    async fn session_limit_plus_one_rejects_before_raft_proposal() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_id = MountId::new(49);
@@ -1121,7 +1014,7 @@ mod tests {
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name("g6"));
         let mount_table = builder.mount_table();
         let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
-        let session_registry = Arc::new(crate::session_registry::SessionRegistry::new(2, 1));
+        let session_registry = Arc::new(crate::session_registry::SessionRegistry::new(2, 1, 60_000));
         let filesystem = builder
             .with_storage(Arc::clone(&storage))
             .with_raft_node(raft_node)
@@ -1141,13 +1034,6 @@ mod tests {
             .await
             .expect("first client session");
 
-        // An active sentinel makes an accidental `try_acquire` observable as
-        // Busy while the intended limit result remains retryable capacity.
-        let sentinel_client = ClientId::new(99);
-        let (second_sentinel_epoch, _) = filesystem
-            .lease_manager()
-            .try_acquire(second_inode_id, sentinel_client, WriteMode::Write, None)
-            .unwrap();
         let log_before_per_client_rejection = storage.get_last_log_index().unwrap();
         let applied_before_per_client_rejection = filesystem.raft_node().get_last_applied_state_id();
         let per_client_rejection = filesystem
@@ -1165,21 +1051,11 @@ mod tests {
             ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted),
         );
         assert!(per_client_rejection.error.message.contains("per_client limit 1"));
-        let second_sentinel = filesystem
-            .lease_manager()
-            .get_active_lease(second_inode_id)
-            .expect("capacity rejection must leave the sentinel lease untouched");
-        assert_eq!(second_sentinel.owner_client_id, sentinel_client);
-        assert_eq!(second_sentinel.lease_epoch, second_sentinel_epoch);
         assert_eq!(storage.get_last_log_index().unwrap(), log_before_per_client_rejection);
         assert_eq!(
             filesystem.raft_node().get_last_applied_state_id(),
             applied_before_per_client_rejection
         );
-        filesystem
-            .lease_manager()
-            .release(second_inode_id, second_sentinel_epoch);
-
         filesystem
             .open_write_inode(
                 &request_context_for(other_client),
@@ -1191,10 +1067,6 @@ mod tests {
             .await
             .expect("another client uses remaining global capacity");
 
-        let (third_sentinel_epoch, _) = filesystem
-            .lease_manager()
-            .try_acquire(third_inode_id, sentinel_client, WriteMode::Write, None)
-            .unwrap();
         let log_before_global_rejection = storage.get_last_log_index().unwrap();
         let applied_before_global_rejection = filesystem.raft_node().get_last_applied_state_id();
         let global_rejection = filesystem
@@ -1212,18 +1084,11 @@ mod tests {
             ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted),
         );
         assert!(global_rejection.error.message.contains("global limit 2"));
-        let third_sentinel = filesystem
-            .lease_manager()
-            .get_active_lease(third_inode_id)
-            .expect("capacity rejection must leave the sentinel lease untouched");
-        assert_eq!(third_sentinel.owner_client_id, sentinel_client);
-        assert_eq!(third_sentinel.lease_epoch, third_sentinel_epoch);
         assert_eq!(storage.get_last_log_index().unwrap(), log_before_global_rejection);
         assert_eq!(
             filesystem.raft_node().get_last_applied_state_id(),
             applied_before_global_rejection
         );
-        filesystem.lease_manager().release(third_inode_id, third_sentinel_epoch);
     }
 
     #[tokio::test]
@@ -1247,7 +1112,7 @@ mod tests {
                 &request_context(),
                 inode_id,
                 vec![inode_id],
-                crate::inode_lease::WriteMode::Write,
+                crate::session_registry::WriteMode::Write,
                 Freshness::default(),
             )
             .await
@@ -1300,8 +1165,6 @@ mod tests {
             )
             .await
             .expect("AcquireWriteLease");
-        let lease_epoch = opened.payload.lease_epoch;
-
         let rename_result = filesystem
             .raft_node()
             .propose(Command::Rename {
@@ -1325,7 +1188,6 @@ mod tests {
 
         assert_retry(&failure.error, ErrorKind::Metadata(MetadataErrorKind::Conflict));
         assert!(filesystem.write_session_for_inode(file_inode_id).is_none());
-        assert!(!filesystem.lease_manager().is_active_lease(file_inode_id, lease_epoch));
         let moved = filesystem.path_resolver.resolve_path("/new/file").unwrap();
         assert_eq!(moved.inode_id, Some(file_inode_id));
         assert_eq!(
@@ -1360,7 +1222,7 @@ mod tests {
                 &request_context(),
                 inode_id,
                 vec![inode_id],
-                crate::inode_lease::WriteMode::Write,
+                crate::session_registry::WriteMode::Write,
                 Freshness::default(),
             )
             .await
@@ -1386,7 +1248,7 @@ mod tests {
                 &request_context(),
                 inode_id,
                 vec![inode_id],
-                crate::inode_lease::WriteMode::Write,
+                crate::session_registry::WriteMode::Write,
                 Freshness::default(),
             )
             .await
@@ -1423,7 +1285,7 @@ mod tests {
                 &request_context(),
                 inode_id,
                 vec![inode_id],
-                crate::inode_lease::WriteMode::Write,
+                crate::session_registry::WriteMode::Write,
                 Freshness::default(),
             )
             .await
@@ -1454,7 +1316,7 @@ mod tests {
                 &request_context(),
                 inode_id,
                 vec![inode_id],
-                crate::inode_lease::WriteMode::Write,
+                crate::session_registry::WriteMode::Write,
                 Freshness::default(),
             )
             .await
@@ -1496,7 +1358,7 @@ mod tests {
                 &request_context(),
                 inode_id,
                 vec![inode_id],
-                crate::inode_lease::WriteMode::Write,
+                crate::session_registry::WriteMode::Write,
                 Freshness::default(),
             )
             .await
@@ -1565,7 +1427,7 @@ mod tests {
                 &request_context(),
                 env.inode_id,
                 vec![env.inode_id],
-                crate::inode_lease::WriteMode::Write,
+                crate::session_registry::WriteMode::Write,
                 Freshness::default(),
             )
             .await

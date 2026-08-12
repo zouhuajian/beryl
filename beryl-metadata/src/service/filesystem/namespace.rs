@@ -916,7 +916,7 @@ mod tests {
                 &open_ctx,
                 crate::service::filesystem::OpenWriteArgs {
                     path: "/file".to_string(),
-                    mode: crate::inode_lease::WriteMode::Write,
+                    mode: crate::session_registry::WriteMode::Write,
                     freshness: Freshness::default(),
                 },
             ),
@@ -950,16 +950,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_write_lease_does_not_leave_delete_permanently_busy() {
+    async fn expired_write_session_does_not_leave_delete_permanently_busy() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_id = MountId::new(65);
         let group_name_value = group_name("g17");
         let parent_inode_id = ROOT_INODE_ID;
         let inode_id = InodeId::new(651);
-        let lease_manager = Arc::new(crate::inode_lease::LeaseManager::new(0, 1_000));
+        let session_registry = Arc::new(crate::session_registry::SessionRegistry::new(10, 10, 5));
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
-            .with_lease_manager(Arc::clone(&lease_manager));
+            .with_session_registry(Arc::clone(&session_registry));
         let mount_table = builder.mount_table();
         let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
         let filesystem = builder
@@ -976,8 +976,8 @@ mod tests {
         storage.put_dentry(parent_inode_id, "expired", inode_id).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         install_write_session(&filesystem, inode_id, mount_id);
+        tokio::time::sleep(Duration::from_millis(10)).await;
 
-        assert!(!lease_manager.has_active_lease(inode_id));
         assert!(filesystem.write_session_for_inode(inode_id).is_none());
 
         filesystem
@@ -1195,7 +1195,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_target_write_lease_does_not_leave_rename_permanently_busy() {
+    async fn expired_target_write_session_does_not_leave_rename_permanently_busy() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_id = MountId::new(66);
@@ -1203,9 +1203,9 @@ mod tests {
         let parent_inode_id = InodeId::new(660);
         let source_inode_id = InodeId::new(661);
         let target_inode_id = InodeId::new(662);
-        let lease_manager = Arc::new(crate::inode_lease::LeaseManager::new(0, 1_000));
+        let session_registry = Arc::new(crate::session_registry::SessionRegistry::new(10, 10, 5));
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
-            .with_lease_manager(Arc::clone(&lease_manager));
+            .with_session_registry(Arc::clone(&session_registry));
         let mount_table = builder.mount_table();
         let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
         let filesystem = builder
@@ -1231,8 +1231,8 @@ mod tests {
             .put_layout(target_inode_id, FileLayout::new(4096, 4096, 1))
             .unwrap();
         install_write_session(&filesystem, target_inode_id, mount_id);
+        tokio::time::sleep(Duration::from_millis(10)).await;
 
-        assert!(!lease_manager.has_active_lease(target_inode_id));
         assert!(filesystem.write_session_for_inode(target_inode_id).is_none());
 
         filesystem

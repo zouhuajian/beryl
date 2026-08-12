@@ -657,9 +657,8 @@ impl BlockCleanupCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inode_lease::WriteMode;
     use crate::raft::{AppMetadataRaftState, AppRaftStateMachine};
-    use crate::session_registry::CreateSessionInput;
+    use crate::session_registry::{BeginSessionInput, WriteMode};
     use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus};
     use crate::MountTable;
     use beryl_types::fs::{Extent, FileAttrs, Inode, InodeData, InodeId};
@@ -758,24 +757,20 @@ mod tests {
 
     fn create_session(registry: &SessionRegistry, inode_id: InodeId) {
         let client_id = ClientId::new(1);
-        let reservation = registry.reserve_session(client_id).expect("session capacity");
-        registry
-            .install_reserved_session(
-                reservation,
-                CreateSessionInput {
-                    inode_id,
-                    mount_id: MountId::new(1),
-                    lease_epoch: 1,
-                    base_size: 0,
-                    content_revision: 0,
-                    mode: WriteMode::Write,
-                    open_client_id: client_id,
-                    layout: FileLayout::new(64, 64, 1),
-                    expires_at_ms: u64::MAX,
-                    ancestor_inode_ids: vec![inode_id],
-                },
-            )
-            .unwrap();
+        let opening = registry
+            .begin_session(BeginSessionInput {
+                inode_id,
+                mount_id: MountId::new(1),
+                current_lease_epoch: Some(0),
+                base_size: 0,
+                content_revision: 0,
+                mode: WriteMode::Write,
+                open_client_id: client_id,
+                layout: FileLayout::new(64, 64, 1),
+                ancestor_inode_ids: vec![inode_id],
+            })
+            .expect("session capacity");
+        opening.activate(1).expect("session created");
     }
 
     fn publish_report(manager: &WorkerManager, replicas: &[ReplicaKey]) {

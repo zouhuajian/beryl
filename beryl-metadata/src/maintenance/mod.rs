@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Background namespace deletion, block cleanup, and worker liveness maintenance.
+//! Background write-session, namespace, block, and worker-state maintenance.
 
 mod cleanup;
 mod detached_root;

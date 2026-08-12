@@ -158,13 +158,13 @@ reserve below the service-wide value. The shipped defaults are `64`, `16`, and
 
 Write-session limits are also restart-only:
 
-- `beryl.metadata.write-session.max-active` bounds pending plus installed
+- `beryl.metadata.write-session.max-active` bounds opening plus active
   write sessions across the Metadata leader.
 - `beryl.metadata.write-session.max-active-per-client` bounds the same states
   attributed to one client ID. Client IDs are fairness keys, not authenticated
   tenant identities.
 
-Excess `OpenWrite` calls fail before local lease acquisition or a Raft proposal.
+Excess `OpenWrite` calls fail before an opening can submit a Raft proposal.
 The shipped defaults are `1024` globally and `64` per client.
 
 The current alpha supports clean installation and same-version restart only.
@@ -218,6 +218,8 @@ Useful Metadata signals:
 - `metadata_worker_live`, worker registration, heartbeat, and block-report
   counters
 - filesystem and RPC request totals and duration histograms
+- `metadata_write_sessions`, labeled by `state=opening|active`, plus
+  write-session capacity rejections and expired-session retirements
 - `grpc_server_requests_inflight` and
   `grpc_server_concurrency_rejections_total`, labeled by traffic class and limit
   scope

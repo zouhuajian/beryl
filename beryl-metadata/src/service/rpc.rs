@@ -530,8 +530,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         let req = request.into_inner();
         let req_ctx = request_context_or_error!(req, OpenWriteResponseProto);
         let mode = match OpenWriteModeProto::try_from(req.mode) {
-            Ok(OpenWriteModeProto::OpenWriteModeWrite) => crate::inode_lease::WriteMode::Write,
-            Ok(OpenWriteModeProto::OpenWriteModeAppend) => crate::inode_lease::WriteMode::Append,
+            Ok(OpenWriteModeProto::OpenWriteModeWrite) => crate::session_registry::WriteMode::Write,
+            Ok(OpenWriteModeProto::OpenWriteModeAppend) => crate::session_registry::WriteMode::Append,
             _ => {
                 return error_response!(
                     OpenWriteResponseProto,
@@ -1081,14 +1081,12 @@ mod tests {
 
         let state_store: Arc<dyn crate::state::StateStore> = Arc::new(TestStateStore::new());
         let session_registry = Arc::new(crate::session_registry::SessionRegistry::default());
-        let lease_manager = Arc::new(crate::inode_lease::LeaseManager::default());
         let filesystem = Arc::new(MetadataFileSystem::new(MetadataFileSystemDeps {
             state_store,
             mount_table: Arc::clone(&mount_table),
             storage: Arc::clone(&storage),
             raft_node: None,
             session_registry: Arc::clone(&session_registry),
-            lease_manager,
             worker_manager: None,
             metrics: None,
             readiness_gate,
@@ -1198,7 +1196,6 @@ mod tests {
 
         let state_store: Arc<dyn crate::state::StateStore> = Arc::new(TestStateStore::new());
         let session_registry = Arc::new(crate::session_registry::SessionRegistry::default());
-        let lease_manager = Arc::new(crate::inode_lease::LeaseManager::default());
         let owner_group_name = group_name("root");
         let filesystem = Arc::new(MetadataFileSystem::new(MetadataFileSystemDeps {
             state_store,
@@ -1206,7 +1203,6 @@ mod tests {
             storage: Arc::clone(&storage),
             raft_node: Some(Arc::clone(&raft_node)),
             session_registry: Arc::clone(&session_registry),
-            lease_manager,
             worker_manager: worker_manager.clone(),
             metrics: None,
             readiness_gate: None,
