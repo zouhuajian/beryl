@@ -281,7 +281,11 @@ impl MetadataServer {
             authority.shutdown().await?;
             return Ok(None);
         }
-        let session_registry = Arc::new(crate::session_registry::SessionRegistry::default());
+        let write_sessions = config.write_session_limits;
+        let session_registry = Arc::new(crate::session_registry::SessionRegistry::new(
+            write_sessions.max_active,
+            write_sessions.max_active_per_client,
+        ));
         let filesystem = match build_filesystem_service_with_sessions(
             config.as_ref(),
             &authority,
@@ -649,7 +653,10 @@ pub async fn build_filesystem_service(
         config,
         authority,
         worker_manager,
-        Arc::new(crate::session_registry::SessionRegistry::default()),
+        Arc::new(crate::session_registry::SessionRegistry::new(
+            config.write_session_limits.max_active,
+            config.write_session_limits.max_active_per_client,
+        )),
         readiness,
     )
     .await
@@ -904,6 +911,7 @@ mod tests {
             bind_host: "127.0.0.1".parse().unwrap(),
             rpc_port: 18080,
             rpc_concurrency: Default::default(),
+            write_session_limits: Default::default(),
             http_port: 18081,
             storage_dir: std::path::PathBuf::from("data/metadata"),
             raft: RaftConfig::default(),

@@ -16,6 +16,8 @@ fn repository_metadata_configs_define_runtime_contract() {
     assert_eq!(config.shutdown_timeout_ms, 30_000);
     assert_eq!(config.rpc_port, 18080);
     assert_eq!(config.http_port, 18081);
+    assert_eq!(config.write_session_limits.max_active, 1024);
+    assert_eq!(config.write_session_limits.max_active_per_client, 64);
 }
 
 fn repo_root() -> PathBuf {

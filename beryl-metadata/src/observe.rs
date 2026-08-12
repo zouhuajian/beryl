@@ -31,6 +31,8 @@ pub(crate) const METADATA_RAFT_AUTHORITY_COMMIT_DURATION_SECONDS: &str =
     "metadata_raft_authority_commit_duration_seconds";
 pub(crate) const METADATA_RPC_REQUESTS_TOTAL: &str = "metadata_rpc_requests_total";
 pub(crate) const METADATA_RPC_REQUEST_DURATION_SECONDS: &str = "metadata_rpc_request_duration_seconds";
+pub(crate) const METADATA_WRITE_SESSIONS: &str = "metadata_write_sessions";
+pub(crate) const METADATA_WRITE_SESSION_REJECTED_TOTAL: &str = "metadata_write_session_rejected_total";
 pub(crate) const METADATA_FS_OPS_TOTAL: &str = "metadata_fs_ops_total";
 pub(crate) const METADATA_FS_OP_DURATION_SECONDS: &str = "metadata_fs_op_duration_seconds";
 pub(crate) const METADATA_ROCKSDB_READS_TOTAL: &str = "metadata_rocksdb_reads_total";
@@ -109,6 +111,17 @@ pub(crate) fn record_raft_proposal(status: &str, error_kind: &str, duration_seco
         "error_kind" => error_kind.to_string()
     )
     .record(duration_seconds);
+}
+
+/// Publish the exact pending and installed write-session counts.
+pub(crate) fn set_write_sessions(pending: usize, active: usize) {
+    metrics::gauge!(METADATA_WRITE_SESSIONS, "state" => "pending").set(pending as f64);
+    metrics::gauge!(METADATA_WRITE_SESSIONS, "state" => "active").set(active as f64);
+}
+
+/// Count immediate write-session capacity rejection by stable limit scope.
+pub(crate) fn record_write_session_rejected(limit: &'static str) {
+    metrics::counter!(METADATA_WRITE_SESSION_REJECTED_TOTAL, "limit" => limit).increment(1);
 }
 
 /// Records serialized command size with one stable operation label.
@@ -337,6 +350,7 @@ pub(crate) fn metadata_error_kind(error: &MetadataError) -> &'static str {
         MetadataError::ActiveWorkerConflict(_) => "active_worker_conflict",
         MetadataError::Again(_) => "again",
         MetadataError::ResourceExhausted(_) => "resource_exhausted",
+        MetadataError::WriteSessionLimitExceeded(_) => "write_session_limit_exceeded",
         MetadataError::LeaseFenced { .. } => "lease_fenced",
         MetadataError::LeaderChanged(_) => "not_leader",
         MetadataError::EpochMismatch { .. } => "epoch_mismatch",
@@ -439,7 +453,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn metadata_metric_contract_names() -> [&'static str; 47] {
+    fn metadata_metric_contract_names() -> [&'static str; 49] {
         [
             METADATA_UP,
             METADATA_BUILD_INFO,
@@ -461,6 +475,8 @@ mod tests {
             METADATA_RAFT_AUTHORITY_COMMIT_DURATION_SECONDS,
             METADATA_RPC_REQUESTS_TOTAL,
             METADATA_RPC_REQUEST_DURATION_SECONDS,
+            METADATA_WRITE_SESSIONS,
+            METADATA_WRITE_SESSION_REJECTED_TOTAL,
             METADATA_FS_OPS_TOTAL,
             METADATA_FS_OP_DURATION_SECONDS,
             METADATA_ROCKSDB_READS_TOTAL,
@@ -491,7 +507,7 @@ mod tests {
         ]
     }
 
-    fn metadata_metric_label_contract_names() -> [&'static str; 12] {
+    fn metadata_metric_label_contract_names() -> [&'static str; 14] {
         [
             "service",
             "version",
@@ -505,6 +521,8 @@ mod tests {
             "change",
             "result",
             "decision",
+            "state",
+            "limit",
         ]
     }
 
@@ -532,6 +550,8 @@ mod tests {
             "metadata_raft_authority_commit_duration_seconds",
             "metadata_rpc_requests_total",
             "metadata_rpc_request_duration_seconds",
+            "metadata_write_sessions",
+            "metadata_write_session_rejected_total",
             "metadata_fs_ops_total",
             "metadata_fs_op_duration_seconds",
             "metadata_rocksdb_reads_total",
@@ -601,6 +621,7 @@ mod tests {
             METADATA_RAFT_TERM,
             METADATA_RAFT_LAST_APPLIED_INDEX,
             METADATA_RAFT_COMMITTED_INDEX,
+            METADATA_WRITE_SESSIONS,
             METADATA_WORKER_LIVE,
             METADATA_WORKER_HEARTBEAT_LAG_SECONDS,
             METADATA_CLEANUP_CANDIDATES,
@@ -623,6 +644,8 @@ mod tests {
         record_raft_term(2);
         record_raft_indexes(Some(3), Some(4));
         record_raft_proposal("ok", "none", 0.001);
+        set_write_sessions(1, 2);
+        record_write_session_rejected("global");
         record_raft_command_bytes("publish_file", 128);
         record_raft_apply("ok", "none", 0.002);
         record_raft_log_durable_write("ok", 128, 0.002);

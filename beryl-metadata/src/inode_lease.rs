@@ -10,6 +10,7 @@ use beryl_types::fs::InodeId;
 use beryl_types::ids::ClientId;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{interval, Duration};
@@ -35,6 +36,8 @@ pub enum LeaseError {
     Active,
     /// The durable lease epoch cannot be incremented without overflow.
     EpochExhausted,
+    /// The process-local acquisition identity space is exhausted.
+    AcquisitionIdExhausted,
     /// No leader-local lease exists for the inode.
     NotFound,
     /// The presented epoch does not identify the current lease.
@@ -58,6 +61,28 @@ pub struct ActiveLease {
     pub mode: WriteMode,
 }
 
+/// One local acquisition result, including identity used only for rollback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AcquiredLease {
+    /// Durable fencing epoch proposed through Raft.
+    pub(crate) lease_epoch: u64,
+    /// Leader-local expiry returned to the client after session installation.
+    pub(crate) expires_at_ms: u64,
+    /// Unique process-local identity for this exact acquisition attempt.
+    pub(crate) acquisition_id: LeaseAcquisitionId,
+}
+
+/// Non-reusable process-local identity distinct from the durable fencing epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LeaseAcquisitionId(u64);
+
+/// Runtime lease state paired with the identity of the acquisition that installed it.
+#[derive(Clone, Debug)]
+struct ActiveLeaseEntry {
+    lease: ActiveLease,
+    acquisition_id: LeaseAcquisitionId,
+}
+
 /// Inode lease manager (runtime, leader-only).
 ///
 /// Lease state:
@@ -68,8 +93,10 @@ pub struct ActiveLease {
 /// acquire leases (lease_epoch increments), and old lease holders will
 /// fail on commit due to fencing (lease_epoch mismatch).
 pub struct LeaseManager {
-    /// Active leases: inode_id -> ActiveLease.
-    leases: Arc<RwLock<HashMap<InodeId, ActiveLease>>>,
+    /// Active leases and their exact process-local acquisition identities.
+    leases: Arc<RwLock<HashMap<InodeId, ActiveLeaseEntry>>>,
+    /// Monotonic identity source that never reuses an ID during this process.
+    next_acquisition_id: AtomicU64,
     /// Lease TTL in milliseconds (default: 60 seconds).
     lease_ttl_ms: u64,
     /// Renewal interval for cleanup (default: 10 seconds).
@@ -81,6 +108,7 @@ impl LeaseManager {
     pub fn new(lease_ttl_ms: u64, cleanup_interval_ms: u64) -> Self {
         Self {
             leases: Arc::new(RwLock::new(HashMap::new())),
+            next_acquisition_id: AtomicU64::new(1),
             lease_ttl_ms,
             cleanup_interval_ms,
         }
@@ -92,6 +120,7 @@ impl LeaseManager {
     /// - Ok((lease_epoch, expires_at_ms)) if acquired
     /// - `Err(LeaseError::Active)` if another non-expired lease exists.
     /// - `Err(LeaseError::EpochExhausted)` if the durable fence cannot advance.
+    /// - `Err(LeaseError::AcquisitionIdExhausted)` if exact rollback identity is exhausted.
     pub fn try_acquire(
         &self,
         inode_id: InodeId,
@@ -99,18 +128,30 @@ impl LeaseManager {
         mode: WriteMode,
         current_lease_epoch: Option<u64>, // From inode (persisted)
     ) -> Result<(u64, u64), LeaseError> {
+        self.try_acquire_with_identity(inode_id, client_id, mode, current_lease_epoch)
+            .map(|acquired| (acquired.lease_epoch, acquired.expires_at_ms))
+    }
+
+    /// Acquire a lease and return the exact identity required by cancellable rollback.
+    pub(crate) fn try_acquire_with_identity(
+        &self,
+        inode_id: InodeId,
+        client_id: ClientId,
+        mode: WriteMode,
+        current_lease_epoch: Option<u64>,
+    ) -> Result<AcquiredLease, LeaseError> {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
 
         let mut leases = self.leases.write();
 
         // Check for existing active lease
         if let Some(existing) = leases.get(&inode_id) {
-            if now_ms < existing.expires_at_ms {
+            if now_ms < existing.lease.expires_at_ms {
                 // Active lease exists and not expired
                 debug!(
                     inode_id = %inode_id,
-                    existing_epoch = existing.lease_epoch,
-                    expires_at = existing.expires_at_ms,
+                    existing_epoch = existing.lease.lease_epoch,
+                    expires_at = existing.lease.expires_at_ms,
                     "Lease conflict: active lease exists"
                 );
                 return Err(LeaseError::Active);
@@ -118,7 +159,7 @@ impl LeaseManager {
             // Lease expired, can be stolen
             debug!(
                 inode_id = %inode_id,
-                expired_epoch = existing.lease_epoch,
+                expired_epoch = existing.lease.lease_epoch,
                 "Lease expired, allowing steal"
             );
         }
@@ -127,6 +168,11 @@ impl LeaseManager {
         let base_epoch = current_lease_epoch.unwrap_or(0);
         let new_epoch = base_epoch.checked_add(1).ok_or(LeaseError::EpochExhausted)?;
         let expires_at_ms = now_ms.saturating_add(self.lease_ttl_ms);
+        let acquisition_id = LeaseAcquisitionId(
+            self.next_acquisition_id
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_add(1))
+                .map_err(|_| LeaseError::AcquisitionIdExhausted)?,
+        );
 
         let active_lease = ActiveLease {
             lease_epoch: new_epoch,
@@ -135,7 +181,13 @@ impl LeaseManager {
             mode,
         };
 
-        leases.insert(inode_id, active_lease.clone());
+        leases.insert(
+            inode_id,
+            ActiveLeaseEntry {
+                lease: active_lease,
+                acquisition_id,
+            },
+        );
 
         debug!(
             inode_id = %inode_id,
@@ -145,7 +197,11 @@ impl LeaseManager {
             "Lease acquired"
         );
 
-        Ok((new_epoch, expires_at_ms))
+        Ok(AcquiredLease {
+            lease_epoch: new_epoch,
+            expires_at_ms,
+            acquisition_id,
+        })
     }
 
     /// Renew a lease (runtime-only, does not write to Raft).
@@ -157,7 +213,7 @@ impl LeaseManager {
 
         let mut leases = self.leases.write();
 
-        let active_lease = leases.get_mut(&inode_id).ok_or(LeaseError::NotFound)?;
+        let active_lease = &mut leases.get_mut(&inode_id).ok_or(LeaseError::NotFound)?.lease;
 
         if active_lease.lease_epoch != lease_epoch {
             warn!(
@@ -203,7 +259,7 @@ impl LeaseManager {
     pub fn release(&self, inode_id: InodeId, lease_epoch: u64) {
         let mut leases = self.leases.write();
         if let Some(active) = leases.get(&inode_id) {
-            if active.lease_epoch == lease_epoch {
+            if active.lease.lease_epoch == lease_epoch {
                 leases.remove(&inode_id);
                 debug!(
                     inode_id = %inode_id,
@@ -214,6 +270,18 @@ impl LeaseManager {
         }
     }
 
+    /// Release only the lease created by one exact local acquisition attempt.
+    pub(crate) fn release_acquisition(&self, inode_id: InodeId, acquisition_id: LeaseAcquisitionId) {
+        let mut leases = self.leases.write();
+        if leases
+            .get(&inode_id)
+            .is_some_and(|active| active.acquisition_id == acquisition_id)
+        {
+            leases.remove(&inode_id);
+            debug!(inode_id = %inode_id, acquisition_id = acquisition_id.0, "Lease acquisition rolled back");
+        }
+    }
+
     /// Validate lease for commit/truncate (fencing check).
     ///
     /// Returns the exact reason when the lease is absent, stale, or expired.
@@ -221,7 +289,7 @@ impl LeaseManager {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
 
         let leases = self.leases.read();
-        let active_lease = leases.get(&inode_id).ok_or(LeaseError::NotFound)?;
+        let active_lease = &leases.get(&inode_id).ok_or(LeaseError::NotFound)?.lease;
 
         if active_lease.lease_epoch != lease_epoch {
             warn!(
@@ -251,7 +319,7 @@ impl LeaseManager {
 
     /// Get active lease for an inode (if any).
     pub fn get_active_lease(&self, inode_id: InodeId) -> Option<ActiveLease> {
-        self.leases.read().get(&inode_id).cloned()
+        self.leases.read().get(&inode_id).map(|entry| entry.lease.clone())
     }
 
     /// Check if an inode has an active, non-expired lease.
@@ -261,7 +329,7 @@ impl LeaseManager {
         self.leases
             .read()
             .get(&inode_id)
-            .map(|lease| now_ms < lease.expires_at_ms)
+            .map(|entry| now_ms < entry.lease.expires_at_ms)
             .unwrap_or(false)
     }
 
@@ -271,7 +339,7 @@ impl LeaseManager {
         self.leases
             .read()
             .get(&inode_id)
-            .map(|lease| lease.lease_epoch == lease_epoch && now_ms < lease.expires_at_ms)
+            .map(|entry| entry.lease.lease_epoch == lease_epoch && now_ms < entry.lease.expires_at_ms)
             .unwrap_or(false)
     }
 
@@ -282,7 +350,7 @@ impl LeaseManager {
         let mut leases = self.leases.write();
         let expired: Vec<InodeId> = leases
             .iter()
-            .filter(|(_, lease)| now_ms >= lease.expires_at_ms)
+            .filter(|(_, entry)| now_ms >= entry.lease.expires_at_ms)
             .map(|(inode_id, _)| *inode_id)
             .collect();
 

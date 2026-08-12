@@ -757,19 +757,24 @@ mod tests {
     }
 
     fn create_session(registry: &SessionRegistry, inode_id: InodeId) {
+        let client_id = ClientId::new(1);
+        let reservation = registry.reserve_session(client_id).expect("session capacity");
         registry
-            .create_session(CreateSessionInput {
-                inode_id,
-                mount_id: MountId::new(1),
-                lease_epoch: 1,
-                base_size: 0,
-                content_revision: 0,
-                mode: WriteMode::Write,
-                open_client_id: ClientId::new(1),
-                layout: FileLayout::new(64, 64, 1),
-                expires_at_ms: u64::MAX,
-                ancestor_inode_ids: vec![inode_id],
-            })
+            .install_reserved_session(
+                reservation,
+                CreateSessionInput {
+                    inode_id,
+                    mount_id: MountId::new(1),
+                    lease_epoch: 1,
+                    base_size: 0,
+                    content_revision: 0,
+                    mode: WriteMode::Write,
+                    open_client_id: client_id,
+                    layout: FileLayout::new(64, 64, 1),
+                    expires_at_ms: u64::MAX,
+                    ancestor_inode_ids: vec![inode_id],
+                },
+            )
             .unwrap();
     }
 
