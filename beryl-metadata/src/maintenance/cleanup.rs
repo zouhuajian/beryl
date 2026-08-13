@@ -518,7 +518,11 @@ impl BlockCleanupCoordinator {
     /// Reading the session first and authority second therefore cannot combine
     /// a pre-publish inode with that publication's already-removed session.
     fn revalidate_reclaimable(&self, replica: &ReplicaKey) -> MetadataResult<CleanupDecision> {
-        if self.session_registry.get_session(replica.block_id.inode_id).is_some() {
+        if self
+            .session_registry
+            .get_session_identity(replica.block_id.inode_id)
+            .is_some()
+        {
             return Ok(CleanupDecision::Wait);
         }
         self.classify_authority(replica)

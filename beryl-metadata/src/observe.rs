@@ -34,6 +34,8 @@ pub(crate) const METADATA_RPC_REQUEST_DURATION_SECONDS: &str = "metadata_rpc_req
 pub(crate) const METADATA_WRITE_SESSIONS: &str = "metadata_write_sessions";
 pub(crate) const METADATA_WRITE_SESSION_REJECTED_TOTAL: &str = "metadata_write_session_rejected_total";
 pub(crate) const METADATA_WRITE_SESSION_EXPIRED_TOTAL: &str = "metadata_write_session_expired_total";
+pub(crate) const METADATA_WRITE_TARGETS: &str = "metadata_write_targets";
+pub(crate) const METADATA_WRITE_TARGET_REJECTED_TOTAL: &str = "metadata_write_target_rejected_total";
 pub(crate) const METADATA_FS_OPS_TOTAL: &str = "metadata_fs_ops_total";
 pub(crate) const METADATA_FS_OP_DURATION_SECONDS: &str = "metadata_fs_op_duration_seconds";
 pub(crate) const METADATA_ROCKSDB_READS_TOTAL: &str = "metadata_rocksdb_reads_total";
@@ -128,6 +130,17 @@ pub(crate) fn record_write_session_rejected(limit: &'static str) {
 /// Count one leader-local opening or active session retired after expiry.
 pub(crate) fn record_write_session_expired() {
     metrics::counter!(METADATA_WRITE_SESSION_EXPIRED_TOTAL).increment(1);
+}
+
+/// Publish the exact pending and issued write-target occupancy.
+pub(crate) fn set_write_targets(pending: usize, issued: usize) {
+    metrics::gauge!(METADATA_WRITE_TARGETS, "state" => "pending").set(pending as f64);
+    metrics::gauge!(METADATA_WRITE_TARGETS, "state" => "issued").set(issued as f64);
+}
+
+/// Count one write-target rejection by stable limit scope.
+pub(crate) fn record_write_target_rejected(limit: &'static str) {
+    metrics::counter!(METADATA_WRITE_TARGET_REJECTED_TOTAL, "limit" => limit).increment(1);
 }
 
 /// Records serialized command size with one stable operation label.
@@ -357,6 +370,7 @@ pub(crate) fn metadata_error_kind(error: &MetadataError) -> &'static str {
         MetadataError::Again(_) => "again",
         MetadataError::ResourceExhausted(_) => "resource_exhausted",
         MetadataError::WriteSessionLimitExceeded(_) => "write_session_limit_exceeded",
+        MetadataError::GlobalWriteTargetLimitExceeded(_) => "global_write_target_limit_exceeded",
         MetadataError::LeaseFenced { .. } => "lease_fenced",
         MetadataError::LeaderChanged(_) => "not_leader",
         MetadataError::EpochMismatch { .. } => "epoch_mismatch",
@@ -459,7 +473,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn metadata_metric_contract_names() -> [&'static str; 50] {
+    fn metadata_metric_contract_names() -> [&'static str; 52] {
         [
             METADATA_UP,
             METADATA_BUILD_INFO,
@@ -484,6 +498,8 @@ mod tests {
             METADATA_WRITE_SESSIONS,
             METADATA_WRITE_SESSION_REJECTED_TOTAL,
             METADATA_WRITE_SESSION_EXPIRED_TOTAL,
+            METADATA_WRITE_TARGETS,
+            METADATA_WRITE_TARGET_REJECTED_TOTAL,
             METADATA_FS_OPS_TOTAL,
             METADATA_FS_OP_DURATION_SECONDS,
             METADATA_ROCKSDB_READS_TOTAL,
@@ -560,6 +576,8 @@ mod tests {
             "metadata_write_sessions",
             "metadata_write_session_rejected_total",
             "metadata_write_session_expired_total",
+            "metadata_write_targets",
+            "metadata_write_target_rejected_total",
             "metadata_fs_ops_total",
             "metadata_fs_op_duration_seconds",
             "metadata_rocksdb_reads_total",
@@ -630,6 +648,7 @@ mod tests {
             METADATA_RAFT_LAST_APPLIED_INDEX,
             METADATA_RAFT_COMMITTED_INDEX,
             METADATA_WRITE_SESSIONS,
+            METADATA_WRITE_TARGETS,
             METADATA_WORKER_LIVE,
             METADATA_WORKER_HEARTBEAT_LAG_SECONDS,
             METADATA_CLEANUP_CANDIDATES,
@@ -655,6 +674,8 @@ mod tests {
         set_write_sessions(1, 2);
         record_write_session_rejected("global");
         record_write_session_expired();
+        set_write_targets(1, 2);
+        record_write_target_rejected("global");
         record_raft_command_bytes("publish_file", 128);
         record_raft_apply("ok", "none", 0.002);
         record_raft_log_durable_write("ok", 128, 0.002);

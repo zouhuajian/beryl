@@ -57,6 +57,16 @@ pub struct WriteSession {
     pub issued_targets: Vec<WriteTarget>,
     /// Logical AddBlock steps issued for predecessor-based replay.
     issued_steps: HashMap<Option<BlockId>, IssuedTarget>,
+    /// The one logical AddBlock step allowed to cross Raft allocation at a time.
+    pending_add_block: Option<PendingAddBlock>,
+}
+
+/// Small active-session snapshot used before AddBlock reserves target state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WriteSessionIdentity {
+    pub(crate) mount_id: MountId,
+    pub(crate) lease_epoch: u64,
+    pub(crate) open_client_id: ClientId,
 }
 
 /// Validated inputs needed before one `OpenWrite` crosses its Raft proposal.
@@ -134,10 +144,18 @@ impl WriteSessionEntry {
     }
 }
 
+/// Compact replay index into the canonical target stored in `issued_targets`.
 #[derive(Clone, Debug)]
 struct IssuedTarget {
     desired_len: Option<u64>,
-    target: WriteTarget,
+    target_index: usize,
+}
+
+/// One predecessor-addressed AddBlock step reserved before Raft allocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingAddBlock {
+    previous_block_id: Option<BlockId>,
+    desired_len: Option<u64>,
 }
 
 /// In-memory, leader-local registry of write sessions and capacity indexes.
@@ -149,6 +167,8 @@ pub struct SessionRegistry {
     state: RwLock<SessionRegistryState>,
     max_sessions: usize,
     max_sessions_per_client: usize,
+    max_write_targets: usize,
+    max_write_targets_per_session: usize,
     /// Fixed lifetime assigned at opening and extended by successful renewal.
     session_ttl_ms: u64,
 }
@@ -160,6 +180,123 @@ pub(crate) enum WriteSessionLimit {
     Global,
     /// Opening plus active capacity attributed to one client ID.
     PerClient,
+}
+
+/// Capacity boundary that rejected one pending write target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteTargetLimit {
+    /// Pending plus issued targets across the Metadata process.
+    Global,
+    /// Pending plus issued targets owned by one write session.
+    PerSession,
+}
+
+impl WriteTargetLimit {
+    /// Stable low-cardinality label used by capacity metrics and logs.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::PerSession => "per_session",
+        }
+    }
+}
+
+/// Exact write-target limit reached before Raft block allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WriteTargetLimitExceeded {
+    pub(crate) limit: WriteTargetLimit,
+    pub(crate) maximum: usize,
+}
+
+/// Outcome of beginning one predecessor-addressed AddBlock step.
+pub(crate) enum BeginAddBlock<'a> {
+    /// The logical step was already issued and can be replayed without capacity.
+    Replay(WriteTarget),
+    /// New capacity is reserved and must be completed or released before return.
+    Reserved(WriteTargetReservation<'a>),
+}
+
+/// Exact failure returned before an AddBlock step may allocate through Raft.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BeginAddBlockError {
+    /// The active session no longer exists or the presented epoch is stale.
+    Session(String),
+    /// The registry's compact replay index no longer resolves to its target.
+    Internal(String),
+    /// The predecessor or requested target shape is invalid for the session.
+    InvalidArgument(String),
+    /// An identical logical step is already allocating and should be retried.
+    Pending,
+    /// Leader-local target capacity is exhausted.
+    LimitExceeded(WriteTargetLimitExceeded),
+}
+
+/// Exact failure returned while converting a pending AddBlock into an issued target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CompleteWriteTargetError {
+    /// Expiry, abort, or replacement removed the reservation's active session.
+    NotCurrent,
+    /// The completed target no longer matches the reserved session state.
+    InvalidTarget(String),
+}
+
+/// Exact leader-local target capacity held across Raft allocation and placement.
+///
+/// Dropping this owner releases only the matching pending step. Completing it
+/// atomically converts the pending slot into one issued target without changing
+/// the total occupied target count.
+#[must_use = "dropping the reservation releases pending write-target capacity"]
+pub(crate) struct WriteTargetReservation<'a> {
+    registry: &'a SessionRegistry,
+    inode_id: InodeId,
+    lease_epoch: u64,
+    pending: PendingAddBlock,
+    layout: FileLayout,
+    open_client_id: ClientId,
+    file_offset: u64,
+    effective_len: u64,
+    block_stamp: u64,
+    armed: bool,
+}
+
+impl WriteTargetReservation<'_> {
+    /// Return the persisted layout that the allocated block must use.
+    pub(crate) fn layout(&self) -> FileLayout {
+        self.layout
+    }
+
+    /// Return the client identity embedded in the target fencing token.
+    pub(crate) fn open_client_id(&self) -> ClientId {
+        self.open_client_id
+    }
+
+    /// Return the file offset reserved for this logical AddBlock step.
+    pub(crate) fn file_offset(&self) -> u64 {
+        self.file_offset
+    }
+
+    /// Return the logical length validated before Raft allocation.
+    pub(crate) fn effective_len(&self) -> u64 {
+        self.effective_len
+    }
+
+    /// Return the content revision stamp captured for this target attempt.
+    pub(crate) fn block_stamp(&self) -> u64 {
+        self.block_stamp
+    }
+
+    /// Atomically install a validated target in place of this pending slot.
+    pub(crate) fn complete(mut self, target: WriteTarget) -> Result<WriteTarget, CompleteWriteTargetError> {
+        let result = self.registry.complete_write_target(
+            self.inode_id,
+            self.lease_epoch,
+            &self.pending,
+            target,
+            current_time_ms(),
+        );
+        self.armed = false;
+        result
+    }
 }
 
 impl WriteSessionLimit {
@@ -263,6 +400,10 @@ struct SessionRegistryState {
     entries_by_expiry: BTreeSet<(u64, InodeId)>,
     /// Next process-local opening identity; zero is never issued.
     next_opening_id: u64,
+    /// Pending plus issued targets retained across every active session.
+    outstanding_write_targets: usize,
+    /// Subset of outstanding targets currently crossing allocation or placement.
+    pending_write_targets: usize,
 }
 
 impl Default for SessionRegistryState {
@@ -274,6 +415,8 @@ impl Default for SessionRegistryState {
             ancestor_activity: HashMap::new(),
             entries_by_expiry: BTreeSet::new(),
             next_opening_id: 1,
+            outstanding_write_targets: 0,
+            pending_write_targets: 0,
         }
     }
 }
@@ -288,17 +431,31 @@ struct AncestorWriteActivity {
 
 impl SessionRegistry {
     /// Create an empty leader-local registry with fixed process limits.
-    pub(crate) fn new(max_sessions: usize, max_sessions_per_client: usize, session_ttl_ms: u64) -> Self {
+    pub(crate) fn new(
+        max_sessions: usize,
+        max_sessions_per_client: usize,
+        max_write_targets: usize,
+        max_write_targets_per_session: usize,
+        session_ttl_ms: u64,
+    ) -> Self {
         assert!(max_sessions > 0, "global write-session limit must be positive");
         assert!(
             max_sessions_per_client > 0 && max_sessions_per_client <= max_sessions,
             "per-client write-session limit must be positive and not exceed the global limit"
         );
+        assert!(max_write_targets > 0, "global write-target limit must be positive");
+        assert!(
+            max_write_targets_per_session > 0 && max_write_targets_per_session <= max_write_targets,
+            "per-session write-target limit must be positive and not exceed the global limit"
+        );
         observe::set_write_sessions(0, 0);
+        observe::set_write_targets(0, 0);
         Self {
             state: RwLock::new(SessionRegistryState::default()),
             max_sessions,
             max_sessions_per_client,
+            max_write_targets,
+            max_write_targets_per_session,
             session_ttl_ms,
         }
     }
@@ -416,6 +573,7 @@ impl SessionRegistry {
             ancestor_inode_ids: opening.ancestor_inode_ids,
             issued_targets: Vec::new(),
             issued_steps: HashMap::new(),
+            pending_add_block: None,
         };
         let previous = state
             .entries
@@ -432,70 +590,185 @@ impl SessionRegistry {
         Ok(session)
     }
 
-    /// Return an issued predecessor-addressed AddBlock step, or validate that
-    /// the caller may allocate the next step.
-    pub fn lookup_issued_target(
+    /// Replay an issued AddBlock step or reserve capacity before Raft allocation.
+    ///
+    /// Replay is resolved before capacity checks. A new step installs the one
+    /// pending slot and increments global occupancy under the registry lock, so
+    /// limit-plus-one cannot cross the subsequent Raft boundary concurrently.
+    pub(crate) fn begin_add_block(
         &self,
         inode_id: InodeId,
         lease_epoch: u64,
         previous_block_id: Option<BlockId>,
         desired_len: Option<u64>,
-    ) -> Result<Option<WriteTarget>, String> {
+    ) -> Result<BeginAddBlock<'_>, BeginAddBlockError> {
         let mut state = self.state.write();
         let now_ms = current_time_ms();
         Self::retire_expired_entry_for_inode(&mut state, inode_id, now_ms);
         Self::retire_expired_entries(&mut state, now_ms);
-        let session = Self::active_session(&state, inode_id)?;
-        if session.lease_epoch != lease_epoch {
-            return Err("write session lease epoch mismatch".to_string());
-        }
-        if let Some(step) = session.issued_steps.get(&previous_block_id) {
-            if step.desired_len == desired_len {
-                return Ok(Some(step.target.clone()));
+        let pending = PendingAddBlock {
+            previous_block_id,
+            desired_len,
+        };
+        let (layout, open_client_id, file_offset, effective_len, block_stamp) = {
+            let session = Self::active_session_mut(&mut state, inode_id).map_err(BeginAddBlockError::Session)?;
+            if session.lease_epoch != lease_epoch {
+                return Err(BeginAddBlockError::Session(
+                    "write session lease epoch mismatch".to_string(),
+                ));
             }
-            return Err("AddBlock predecessor reused with a different desired_len".to_string());
-        }
+            if let Some(step) = session.issued_steps.get(&previous_block_id) {
+                if step.desired_len != desired_len {
+                    return Err(BeginAddBlockError::InvalidArgument(
+                        "AddBlock predecessor reused with a different desired_len".to_string(),
+                    ));
+                }
+                let target = session.issued_targets.get(step.target_index).cloned().ok_or_else(|| {
+                    BeginAddBlockError::Internal("issued AddBlock target index is inconsistent".to_string())
+                })?;
+                return Ok(BeginAddBlock::Replay(target));
+            }
 
-        let expected_previous = session.issued_targets.last().map(|target| target.block_id);
-        if previous_block_id != expected_previous {
-            return Err(format!(
-                "AddBlock predecessor mismatch: expected {expected_previous:?}, got {previous_block_id:?}"
-            ));
+            let expected_previous = session.issued_targets.last().map(|target| target.block_id);
+            if previous_block_id != expected_previous {
+                return Err(BeginAddBlockError::InvalidArgument(format!(
+                    "AddBlock predecessor mismatch: expected {expected_previous:?}, got {previous_block_id:?}"
+                )));
+            }
+            if let Some(current) = &session.pending_add_block {
+                if current == &pending {
+                    return Err(BeginAddBlockError::Pending);
+                }
+                return Err(BeginAddBlockError::InvalidArgument(
+                    "AddBlock predecessor reused with a different desired_len".to_string(),
+                ));
+            }
+            let effective_len = desired_len.unwrap_or(u64::from(session.layout.block_size));
+            BlockShape::for_effective_len(&session.layout, effective_len).map_err(|error| {
+                BeginAddBlockError::InvalidArgument(format!("invalid AddBlock desired_len: {error}"))
+            })?;
+            let file_offset = session
+                .issued_targets
+                .last()
+                .map(|target| target.file_offset.checked_add(target.effective_len))
+                .unwrap_or(Some(session.base_size))
+                .ok_or_else(|| BeginAddBlockError::InvalidArgument("write target file offset overflow".to_string()))?;
+            let block_stamp = session
+                .content_revision
+                .checked_add(1)
+                .ok_or_else(|| BeginAddBlockError::InvalidArgument("content revision overflow".to_string()))?;
+            if session.issued_targets.len() >= self.max_write_targets_per_session {
+                observe::record_write_target_rejected(WriteTargetLimit::PerSession.label());
+                return Err(BeginAddBlockError::LimitExceeded(WriteTargetLimitExceeded {
+                    limit: WriteTargetLimit::PerSession,
+                    maximum: self.max_write_targets_per_session,
+                }));
+            }
+            (
+                session.layout,
+                session.open_client_id,
+                file_offset,
+                effective_len,
+                block_stamp,
+            )
+        };
+
+        if state.outstanding_write_targets >= self.max_write_targets {
+            observe::record_write_target_rejected(WriteTargetLimit::Global.label());
+            return Err(BeginAddBlockError::LimitExceeded(WriteTargetLimitExceeded {
+                limit: WriteTargetLimit::Global,
+                maximum: self.max_write_targets,
+            }));
         }
-        Ok(None)
+        let session = Self::active_session_mut(&mut state, inode_id)
+            .expect("validated active session must remain current under the registry lock");
+        assert!(session.pending_add_block.replace(pending.clone()).is_none());
+        state.outstanding_write_targets = state
+            .outstanding_write_targets
+            .checked_add(1)
+            .expect("write-target occupancy below its limit must increment");
+        state.pending_write_targets = state
+            .pending_write_targets
+            .checked_add(1)
+            .expect("pending write-target occupancy must increment");
+        Self::record_write_target_gauges(&state);
+
+        Ok(BeginAddBlock::Reserved(WriteTargetReservation {
+            registry: self,
+            inode_id,
+            lease_epoch,
+            pending,
+            layout,
+            open_client_id,
+            file_offset,
+            effective_len,
+            block_stamp,
+            armed: true,
+        }))
     }
 
-    /// Install one newly allocated target, or return the winner of a concurrent
-    /// request for the same predecessor.
-    pub fn install_issued_target(
+    /// Replace only the matching pending step with one fully validated target.
+    fn complete_write_target(
         &self,
         inode_id: InodeId,
         lease_epoch: u64,
-        previous_block_id: Option<BlockId>,
-        desired_len: Option<u64>,
+        pending: &PendingAddBlock,
         target: WriteTarget,
-    ) -> Result<WriteTarget, String> {
+        now_ms: u64,
+    ) -> Result<WriteTarget, CompleteWriteTargetError> {
         let mut state = self.state.write();
-        let now_ms = current_time_ms();
         Self::retire_expired_entry_for_inode(&mut state, inode_id, now_ms);
         Self::retire_expired_entries(&mut state, now_ms);
-        let session = Self::active_session_mut(&mut state, inode_id)?;
-        if session.lease_epoch != lease_epoch {
-            return Err("write session lease epoch mismatch".to_string());
-        }
-        if let Some(step) = session.issued_steps.get(&previous_block_id) {
-            if step.desired_len == desired_len {
-                return Ok(step.target.clone());
+        let validation = {
+            let session =
+                Self::active_session_mut(&mut state, inode_id).map_err(|_| CompleteWriteTargetError::NotCurrent)?;
+            if session.lease_epoch != lease_epoch {
+                return Err(CompleteWriteTargetError::NotCurrent);
             }
-            return Err("AddBlock predecessor reused with a different desired_len".to_string());
+            if session.pending_add_block.as_ref() != Some(pending) {
+                return Err(CompleteWriteTargetError::NotCurrent);
+            }
+            Self::validate_write_target(session, lease_epoch, pending, &target)
+        };
+        if let Err(error) = validation {
+            Self::cancel_write_target_locked(&mut state, inode_id, lease_epoch, pending);
+            return Err(CompleteWriteTargetError::InvalidTarget(error));
         }
-        let expected_previous = session.issued_targets.last().map(|issued| issued.block_id);
-        if previous_block_id != expected_previous {
-            return Err(format!(
-                "AddBlock predecessor mismatch: expected {expected_previous:?}, got {previous_block_id:?}"
-            ));
-        }
-        if target.block_id.inode_id != inode_id {
+
+        let session = Self::active_session_mut(&mut state, inode_id)
+            .expect("validated active session must remain current under the registry lock");
+        let target_index = session.issued_targets.len();
+        session.issued_targets.push(target.clone());
+        assert!(
+            session
+                .issued_steps
+                .insert(
+                    pending.previous_block_id,
+                    IssuedTarget {
+                        desired_len: pending.desired_len,
+                        target_index,
+                    },
+                )
+                .is_none(),
+            "reserved AddBlock predecessor must not already be issued"
+        );
+        assert_eq!(session.pending_add_block.take().as_ref(), Some(pending));
+        state.pending_write_targets = state
+            .pending_write_targets
+            .checked_sub(1)
+            .expect("completed target must own one pending count");
+        Self::record_write_target_gauges(&state);
+        Ok(target)
+    }
+
+    /// Revalidate fencing, layout, offset, and revision before issuing a reserved target.
+    fn validate_write_target(
+        session: &WriteSession,
+        lease_epoch: u64,
+        pending: &PendingAddBlock,
+        target: &WriteTarget,
+    ) -> Result<(), String> {
+        if target.block_id.inode_id != session.inode_id {
             return Err("write target inode mismatch".to_string());
         }
         if target.fencing_token.block_id != target.block_id
@@ -504,7 +777,7 @@ impl SessionRegistry {
         {
             return Err("write target fencing token mismatch".to_string());
         }
-        let expected_effective_len = desired_len.unwrap_or(target.block_size);
+        let expected_effective_len = pending.desired_len.unwrap_or(target.block_size);
         if target.effective_len != expected_effective_len {
             return Err(format!(
                 "write target effective length mismatch: expected {expected_effective_len}, got {}",
@@ -544,15 +817,7 @@ impl SessionRegistry {
                 target.block_stamp
             ));
         }
-        session.issued_targets.push(target.clone());
-        session.issued_steps.insert(
-            previous_block_id,
-            IssuedTarget {
-                desired_len,
-                target: target.clone(),
-            },
-        );
-        Ok(target)
+        Ok(())
     }
 
     /// Get a non-expired write session after bounded global and exact-inode retirement.
@@ -563,6 +828,22 @@ impl SessionRegistry {
         Self::retire_expired_entries(&mut state, now_ms);
         match state.entries.get(&inode_id) {
             Some(WriteSessionEntry::Active(session)) => Some(session.clone()),
+            Some(WriteSessionEntry::Opening(_)) | None => None,
+        }
+    }
+
+    /// Get a lightweight active-session snapshot for admission, preflight, or presence checks.
+    pub(crate) fn get_session_identity(&self, inode_id: InodeId) -> Option<WriteSessionIdentity> {
+        let mut state = self.state.write();
+        let now_ms = current_time_ms();
+        Self::retire_expired_entry_for_inode(&mut state, inode_id, now_ms);
+        Self::retire_expired_entries(&mut state, now_ms);
+        match state.entries.get(&inode_id) {
+            Some(WriteSessionEntry::Active(session)) => Some(WriteSessionIdentity {
+                mount_id: session.mount_id,
+                lease_epoch: session.lease_epoch,
+                open_client_id: session.open_client_id,
+            }),
             Some(WriteSessionEntry::Opening(_)) | None => None,
         }
     }
@@ -756,6 +1037,42 @@ impl SessionRegistry {
         }
     }
 
+    /// Release only the matching pending AddBlock step after failure or cancellation.
+    fn cancel_write_target(&self, inode_id: InodeId, lease_epoch: u64, pending: &PendingAddBlock) {
+        let mut state = self.state.write();
+        Self::cancel_write_target_locked(&mut state, inode_id, lease_epoch, pending);
+    }
+
+    /// Release only the exact pending step so a stale guard cannot cancel replacement state.
+    fn cancel_write_target_locked(
+        state: &mut SessionRegistryState,
+        inode_id: InodeId,
+        lease_epoch: u64,
+        pending: &PendingAddBlock,
+    ) -> bool {
+        let matches = matches!(
+            state.entries.get(&inode_id),
+            Some(WriteSessionEntry::Active(session))
+                if session.lease_epoch == lease_epoch && session.pending_add_block.as_ref() == Some(pending)
+        );
+        if !matches {
+            return false;
+        }
+        let session = Self::active_session_mut(state, inode_id)
+            .expect("matching pending target must belong to an active session");
+        assert_eq!(session.pending_add_block.take().as_ref(), Some(pending));
+        state.outstanding_write_targets = state
+            .outstanding_write_targets
+            .checked_sub(1)
+            .expect("pending target must own one outstanding count");
+        state.pending_write_targets = state
+            .pending_write_targets
+            .checked_sub(1)
+            .expect("pending target must own one pending count");
+        Self::record_write_target_gauges(state);
+        true
+    }
+
     /// Insert one primary entry and every derived index under the state lock.
     fn insert_entry(state: &mut SessionRegistryState, entry: WriteSessionEntry) {
         let inode_id = match &entry {
@@ -789,6 +1106,13 @@ impl SessionRegistry {
     fn remove_entry(state: &mut SessionRegistryState, inode_id: InodeId) -> Option<WriteSessionEntry> {
         let entry = state.entries.get(&inode_id)?;
         let client_id = entry.client_id();
+        let (owned_write_targets, pending_write_targets) = match entry {
+            WriteSessionEntry::Opening(_) => (0, 0),
+            WriteSessionEntry::Active(session) => (
+                session.issued_targets.len() + usize::from(session.pending_add_block.is_some()),
+                usize::from(session.pending_add_block.is_some()),
+            ),
+        };
         assert!(
             state
                 .occupied_sessions_by_client
@@ -807,7 +1131,16 @@ impl SessionRegistry {
         }
         Self::remove_from_indexes(state, inode_id, &entry);
         Self::decrement_client_occupancy(state, client_id);
+        state.outstanding_write_targets = state
+            .outstanding_write_targets
+            .checked_sub(owned_write_targets)
+            .expect("removed session targets must be included in global occupancy");
+        state.pending_write_targets = state
+            .pending_write_targets
+            .checked_sub(pending_write_targets)
+            .expect("removed session pending target must be included in pending occupancy");
         Self::record_session_gauges(state);
+        Self::record_write_target_gauges(state);
         Some(entry)
     }
 
@@ -895,14 +1228,6 @@ impl SessionRegistry {
         }
     }
 
-    fn active_session(state: &SessionRegistryState, inode_id: InodeId) -> Result<&WriteSession, String> {
-        match state.entries.get(&inode_id) {
-            Some(WriteSessionEntry::Active(session)) => Ok(session),
-            Some(WriteSessionEntry::Opening(_)) => Err("write session is still opening".to_string()),
-            None => Err("write session not found".to_string()),
-        }
-    }
-
     fn active_session_mut(state: &mut SessionRegistryState, inode_id: InodeId) -> Result<&mut WriteSession, String> {
         match state.entries.get_mut(&inode_id) {
             Some(WriteSessionEntry::Active(session)) => Ok(session),
@@ -919,12 +1244,31 @@ impl SessionRegistry {
             .expect("opening session count cannot exceed primary entries");
         observe::set_write_sessions(state.opening_sessions, active_sessions);
     }
+
+    /// Publish issued occupancy as total outstanding capacity minus pending reservations.
+    fn record_write_target_gauges(state: &SessionRegistryState) {
+        let issued = state
+            .outstanding_write_targets
+            .checked_sub(state.pending_write_targets)
+            .expect("pending write targets cannot exceed total occupancy");
+        observe::set_write_targets(state.pending_write_targets, issued);
+    }
 }
 
 impl Drop for WriteOpening<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.registry.cancel_opening(self.inode_id, self.opening_id);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for WriteTargetReservation<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry
+                .cancel_write_target(self.inode_id, self.lease_epoch, &self.pending);
             self.armed = false;
         }
     }
@@ -943,6 +1287,8 @@ impl Default for SessionRegistry {
         Self::new(
             config.write_session_limits.max_active,
             config.write_session_limits.max_active_per_client,
+            config.write_target_limits.max_outstanding,
+            config.write_target_limits.max_outstanding_per_session,
             config.write_lease_timeout_ms,
         )
     }
@@ -1042,14 +1388,19 @@ mod tests {
         target.file_offset = file_offset;
         target.effective_len = desired_len;
         target.block_stamp = block_stamp;
-        registry
-            .install_issued_target(inode_id, 7, previous_block_id, Some(desired_len), target)
+        let reservation = match registry
+            .begin_add_block(inode_id, 7, previous_block_id, Some(desired_len))
             .unwrap()
+        {
+            BeginAddBlock::Reserved(reservation) => reservation,
+            BeginAddBlock::Replay(_) => panic!("new test target must reserve capacity"),
+        };
+        reservation.complete(target).unwrap()
     }
 
     #[test]
     fn opening_and_active_sessions_share_global_capacity() {
-        let registry = SessionRegistry::new(2, 2, 60_000);
+        let registry = SessionRegistry::new(2, 2, 100, 100, 60_000);
         install_session(&registry, create_input(InodeId::new(1))).unwrap();
         let opening = begin_opening(&registry, InodeId::new(2), ClientId::new(1)).unwrap();
 
@@ -1077,7 +1428,7 @@ mod tests {
 
     #[test]
     fn per_client_capacity_does_not_block_another_client() {
-        let registry = SessionRegistry::new(3, 1, 60_000);
+        let registry = SessionRegistry::new(3, 1, 100, 100, 60_000);
         install_session(&registry, create_input(InodeId::new(1))).unwrap();
 
         let rejection = match begin_opening(&registry, InodeId::new(2), ClientId::new(1)) {
@@ -1097,7 +1448,7 @@ mod tests {
 
     #[test]
     fn dropped_or_invalid_openings_restore_capacity() {
-        let registry = SessionRegistry::new(1, 1, 60_000);
+        let registry = SessionRegistry::new(1, 1, 100, 100, 60_000);
         let opening = begin_opening(&registry, InodeId::new(1), ClientId::new(1)).unwrap();
         drop(opening);
 
@@ -1117,7 +1468,7 @@ mod tests {
 
     #[test]
     fn opening_owns_inode_ancestor_and_capacity_until_drop() {
-        let registry = SessionRegistry::new(1, 1, 60_000);
+        let registry = SessionRegistry::new(1, 1, 100, 100, 60_000);
         let inode_id = InodeId::new(30);
         let root_inode_id = InodeId::new(1);
         let mut input = create_input(inode_id);
@@ -1136,7 +1487,7 @@ mod tests {
 
     #[test]
     fn stale_opening_drop_cannot_remove_replacement_with_same_proposed_epoch() {
-        let registry = SessionRegistry::new(1, 1, 1);
+        let registry = SessionRegistry::new(1, 1, 100, 100, 1);
         let inode_id = InodeId::new(31);
         let input = create_input(inode_id);
         let stale = registry.begin_session_at(input.clone(), 0).unwrap();
@@ -1164,7 +1515,7 @@ mod tests {
 
     #[test]
     fn expired_opening_cannot_activate_and_releases_all_indexes() {
-        let registry = SessionRegistry::new(1, 1, 1);
+        let registry = SessionRegistry::new(1, 1, 100, 100, 1);
         let inode_id = InodeId::new(32);
         let opening = registry.begin_session_at(create_input(inode_id), 0).unwrap();
 
@@ -1183,7 +1534,7 @@ mod tests {
 
     #[test]
     fn epoch_and_opening_identity_exhaustion_do_not_consume_registry_state() {
-        let registry = SessionRegistry::new(1, 1, 60_000);
+        let registry = SessionRegistry::new(1, 1, 100, 100, 60_000);
         let inode_id = InodeId::new(34);
         let mut exhausted_epoch = create_input(inode_id);
         exhausted_epoch.current_lease_epoch = Some(u64::MAX);
@@ -1234,7 +1585,7 @@ mod tests {
             .unwrap(),
         );
         let worker_manager = Arc::new(WorkerManager::new(60_000));
-        let registry = Arc::new(SessionRegistry::new(1, 1, 100));
+        let registry = Arc::new(SessionRegistry::new(1, 1, 100, 100, 100));
         let inode_id = InodeId::new(35);
         install_session(&registry, create_input(inode_id)).unwrap();
         assert!(registry.state.read().entries.contains_key(&inode_id));
@@ -1281,7 +1632,7 @@ mod tests {
 
     #[test]
     fn concurrent_openings_never_exceed_global_capacity() {
-        let registry = std::sync::Arc::new(SessionRegistry::new(4, 4, 60_000));
+        let registry = std::sync::Arc::new(SessionRegistry::new(4, 4, 100, 100, 60_000));
         let contender_count = 16;
         let start = std::sync::Arc::new(std::sync::Barrier::new(contender_count + 1));
         let release = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
@@ -1381,7 +1732,7 @@ mod tests {
 
     #[test]
     fn expired_session_does_not_keep_ancestor_busy() {
-        let registry = SessionRegistry::new(10, 10, 1);
+        let registry = SessionRegistry::new(10, 10, 100, 100, 1);
         let inode_id = InodeId::new(22);
         let root_inode_id = InodeId::new(1);
         let mut input = create_input(inode_id);
@@ -1399,7 +1750,7 @@ mod tests {
 
     #[test]
     fn renewed_session_updates_ancestor_expiry() {
-        let registry = SessionRegistry::new(10, 10, 10);
+        let registry = SessionRegistry::new(10, 10, 100, 100, 10);
         let inode_id = InodeId::new(24);
         let root_inode_id = InodeId::new(1);
         let mut input = create_input(inode_id);
@@ -1427,7 +1778,7 @@ mod tests {
 
     #[test]
     fn rejected_renewal_leaves_primary_and_expiry_indexes_unchanged() {
-        let registry = SessionRegistry::new(10, 10, 10);
+        let registry = SessionRegistry::new(10, 10, 100, 100, 10);
         let inode_id = InodeId::new(33);
         install_session_at(&registry, create_input(inode_id), 100).unwrap();
 
@@ -1454,7 +1805,7 @@ mod tests {
 
     #[test]
     fn expiry_renewal_and_close_retire_shared_ancestor_state() {
-        let registry = SessionRegistry::new(10, 10, 10);
+        let registry = SessionRegistry::new(10, 10, 100, 100, 10);
         let root_inode_id = InodeId::new(1);
         let expired_handle = InodeId::new(25);
         let active_handle = InodeId::new(26);
@@ -1487,7 +1838,7 @@ mod tests {
     #[test]
     fn expiry_sweep_is_bounded_and_queries_ignore_residual_expired_entries() {
         let historical_expired_count = MAX_EXPIRED_SESSION_RETIREMENTS_PER_CALL * 3 + 17;
-        let registry = SessionRegistry::new(historical_expired_count + 1, historical_expired_count + 1, 10);
+        let registry = SessionRegistry::new(historical_expired_count + 1, historical_expired_count + 1, 100, 100, 10);
         let residual_expired_count = MAX_EXPIRED_SESSION_RETIREMENTS_PER_CALL * 2 + 3;
         for raw in 1..=historical_expired_count {
             let inode_id = InodeId::new(raw as u64);
@@ -1564,15 +1915,11 @@ mod tests {
         let inode_id = InodeId::new(11);
         install_session(&registry, create_input(inode_id)).unwrap();
 
-        assert!(registry
-            .lookup_issued_target(inode_id, 7, None, Some(32))
-            .unwrap()
-            .is_none());
         let first = issue_target(&registry, inode_id, None, 32, 0, 0, 1);
-        let replay = registry
-            .lookup_issued_target(inode_id, 7, None, Some(32))
-            .unwrap()
-            .unwrap();
+        let replay = match registry.begin_add_block(inode_id, 7, None, Some(32)).unwrap() {
+            BeginAddBlock::Replay(target) => target,
+            BeginAddBlock::Reserved(_) => panic!("issued predecessor must replay"),
+        };
         assert_eq!(replay, first);
 
         let second = issue_target(&registry, inode_id, Some(first.block_id), 64, 1, 32, 1);
@@ -1581,32 +1928,44 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_duplicate_add_block_installs_one_target_and_returns_one_result() {
+    fn concurrent_duplicate_add_block_reserves_one_target_before_completion() {
         let registry = std::sync::Arc::new(SessionRegistry::default());
         let inode_id = InodeId::new(15);
         install_session(&registry, create_input(inode_id)).unwrap();
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let reserved = std::sync::Arc::new(std::sync::Barrier::new(2));
 
         let mut joins = Vec::new();
         for index in 0..2 {
             let registry = std::sync::Arc::clone(&registry);
-            let barrier = std::sync::Arc::clone(&barrier);
+            let start = std::sync::Arc::clone(&start);
+            let reserved = std::sync::Arc::clone(&reserved);
             joins.push(std::thread::spawn(move || {
-                let mut target = write_target(inode_id, index);
-                target.effective_len = 32;
-                barrier.wait();
-                registry
-                    .install_issued_target(inode_id, 7, None, Some(32), target)
-                    .unwrap()
+                start.wait();
+                match registry.begin_add_block(inode_id, 7, None, Some(32)) {
+                    Ok(BeginAddBlock::Reserved(reservation)) => {
+                        reserved.wait();
+                        let mut target = write_target(inode_id, index);
+                        target.effective_len = 32;
+                        Some(reservation.complete(target).unwrap())
+                    }
+                    Err(BeginAddBlockError::Pending) => {
+                        reserved.wait();
+                        None
+                    }
+                    Ok(BeginAddBlock::Replay(_)) | Err(_) => panic!("unexpected concurrent AddBlock outcome"),
+                }
             }));
         }
 
         let first = joins.remove(0).join().unwrap();
         let second = joins.remove(0).join().unwrap();
-        assert_eq!(first, second);
+        let issued = first.or(second).expect("one request must issue the target");
         let session = registry.get_session(inode_id).unwrap();
-        assert_eq!(session.issued_targets, vec![first]);
+        assert_eq!(session.issued_targets, vec![issued]);
         assert_eq!(session.issued_steps.len(), 1);
+        assert_eq!(registry.state.read().outstanding_write_targets, 1);
+        assert_eq!(registry.state.read().pending_write_targets, 0);
     }
 
     #[test]
@@ -1616,8 +1975,14 @@ mod tests {
         install_session(&registry, create_input(inode_id)).unwrap();
         issue_target(&registry, inode_id, None, 32, 0, 0, 1);
 
-        assert!(registry.lookup_issued_target(inode_id, 7, None, Some(64)).is_err());
-        assert!(registry.lookup_issued_target(inode_id, 6, None, Some(32)).is_err());
+        assert!(matches!(
+            registry.begin_add_block(inode_id, 7, None, Some(64)),
+            Err(BeginAddBlockError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            registry.begin_add_block(inode_id, 6, None, Some(32)),
+            Err(BeginAddBlockError::Session(_))
+        ));
         assert_eq!(registry.get_session(inode_id).unwrap().issued_targets.len(), 1);
     }
 
@@ -1628,10 +1993,10 @@ mod tests {
         install_session(&registry, create_input(inode_id)).unwrap();
         let unknown = BlockId::new(inode_id, BlockIndex::new(99));
 
-        assert!(registry
-            .lookup_issued_target(inode_id, 7, Some(unknown), Some(32))
-            .unwrap_err()
-            .contains("predecessor mismatch"));
+        assert!(matches!(
+            registry.begin_add_block(inode_id, 7, Some(unknown), Some(32)),
+            Err(BeginAddBlockError::InvalidArgument(message)) if message.contains("predecessor mismatch")
+        ));
         assert!(registry.get_session(inode_id).unwrap().issued_targets.is_empty());
     }
 
@@ -1647,10 +2012,10 @@ mod tests {
             .update_published_state(inode_id, 7, 1, 32)
             .expect("advance published state");
 
-        let replay = registry
-            .lookup_issued_target(inode_id, 7, None, Some(32))
-            .unwrap()
-            .unwrap();
+        let replay = match registry.begin_add_block(inode_id, 7, None, Some(32)).unwrap() {
+            BeginAddBlock::Replay(target) => target,
+            BeginAddBlock::Reserved(_) => panic!("issued predecessor must replay"),
+        };
         assert_eq!(replay, first);
         let second = issue_target(&registry, inode_id, Some(first.block_id), 32, 1, 32, 2);
         assert_eq!(second.block_stamp, 2);
@@ -1663,6 +2028,13 @@ mod tests {
         let inode_id = InodeId::new(16);
         install_session(&registry, create_input(inode_id)).unwrap();
         let first = issue_target(&registry, inode_id, None, 32, 0, 0, 1);
+        let reservation = match registry
+            .begin_add_block(inode_id, 7, Some(first.block_id), Some(32))
+            .unwrap()
+        {
+            BeginAddBlock::Reserved(reservation) => reservation,
+            BeginAddBlock::Replay(_) => panic!("new predecessor must reserve"),
+        };
         registry
             .update_published_state(inode_id, 7, 1, 32)
             .expect("advance published state while AddBlock is in flight");
@@ -1671,11 +2043,105 @@ mod tests {
         stale.effective_len = 32;
         stale.block_stamp = 1;
 
-        let error = registry
-            .install_issued_target(inode_id, 7, Some(first.block_id), Some(32), stale)
+        let error = reservation
+            .complete(stale)
             .expect_err("an AddBlock result from the previous revision must be rejected");
 
-        assert!(error.contains("block stamp changed: expected 2, got 1"));
+        assert!(matches!(
+            error,
+            CompleteWriteTargetError::InvalidTarget(message)
+                if message.contains("block stamp changed: expected 2, got 1")
+        ));
         assert_eq!(registry.get_session(inode_id).unwrap().issued_targets, vec![first]);
+        assert_eq!(registry.state.read().outstanding_write_targets, 1);
+        assert_eq!(registry.state.read().pending_write_targets, 0);
+    }
+
+    #[test]
+    fn target_limits_count_pending_and_issued_while_replay_bypasses_capacity() {
+        let registry = SessionRegistry::new(3, 3, 2, 1, 60_000);
+        let first_inode = InodeId::new(31);
+        let second_inode = InodeId::new(32);
+        let third_inode = InodeId::new(33);
+        for inode_id in [first_inode, second_inode, third_inode] {
+            install_session(&registry, create_input(inode_id)).unwrap();
+        }
+
+        let first = issue_target(&registry, first_inode, None, 32, 0, 0, 1);
+        assert!(matches!(
+            registry.begin_add_block(first_inode, 7, Some(first.block_id), Some(32)),
+            Err(BeginAddBlockError::LimitExceeded(WriteTargetLimitExceeded {
+                limit: WriteTargetLimit::PerSession,
+                maximum: 1,
+            }))
+        ));
+        issue_target(&registry, second_inode, None, 32, 0, 0, 1);
+        assert!(matches!(
+            registry.begin_add_block(third_inode, 7, None, Some(32)),
+            Err(BeginAddBlockError::LimitExceeded(WriteTargetLimitExceeded {
+                limit: WriteTargetLimit::Global,
+                maximum: 2,
+            }))
+        ));
+        assert!(matches!(
+            registry.begin_add_block(first_inode, 7, None, Some(32)),
+            Ok(BeginAddBlock::Replay(target)) if target == first
+        ));
+
+        registry.remove_session_if_epoch(second_inode, 7).unwrap();
+        assert!(matches!(
+            registry.begin_add_block(third_inode, 7, None, Some(32)),
+            Ok(BeginAddBlock::Reserved(_))
+        ));
+    }
+
+    #[test]
+    fn pending_target_drop_and_session_removal_release_exact_capacity() {
+        let registry = SessionRegistry::new(1, 1, 1, 1, 60_000);
+        let inode_id = InodeId::new(34);
+        install_session(&registry, create_input(inode_id)).unwrap();
+
+        let reservation = match registry.begin_add_block(inode_id, 7, None, Some(32)).unwrap() {
+            BeginAddBlock::Reserved(reservation) => reservation,
+            BeginAddBlock::Replay(_) => panic!("new target must reserve"),
+        };
+        assert_eq!(registry.state.read().outstanding_write_targets, 1);
+        assert_eq!(registry.state.read().pending_write_targets, 1);
+        drop(reservation);
+        assert_eq!(registry.state.read().outstanding_write_targets, 0);
+        assert_eq!(registry.state.read().pending_write_targets, 0);
+
+        issue_target(&registry, inode_id, None, 32, 0, 0, 1);
+        assert_eq!(registry.state.read().outstanding_write_targets, 1);
+        assert_eq!(registry.state.read().pending_write_targets, 0);
+        registry.remove_session_if_epoch(inode_id, 7).unwrap();
+        assert_eq!(registry.state.read().outstanding_write_targets, 0);
+        assert_eq!(registry.state.read().pending_write_targets, 0);
+    }
+
+    #[test]
+    fn expiry_releases_issued_and_pending_target_capacity_exactly_once() {
+        let registry = SessionRegistry::new(2, 2, 2, 1, 60_000);
+        let issued_inode = InodeId::new(35);
+        let pending_inode = InodeId::new(36);
+        install_session(&registry, create_input(issued_inode)).unwrap();
+        install_session(&registry, create_input(pending_inode)).unwrap();
+        issue_target(&registry, issued_inode, None, 32, 0, 0, 1);
+        let reservation = match registry.begin_add_block(pending_inode, 7, None, Some(32)).unwrap() {
+            BeginAddBlock::Reserved(reservation) => reservation,
+            BeginAddBlock::Replay(_) => panic!("new target must reserve"),
+        };
+        assert_eq!(registry.state.read().outstanding_write_targets, 2);
+        assert_eq!(registry.state.read().pending_write_targets, 1);
+
+        {
+            let mut state = registry.state.write();
+            assert_eq!(SessionRegistry::retire_expired_entries(&mut state, u64::MAX), 2);
+        }
+        assert_eq!(registry.state.read().outstanding_write_targets, 0);
+        assert_eq!(registry.state.read().pending_write_targets, 0);
+        drop(reservation);
+        assert_eq!(registry.state.read().outstanding_write_targets, 0);
+        assert_eq!(registry.state.read().pending_write_targets, 0);
     }
 }

@@ -284,9 +284,12 @@ impl MetadataServer {
             return Ok(None);
         }
         let write_sessions = config.write_session_limits;
+        let write_targets = config.write_target_limits;
         let session_registry = Arc::new(crate::session_registry::SessionRegistry::new(
             write_sessions.max_active,
             write_sessions.max_active_per_client,
+            write_targets.max_outstanding,
+            write_targets.max_outstanding_per_session,
             config.write_lease_timeout_ms,
         ));
         let filesystem = match build_filesystem_service_with_sessions(
@@ -661,6 +664,8 @@ pub async fn build_filesystem_service(
         Arc::new(crate::session_registry::SessionRegistry::new(
             config.write_session_limits.max_active,
             config.write_session_limits.max_active_per_client,
+            config.write_target_limits.max_outstanding,
+            config.write_target_limits.max_outstanding_per_session,
             config.write_lease_timeout_ms,
         )),
         readiness,
@@ -912,6 +917,7 @@ mod tests {
             rpc_port: 18080,
             rpc_concurrency: Default::default(),
             write_session_limits: Default::default(),
+            write_target_limits: Default::default(),
             http_port: 18081,
             storage_dir: std::path::PathBuf::from("data/metadata"),
             raft: RaftConfig::default(),
