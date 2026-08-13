@@ -89,7 +89,6 @@ fn open_request() -> WriteOpenRequest {
         block_size: 4096,
         block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
         chunk_size: 4096,
-        effective_len: 1024,
         checksum_kind: ChecksumKind::None,
         tier: Tier::Hdd,
     }

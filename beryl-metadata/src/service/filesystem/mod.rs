@@ -736,7 +736,20 @@ mod tests {
     }
 
     pub(super) fn report_block_with_stamp(block_id: BlockId, block_stamp: u64) -> BlockReportBlock {
-        report_block_with_stamp_and_state(block_id, block_stamp, BlockReportBlockState::Ready)
+        report_block_with_stamp_and_len(block_id, block_stamp, 64)
+    }
+
+    pub(super) fn report_block_with_stamp_and_len(
+        block_id: BlockId,
+        block_stamp: u64,
+        effective_len: u64,
+    ) -> BlockReportBlock {
+        BlockReportBlock {
+            block_id,
+            block_stamp,
+            block_state: BlockReportBlockState::Ready,
+            effective_len,
+        }
     }
 
     pub(super) fn report_block_with_stamp_and_state(
@@ -748,6 +761,11 @@ mod tests {
             block_id,
             block_stamp,
             block_state,
+            effective_len: if block_state == BlockReportBlockState::Ready {
+                64
+            } else {
+                0
+            },
         }
     }
 
@@ -886,7 +904,6 @@ mod tests {
             block_id,
             file_offset: 0,
             block_size: 64,
-            effective_len: 64,
             worker_endpoints: Vec::new(),
             fencing_token: FencingToken {
                 block_id,
@@ -914,7 +931,7 @@ mod tests {
             .expect("session capacity");
         opening.activate(lease_epoch).expect("session created");
         let target_reservation = match session_registry
-            .begin_add_block(inode_id, lease_epoch, None, Some(64))
+            .begin_add_block(inode_id, lease_epoch, None)
             .expect("target capacity")
         {
             crate::session_registry::BeginAddBlock::Reserved(reservation) => reservation,
@@ -931,11 +948,7 @@ mod tests {
         }
     }
 
-    pub(super) async fn add_block_for_key(
-        filesystem: &MetadataFileSystem,
-        key: &OpenWriteOutput,
-        desired_len: u64,
-    ) -> WriteTarget {
+    pub(super) async fn add_block_for_key(filesystem: &MetadataFileSystem, key: &OpenWriteOutput) -> WriteTarget {
         let previous_block_id = filesystem
             .session_registry
             .get_session(key.inode_id)
@@ -945,7 +958,6 @@ mod tests {
                 &request_context(),
                 key.inode_id,
                 key.lease_epoch,
-                Some(desired_len),
                 previous_block_id,
                 Freshness::default(),
             )
@@ -1024,7 +1036,7 @@ mod tests {
         let mut attrs = FileAttrs::new();
         attrs.size = base_size;
         storage.put_inode(&Inode::new_file(inode_id, attrs, mount_id)).unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+        storage.put_layout(inode_id, FileLayout::new(64, 64, 1)).unwrap();
 
         WriteFlowEnv {
             _dir: dir,
@@ -1081,15 +1093,23 @@ mod tests {
     }
 
     pub(super) fn publish_env_write_target(env: &WriteFlowEnv, target: &WriteTarget, report_seq: u64) {
+        publish_env_write_target_with_len(env, target, report_seq, 64);
+    }
+
+    pub(super) fn publish_env_write_target_with_len(
+        env: &WriteFlowEnv,
+        target: &WriteTarget,
+        report_seq: u64,
+        effective_len: u64,
+    ) {
         let worker = target.worker_endpoints.first().expect("write target worker");
         let worker_manager = env.filesystem.worker_manager.as_ref().expect("worker manager");
-        publish_report_locations_with_stamp(
+        publish_report_block(
             worker_manager,
             &env.group_name,
             worker.worker_id,
             report_seq,
-            Some(target.block_stamp),
-            vec![target.block_id],
+            report_block_with_stamp_and_len(target.block_id, target.block_stamp, effective_len),
         );
     }
 

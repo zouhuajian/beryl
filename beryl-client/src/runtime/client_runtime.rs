@@ -66,7 +66,6 @@ impl ClientRuntime {
             .add_block(
                 session.path(),
                 session.write_handle(),
-                block_len,
                 session.previous_block_id(),
                 deadline.clone(),
             )

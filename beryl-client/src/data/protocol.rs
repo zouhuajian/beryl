@@ -87,10 +87,9 @@ pub(super) fn build_open_write_stream_request(
         block_stamp: target.target.block_stamp,
         chunk_size: target.target.chunk_size,
         token: Some(target.target.fencing_token.into()),
-        frame_size: default_frame_size(target.target.effective_len.min(u64::from(u32::MAX)) as u32),
+        frame_size: default_frame_size(target.target.block_size.min(u64::from(u32::MAX)) as u32),
         block_format_id: target.target.block_format_id.as_raw(),
         worker_run_id: worker.worker_run_id.to_string(),
-        effective_len: target.target.effective_len,
         tier: beryl_proto::common::TierProto::from(target.target.tier) as i32,
     })
 }
@@ -500,7 +499,7 @@ fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> 
         target.target.block_format_id,
         target.target.block_size,
         target.target.chunk_size,
-        target.target.effective_len,
+        target.target.block_size,
     )
     .map_err(|err| ClientError::InvalidLayout(format!("write target has invalid shape: {err}")))?;
     if target.target.worker_endpoints.is_empty() {
@@ -694,7 +693,6 @@ mod tests {
         );
         assert_eq!(request.block_size, 4096);
         assert_eq!(request.chunk_size, 4096);
-        assert_eq!(request.effective_len, 5);
     }
 
     #[test]
@@ -743,7 +741,6 @@ mod tests {
             beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw()
         );
         assert_eq!(request.worker_run_id, test_worker_run_id().to_string());
-        assert_eq!(request.effective_len, 5);
         assert_eq!(
             request.token.as_ref().and_then(|token| token.owner),
             Some(ClientId::new(7).into())
@@ -1016,7 +1013,6 @@ mod tests {
                 block_id: BlockId::new(InodeId::new(202), BlockIndex::new(0)),
                 file_offset: 0,
                 block_size: 4096,
-                effective_len: 5,
                 worker_endpoints: vec![worker_endpoint()],
                 fencing_token: FencingToken {
                     block_id: BlockId::new(InodeId::new(202), BlockIndex::new(0)),

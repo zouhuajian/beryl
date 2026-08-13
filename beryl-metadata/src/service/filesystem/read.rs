@@ -1767,16 +1767,12 @@ mod tests {
             .await
             .expect("open write should succeed");
         let key = open.payload;
-        let target = add_block_for_key(&env.filesystem, &key, 64).await;
+        let target = add_block_for_key(&env.filesystem, &key).await;
         publish_env_write_target(&env, &target, 1);
         commit_for_key(
             &env.filesystem,
             &key,
-            vec![committed_block(
-                target.block_id,
-                target.file_offset,
-                target.effective_len,
-            )],
+            vec![committed_block(target.block_id, target.file_offset, 64)],
             64,
         )
         .await
@@ -1832,16 +1828,12 @@ mod tests {
             .await
             .expect("open write should succeed");
         let key = open.payload;
-        let target = add_block_for_key(&env.filesystem, &key, 64).await;
+        let target = add_block_for_key(&env.filesystem, &key).await;
         publish_env_write_target(&env, &target, 1);
         commit_for_key(
             &env.filesystem,
             &key,
-            vec![committed_block(
-                target.block_id,
-                target.file_offset,
-                target.effective_len,
-            )],
+            vec![committed_block(target.block_id, target.file_offset, 64)],
             64,
         )
         .await

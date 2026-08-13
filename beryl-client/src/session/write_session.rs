@@ -152,19 +152,33 @@ impl WriteSession {
                 self.flush_cursor, target.file_offset
             )));
         }
-        if target.effective_len != expected_len {
+        if expected_len == 0 || expected_len > target.block_size {
             return Err(ClientError::InvalidLayout(format!(
-                "write target effective_len mismatch: expected {}, got {}",
-                expected_len, target.effective_len
+                "write length must be in 1..={}: got {}",
+                target.block_size, expected_len
             )));
         }
         BlockShape::new(
             target.block_format_id,
             target.block_size,
             target.chunk_size,
-            target.effective_len,
+            target.block_size,
         )
         .map_err(|err| ClientError::InvalidLayout(format!("write target has invalid shape: {err}")))?;
+        if target.block_format_id != self.layout.block_format_id
+            || target.block_size != u64::from(self.layout.block_size)
+            || target.chunk_size != self.layout.chunk_size
+        {
+            return Err(ClientError::InvalidLayout(format!(
+                "write target layout does not match session layout: target=({}, {}, {}), session=({}, {}, {})",
+                target.block_format_id.as_raw(),
+                target.block_size,
+                target.chunk_size,
+                self.layout.block_format_id.as_raw(),
+                self.layout.block_size,
+                self.layout.chunk_size
+            )));
+        }
         let block = target.block_id;
         if block.inode_id != self.inode_id {
             return Err(ClientError::StaleHandle {
@@ -948,7 +962,7 @@ mod tests {
         )
         .expect("session");
         session
-            .push_pending_block(write_target(302, 0, 0, 5), block_write_handle(302, 0, 0, 5, 9), 5, 1)
+            .push_pending_block(write_target(302, 0, 0), block_write_handle(302, 0, 0, 9), 5, 1)
             .expect("pending block");
 
         let first = session
@@ -1027,7 +1041,7 @@ mod tests {
         )
         .expect("session");
         session
-            .push_pending_block(write_target(302, 0, 0, 5), block_write_handle(302, 0, 0, 5, 9), 5, 1)
+            .push_pending_block(write_target(302, 0, 0), block_write_handle(302, 0, 0, 9), 5, 1)
             .expect("pending block");
         session.pending_blocks[0].mark_worker_committed(false);
 
@@ -1188,12 +1202,11 @@ mod tests {
         }
     }
 
-    fn write_target(inode_id: u64, block_index: u32, file_offset: u64, len: u64) -> WriteTarget {
+    fn write_target(inode_id: u64, block_index: u32, file_offset: u64) -> WriteTarget {
         WriteTarget {
             block_id: BlockId::new(InodeId::new(inode_id), BlockIndex::new(block_index)),
             file_offset,
             block_size: 1024,
-            effective_len: len,
             worker_endpoints: vec![worker_endpoint()],
             fencing_token: FencingToken {
                 block_id: BlockId::new(InodeId::new(inode_id), BlockIndex::new(block_index)),
@@ -1222,13 +1235,12 @@ mod tests {
         inode_id: u64,
         block_index: u32,
         file_offset: u64,
-        len: u64,
         stream_low: u64,
     ) -> WorkerBlockWriteHandle {
         WorkerBlockWriteHandle {
             group_name: test_group_name(),
             worker: worker_endpoint(),
-            target: write_target(inode_id, block_index, file_offset, len),
+            target: write_target(inode_id, block_index, file_offset),
             stream_id: StreamIdProto {
                 high: 1,
                 low: stream_low,
@@ -1246,7 +1258,7 @@ mod tests {
             block.worker.worker_id.as_raw(),
             block.worker.worker_run_id.to_string(),
             block.target.file_offset,
-            block.target.effective_len,
+            block.target.block_size,
             block.target.block_stamp,
             block.target.block_id.index.as_raw(),
             block.target.block_id.inode_id.as_raw(),

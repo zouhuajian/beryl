@@ -373,13 +373,8 @@ impl TryFrom<proto_metadata::WriteTargetProto> for WriteTarget {
     fn try_from(target: proto_metadata::WriteTargetProto) -> Result<Self, Self::Error> {
         let block_format_id = beryl_types::layout::BlockFormatId::from_raw(target.block_format_id)
             .map_err(|err| format!("WriteTargetProto.block_format_id invalid: {err}"))?;
-        BlockShape::new(
-            block_format_id,
-            target.block_size,
-            target.chunk_size,
-            target.effective_len,
-        )
-        .map_err(|err| format!("WriteTargetProto invalid block shape: {err}"))?;
+        BlockShape::new(block_format_id, target.block_size, target.chunk_size, target.block_size)
+            .map_err(|err| format!("WriteTargetProto invalid block shape: {err}"))?;
         if target.worker_endpoints.is_empty() {
             return Err("WriteTargetProto.worker_endpoints must not be empty".to_string());
         }
@@ -404,7 +399,6 @@ impl TryFrom<proto_metadata::WriteTargetProto> for WriteTarget {
             block_id,
             file_offset: target.file_offset,
             block_size: target.block_size,
-            effective_len: target.effective_len,
             worker_endpoints,
             fencing_token,
             block_stamp: target.block_stamp,
@@ -420,7 +414,6 @@ impl From<&WriteTarget> for proto_metadata::WriteTargetProto {
         Self {
             block_id: Some(target.block_id.into()),
             file_offset: target.file_offset,
-            effective_len: target.effective_len,
             worker_endpoints: target.worker_endpoints.iter().map(Into::into).collect(),
             fencing_token: Some(target.fencing_token.into()),
             block_stamp: target.block_stamp,
@@ -437,7 +430,6 @@ impl From<WriteTarget> for proto_metadata::WriteTargetProto {
         Self {
             block_id: Some(target.block_id.into()),
             file_offset: target.file_offset,
-            effective_len: target.effective_len,
             worker_endpoints: target.worker_endpoints.into_iter().map(Into::into).collect(),
             fencing_token: Some(target.fencing_token.into()),
             block_stamp: target.block_stamp,
@@ -1421,11 +1413,15 @@ mod tests {
                 ("block_size", 4),
                 ("chunk_size", 5),
                 ("block_stamp", 6),
-                ("effective_len", 7),
-                ("worker_endpoints", 8),
-                ("fencing_token", 9),
-                ("tier", 10),
+                ("worker_endpoints", 7),
+                ("fencing_token", 8),
+                ("tier", 9),
             ],
+        );
+        assert_message_fields(
+            &descriptors,
+            "metadata.AddBlockRequestProto",
+            &[("header", 1), ("write_handle", 2), ("previous_block_id", 3)],
         );
         assert_message_fields(
             &descriptors,
@@ -1533,9 +1529,18 @@ mod tests {
                 ("token", 7),
                 ("frame_size", 8),
                 ("worker_run_id", 9),
-                ("effective_len", 10),
-                ("group_name", 11),
-                ("tier", 12),
+                ("group_name", 10),
+                ("tier", 11),
+            ],
+        );
+        assert_message_fields(
+            &descriptors,
+            "metadata.BlockReportBlockProto",
+            &[
+                ("block_id", 1),
+                ("block_stamp", 2),
+                ("block_state", 3),
+                ("effective_len", 4),
             ],
         );
         assert_message_fields(
@@ -2023,7 +2028,6 @@ mod tests {
         let mut target = proto_metadata::WriteTargetProto {
             block_id: Some(block_id.into()),
             file_offset: 128,
-            effective_len: 4096,
             worker_endpoints: Vec::new(),
             fencing_token: Some(token.into()),
             block_stamp: 55,
@@ -2078,7 +2082,6 @@ mod tests {
             block_id,
             file_offset: 128,
             block_size: 4096,
-            effective_len: 3072,
             worker_endpoints: vec![endpoint.clone()],
             fencing_token: token,
             block_stamp: 55,
@@ -2093,7 +2096,6 @@ mod tests {
         let missing_format = proto_metadata::WriteTargetProto {
             block_id: Some(block_id.into()),
             file_offset: 128,
-            effective_len: 4096,
             worker_endpoints: vec![endpoint.clone().into()],
             fencing_token: Some(token.into()),
             block_stamp: 55,

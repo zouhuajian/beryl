@@ -11,11 +11,12 @@ use super::{
 use crate::error::{MetadataError, MetadataResult};
 use crate::observe;
 use crate::raft::{ApplySuccess, Command, PublishMode};
-use crate::worker::{PublishReadyConflict, PublishReadyStatus};
+use crate::session_registry::{BeginWritePublicationError, WritePublication};
+use crate::worker::{PublishReadyConflict, PublishReadyStatus, PublishReadyTarget};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint, WorkerErrorKind};
 use beryl_types::fs::{Extent, InodeId};
 use beryl_types::ids::MountId;
-use beryl_types::{CommittedBlock, GroupName, WriteTarget, MAX_FILE_EXTENTS};
+use beryl_types::{CommittedBlock, GroupName, MAX_FILE_EXTENTS};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]
@@ -202,6 +203,80 @@ impl MetadataFileSystem {
         Ok(Some(session))
     }
 
+    /// Freeze the current issued-target sequence before validating publication.
+    fn begin_write_publication<'a>(
+        &'a self,
+        ctx: &RequestContext,
+        inode_id: InodeId,
+        lease_epoch: u64,
+        publish_mode: PublishMode,
+        operation: &'static str,
+    ) -> Result<WritePublication<'a>, FsFailure> {
+        let publication = match self.session_registry.begin_publication(inode_id, lease_epoch) {
+            Ok(publication) => publication,
+            Err(BeginWritePublicationError::Session(message)) => {
+                return Err(self
+                    .session_terminal_failure::<()>(
+                        ctx,
+                        ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                        format!("{operation} write session is no longer current: {message}"),
+                        None,
+                        None,
+                    )
+                    .expect_err("session_terminal_failure always returns Err"));
+            }
+            Err(BeginWritePublicationError::AddBlockPending) => {
+                return Err(self
+                    .failure_from_error::<()>(
+                        ctx,
+                        MetadataError::Again(format!(
+                            "{operation} cannot freeze inode_id={inode_id} while AddBlock is pending"
+                        )),
+                        None,
+                        None,
+                    )
+                    .expect_err("failure_from_error always returns Err"));
+            }
+            Err(BeginWritePublicationError::PublicationInProgress) => {
+                return Err(self
+                    .failure_from_error::<()>(
+                        ctx,
+                        MetadataError::Again(format!(
+                            "another file publication is already in progress for inode_id={inode_id}"
+                        )),
+                        None,
+                        None,
+                    )
+                    .expect_err("failure_from_error always returns Err"));
+            }
+            Err(BeginWritePublicationError::PublicationIdExhausted) => {
+                return Err(self
+                    .failure_from_error::<()>(
+                        ctx,
+                        MetadataError::Internal("write publication identity exhausted".to_string()),
+                        None,
+                        None,
+                    )
+                    .expect_err("failure_from_error always returns Err"));
+            }
+        };
+        let session = publication.session();
+        if session.open_client_id != ctx.caller.client.client_id
+            || Self::publish_mode_for_session(session) != publish_mode
+        {
+            return Err(self
+                .session_terminal_failure::<()>(
+                    ctx,
+                    ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                    format!("{operation} publish precondition does not match the active session"),
+                    None,
+                    None,
+                )
+                .expect_err("session_terminal_failure always returns Err"));
+        }
+        Ok(publication)
+    }
+
     /// Resolve an ambiguous publish from the durable file state.
     ///
     /// This is state-equivalence recovery, not historical request replay. Once
@@ -328,7 +403,7 @@ impl MetadataFileSystem {
         session: &crate::session_registry::WriteSession,
         committed_blocks: &[CommittedBlock],
         expected_content_revision: u64,
-    ) -> MetadataResult<Vec<WriteTarget>> {
+    ) -> MetadataResult<Vec<PublishReadyTarget>> {
         let new_block_stamp = expected_content_revision
             .checked_add(1)
             .ok_or_else(|| MetadataError::InvalidArgument("content revision overflow".to_string()))?;
@@ -381,7 +456,10 @@ impl MetadataFileSystem {
                     block.block_id, target.block_stamp
                 )));
             }
-            ready_targets.push((*target).clone());
+            ready_targets.push(PublishReadyTarget {
+                target: (*target).clone(),
+                effective_len: block.len,
+            });
         }
         Ok(ready_targets)
     }
@@ -472,6 +550,23 @@ impl MetadataFileSystem {
                 (mount_epoch, route_epoch),
                 false,
             ),
+            PublishReadyConflict::EffectiveLenMismatch {
+                block_id,
+                worker_id,
+                expected,
+                reported,
+            } => self
+                .failure_from_error_with_route_epoch::<()>(
+                    ctx,
+                    MetadataError::InvalidArgument(format!(
+                        "worker effective length does not match the committed block: block_id={block_id}, worker_id={}, expected={expected}, reported={reported}",
+                        worker_id.as_raw()
+                    )),
+                    Some(group_name.clone()),
+                    mount_epoch,
+                    route_epoch,
+                )
+                .expect_err("failure_from_error_with_route_epoch always returns Err"),
             PublishReadyConflict::UnreadableBlock {
                 block_id,
                 worker_id,
@@ -502,7 +597,7 @@ impl MetadataFileSystem {
         group_name: &GroupName,
         mount_epoch: Option<u64>,
         route_epoch: Option<u64>,
-        targets: &[WriteTarget],
+        targets: &[PublishReadyTarget],
     ) -> Result<(), FsFailure> {
         if targets.is_empty() {
             return Ok(());
@@ -579,7 +674,7 @@ impl MetadataFileSystem {
         group_name: &GroupName,
         mount_epoch: Option<u64>,
         route_epoch: Option<u64>,
-        targets: &[WriteTarget],
+        targets: &[PublishReadyTarget],
     ) -> Result<(), FsFailure> {
         if targets.is_empty() {
             return Ok(());
@@ -641,30 +736,39 @@ impl MetadataFileSystem {
     async fn revalidate_publish_session(
         &self,
         ctx: &RequestContext,
-        expected: &crate::session_registry::WriteSession,
+        publication: &WritePublication<'_>,
         publish_mode: PublishMode,
         operation: &'static str,
     ) -> Result<crate::session_registry::WriteSession, FsFailure> {
+        let expected = publication.session();
         if let Some(failure) = self.session_write_admission_failure(ctx, expected.inode_id).await {
             return Err(self
                 .failure_from_admission::<()>(failure)
                 .expect_err("failure_from_admission always returns Err"));
         }
-        let current =
-            match self.active_publish_session(ctx, expected.inode_id, expected.lease_epoch, publish_mode, operation)? {
-                Some(session) => session,
-                None => {
-                    return Err(self
-                        .session_terminal_failure::<()>(
-                            ctx,
-                            ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
-                            format!("{operation} write session disappeared while waiting for Ready block reports"),
-                            None,
-                            None,
-                        )
-                        .expect_err("session_terminal_failure always returns Err"));
-                }
-            };
+        let current = publication.revalidate().map_err(|message| {
+            self.session_terminal_failure::<()>(
+                ctx,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                format!("{operation} write publication changed while waiting for Ready block reports: {message}"),
+                None,
+                None,
+            )
+            .expect_err("session_terminal_failure always returns Err")
+        })?;
+        if current.open_client_id != ctx.caller.client.client_id
+            || Self::publish_mode_for_session(&current) != publish_mode
+        {
+            return Err(self
+                .session_terminal_failure::<()>(
+                    ctx,
+                    ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                    format!("{operation} publish precondition does not match the active session"),
+                    None,
+                    None,
+                )
+                .expect_err("session_terminal_failure always returns Err"));
+        }
         if current.inode_id != expected.inode_id
             || current.mount_id != expected.mount_id
             || current.base_size != expected.base_size
@@ -715,7 +819,13 @@ impl MetadataFileSystem {
         };
         match self.resolve_published_state(inode_id, lease_epoch, &intent, expected_content_revision, publish_mode) {
             Ok(Some((_inode_id, mount_id, content_revision))) => {
-                if active_session.as_ref().is_some_and(|session| {
+                let publication = if active_session.is_some() {
+                    Some(self.begin_write_publication(ctx, inode_id, lease_epoch, publish_mode, "SyncWrite")?)
+                } else {
+                    None
+                };
+                if publication.as_ref().is_some_and(|publication| {
+                    let session = publication.session();
                     session.content_revision != expected_content_revision
                         && session.content_revision != content_revision
                 }) {
@@ -730,13 +840,10 @@ impl MetadataFileSystem {
                 let (group_name, mount_epoch, route_epoch) = self
                     .completed_publish_hints(ctx, freshness, mount_id, "SyncWrite")
                     .await?;
-                if active_session.is_some() {
-                    let _ = self.session_registry.update_published_state(
-                        inode_id,
-                        lease_epoch,
-                        content_revision,
-                        intent.final_size,
-                    );
+                if let Some(publication) = publication {
+                    if let Err(message) = publication.complete_sync(content_revision, intent.final_size) {
+                        return self.failure_from_error(ctx, MetadataError::Internal(message), group_name, mount_epoch);
+                    }
                 }
                 return self.success_with_route_epoch(
                     ctx,
@@ -752,8 +859,11 @@ impl MetadataFileSystem {
             Ok(None) => {}
             Err(err) => return self.failure_from_error(ctx, err, None, None),
         }
-        let session = match active_session {
-            Some(session) => session,
+        let publication = match active_session {
+            Some(_) => match self.begin_write_publication(ctx, inode_id, lease_epoch, publish_mode, "SyncWrite") {
+                Ok(publication) => publication,
+                Err(failure) => return Err(failure),
+            },
             None => {
                 return self.session_terminal_failure(
                     ctx,
@@ -764,6 +874,7 @@ impl MetadataFileSystem {
                 );
             }
         };
+        let session = publication.session().clone();
         if session.content_revision != expected_content_revision {
             return self.session_terminal_failure(
                 ctx,
@@ -880,7 +991,7 @@ impl MetadataFileSystem {
             .validate_route_epoch(ctx, revalidated_freshness, group_name.clone(), mount_epoch, "SyncWrite")
             .await?;
         let session = self
-            .revalidate_publish_session(ctx, &session, publish_mode, "SyncWrite")
+            .revalidate_publish_session(ctx, &publication, publish_mode, "SyncWrite")
             .await?;
         self.require_publish_ready(ctx, &worker_lookup_group_name, mount_epoch, route_epoch, &new_targets)?;
 
@@ -922,10 +1033,7 @@ impl MetadataFileSystem {
                 return self.failure_from_error(ctx, err, Some(routed.group_name.clone()), Some(routed.mount_epoch));
             }
         };
-        if let Err(message) =
-            self.session_registry
-                .update_published_state(inode_id, lease_epoch, content_revision, intent.final_size)
-        {
+        if let Err(message) = publication.complete_sync(content_revision, intent.final_size) {
             return self.failure_from_error(
                 ctx,
                 MetadataError::Internal(message),
@@ -1039,6 +1147,10 @@ impl MetadataFileSystem {
         Ok(())
     }
 
+    /// Convert client-reported actual lengths into extents under issued target bounds.
+    ///
+    /// A newly published partial block must be the session's last issued target;
+    /// otherwise the next capacity-aligned target would leave a file gap.
     fn validate_committed_blocks(
         intent: &CloseWriteIntent,
         session: &crate::session_registry::WriteSession,
@@ -1051,8 +1163,9 @@ impl MetadataFileSystem {
         }
         let mut issued = HashMap::with_capacity(session.issued_targets.len());
         for target in &session.issued_targets {
-            issued.insert(target.block_id, (target.file_offset, target.effective_len));
+            issued.insert(target.block_id, target);
         }
+        let last_issued_block_id = session.issued_targets.last().map(|target| target.block_id);
 
         let mut seen = HashSet::with_capacity(intent.committed_blocks.len());
         let mut sorted = intent.committed_blocks.iter().collect::<Vec<_>>();
@@ -1078,16 +1191,29 @@ impl MetadataFileSystem {
                     block.block_id
                 )));
             }
-            let Some((issued_offset, issued_len)) = issued.get(&block.block_id).copied() else {
+            let Some(target) = issued.get(&block.block_id).copied() else {
                 return Err(MetadataError::InvalidArgument(format!(
                     "Committed block {} was not issued by AddBlock",
                     block.block_id
                 )));
             };
-            if block.file_offset != issued_offset || block.len != issued_len {
+            if block.file_offset != target.file_offset {
                 return Err(MetadataError::InvalidArgument(format!(
-                    "Committed block {} does not match issued target: expected offset={} len={}, got offset={} len={}",
-                    block.block_id, issued_offset, issued_len, block.file_offset, block.len
+                    "Committed block {} does not match its issued target offset: expected {}, got {}",
+                    block.block_id, target.file_offset, block.file_offset
+                )));
+            }
+            if block.len > target.block_size {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "Committed block {} length {} exceeds its issued capacity {}",
+                    block.block_id, block.len, target.block_size
+                )));
+            }
+            let is_new_partial = target.file_offset >= session.base_size && block.len < target.block_size;
+            if is_new_partial && last_issued_block_id != Some(block.block_id) {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "partial committed block {} must be the last target issued by AddBlock",
+                    block.block_id
                 )));
             }
             let Some(end) = Self::block_end(block) else {
@@ -1184,7 +1310,13 @@ impl MetadataFileSystem {
         };
         match self.resolve_published_state(inode_id, lease_epoch, &intent, expected_content_revision, publish_mode) {
             Ok(Some((_inode_id, mount_id, content_revision))) => {
-                if active_session.as_ref().is_some_and(|session| {
+                let publication = if active_session.is_some() {
+                    Some(self.begin_write_publication(ctx, inode_id, lease_epoch, publish_mode, "CommitFile")?)
+                } else {
+                    None
+                };
+                if publication.as_ref().is_some_and(|publication| {
+                    let session = publication.session();
                     session.content_revision != expected_content_revision
                         && session.content_revision != content_revision
                 }) {
@@ -1199,7 +1331,11 @@ impl MetadataFileSystem {
                 let (group_name, mount_epoch, route_epoch) = self
                     .completed_publish_hints(ctx, freshness, mount_id, "CommitFile")
                     .await?;
-                self.session_registry.remove_session_if_epoch(inode_id, lease_epoch);
+                if let Some(publication) = publication {
+                    if let Err(message) = publication.complete_commit() {
+                        return self.failure_from_error(ctx, MetadataError::Internal(message), group_name, mount_epoch);
+                    }
+                }
                 return self.success_with_route_epoch(
                     ctx,
                     CloseWriteOutput {
@@ -1213,8 +1349,11 @@ impl MetadataFileSystem {
             Ok(None) => {}
             Err(err) => return self.failure_from_error(ctx, err, None, None),
         }
-        let session = match active_session {
-            Some(session) => session,
+        let publication = match active_session {
+            Some(_) => match self.begin_write_publication(ctx, inode_id, lease_epoch, publish_mode, "CommitFile") {
+                Ok(publication) => publication,
+                Err(failure) => return Err(failure),
+            },
             None => {
                 return self.session_terminal_failure(
                     ctx,
@@ -1225,6 +1364,7 @@ impl MetadataFileSystem {
                 );
             }
         };
+        let session = publication.session().clone();
         if session.content_revision != expected_content_revision {
             return self.session_terminal_failure(
                 ctx,
@@ -1325,7 +1465,7 @@ impl MetadataFileSystem {
             )
             .await?;
         let session = self
-            .revalidate_publish_session(ctx, &session, publish_mode, "CommitFile")
+            .revalidate_publish_session(ctx, &publication, publish_mode, "CommitFile")
             .await?;
         self.require_publish_ready(ctx, &worker_lookup_group_name, mount_epoch, route_epoch, &new_targets)?;
 
@@ -1368,7 +1508,14 @@ impl MetadataFileSystem {
             }
         }
 
-        self.session_registry.remove_session_if_epoch(inode_id, lease_epoch);
+        if let Err(message) = publication.complete_commit() {
+            return self.failure_from_error(
+                ctx,
+                MetadataError::Internal(message),
+                Some(routed.group_name.clone()),
+                Some(routed.mount_epoch),
+            );
+        }
 
         self.success_with_route_epoch(
             ctx,
@@ -1402,20 +1549,116 @@ mod tests {
             .await
             .expect("open write")
             .payload;
-        let target = add_block_for_key(&env.filesystem, &open, 64).await;
+        let target = add_block_for_key(&env.filesystem, &open).await;
         (open, target)
     }
 
     fn target_intent(target: &WriteTarget, expected_file_size: u64) -> CloseWriteIntent {
         CloseWriteIntent {
-            committed_blocks: vec![committed_block(
-                target.block_id,
-                target.file_offset,
-                target.effective_len,
-            )],
-            final_size: target.file_offset + target.effective_len,
+            committed_blocks: vec![committed_block(target.block_id, target.file_offset, 64)],
+            final_size: target.file_offset + 64,
             expected_file_size,
         }
+    }
+
+    #[tokio::test]
+    async fn partial_sync_rebases_the_next_target_to_the_visible_length() {
+        let env = write_flow_env(0).await;
+        let (open, target) = open_write_with_target(&env).await;
+        publish_env_write_target_with_len(&env, &target, 1, 32);
+
+        env.filesystem
+            .sync_write_session(
+                &request_context(),
+                PresentedWriteHandle {
+                    inode_id: open.inode_id,
+                    lease_epoch: open.lease_epoch,
+                },
+                CloseWriteIntent {
+                    committed_blocks: vec![committed_block(target.block_id, target.file_offset, 32)],
+                    final_size: 32,
+                    expected_file_size: 0,
+                },
+                Freshness::default(),
+                open.content_revision,
+                PublishMode::ReplaceIfUnchanged,
+            )
+            .await
+            .expect("partial tail should become visible");
+
+        let synced = env
+            .filesystem
+            .write_session_for_inode(open.inode_id)
+            .expect("SyncWrite keeps the session open");
+        assert_eq!(synced.base_size, 32);
+        assert_eq!(synced.content_revision, 1);
+        let next = add_block_for_key(&env.filesystem, &open).await;
+        assert_eq!(next.file_offset, 32);
+        assert_eq!(next.block_stamp, 2);
+    }
+
+    #[tokio::test]
+    async fn partial_commit_rejects_a_later_issued_target() {
+        let env = write_flow_env(0).await;
+        let (open, first) = open_write_with_target(&env).await;
+        let second = add_block_for_key(&env.filesystem, &open).await;
+        assert_eq!(second.file_offset, first.block_size);
+
+        let failure = env
+            .filesystem
+            .close_write_session(
+                &request_context(),
+                PresentedWriteHandle {
+                    inode_id: open.inode_id,
+                    lease_epoch: open.lease_epoch,
+                },
+                CloseWriteIntent {
+                    committed_blocks: vec![committed_block(first.block_id, first.file_offset, 32)],
+                    final_size: 32,
+                    expected_file_size: 0,
+                },
+                Freshness::default(),
+                open.content_revision,
+                PublishMode::ReplaceIfUnchanged,
+            )
+            .await
+            .expect_err("a partial target cannot strand a later capacity-aligned target");
+
+        assert!(failure
+            .error
+            .message
+            .contains("must be the last target issued by AddBlock"));
+        assert_eq!(stored_content_revision(&env.storage, env.inode_id), None);
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_worker_length_that_differs_from_the_commit() {
+        let env = write_flow_env(0).await;
+        let (open, target) = open_write_with_target(&env).await;
+        publish_env_write_target_with_len(&env, &target, 1, 31);
+
+        let failure = env
+            .filesystem
+            .close_write_session(
+                &request_context(),
+                PresentedWriteHandle {
+                    inode_id: open.inode_id,
+                    lease_epoch: open.lease_epoch,
+                },
+                CloseWriteIntent {
+                    committed_blocks: vec![committed_block(target.block_id, target.file_offset, 32)],
+                    final_size: 32,
+                    expected_file_size: 0,
+                },
+                Freshness::default(),
+                open.content_revision,
+                PublishMode::ReplaceIfUnchanged,
+            )
+            .await
+            .expect_err("worker length mismatch must fail before Raft publication");
+
+        assert!(failure.error.message.contains("worker effective length does not match"));
+        assert_eq!(stored_content_revision(&env.storage, env.inode_id), None);
     }
 
     #[tokio::test]
@@ -1507,12 +1750,8 @@ mod tests {
             .await
             .expect("open write")
             .payload;
-        let target = add_block_for_key(&env.filesystem, &open, 64).await;
-        let committed = vec![committed_block(
-            target.block_id,
-            target.file_offset,
-            target.effective_len,
-        )];
+        let target = add_block_for_key(&env.filesystem, &open).await;
+        let committed = vec![committed_block(target.block_id, target.file_offset, 64)];
         let commit = commit_for_key(&env.filesystem, &open, committed, 64);
         tokio::pin!(commit);
 
@@ -1550,7 +1789,7 @@ mod tests {
             .await
             .expect("open write")
             .payload;
-        let target = add_block_for_key(&env.filesystem, &open, 64).await;
+        let target = add_block_for_key(&env.filesystem, &open).await;
         let mut ctx = request_context();
         ctx.caller.deadline = Deadline::from_now(Duration::from_millis(20));
 
@@ -1563,11 +1802,7 @@ mod tests {
                     lease_epoch: open.lease_epoch,
                 },
                 CloseWriteIntent {
-                    committed_blocks: vec![committed_block(
-                        target.block_id,
-                        target.file_offset,
-                        target.effective_len,
-                    )],
+                    committed_blocks: vec![committed_block(target.block_id, target.file_offset, 64)],
                     final_size: 64,
                     expected_file_size: open.base_size,
                 },
@@ -1598,7 +1833,7 @@ mod tests {
             .await
             .expect("open write")
             .payload;
-        let target = add_block_for_key(&env.filesystem, &open, 64).await;
+        let target = add_block_for_key(&env.filesystem, &open).await;
         publish_env_write_target(&env, &target, 1);
         let mut ctx = request_context();
         ctx.caller.deadline = Deadline::from_unix_ms(0);
@@ -1612,11 +1847,7 @@ mod tests {
                     lease_epoch: open.lease_epoch,
                 },
                 CloseWriteIntent {
-                    committed_blocks: vec![committed_block(
-                        target.block_id,
-                        target.file_offset,
-                        target.effective_len,
-                    )],
+                    committed_blocks: vec![committed_block(target.block_id, target.file_offset, 64)],
                     final_size: 64,
                     expected_file_size: open.base_size,
                 },
@@ -1654,7 +1885,7 @@ mod tests {
             .await
             .expect("open write")
             .payload;
-        let target = add_block_for_key(&env.filesystem, &open, 64).await;
+        let target = add_block_for_key(&env.filesystem, &open).await;
         publish_env_write_target(&env, &target, 1);
         let mut ctx = request_context();
         ctx.caller.deadline = Deadline::from_unix_ms(0);
@@ -1668,11 +1899,7 @@ mod tests {
                     lease_epoch: open.lease_epoch,
                 },
                 CloseWriteIntent {
-                    committed_blocks: vec![committed_block(
-                        target.block_id,
-                        target.file_offset,
-                        target.effective_len,
-                    )],
+                    committed_blocks: vec![committed_block(target.block_id, target.file_offset, 64)],
                     final_size: 64,
                     expected_file_size: open.base_size,
                 },
@@ -1710,7 +1937,7 @@ mod tests {
             .await
             .expect("open write")
             .payload;
-        let target = add_block_for_key(&env.filesystem, &open, 64).await;
+        let target = add_block_for_key(&env.filesystem, &open).await;
         let mut ctx = request_context();
         ctx.caller.deadline = Deadline::from_now(Duration::from_millis(40));
         let commit = env.filesystem.close_write_session(
@@ -1720,11 +1947,7 @@ mod tests {
                 lease_epoch: open.lease_epoch,
             },
             CloseWriteIntent {
-                committed_blocks: vec![committed_block(
-                    target.block_id,
-                    target.file_offset,
-                    target.effective_len,
-                )],
+                committed_blocks: vec![committed_block(target.block_id, target.file_offset, 64)],
                 final_size: 64,
                 expected_file_size: open.base_size,
             },
@@ -1750,7 +1973,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unpublished_old_stamp_target_cannot_enter_a_later_revision() {
+    async fn discarded_old_revision_target_cannot_enter_a_later_revision() {
         let env = write_flow_env(0).await;
         let open = env
             .filesystem
@@ -1764,12 +1987,12 @@ mod tests {
             .await
             .expect("open write")
             .payload;
-        let first = add_block_for_key(&env.filesystem, &open, 64).await;
-        let second = add_block_for_key(&env.filesystem, &open, 64).await;
+        let first = add_block_for_key(&env.filesystem, &open).await;
+        let second = add_block_for_key(&env.filesystem, &open).await;
         assert_eq!(first.block_stamp, 1);
         assert_eq!(second.block_stamp, 1);
         publish_env_write_target(&env, &first, 1);
-        let first_committed = committed_block(first.block_id, first.file_offset, first.effective_len);
+        let first_committed = committed_block(first.block_id, first.file_offset, 64);
         env.filesystem
             .sync_write_session(
                 &request_context(),
@@ -1804,7 +2027,7 @@ mod tests {
                 CloseWriteIntent {
                     committed_blocks: vec![
                         first_committed,
-                        committed_block(second.block_id, second.file_offset, second.effective_len),
+                        committed_block(second.block_id, second.file_offset, 64),
                     ],
                     final_size: 128,
                     expected_file_size: synced.base_size,
@@ -1816,7 +2039,7 @@ mod tests {
             .await
             .expect_err("an uncommitted old-stamp target must fail closed");
 
-        assert!(failure.error.message.contains("is not visible at content revision 1"));
+        assert!(failure.error.message.contains("was not issued by AddBlock"));
         let inode = env.storage.get_inode(env.inode_id).unwrap().expect("stored inode");
         assert_eq!(inode.attrs.size, 64);
         let beryl_types::fs::InodeData::File {
@@ -2014,8 +2237,8 @@ mod tests {
             .await
             .expect("open write")
             .payload;
-        let first = add_block_for_key(&env.filesystem, &open, 64).await;
-        let second = add_block_for_key(&env.filesystem, &open, 64).await;
+        let first = add_block_for_key(&env.filesystem, &open).await;
+        let second = add_block_for_key(&env.filesystem, &open).await;
         let first_worker = first.worker_endpoints.first().expect("first target worker");
         let second_worker = second.worker_endpoints.first().expect("second target worker");
         assert_ne!(
@@ -2023,8 +2246,8 @@ mod tests {
             "test requires targets on distinct workers"
         );
         let committed = vec![
-            committed_block(first.block_id, first.file_offset, first.effective_len),
-            committed_block(second.block_id, second.file_offset, second.effective_len),
+            committed_block(first.block_id, first.file_offset, 64),
+            committed_block(second.block_id, second.file_offset, 64),
         ];
         publish_env_write_target(&env, &first, 1);
         let ctx = request_context();
@@ -2070,8 +2293,8 @@ mod tests {
             .await
             .expect("open deleting case")
             .payload;
-        let ready = add_block_for_key(&deleting_env.filesystem, &deleting_open, 64).await;
-        let deleting = add_block_for_key(&deleting_env.filesystem, &deleting_open, 64).await;
+        let ready = add_block_for_key(&deleting_env.filesystem, &deleting_open).await;
+        let deleting = add_block_for_key(&deleting_env.filesystem, &deleting_open).await;
         publish_env_write_target(&deleting_env, &ready, 1);
         let deleting_worker = deleting.worker_endpoints.first().expect("deleting target worker");
         publish_report_block(
@@ -2091,8 +2314,8 @@ mod tests {
                 },
                 CloseWriteIntent {
                     committed_blocks: vec![
-                        committed_block(ready.block_id, ready.file_offset, ready.effective_len),
-                        committed_block(deleting.block_id, deleting.file_offset, deleting.effective_len),
+                        committed_block(ready.block_id, ready.file_offset, 64),
+                        committed_block(deleting.block_id, deleting.file_offset, 64),
                     ],
                     final_size: 128,
                     expected_file_size: 0,
@@ -2125,12 +2348,8 @@ mod tests {
             .await
             .expect("open write")
             .payload;
-        let target = add_block_for_key(&env.filesystem, &open, 64).await;
-        let committed = vec![committed_block(
-            target.block_id,
-            target.file_offset,
-            target.effective_len,
-        )];
+        let target = add_block_for_key(&env.filesystem, &open).await;
+        let committed = vec![committed_block(target.block_id, target.file_offset, 64)];
         publish_env_write_target(&env, &target, 1);
         env.filesystem
             .sync_write_session(
