@@ -3,12 +3,13 @@
 
 //! Local block storage boundary.
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use beryl_common::error::rpc::{ErrorKind, WorkerErrorKind};
-use beryl_types::ids::BlockId;
+use beryl_types::ids::{BlockId, BlockIndex, InodeId};
 use beryl_types::layout::{BlockFormatId, BlockShape};
 use beryl_types::{GroupName, Tier};
 use bytes::Bytes;
@@ -706,13 +707,140 @@ impl FullBlockFileStore {
         Ok(recovered)
     }
 
-    /// Removes unpublished staging files for an aborted write.
-    /// Final Ready or Corrupt metadata and data are not touched.
+    /// Removes every exactly identified unpublished block left by an older run.
+    ///
+    /// Final `.meta` is the local visibility commit point. Recovery preserves a
+    /// valid Ready pair, removes its disposable leftovers, and deletes an
+    /// interrupted publication only when a staging path proves the block
+    /// identity. Unknown files or ambiguous final data fail startup closed.
+    pub fn recover_unpublished_blocks(&self) -> StoreResult<usize> {
+        let groups_dir = self.config.data_root.join("groups");
+        if !groups_dir.exists() {
+            return Ok(0);
+        }
+
+        let mut recovered = 0usize;
+        for group_entry in fs::read_dir(&groups_dir)? {
+            let group_entry = group_entry?;
+            if !group_entry.file_type()?.is_dir() {
+                return Err(corrupt(format!(
+                    "unexpected file in worker groups directory: path={}",
+                    group_entry.path().display()
+                )));
+            }
+            let group_raw = group_entry
+                .file_name()
+                .to_str()
+                .ok_or_else(|| corrupt("worker group directory name is not UTF-8"))?
+                .to_string();
+            let group_name = GroupName::parse(&group_raw)
+                .map_err(|err| corrupt(format!("invalid worker group directory {group_raw}: {err}")))?;
+            let tmp_dir = group_entry.path().join("tmp");
+            if !tmp_dir.exists() {
+                continue;
+            }
+
+            let mut blocks = HashSet::new();
+            for entry in fs::read_dir(&tmp_dir)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    return Err(corrupt(format!(
+                        "unexpected non-file in worker staging directory: path={}",
+                        entry.path().display()
+                    )));
+                }
+                let name = entry
+                    .file_name()
+                    .to_str()
+                    .ok_or_else(|| corrupt("worker staging file name is not UTF-8"))?
+                    .to_string();
+                let block_id = parse_staging_block_file_name(&name).ok_or_else(|| {
+                    corrupt(format!(
+                        "unexpected worker staging file name: path={}",
+                        entry.path().display()
+                    ))
+                })?;
+                blocks.insert(block_id);
+            }
+
+            for block_id in blocks {
+                let paths = self.paths(&group_name, block_id);
+                if paths.meta_path.exists() {
+                    let meta = self.load_meta(&group_name, block_id)?;
+                    ensure_readable(&meta)?;
+                    validate_ready_data_file(&paths, &meta)?;
+                } else {
+                    let has_staging_meta = paths.staging_meta_path.exists();
+                    if has_staging_meta {
+                        self.load_staging_meta(&group_name, block_id)?;
+                    }
+                    if paths.data_path.exists() && !has_staging_meta {
+                        return Err(corrupt(format!(
+                            "unpublished final data has no staging identity: group_name={}, block_id={}",
+                            group_name, block_id
+                        )));
+                    }
+                    if paths.data_path.exists() {
+                        remove_file_if_exists(&paths.data_path)?;
+                        if let Some(parent) = paths.data_path.parent() {
+                            sync_parent_dir(parent)?;
+                        }
+                    }
+                }
+
+                remove_file_if_exists(&paths.staging_data_path)?;
+                remove_file_if_exists(&paths.staging_meta_path)?;
+                remove_file_if_exists(&paths.temp_meta_path)?;
+                sync_parent_dir(&tmp_dir)?;
+                if let Some(parent) = paths.data_path.parent() {
+                    if parent.exists() {
+                        sync_parent_dir(parent)?;
+                    }
+                }
+                recovered = recovered.saturating_add(1);
+            }
+        }
+        Ok(recovered)
+    }
+
+    /// Idempotently removes every unpublished artifact for an aborted write.
+    ///
+    /// A valid final `.meta` is preserved as the local commit point. Final data
+    /// without that commit point is removed only when the staging sidecar proves
+    /// it belongs to the interrupted publication.
     pub fn abort_staging_block(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<()> {
         let paths = self.paths(group_name, block_id);
+        if paths.meta_path.exists() {
+            let meta = self.load_meta(group_name, block_id)?;
+            ensure_readable(&meta)?;
+            validate_ready_data_file(&paths, &meta)?;
+        } else {
+            let has_staging_meta = paths.staging_meta_path.exists();
+            if has_staging_meta {
+                self.load_staging_meta(group_name, block_id)?;
+            }
+            if paths.data_path.exists() && !has_staging_meta {
+                return Err(corrupt(format!(
+                    "unpublished final data has no staging identity: group_name={}, block_id={}",
+                    group_name, block_id
+                )));
+            }
+            if paths.data_path.exists() {
+                remove_file_if_exists(&paths.data_path)?;
+                if let Some(parent) = paths.data_path.parent() {
+                    sync_parent_dir(parent)?;
+                }
+            }
+        }
         remove_file_if_exists(&paths.staging_data_path)?;
         remove_file_if_exists(&paths.staging_meta_path)?;
+        remove_file_if_exists(&paths.temp_meta_path)?;
         if let Some(parent) = paths.staging_data_path.parent() {
+            if parent.exists() {
+                sync_parent_dir(parent)?;
+            }
+        }
+        if let Some(parent) = paths.data_path.parent() {
             if parent.exists() {
                 sync_parent_dir(parent)?;
             }
@@ -1346,6 +1474,20 @@ fn block_hash_prefix(block_id: BlockId) -> (u8, u8) {
     value = value.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
     value ^= value >> 33;
     ((value >> 56) as u8, (value >> 48) as u8)
+}
+
+fn parse_staging_block_file_name(name: &str) -> Option<BlockId> {
+    let stem = name
+        .strip_suffix(".blk.tmp")
+        .or_else(|| name.strip_suffix(".meta.tmp"))?
+        .strip_prefix("b_")?;
+    let (inode_raw, index_raw) = stem.split_once('_')?;
+    if inode_raw.len() != 16 || index_raw.len() != 8 {
+        return None;
+    }
+    let inode_id = u64::from_str_radix(inode_raw, 16).ok()?;
+    let block_index = u32::from_str_radix(index_raw, 16).ok()?;
+    Some(BlockId::new(InodeId::new(inode_id), BlockIndex::new(block_index)))
 }
 
 fn sync_parent_dir(parent: &Path) -> StoreResult<()> {
@@ -2700,6 +2842,74 @@ mod tests {
             other => panic!("expected not found error, got {other:?}"),
         }
         assert_not_found(store.read_at(group_name_value, block_id, 0, 8));
+    }
+
+    #[test]
+    fn startup_recovery_removes_unpublished_shapes_and_preserves_ready_commit() {
+        let (_temp, store) = store();
+        let (group_name_value, staging_id) = ids();
+        let interrupted_id = BlockId::new(staging_id.inode_id, BlockIndex::new(staging_id.index.as_raw() + 1));
+        let ready_id = BlockId::new(staging_id.inode_id, BlockIndex::new(staging_id.index.as_raw() + 2));
+        let ready_data = Bytes::from(vec![9; 4096]);
+
+        create_default_block(&store, group_name_value, staging_id);
+        store
+            .write_at(group_name_value, staging_id, 0, Bytes::from_static(b"partial"))
+            .expect("write staging block");
+
+        create_default_block(&store, group_name_value, interrupted_id);
+        store
+            .write_at(group_name_value, interrupted_id, 0, Bytes::from(vec![8; 4096]))
+            .expect("write interrupted block");
+        let interrupted_paths = store.paths(group_name_value, interrupted_id);
+        fs::create_dir_all(interrupted_paths.parent_dir().expect("block parent")).expect("create block parent");
+        fs::rename(&interrupted_paths.staging_data_path, &interrupted_paths.data_path)
+            .expect("simulate interrupted data publication");
+
+        create_default_block(&store, group_name_value, ready_id);
+        store
+            .write_at(group_name_value, ready_id, 0, ready_data.clone())
+            .expect("write ready block");
+        let ready_paths = store.paths(group_name_value, ready_id);
+        let leftover_data = fs::read(&ready_paths.staging_data_path).expect("read staging data");
+        store
+            .publish_ready(publish_request(group_name_value, ready_id, 4096, 9))
+            .expect("publish ready block");
+        fs::write(&ready_paths.staging_data_path, leftover_data).expect("restore staging data leftover");
+        fs::write(&ready_paths.staging_meta_path, b"corrupt disposable staging meta")
+            .expect("restore corrupt staging meta leftover");
+
+        assert_eq!(store.recover_unpublished_blocks().expect("recover startup state"), 3);
+
+        for block_id in [staging_id, interrupted_id, ready_id] {
+            let paths = store.paths(group_name_value, block_id);
+            assert!(!paths.staging_data_path.exists());
+            assert!(!paths.staging_meta_path.exists());
+        }
+        assert!(!interrupted_paths.data_path.exists());
+        assert_eq!(
+            store
+                .read_at(group_name_value, ready_id, 0, 4096)
+                .expect("read preserved ready block"),
+            ready_data
+        );
+    }
+
+    #[test]
+    fn startup_recovery_fails_closed_on_unknown_staging_file() {
+        let (_temp, store) = store();
+        let (group_name_value, block_id) = ids();
+        create_default_block(&store, group_name_value, block_id);
+        let paths = store.paths(group_name_value, block_id);
+        fs::write(
+            paths.staging_parent_dir().expect("staging parent").join("unknown.tmp"),
+            b"unknown",
+        )
+        .expect("write unknown staging artifact");
+
+        assert_corrupt(store.recover_unpublished_blocks());
+        assert!(paths.staging_meta_path.exists());
+        assert!(paths.staging_data_path.exists());
     }
 
     #[test]

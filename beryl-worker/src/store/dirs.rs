@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Worker-local store directory admission and capacity reporting.
+//! Worker-local store directory selection and capacity reporting.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::CString;
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use beryl_types::{BlockId, GroupName, Tier, TierFree};
 use bytes::Bytes;
 use tokio::sync::Notify;
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::StoreDirConfig;
@@ -112,6 +112,14 @@ impl StoreDirs {
             let mount_key = mount_key(&config.path)?;
             let store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(config.path.clone()));
             store.recover_deleting_markers()?;
+            let recovered_unpublished = store.recover_unpublished_blocks()?;
+            if recovered_unpublished > 0 {
+                info!(
+                    store_dir = %id,
+                    recovered_unpublished,
+                    "Worker startup removed unpublished blocks from an older run"
+                );
+            }
             let (used_bytes, block_count) = scan_store_usage(&store, &config.path)?;
             dirs.push(StoreDirState {
                 id,
@@ -245,28 +253,70 @@ impl StoreDirs {
         *cursor = cursor.saturating_add(1);
 
         let key = (req.group_name.clone(), req.block_id);
-        if inner.dirs[selected].pending_blocks.contains_key(&key) {
+        if inner.dirs.iter().any(|dir| dir.pending_blocks.contains_key(&key)) {
             return Err(WorkerError::InvalidArgument(format!(
                 "staging block already has a pending reservation: block_id={}",
                 req.block_id
             )));
         }
-        inner.dirs[selected].pending_bytes = inner.dirs[selected].pending_bytes.saturating_add(req.block_size);
+        inner.dirs[selected].pending_bytes = inner.dirs[selected]
+            .pending_bytes
+            .checked_add(req.block_size)
+            .ok_or_else(|| WorkerError::Corrupt("store dir pending byte accounting overflow".to_string()))?;
         inner.dirs[selected].pending_blocks.insert(key, req.block_size);
         Ok((selected, inner.dirs[selected].store.clone()))
     }
 
-    fn release_pending(&self, dir_index: usize, group_name: &GroupName, block_id: BlockId) {
+    fn release_pending(&self, dir_index: usize, group_name: &GroupName, block_id: BlockId) -> StoreResult<bool> {
         let mut inner = self.inner.lock().expect("store dir state poisoned");
-        release_pending_locked(&mut inner.dirs[dir_index], group_name, block_id);
+        release_pending_locked(&mut inner.dirs[dir_index], group_name, block_id)
     }
 
-    fn find_staging_store(&self, group_name: &GroupName, block_id: BlockId) -> Option<(usize, FullBlockFileStore)> {
+    /// Resolves the exact directory that owns one live pending reservation.
+    fn find_pending_store(
+        &self,
+        group_name: &GroupName,
+        block_id: BlockId,
+    ) -> StoreResult<Option<(usize, FullBlockFileStore)>> {
         let inner = self.inner.lock().expect("store dir state poisoned");
-        inner.dirs.iter().enumerate().find_map(|(idx, dir)| {
+        let key = (group_name.clone(), block_id);
+        let mut found = None;
+        for (idx, dir) in inner.dirs.iter().enumerate() {
+            if !dir.pending_blocks.contains_key(&key) {
+                continue;
+            }
+            if found.is_some() {
+                return Err(WorkerError::Corrupt(format!(
+                    "pending block exists in multiple worker store dirs: group_name={}, block_id={}",
+                    group_name, block_id
+                )));
+            }
+            found = Some((idx, dir.store.clone()));
+        }
+        Ok(found)
+    }
+
+    fn find_staging_store(
+        &self,
+        group_name: &GroupName,
+        block_id: BlockId,
+    ) -> StoreResult<Option<(usize, FullBlockFileStore)>> {
+        let inner = self.inner.lock().expect("store dir state poisoned");
+        let mut found = None;
+        for (idx, dir) in inner.dirs.iter().enumerate() {
             let paths = dir.store.paths(group_name, block_id);
-            (paths.staging_meta_path.exists() || paths.staging_data_path.exists()).then(|| (idx, dir.store.clone()))
-        })
+            if !paths.staging_meta_path.exists() && !paths.staging_data_path.exists() {
+                continue;
+            }
+            if found.is_some() {
+                return Err(WorkerError::Corrupt(format!(
+                    "staging block exists in multiple worker store dirs: group_name={}, block_id={}",
+                    group_name, block_id
+                )));
+            }
+            found = Some((idx, dir.store.clone()));
+        }
+        Ok(found)
     }
 
     fn find_final_store(&self, group_name: &GroupName, block_id: BlockId) -> Option<(usize, FullBlockFileStore)> {
@@ -328,10 +378,22 @@ impl LocalBlockStore for StoreDirs {
         let (dir_index, store) = self.reserve_dir(&req)?;
         match store.create_staging_block(req) {
             Ok(meta) => Ok(meta),
-            Err(err) => {
-                self.release_pending(dir_index, &group_name, block_id);
-                Err(err)
-            }
+            Err(err) => match store.abort_staging_block(&group_name, block_id) {
+                Ok(()) => {
+                    self.release_pending(dir_index, &group_name, block_id)?;
+                    Err(err)
+                }
+                Err(cleanup_error) => {
+                    tracing::warn!(
+                        group_name = %group_name,
+                        block_id = %block_id,
+                        create_error = %err,
+                        cleanup_error = %cleanup_error,
+                        "failed staging creation retained pending capacity for retry"
+                    );
+                    Err(cleanup_error)
+                }
+            },
         }
     }
 
@@ -339,9 +401,9 @@ impl LocalBlockStore for StoreDirs {
         if let Some((_, store)) = self.find_final_store(group_name, block_id) {
             return store.write_at(group_name, block_id, offset, data);
         }
-        let Some((_, store)) = self.find_staging_store(group_name, block_id) else {
+        let Some((_, store)) = self.find_pending_store(group_name, block_id)? else {
             return Err(WorkerError::NotFound(format!(
-                "staging block not found: group_name={}, block_id={}",
+                "pending staging block not found: group_name={}, block_id={}",
                 group_name, block_id
             )));
         };
@@ -351,15 +413,20 @@ impl LocalBlockStore for StoreDirs {
     fn publish_ready(&self, req: PublishReadyRequest) -> StoreResult<BlockMetaPayload> {
         let group_name = req.group_name.clone();
         let block_id = req.block_id;
-        let Some((dir_index, store)) = self.find_staging_store(&group_name, block_id) else {
+        let Some((dir_index, store)) = self.find_pending_store(&group_name, block_id)? else {
             return Err(WorkerError::NotFound(format!(
-                "staging block not found: group_name={}, block_id={}",
+                "pending staging block not found: group_name={}, block_id={}",
                 group_name, block_id
             )));
         };
         let meta = store.publish_ready(req)?;
         let mut inner = self.inner.lock().expect("store dir state poisoned");
-        release_pending_locked(&mut inner.dirs[dir_index], &group_name, block_id);
+        if !release_pending_locked(&mut inner.dirs[dir_index], &group_name, block_id)? {
+            return Err(WorkerError::Corrupt(format!(
+                "published block lost its pending reservation: group_name={}, block_id={}",
+                group_name, block_id
+            )));
+        }
         inner.dirs[dir_index].used_bytes = inner.dirs[dir_index]
             .used_bytes
             .saturating_add(meta.source.effective_len);
@@ -423,7 +490,7 @@ impl LocalBlockStore for StoreDirs {
         let result = store.reclaim_block(req)?;
         if let ReclaimBlockResult::Deleted { effective_len } = result {
             let mut inner = self.inner.lock().expect("store dir state poisoned");
-            release_pending_locked(&mut inner.dirs[dir_index], &req.group_name, req.block_id);
+            release_pending_locked(&mut inner.dirs[dir_index], &req.group_name, req.block_id)?;
             inner.dirs[dir_index].used_bytes = inner.dirs[dir_index].used_bytes.saturating_sub(effective_len);
             inner.dirs[dir_index].block_count = inner.dirs[dir_index].block_count.saturating_sub(1);
             drop(inner);
@@ -433,12 +500,22 @@ impl LocalBlockStore for StoreDirs {
     }
 
     fn abort_staging_block(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<()> {
-        let Some((dir_index, store)) = self.find_staging_store(group_name, block_id) else {
+        let pending = self.find_pending_store(group_name, block_id)?;
+        let staging = self.find_staging_store(group_name, block_id)?;
+        if let (Some((pending_index, _)), Some((staging_index, _))) = (&pending, &staging) {
+            if pending_index != staging_index {
+                return Err(WorkerError::Corrupt(format!(
+                    "pending reservation and staging artifacts use different worker store dirs: group_name={}, block_id={}",
+                    group_name, block_id
+                )));
+            }
+        }
+        let Some((dir_index, store)) = pending.or(staging) else {
             return Ok(());
         };
         store.abort_staging_block(group_name, block_id)?;
         let mut inner = self.inner.lock().expect("store dir state poisoned");
-        release_pending_locked(&mut inner.dirs[dir_index], group_name, block_id);
+        release_pending_locked(&mut inner.dirs[dir_index], group_name, block_id)?;
         Ok(())
     }
 }
@@ -534,11 +611,20 @@ fn tier_report_rank(tier: Tier) -> u8 {
     }
 }
 
-fn release_pending_locked(dir: &mut StoreDirState, group_name: &GroupName, block_id: BlockId) {
+fn release_pending_locked(dir: &mut StoreDirState, group_name: &GroupName, block_id: BlockId) -> StoreResult<bool> {
     let key = (group_name.clone(), block_id);
-    if let Some(bytes) = dir.pending_blocks.remove(&key) {
-        dir.pending_bytes = dir.pending_bytes.saturating_sub(bytes);
+    if let Some(bytes) = dir.pending_blocks.get(&key).copied() {
+        let remaining = dir.pending_bytes.checked_sub(bytes).ok_or_else(|| {
+            WorkerError::Corrupt(format!(
+                "store dir pending byte accounting underflow: group_name={}, block_id={}, pending_bytes={}, reserved_bytes={}",
+                group_name, block_id, dir.pending_bytes, bytes
+            ))
+        })?;
+        dir.pending_blocks.remove(&key);
+        dir.pending_bytes = remaining;
+        return Ok(true);
     }
+    Ok(false)
 }
 
 fn init_store_path(path: &Path) -> StoreResult<()> {

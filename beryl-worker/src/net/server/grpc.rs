@@ -135,13 +135,15 @@ impl WorkerDataServiceImpl {
             last_acked_seq: 0,
             written_through: 0,
         };
-        let mut active_stream_id = None;
+        let mut owned_stream_id = None;
+        let mut cancellation_cleanup = WriteStreamCancellation::new(&self.core);
         while let Some(frame) = frames.next().await {
             let frame = match frame {
                 Ok(frame) => frame,
                 Err(status) => {
                     observe::record_stream_frame("write", "error", status_error_kind(&status), 0);
-                    cleanup_write_stream_after_error(&self.core, active_stream_id).await?;
+                    cleanup_write_stream_after_error(&self.core, owned_stream_id).await?;
+                    cancellation_cleanup.disarm();
                     return Err(status);
                 }
             };
@@ -151,19 +153,39 @@ impl WorkerDataServiceImpl {
                 Ok(domain) => domain,
                 Err(error) => {
                     observe::record_stream_frame("write", "error", observe::worker_error_kind(&error), frame_bytes);
-                    cleanup_write_stream_after_error(&self.core, frame_stream_id.or(active_stream_id)).await?;
+                    cleanup_write_stream_after_error(&self.core, owned_stream_id.or(frame_stream_id)).await?;
+                    cancellation_cleanup.disarm();
                     return Err(error.to_status());
                 }
             };
-            active_stream_id = Some(domain.stream_id);
+            if let Some(owned) = owned_stream_id {
+                if domain.stream_id != owned {
+                    let error = WorkerError::InvalidArgument(format!(
+                        "WriteStream changed stream identity: expected={owned}, actual={}",
+                        domain.stream_id
+                    ));
+                    observe::record_stream_frame("write", "error", observe::worker_error_kind(&error), frame_bytes);
+                    cleanup_write_stream_after_error(&self.core, Some(owned)).await?;
+                    cancellation_cleanup.disarm();
+                    return Err(error.to_status());
+                }
+            } else if self.core.stream_manager().is_write_stream(domain.stream_id) {
+                owned_stream_id = Some(domain.stream_id);
+                cancellation_cleanup.claim_stream(domain.stream_id);
+            }
             let result = match self.core.write_stream(domain).await {
                 Ok(result) => result,
                 Err(error) => {
                     observe::record_stream_frame("write", "error", observe::worker_error_kind(&error), frame_bytes);
-                    cleanup_write_stream_after_error(&self.core, active_stream_id).await?;
+                    cleanup_write_stream_after_error(&self.core, owned_stream_id).await?;
+                    cancellation_cleanup.disarm();
                     return Err(error.to_status());
                 }
             };
+            debug_assert!(
+                owned_stream_id.is_some(),
+                "accepted WriteStream frame must own a write stream"
+            );
             observe::record_stream_frame("write", "ok", "none", frame_bytes);
             response = WriteStreamResponseProto {
                 accepted: result.accepted,
@@ -171,11 +193,53 @@ impl WorkerDataServiceImpl {
                 written_through: result.written_through,
             };
             if !response.accepted {
-                cleanup_write_stream_after_error(&self.core, active_stream_id).await?;
+                cleanup_write_stream_after_error(&self.core, owned_stream_id).await?;
+                cancellation_cleanup.disarm();
                 break;
             }
         }
+        cancellation_cleanup.disarm();
         Ok(response)
+    }
+}
+
+/// Converts transport-task cancellation into a synchronous Retiring request.
+///
+/// Drop performs no filesystem IO and starts no detached task. The process-owned
+/// maintenance loop completes the idempotent staging cleanup.
+struct WriteStreamCancellation<'a> {
+    core: &'a WorkerCore,
+    stream_id: Option<beryl_types::StreamId>,
+    armed: bool,
+}
+
+impl<'a> WriteStreamCancellation<'a> {
+    fn new(core: &'a WorkerCore) -> Self {
+        Self {
+            core,
+            stream_id: None,
+            armed: true,
+        }
+    }
+
+    fn claim_stream(&mut self, stream_id: beryl_types::StreamId) {
+        debug_assert!(self.stream_id.is_none(), "WriteStream ownership is immutable");
+        self.stream_id = Some(stream_id);
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WriteStreamCancellation<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(stream_id) = self.stream_id {
+            self.core.stream_manager().request_write_retirement(stream_id);
+        }
     }
 }
 
@@ -237,7 +301,7 @@ impl Drop for ReadStreamCleanup {
             return;
         }
         self.done.store(true, Ordering::Release);
-        self.core.stream_manager().remove_now(self.stream_id);
+        self.core.stream_manager().retire_cancelled_read(self.stream_id);
     }
 }
 
@@ -484,7 +548,14 @@ impl WorkerDataService for WorkerDataServiceImpl {
                         written_through: result.written_through,
                     },
                     Err(error) => {
-                        let _ = self.core.abort_write_stream_after_error(stream_id).await;
+                        if let Err(cleanup_error) = self.core.abort_write_stream_after_error(stream_id).await {
+                            tracing::warn!(
+                                stream_id = %stream_id,
+                                error_code = observe::worker_error_kind(&cleanup_error),
+                                error = %cleanup_error,
+                                "Failed commit cleanup retained a Retiring write stream"
+                            );
+                        }
                         CommitWriteResponseProto {
                             header: Some(Self::error_response_header(header, error)),
                             effective_len: 0,
@@ -716,7 +787,8 @@ mod tests {
     use crate::observe::WORKER_STREAM_INFLIGHT;
     use crate::runtime::stream::{StreamManager, StreamState};
     use crate::store::block::{
-        ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, PublishReadyRequest,
+        ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
+        PublishReadyRequest,
     };
     use crate::store::dirs::StoreDirs;
 
@@ -1054,6 +1126,137 @@ mod tests {
         assert!(!store.paths(&group_name(), block_id()).meta_path.exists());
         assert_not_found(store.read_at(&group_name(), block_id(), 0, 1));
         assert!(store.scan_group_blocks(&group_name()).expect("scan group").is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_stream_error_does_not_retire_a_read_stream_identity() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+        let data = payload();
+        publish_ready_block(&store, data.clone(), BLOCK_STAMP);
+        let core = Arc::new(core);
+        let service = registered_data_service(Arc::clone(&core));
+        let read = core
+            .open_read(crate::data::core::ReadOpenRequest {
+                group_name: group_name(),
+                block_id: block_id(),
+                worker_run_id: test_worker_run_id(),
+                byte_range: beryl_types::chunk::ByteRange { offset: 0, len: 4 },
+                block_stamp: BLOCK_STAMP,
+                block_format_id: BlockFormatId::FULL_EFFECTIVE,
+                block_size: BLOCK_SIZE,
+                chunk_size: CHUNK_SIZE,
+                effective_len: BLOCK_SIZE,
+                frame_size: 512,
+            })
+            .await
+            .expect("open read");
+
+        let status = service
+            .handle_write_frames(futures::stream::iter(vec![Ok(WriteStreamRequestProto {
+                stream_id: Some(crate::data::convert::stream_id_to_proto(read.stream_id)),
+                seq: 1,
+                offset_in_block: 0,
+                data: Bytes::from_static(b"abcd"),
+            })]))
+            .await
+            .expect_err("read identity must reject WriteStream");
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        let frames = core
+            .read_stream(read.stream_id, 512)
+            .await
+            .expect("read stream remains open");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, data.slice(0..4));
+        assert!(frames[0].eos);
+    }
+
+    #[tokio::test]
+    async fn write_stream_identity_switch_cleans_only_the_owned_write() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = report_store(&temp);
+        let read_block_id = BlockId::new(InodeId::new(7), BlockIndex::new(4));
+        let read_data = payload();
+        store
+            .create_staging_block(CreateStagingBlockRequest {
+                group_name: group_name(),
+                block_id: read_block_id,
+                block_size: BLOCK_SIZE,
+                block_format_id: BlockFormatId::FULL_EFFECTIVE,
+                chunk_size: CHUNK_SIZE,
+                checksum_kind: ChecksumKind::None,
+                tier: Tier::Hdd,
+            })
+            .expect("create read block staging");
+        store
+            .write_at(&group_name(), read_block_id, 0, read_data.clone())
+            .expect("write read block");
+        store
+            .publish_ready(PublishReadyRequest {
+                group_name: group_name(),
+                block_id: read_block_id,
+                effective_len: BLOCK_SIZE,
+                block_stamp: BLOCK_STAMP,
+            })
+            .expect("publish read block");
+        let core = Arc::new(WorkerCore::with_local_store(
+            512,
+            2048,
+            Duration::from_secs(60),
+            store.clone(),
+        ));
+        let service = registered_data_service(Arc::clone(&core));
+        let write = service
+            .open_write_stream(tonic::Request::new(open_write_proto(512)))
+            .await
+            .expect("open write")
+            .into_inner();
+        let write_stream_id =
+            crate::data::convert::proto_to_stream_id(write.stream_id, "stream_id").expect("write stream id");
+        let read = core
+            .open_read(crate::data::core::ReadOpenRequest {
+                group_name: group_name(),
+                block_id: read_block_id,
+                worker_run_id: test_worker_run_id(),
+                byte_range: beryl_types::chunk::ByteRange { offset: 0, len: 4 },
+                block_stamp: BLOCK_STAMP,
+                block_format_id: BlockFormatId::FULL_EFFECTIVE,
+                block_size: BLOCK_SIZE,
+                chunk_size: CHUNK_SIZE,
+                effective_len: BLOCK_SIZE,
+                frame_size: 512,
+            })
+            .await
+            .expect("open read");
+        assert_eq!(store.report().expect("pending write report").pending_bytes, BLOCK_SIZE);
+
+        let status = service
+            .handle_write_frames(futures::stream::iter(vec![
+                Ok(WriteStreamRequestProto {
+                    stream_id: Some(crate::data::convert::stream_id_to_proto(write_stream_id)),
+                    seq: 1,
+                    offset_in_block: 0,
+                    data: Bytes::from_static(b"partial"),
+                }),
+                Ok(WriteStreamRequestProto {
+                    stream_id: Some(crate::data::convert::stream_id_to_proto(read.stream_id)),
+                    seq: 1,
+                    offset_in_block: 0,
+                    data: Bytes::from_static(b"abcd"),
+                }),
+            ]))
+            .await
+            .expect_err("WriteStream identity switch must fail");
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(store.report().expect("cleaned write report").pending_bytes, 0);
+        assert!(core.stream_manager().get(write_stream_id).await.is_none());
+        let frames = core
+            .read_stream(read.stream_id, 512)
+            .await
+            .expect("read identity remains open");
+        assert_eq!(frames[0].data, read_data.slice(0..4));
+        assert!(frames[0].eos);
     }
 
     #[tokio::test]
@@ -1740,22 +1943,25 @@ mod tests {
         state.context.mode = StreamMode::Write;
         state.last_activity = Instant::now() - Duration::from_secs(10);
 
-        manager.register_write(state.clone()).await;
+        assert!(manager.register_write(state.clone()));
         assert_eq!(manager.active_count().await, 1);
         assert_eq!(manager.get(stream_id()).await.unwrap().context.stream_id, stream_id());
 
-        assert!(manager.touch(stream_id()).await);
+        drop(manager.begin_operation(stream_id()).await.expect("begin operation"));
         let touched = manager.get(stream_id()).await.unwrap();
         assert!(touched.last_activity > state.last_activity);
 
-        manager.remove(stream_id()).await;
+        let operation = manager.begin_retirement(stream_id()).await.expect("retire stream");
+        manager.complete_retirement(stream_id(), &operation);
         assert_eq!(manager.active_count().await, 0);
 
         let mut idle = StreamState::new(stream_context());
         idle.context.mode = StreamMode::Write;
         idle.last_activity = Instant::now() - Duration::from_secs(10);
-        manager.register_write(idle).await;
-        assert_eq!(manager.cleanup_idle_streams().await, 1);
+        assert!(manager.register_write(idle));
+        assert_eq!(manager.take_cleanup_batch(1, false, None), vec![stream_id()]);
+        let operation = manager.begin_retirement(stream_id()).await.expect("retire idle stream");
+        manager.complete_retirement(stream_id(), &operation);
         assert_eq!(manager.active_count().await, 0);
     }
 
@@ -1763,7 +1969,7 @@ mod tests {
     #[should_panic(expected = "write stream registration requires write mode")]
     async fn stream_manager_rejects_unpinned_read_registration() {
         let manager = StreamManager::with_default_timeout();
-        manager.register_write(StreamState::new(stream_context())).await;
+        manager.register_write(StreamState::new(stream_context()));
     }
 
     #[derive(Default)]

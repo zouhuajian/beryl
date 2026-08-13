@@ -229,7 +229,7 @@ impl BlockCleanupExecutor {
 
 /// Drains the bounded command channel and owns all process-local cleanup tasks.
 ///
-/// Graceful shutdown stops admission and drains active tasks until forced;
+/// Graceful shutdown stops accepting new tasks and drains active tasks until forced;
 /// any undeleted replica remains discoverable through a later block report.
 async fn run_executor(
     inner: Arc<BlockCleanupInner>,
