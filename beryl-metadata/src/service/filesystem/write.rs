@@ -47,7 +47,6 @@ pub(crate) struct RenewLeaseOutput {
 
 pub(crate) struct AddBlockArgs {
     pub(crate) handle: PresentedWriteHandle,
-    pub(crate) desired_len: Option<u64>,
     pub(crate) previous_block_id: Option<BlockId>,
     pub(crate) freshness: Freshness,
 }
@@ -73,7 +72,6 @@ impl MetadataFileSystem {
                 ctx,
                 handle.inode_id,
                 handle.lease_epoch,
-                args.desired_len,
                 args.previous_block_id,
                 args.freshness,
             )
@@ -91,7 +89,6 @@ impl MetadataFileSystem {
                     block_id = %target.block_id,
                     block_index = target.block_id.index.as_raw(),
                     group_id = success.group_name.as_ref().map(|group| group.as_str()),
-                    desired_len = args.desired_len,
                     target_count = target.worker_endpoints.len(),
                     targets_sample = ?target.worker_endpoints.iter().take(3).map(|endpoint| endpoint.worker_id.as_raw()).collect::<Vec<_>>(),
                     inode_id = target.block_id.inode_id.as_raw(),
@@ -108,7 +105,6 @@ impl MetadataFileSystem {
                 error_code = crate::observe::rpc_error_kind(&failure.error),
                 client_id = %ctx.caller.client.client_id,
                 call_id = %ctx.caller.client.call_id,
-                desired_len = args.desired_len,
                 handle_inode_id = handle.inode_id.as_raw(),
                 lease_epoch = handle.lease_epoch,
                 mount_epoch = failure.mount_epoch,
@@ -600,7 +596,6 @@ impl MetadataFileSystem {
         ctx: &RequestContext,
         inode_id: InodeId,
         lease_epoch: u64,
-        desired_len: Option<u64>,
         previous_block_id: Option<BlockId>,
         freshness: Freshness,
     ) -> FsResult<AddBlockOutput> {
@@ -665,75 +660,83 @@ impl MetadataFileSystem {
             );
         }
 
-        let reservation =
-            match self
-                .session_registry
-                .begin_add_block(inode_id, lease_epoch, previous_block_id, desired_len)
-            {
-                Ok(BeginAddBlock::Replay(target)) => {
-                    return self.success_with_route_epoch(
-                        ctx,
-                        AddBlockOutput { target },
-                        group_name,
-                        mount_epoch,
-                        route_epoch,
-                    )
-                }
-                Ok(BeginAddBlock::Reserved(reservation)) => reservation,
-                Err(BeginAddBlockError::Session(message)) => {
-                    return self.session_terminal_failure(
-                        ctx,
-                        ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
-                        format!("AddBlock session is no longer current for inode_id={inode_id}: {message}"),
-                        group_name,
-                        mount_epoch,
-                    )
-                }
-                Err(BeginAddBlockError::Internal(message)) => {
-                    return self.failure_from_error(
-                        ctx,
-                        MetadataError::Internal(format!(
-                            "AddBlock replay state is inconsistent for inode_id={inode_id}: {message}"
-                        )),
-                        group_name,
-                        mount_epoch,
-                    )
-                }
-                Err(BeginAddBlockError::InvalidArgument(message)) => {
-                    return self.failure_from_error(
-                        ctx,
-                        MetadataError::InvalidArgument(format!("AddBlock rejected for inode_id={inode_id}: {message}")),
-                        group_name,
-                        mount_epoch,
-                    )
-                }
-                Err(BeginAddBlockError::Pending) => {
-                    return self.failure_from_error(
-                        ctx,
-                        MetadataError::Again(format!(
-                            "AddBlock is already pending for inode_id={inode_id} and predecessor={previous_block_id:?}"
-                        )),
-                        group_name,
-                        mount_epoch,
-                    )
-                }
-                Err(BeginAddBlockError::LimitExceeded(exceeded)) => {
-                    let error = match exceeded.limit {
-                        WriteTargetLimit::Global => MetadataError::GlobalWriteTargetLimitExceeded(format!(
-                            "global limit {} reached before allocating inode_id={inode_id}",
-                            exceeded.maximum
-                        )),
-                        WriteTargetLimit::PerSession => MetadataError::ResourceExhausted(format!(
-                            "write session target limit {} reached for inode_id={inode_id}",
-                            exceeded.maximum
-                        )),
-                    };
-                    return self.failure_from_error(ctx, error, group_name, mount_epoch);
-                }
-            };
+        let reservation = match self
+            .session_registry
+            .begin_add_block(inode_id, lease_epoch, previous_block_id)
+        {
+            Ok(BeginAddBlock::Replay(target)) => {
+                return self.success_with_route_epoch(
+                    ctx,
+                    AddBlockOutput { target },
+                    group_name,
+                    mount_epoch,
+                    route_epoch,
+                )
+            }
+            Ok(BeginAddBlock::Reserved(reservation)) => reservation,
+            Err(BeginAddBlockError::Session(message)) => {
+                return self.session_terminal_failure(
+                    ctx,
+                    ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
+                    format!("AddBlock session is no longer current for inode_id={inode_id}: {message}"),
+                    group_name,
+                    mount_epoch,
+                )
+            }
+            Err(BeginAddBlockError::Internal(message)) => {
+                return self.failure_from_error(
+                    ctx,
+                    MetadataError::Internal(format!(
+                        "AddBlock replay state is inconsistent for inode_id={inode_id}: {message}"
+                    )),
+                    group_name,
+                    mount_epoch,
+                )
+            }
+            Err(BeginAddBlockError::InvalidArgument(message)) => {
+                return self.failure_from_error(
+                    ctx,
+                    MetadataError::InvalidArgument(format!("AddBlock rejected for inode_id={inode_id}: {message}")),
+                    group_name,
+                    mount_epoch,
+                )
+            }
+            Err(BeginAddBlockError::Pending) => {
+                return self.failure_from_error(
+                    ctx,
+                    MetadataError::Again(format!(
+                        "AddBlock is already pending for inode_id={inode_id} and predecessor={previous_block_id:?}"
+                    )),
+                    group_name,
+                    mount_epoch,
+                )
+            }
+            Err(BeginAddBlockError::PublicationInProgress) => {
+                return self.failure_from_error(
+                    ctx,
+                    MetadataError::Again(format!(
+                        "AddBlock cannot allocate inode_id={inode_id} while file publication is in progress"
+                    )),
+                    group_name,
+                    mount_epoch,
+                )
+            }
+            Err(BeginAddBlockError::LimitExceeded(exceeded)) => {
+                let error = match exceeded.limit {
+                    WriteTargetLimit::Global => MetadataError::GlobalWriteTargetLimitExceeded(format!(
+                        "global limit {} reached before allocating inode_id={inode_id}",
+                        exceeded.maximum
+                    )),
+                    WriteTargetLimit::PerSession => MetadataError::ResourceExhausted(format!(
+                        "write session target limit {} reached for inode_id={inode_id}",
+                        exceeded.maximum
+                    )),
+                };
+                return self.failure_from_error(ctx, error, group_name, mount_epoch);
+            }
+        };
         let layout = reservation.layout();
         let file_offset = reservation.file_offset();
-        let effective_len = reservation.effective_len();
         let block_stamp = reservation.block_stamp();
         let open_client_id = reservation.open_client_id();
         let block_id = match self.propose_block_allocation(inode_id, lease_epoch).await {
@@ -817,7 +820,6 @@ impl MetadataFileSystem {
             block_id,
             file_offset,
             block_size: u64::from(layout.block_size),
-            effective_len,
             worker_endpoints,
             fencing_token: FencingToken {
                 block_id,
@@ -1371,7 +1373,6 @@ mod tests {
                 &request_context(),
                 inode_id,
                 opened.payload.lease_epoch,
-                Some(4096),
                 None,
                 Freshness::default(),
             )
@@ -1404,7 +1405,6 @@ mod tests {
                 &request_context(),
                 inode_id,
                 opened.payload.lease_epoch,
-                Some(4096),
                 None,
                 Freshness::default(),
             )
@@ -1436,7 +1436,7 @@ mod tests {
             .expect("OpenWrite");
         let session_registry = env.filesystem.session_registry();
         let reservation = match session_registry
-            .begin_add_block(env.inode_id, opened.payload.lease_epoch, None, Some(4096))
+            .begin_add_block(env.inode_id, opened.payload.lease_epoch, None)
             .expect("reserve first AddBlock")
         {
             crate::session_registry::BeginAddBlock::Reserved(reservation) => reservation,
@@ -1448,7 +1448,6 @@ mod tests {
                 &request_context(),
                 env.inode_id,
                 opened.payload.lease_epoch,
-                Some(4096),
                 None,
                 Freshness::default(),
             )
@@ -1472,7 +1471,6 @@ mod tests {
                 &request_context(),
                 env.inode_id,
                 opened.payload.lease_epoch,
-                Some(4096),
                 None,
                 Freshness::default(),
             )

@@ -212,6 +212,7 @@ impl AppRaftStateMachine {
             }
 
             let mut seen = std::collections::HashSet::with_capacity(requested_extents.len());
+            let block_capacity = u64::from(layout.block_size);
             for extent in &requested_extents {
                 if extent.len == 0 {
                     return Err(MetadataError::InvalidArgument(
@@ -230,10 +231,38 @@ impl AppRaftStateMachine {
                         extent.block_id
                     )));
                 }
+                if extent.block_offset != 0 {
+                    return Err(MetadataError::InvalidArgument(format!(
+                        "Committed block {} must start at block offset 0",
+                        extent.block_id
+                    )));
+                }
+                if extent.len > block_capacity {
+                    return Err(MetadataError::InvalidArgument(format!(
+                        "Committed block {} length {} exceeds layout block capacity {}",
+                        extent.block_id, extent.len, block_capacity
+                    )));
+                }
                 if Self::extent_end(extent)? > target_size {
                     return Err(MetadataError::InvalidArgument(format!(
                         "Extent extends beyond target_size {target_size}: {}",
                         extent.block_id
+                    )));
+                }
+            }
+
+            // Only the last block introduced by one publication may be partial.
+            // Exact visible extents are excluded so a later SyncWrite can append
+            // after a partial block already made durable by an earlier command.
+            let newly_visible = requested_extents
+                .iter()
+                .filter(|extent| !Self::extent_matches_visible(&existing_extents, extent))
+                .collect::<Vec<_>>();
+            for extent in newly_visible.iter().take(newly_visible.len().saturating_sub(1)) {
+                if extent.len != block_capacity {
+                    return Err(MetadataError::InvalidArgument(format!(
+                        "non-tail committed block {} must use full layout capacity {}",
+                        extent.block_id, block_capacity
                     )));
                 }
             }
@@ -649,6 +678,55 @@ mod tests {
             ApplyRejectionKind::LeaseFenced { expected: 2, got: 1 },
         );
         assert_eq!(storage.get_inode(inode_id).unwrap().unwrap().attrs.size, 0);
+    }
+
+    #[test]
+    fn publish_rejects_lengths_outside_the_layout_capacity_rules() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage));
+
+        let oversized_inode = InodeId::new(108);
+        install_file_with_extents(&storage, InodeId::new(100), "oversized", oversized_inode, Vec::new(), 0);
+        expect_apply_rejection(
+            sm.apply(Command::PublishFile {
+                proposed_at_ms: 1,
+                inode_id: oversized_inode,
+                extents: vec![extent(BlockId::new(oversized_inode, BlockIndex::new(0)), 0, 4097)],
+                target_size: 4097,
+                expected_content_revision: 0,
+                expected_file_size: 0,
+                lease_epoch: 1,
+                mode: PublishMode::ReplaceIfUnchanged,
+            }),
+            ApplyRejectionKind::InvalidArgument,
+        );
+
+        let non_tail_inode = InodeId::new(109);
+        install_file_with_extents(
+            &storage,
+            InodeId::new(100),
+            "non-tail-partial",
+            non_tail_inode,
+            Vec::new(),
+            0,
+        );
+        expect_apply_rejection(
+            sm.apply(Command::PublishFile {
+                proposed_at_ms: 1,
+                inode_id: non_tail_inode,
+                extents: vec![
+                    extent(BlockId::new(non_tail_inode, BlockIndex::new(0)), 0, 1024),
+                    extent(BlockId::new(non_tail_inode, BlockIndex::new(1)), 1024, 1024),
+                ],
+                target_size: 2048,
+                expected_content_revision: 0,
+                expected_file_size: 0,
+                lease_epoch: 1,
+                mode: PublishMode::ReplaceIfUnchanged,
+            }),
+            ApplyRejectionKind::InvalidArgument,
+        );
     }
 
     #[test]

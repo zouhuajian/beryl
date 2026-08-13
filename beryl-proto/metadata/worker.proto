@@ -113,6 +113,9 @@ message BlockReportBlockProto {
   common.BlockIdProto block_id = 1;
   uint64 block_stamp = 2;
   BlockReportBlockStateProto block_state = 3;
+  // Worker-persisted valid length for this exact local block version.
+  // Ready entries must carry a non-zero value; Deleting entries may use zero.
+  uint64 effective_len = 4;
 }
 
 /// Delta operation type for the current published full-report baseline.

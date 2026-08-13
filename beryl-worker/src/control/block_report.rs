@@ -430,6 +430,7 @@ impl MetadataBlockReportLoop {
                     block_id: Some(reclaiming.block_id.into()),
                     block_stamp: reclaiming.block_stamp,
                     block_state: BlockReportBlockStateProto::BlockReportBlockStateDeleting as i32,
+                    effective_len: 0,
                 },
             );
         }
@@ -707,6 +708,7 @@ fn meta_to_report_block(meta: BlockMetaPayload) -> Result<BlockReportBlockProto,
         block_id: Some(block_id.into()),
         block_stamp: meta.visibility.block_stamp,
         block_state: block_state as i32,
+        effective_len: meta.source.effective_len,
     })
 }
 

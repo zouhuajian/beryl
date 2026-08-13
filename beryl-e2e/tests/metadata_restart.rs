@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
 use beryl_client::{ClientError, CreateOptions, FileStatus};
-use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction};
+use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction};
 use beryl_common::header::RequestHeader;
 use beryl_e2e::{data::deterministic_bytes, TestCluster, TestResult};
 use beryl_proto::common::{ByteRangeProto, FileLayoutProto, RequestHeaderProto, ResponseHeaderProto};
@@ -242,7 +242,6 @@ async fn session_operations_converge_by_predecessor_and_ensure_absent() {
     let add_request = AddBlockRequestProto {
         header: Some(add_header.clone()),
         write_handle: Some(write_handle),
-        desired_len: Some(1024),
         previous_block_id: None,
     };
     let first_add = metadata
@@ -264,7 +263,6 @@ async fn session_operations_converge_by_predecessor_and_ensure_absent() {
         .add_block(Request::new(AddBlockRequestProto {
             header: Some(metadata_header(801)),
             write_handle: Some(write_handle),
-            desired_len: Some(1024),
             previous_block_id: Some(first_block_id),
         }))
         .await
@@ -278,21 +276,17 @@ async fn session_operations_converge_by_predecessor_and_ensure_absent() {
         .expect("second block id");
     assert_eq!(second_block_id.block_index, first_block_id.block_index + 1);
 
-    let conflict = metadata
+    let first_step_replay = metadata
         .add_block(Request::new(AddBlockRequestProto {
             header: Some(add_header),
             write_handle: Some(write_handle),
-            desired_len: Some(512),
             previous_block_id: None,
         }))
         .await
-        .expect("AddBlock conflict response")
+        .expect("AddBlock replay response")
         .into_inner();
-    let error = conflict.header.expect("conflict header").error.expect("conflict error");
-    assert_eq!(
-        rpc_error_from_proto(&error).kind,
-        ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument)
-    );
+    assert_metadata_ok(first_step_replay.header);
+    assert_eq!(first_step_replay.target, Some(first_target));
 
     let abort_request = AbortFileWriteRequestProto {
         header: Some(metadata_header(801)),
@@ -368,7 +362,6 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
             .add_block(Request::new(AddBlockRequestProto {
                 header: Some(metadata_header(900)),
                 write_handle: Some(old_handle),
-                desired_len: Some(1024),
                 previous_block_id,
             }))
             .await
@@ -405,7 +398,6 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
         .add_block(Request::new(AddBlockRequestProto {
             header: Some(metadata_header(900)),
             write_handle: Some(new_handle),
-            desired_len: Some(1024),
             previous_block_id: None,
         }))
         .await
@@ -562,7 +554,6 @@ async fn raw_create_commit_worker_block(
         .add_block(Request::new(AddBlockRequestProto {
             header: Some(metadata_header(401)),
             write_handle: Some(write_handle),
-            desired_len: Some(payload.len() as u64),
             previous_block_id: None,
         }))
         .await?
@@ -635,7 +626,6 @@ async fn write_and_commit_worker_target(target: &WriteTargetProto, payload: &[u8
             token: target.fencing_token,
             frame_size: payload.len().max(1) as u32,
             worker_run_id: worker.worker_run_id.clone(),
-            effective_len: target.effective_len,
             tier: target.tier,
         }))
         .await?

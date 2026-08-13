@@ -98,9 +98,8 @@ message OpenWriteStreamRequestProto {
   // StoreBackend / IoEngine selection is worker-local and is not encoded here.
   uint32 block_format_id = 3;
 
-  // Full logical block size for this block format, from the persisted
-  // FileLayout. This value is persisted in worker BlockMeta.format.block_size.
-  // Tail length is carried separately through CommitWrite.effective_len.
+  // Maximum writable capacity for this block, from the persisted FileLayout.
+  // The final effective length is established by CommitWrite.
   uint64 block_size = 4;
 
   // Metadata-issued StorageChunk size for this block format.
@@ -121,14 +120,11 @@ message OpenWriteStreamRequestProto {
   // Metadata-confirmed worker process-run identity for the selected endpoint.
   string worker_run_id = 9;
 
-  // Metadata-issued valid length for this write target.
-  uint64 effective_len = 10;
-
   // Stable metadata group name for the local block-store staging lookup.
-  string group_name = 11;
+  string group_name = 10;
 
   // Worker-local storage tier requested by metadata for this block replica.
-  common.TierProto tier = 12;
+  common.TierProto tier = 11;
 }
 
 message OpenWriteStreamResponseProto {

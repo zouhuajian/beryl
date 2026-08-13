@@ -208,6 +208,8 @@ pub struct BlockReportBlock {
     pub block_id: BlockId,
     pub block_stamp: u64,
     pub block_state: BlockReportBlockState,
+    /// Worker-persisted valid byte length. Ready reports must carry a non-zero value.
+    pub effective_len: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -269,6 +271,13 @@ pub(crate) enum PublishReadyStatus {
     Conflict(PublishReadyConflict),
 }
 
+/// One metadata-issued target paired with the exact length requested for publication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PublishReadyTarget {
+    pub(crate) target: WriteTarget,
+    pub(crate) effective_len: u64,
+}
+
 /// Deterministic worker evidence that cannot authorize file publication.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PublishReadyConflict {
@@ -286,6 +295,12 @@ pub(crate) enum PublishReadyConflict {
         worker_id: WorkerId,
     },
     BlockStampMismatch {
+        block_id: BlockId,
+        worker_id: WorkerId,
+        expected: u64,
+        reported: u64,
+    },
+    EffectiveLenMismatch {
         block_id: BlockId,
         worker_id: WorkerId,
         expected: u64,
@@ -1625,7 +1640,11 @@ impl WorkerManager {
     /// heartbeat, descriptor, and full-report guards remain held together while
     /// every target is checked, and callers must recheck after every wakeup and
     /// immediately before proposing the visibility-changing Raft command.
-    pub(crate) fn check_publish_ready(&self, group_name: &GroupName, targets: &[WriteTarget]) -> PublishReadyStatus {
+    pub(crate) fn check_publish_ready(
+        &self,
+        group_name: &GroupName,
+        targets: &[PublishReadyTarget],
+    ) -> PublishReadyStatus {
         let descriptors = self.descriptors.read();
         let registrations = self.registrations.read();
         let runtime = self.runtime.read();
@@ -1633,7 +1652,8 @@ impl WorkerManager {
         let now = Instant::now();
         let timeout = self.heartbeat_timeout();
 
-        for target in targets {
+        for expected in targets {
+            let target = &expected.target;
             if target.worker_endpoints.is_empty() {
                 return PublishReadyStatus::Conflict(PublishReadyConflict::MissingWriteEndpoint {
                     block_id: target.block_id,
@@ -1705,6 +1725,15 @@ impl WorkerManager {
                         worker_id: endpoint.worker_id,
                         expected: target.block_stamp,
                         reported: block.block_stamp,
+                    });
+                    continue;
+                }
+                if block.block_state == BlockReportBlockState::Ready && block.effective_len != expected.effective_len {
+                    conflict = Some(PublishReadyConflict::EffectiveLenMismatch {
+                        block_id: target.block_id,
+                        worker_id: endpoint.worker_id,
+                        expected: expected.effective_len,
+                        reported: block.effective_len,
                     });
                     continue;
                 }
@@ -1832,8 +1861,8 @@ mod tests {
 
     use super::{
         BlockLocationKey, BlockReportBlock, BlockReportBlockState, BlockReportDeltaEntry, BlockReportDeltaOp,
-        HealthStatus, PublishReadyConflict, PublishReadyStatus, ReadyReplicaCursor, ReplicaKey, WorkerInfo,
-        WorkerManager, WorkerRegistrationKey,
+        HealthStatus, PublishReadyConflict, PublishReadyStatus, PublishReadyTarget, ReadyReplicaCursor, ReplicaKey,
+        WorkerInfo, WorkerManager, WorkerRegistrationKey,
     };
     use crate::error::MetadataError;
     use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
@@ -1861,6 +1890,7 @@ mod tests {
             block_id,
             block_stamp: u64::from(block_id.index.as_raw()) + 100,
             block_state: BlockReportBlockState::Ready,
+            effective_len: 64,
         }
     }
 
@@ -1902,27 +1932,29 @@ mod tests {
         run_id: WorkerRunId,
         block_id: BlockId,
         block_stamp: u64,
-    ) -> WriteTarget {
-        WriteTarget {
-            block_id,
-            file_offset: 0,
-            block_size: 64,
+    ) -> PublishReadyTarget {
+        PublishReadyTarget {
             effective_len: 64,
-            worker_endpoints: vec![WorkerEndpointInfo {
-                worker_id,
-                endpoint: "127.0.0.1:9090".to_string(),
-                worker_net_protocol: WorkerNetProtocol::Grpc,
-                worker_run_id: run_id,
-            }],
-            fencing_token: FencingToken {
+            target: WriteTarget {
                 block_id,
-                owner: ClientId::new(7),
-                epoch: 1,
+                file_offset: 0,
+                block_size: 64,
+                worker_endpoints: vec![WorkerEndpointInfo {
+                    worker_id,
+                    endpoint: "127.0.0.1:9090".to_string(),
+                    worker_net_protocol: WorkerNetProtocol::Grpc,
+                    worker_run_id: run_id,
+                }],
+                fencing_token: FencingToken {
+                    block_id,
+                    owner: ClientId::new(7),
+                    epoch: 1,
+                },
+                block_stamp,
+                chunk_size: 64,
+                block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
+                tier: Tier::Hdd,
             },
-            block_stamp,
-            chunk_size: 64,
-            block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
-            tier: Tier::Hdd,
         }
     }
 
@@ -1953,6 +1985,7 @@ mod tests {
                     block_id,
                     block_stamp: 7,
                     block_state: BlockReportBlockState::Ready,
+                    effective_len: 64,
                 }],
             )
             .unwrap();
@@ -1995,6 +2028,7 @@ mod tests {
                     block_id,
                     block_stamp: 8,
                     block_state: BlockReportBlockState::Ready,
+                    effective_len: 64,
                 }],
             )
             .unwrap();
@@ -2014,7 +2048,29 @@ mod tests {
                 vec![BlockReportBlock {
                     block_id,
                     block_stamp: 7,
+                    block_state: BlockReportBlockState::Ready,
+                    effective_len: 32,
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.check_publish_ready(&group_name_value, std::slice::from_ref(&target)),
+            PublishReadyStatus::Conflict(PublishReadyConflict::EffectiveLenMismatch { .. })
+        ));
+
+        manager
+            .receive_full_block_report(
+                &group_name_value,
+                worker_id,
+                run_id,
+                3,
+                0,
+                true,
+                vec![BlockReportBlock {
+                    block_id,
+                    block_stamp: 7,
                     block_state: BlockReportBlockState::Corrupt,
+                    effective_len: 64,
                 }],
             )
             .unwrap();
@@ -2024,7 +2080,7 @@ mod tests {
         ));
 
         let mut wrong_endpoint = target.clone();
-        wrong_endpoint.worker_endpoints[0].endpoint = "127.0.0.1:9191".to_string();
+        wrong_endpoint.target.worker_endpoints[0].endpoint = "127.0.0.1:9191".to_string();
         assert!(matches!(
             manager.check_publish_ready(&group_name_value, std::slice::from_ref(&wrong_endpoint)),
             PublishReadyStatus::Conflict(PublishReadyConflict::EndpointMismatch { .. })
@@ -2074,6 +2130,7 @@ mod tests {
                     block_id,
                     block_stamp: 7,
                     block_state: BlockReportBlockState::Ready,
+                    effective_len: 64,
                 }],
             )
             .unwrap();

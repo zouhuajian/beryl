@@ -339,7 +339,6 @@ impl MetadataExecutor {
         &self,
         path: &str,
         write_handle: beryl_proto::metadata::WriteHandleProto,
-        desired_len: u64,
         previous_block_id: Option<BlockId>,
         deadline: OperationDeadline,
     ) -> ClientResult<AddBlockResult> {
@@ -348,7 +347,6 @@ impl MetadataExecutor {
             beryl_proto::metadata::AddBlockRequestProto {
                 header: None,
                 write_handle: Some(write_handle),
-                desired_len: Some(desired_len),
                 previous_block_id: previous_block_id.map(Into::into),
             },
             |gateway, ctx, req| async move { gateway.add_block(ctx, req).await },

@@ -126,7 +126,6 @@ pub struct WriteOpenRequest {
     /// Metadata-selected Beryl block data/meta interpretation format.
     pub block_format_id: BlockFormatId,
     pub chunk_size: u32,
-    pub effective_len: u64,
     pub checksum_kind: ChecksumKind,
     pub tier: Tier,
 }
@@ -444,6 +443,10 @@ impl WorkerCore {
         self.block_manager.wait_for_block_report_change().await;
     }
 
+    /// Open a staging stream bounded by Metadata's full block capacity.
+    ///
+    /// The final valid length is intentionally unknown here and is fixed by
+    /// `commit_write` after the worker verifies the written cursor exactly.
     pub async fn open_write(&self, req: WriteOpenRequest) -> WorkerCoreResult<WriteOpenResult> {
         let group_name = req.group_name.clone();
         let block_id = req.block_id;
@@ -462,14 +465,14 @@ impl WorkerCore {
                 mode: StreamMode::Write,
                 worker_run_id: req.worker_run_id,
                 start_offset: 0,
-                end_offset: req.effective_len,
+                end_offset: req.block_size,
                 frame_size,
                 block_stamp: req.block_stamp,
                 block_format_id: req.block_format_id,
                 block_size: req.block_size,
                 chunk_size: req.chunk_size,
                 committed_length: 0,
-                effective_len: req.effective_len,
+                effective_len: req.block_size,
                 fencing_token: Some(req.token),
             };
             let stream_state = StreamState::new(context);
@@ -1024,7 +1027,7 @@ fn validate_write_open_request(req: &WriteOpenRequest) -> WorkerCoreResult<()> {
         req.block_format_id,
         req.block_size,
         req.chunk_size,
-        req.effective_len,
+        req.block_size,
         req.checksum_kind,
     )?;
     Ok(())
@@ -1104,7 +1107,6 @@ fn validate_existing_block_shape(
     if meta.format.format_id != req.block_format_id
         || meta.format.block_size != req.block_size
         || meta.format.chunk_size != u64::from(req.chunk_size)
-        || meta.source.effective_len != req.effective_len
         || meta.tier != req.tier
     {
         return Err(WorkerError::RefreshMetadata {
@@ -1361,7 +1363,6 @@ mod tests {
             block_size: BLOCK_SIZE,
             block_format_id: BlockFormatId::FULL_EFFECTIVE,
             chunk_size: CHUNK_SIZE,
-            effective_len: BLOCK_SIZE,
             checksum_kind: ChecksumKind::None,
             tier: Tier::Hdd,
         }
@@ -1610,10 +1611,6 @@ mod tests {
         non_aligned.chunk_size = 1000;
         assert_invalid_argument(core.open_write(non_aligned).await);
 
-        let mut over_len = write_open_request();
-        over_len.effective_len = BLOCK_SIZE + 1;
-        assert_invalid_argument(core.open_write(over_len).await);
-
         assert!(!paths.staging_data_path.exists());
         assert!(!paths.staging_meta_path.exists());
         assert_eq!(core.stream_manager().active_count().await, 0);
@@ -1795,9 +1792,7 @@ mod tests {
         let (_temp, store, core) = core_with_store(512, 2048);
         let effective_len = 3073;
         let data = payload().slice(0..effective_len as usize);
-        let mut open_req = write_open_request();
-        open_req.effective_len = effective_len;
-        let open = core.open_write(open_req).await.expect("open write");
+        let open = core.open_write(write_open_request()).await.expect("open write");
 
         let chunks = [
             data.slice(0..700),
@@ -1924,9 +1919,7 @@ mod tests {
     #[tokio::test]
     async fn commit_write_rejects_layout_mismatch_against_open_request() {
         let (_temp, _store, core) = core_with_store(512, 2048);
-        let mut open_req = write_open_request();
-        open_req.effective_len = 4;
-        let open = core.open_write(open_req).await.expect("open write");
+        let open = core.open_write(write_open_request()).await.expect("open write");
         core.write_stream(WriteFrame {
             stream_id: open.stream_id,
             seq: 1,

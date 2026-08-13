@@ -131,7 +131,6 @@ async fn add_block(
         .add_block(Request::new(AddBlockRequestProto {
             header: Some(metadata_header(client_id)),
             write_handle: Some(write_handle),
-            desired_len: Some(1024),
             previous_block_id,
         }))
         .await

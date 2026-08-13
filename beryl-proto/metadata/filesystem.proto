@@ -80,22 +80,18 @@ message WriteTargetProto {
   // Metadata-selected Beryl block data/meta interpretation format for this target.
   // Worker-local execution backend selection is not encoded here.
   uint32 block_format_id = 3;
-  // Full logical block size from the persisted FileLayout. Workers persist this
-  // value in BlockMeta.format.block_size.
+  // Maximum writable capacity from the persisted FileLayout. Workers reserve
+  // and enforce this bound before the final effective length is known.
   uint64 block_size = 4;
   // Metadata-selected chunk size for the worker-local block format.
   uint32 chunk_size = 5;
   // Metadata-assigned stamp that the worker must persist when publishing this
   // block and future direct readers must present back to the worker.
   uint64 block_stamp = 6;
-  // Valid length for this block target. It is normally equal to block_size for
-  // full blocks and may be smaller for tail or bounded blocks. Workers publish
-  // this as BlockMeta.source.effective_len.
-  uint64 effective_len = 7;
-  repeated common.WorkerEndpointInfoProto worker_endpoints = 8;
-  common.FencingTokenProto fencing_token = 9;
+  repeated common.WorkerEndpointInfoProto worker_endpoints = 7;
+  common.FencingTokenProto fencing_token = 8;
   // Worker-local storage tier requested for this block replica.
-  common.TierProto tier = 10;
+  common.TierProto tier = 9;
 }
 
 message CommittedBlockProto {
@@ -277,10 +273,9 @@ message OpenWriteResponseProto {
 message AddBlockRequestProto {
   common.RequestHeaderProto header = 1;
   WriteHandleProto write_handle = 2;
-  optional uint64 desired_len = 3;
   // The first allocation has no predecessor. Every later logical allocation
   // names the block returned by the preceding AddBlock.
-  optional common.BlockIdProto previous_block_id = 4;
+  optional common.BlockIdProto previous_block_id = 3;
 }
 
 message AddBlockResponseProto {

@@ -905,7 +905,6 @@ mod tests {
             block_size: BLOCK_SIZE,
             block_format_id: BlockFormatId::FULL_EFFECTIVE,
             chunk_size: CHUNK_SIZE,
-            effective_len: BLOCK_SIZE,
             checksum_kind: ChecksumKind::None,
             tier: Tier::Hdd,
         }
@@ -1035,7 +1034,6 @@ mod tests {
             token: Some(test_token_proto()),
             frame_size,
             worker_run_id: test_worker_run_id().to_string(),
-            effective_len: BLOCK_SIZE,
             tier: beryl_proto::common::TierProto::TierHdd as i32,
         }
     }

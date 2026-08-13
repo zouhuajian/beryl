@@ -1060,7 +1060,7 @@ mod tests {
 
         let calls = gateway.calls();
         assert_eq!(calls[0].create_layout, Some(requested));
-        assert_eq!(add_block_lens(&calls), vec![8, 8, 4]);
+        assert_eq!(add_block_count(&calls), 3);
         assert_eq!(worker.write_lens(), vec![8, 8, 4]);
     }
 
@@ -1085,7 +1085,7 @@ mod tests {
             .find(|call| call.method == "open_write")
             .expect("open_write call");
         assert_eq!(append.create_layout, None);
-        assert_eq!(add_block_lens(&calls), vec![6, 6, 2]);
+        assert_eq!(add_block_count(&calls), 3);
         assert_eq!(worker.write_lens(), vec![6, 6, 2]);
         let commit = calls
             .into_iter()
@@ -1112,7 +1112,7 @@ mod tests {
         writer.write_all(Bytes::from_static(b"lo")).await.expect("second write");
 
         assert_eq!(writer.cursor(), 5);
-        assert_eq!(add_block_lens(&gateway.calls()), Vec::<u64>::new());
+        assert_eq!(add_block_count(&gateway.calls()), 0);
         assert_eq!(worker.write_lens(), Vec::<u64>::new());
 
         writer.close().await.expect("close");
@@ -1147,13 +1147,13 @@ mod tests {
             .expect("write should flush only complete blocks");
 
         assert_eq!(writer.cursor(), 20);
-        assert_eq!(add_block_lens(&gateway.calls()), vec![8, 8]);
+        assert_eq!(add_block_count(&gateway.calls()), 2);
         assert_eq!(worker.write_lens(), vec![8, 8]);
 
         writer.close().await.expect("close");
 
         let calls = gateway.calls();
-        assert_eq!(add_block_lens(&calls), vec![8, 8, 4]);
+        assert_eq!(add_block_count(&calls), 3);
         let commit = calls
             .into_iter()
             .find(|call| call.method == "commit_file")
@@ -1177,7 +1177,7 @@ mod tests {
 
             writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
 
-            assert_eq!(add_block_lens(&gateway.calls()), Vec::<u64>::new());
+            assert_eq!(add_block_count(&gateway.calls()), 0);
             assert_eq!(worker.write_lens(), Vec::<u64>::new());
 
             if durable {
@@ -1594,7 +1594,6 @@ mod tests {
         committed_block_offsets: Vec<u64>,
         committed_block_lens: Vec<u64>,
         create_layout: Option<RecordedLayout>,
-        add_block_desired_len: Option<u64>,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1636,12 +1635,8 @@ mod tests {
         }
     }
 
-    fn add_block_lens(calls: &[RecordedCall]) -> Vec<u64> {
-        calls
-            .iter()
-            .filter(|call| call.method == "add_block")
-            .map(|call| call.add_block_desired_len.expect("add_block desired_len"))
-            .collect()
+    fn add_block_count(calls: &[RecordedCall]) -> usize {
+        calls.iter().filter(|call| call.method == "add_block").count()
     }
 
     fn unix_now_ms() -> u64 {
@@ -1845,7 +1840,6 @@ mod tests {
                 committed_block_offsets: Vec::new(),
                 committed_block_lens: Vec::new(),
                 create_layout: None,
-                add_block_desired_len: None,
             });
         }
 
@@ -1863,7 +1857,6 @@ mod tests {
                 committed_block_offsets: Vec::new(),
                 committed_block_lens: Vec::new(),
                 create_layout: req.layout.as_ref().map(recorded_layout),
-                add_block_desired_len: None,
             });
         }
 
@@ -1886,7 +1879,6 @@ mod tests {
                 committed_block_offsets: Vec::new(),
                 committed_block_lens: Vec::new(),
                 create_layout: None,
-                add_block_desired_len: None,
             });
         }
 
@@ -1905,7 +1897,6 @@ mod tests {
                 committed_block_offsets: req.committed_blocks.iter().map(|block| block.file_offset).collect(),
                 committed_block_lens: req.committed_blocks.iter().map(|block| block.len).collect(),
                 create_layout: None,
-                add_block_desired_len: None,
             });
         }
 
@@ -1923,11 +1914,10 @@ mod tests {
                 committed_block_offsets: req.committed_blocks.iter().map(|block| block.file_offset).collect(),
                 committed_block_lens: req.committed_blocks.iter().map(|block| block.len).collect(),
                 create_layout: None,
-                add_block_desired_len: None,
             });
         }
 
-        fn record_add_block(&self, ctx: &AttemptContext, req: &beryl_proto::metadata::AddBlockRequestProto) {
+        fn record_add_block(&self, ctx: &AttemptContext, _req: &beryl_proto::metadata::AddBlockRequestProto) {
             let header = ctx.metadata_header().expect("metadata header");
             self.calls.lock().expect("calls").push(RecordedCall {
                 method: "add_block",
@@ -1941,7 +1931,6 @@ mod tests {
                 committed_block_offsets: Vec::new(),
                 committed_block_lens: Vec::new(),
                 create_layout: None,
-                add_block_desired_len: req.desired_len,
             });
         }
 
@@ -2164,7 +2153,6 @@ mod tests {
                 }
             }
             let write_handle = req.write_handle.as_ref().expect("write handle");
-            let requested_len = req.desired_len.expect("desired len");
             let layout = self
                 .write_layouts
                 .lock()
@@ -2172,12 +2160,11 @@ mod tests {
                 .get(&inode_id_from_write_handle(write_handle))
                 .copied()
                 .unwrap_or_else(default_layout);
-            let len = requested_len.min(u64::from(layout.block_size)).max(1);
             let offset = {
                 let mut offsets = self.next_offsets.lock().expect("offsets");
                 let session_id = inode_id_from_write_handle(write_handle);
                 let offset = *offsets.entry(session_id).or_insert(0);
-                offsets.insert(session_id, offset + len);
+                offsets.insert(session_id, offset + u64::from(layout.block_size));
                 offset
             };
             let block_index = {
@@ -2191,7 +2178,7 @@ mod tests {
             let header = ctx.metadata_header().expect("metadata header");
             Ok(AddBlockResult {
                 group_name: group_name_from(&header.group_name),
-                target: write_target_with_layout(inode_id, block_index, offset, len, layout),
+                target: write_target_with_layout(inode_id, block_index, offset, layout),
             })
         }
 
@@ -2254,6 +2241,12 @@ mod tests {
                 .lock()
                 .expect("sync response size")
                 .unwrap_or(req.target_size);
+            if let Some(write_handle) = req.write_handle.as_ref() {
+                self.next_offsets
+                    .lock()
+                    .expect("offsets")
+                    .insert(write_handle.inode_id, synced_size);
+            }
             Ok(SyncWriteResponseProto {
                 synced_size,
                 content_revision: Some(1),
@@ -2620,7 +2613,6 @@ mod tests {
         inode_id: u64,
         block_index: u32,
         file_offset: u64,
-        len: u64,
         layout: RecordedLayout,
     ) -> WriteTarget {
         let block_id = BlockId::new(InodeId::new(inode_id), BlockIndex::new(block_index));
@@ -2628,7 +2620,6 @@ mod tests {
             block_id,
             file_offset,
             block_size: u64::from(layout.block_size),
-            effective_len: len,
             worker_endpoints: vec![worker_endpoint()],
             fencing_token: FencingToken::new(block_id, ClientId::new(7), 1),
             block_stamp: 1,

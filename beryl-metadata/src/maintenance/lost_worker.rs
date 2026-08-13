@@ -154,6 +154,7 @@ mod tests {
             block_id,
             block_stamp: u64::from(block_id.index.as_raw()) + 1,
             block_state: BlockReportBlockState::Ready,
+            effective_len: 64,
         }
     }
 

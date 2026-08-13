@@ -215,7 +215,7 @@ async fn visibility_sync_then_continue_write_roundtrip() {
     let mut cluster = TestCluster::start().await.expect("start hermetic local cluster");
     let client = cluster.client();
     let path = "/sync-continue";
-    let first = Bytes::from(vec![b'a'; 1024]);
+    let first = Bytes::from(vec![b'a'; 317]);
     let second = Bytes::from(vec![b'b'; 1024]);
 
     let mut writer = client

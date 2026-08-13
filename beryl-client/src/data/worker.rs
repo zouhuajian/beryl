@@ -876,13 +876,7 @@ mod tests {
         let handle = worker_block_write_handle(worker.clone());
 
         let err = client
-            .commit_block_write(
-                data_attempt_context("CommitWrite"),
-                &handle,
-                handle.target.effective_len,
-                1,
-                false,
-            )
+            .commit_block_write(data_attempt_context("CommitWrite"), &handle, 4, 1, false)
             .await
             .expect_err("transient CommitWrite transport failure must be unknown outcome");
 
@@ -1140,7 +1134,6 @@ mod tests {
             block_id,
             file_offset: 0,
             block_size: 4096,
-            effective_len: 4,
             worker_endpoints: vec![worker],
             fencing_token: FencingToken::new(block_id, ClientId::new(7), 1),
             block_stamp: 77,

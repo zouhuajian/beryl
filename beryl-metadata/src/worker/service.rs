@@ -307,10 +307,16 @@ impl MetadataWorkerServiceImpl {
                 ));
             }
         };
+        if block_state == BlockReportBlockState::Ready && block.effective_len == 0 {
+            return Err(MetadataError::InvalidArgument(
+                "Ready block report entry effective_len must be greater than zero".to_string(),
+            ));
+        }
         Ok(BlockReportBlock {
             block_id,
             block_stamp: block.block_stamp,
             block_state,
+            effective_len: block.effective_len,
         })
     }
 
@@ -1465,6 +1471,7 @@ mod tests {
             block_id: Some(block_proto(block_id)),
             block_stamp: 100 + u64::from(block_id.index.as_raw()),
             block_state: BlockReportBlockStateProto::BlockReportBlockStateReady as i32,
+            effective_len: 64,
         }
     }
 
@@ -2184,6 +2191,7 @@ mod tests {
                     block_id,
                     block_stamp: 100,
                     block_state: BlockReportBlockState::Ready,
+                    effective_len: 64,
                 }],
             )
             .unwrap();
@@ -2834,6 +2842,7 @@ mod tests {
                     block_id,
                     block_stamp,
                     block_state: BlockReportBlockState::Ready,
+                    effective_len: 64,
                 }],
             )
             .unwrap();

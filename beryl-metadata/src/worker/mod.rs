@@ -16,5 +16,5 @@ pub use manager::{
     BlockReportBlock, BlockReportBlockState, HealthStatus, ReplicaKey, WorkerDescriptor, WorkerInfo, WorkerLiveState,
     WorkerManager,
 };
-pub(crate) use manager::{PublishReadyConflict, PublishReadyStatus, ReadyReplicaCursor};
+pub(crate) use manager::{PublishReadyConflict, PublishReadyStatus, PublishReadyTarget, ReadyReplicaCursor};
 pub use service::{MetadataWorkerServiceImpl, WorkerBackgroundHandle};

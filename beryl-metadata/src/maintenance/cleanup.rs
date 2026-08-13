@@ -828,6 +828,7 @@ mod tests {
                         block_id: replica.block_id,
                         block_stamp: replica.block_stamp,
                         block_state: BlockReportBlockState::Ready,
+                        effective_len: 64,
                     })
                     .collect(),
             )
@@ -1676,6 +1677,7 @@ mod tests {
                     block_id: candidates[0].block_id,
                     block_stamp: candidates[0].block_stamp,
                     block_state: BlockReportBlockState::Ready,
+                    effective_len: 64,
                 }],
             )
             .unwrap();

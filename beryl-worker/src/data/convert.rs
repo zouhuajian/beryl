@@ -84,7 +84,6 @@ pub fn write_open_request_to_proto(req: WriteOpenRequest, ctx: &RequestHeader) -
         frame_size: req.frame_size,
         block_format_id: req.block_format_id.as_raw(),
         worker_run_id: req.worker_run_id.to_string(),
-        effective_len: req.effective_len,
         tier: TierProto::from(req.tier) as i32,
     }
 }
@@ -204,7 +203,6 @@ pub fn proto_to_write_open_request(proto: OpenWriteStreamRequestProto) -> Worker
         block_size: proto.block_size,
         block_format_id,
         chunk_size: proto.chunk_size,
-        effective_len: proto.effective_len,
         checksum_kind: ChecksumKind::None,
         tier,
     })
@@ -401,7 +399,6 @@ mod tests {
             token: Some(test_token_proto()),
             frame_size,
             worker_run_id: test_worker_run_id().to_string(),
-            effective_len: BLOCK_SIZE,
             tier: beryl_proto::common::TierProto::TierHdd as i32,
         }
     }
@@ -470,7 +467,6 @@ mod tests {
         assert_eq!(domain.frame_size, 8192);
         assert_eq!(domain.block_size, BLOCK_SIZE);
         assert_eq!(domain.chunk_size, CHUNK_SIZE);
-        assert_eq!(domain.effective_len, BLOCK_SIZE);
         assert_eq!(domain.checksum_kind, ChecksumKind::None);
         assert_eq!(domain.tier, Tier::Hdd);
     }

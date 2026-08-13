@@ -602,7 +602,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 &req_ctx,
                 AddBlockArgs {
                     handle,
-                    desired_len: req.desired_len,
                     previous_block_id,
                     freshness: Self::freshness_from_header(&req.header),
                 },
@@ -1265,12 +1264,12 @@ mod tests {
         worker_id: WorkerId,
         block_id: BlockId,
         block_stamp: u64,
-        _effective_len: u64,
+        effective_len: u64,
     ) {
-        publish_reported_locations(env, worker_id, vec![(block_id, block_stamp)]);
+        publish_reported_locations(env, worker_id, vec![(block_id, block_stamp, effective_len)]);
     }
 
-    fn publish_reported_locations(env: &PathTestEnv, worker_id: WorkerId, blocks: Vec<(BlockId, u64)>) {
+    fn publish_reported_locations(env: &PathTestEnv, worker_id: WorkerId, blocks: Vec<(BlockId, u64, u64)>) {
         let worker_manager = env.worker_manager.as_ref().expect("worker manager");
         let worker_run_id = worker_manager
             .get_registration(&group_name("root"), worker_id)
@@ -1286,10 +1285,11 @@ mod tests {
                 true,
                 blocks
                     .into_iter()
-                    .map(|(block_id, block_stamp)| BlockReportBlock {
+                    .map(|(block_id, block_stamp, effective_len)| BlockReportBlock {
                         block_id,
                         block_stamp,
                         block_state: BlockReportBlockState::Ready,
+                        effective_len,
                     })
                     .collect(),
             )
@@ -1297,7 +1297,7 @@ mod tests {
     }
 
     fn publish_target_reports(env: &PathTestEnv, targets: &[&WriteTargetProto]) {
-        let mut by_worker = std::collections::HashMap::<WorkerId, Vec<(BlockId, u64)>>::new();
+        let mut by_worker = std::collections::HashMap::<WorkerId, Vec<(BlockId, u64, u64)>>::new();
         for target in targets {
             let worker_id = WorkerId::new(
                 target
@@ -1310,6 +1310,7 @@ mod tests {
             by_worker.entry(worker_id).or_default().push((
                 BlockId::new(InodeId::new(block_id.inode_id), BlockIndex::new(block_id.block_index)),
                 target.block_stamp,
+                target.block_size,
             ));
         }
         for (worker_id, blocks) in by_worker {
@@ -1366,7 +1367,6 @@ mod tests {
             Request::new(AddBlockRequestProto {
                 header: header(client_id),
                 write_handle: Some(write_handle),
-                desired_len: Some(128),
                 previous_block_id: None,
             }),
         )
@@ -1391,12 +1391,12 @@ mod tests {
                 BlockIndex::new(reported_block_id.block_index),
             ),
             target.block_stamp,
-            target.effective_len,
+            128,
         );
         let committed = CommittedBlockProto {
             block_id: target.block_id,
             file_offset: target.file_offset,
-            len: target.effective_len,
+            len: 128,
         };
 
         (write_handle, committed, expected_content_revision, write_mode)
@@ -2266,8 +2266,8 @@ mod tests {
                     ..Default::default()
                 }),
                 layout: Some(beryl_proto::common::FileLayoutProto {
-                    block_size: 4096,
-                    chunk_size: 4096,
+                    block_size: 128,
+                    chunk_size: 128,
                     replication: 1,
                     block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
                 }),
@@ -2297,7 +2297,6 @@ mod tests {
             Request::new(AddBlockRequestProto {
                 header: header(client_id),
                 write_handle: Some(write_handle),
-                desired_len: Some(128),
                 previous_block_id: None,
             }),
         )
@@ -2311,7 +2310,6 @@ mod tests {
             Request::new(AddBlockRequestProto {
                 header: header(client_id),
                 write_handle: Some(write_handle),
-                desired_len: Some(128),
                 previous_block_id: first_target.block_id,
             }),
         )
@@ -2323,12 +2321,12 @@ mod tests {
         let first = CommittedBlockProto {
             block_id: first_target.block_id,
             file_offset: first_target.file_offset,
-            len: first_target.effective_len,
+            len: first_target.block_size,
         };
         let second = CommittedBlockProto {
             block_id: second_target.block_id,
             file_offset: second_target.file_offset,
-            len: second_target.effective_len,
+            len: second_target.block_size,
         };
         publish_target_reports(&env, &[&first_target, &second_target]);
 
@@ -2497,7 +2495,6 @@ mod tests {
             Request::new(AddBlockRequestProto {
                 header: header(30),
                 write_handle: Some(write_handle),
-                desired_len: Some(128),
                 previous_block_id: None,
             }),
         )
@@ -2510,7 +2507,7 @@ mod tests {
         let committed_blocks = vec![CommittedBlockProto {
             block_id: Some(block_id),
             file_offset: target.file_offset,
-            len: target.effective_len,
+            len: 128,
         }];
         let typed_block_id = BlockId::new(InodeId::new(block_id.inode_id), BlockIndex::new(block_id.block_index));
         let reported_worker_id = WorkerId::new(
@@ -2520,13 +2517,7 @@ mod tests {
                 .expect("target worker endpoint")
                 .worker_id,
         );
-        publish_reported_location(
-            &env,
-            reported_worker_id,
-            typed_block_id,
-            target.block_stamp,
-            target.effective_len,
-        );
+        publish_reported_location(&env, reported_worker_id, typed_block_id, target.block_stamp, 128);
 
         let commit_header = header(30);
         let first = FileSystemServiceProto::commit_file(
