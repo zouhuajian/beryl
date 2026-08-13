@@ -1272,10 +1272,11 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_remove() {
     .await
     .expect("cleanup must become Deleting while the read pin is active");
 
-    core.stream_manager()
-        .remove(read.stream_id)
+    let frames = core
+        .read_stream(read.stream_id, 1024)
         .await
-        .expect("remove pinned read");
+        .expect("finish pinned read");
+    assert!(frames.last().is_some_and(|frame| frame.eos));
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if store.report().expect("store report").dirs[0].block_count == 0 {

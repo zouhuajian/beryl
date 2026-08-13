@@ -15,17 +15,22 @@ use beryl_types::layout::{BlockFormatId, BlockShape, BlockShapeError};
 use beryl_types::lease::FencingToken;
 use beryl_types::{GroupName, Tier, WorkerRunId};
 use bytes::Bytes;
+use tokio::time::Instant as TokioInstant;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::WorkerError;
 use crate::observe;
 use crate::runtime::block::{BlockManager, ReclaimingBlock};
-use crate::runtime::stream::{StreamManager, StreamState};
+use crate::runtime::stream::{StreamAccessError, StreamManager, StreamOperation, StreamState};
 use crate::store::block::{
     BlockState, ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
     PublishReadyRequest, ReclaimBlockRequest, ReclaimBlockResult, SyncReadyBlockRequest,
 };
 
 pub type WorkerCoreResult<T> = Result<T, WorkerError>;
+
+const STREAM_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_STREAM_RETIREMENTS_PER_PASS: usize = 64;
 
 /// Stream operation mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,6 +303,7 @@ pub struct WorkerCore {
     block_manager: Arc<BlockManager>,
     block_store: Arc<dyn LocalBlockStore + Send + Sync>,
     next_stream_seq: Arc<AtomicU64>,
+    stream_id_prefix: u128,
 }
 
 impl WorkerCore {
@@ -317,12 +323,33 @@ impl WorkerCore {
         stream_idle_timeout: Duration,
         block_store: Arc<dyn LocalBlockStore + Send + Sync>,
     ) -> Self {
+        Self::with_local_store_for_run(
+            default_frame_size,
+            max_frame_size,
+            stream_idle_timeout,
+            WorkerRunId::new(),
+            block_store,
+        )
+    }
+
+    /// Builds a Worker core whose opaque stream IDs are scoped to one process run.
+    ///
+    /// The run-derived prefix prevents stale high-frequency frames, which carry
+    /// only a stream ID, from matching a stream created after Worker restart.
+    pub fn with_local_store_for_run(
+        default_frame_size: u32,
+        max_frame_size: u32,
+        stream_idle_timeout: Duration,
+        worker_run_id: WorkerRunId,
+        block_store: Arc<dyn LocalBlockStore + Send + Sync>,
+    ) -> Self {
         let block_manager = Arc::new(BlockManager::new(default_frame_size, max_frame_size));
         Self {
             stream_manager: Arc::new(StreamManager::new(stream_idle_timeout)),
             block_manager,
             block_store,
             next_stream_seq: Arc::new(AtomicU64::new(1)),
+            stream_id_prefix: worker_run_id.as_uuid().as_u128() & !u128::from(u32::MAX),
         }
     }
 
@@ -366,9 +393,11 @@ impl WorkerCore {
             effective_len: snapshot.effective_len,
             fencing_token: None,
         };
-        self.stream_manager
-            .register_read(StreamState::new(context), read_pin)
-            .await;
+        if !self.stream_manager.register_read(StreamState::new(context), read_pin) {
+            return Err(WorkerError::Internal(format!(
+                "duplicate stream identity generated: stream_id={stream_id}"
+            )));
+        }
 
         Ok(ReadOpenResult {
             stream_id,
@@ -388,7 +417,7 @@ impl WorkerCore {
         self.block_store.inspect_reclaim_block(&req)?;
         let wait_timeout = self.stream_manager.idle_timeout().max(Duration::from_millis(1));
         let permit = loop {
-            self.stream_manager.cleanup_idle_read_streams().await;
+            self.stream_manager.cleanup_idle_read_streams(64).await;
             match tokio::time::timeout(
                 wait_timeout,
                 self.block_manager
@@ -426,6 +455,24 @@ impl WorkerCore {
             validate_write_open_request(&req)?;
             reject_existing_final_block(self.block_store.as_ref(), &req)?;
             let stream_id = self.next_stream_id()?;
+            let context = StreamContext {
+                stream_id,
+                group_name: req.group_name.clone(),
+                block_id: req.block_id,
+                mode: StreamMode::Write,
+                worker_run_id: req.worker_run_id,
+                start_offset: 0,
+                end_offset: req.effective_len,
+                frame_size,
+                block_stamp: req.block_stamp,
+                block_format_id: req.block_format_id,
+                block_size: req.block_size,
+                chunk_size: req.chunk_size,
+                committed_length: 0,
+                effective_len: req.effective_len,
+                fencing_token: Some(req.token),
+            };
+            let stream_state = StreamState::new(context);
 
             match self.block_store.create_staging_block(CreateStagingBlockRequest {
                 group_name: req.group_name.clone(),
@@ -461,28 +508,33 @@ impl WorkerCore {
                         block_stamp,
                         "Block create rejected"
                     );
+                    if let Err(cleanup_error) = self.block_store.abort_staging_block(&req.group_name, req.block_id) {
+                        tracing::warn!(
+                            target: "worker.block",
+                            op = "AbortFailedOpen",
+                            group_id = %group_name,
+                            block_id = %block_id,
+                            error_code = observe::worker_error_kind(&cleanup_error),
+                            error = %cleanup_error,
+                            "Failed OpenWrite retained a Retiring stream for cleanup retry"
+                        );
+                        if !self.stream_manager.register_write(stream_state) {
+                            return Err(WorkerError::Internal(format!(
+                                "duplicate stream identity generated while retaining failed open: stream_id={stream_id}"
+                            )));
+                        }
+                        self.stream_manager.request_write_retirement(stream_id);
+                    }
                     return Err(error);
                 }
             }
 
-            let context = StreamContext {
-                stream_id,
-                group_name: req.group_name,
-                block_id: req.block_id,
-                mode: StreamMode::Write,
-                worker_run_id: req.worker_run_id,
-                start_offset: 0,
-                end_offset: req.effective_len,
-                frame_size,
-                block_stamp: req.block_stamp,
-                block_format_id: req.block_format_id,
-                block_size: req.block_size,
-                chunk_size: req.chunk_size,
-                committed_length: 0,
-                effective_len: req.effective_len,
-                fencing_token: Some(req.token),
-            };
-            self.stream_manager.register_write(StreamState::new(context)).await;
+            if !self.stream_manager.register_write(stream_state) {
+                self.block_store.abort_staging_block(&req.group_name, req.block_id)?;
+                return Err(WorkerError::Internal(format!(
+                    "duplicate stream identity generated: stream_id={stream_id}"
+                )));
+            }
 
             Ok(WriteOpenResult {
                 stream_id,
@@ -530,8 +582,9 @@ impl WorkerCore {
         let worker_run_id = req.worker_run_id;
         let inode_id = req.block_id.inode_id;
         let result = async {
-            let state = self.write_state(req.stream_id).await?;
-            validate_commit_request(&state, &req)?;
+            let operation = self.write_operation(req.stream_id).await?;
+            validate_commit_request(&operation, &req)?;
+            operation.mark_retiring();
 
             // FullBlockFileStore publishes synchronously, so require_sync currently
             // selects the same conservative path as the default commit.
@@ -592,7 +645,7 @@ impl WorkerCore {
                 block_stamp = meta.visibility.block_stamp,
                 "CommitWrite completed"
             );
-            self.stream_manager.remove(req.stream_id).await;
+            self.stream_manager.complete_retirement(req.stream_id, &operation);
 
             Ok(CommitWriteResult {
                 effective_len: meta.source.effective_len,
@@ -645,25 +698,122 @@ impl WorkerCore {
         })
     }
 
+    /// Idempotently aborts one write stream and its unpublished local block.
+    ///
+    /// A missing stream is already terminal and succeeds. Existing streams are
+    /// identity- and token-checked before entering Retiring. Filesystem failure
+    /// keeps the Retiring entry so process-owned cleanup can retry exactly.
     pub async fn abort_write(&self, req: AbortWriteRequest) -> WorkerCoreResult<AbortWriteResult> {
-        let state = self.write_state(req.stream_id).await?;
-        validate_abort_request(&state, &req)?;
-        self.stream_manager.remove(req.stream_id).await;
+        let operation = match self.stream_manager.begin_operation(req.stream_id).await {
+            Ok(operation) => operation,
+            Err(StreamAccessError::Missing) => return Ok(AbortWriteResult { aborted: true }),
+            Err(StreamAccessError::Retiring) => match self.stream_manager.begin_write_retirement(req.stream_id).await {
+                Ok(operation) => operation,
+                Err(StreamAccessError::Missing) => return Ok(AbortWriteResult { aborted: true }),
+                Err(error) => return Err(stream_access_error("write", req.stream_id, error)),
+            },
+            Err(StreamAccessError::WrongMode) => unreachable!("begin_operation does not inspect stream mode"),
+        };
+        if operation.context.mode != StreamMode::Write {
+            return Err(WorkerError::InvalidArgument(format!(
+                "stream is not a write stream: stream_id={}",
+                req.stream_id
+            )));
+        }
+        validate_abort_request(&operation, &req)?;
+        operation.mark_retiring();
         self.block_store.abort_staging_block(&req.group_name, req.block_id)?;
+        self.stream_manager.complete_retirement(req.stream_id, &operation);
         Ok(AbortWriteResult { aborted: true })
     }
 
+    /// Retires only a write stream after transport or protocol failure.
+    ///
+    /// Missing and non-write identities are no-ops; local abort failure keeps
+    /// the write Retiring for the process-owned maintenance loop.
     pub(crate) async fn abort_write_stream_after_error(&self, stream_id: StreamId) -> WorkerCoreResult<()> {
-        let Some(state) = self.stream_manager.get(stream_id).await else {
-            return Ok(());
+        let operation = match self.stream_manager.begin_write_retirement(stream_id).await {
+            Ok(operation) => operation,
+            Err(StreamAccessError::Missing | StreamAccessError::WrongMode) => return Ok(()),
+            Err(StreamAccessError::Retiring) => {
+                unreachable!("begin_write_retirement accepts a Retiring write stream")
+            }
         };
-        if state.context.mode != StreamMode::Write {
-            return Ok(());
-        }
-        self.stream_manager.remove(stream_id).await;
         self.block_store
-            .abort_staging_block(&state.context.group_name, state.context.block_id)?;
+            .abort_staging_block(&operation.context.group_name, operation.context.block_id)?;
+        self.stream_manager.complete_retirement(stream_id, &operation);
         Ok(())
+    }
+
+    /// Runs bounded idle retirement until process shutdown begins.
+    pub async fn run_idle_stream_cleanup(&self, shutdown: CancellationToken) {
+        let mut interval = tokio::time::interval(STREAM_CLEANUP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                _ = interval.tick() => {
+                    self.cleanup_stream_batch(false).await;
+                }
+            }
+        }
+    }
+
+    /// Retires all streams until they are gone or the process deadline expires.
+    ///
+    /// A timed-out drain leaves unpublished files for the startup recovery path;
+    /// it never reports those resources as successfully released.
+    pub async fn drain_streams_until(&self, deadline: TokioInstant) -> bool {
+        loop {
+            self.cleanup_stream_batch(true).await;
+            if self.stream_manager.active_count().await == 0 {
+                return false;
+            }
+            if TokioInstant::now() >= deadline {
+                return true;
+            }
+            let retry_at = (TokioInstant::now() + Duration::from_millis(10)).min(deadline);
+            tokio::time::sleep_until(retry_at).await;
+        }
+    }
+
+    /// Completes at most one bounded batch of drained stream cleanup.
+    async fn cleanup_stream_batch(&self, drain: bool) -> usize {
+        let candidates = self
+            .stream_manager
+            .take_cleanup_batch(MAX_STREAM_RETIREMENTS_PER_PASS, drain, None);
+        let mut completed = 0usize;
+        for stream_id in candidates {
+            let operation = match self.stream_manager.try_begin_retirement(stream_id) {
+                Ok(Some(operation)) => operation,
+                Ok(None) | Err(StreamAccessError::Missing) => continue,
+                Err(StreamAccessError::Retiring) => unreachable!("retirement accepts a Retiring stream"),
+                Err(StreamAccessError::WrongMode) => unreachable!("generic retirement accepts both stream modes"),
+            };
+            let cleanup = match operation.context.mode {
+                StreamMode::Read => Ok(()),
+                StreamMode::Write => self
+                    .block_store
+                    .abort_staging_block(&operation.context.group_name, operation.context.block_id),
+            };
+            match cleanup {
+                Ok(()) => {
+                    completed += usize::from(self.stream_manager.complete_retirement(stream_id, &operation));
+                }
+                Err(error) => tracing::warn!(
+                    target: "worker.state",
+                    op = "RetireStream",
+                    stream_id = %stream_id,
+                    group_id = %operation.context.group_name,
+                    block_id = %operation.context.block_id,
+                    error_code = observe::worker_error_kind(&error),
+                    error = %error,
+                    "Stream retirement retained local resources for retry"
+                ),
+            }
+        }
+        completed
     }
 
     pub async fn read_frame(&self, stream_id: StreamId, max_bytes: u32) -> WorkerCoreResult<Vec<ReadFrame>> {
@@ -671,27 +821,26 @@ impl WorkerCore {
     }
 
     pub async fn read_stream(&self, stream_id: StreamId, max_bytes: u32) -> WorkerCoreResult<Vec<ReadFrame>> {
-        let (state, _read_pin) = self
+        let mut operation = self
             .stream_manager
-            .get_for_read(stream_id)
+            .begin_operation(stream_id)
             .await
-            .ok_or_else(|| WorkerError::NotFound(format!("read stream not found: stream_id={stream_id}")))?;
-        if state.context.mode != StreamMode::Read {
+            .map_err(|error| stream_access_error("read", stream_id, error))?;
+        if operation.context.mode != StreamMode::Read {
             return Err(WorkerError::InvalidArgument(format!(
                 "stream is not a read stream: stream_id={stream_id}"
             )));
         }
-        debug_assert!(_read_pin.is_some(), "registered read stream must retain a block pin");
-        self.stream_manager.touch(stream_id).await;
-        if state.cursor >= state.context.end_offset {
-            self.stream_manager.remove(stream_id).await;
+        if operation.cursor >= operation.context.end_offset {
+            operation.mark_retiring();
+            self.stream_manager.complete_retirement(stream_id, &operation);
             return Ok(Vec::new());
         }
 
         let frame_budget = if max_bytes == 0 {
-            state.context.frame_size
+            operation.context.frame_size
         } else {
-            max_bytes.min(state.context.frame_size)
+            max_bytes.min(operation.context.frame_size)
         };
         if frame_budget == 0 {
             return Err(WorkerError::InvalidArgument(
@@ -699,13 +848,13 @@ impl WorkerCore {
             ));
         }
 
-        let remaining = state.context.end_offset - state.cursor;
+        let remaining = operation.context.end_offset - operation.cursor;
         let read_len = remaining.min(u64::from(frame_budget));
         let store_started = Instant::now();
         let data = match self.block_store.read_at(
-            &state.context.group_name,
-            state.context.block_id,
-            state.cursor,
+            &operation.context.group_name,
+            operation.context.block_id,
+            operation.cursor,
             read_len,
         ) {
             Ok(data) => {
@@ -726,28 +875,30 @@ impl WorkerCore {
                     0,
                     store_started.elapsed().as_secs_f64(),
                 );
-                self.stream_manager.remove(stream_id).await;
+                operation.mark_retiring();
+                self.stream_manager.complete_retirement(stream_id, &operation);
                 return Err(error);
             }
         };
-        let next_cursor = state
+        let next_cursor = operation
             .cursor
             .checked_add(
                 u64::try_from(data.len())
                     .map_err(|_| WorkerError::InvalidArgument("read frame length does not fit in u64".to_string()))?,
             )
             .ok_or_else(|| WorkerError::InvalidArgument("read cursor overflow".to_string()))?;
-        let eos = next_cursor >= state.context.end_offset;
+        let eos = next_cursor >= operation.context.end_offset;
         let frame = ReadFrame {
-            offset_in_block: state.cursor,
+            offset_in_block: operation.cursor,
             data,
             checksum32: 0,
             eos,
         };
         if eos {
-            self.stream_manager.remove(stream_id).await;
+            operation.mark_retiring();
+            self.stream_manager.complete_retirement(stream_id, &operation);
         } else {
-            self.stream_manager.update_cursor(stream_id, next_cursor).await;
+            operation.cursor = next_cursor;
         }
         Ok(vec![frame])
     }
@@ -757,19 +908,19 @@ impl WorkerCore {
     }
 
     pub async fn write_stream(&self, frame: WriteFrame) -> WorkerCoreResult<WriteFrameResult> {
-        let state = self.write_state(frame.stream_id).await?;
-        let expected_seq = state
+        let mut operation = self.write_operation(frame.stream_id).await?;
+        let expected_seq = operation
             .last_acked_seq
             .checked_add(1)
             .ok_or_else(|| WorkerError::InvalidArgument("write stream sequence overflow".to_string()))?;
         if frame.seq != expected_seq {
-            return Ok(rejected_write_frame(&state));
+            return Ok(rejected_write_frame(&operation));
         }
-        if frame.offset_in_block != state.cursor {
-            return Ok(rejected_write_frame(&state));
+        if frame.offset_in_block != operation.cursor {
+            return Ok(rejected_write_frame(&operation));
         }
         if frame.data.is_empty() {
-            return Ok(rejected_write_frame(&state));
+            return Ok(rejected_write_frame(&operation));
         }
         let len = u64::try_from(frame.data.len())
             .map_err(|_| WorkerError::InvalidArgument("write frame length does not fit in u64".to_string()))?;
@@ -777,14 +928,14 @@ impl WorkerCore {
             .offset_in_block
             .checked_add(len)
             .ok_or_else(|| WorkerError::InvalidArgument("write frame offset overflow".to_string()))?;
-        if written_through > state.context.end_offset {
-            return Ok(rejected_write_frame(&state));
+        if written_through > operation.context.end_offset {
+            return Ok(rejected_write_frame(&operation));
         }
 
         let store_started = Instant::now();
         match self.block_store.write_at(
-            &state.context.group_name,
-            state.context.block_id,
+            &operation.context.group_name,
+            operation.context.block_id,
             frame.offset_in_block,
             frame.data,
         ) {
@@ -800,16 +951,9 @@ impl WorkerCore {
                 return Err(error);
             }
         }
-        if !self
-            .stream_manager
-            .advance_write_progress(frame.stream_id, frame.seq, written_through)
-            .await
-        {
-            return Err(WorkerError::Internal(format!(
-                "write stream disappeared after local write: stream_id={}",
-                frame.stream_id
-            )));
-        }
+        operation.cursor = written_through;
+        operation.last_acked_seq = frame.seq;
+        operation.written_through = written_through;
         Ok(WriteFrameResult {
             accepted: true,
             last_acked_seq: frame.seq,
@@ -834,26 +978,38 @@ impl WorkerCore {
 
     fn next_stream_id(&self) -> WorkerCoreResult<StreamId> {
         let seq = self.next_stream_seq.fetch_add(1, Ordering::Relaxed);
-        if seq == u64::MAX {
+        if seq > u64::from(u32::MAX) {
             return Err(WorkerError::ResourceExhausted(
                 "stream id sequence exhausted".to_string(),
             ));
         }
-        Ok(StreamId::new(u128::from(seq)))
+        Ok(StreamId::new(self.stream_id_prefix | u128::from(seq)))
     }
 
-    async fn write_state(&self, stream_id: StreamId) -> WorkerCoreResult<StreamState> {
-        let state = self
+    async fn write_operation(&self, stream_id: StreamId) -> WorkerCoreResult<StreamOperation> {
+        let operation = self
             .stream_manager
-            .get(stream_id)
+            .begin_operation(stream_id)
             .await
-            .ok_or_else(|| WorkerError::NotFound(format!("write stream not found: stream_id={stream_id}")))?;
-        if state.context.mode != StreamMode::Write {
+            .map_err(|error| stream_access_error("write", stream_id, error))?;
+        if operation.context.mode != StreamMode::Write {
             return Err(WorkerError::InvalidArgument(format!(
                 "stream is not a write stream: stream_id={stream_id}"
             )));
         }
-        Ok(state)
+        Ok(operation)
+    }
+}
+
+fn stream_access_error(mode: &str, stream_id: StreamId, error: StreamAccessError) -> WorkerError {
+    match error {
+        StreamAccessError::Missing => WorkerError::NotFound(format!("{mode} stream not found: stream_id={stream_id}")),
+        StreamAccessError::Retiring => {
+            WorkerError::NotFound(format!("{mode} stream is retiring: stream_id={stream_id}"))
+        }
+        StreamAccessError::WrongMode => {
+            WorkerError::InvalidArgument(format!("stream is not a {mode} stream: stream_id={stream_id}"))
+        }
     }
 }
 
@@ -1122,6 +1278,7 @@ fn rejected_write_frame(state: &StreamState) -> WriteFrameResult {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1134,6 +1291,7 @@ mod tests {
     use bytes::Bytes;
     use tempfile::TempDir;
 
+    use crate::config::StoreDirConfig;
     use crate::data::core::{
         AbortWriteRequest, CommitWriteRequest, RangeMapper, ReadOpenRequest, StreamContext, StreamMode,
         SyncCommittedBlockRequest, WorkerCore, WorkerCoreResult, WriteFrame, WriteOpenRequest,
@@ -1141,9 +1299,10 @@ mod tests {
     use crate::error::WorkerError;
     use crate::runtime::stream::StreamState;
     use crate::store::block::{
-        ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, PublishReadyRequest,
-        ReclaimBlockRequest, ReclaimBlockResult,
+        ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
+        PublishReadyRequest, ReclaimBlockRequest, ReclaimBlockResult,
     };
+    use crate::store::dirs::StoreDirs;
 
     const BLOCK_SIZE: u64 = 4096;
     const CHUNK_SIZE: u32 = 1024;
@@ -1283,6 +1442,30 @@ mod tests {
             store.clone(),
         );
         (temp, store, core)
+    }
+
+    #[test]
+    fn stream_ids_are_scoped_to_the_worker_process_run() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
+            temp.path().to_path_buf(),
+        )));
+        let first = WorkerCore::with_local_store_for_run(
+            512,
+            2048,
+            Duration::from_secs(60),
+            "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
+            store.clone(),
+        );
+        let second = WorkerCore::with_local_store_for_run(
+            512,
+            2048,
+            Duration::from_secs(60),
+            "650e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
+            store,
+        );
+
+        assert_ne!(first.next_stream_id().unwrap(), second.next_stream_id().unwrap());
     }
 
     fn publish_ready_block(store: &FullBlockFileStore, data: Bytes, block_stamp: u64) {
@@ -2025,12 +2208,14 @@ mod tests {
             })
             .await,
         );
-        assert_not_found(
+        assert!(
             core.abort_write(AbortWriteRequest {
                 stream_id: open.stream_id,
                 ..abort_write_request()
             })
-            .await,
+            .await
+            .expect("repeated abort")
+            .aborted
         );
     }
 
@@ -2057,17 +2242,128 @@ mod tests {
         .await
         .expect("commit write");
 
-        assert_not_found(
+        assert!(
             core.abort_write(AbortWriteRequest {
                 stream_id: open.stream_id,
                 ..abort_write_request()
             })
-            .await,
+            .await
+            .expect("abort after commit")
+            .aborted
         );
 
         let scanned = store.scan_group_blocks(&group_name()).expect("scan group");
         assert_eq!(scanned.len(), 1);
         assert_eq!(store.read_at(&group_name(), block_id(), 0, BLOCK_SIZE).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn rejected_abort_does_not_retire_the_open_stream() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        let mut wrong_abort = abort_write_request();
+        wrong_abort.stream_id = open.stream_id;
+        wrong_abort.token = FencingToken::new(block_id(), ClientId::new(99), 11);
+
+        assert!(matches!(
+            core.abort_write(wrong_abort).await,
+            Err(WorkerError::Fencing(_))
+        ));
+        assert!(core.stream_manager().get(open.stream_id).await.is_some());
+
+        core.abort_write(AbortWriteRequest {
+            stream_id: open.stream_id,
+            ..abort_write_request()
+        })
+        .await
+        .expect("valid abort after rejection");
+        let paths = store.paths(&group_name(), block_id());
+        assert!(!paths.staging_data_path.exists());
+        assert!(!paths.staging_meta_path.exists());
+    }
+
+    #[tokio::test]
+    async fn concurrent_abort_is_idempotent_across_exact_removal() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = Arc::new(
+            StoreDirs::open(
+                BTreeMap::from([(
+                    "hdd0".to_string(),
+                    StoreDirConfig {
+                        path: temp.path().join("hdd0"),
+                        tier: Tier::Hdd,
+                        capacity_bytes: 64 * 1024,
+                    },
+                )]),
+                0,
+                30_000,
+            )
+            .expect("open store dirs"),
+        );
+        let core = Arc::new(WorkerCore::with_local_store(
+            512,
+            2048,
+            Duration::from_secs(60),
+            store.clone(),
+        ));
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        let terminal = core
+            .stream_manager()
+            .begin_operation(open.stream_id)
+            .await
+            .expect("hold first terminal operation");
+        let second_core = Arc::clone(&core);
+        let second = tokio::spawn(async move {
+            second_core
+                .abort_write(AbortWriteRequest {
+                    stream_id: open.stream_id,
+                    ..abort_write_request()
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        terminal.mark_retiring();
+        store
+            .abort_staging_block(&terminal.context.group_name, terminal.context.block_id)
+            .expect("first abort local cleanup");
+        assert!(core.stream_manager().complete_retirement(open.stream_id, &terminal));
+        drop(terminal);
+
+        assert!(
+            second
+                .await
+                .expect("second abort task")
+                .expect("idempotent second abort")
+                .aborted
+        );
+        assert_eq!(store.report().expect("store report").pending_bytes, 0);
+        assert_eq!(core.stream_manager().active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_aborts_open_write_before_deadline() {
+        let (_temp, store, core) = core_with_store(512, 2048);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: Bytes::from_static(b"partial"),
+            checksum32: 0,
+        })
+        .await
+        .expect("partial frame");
+
+        let forced = core
+            .drain_streams_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await;
+
+        assert!(!forced);
+        assert_eq!(core.stream_manager().active_count().await, 0);
+        let paths = store.paths(&group_name(), block_id());
+        assert!(!paths.staging_data_path.exists());
+        assert!(!paths.staging_meta_path.exists());
     }
 
     #[tokio::test]
@@ -2166,7 +2462,12 @@ mod tests {
                         ..
                     }) => break,
                     Ok(extra) => {
-                        core.stream_manager().remove(extra.stream_id).await;
+                        let manager = core.stream_manager();
+                        let operation = manager
+                            .begin_retirement(extra.stream_id)
+                            .await
+                            .expect("retire extra read stream");
+                        manager.complete_retirement(extra.stream_id, &operation);
                     }
                     Err(other) => panic!("unexpected read-open result while reclaim starts: {other:?}"),
                 }
@@ -2476,7 +2777,7 @@ mod tests {
 
         assert_not_found(core.read_stream(stream_id(), 1024).await);
         let state = StreamState::new(write_stream_context());
-        core.stream_manager().register_write(state).await;
+        assert!(core.stream_manager().register_write(state));
 
         match core
             .read_stream(stream_id(), 1024)

@@ -279,6 +279,28 @@ fn create_failure_releases_pending_reservation() {
 }
 
 #[test]
+fn open_recovers_orphan_staging_before_capacity_is_reported() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("hdd0");
+    let raw_store = beryl_worker::store::block::FullBlockFileStore::new(
+        beryl_worker::store::block::FullBlockFileStoreConfig::new(path.clone()),
+    );
+    raw_store.create_staging_block(staging_req(0)).unwrap();
+    raw_store
+        .write_at(&group_name(), block_id(0), 0, Bytes::from_static(b"orphan"))
+        .unwrap();
+    let paths = raw_store.paths(&group_name(), block_id(0));
+
+    let store = StoreDirs::open(store_dirs(vec![dir_config(path, 32 * 1024)]), 0, 30_000).unwrap();
+    let report = store.report().unwrap();
+
+    assert_eq!(report.pending_bytes, 0);
+    assert_eq!(report.used_bytes, 0);
+    assert!(!paths.staging_data_path.exists());
+    assert!(!paths.staging_meta_path.exists());
+}
+
+#[test]
 fn same_tier_multi_dir_round_robin_uses_each_dir() {
     let temp = TempDir::new().unwrap();
     let store = StoreDirs::open(
@@ -303,6 +325,33 @@ fn same_tier_multi_dir_round_robin_uses_each_dir() {
     let reports = store.report().unwrap().dirs;
     assert_eq!(reports[0].pending_bytes, BLOCK_SIZE);
     assert_eq!(reports[1].pending_bytes, BLOCK_SIZE);
+}
+
+#[test]
+fn duplicate_block_reservation_is_rejected_across_store_dirs() {
+    let temp = TempDir::new().unwrap();
+    let store = StoreDirs::open(
+        store_dirs(vec![
+            (
+                "hdd0".to_string(),
+                store_dir_config(temp.path().join("hdd0"), Tier::Hdd, 32 * 1024),
+            ),
+            (
+                "hdd1".to_string(),
+                store_dir_config(temp.path().join("hdd1"), Tier::Hdd, 32 * 1024),
+            ),
+        ]),
+        0,
+        30_000,
+    )
+    .unwrap();
+
+    store.create_staging_block(staging_req(0)).unwrap();
+    assert!(matches!(
+        store.create_staging_block(staging_req(0)),
+        Err(WorkerError::InvalidArgument(_))
+    ));
+    assert_eq!(store.report().unwrap().pending_bytes, BLOCK_SIZE);
 }
 
 #[test]
