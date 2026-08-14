@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::WorkerError;
 use crate::observe;
-use crate::runtime::block::{BlockManager, ReclaimingBlock};
+use crate::runtime::block::{BlockManager, ReadPin, ReclaimingBlock};
 use crate::runtime::stream::{StreamAccessError, StreamManager, StreamOperation, StreamState};
 use crate::store::block::{
     BlockState, ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
@@ -32,78 +32,55 @@ pub type WorkerCoreResult<T> = Result<T, WorkerError>;
 const STREAM_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_STREAM_RETIREMENTS_PER_PASS: usize = 64;
 
-/// Stream operation mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StreamMode {
-    Read,
-    Write,
-}
-
-/// Stream context established at open time.
+/// Stable metadata-authorized facts for one open write stream.
 #[derive(Clone, Debug)]
-pub struct StreamContext {
+pub struct WriteStreamContext {
     pub stream_id: StreamId,
     pub group_name: GroupName,
     pub block_id: BlockId,
-    pub mode: StreamMode,
     pub worker_run_id: WorkerRunId,
-    /// First block-local byte offset in this stream.
-    pub start_offset: u64,
-    /// Exclusive block-local byte offset where this stream stops.
+    /// Exclusive block-local byte offset where writes must stop.
     pub end_offset: u64,
-    /// Transport frame payload size negotiated at stream open.
-    /// This controls network batching and does not define StorageChunk size.
-    pub frame_size: u32,
-    /// Logical block stamp used for direct read/write validation.
-    /// It changes on logical commit or block metadata changes, not on ordinary reads.
+    /// Metadata-authoritative block stamp bound at write open.
     pub block_stamp: u64,
     pub block_format_id: BlockFormatId,
     pub block_size: u64,
     pub chunk_size: u32,
-    /// Block-local readable committed prefix length.
-    /// This is not the sum of ready chunks.
-    pub committed_length: u64,
-    /// Block-local valid length for reads, or the full write bound before commit.
-    ///
-    /// Write commits publish their final valid length through
-    /// `CommitWriteRequest.effective_len`.
-    pub effective_len: u64,
-    /// Fencing token bound during write open. Read streams do not carry one.
-    pub fencing_token: Option<FencingToken>,
+    /// Fencing token that every later write operation must match.
+    pub fencing_token: FencingToken,
 }
 
-/// Open-read request in worker core terms.
+/// Metadata-authorized block-local range requested by one read RPC.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadOpenRequest {
-    pub group_name: GroupName,
-    pub block_id: BlockId,
-    pub worker_run_id: WorkerRunId,
+pub(crate) struct ReadBlockRequest {
+    pub(crate) group_name: GroupName,
+    pub(crate) block_id: BlockId,
     /// Block-local byte range. The offset is relative to block_id, not to the file.
-    pub byte_range: ByteRange,
+    pub(crate) byte_range: ByteRange,
     /// Logical block stamp used for direct read validation.
     /// Normal client reads must use a non-zero metadata-authoritative stamp.
-    /// Public worker read opens reject 0 before local block metadata lookup.
-    pub block_stamp: u64,
-    pub block_format_id: BlockFormatId,
-    pub block_size: u64,
-    pub chunk_size: u32,
-    pub effective_len: u64,
+    /// The `ReadBlock` RPC rejects 0 before local block metadata lookup.
+    pub(crate) block_stamp: u64,
+    pub(crate) block_format_id: BlockFormatId,
+    pub(crate) block_size: u64,
+    pub(crate) chunk_size: u32,
+    pub(crate) effective_len: u64,
     /// Requested transport frame payload size, not the worker-local StorageChunk size.
-    pub frame_size: u32,
+    pub(crate) frame_size: u32,
 }
 
-/// Open-read result in worker core terms.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadOpenResult {
-    pub stream_id: StreamId,
-    /// Transport frame payload size negotiated at stream open.
-    /// This controls network batching and does not define StorageChunk size.
-    pub frame_size: u32,
-    /// Logical block stamp used for direct read validation.
-    pub block_stamp: u64,
-    /// Block-local readable committed prefix length.
-    /// This is not the sum of ready chunks.
-    pub committed_length: u64,
+/// Live state for one `ReadBlock` response stream.
+///
+/// The pin spans the response stream and is cloned into every blocking read so
+/// cancellation cannot let reclamation pass an unfinished filesystem access.
+#[derive(Debug)]
+pub(crate) struct ActiveBlockRead {
+    group_name: GroupName,
+    block_id: BlockId,
+    next_offset: u64,
+    end_offset: u64,
+    frame_size: u32,
+    read_pin: ReadPin,
 }
 
 /// Open-write request in worker core terms.
@@ -141,15 +118,6 @@ pub struct WriteOpenResult {
     /// Published effective length reported to the caller.
     /// For a newly opened staging block this is zero until CommitWrite publishes Ready metadata.
     pub committed_length: u64,
-}
-
-/// Transport payload returned by a read stream.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadFrame {
-    pub offset_in_block: u64,
-    pub data: Bytes,
-    pub checksum32: u32,
-    pub eos: bool,
 }
 
 /// Transport payload accepted by a write stream.
@@ -364,45 +332,33 @@ impl WorkerCore {
         Arc::clone(&self.stream_manager)
     }
 
-    pub async fn open_read(&self, req: ReadOpenRequest) -> WorkerCoreResult<ReadOpenResult> {
+    /// Validates one metadata-authorized range and binds its pin to an RPC-owned read.
+    pub(crate) async fn begin_block_read(&self, req: ReadBlockRequest) -> WorkerCoreResult<ActiveBlockRead> {
         let frame_size = self.negotiate_frame_size(req.frame_size)?;
+        self.block_manager.validate_read_request(&req)?;
         let read_pin = self.block_manager.pin_read(&req.group_name, req.block_id)?;
-        let snapshot = self.block_manager.validate_read(self.block_store.as_ref(), &req)?;
-        let stream_id = self.next_stream_id()?;
+        let validation_pin = read_pin.clone();
+        let block_manager = Arc::clone(&self.block_manager);
+        let block_store = Arc::clone(&self.block_store);
+        let validation_request = req.clone();
+        tokio::task::spawn_blocking(move || {
+            let _pin = validation_pin;
+            block_manager.validate_read(block_store.as_ref(), &validation_request)
+        })
+        .await
+        .map_err(|error| WorkerError::Internal(format!("block read validation task failed: {error}")))??;
         let end_offset = req
             .byte_range
             .offset
             .checked_add(u64::from(req.byte_range.len))
             .ok_or_else(|| WorkerError::InvalidArgument("byte range offset overflow".to_string()))?;
-
-        let context = StreamContext {
-            stream_id,
-            group_name: snapshot.group_name,
-            block_id: snapshot.block_id,
-            mode: StreamMode::Read,
-            worker_run_id: req.worker_run_id,
-            start_offset: req.byte_range.offset,
+        Ok(ActiveBlockRead {
+            group_name: req.group_name,
+            block_id: req.block_id,
+            next_offset: req.byte_range.offset,
             end_offset,
             frame_size,
-            block_stamp: snapshot.block_stamp,
-            block_format_id: snapshot.block_format_id,
-            block_size: snapshot.block_size,
-            chunk_size: snapshot.chunk_size,
-            committed_length: snapshot.effective_len,
-            effective_len: snapshot.effective_len,
-            fencing_token: None,
-        };
-        if !self.stream_manager.register_read(StreamState::new(context), read_pin) {
-            return Err(WorkerError::Internal(format!(
-                "duplicate stream identity generated: stream_id={stream_id}"
-            )));
-        }
-
-        Ok(ReadOpenResult {
-            stream_id,
-            frame_size,
-            block_stamp: snapshot.block_stamp,
-            committed_length: snapshot.effective_len,
+            read_pin,
         })
     }
 
@@ -410,24 +366,14 @@ impl WorkerCore {
     ///
     /// The exact stamp is checked before reader exclusion and again before the
     /// durable marker is published. New readers are rejected once reclaiming
-    /// starts, existing read streams drain through RAII pins, and any filesystem
+    /// starts, existing read RPCs drain through RAII pins, and any filesystem
     /// error leaves the block reclaiming for an idempotent retry.
     pub async fn reclaim_block(&self, req: ReclaimBlockRequest) -> WorkerCoreResult<ReclaimBlockResult> {
         self.block_store.inspect_reclaim_block(&req)?;
-        let wait_timeout = self.stream_manager.idle_timeout().max(Duration::from_millis(1));
-        let permit = loop {
-            self.stream_manager.cleanup_idle_read_streams(64).await;
-            match tokio::time::timeout(
-                wait_timeout,
-                self.block_manager
-                    .begin_reclaim(&req.group_name, req.block_id, req.expected_block_stamp),
-            )
-            .await
-            {
-                Ok(result) => break result?,
-                Err(_) => continue,
-            }
-        };
+        let permit = self
+            .block_manager
+            .begin_reclaim(&req.group_name, req.block_id, req.expected_block_stamp)
+            .await?;
         let result = self.block_store.reclaim_block(&req)?;
         permit.complete();
         Ok(result)
@@ -458,22 +404,17 @@ impl WorkerCore {
             validate_write_open_request(&req)?;
             reject_existing_final_block(self.block_store.as_ref(), &req)?;
             let stream_id = self.next_stream_id()?;
-            let context = StreamContext {
+            let context = WriteStreamContext {
                 stream_id,
                 group_name: req.group_name.clone(),
                 block_id: req.block_id,
-                mode: StreamMode::Write,
                 worker_run_id: req.worker_run_id,
-                start_offset: 0,
                 end_offset: req.block_size,
-                frame_size,
                 block_stamp: req.block_stamp,
                 block_format_id: req.block_format_id,
                 block_size: req.block_size,
                 chunk_size: req.chunk_size,
-                committed_length: 0,
-                effective_len: req.block_size,
-                fencing_token: Some(req.token),
+                fencing_token: req.token,
             };
             let stream_state = StreamState::new(context);
 
@@ -715,14 +656,7 @@ impl WorkerCore {
                 Err(StreamAccessError::Missing) => return Ok(AbortWriteResult { aborted: true }),
                 Err(error) => return Err(stream_access_error("write", req.stream_id, error)),
             },
-            Err(StreamAccessError::WrongMode) => unreachable!("begin_operation does not inspect stream mode"),
         };
-        if operation.context.mode != StreamMode::Write {
-            return Err(WorkerError::InvalidArgument(format!(
-                "stream is not a write stream: stream_id={}",
-                req.stream_id
-            )));
-        }
         validate_abort_request(&operation, &req)?;
         operation.mark_retiring();
         self.block_store.abort_staging_block(&req.group_name, req.block_id)?;
@@ -737,7 +671,7 @@ impl WorkerCore {
     pub(crate) async fn abort_write_stream_after_error(&self, stream_id: StreamId) -> WorkerCoreResult<()> {
         let operation = match self.stream_manager.begin_write_retirement(stream_id).await {
             Ok(operation) => operation,
-            Err(StreamAccessError::Missing | StreamAccessError::WrongMode) => return Ok(()),
+            Err(StreamAccessError::Missing) => return Ok(()),
             Err(StreamAccessError::Retiring) => {
                 unreachable!("begin_write_retirement accepts a Retiring write stream")
             }
@@ -785,21 +719,17 @@ impl WorkerCore {
     async fn cleanup_stream_batch(&self, drain: bool) -> usize {
         let candidates = self
             .stream_manager
-            .take_cleanup_batch(MAX_STREAM_RETIREMENTS_PER_PASS, drain, None);
+            .take_cleanup_batch(MAX_STREAM_RETIREMENTS_PER_PASS, drain);
         let mut completed = 0usize;
         for stream_id in candidates {
             let operation = match self.stream_manager.try_begin_retirement(stream_id) {
                 Ok(Some(operation)) => operation,
                 Ok(None) | Err(StreamAccessError::Missing) => continue,
                 Err(StreamAccessError::Retiring) => unreachable!("retirement accepts a Retiring stream"),
-                Err(StreamAccessError::WrongMode) => unreachable!("generic retirement accepts both stream modes"),
             };
-            let cleanup = match operation.context.mode {
-                StreamMode::Read => Ok(()),
-                StreamMode::Write => self
-                    .block_store
-                    .abort_staging_block(&operation.context.group_name, operation.context.block_id),
-            };
+            let cleanup = self
+                .block_store
+                .abort_staging_block(&operation.context.group_name, operation.context.block_id);
             match cleanup {
                 Ok(()) => {
                     completed += usize::from(self.stream_manager.complete_retirement(stream_id, &operation));
@@ -819,47 +749,28 @@ impl WorkerCore {
         completed
     }
 
-    pub async fn read_frame(&self, stream_id: StreamId, max_bytes: u32) -> WorkerCoreResult<Vec<ReadFrame>> {
-        self.read_stream(stream_id, max_bytes).await
-    }
-
-    pub async fn read_stream(&self, stream_id: StreamId, max_bytes: u32) -> WorkerCoreResult<Vec<ReadFrame>> {
-        let mut operation = self
-            .stream_manager
-            .begin_operation(stream_id)
-            .await
-            .map_err(|error| stream_access_error("read", stream_id, error))?;
-        if operation.context.mode != StreamMode::Read {
-            return Err(WorkerError::InvalidArgument(format!(
-                "stream is not a read stream: stream_id={stream_id}"
-            )));
+    /// Reads the next exact chunk without executing filesystem work on Tokio workers.
+    pub(crate) async fn read_block_chunk(&self, read: &mut ActiveBlockRead) -> WorkerCoreResult<Option<Bytes>> {
+        if read.next_offset >= read.end_offset {
+            return Ok(None);
         }
-        if operation.cursor >= operation.context.end_offset {
-            operation.mark_retiring();
-            self.stream_manager.complete_retirement(stream_id, &operation);
-            return Ok(Vec::new());
-        }
-
-        let frame_budget = if max_bytes == 0 {
-            operation.context.frame_size
-        } else {
-            max_bytes.min(operation.context.frame_size)
-        };
-        if frame_budget == 0 {
-            return Err(WorkerError::InvalidArgument(
-                "read stream frame budget must be greater than zero".to_string(),
-            ));
-        }
-
-        let remaining = operation.context.end_offset - operation.cursor;
-        let read_len = remaining.min(u64::from(frame_budget));
+        let remaining = read.end_offset - read.next_offset;
+        let read_len = remaining.min(u64::from(read.frame_size));
+        let expected_len = usize::try_from(read_len)
+            .map_err(|_| WorkerError::InvalidArgument("read length does not fit in usize".to_string()))?;
+        let block_store = Arc::clone(&self.block_store);
+        let group_name = read.group_name.clone();
+        let block_id = read.block_id;
+        let offset = read.next_offset;
+        let io_pin = read.read_pin.clone();
         let store_started = Instant::now();
-        let data = match self.block_store.read_at(
-            &operation.context.group_name,
-            operation.context.block_id,
-            operation.cursor,
-            read_len,
-        ) {
+        let result = tokio::task::spawn_blocking(move || {
+            let _pin = io_pin;
+            block_store.read_at(&group_name, block_id, offset, read_len)
+        })
+        .await
+        .map_err(|error| WorkerError::Internal(format!("block read task failed: {error}")))?;
+        let data = match result {
             Ok(data) => {
                 observe::record_store_io(
                     "read",
@@ -878,32 +789,23 @@ impl WorkerCore {
                     0,
                     store_started.elapsed().as_secs_f64(),
                 );
-                operation.mark_retiring();
-                self.stream_manager.complete_retirement(stream_id, &operation);
                 return Err(error);
             }
         };
-        let next_cursor = operation
-            .cursor
+        if data.len() != expected_len {
+            return Err(WorkerError::Corrupt(format!(
+                "block read returned {} bytes, expected {expected_len}",
+                data.len()
+            )));
+        }
+        read.next_offset = read
+            .next_offset
             .checked_add(
                 u64::try_from(data.len())
-                    .map_err(|_| WorkerError::InvalidArgument("read frame length does not fit in u64".to_string()))?,
+                    .map_err(|_| WorkerError::InvalidArgument("read chunk length does not fit in u64".to_string()))?,
             )
             .ok_or_else(|| WorkerError::InvalidArgument("read cursor overflow".to_string()))?;
-        let eos = next_cursor >= operation.context.end_offset;
-        let frame = ReadFrame {
-            offset_in_block: operation.cursor,
-            data,
-            checksum32: 0,
-            eos,
-        };
-        if eos {
-            operation.mark_retiring();
-            self.stream_manager.complete_retirement(stream_id, &operation);
-        } else {
-            operation.cursor = next_cursor;
-        }
-        Ok(vec![frame])
+        Ok(Some(data))
     }
 
     pub async fn write_frame(&self, frame: WriteFrame) -> WorkerCoreResult<WriteFrameResult> {
@@ -995,11 +897,6 @@ impl WorkerCore {
             .begin_operation(stream_id)
             .await
             .map_err(|error| stream_access_error("write", stream_id, error))?;
-        if operation.context.mode != StreamMode::Write {
-            return Err(WorkerError::InvalidArgument(format!(
-                "stream is not a write stream: stream_id={stream_id}"
-            )));
-        }
         Ok(operation)
     }
 }
@@ -1009,9 +906,6 @@ fn stream_access_error(mode: &str, stream_id: StreamId, error: StreamAccessError
         StreamAccessError::Missing => WorkerError::NotFound(format!("{mode} stream not found: stream_id={stream_id}")),
         StreamAccessError::Retiring => {
             WorkerError::NotFound(format!("{mode} stream is retiring: stream_id={stream_id}"))
-        }
-        StreamAccessError::WrongMode => {
-            WorkerError::InvalidArgument(format!("stream is not a {mode} stream: stream_id={stream_id}"))
         }
     }
 }
@@ -1258,11 +1152,7 @@ fn validate_stream_identity(state: &StreamState, group_name: &GroupName, block_i
 }
 
 fn validate_matching_token(state: &StreamState, token: FencingToken) -> WorkerCoreResult<()> {
-    let expected = state
-        .context
-        .fencing_token
-        .ok_or_else(|| WorkerError::InvalidArgument("write stream has no fencing token".to_string()))?;
-    if token != expected {
+    if token != state.context.fencing_token {
         return Err(WorkerError::Fencing(
             "fencing token does not match write stream".to_string(),
         ));
@@ -1281,7 +1171,7 @@ fn rejected_write_frame(state: &StreamState) -> WriteFrameResult {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
 
     use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
@@ -1295,14 +1185,14 @@ mod tests {
 
     use crate::config::StoreDirConfig;
     use crate::data::core::{
-        AbortWriteRequest, CommitWriteRequest, RangeMapper, ReadOpenRequest, StreamContext, StreamMode,
+        AbortWriteRequest, ActiveBlockRead, CommitWriteRequest, RangeMapper, ReadBlockRequest,
         SyncCommittedBlockRequest, WorkerCore, WorkerCoreResult, WriteFrame, WriteOpenRequest,
     };
     use crate::error::WorkerError;
-    use crate::runtime::stream::StreamState;
     use crate::store::block::{
-        ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
-        PublishReadyRequest, ReclaimBlockRequest, ReclaimBlockResult,
+        BlockMetaPayload, ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig,
+        LocalBlockStore, PublishReadyRequest, ReclaimBlockRequest, ReclaimBlockResult, ReclaimBlockState,
+        RecoveredBlock, StoreResult, SyncReadyBlockRequest,
     };
     use crate::store::dirs::StoreDirs;
 
@@ -1407,26 +1297,6 @@ mod tests {
         }
     }
 
-    fn stream_context() -> StreamContext {
-        StreamContext {
-            stream_id: stream_id(),
-            group_name: group_name(),
-            block_id: block_id(),
-            mode: StreamMode::Read,
-            start_offset: 0,
-            end_offset: 4096,
-            frame_size: 8192,
-            block_stamp: 17,
-            block_format_id: BlockFormatId::FULL_EFFECTIVE,
-            block_size: BLOCK_SIZE,
-            chunk_size: CHUNK_SIZE,
-            committed_length: 4096,
-            effective_len: 4096,
-            worker_run_id: test_worker_run_id(),
-            fencing_token: None,
-        }
-    }
-
     pub(super) fn payload() -> Bytes {
         Bytes::from((0..BLOCK_SIZE).map(|idx| (idx % 251) as u8).collect::<Vec<_>>())
     }
@@ -1443,6 +1313,62 @@ mod tests {
             store.clone(),
         );
         (temp, store, core)
+    }
+
+    struct BlockingReadStore {
+        inner: Arc<FullBlockFileStore>,
+        started: Mutex<Option<mpsc::Sender<()>>>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl LocalBlockStore for BlockingReadStore {
+        fn create_staging_block(&self, req: CreateStagingBlockRequest) -> StoreResult<BlockMetaPayload> {
+            self.inner.create_staging_block(req)
+        }
+
+        fn write_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, data: Bytes) -> StoreResult<()> {
+            self.inner.write_at(group_name, block_id, offset, data)
+        }
+
+        fn publish_ready(&self, req: PublishReadyRequest) -> StoreResult<BlockMetaPayload> {
+            self.inner.publish_ready(req)
+        }
+
+        fn read_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, len: u64) -> StoreResult<Bytes> {
+            if let Some(started) = self.started.lock().expect("read started sender").take() {
+                started.send(()).expect("report blocking read start");
+                self.release
+                    .lock()
+                    .expect("read release receiver")
+                    .recv()
+                    .expect("release read");
+            }
+            self.inner.read_at(group_name, block_id, offset, len)
+        }
+
+        fn load_meta(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<BlockMetaPayload> {
+            self.inner.load_meta(group_name, block_id)
+        }
+
+        fn sync_ready_block(&self, req: SyncReadyBlockRequest) -> StoreResult<BlockMetaPayload> {
+            self.inner.sync_ready_block(req)
+        }
+
+        fn recover_block(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<RecoveredBlock> {
+            self.inner.recover_block(group_name, block_id)
+        }
+
+        fn inspect_reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockState> {
+            self.inner.inspect_reclaim_block(req)
+        }
+
+        fn reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockResult> {
+            self.inner.reclaim_block(req)
+        }
+
+        fn abort_staging_block(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<()> {
+            self.inner.abort_staging_block(group_name, block_id)
+        }
     }
 
     #[test]
@@ -1494,21 +1420,20 @@ mod tests {
             .expect("publish ready block");
     }
 
-    fn read_open_request_for(offset: u64, len: u32, block_stamp: u64, frame_size: u32) -> ReadOpenRequest {
-        read_open_request_for_len(offset, len, block_stamp, BLOCK_SIZE, frame_size)
+    fn read_block_request(offset: u64, len: u32, block_stamp: u64, frame_size: u32) -> ReadBlockRequest {
+        read_block_request_for_len(offset, len, block_stamp, BLOCK_SIZE, frame_size)
     }
 
-    fn read_open_request_for_len(
+    fn read_block_request_for_len(
         offset: u64,
         len: u32,
         block_stamp: u64,
         effective_len: u64,
         frame_size: u32,
-    ) -> ReadOpenRequest {
-        ReadOpenRequest {
+    ) -> ReadBlockRequest {
+        ReadBlockRequest {
             group_name: group_name(),
             block_id: block_id(),
-            worker_run_id: test_worker_run_id(),
             byte_range: ByteRange { offset, len },
             block_stamp,
             block_format_id: BlockFormatId::FULL_EFFECTIVE,
@@ -1519,28 +1444,12 @@ mod tests {
         }
     }
 
-    async fn collect_core_read(core: &WorkerCore, stream_id: StreamId, max_bytes: u32) -> Bytes {
+    async fn collect_core_read(core: &WorkerCore, mut read: ActiveBlockRead) -> Bytes {
         let mut out = Vec::new();
-        loop {
-            let frames = core.read_stream(stream_id, max_bytes).await.expect("read stream");
-            let Some(frame) = frames.into_iter().next() else {
-                break;
-            };
-            let eos = frame.eos;
-            out.extend_from_slice(&frame.data);
-            if eos {
-                break;
-            }
+        while let Some(chunk) = core.read_block_chunk(&mut read).await.expect("read block chunk") {
+            out.extend_from_slice(&chunk);
         }
         Bytes::from(out)
-    }
-
-    fn write_stream_context() -> StreamContext {
-        StreamContext {
-            mode: StreamMode::Write,
-            fencing_token: Some(token()),
-            ..stream_context()
-        }
     }
 
     #[test]
@@ -1591,7 +1500,6 @@ mod tests {
             .expect("write stream registered");
         assert_eq!(state.context.group_name, group_name());
         assert_eq!(state.context.block_id, block_id());
-        assert_eq!(state.context.mode, StreamMode::Write);
         assert_eq!(state.context.end_offset, BLOCK_SIZE);
         assert_eq!(state.cursor, 0);
         assert_eq!(state.last_acked_seq, 0);
@@ -1720,31 +1628,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_stream_rejects_read_stream() {
-        let (_temp, store, core) = core_with_store(512, 2048);
-        publish_ready_block(&store, payload(), BLOCK_STAMP);
-        let open = core
-            .open_read(read_open_request_for(0, 4, BLOCK_STAMP, 512))
-            .await
-            .expect("open read");
-
-        match core
-            .write_stream(WriteFrame {
-                stream_id: open.stream_id,
-                seq: 1,
-                offset_in_block: 0,
-                data: Bytes::from_static(b"abcd"),
-                checksum32: 0,
-            })
-            .await
-            .expect_err("read stream must reject writes")
-        {
-            WorkerError::InvalidArgument(message) => assert!(message.contains("not a write stream")),
-            other => panic!("expected InvalidArgument, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
     async fn commit_write_publishes_ready_block() {
         let (_temp, store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
@@ -1833,8 +1716,8 @@ mod tests {
             data
         );
 
-        let open_read = core
-            .open_read(read_open_request_for_len(
+        let read = core
+            .begin_block_read(read_block_request_for_len(
                 0,
                 effective_len as u32,
                 BLOCK_STAMP,
@@ -1842,11 +1725,11 @@ mod tests {
                 600,
             ))
             .await
-            .expect("open read");
-        assert_eq!(collect_core_read(&core, open_read.stream_id, 600).await, data);
+            .expect("begin block read");
+        assert_eq!(collect_core_read(&core, read).await, data);
 
         let eof_read = core
-            .open_read(read_open_request_for_len(
+            .begin_block_read(read_block_request_for_len(
                 effective_len,
                 0,
                 BLOCK_STAMP,
@@ -1854,10 +1737,10 @@ mod tests {
                 600,
             ))
             .await
-            .expect("open eof read");
-        assert!(collect_core_read(&core, eof_read.stream_id, 600).await.is_empty());
+            .expect("begin eof read");
+        assert!(collect_core_read(&core, eof_read).await.is_empty());
         assert_invalid_argument(
-            core.open_read(read_open_request_for_len(
+            core.begin_block_read(read_block_request_for_len(
                 effective_len,
                 1,
                 BLOCK_STAMP,
@@ -2187,7 +2070,7 @@ mod tests {
         assert!(!paths.meta_path.exists());
         assert_not_found(store.read_at(&group_name(), block_id(), 0, 1));
         assert_refresh_metadata(
-            core.open_read(read_open_request_for(0, 1, BLOCK_STAMP, 512)).await,
+            core.begin_block_read(read_block_request(0, 1, BLOCK_STAMP, 512)).await,
             ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
         );
         assert!(store.scan_group_blocks(&group_name()).expect("scan group").is_empty());
@@ -2400,42 +2283,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_read_ready_block_succeeds() {
-        let (_temp, store, core) = core_with_store(512, 2048);
-        publish_ready_block(&store, payload(), BLOCK_STAMP);
-
-        let result = core
-            .open_read(read_open_request_for(128, 1024, BLOCK_STAMP, 0))
-            .await
-            .expect("open read");
-
-        assert_eq!(result.frame_size, 512);
-        assert_eq!(result.block_stamp, BLOCK_STAMP);
-        assert_eq!(result.committed_length, BLOCK_SIZE);
-
-        let state = core
-            .stream_manager()
-            .get(result.stream_id)
-            .await
-            .expect("read stream registered");
-        assert_eq!(state.context.group_name, group_name());
-        assert_eq!(state.context.block_id, block_id());
-        assert_eq!(state.context.mode, StreamMode::Read);
-        assert_eq!(state.context.start_offset, 128);
-        assert_eq!(state.context.end_offset, 1152);
-        assert_eq!(state.cursor, 128);
-        assert_eq!(state.context.effective_len, BLOCK_SIZE);
-    }
-
-    #[tokio::test]
-    async fn reclaim_waits_for_whole_read_stream_before_deleting() {
+    async fn reclaim_waits_for_read_rpc_lifetime_before_deleting() {
         let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
         let core = Arc::new(core);
-        let open = core
-            .open_read(read_open_request_for(0, BLOCK_SIZE as u32, BLOCK_STAMP, 512))
+        let read = core
+            .begin_block_read(read_block_request(0, BLOCK_SIZE as u32, BLOCK_STAMP, 512))
             .await
-            .expect("open pinned read");
+            .expect("begin pinned read");
         let reclaim_core = Arc::clone(&core);
         let reclaim = tokio::spawn(async move {
             reclaim_core
@@ -2449,19 +2304,12 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                match core.open_read(read_open_request_for(0, 1, BLOCK_STAMP, 512)).await {
+                match core.begin_block_read(read_block_request(0, 1, BLOCK_STAMP, 512)).await {
                     Err(WorkerError::RefreshMetadata {
                         kind: ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
                         ..
                     }) => break,
-                    Ok(extra) => {
-                        let manager = core.stream_manager();
-                        let operation = manager
-                            .begin_retirement(extra.stream_id)
-                            .await
-                            .expect("retire extra read stream");
-                        manager.complete_retirement(extra.stream_id, &operation);
-                    }
+                    Ok(extra) => drop(extra),
                     Err(other) => panic!("unexpected read-open result while reclaim starts: {other:?}"),
                 }
                 tokio::task::yield_now().await;
@@ -2471,7 +2319,7 @@ mod tests {
         .expect("reclaim should reject new readers");
         assert!(!reclaim.is_finished(), "reclaim must wait for the active stream");
 
-        assert_eq!(collect_core_read(&core, open.stream_id, 257).await, payload());
+        assert_eq!(collect_core_read(&core, read).await, payload());
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), reclaim)
                 .await
@@ -2489,38 +2337,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reclaim_expires_abandoned_read_stream_before_deleting() {
+    async fn cancelled_read_keeps_pin_until_blocking_io_exits() {
         let temp = TempDir::new().expect("tempdir");
-        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
+        let inner = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
             temp.path().to_path_buf(),
         )));
-        publish_ready_block(&store, payload(), BLOCK_STAMP);
-        let core = WorkerCore::with_local_store(512, 2048, Duration::from_millis(10), store.clone());
-        let open = core
-            .open_read(read_open_request_for(0, BLOCK_SIZE as u32, BLOCK_STAMP, 512))
+        publish_ready_block(&inner, payload(), BLOCK_STAMP);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let store: Arc<dyn LocalBlockStore + Send + Sync> = Arc::new(BlockingReadStore {
+            inner,
+            started: Mutex::new(Some(started_tx)),
+            release: Mutex::new(release_rx),
+        });
+        let core = Arc::new(WorkerCore::with_local_store(512, 2048, Duration::from_secs(60), store));
+        let mut read = core
+            .begin_block_read(read_block_request(0, 8, BLOCK_STAMP, 512))
             .await
-            .expect("open abandoned read");
+            .expect("begin read");
+        let read_core = Arc::clone(&core);
+        let read_task = tokio::spawn(async move { read_core.read_block_chunk(&mut read).await });
+        tokio::task::spawn_blocking(move || started_rx.recv().expect("blocking read started"))
+            .await
+            .expect("wait for blocking read");
+        read_task.abort();
+        assert!(read_task.await.expect_err("read task cancelled").is_cancelled());
 
-        assert_eq!(
-            tokio::time::timeout(
-                Duration::from_secs(1),
-                core.reclaim_block(ReclaimBlockRequest {
+        let reclaim_core = Arc::clone(&core);
+        let reclaim = tokio::spawn(async move {
+            reclaim_core
+                .reclaim_block(ReclaimBlockRequest {
                     group_name: group_name(),
                     block_id: block_id(),
                     expected_block_stamp: BLOCK_STAMP,
-                }),
-            )
-            .await
-            .expect("idle stream must not stall reclaim")
-            .expect("reclaim block"),
-            ReclaimBlockResult::Deleted {
-                effective_len: BLOCK_SIZE
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match core.begin_block_read(read_block_request(0, 1, BLOCK_STAMP, 512)).await {
+                    Err(WorkerError::RefreshMetadata {
+                        kind: ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
+                        ..
+                    }) => break,
+                    Ok(extra) => drop(extra),
+                    Err(other) => panic!("unexpected read result while reclaim starts: {other:?}"),
+                }
+                tokio::task::yield_now().await;
             }
-        );
-        assert!(core.stream_manager().get(open.stream_id).await.is_none());
-        let paths = store.paths(&group_name(), block_id());
-        assert!(!paths.data_path.exists());
-        assert!(!paths.meta_path.exists());
+        })
+        .await
+        .expect("reclaim starts");
+        assert!(!reclaim.is_finished(), "reclaim passed a cancelled blocking read");
+
+        release_tx.send(()).expect("release blocking read");
+        assert!(tokio::time::timeout(Duration::from_secs(1), reclaim)
+            .await
+            .expect("reclaim completes after blocking IO")
+            .expect("reclaim task")
+            .is_ok());
     }
 
     #[tokio::test]
@@ -2537,11 +2412,11 @@ mod tests {
             .await,
             ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
         );
-        let open = core
-            .open_read(read_open_request_for(0, 8, BLOCK_STAMP, 512))
+        let read = core
+            .begin_block_read(read_block_request(0, 8, BLOCK_STAMP, 512))
             .await
             .expect("stamp mismatch must not fence valid reads");
-        assert_eq!(collect_core_read(&core, open.stream_id, 8).await, payload().slice(0..8));
+        assert_eq!(collect_core_read(&core, read).await, payload().slice(0..8));
     }
 
     #[tokio::test]
@@ -2553,11 +2428,11 @@ mod tests {
 
         let core = WorkerCore::with_options(512, 2048, Duration::from_secs(60), custom_dir.path().to_path_buf());
 
-        let result = core
-            .open_read(read_open_request_for(0, 8, BLOCK_STAMP, 512))
+        let read = core
+            .begin_block_read(read_block_request(0, 8, BLOCK_STAMP, 512))
             .await
-            .expect("open read from configured store dir");
-        assert!(core.stream_manager().get(result.stream_id).await.is_some());
+            .expect("begin read from configured store dir");
+        assert_eq!(collect_core_read(&core, read).await, payload().slice(0..8));
 
         let paths = store.paths(&group_name(), block_id());
         assert!(paths.data_path.starts_with(custom_dir.path()));
@@ -2584,18 +2459,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_read_rejects_invalid_ready_block_requests() {
+    async fn read_block_rejects_invalid_authority_and_ranges() {
         let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
 
-        let mut block_size_mismatch = read_open_request_for(0, 1024, BLOCK_STAMP, 512);
+        let mut block_size_mismatch = read_block_request(0, 1024, BLOCK_STAMP, 512);
         block_size_mismatch.block_size = BLOCK_SIZE * 2;
-        let mut chunk_size_mismatch = read_open_request_for(0, 1024, BLOCK_STAMP, 512);
+        let mut chunk_size_mismatch = read_block_request(0, 1024, BLOCK_STAMP, 512);
         chunk_size_mismatch.chunk_size = CHUNK_SIZE * 2;
         let cases = [
             (
                 "stamp mismatch",
-                read_open_request_for(0, 1024, BLOCK_STAMP + 1, 512),
+                read_block_request(0, 1024, BLOCK_STAMP + 1, 512),
                 Some(ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch)),
             ),
             (
@@ -2608,178 +2483,82 @@ mod tests {
                 chunk_size_mismatch,
                 Some(ErrorKind::Metadata(MetadataErrorKind::StaleState)),
             ),
-            ("zero block stamp", read_open_request_for(0, 1024, 0, 512), None),
+            ("zero block stamp", read_block_request(0, 1024, 0, 512), None),
             (
                 "out of bounds range",
-                read_open_request_for(4090, 16, BLOCK_STAMP, 512),
+                read_block_request(4090, 16, BLOCK_STAMP, 512),
                 None,
             ),
         ];
 
         for (case, request, refresh_error) in cases {
-            let result = core.open_read(request).await;
+            let result = core.begin_block_read(request).await;
             if let Some(expected) = refresh_error {
                 assert_refresh_metadata(result, expected);
             } else {
                 assert_invalid_argument(result);
             }
-            assert_eq!(
-                core.stream_manager().active_count().await,
-                0,
-                "case {case} must not register a stream"
-            );
+            let _ = case;
         }
     }
 
     #[tokio::test]
-    async fn open_read_rejects_missing_block() {
+    async fn read_block_rejects_missing_block() {
         let (_temp, _store, core) = core_with_store(512, 2048);
 
         assert_refresh_metadata(
-            core.open_read(read_open_request_for(0, 1024, BLOCK_STAMP, 512)).await,
+            core.begin_block_read(read_block_request(0, 1024, BLOCK_STAMP, 512))
+                .await,
             ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
         );
-        assert_eq!(core.stream_manager().active_count().await, 0);
     }
 
     #[tokio::test]
-    async fn read_stream_advances_cursor_and_respects_max_bytes() {
+    async fn read_block_emits_bounded_chunks_and_implicit_eof() {
         let (_temp, store, core) = core_with_store(8, 16);
         let data = payload();
         publish_ready_block(&store, data.clone(), BLOCK_STAMP);
-        let open = core
-            .open_read(read_open_request_for(0, 8, BLOCK_STAMP, 8))
+        let mut read = core
+            .begin_block_read(read_block_request(2, 8, BLOCK_STAMP, 3))
             .await
-            .expect("open read");
+            .expect("begin read");
 
-        let first = core.read_stream(open.stream_id, 3).await.expect("first read");
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].data, data.slice(0..3));
-        assert!(!first[0].eos);
-        assert_eq!(
-            core.stream_manager().get(open.stream_id).await.expect("stream").cursor,
-            3
-        );
-
-        let second = core.read_stream(open.stream_id, 4).await.expect("second read");
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].data, data.slice(3..7));
-        assert!(!second[0].eos);
-        assert_eq!(
-            core.stream_manager().get(open.stream_id).await.expect("stream").cursor,
-            7
-        );
-
-        let third = core.read_stream(open.stream_id, 4).await.expect("third read");
-        assert_eq!(third.len(), 1);
-        assert_eq!(third[0].data, data.slice(7..8));
-        assert!(third[0].eos);
-        assert!(core.stream_manager().get(open.stream_id).await.is_none());
+        assert_eq!(core.read_block_chunk(&mut read).await.unwrap(), Some(data.slice(2..5)));
+        assert_eq!(core.read_block_chunk(&mut read).await.unwrap(), Some(data.slice(5..8)));
+        assert_eq!(core.read_block_chunk(&mut read).await.unwrap(), Some(data.slice(8..10)));
+        assert_eq!(core.read_block_chunk(&mut read).await.unwrap(), None);
     }
 
     #[tokio::test]
-    async fn read_stream_offset_length_and_eof_boundaries_are_exact() {
+    async fn read_block_range_and_eof_boundaries_are_exact() {
         let (_temp, store, core) = core_with_store(513, 2048);
         let effective_len = u64::from(CHUNK_SIZE) * 2 + 17;
         let data = payload().slice(0..effective_len as usize);
         publish_ready_block(&store, data.clone(), BLOCK_STAMP);
 
-        let full = core
-            .open_read(read_open_request_for_len(
-                0,
-                effective_len as u32,
-                BLOCK_STAMP,
-                effective_len,
-                513,
-            ))
-            .await
-            .expect("open full read");
-        assert_eq!(collect_core_read(&core, full.stream_id, 513).await, data);
-
-        let nonzero = core
-            .open_read(read_open_request_for_len(17, 100, BLOCK_STAMP, effective_len, 64))
-            .await
-            .expect("open nonzero read");
-        assert_eq!(
-            collect_core_read(&core, nonzero.stream_id, 64).await,
-            data.slice(17..117)
-        );
-
-        let short = core
-            .open_read(read_open_request_for_len(100, 3, BLOCK_STAMP, effective_len, 64))
-            .await
-            .expect("open short read");
-        assert_eq!(
-            collect_core_read(&core, short.stream_id, 64).await,
-            data.slice(100..103)
-        );
-
         let boundary_offset = u64::from(CHUNK_SIZE) - 3;
-        let across_chunk = core
-            .open_read(read_open_request_for_len(
-                boundary_offset,
-                10,
-                BLOCK_STAMP,
-                effective_len,
-                4,
-            ))
-            .await
-            .expect("open chunk boundary read");
-        assert_eq!(
-            collect_core_read(&core, across_chunk.stream_id, 4).await,
-            data.slice(boundary_offset as usize..boundary_offset as usize + 10)
-        );
-
-        let eof = core
-            .open_read(read_open_request_for_len(
-                effective_len,
-                0,
-                BLOCK_STAMP,
-                effective_len,
-                64,
-            ))
-            .await
-            .expect("open eof read");
-        assert!(collect_core_read(&core, eof.stream_id, 64).await.is_empty());
-
-        assert_invalid_argument(
-            core.open_read(read_open_request_for_len(
-                effective_len,
-                1,
-                BLOCK_STAMP,
-                effective_len,
-                64,
-            ))
-            .await,
-        );
-        assert_invalid_argument(
-            core.open_read(read_open_request_for_len(
-                effective_len - 1,
-                2,
-                BLOCK_STAMP,
-                effective_len,
-                64,
-            ))
-            .await,
-        );
-    }
-
-    #[tokio::test]
-    async fn read_stream_rejects_missing_and_write_streams() {
-        let (_temp, _store, core) = core_with_store(8, 16);
-
-        assert_not_found(core.read_stream(stream_id(), 1024).await);
-        let state = StreamState::new(write_stream_context());
-        assert!(core.stream_manager().register_write(state));
-
-        match core
-            .read_stream(stream_id(), 1024)
-            .await
-            .expect_err("write stream must not be readable")
-        {
-            WorkerError::InvalidArgument(message) => assert!(message.contains("not a read stream")),
-            other => panic!("expected InvalidArgument, got {other:?}"),
+        for (offset, len, frame_size) in [(17, 100, 64), (boundary_offset, 10, 4), (effective_len, 0, 64)] {
+            let read = core
+                .begin_block_read(read_block_request_for_len(
+                    offset,
+                    len,
+                    BLOCK_STAMP,
+                    effective_len,
+                    frame_size,
+                ))
+                .await
+                .expect("begin valid range");
+            assert_eq!(
+                collect_core_read(&core, read).await,
+                data.slice(offset as usize..offset as usize + len as usize)
+            );
         }
-        assert_eq!(core.stream_manager().get(stream_id()).await.expect("stream").cursor, 0);
+
+        for (offset, len) in [(effective_len, 1), (effective_len - 1, 2)] {
+            assert_invalid_argument(
+                core.begin_block_read(read_block_request_for_len(offset, len, BLOCK_STAMP, effective_len, 64))
+                    .await,
+            );
+        }
     }
 }

@@ -364,6 +364,7 @@ dependencies = [
  "bytes",
  "futures",
  "libc",
+ "prost",
  "tempfile",
  "tokio",
  "tokio-stream",

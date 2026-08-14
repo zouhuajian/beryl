@@ -4,29 +4,32 @@
 //! gRPC WorkerDataService adapter and server entry point.
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use beryl_common::header::{HEADER_WORKER_DATA_ERROR_DETAIL, WORKER_DATA_ERROR_DETAIL_V1};
 use beryl_proto::common::{ClientInfoProto, ErrorDetailProto};
 use beryl_proto::convert::require_worker_run_id;
 use beryl_proto::worker::worker_data_service_server::{WorkerDataService, WorkerDataServiceServer};
 use beryl_proto::worker::{
     AbortWriteRequestProto, AbortWriteResponseProto, CommitWriteRequestProto, CommitWriteResponseProto,
-    DataRequestHeaderProto, DataResponseHeaderProto, OpenReadStreamRequestProto, OpenReadStreamResponseProto,
-    OpenWriteStreamRequestProto, OpenWriteStreamResponseProto, ReadStreamRequestProto, ReadStreamResponseProto,
-    SyncCommittedBlockRequestProto, SyncCommittedBlockResponseProto, WriteStreamRequestProto, WriteStreamResponseProto,
+    DataRequestHeaderProto, DataResponseHeaderProto, OpenWriteStreamRequestProto, OpenWriteStreamResponseProto,
+    ReadBlockChunkProto, ReadBlockRequestProto, SyncCommittedBlockRequestProto, SyncCommittedBlockResponseProto,
+    WriteStreamRequestProto, WriteStreamResponseProto,
 };
+use bytes::Bytes;
 use futures::{stream, Stream, StreamExt};
+use prost::Message;
+use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::service::Routes;
 use tonic::{Request, Response, Status};
 
 use crate::control::RegistrationSet;
 use crate::data::convert::{
-    proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_open_request, proto_to_stream_id,
+    proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_block_request, proto_to_stream_id,
     proto_to_sync_committed_block_request, proto_to_write_frame, proto_to_write_open_request, stream_id_to_proto,
 };
-use crate::data::core::{StreamMode, WorkerCore};
+use crate::data::core::{ActiveBlockRead, WorkerCore};
 use crate::error::WorkerError;
 use crate::observe;
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
@@ -74,6 +77,18 @@ impl WorkerDataServiceImpl {
     fn error_detail(error: &WorkerError) -> ErrorDetailProto {
         let rpc_error: beryl_common::error::rpc::RpcErrorDetail = error.clone().into();
         beryl_proto::convert::rpc_error_to_proto(&rpc_error)
+    }
+
+    /// Encodes one Worker-owned error without turning it into an untyped transport failure.
+    fn data_error_status(header: Option<DataRequestHeaderProto>, error: WorkerError) -> Status {
+        let status = error.to_status();
+        let details = Self::error_response_header(header, error).encode_to_vec();
+        let mut metadata = MetadataMap::new();
+        metadata.insert(
+            HEADER_WORKER_DATA_ERROR_DETAIL,
+            MetadataValue::from_static(WORKER_DATA_ERROR_DETAIL_V1),
+        );
+        Status::with_details_and_metadata(status.code(), status.message(), Bytes::from(details), metadata)
     }
 
     fn ensure_group_ready(&self, group_name: &str) -> Result<(), WorkerError> {
@@ -169,7 +184,7 @@ impl WorkerDataServiceImpl {
                     cancellation_cleanup.disarm();
                     return Err(error.to_status());
                 }
-            } else if self.core.stream_manager().is_write_stream(domain.stream_id) {
+            } else if self.core.stream_manager().contains(domain.stream_id) {
                 owned_stream_id = Some(domain.stream_id);
                 cancellation_cleanup.claim_stream(domain.stream_id);
             }
@@ -243,76 +258,69 @@ impl Drop for WriteStreamCancellation<'_> {
     }
 }
 
-struct ReadStreamState {
-    core: Arc<WorkerCore>,
-    stream_id: beryl_types::StreamId,
-    max_bytes: u32,
-    done: Arc<AtomicBool>,
-    _cleanup: ReadStreamCleanup,
+/// Terminal outcome recorded when one `ReadBlock` response state is dropped.
+#[derive(Clone, Copy)]
+enum ReadBlockOutcome {
+    Active,
+    Success,
+    Error(&'static str),
 }
 
-impl ReadStreamState {
-    async fn next(self) -> Option<(Result<ReadStreamResponseProto, Status>, Self)> {
-        if self.done.load(Ordering::Acquire) {
+/// Owns one response stream, its read pin, and exact-once lifecycle metrics.
+struct ReadBlockState {
+    core: Arc<WorkerCore>,
+    read: ActiveBlockRead,
+    request_header: Option<DataRequestHeaderProto>,
+    started: Instant,
+    outcome: ReadBlockOutcome,
+}
+
+impl ReadBlockState {
+    async fn next(mut self) -> Option<(Result<ReadBlockChunkProto, Status>, Self)> {
+        if !matches!(self.outcome, ReadBlockOutcome::Active) {
             return None;
         }
 
-        match self.core.read_stream(self.stream_id, self.max_bytes).await {
-            Ok(mut frames) => {
-                let Some(frame) = frames.pop() else {
-                    self.done.store(true, Ordering::Release);
-                    return None;
-                };
-                if frame.eos {
-                    self.done.store(true, Ordering::Release);
-                }
-                observe::record_stream_frame("read", "ok", "none", frame.data.len() as u64);
-                Some((
-                    Ok(ReadStreamResponseProto {
-                        offset_in_block: frame.offset_in_block,
-                        data: frame.data,
-                        eos: frame.eos,
-                    }),
-                    self,
-                ))
+        match self.core.read_block_chunk(&mut self.read).await {
+            Ok(Some(data)) => {
+                observe::record_stream_frame("read", "ok", "none", data.len() as u64);
+                Some((Ok(ReadBlockChunkProto { data }), self))
+            }
+            Ok(None) => {
+                self.outcome = ReadBlockOutcome::Success;
+                None
             }
             Err(error) => {
-                self.done.store(true, Ordering::Release);
-                observe::record_stream_frame("read", "error", observe::worker_error_kind(&error), 0);
-                Some((Err(error.to_status()), self))
+                let error_kind = observe::worker_error_kind(&error);
+                self.outcome = ReadBlockOutcome::Error(error_kind);
+                observe::record_stream_frame("read", "error", error_kind, 0);
+                let status = WorkerDataServiceImpl::data_error_status(self.request_header.clone(), error);
+                Some((Err(status), self))
             }
         }
     }
 }
 
-/// Releases a read stream synchronously when its response future is cancelled.
-///
-/// Synchronous removal prevents a detached cleanup task from outliving the
-/// process-owned gRPC request tracker during forced shutdown.
-struct ReadStreamCleanup {
-    core: Arc<WorkerCore>,
-    stream_id: beryl_types::StreamId,
-    done: Arc<AtomicBool>,
-}
-
-impl Drop for ReadStreamCleanup {
+impl Drop for ReadBlockState {
     fn drop(&mut self) {
-        if self.done.load(Ordering::Acquire) {
-            return;
-        }
-        self.done.store(true, Ordering::Release);
-        self.core.stream_manager().retire_cancelled_read(self.stream_id);
+        let (status, error_kind) = match self.outcome {
+            ReadBlockOutcome::Active => ("cancelled", "cancelled"),
+            ReadBlockOutcome::Success => ("ok", "none"),
+            ReadBlockOutcome::Error(error_kind) => ("error", error_kind),
+        };
+        observe::decrement_stream_inflight("read");
+        observe::record_data_rpc("read_block", status, error_kind, self.started.elapsed().as_secs_f64());
     }
 }
 
 #[tonic::async_trait]
 impl WorkerDataService for WorkerDataServiceImpl {
-    type ReadStreamStream = Pin<Box<dyn futures::Stream<Item = Result<ReadStreamResponseProto, Status>> + Send>>;
+    type ReadBlockStream = Pin<Box<dyn futures::Stream<Item = Result<ReadBlockChunkProto, Status>> + Send>>;
 
-    async fn open_read_stream(
+    async fn read_block(
         &self,
-        request: Request<OpenReadStreamRequestProto>,
-    ) -> Result<Response<OpenReadStreamResponseProto>, Status> {
+        request: Request<ReadBlockRequestProto>,
+    ) -> Result<Response<Self::ReadBlockStream>, Status> {
         let started = Instant::now();
         let transport_context = extract_trace_context(request.metadata());
         let mut request = request.into_inner();
@@ -320,115 +328,35 @@ impl WorkerDataService for WorkerDataServiceImpl {
         let header = request.header.clone();
         if let Err(error) = self.ensure_group_ready_for_run(&request.group_name, &request.worker_run_id) {
             let error_kind = observe::worker_error_kind(&error);
-            let duration = started.elapsed().as_secs_f64();
-            observe::record_data_rpc("open_read_stream", "error", error_kind, duration);
-            observe::record_stream_open("read", "error", error_kind);
-            return Ok(Response::new(OpenReadStreamResponseProto {
-                header: Some(Self::error_response_header(header, error)),
-                stream_id: None,
-                frame_size: 0,
-                block_stamp: 0,
-                committed_length: 0,
-            }));
+            observe::record_data_rpc("read_block", "error", error_kind, started.elapsed().as_secs_f64());
+            return Err(Self::data_error_status(header, error));
         }
-        let response = match proto_to_read_open_request(request) {
-            Ok(domain) => match self.core.open_read(domain).await {
-                Ok(result) => OpenReadStreamResponseProto {
-                    header: Some(Self::ok_response_header(header)),
-                    stream_id: Some(stream_id_to_proto(result.stream_id)),
-                    frame_size: result.frame_size,
-                    block_stamp: result.block_stamp,
-                    committed_length: result.committed_length,
-                },
-                Err(error) => OpenReadStreamResponseProto {
-                    header: Some(Self::error_response_header(header, error)),
-                    stream_id: None,
-                    frame_size: 0,
-                    block_stamp: 0,
-                    committed_length: 0,
-                },
-            },
-            Err(error) => OpenReadStreamResponseProto {
-                header: Some(Self::error_response_header(header, error)),
-                stream_id: None,
-                frame_size: 0,
-                block_stamp: 0,
-                committed_length: 0,
-            },
-        };
-        let (status, error_kind) = response_status_error_kind(response.header.as_ref());
-        let duration = started.elapsed().as_secs_f64();
-        observe::record_data_rpc("open_read_stream", status, error_kind, duration);
-        observe::record_stream_open("read", status, error_kind);
-
-        Ok(Response::new(response))
-    }
-
-    async fn read_stream(
-        &self,
-        request: Request<ReadStreamRequestProto>,
-    ) -> Result<Response<Self::ReadStreamStream>, Status> {
-        let started = Instant::now();
-        record_transport_context(&extract_trace_context(request.metadata()));
-        if let Err(error) = self.ensure_any_ready() {
-            observe::record_data_rpc(
-                "read_stream",
-                "error",
-                observe::worker_error_kind(&error),
-                started.elapsed().as_secs_f64(),
-            );
-            return Err(error.to_status());
-        }
-        let request = request.into_inner();
-        let stream_id = match proto_to_stream_id(request.stream_id, "stream_id") {
-            Ok(stream_id) => stream_id,
+        let domain = match proto_to_read_block_request(request) {
+            Ok(domain) => domain,
             Err(error) => {
-                observe::record_data_rpc(
-                    "read_stream",
-                    "error",
-                    observe::worker_error_kind(&error),
-                    started.elapsed().as_secs_f64(),
-                );
-                return Err(error.to_status());
+                let error_kind = observe::worker_error_kind(&error);
+                observe::record_data_rpc("read_block", "error", error_kind, started.elapsed().as_secs_f64());
+                return Err(Self::data_error_status(header, error));
             }
         };
-        let Some(state) = self.core.stream_manager().get(stream_id).await else {
-            let error = WorkerError::NotFound(format!("read stream not found: stream_id={stream_id}"));
-            observe::record_data_rpc(
-                "read_stream",
-                "error",
-                observe::worker_error_kind(&error),
-                started.elapsed().as_secs_f64(),
-            );
-            return Err(error.to_status());
+        let read = match self.core.begin_block_read(domain).await {
+            Ok(read) => read,
+            Err(error) => {
+                let error_kind = observe::worker_error_kind(&error);
+                observe::record_data_rpc("read_block", "error", error_kind, started.elapsed().as_secs_f64());
+                return Err(Self::data_error_status(header, error));
+            }
         };
-        if state.context.mode != StreamMode::Read {
-            let error = WorkerError::InvalidArgument(format!("stream is not a read stream: stream_id={stream_id}"));
-            observe::record_data_rpc(
-                "read_stream",
-                "error",
-                observe::worker_error_kind(&error),
-                started.elapsed().as_secs_f64(),
-            );
-            return Err(error.to_status());
-        }
-        observe::record_data_rpc("read_stream", "ok", "none", started.elapsed().as_secs_f64());
-
-        let done = Arc::new(AtomicBool::new(false));
-        let cleanup = ReadStreamCleanup {
+        observe::increment_stream_inflight("read");
+        let state = ReadBlockState {
             core: Arc::clone(&self.core),
-            stream_id,
-            done: Arc::clone(&done),
-        };
-        let state = ReadStreamState {
-            core: Arc::clone(&self.core),
-            stream_id,
-            max_bytes: request.max_bytes,
-            done,
-            _cleanup: cleanup,
+            read,
+            request_header: header,
+            started,
+            outcome: ReadBlockOutcome::Active,
         };
         let responses = stream::unfold(state, |state| async move { state.next().await });
-        Ok(Response::new(Box::pin(responses) as Self::ReadStreamStream))
+        Ok(Response::new(Box::pin(responses) as Self::ReadBlockStream))
     }
 
     async fn open_write_stream(
@@ -749,7 +677,11 @@ fn parse_group_name(value: &str) -> Result<GroupName, WorkerError> {
 /// Builds the Worker data-plane routes retained by the process-owned listener.
 pub fn worker_data_routes(core: Arc<WorkerCore>, registration_state: Arc<RegistrationSet>) -> Routes {
     let service = WorkerDataServiceImpl::new(core, registration_state);
-    Routes::new(WorkerDataServiceServer::new(service))
+    Routes::new(
+        WorkerDataServiceServer::new(service)
+            .max_decoding_message_size(beryl_proto::MAX_WORKER_DATA_MESSAGE_SIZE)
+            .max_encoding_message_size(beryl_proto::MAX_WORKER_DATA_MESSAGE_SIZE),
+    )
 }
 
 #[cfg(test)]
@@ -758,16 +690,16 @@ mod tests {
 
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use beryl_common::error::rpc::{
         ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RpcErrorDetail, WorkerErrorKind,
     };
-    use beryl_proto::common::{BlockIdProto, ByteRangeProto, ClientInfoProto, FencingTokenProto, StreamIdProto};
+    use beryl_proto::common::{BlockIdProto, ByteRangeProto, ClientInfoProto, FencingTokenProto};
     use beryl_proto::worker::worker_data_service_server::WorkerDataService;
     use beryl_proto::worker::{
-        AbortWriteRequestProto, CommitWriteRequestProto, DataRequestHeaderProto, OpenReadStreamRequestProto,
-        OpenWriteStreamRequestProto, ReadStreamRequestProto, SyncCommittedBlockRequestProto, WriteStreamRequestProto,
+        AbortWriteRequestProto, CommitWriteRequestProto, DataRequestHeaderProto, OpenWriteStreamRequestProto,
+        ReadBlockRequestProto, SyncCommittedBlockRequestProto, WriteStreamRequestProto,
     };
     use beryl_types::ids::{BlockId, BlockIndex, ClientId, InodeId, StreamId, WorkerId};
     use beryl_types::layout::BlockFormatId;
@@ -781,14 +713,12 @@ mod tests {
 
     use crate::config::StoreDirConfig;
     use crate::control::{Registration, RegistrationSet};
-    use crate::data::core::{StreamContext, StreamMode, WorkerCore, WorkerCoreResult, WriteFrame, WriteOpenRequest};
+    use crate::data::core::{WorkerCore, WorkerCoreResult, WriteFrame, WriteOpenRequest};
     use crate::error::WorkerError;
     use crate::net::server::grpc::WorkerDataServiceImpl;
     use crate::observe::WORKER_STREAM_INFLIGHT;
-    use crate::runtime::stream::{StreamManager, StreamState};
     use crate::store::block::{
-        ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
-        PublishReadyRequest,
+        ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, PublishReadyRequest,
     };
     use crate::store::dirs::StoreDirs;
 
@@ -817,10 +747,6 @@ mod tests {
             inode_id: 7,
             block_index: 3,
         }
-    }
-
-    fn test_stream_id_proto() -> StreamIdProto {
-        StreamIdProto { high: 1, low: 42 }
     }
 
     fn test_token_proto() -> FencingTokenProto {
@@ -857,11 +783,6 @@ mod tests {
             matches!(rpc_error.recovery, RecoveryAction::RefreshMetadata { .. }),
             "{rpc_error:?}"
         );
-    }
-
-    fn assert_header_fail(error: &beryl_proto::common::ErrorDetailProto, expected_kind: ErrorKind) {
-        let rpc_error = assert_header_recovery(error, expected_kind);
-        assert!(matches!(rpc_error.recovery, RecoveryAction::Fail), "{rpc_error:?}");
     }
 
     fn assert_not_found<T: std::fmt::Debug>(result: WorkerCoreResult<T>) {
@@ -907,26 +828,6 @@ mod tests {
             chunk_size: CHUNK_SIZE,
             checksum_kind: ChecksumKind::None,
             tier: Tier::Hdd,
-        }
-    }
-
-    fn stream_context() -> StreamContext {
-        StreamContext {
-            stream_id: stream_id(),
-            group_name: group_name(),
-            block_id: block_id(),
-            mode: StreamMode::Read,
-            start_offset: 0,
-            end_offset: 4096,
-            frame_size: 8192,
-            block_stamp: 17,
-            block_format_id: BlockFormatId::FULL_EFFECTIVE,
-            block_size: BLOCK_SIZE,
-            chunk_size: CHUNK_SIZE,
-            committed_length: 4096,
-            effective_len: 4096,
-            worker_run_id: test_worker_run_id(),
-            fencing_token: None,
         }
     }
 
@@ -991,23 +892,8 @@ mod tests {
             .expect("publish ready block");
     }
 
-    async fn wait_for_active_stream_count(core: &WorkerCore, expected: usize) {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            let active = core.stream_manager().active_count().await;
-            if active == expected {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "active stream count stayed at {active}, expected {expected}"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-
-    fn open_read_proto(offset: u64, len: u32, block_stamp: u64, frame_size: u32) -> OpenReadStreamRequestProto {
-        OpenReadStreamRequestProto {
+    fn read_block_proto(offset: u64, len: u32, block_stamp: u64, frame_size: u32) -> ReadBlockRequestProto {
+        ReadBlockRequestProto {
             header: Some(test_header()),
             group_name: "root".to_string(),
             block_id: Some(test_block_id_proto()),
@@ -1127,76 +1013,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_stream_error_does_not_retire_a_read_stream_identity() {
-        let (_temp, store, core) = core_with_store(512, 2048);
-        let data = payload();
-        publish_ready_block(&store, data.clone(), BLOCK_STAMP);
-        let core = Arc::new(core);
-        let service = registered_data_service(Arc::clone(&core));
-        let read = core
-            .open_read(crate::data::core::ReadOpenRequest {
-                group_name: group_name(),
-                block_id: block_id(),
-                worker_run_id: test_worker_run_id(),
-                byte_range: beryl_types::chunk::ByteRange { offset: 0, len: 4 },
-                block_stamp: BLOCK_STAMP,
-                block_format_id: BlockFormatId::FULL_EFFECTIVE,
-                block_size: BLOCK_SIZE,
-                chunk_size: CHUNK_SIZE,
-                effective_len: BLOCK_SIZE,
-                frame_size: 512,
-            })
-            .await
-            .expect("open read");
-
-        let status = service
-            .handle_write_frames(futures::stream::iter(vec![Ok(WriteStreamRequestProto {
-                stream_id: Some(crate::data::convert::stream_id_to_proto(read.stream_id)),
-                seq: 1,
-                offset_in_block: 0,
-                data: Bytes::from_static(b"abcd"),
-            })]))
-            .await
-            .expect_err("read identity must reject WriteStream");
-
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
-        let frames = core
-            .read_stream(read.stream_id, 512)
-            .await
-            .expect("read stream remains open");
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].data, data.slice(0..4));
-        assert!(frames[0].eos);
-    }
-
-    #[tokio::test]
     async fn write_stream_identity_switch_cleans_only_the_owned_write() {
         let temp = TempDir::new().expect("tempdir");
         let store = report_store(&temp);
-        let read_block_id = BlockId::new(InodeId::new(7), BlockIndex::new(4));
-        let read_data = payload();
-        store
-            .create_staging_block(CreateStagingBlockRequest {
-                group_name: group_name(),
-                block_id: read_block_id,
-                block_size: BLOCK_SIZE,
-                block_format_id: BlockFormatId::FULL_EFFECTIVE,
-                chunk_size: CHUNK_SIZE,
-                checksum_kind: ChecksumKind::None,
-                tier: Tier::Hdd,
-            })
-            .expect("create read block staging");
-        store
-            .write_at(&group_name(), read_block_id, 0, read_data.clone())
-            .expect("write read block");
-        store
-            .publish_ready(PublishReadyRequest {
-                group_name: group_name(),
-                block_id: read_block_id,
-                effective_len: BLOCK_SIZE,
-                block_stamp: BLOCK_STAMP,
-            })
-            .expect("publish read block");
         let core = Arc::new(WorkerCore::with_local_store(
             512,
             2048,
@@ -1211,21 +1030,6 @@ mod tests {
             .into_inner();
         let write_stream_id =
             crate::data::convert::proto_to_stream_id(write.stream_id, "stream_id").expect("write stream id");
-        let read = core
-            .open_read(crate::data::core::ReadOpenRequest {
-                group_name: group_name(),
-                block_id: read_block_id,
-                worker_run_id: test_worker_run_id(),
-                byte_range: beryl_types::chunk::ByteRange { offset: 0, len: 4 },
-                block_stamp: BLOCK_STAMP,
-                block_format_id: BlockFormatId::FULL_EFFECTIVE,
-                block_size: BLOCK_SIZE,
-                chunk_size: CHUNK_SIZE,
-                effective_len: BLOCK_SIZE,
-                frame_size: 512,
-            })
-            .await
-            .expect("open read");
         assert_eq!(store.report().expect("pending write report").pending_bytes, BLOCK_SIZE);
 
         let status = service
@@ -1237,7 +1041,7 @@ mod tests {
                     data: Bytes::from_static(b"partial"),
                 }),
                 Ok(WriteStreamRequestProto {
-                    stream_id: Some(crate::data::convert::stream_id_to_proto(read.stream_id)),
+                    stream_id: Some(crate::data::convert::stream_id_to_proto(stream_id())),
                     seq: 1,
                     offset_in_block: 0,
                     data: Bytes::from_static(b"abcd"),
@@ -1249,12 +1053,6 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert_eq!(store.report().expect("cleaned write report").pending_bytes, 0);
         assert!(core.stream_manager().get(write_stream_id).await.is_none());
-        let frames = core
-            .read_stream(read.stream_id, 512)
-            .await
-            .expect("read identity remains open");
-        assert_eq!(frames[0].data, read_data.slice(0..4));
-        assert!(frames[0].eos);
     }
 
     #[tokio::test]
@@ -1276,7 +1074,6 @@ mod tests {
 
         assert_commit_write_success_response().await;
         assert_sync_committed_block_success_response().await;
-        assert_open_read_success_response().await;
     }
 
     #[tokio::test]
@@ -1303,18 +1100,16 @@ mod tests {
         let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
         let service = registered_data_service(Arc::new(core));
-        let mut request = open_read_proto(0, 1024, BLOCK_STAMP, 0);
+        let mut request = read_block_proto(0, 1024, BLOCK_STAMP, 0);
         request.worker_run_id = other_worker_run_id().to_string();
 
-        let response = service
-            .open_read_stream(tonic::Request::new(request))
-            .await
-            .expect("open read response")
-            .into_inner();
-        let error = response.header.expect("header").error.expect("header error");
-
+        let status = match service.read_block(tonic::Request::new(request)).await {
+            Ok(_) => panic!("stale Worker run unexpectedly read a block"),
+            Err(status) => status,
+        };
+        let header = DataResponseHeaderProto::decode(status.details()).expect("structured status detail");
+        let error = header.error.expect("header error");
         assert_header_refresh_metadata(&error, ErrorKind::Worker(WorkerErrorKind::RunMismatch));
-        assert!(response.stream_id.is_none());
     }
 
     #[tokio::test]
@@ -1596,162 +1391,49 @@ mod tests {
         assert_eq!(response.block_stamp, BLOCK_STAMP);
     }
 
-    async fn assert_open_read_success_response() {
-        let (_temp, store, core) = core_with_store(512, 2048);
-        publish_ready_block(&store, payload(), BLOCK_STAMP);
-        let service = registered_data_service(Arc::new(core));
-
-        let response = service
-            .open_read_stream(tonic::Request::new(open_read_proto(0, 1024, BLOCK_STAMP, 0)))
-            .await
-            .expect("open read response")
-            .into_inner();
-
-        assert!(response.header.expect("header").error.is_none());
-        assert!(response.stream_id.is_some());
-        assert_eq!(response.frame_size, 512);
-        assert_eq!(response.block_stamp, BLOCK_STAMP);
-        assert_eq!(response.committed_length, BLOCK_SIZE);
+    fn structured_status_error(status: Status) -> RpcErrorDetail {
+        assert_eq!(
+            status
+                .metadata()
+                .get(HEADER_WORKER_DATA_ERROR_DETAIL)
+                .and_then(|value| value.to_str().ok()),
+            Some(WORKER_DATA_ERROR_DETAIL_V1)
+        );
+        let header = DataResponseHeaderProto::decode(status.details()).expect("structured Worker status");
+        beryl_proto::convert::rpc_error_from_proto(&header.error.expect("structured Worker error"))
     }
 
     #[tokio::test]
-    async fn grpc_open_read_maps_structured_errors() {
-        let (_temp, store, core) = core_with_store(512, 2048);
-        publish_ready_block(&store, payload(), BLOCK_STAMP);
-        let service = registered_data_service(Arc::new(core));
-
-        let response = service
-            .open_read_stream(tonic::Request::new(open_read_proto(0, 1024, BLOCK_STAMP + 1, 512)))
-            .await
-            .expect("open read response")
-            .into_inner();
-        let error = response
-            .header
-            .expect("header")
-            .error
-            .expect("stale stamp should return structured error");
-
-        assert_header_refresh_metadata(&error, ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch));
-        assert!(response.stream_id.is_none());
-
-        assert_open_read_missing_block_error().await;
-        assert_open_read_zero_stamp_error().await;
-    }
-
-    async fn assert_open_read_missing_block_error() {
-        let (_temp, _store, core) = core_with_store(512, 2048);
-        let service = registered_data_service(Arc::new(core));
-
-        let response = service
-            .open_read_stream(tonic::Request::new(open_read_proto(0, 1024, BLOCK_STAMP, 512)))
-            .await
-            .expect("open read response")
-            .into_inner();
-        let error = response
-            .header
-            .expect("header")
-            .error
-            .expect("missing block should return structured error");
-
-        assert_header_refresh_metadata(&error, ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable));
-        assert!(response.stream_id.is_none());
-    }
-
-    async fn assert_open_read_zero_stamp_error() {
-        let (_temp, store, core) = core_with_store(512, 2048);
-        publish_ready_block(&store, payload(), BLOCK_STAMP);
-        let service = registered_data_service(Arc::new(core));
-
-        let response = service
-            .open_read_stream(tonic::Request::new(open_read_proto(0, 1024, 0, 512)))
-            .await
-            .expect("open read response")
-            .into_inner();
-        let error = response
-            .header
-            .expect("header")
-            .error
-            .expect("zero stamp should return structured error");
-
-        assert_header_fail(&error, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
-        assert!(error.message.contains("block_stamp"));
-        assert!(response.stream_id.is_none());
-    }
-
-    #[tokio::test]
-    async fn read_stream_returns_data_frames() {
-        let (_temp, store, core) = core_with_store(512, 2048);
-        let data = payload();
-        publish_ready_block(&store, data.clone(), BLOCK_STAMP);
-        let service = registered_data_service(Arc::new(core));
-
-        let open = service
-            .open_read_stream(tonic::Request::new(open_read_proto(4, 6, BLOCK_STAMP, 512)))
-            .await
-            .expect("open read response")
-            .into_inner();
-        let stream_id = open.stream_id.expect("stream id");
-        let response_stream = service
-            .read_stream(tonic::Request::new(ReadStreamRequestProto {
-                stream_id: Some(stream_id),
-                max_bytes: 0,
-            }))
-            .await
-            .expect("read stream response")
-            .into_inner();
-        let frames = response_stream
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .expect("stream frames");
-
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].offset_in_block, 4);
-        assert_eq!(frames[0].data, data.slice(4..10));
-        assert!(frames[0].eos);
-    }
-
-    #[tokio::test]
-    async fn read_stream_service_completion_decrements_inflight_once() {
+    async fn read_block_streams_exact_range_and_balances_inflight() {
         let recorder = StreamGaugeRecorder::default();
 
         metrics::with_local_recorder(&recorder, || {
             futures::executor::block_on(async {
                 let (_temp, store, core) = core_with_store(512, 2048);
-                publish_ready_block(&store, payload(), BLOCK_STAMP);
-                let core = Arc::new(core);
-                let service = registered_data_service(Arc::clone(&core));
+                let data = payload();
+                publish_ready_block(&store, data.clone(), BLOCK_STAMP);
+                let service = registered_data_service(Arc::new(core));
 
-                let open = service
-                    .open_read_stream(tonic::Request::new(open_read_proto(
-                        0,
-                        BLOCK_SIZE as u32,
-                        BLOCK_STAMP,
-                        512,
-                    )))
-                    .await
-                    .expect("open read")
-                    .into_inner();
-                let stream_id =
-                    crate::data::convert::proto_to_stream_id(open.stream_id, "stream_id").expect("stream id");
                 let response_stream = service
-                    .read_stream(tonic::Request::new(ReadStreamRequestProto {
-                        stream_id: Some(crate::data::convert::stream_id_to_proto(stream_id)),
-                        max_bytes: 512,
-                    }))
+                    .read_block(tonic::Request::new(read_block_proto(4, 1030, BLOCK_STAMP, 512)))
                     .await
-                    .expect("read stream response")
+                    .expect("read block response")
                     .into_inner();
-                let frames = response_stream
+                let chunks = response_stream
                     .collect::<Vec<_>>()
                     .await
                     .into_iter()
                     .collect::<Result<Vec<_>, _>>()
-                    .expect("read frames");
+                    .expect("read block chunks");
 
-                assert!(frames.last().expect("last frame").eos);
-                assert_eq!(core.stream_manager().active_count().await, 0);
+                assert_eq!(
+                    chunks.iter().map(|chunk| chunk.data.len()).collect::<Vec<_>>(),
+                    [512, 512, 6]
+                );
+                assert_eq!(
+                    chunks.into_iter().flat_map(|chunk| chunk.data).collect::<Bytes>(),
+                    data.slice(4..1034)
+                );
             });
         });
 
@@ -1762,151 +1444,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_stream_response_drop_decrements_inflight_once() {
+    async fn read_block_errors_preserve_structured_worker_actions() {
         let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
-        let core = Arc::new(core);
-        let service = registered_data_service(Arc::clone(&core));
+        let service = registered_data_service(Arc::new(core));
 
-        let open = service
-            .open_read_stream(tonic::Request::new(open_read_proto(
-                0,
-                BLOCK_SIZE as u32,
-                BLOCK_STAMP,
-                512,
-            )))
-            .await
-            .expect("open read")
-            .into_inner();
-        let stream_id = crate::data::convert::proto_to_stream_id(open.stream_id, "stream_id").expect("stream id");
-        let response_stream = service
-            .read_stream(tonic::Request::new(ReadStreamRequestProto {
-                stream_id: Some(crate::data::convert::stream_id_to_proto(stream_id)),
-                max_bytes: 512,
-            }))
-            .await
-            .expect("read stream response")
-            .into_inner();
-
-        drop(response_stream);
-
-        wait_for_active_stream_count(&core, 0).await;
-    }
-
-    #[tokio::test]
-    async fn read_stream_early_drop_does_not_affect_later_read() {
-        let (_temp, store, core) = core_with_store(512, 2048);
-        let data = payload();
-        publish_ready_block(&store, data.clone(), BLOCK_STAMP);
-        let core = Arc::new(core);
-        let service = registered_data_service(Arc::clone(&core));
-
-        let open = service
-            .open_read_stream(tonic::Request::new(open_read_proto(
-                0,
-                BLOCK_SIZE as u32,
-                BLOCK_STAMP,
-                512,
-            )))
-            .await
-            .expect("open first read")
-            .into_inner();
-        let stream_id = open.stream_id.expect("stream id");
-        let mut response_stream = service
-            .read_stream(tonic::Request::new(ReadStreamRequestProto {
-                stream_id: Some(stream_id),
-                max_bytes: 512,
-            }))
-            .await
-            .expect("read stream response")
-            .into_inner();
-        let first = response_stream
-            .next()
-            .await
-            .expect("first frame")
-            .expect("first frame ok");
-        assert_eq!(first.data, data.slice(0..512));
-        assert!(!first.eos);
-
-        drop(response_stream);
-        wait_for_active_stream_count(&core, 0).await;
-
-        let second_open = service
-            .open_read_stream(tonic::Request::new(open_read_proto(
-                0,
-                BLOCK_SIZE as u32,
-                BLOCK_STAMP,
-                512,
-            )))
-            .await
-            .expect("open second read")
-            .into_inner();
-        let second_stream = service
-            .read_stream(tonic::Request::new(ReadStreamRequestProto {
-                stream_id: second_open.stream_id,
-                max_bytes: 512,
-            }))
-            .await
-            .expect("second read stream")
-            .into_inner();
-        let frames = second_stream
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .expect("second read frames");
-        let mut reread = Vec::new();
-        for frame in &frames {
-            reread.extend_from_slice(&frame.data);
+        for (request, expected_kind, expected_recovery) in [
+            (
+                read_block_proto(0, 8, BLOCK_STAMP + 1, 512),
+                ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
+                "refresh",
+            ),
+            (
+                read_block_proto(0, 8, 0, 512),
+                ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument),
+                "fail",
+            ),
+        ] {
+            let status = match service.read_block(tonic::Request::new(request)).await {
+                Ok(_) => panic!("invalid read unexpectedly succeeded"),
+                Err(status) => status,
+            };
+            let error = structured_status_error(status);
+            assert_eq!(error.kind, expected_kind);
+            match expected_recovery {
+                "refresh" => assert!(matches!(error.recovery, RecoveryAction::RefreshMetadata { .. })),
+                "fail" => assert!(matches!(error.recovery, RecoveryAction::Fail)),
+                _ => unreachable!(),
+            }
         }
 
-        assert_eq!(Bytes::from(reread), data);
-        assert!(frames.last().expect("last frame").eos);
-        assert_eq!(core.stream_manager().active_count().await, 0);
+        let mut stream = service
+            .read_block(tonic::Request::new(read_block_proto(0, 8, BLOCK_STAMP, 512)))
+            .await
+            .expect("start valid read")
+            .into_inner();
+        std::fs::remove_file(store.paths(&group_name(), block_id()).data_path).expect("remove block data");
+        let status = stream
+            .next()
+            .await
+            .expect("stream error item")
+            .expect_err("missing data must fail the response stream");
+        let error = structured_status_error(status);
+        assert!(matches!(error.recovery, RecoveryAction::Fail));
+
+        let (_temp, _store, core) = core_with_store(512, 2048);
+        let service = registered_data_service(Arc::new(core));
+        let status = match service
+            .read_block(tonic::Request::new(read_block_proto(0, 8, BLOCK_STAMP, 512)))
+            .await
+        {
+            Ok(_) => panic!("missing block unexpectedly succeeded"),
+            Err(status) => status,
+        };
+        let error = structured_status_error(status);
+        assert_eq!(error.kind, ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable));
+        assert!(matches!(error.recovery, RecoveryAction::RefreshMetadata { .. }));
     }
 
     #[tokio::test]
-    async fn read_stream_store_error_decrements_inflight_once() {
+    async fn dropping_read_block_response_releases_inflight_once() {
         let recorder = StreamGaugeRecorder::default();
 
         metrics::with_local_recorder(&recorder, || {
             futures::executor::block_on(async {
                 let (_temp, store, core) = core_with_store(512, 2048);
                 publish_ready_block(&store, payload(), BLOCK_STAMP);
-                let paths = store.paths(&group_name(), block_id());
-                let core = Arc::new(core);
-                let service = registered_data_service(Arc::clone(&core));
+                let service = registered_data_service(Arc::new(core));
 
-                let open = service
-                    .open_read_stream(tonic::Request::new(open_read_proto(
+                let response_stream = service
+                    .read_block(tonic::Request::new(read_block_proto(
                         0,
                         BLOCK_SIZE as u32,
                         BLOCK_STAMP,
                         512,
                     )))
                     .await
-                    .expect("open read")
+                    .expect("read block response")
                     .into_inner();
-                let stream_id =
-                    crate::data::convert::proto_to_stream_id(open.stream_id, "stream_id").expect("stream id");
-                std::fs::remove_file(paths.data_path).expect("remove ready data file");
-
-                let response_stream = service
-                    .read_stream(tonic::Request::new(ReadStreamRequestProto {
-                        stream_id: Some(crate::data::convert::stream_id_to_proto(stream_id)),
-                        max_bytes: 512,
-                    }))
-                    .await
-                    .expect("read stream response")
-                    .into_inner();
-                let result = response_stream
-                    .collect::<Vec<_>>()
-                    .await
-                    .into_iter()
-                    .collect::<Result<Vec<_>, _>>();
-
-                assert!(result.is_err());
-                assert_eq!(core.stream_manager().active_count().await, 0);
+                drop(response_stream);
             });
         });
 
@@ -1914,60 +1530,6 @@ mod tests {
             recorder.stream_values(),
             vec![("read".to_string(), 1.0), ("read".to_string(), -1.0)]
         );
-    }
-
-    #[tokio::test]
-    async fn service_read_stream_rejects_missing_stream() {
-        let (_temp, _store, core) = core_with_store(512, 2048);
-        let service = registered_data_service(Arc::new(core));
-
-        let read_status = match service
-            .read_stream(tonic::Request::new(ReadStreamRequestProto {
-                stream_id: Some(test_stream_id_proto()),
-                max_bytes: 1024,
-            }))
-            .await
-        {
-            Ok(_) => panic!("ReadStream unexpectedly succeeded"),
-            Err(status) => status,
-        };
-        assert_eq!(read_status.code(), tonic::Code::NotFound);
-    }
-
-    #[tokio::test]
-    async fn stream_manager_register_get_touch_remove_and_cleanup() {
-        let manager = StreamManager::new(Duration::from_millis(50));
-        let mut state = StreamState::new(stream_context());
-        state.context.mode = StreamMode::Write;
-        state.last_activity = Instant::now() - Duration::from_secs(10);
-
-        assert!(manager.register_write(state.clone()));
-        assert_eq!(manager.active_count().await, 1);
-        assert_eq!(manager.get(stream_id()).await.unwrap().context.stream_id, stream_id());
-
-        drop(manager.begin_operation(stream_id()).await.expect("begin operation"));
-        let touched = manager.get(stream_id()).await.unwrap();
-        assert!(touched.last_activity > state.last_activity);
-
-        let operation = manager.begin_retirement(stream_id()).await.expect("retire stream");
-        manager.complete_retirement(stream_id(), &operation);
-        assert_eq!(manager.active_count().await, 0);
-
-        let mut idle = StreamState::new(stream_context());
-        idle.context.mode = StreamMode::Write;
-        idle.last_activity = Instant::now() - Duration::from_secs(10);
-        assert!(manager.register_write(idle));
-        assert_eq!(manager.take_cleanup_batch(1, false, None), vec![stream_id()]);
-        let operation = manager.begin_retirement(stream_id()).await.expect("retire idle stream");
-        manager.complete_retirement(stream_id(), &operation);
-        assert_eq!(manager.active_count().await, 0);
-    }
-
-    #[tokio::test]
-    #[should_panic(expected = "write stream registration requires write mode")]
-    async fn stream_manager_rejects_unpinned_read_registration() {
-        let manager = StreamManager::with_default_timeout();
-        manager.register_write(StreamState::new(stream_context()));
     }
 
     #[derive(Default)]

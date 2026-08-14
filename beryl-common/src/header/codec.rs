@@ -24,6 +24,10 @@ pub const HEADER_GRPC_TIMEOUT: &str = "grpc-timeout";
 pub const HEADER_PRE_HANDLER_REJECTION: &str = "beryl-pre-handler-rejection";
 /// Marker value for pre-handler request-concurrency rejection.
 pub const PRE_HANDLER_REJECTION_RPC_CONCURRENCY: &str = "rpc-concurrency";
+/// Identifies structured Worker data errors encoded in gRPC status details.
+pub const HEADER_WORKER_DATA_ERROR_DETAIL: &str = "beryl-worker-data-error-detail";
+/// Version marker for `DataResponseHeaderProto` encoded in status details.
+pub const WORKER_DATA_ERROR_DETAIL_V1: &str = "v1";
 
 /// Codec for RequestHeader header encoding/decoding.
 pub struct RequestHeaderCodec;

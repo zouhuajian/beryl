@@ -7,9 +7,8 @@ use beryl_common::header::RequestHeader;
 use beryl_proto::common::{BlockIdProto, ByteRangeProto, FencingTokenProto, StreamIdProto, TierProto};
 use beryl_proto::convert as proto_convert;
 use beryl_proto::worker::{
-    AbortWriteRequestProto, CommitWriteRequestProto, DataRequestHeaderProto, OpenReadStreamRequestProto,
-    OpenWriteStreamRequestProto, ReadStreamResponseProto, SyncCommittedBlockRequestProto, WriteStreamRequestProto,
-    WriteStreamResponseProto,
+    AbortWriteRequestProto, CommitWriteRequestProto, DataRequestHeaderProto, OpenWriteStreamRequestProto,
+    ReadBlockRequestProto, SyncCommittedBlockRequestProto, WriteStreamRequestProto, WriteStreamResponseProto,
 };
 use beryl_types::chunk::ByteRange;
 use beryl_types::ids::{BlockId, StreamId};
@@ -18,8 +17,8 @@ use beryl_types::lease::FencingToken;
 use beryl_types::{GroupName, WorkerRunId};
 
 use crate::data::core::{
-    AbortWriteRequest, CommitWriteRequest, ReadFrame, ReadOpenRequest, SyncCommittedBlockRequest, WorkerCoreResult,
-    WriteFrame, WriteFrameResult, WriteOpenRequest,
+    AbortWriteRequest, CommitWriteRequest, ReadBlockRequest, SyncCommittedBlockRequest, WorkerCoreResult, WriteFrame,
+    WriteFrameResult, WriteOpenRequest,
 };
 use crate::error::WorkerError;
 use crate::store::block::ChecksumKind;
@@ -44,32 +43,12 @@ pub fn block_id_to_proto(block_id: BlockId) -> BlockIdProto {
     block_id.into()
 }
 
-pub fn byte_range_to_proto(byte_range: ByteRange) -> ByteRangeProto {
-    byte_range.into()
-}
-
 pub fn fencing_token_to_proto(token: FencingToken) -> FencingTokenProto {
     token.into()
 }
 
 pub fn request_header_to_data_proto(ctx: &RequestHeader) -> DataRequestHeaderProto {
     ctx.into()
-}
-
-pub fn read_open_request_to_proto(req: ReadOpenRequest, ctx: &RequestHeader) -> OpenReadStreamRequestProto {
-    OpenReadStreamRequestProto {
-        header: Some(request_header_to_data_proto(ctx)),
-        group_name: req.group_name.to_string(),
-        block_id: Some(block_id_to_proto(req.block_id)),
-        byte_range: Some(byte_range_to_proto(req.byte_range)),
-        block_stamp: req.block_stamp,
-        frame_size: req.frame_size,
-        worker_run_id: req.worker_run_id.to_string(),
-        block_format_id: req.block_format_id.as_raw(),
-        block_size: req.block_size,
-        chunk_size: req.chunk_size,
-        effective_len: req.effective_len,
-    }
 }
 
 pub fn write_open_request_to_proto(req: WriteOpenRequest, ctx: &RequestHeader) -> OpenWriteStreamRequestProto {
@@ -142,15 +121,6 @@ pub fn abort_write_request_to_proto(req: AbortWriteRequest, ctx: &RequestHeader)
     }
 }
 
-pub fn proto_to_read_frame(proto: ReadStreamResponseProto) -> ReadFrame {
-    ReadFrame {
-        offset_in_block: proto.offset_in_block,
-        data: proto.data,
-        checksum32: 0,
-        eos: proto.eos,
-    }
-}
-
 pub fn proto_to_write_frame_result(proto: WriteStreamResponseProto) -> WriteFrameResult {
     WriteFrameResult {
         accepted: proto.accepted,
@@ -159,20 +129,18 @@ pub fn proto_to_write_frame_result(proto: WriteStreamResponseProto) -> WriteFram
     }
 }
 
-pub fn proto_to_read_open_request(proto: OpenReadStreamRequestProto) -> WorkerCoreResult<ReadOpenRequest> {
+pub(crate) fn proto_to_read_block_request(proto: ReadBlockRequestProto) -> WorkerCoreResult<ReadBlockRequest> {
     let group_name = proto_to_group_name(&proto.group_name, "group_name")?;
     let block_id = proto_to_block_id(proto.block_id, "block_id")?;
     let byte_range = proto
         .byte_range
         .ok_or_else(|| WorkerError::InvalidArgument("missing byte_range".to_string()))?;
-    let worker_run_id = proto_to_worker_run_id(&proto.worker_run_id)?;
     let block_format_id = BlockFormatId::from_raw(proto.block_format_id)
         .map_err(|err| WorkerError::InvalidArgument(format!("block_format_id invalid: {err}")))?;
 
-    Ok(ReadOpenRequest {
+    Ok(ReadBlockRequest {
         group_name,
         block_id,
-        worker_run_id,
         byte_range: proto_to_byte_range(&byte_range),
         block_stamp: proto.block_stamp,
         block_format_id,
@@ -306,8 +274,8 @@ fn proto_to_group_name(value: &str, field_name: &str) -> WorkerCoreResult<GroupN
 mod tests {
     use beryl_proto::common::{BlockIdProto, ByteRangeProto, ClientInfoProto, FencingTokenProto, StreamIdProto};
     use beryl_proto::worker::{
-        AbortWriteRequestProto, CommitWriteRequestProto, DataRequestHeaderProto, OpenReadStreamRequestProto,
-        OpenWriteStreamRequestProto, SyncCommittedBlockRequestProto, WriteStreamRequestProto,
+        AbortWriteRequestProto, CommitWriteRequestProto, DataRequestHeaderProto, OpenWriteStreamRequestProto,
+        ReadBlockRequestProto, SyncCommittedBlockRequestProto, WriteStreamRequestProto,
     };
     use beryl_types::chunk::ByteRange;
     use beryl_types::ids::{BlockId, BlockIndex, ClientId, InodeId, StreamId};
@@ -316,7 +284,7 @@ mod tests {
     use bytes::Bytes;
 
     use crate::data::convert::{
-        proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_open_request,
+        proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_block_request,
         proto_to_sync_committed_block_request, proto_to_write_frame, proto_to_write_open_request,
     };
     use crate::store::block::ChecksumKind;
@@ -371,8 +339,8 @@ mod tests {
         "550e8400-e29b-41d4-a716-446655440000".parse().unwrap()
     }
 
-    fn open_read_proto(offset: u64, len: u32, block_stamp: u64, frame_size: u32) -> OpenReadStreamRequestProto {
-        OpenReadStreamRequestProto {
+    fn read_block_proto(offset: u64, len: u32, block_stamp: u64, frame_size: u32) -> ReadBlockRequestProto {
+        ReadBlockRequestProto {
             header: Some(test_header()),
             group_name: "root".to_string(),
             block_id: Some(test_block_id_proto()),
@@ -435,16 +403,15 @@ mod tests {
         }
     }
 
-    fn assert_open_read_request_conversion() {
-        let request = open_read_proto(128, 4096, 0, 8192);
+    fn assert_read_block_request_conversion() {
+        let request = read_block_proto(128, 4096, 0, 8192);
 
-        let domain = proto_to_read_open_request(request).unwrap();
+        let domain = proto_to_read_block_request(request).unwrap();
 
         assert_eq!(domain.group_name, group_name());
         assert_eq!(domain.block_id, block_id());
         assert_eq!(domain.byte_range, ByteRange { offset: 128, len: 4096 });
         assert_eq!(domain.block_stamp, 0);
-        assert_eq!(domain.worker_run_id, test_worker_run_id());
         assert_eq!(domain.block_format_id, BlockFormatId::FULL_EFFECTIVE);
         assert_eq!(domain.block_size, BLOCK_SIZE);
         assert_eq!(domain.chunk_size, CHUNK_SIZE);
@@ -546,7 +513,7 @@ mod tests {
 
     #[test]
     fn converts_valid_data_plane_requests_to_domain() {
-        assert_open_read_request_conversion();
+        assert_read_block_request_conversion();
         assert_open_write_request_conversion();
         assert_write_frame_conversion_without_copying_payload();
         assert_commit_and_abort_request_conversion();
@@ -557,7 +524,7 @@ mod tests {
     fn conversion_reports_missing_required_fields_without_panic() {
         assert_unknown_block_format_is_rejected();
 
-        let read_err = proto_to_read_open_request(OpenReadStreamRequestProto {
+        let read_err = proto_to_read_block_request(ReadBlockRequestProto {
             header: Some(test_header()),
             group_name: "root".to_string(),
             block_id: None,
@@ -573,7 +540,7 @@ mod tests {
         .unwrap_err();
         assert!(read_err.to_string().contains("missing block_id"));
 
-        let read_err = proto_to_read_open_request(OpenReadStreamRequestProto {
+        let read_err = proto_to_read_block_request(ReadBlockRequestProto {
             header: Some(test_header()),
             group_name: String::new(),
             block_id: Some(test_block_id_proto()),
@@ -589,7 +556,7 @@ mod tests {
         .unwrap_err();
         assert!(read_err.to_string().contains("missing group_name"));
 
-        let read_err = proto_to_read_open_request(OpenReadStreamRequestProto {
+        let read_err = proto_to_read_block_request(ReadBlockRequestProto {
             header: Some(test_header()),
             group_name: "Root".to_string(),
             block_id: Some(test_block_id_proto()),

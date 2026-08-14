@@ -23,6 +23,7 @@ use crate::runtime::AttemptContext;
 /// Stream identifiers and endpoint details stay inside the implementation.
 #[async_trait]
 pub(crate) trait WorkerDataClient: Send + Sync {
+    /// Reads one metadata-planned block-local range with exact-length semantics.
     async fn read_block_range(
         &self,
         attempt: AttemptContext,
@@ -71,15 +72,10 @@ pub(crate) struct WorkerWriteTarget {
     pub(crate) target: WriteTarget,
 }
 
-/// Worker OpenReadStream evidence plus the bytes read from that stream.
+/// Exact bytes returned for one metadata-planned block-local range.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WorkerReadResult {
-    /// Bytes returned for the planned block read.
     pub(crate) bytes: Bytes,
-    /// Worker-observed block stamp from OpenReadStream.
-    pub(crate) block_stamp: u64,
-    /// Worker-observed readable committed prefix from OpenReadStream.
-    pub(crate) committed_length: u64,
 }
 
 /// Worker block write handle returned by OpenWriteStream.

@@ -19,9 +19,9 @@ import "worker/data_header.proto";
 // StorageChunk and TransportFrame are intentionally not encoded as the same
 // message.
 
-message OpenReadStreamRequestProto {
+message ReadBlockRequestProto {
   // Low-frequency data-plane control header.
-  // High-frequency ReadStream frames must not carry this header.
+  // High-frequency ReadBlock chunks must not carry this header.
   worker.DataRequestHeaderProto header = 1;
 
   // Target block. Worker data-plane APIs are block-local and must not parse
@@ -38,7 +38,7 @@ message OpenReadStreamRequestProto {
   uint64 block_stamp = 4;
 
   // Client-preferred transport frame payload size in bytes.
-  // The worker may clamp or adjust it and returns the accepted value.
+  // The worker may clamp it to its configured maximum.
   // This is not the worker-local StorageChunk size.
   uint32 frame_size = 5;
 
@@ -55,35 +55,11 @@ message OpenReadStreamRequestProto {
   string group_name = 11;
 }
 
-message OpenReadStreamResponseProto {
-  // Structured result for stream open.
-  // Business/protocol errors are encoded here with gRPC OK.
-  worker.DataResponseHeaderProto header = 1;
-
-  // Stream session allocated by the worker. Valid only when header is OK.
-  common.StreamIdProto stream_id = 2;
-
-  // Worker-accepted transport frame payload size in bytes.
-  // This controls network batching only and does not affect on-disk format.
-  uint32 frame_size = 3;
-
-  // Worker's current logical block stamp.
-  uint64 block_stamp = 4;
-
-  // Block-local readable committed prefix length in bytes.
-  // This is not the sum of ready chunks.
-  uint64 committed_length = 5;
-}
-
-message ReadStreamRequestProto {
-  common.StreamIdProto stream_id = 1;
-  uint32 max_bytes = 2;
-}
-
-message ReadStreamResponseProto {
-  uint64 offset_in_block = 1;
-  bytes data = 2;
-  bool eos = 3;
+// One ordered payload from a ReadBlock response stream. Normal stream
+// completion is the only end-of-stream marker; the client validates the exact
+// requested byte count.
+message ReadBlockChunkProto {
+  bytes data = 1;
 }
 
 message OpenWriteStreamRequestProto {
@@ -242,11 +218,8 @@ message AbortWriteResponseProto {
 }
 
 service WorkerDataService {
-  rpc OpenReadStream(OpenReadStreamRequestProto)
-      returns (OpenReadStreamResponseProto);
-
-  rpc ReadStream(ReadStreamRequestProto)
-      returns (stream ReadStreamResponseProto);
+  rpc ReadBlock(ReadBlockRequestProto)
+      returns (stream ReadBlockChunkProto);
 
   rpc OpenWriteStream(OpenWriteStreamRequestProto)
       returns (OpenWriteStreamResponseProto);

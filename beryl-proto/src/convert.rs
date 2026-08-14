@@ -1501,7 +1501,7 @@ mod tests {
 
         assert_message_fields(
             &descriptors,
-            "worker.OpenReadStreamRequestProto",
+            "worker.ReadBlockRequestProto",
             &[
                 ("header", 1),
                 ("block_id", 2),

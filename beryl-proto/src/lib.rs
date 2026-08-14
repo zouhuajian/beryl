@@ -17,6 +17,11 @@
 //! - Do NOT use wildcard imports or re-export all types from a module.
 //! - The `convert` module provides bidirectional conversions between proto types and domain types.
 
+/// Maximum payload carried by one Worker data message.
+pub const MAX_WORKER_DATA_FRAME_SIZE: u32 = 4 * 1024 * 1024;
+/// Maximum encoded Worker data message, including bounded identity and offset fields.
+pub const MAX_WORKER_DATA_MESSAGE_SIZE: usize = MAX_WORKER_DATA_FRAME_SIZE as usize + 1024;
+
 // Common types (IDs, headers, etc.)
 // Package: common
 pub mod common {

@@ -5,13 +5,12 @@ use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use beryl_types::chunk::ByteRange;
 use beryl_types::ids::{BlockId, BlockIndex, ClientId, InodeId};
 use beryl_types::layout::BlockFormatId;
 use beryl_types::lease::FencingToken;
 use beryl_types::{GroupName, Tier, WorkerRunId};
 use beryl_worker::store::block::{ChecksumKind, FullBlockFileStore, FullBlockFileStoreConfig};
-use beryl_worker::{CommitWriteRequest, ReadOpenRequest, WorkerCore, WriteFrame, WriteOpenRequest};
+use beryl_worker::{CommitWriteRequest, WorkerCore, WriteFrame, WriteOpenRequest};
 use bytes::Bytes;
 use tempfile::TempDir;
 use tracing::instrument::WithSubscriber;
@@ -187,75 +186,4 @@ async fn open_write_and_commit_emit_state_and_block_logs_without_info_frame_logs
             .all(|log| log["op"] != "WriteStreamFrame"),
         "{logs:?}"
     );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn open_read_does_not_emit_state_change_log() {
-    let _log_guard = log_test_mutex().lock().await;
-    let temp_dir = TempDir::new().expect("temp dir");
-    let core = core(&temp_dir);
-    let open = core.open_write(open_request()).await.expect("open write");
-    core.write_frame(WriteFrame {
-        stream_id: open.stream_id,
-        seq: 1,
-        offset_in_block: 0,
-        data: Bytes::from(vec![1; 1024]),
-        checksum32: 0,
-    })
-    .await
-    .expect("write frame");
-    core.commit_write(CommitWriteRequest {
-        stream_id: open.stream_id,
-        group_name: group_name(),
-        block_id: block_id(),
-        worker_run_id: worker_run_id(),
-        token: token(),
-        commit_seq: 1,
-        effective_len: 1024,
-        block_stamp: 11,
-        block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
-        block_size: 4096,
-        chunk_size: 4096,
-        require_sync: true,
-    })
-    .await
-    .expect("commit write");
-
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let writer = LogCaptureWriter::new(Arc::clone(&output));
-    let subscriber = Registry::default().with(
-        fmt::layer()
-            .json()
-            .flatten_event(true)
-            .with_current_span(false)
-            .with_span_list(false)
-            .with_ansi(false)
-            .with_target(true)
-            .with_file(false)
-            .with_line_number(false)
-            .with_writer(move || writer.clone()),
-    );
-
-    let dispatch = tracing::Dispatch::new(subscriber);
-    async {
-        core.open_read(ReadOpenRequest {
-            group_name: group_name(),
-            block_id: block_id(),
-            worker_run_id: worker_run_id(),
-            byte_range: ByteRange { offset: 0, len: 16 },
-            block_stamp: 11,
-            block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
-            block_size: 4096,
-            chunk_size: 4096,
-            effective_len: 1024,
-            frame_size: 1024,
-        })
-        .await
-        .expect("open read");
-    }
-    .with_subscriber(dispatch.clone())
-    .await;
-
-    let logs = captured_logs(&output);
-    assert!(logs.iter().all(|log| log["target"] != "worker.state"), "{logs:?}");
 }
