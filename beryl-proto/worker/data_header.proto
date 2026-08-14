@@ -13,7 +13,7 @@ import "common/errors.proto";
 // ============================================================================
 
 // DataRequestHeaderProto is carried by low-frequency worker data-plane control
-// operations such as OpenRead, OpenWrite, CommitWrite, AbortWrite, and
+// operations such as ReadBlock, OpenWrite, CommitWrite, AbortWrite, and
 // SyncCommittedBlock.
 //
 // Hot-path stream frames intentionally do not carry this header. Stream
@@ -30,6 +30,8 @@ message DataRequestHeaderProto {
 /// Response header for data-plane operations.
 /// Recoverable business or protocol errors use common.ErrorDetailProto and may
 /// be returned with gRPC OK.
+/// ReadBlock errors encode this header in non-OK status details and identify
+/// its version with the beryl-worker-data-error-detail metadata marker.
 /// Transport or framework errors may still use non-OK gRPC status.
 message DataResponseHeaderProto {
   /// Client information (call_id, client_id, client_name).

@@ -8,24 +8,13 @@ use std::sync::{Arc, Mutex};
 
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
 use beryl_types::ids::BlockId;
-use beryl_types::layout::{BlockFormatId, BlockShape};
+use beryl_types::layout::BlockShape;
 use beryl_types::GroupName;
 use tokio::sync::Notify;
 
-use crate::data::core::{ReadOpenRequest, WorkerCoreResult};
+use crate::data::core::{ReadBlockRequest, WorkerCoreResult};
 use crate::error::WorkerError;
 use crate::store::block::{BlockState, LocalBlockStore};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadBlockSnapshot {
-    pub group_name: GroupName,
-    pub block_id: BlockId,
-    pub effective_len: u64,
-    pub block_stamp: u64,
-    pub block_format_id: BlockFormatId,
-    pub block_size: u64,
-    pub chunk_size: u32,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct BlockAccessKey {
@@ -63,11 +52,11 @@ pub(crate) struct ReclaimingBlock {
     pub block_stamp: u64,
 }
 
-/// RAII guard that keeps a Ready block available for one complete read stream.
+/// RAII guard that keeps a Ready block available for one complete read RPC.
 ///
 /// The guard is acquired before local metadata validation so cleanup cannot pass
-/// between validation and stream registration. Dropping the active stream
-/// releases the pin after any in-progress read call drops its clone.
+/// between validation and response-stream ownership. A blocking read clones the
+/// guard so cancellation cannot release reclamation before filesystem IO exits.
 #[derive(Clone, Debug)]
 pub(crate) struct ReadPin {
     _inner: Arc<ReadPinInner>,
@@ -323,7 +312,7 @@ pub struct BlockManager {
 
 impl BlockManager {
     pub const DEFAULT_FRAME_SIZE: u32 = 1024 * 1024;
-    pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
+    pub const MAX_FRAME_SIZE: u32 = beryl_proto::MAX_WORKER_DATA_FRAME_SIZE;
     pub fn new(default_frame_size: u32, max_frame_size: u32) -> Self {
         Self {
             default_frame_size,
@@ -344,7 +333,7 @@ impl BlockManager {
         self.max_frame_size
     }
 
-    /// Pins a block before read validation and holds it through stream teardown.
+    /// Pins a block before read validation and holds it through the `ReadBlock` response lifetime.
     pub(crate) fn pin_read(&self, group_name: &GroupName, block_id: BlockId) -> WorkerCoreResult<ReadPin> {
         self.access.pin_read(BlockAccessKey {
             group_name: group_name.clone(),
@@ -352,7 +341,7 @@ impl BlockManager {
         })
     }
 
-    /// Prevents new readers and waits for existing stream pins before cleanup.
+    /// Prevents new readers and waits for existing `ReadBlock` pins before cleanup.
     pub(crate) async fn begin_reclaim(
         &self,
         group_name: &GroupName,
@@ -380,19 +369,13 @@ impl BlockManager {
         self.access.wait_for_block_report_change().await;
     }
 
-    pub fn validate_read(
+    /// Validates local Ready state against metadata facts while the caller holds a read pin.
+    pub(crate) fn validate_read(
         &self,
         store: &(dyn LocalBlockStore + Send + Sync),
-        req: &ReadOpenRequest,
-    ) -> WorkerCoreResult<ReadBlockSnapshot> {
-        if req.block_stamp == 0 {
-            return Err(WorkerError::InvalidArgument(
-                "block_stamp must be metadata-assigned and non-zero".to_string(),
-            ));
-        }
-        BlockShape::new(req.block_format_id, req.block_size, req.chunk_size, req.effective_len)
-            .map_err(|err| WorkerError::InvalidArgument(err.to_string()))?;
-
+        req: &ReadBlockRequest,
+    ) -> WorkerCoreResult<()> {
+        self.validate_read_request(req)?;
         let meta = match store.load_meta(&req.group_name, req.block_id) {
             Ok(meta) => meta,
             Err(WorkerError::NotFound(message)) => {
@@ -403,7 +386,6 @@ impl BlockManager {
             }
             Err(error) => return Err(error),
         };
-
         if meta.visibility.block_state != BlockState::Ready {
             return Err(Self::refresh_metadata(
                 ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
@@ -457,16 +439,31 @@ impl BlockManager {
             )));
         }
 
-        Ok(ReadBlockSnapshot {
-            group_name: req.group_name.clone(),
-            block_id: req.block_id,
-            effective_len: meta.source.effective_len,
-            block_stamp: meta.visibility.block_stamp,
-            block_format_id: meta.format.format_id,
-            block_size: meta.format.block_size,
-            chunk_size: u32::try_from(meta.format.chunk_size)
-                .map_err(|_| WorkerError::Corrupt("local chunk_size does not fit u32".to_string()))?,
-        })
+        Ok(())
+    }
+
+    /// Rejects malformed or internally inconsistent read authority before pinning.
+    pub(crate) fn validate_read_request(&self, req: &ReadBlockRequest) -> WorkerCoreResult<()> {
+        if req.block_stamp == 0 {
+            return Err(WorkerError::InvalidArgument(
+                "block_stamp must be metadata-assigned and non-zero".to_string(),
+            ));
+        }
+        BlockShape::new(req.block_format_id, req.block_size, req.chunk_size, req.effective_len)
+            .map_err(|err| WorkerError::InvalidArgument(err.to_string()))?;
+
+        let range_end = req
+            .byte_range
+            .offset
+            .checked_add(u64::from(req.byte_range.len))
+            .ok_or_else(|| WorkerError::InvalidArgument("byte range offset overflow".to_string()))?;
+        if req.byte_range.offset > req.effective_len || range_end > req.effective_len {
+            return Err(WorkerError::InvalidArgument(format!(
+                "byte range exceeds expected block length: offset={}, len={}, effective_len={}",
+                req.byte_range.offset, req.byte_range.len, req.effective_len
+            )));
+        }
+        Ok(())
     }
 
     fn refresh_metadata(kind: ErrorKind, message: String) -> WorkerError {

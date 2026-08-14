@@ -13,9 +13,8 @@ pub mod runtime;
 pub mod store;
 
 pub use data::core::{
-    AbortWriteRequest, AbortWriteResult, CommitWriteRequest, CommitWriteResult, RangeMapper, ReadFrame,
-    ReadOpenRequest, ReadOpenResult, StorageChunkSlice, StreamContext, StreamMode, WorkerCore, WorkerCoreResult,
-    WriteFrame, WriteOpenRequest, WriteOpenResult,
+    AbortWriteRequest, AbortWriteResult, CommitWriteRequest, CommitWriteResult, RangeMapper, StorageChunkSlice,
+    WorkerCore, WorkerCoreResult, WriteFrame, WriteOpenRequest, WriteOpenResult, WriteStreamContext,
 };
 pub use error::{ErrorMetadata, WorkerError};
 pub use runtime::block::BlockManager;

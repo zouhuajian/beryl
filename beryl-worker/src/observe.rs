@@ -445,7 +445,7 @@ mod tests {
         record_store_writable("hdd0", true);
         record_store_blocks("hdd0", 1);
         record_store_io("read", "ok", "none", 1, 0.003);
-        record_data_rpc("open_read_stream", "ok", "none", 0.004);
+        record_data_rpc("read_block", "ok", "none", 0.004);
         record_stream_open("read", "ok", "none");
         increment_stream_inflight("read");
         decrement_stream_inflight("read");

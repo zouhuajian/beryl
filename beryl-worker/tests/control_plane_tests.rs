@@ -19,11 +19,14 @@ use beryl_proto::metadata::{
     BlockReportRequestProto, BlockReportResponseProto, HeartbeatRequestProto, HeartbeatResponseProto,
     RegisterWorkerRequestProto, RegisterWorkerResponseProto,
 };
+use beryl_proto::worker::worker_data_service_server::WorkerDataService;
+use beryl_proto::worker::ReadBlockRequestProto;
 use beryl_types::chunk::ByteRange;
 use beryl_types::ids::{BlockId, BlockIndex, ClientId, InodeId, WorkerId};
 use beryl_types::layout::BlockFormatId;
 use beryl_types::{GroupName, Tier, TierFree, WorkerRunId, MAX_REPORT_ENTRIES};
 use bytes::Bytes;
+use futures::StreamExt;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
@@ -38,12 +41,13 @@ use beryl_worker::control::{
 };
 use beryl_worker::net::config::WorkerNetConfig;
 use beryl_worker::net::protocol::WorkerNetProtocol;
+use beryl_worker::net::server::grpc::WorkerDataServiceImpl;
 use beryl_worker::store::block::{
     ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
     PublishReadyRequest, ReclaimBlockRequest,
 };
 use beryl_worker::store::dirs::{StoreDirs, StoreReport};
-use beryl_worker::{ReadOpenRequest, WorkerCore};
+use beryl_worker::WorkerCore;
 
 const BLOCK_SIZE: u64 = 4096;
 const CHUNK_SIZE: u32 = 1024;
@@ -1233,21 +1237,24 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_remove() {
     )
     .expect("block reporter");
 
-    let read = core
-        .open_read(ReadOpenRequest {
-            group_name: group_name(),
-            block_id: block_id(),
-            worker_run_id,
-            byte_range: ByteRange { offset: 0, len: 1 },
+    let service = WorkerDataServiceImpl::new(Arc::clone(&core), Arc::clone(&state));
+    let read = service
+        .read_block(Request::new(ReadBlockRequestProto {
+            header: None,
+            group_name: group_name().to_string(),
+            block_id: Some(block_id().into()),
+            worker_run_id: worker_run_id.to_string(),
+            byte_range: Some(ByteRange { offset: 0, len: 1 }.into()),
             block_stamp: 101,
-            block_format_id: BlockFormatId::FULL_EFFECTIVE,
+            block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
             block_size: BLOCK_SIZE,
             chunk_size: CHUNK_SIZE,
             effective_len: BLOCK_SIZE,
             frame_size: 1024,
-        })
+        }))
         .await
-        .expect("open pinned read");
+        .expect("start pinned read")
+        .into_inner();
     reporter.send_full_once().await.expect("publish Ready baseline");
     heartbeat
         .send_once(HeartbeatSnapshot::default())
@@ -1272,11 +1279,13 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_remove() {
     .await
     .expect("cleanup must become Deleting while the read pin is active");
 
-    let frames = core
-        .read_stream(read.stream_id, 1024)
+    let chunks = read
+        .collect::<Vec<_>>()
         .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
         .expect("finish pinned read");
-    assert!(frames.last().is_some_and(|frame| frame.eos));
+    assert_eq!(chunks.len(), 1);
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if store.report().expect("store report").dirs[0].block_count == 0 {

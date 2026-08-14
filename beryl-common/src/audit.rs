@@ -232,7 +232,7 @@ mod tests {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             call_id: "test-call-id".to_string(),
             client_id: 12345,
-            operation: "OpenReadStream".to_string(),
+            operation: "ReadBlock".to_string(),
             path: Some("/test/path".to_string()),
             block_id: Some("1:0".to_string()),
             chunk_ref: None,

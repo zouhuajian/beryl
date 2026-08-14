@@ -345,6 +345,12 @@ impl WorkerConfig {
                 "must be positive and not exceed the maximum frame size",
             ));
         }
+        if self.max_frame_size > beryl_proto::MAX_WORKER_DATA_FRAME_SIZE {
+            return Err(invalid_config(
+                STREAM_MAX_FRAME_SIZE,
+                "exceeds the Worker data protocol maximum",
+            ));
+        }
         if self.block_report_batch_size > beryl_types::MAX_REPORT_ENTRIES {
             return Err(invalid_config(
                 BLOCK_REPORT_BATCH_SIZE,
@@ -673,6 +679,11 @@ mod tests {
         let mut flat = base_flat();
         flat.set(STREAM_FRAME_SIZE, "8MiB");
         flat.set(STREAM_MAX_FRAME_SIZE, "4MiB");
+        assert!(WorkerConfig::from_server_config(&ServerConfig::from_flat(flat)).is_err());
+
+        let mut flat = base_flat();
+        flat.set(STREAM_FRAME_SIZE, "4MiB");
+        flat.set(STREAM_MAX_FRAME_SIZE, "8MiB");
         assert!(WorkerConfig::from_server_config(&ServerConfig::from_flat(flat)).is_err());
 
         for host in ["0.0.0.0", " worker-01", "http://worker-01", "worker-01:19090"] {

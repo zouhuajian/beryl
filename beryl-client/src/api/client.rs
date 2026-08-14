@@ -887,57 +887,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reader_rejects_worker_block_stamp_mismatch() {
-        let gateway = Arc::new(MockGateway::with_layout(layout_response(
-            "root",
-            202,
-            Some(3),
-            16,
-            vec![location(202, 0, 0, 16)],
-        )));
-        let worker = Arc::new(MockDataClient::with_read_block_stamp(b"abcdefghijklmnop", 99));
-        let client = fs_client_with_data_plane(test_config("root"), gateway, data_plane(worker)).expect("client");
-        let reader = read_reader(&client, 16);
-
-        let err = reader
-            .read_at(2, 5)
-            .await
-            .expect_err("worker block_stamp mismatch must fail");
-
-        match &err {
-            ClientError::Action(action) => match action.action() {
-                ClientAction::Refresh { rpc_error, .. } => {
-                    assert_eq!(rpc_error.kind, ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch));
-                }
-                other => panic!("expected refresh action, got {other:?}"),
-            },
-            other => panic!("expected typed action error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn reader_rejects_worker_committed_length_that_does_not_cover_range() {
-        let gateway = Arc::new(MockGateway::with_layout(layout_response(
-            "root",
-            202,
-            Some(3),
-            16,
-            vec![location(202, 0, 0, 16)],
-        )));
-        let worker = Arc::new(MockDataClient::with_read_committed_length(b"abcdefghijklmnop", 6));
-        let client = fs_client_with_data_plane(test_config("root"), gateway, data_plane(worker)).expect("client");
-        let reader = read_reader(&client, 16);
-
-        let err = reader
-            .read_at(2, 5)
-            .await
-            .expect_err("short worker committed_length must fail");
-
-        assert!(matches!(&err, ClientError::InvalidResponse { operation, reason }
-            if *operation == "OpenReadStream" && reason.contains("committed_length")));
-    }
-
-    #[tokio::test]
     async fn reader_repeated_reads_fetch_current_metadata_locations() {
         let gateway = Arc::new(MockGateway::with_layout(layout_response(
             "root",
@@ -2312,8 +2261,6 @@ mod tests {
         write_stream_outcomes: Mutex<VecDeque<WorkerWriteOutcome>>,
         commit_sync_flags: Mutex<Vec<bool>>,
         block_syncs: Mutex<Vec<u64>>,
-        read_block_stamp: Mutex<Option<u64>>,
-        read_committed_length: Mutex<Option<u64>>,
         record_written_body: bool,
         events: Option<EventLog>,
     }
@@ -2331,8 +2278,6 @@ mod tests {
                 write_stream_outcomes: Mutex::new(VecDeque::new()),
                 commit_sync_flags: Mutex::new(Vec::new()),
                 block_syncs: Mutex::new(Vec::new()),
-                read_block_stamp: Mutex::new(None),
-                read_committed_length: Mutex::new(None),
                 record_written_body: true,
                 events: None,
             }
@@ -2348,20 +2293,6 @@ mod tests {
         fn with_refresh_once(file: &'static [u8], kind: ErrorKind) -> Self {
             Self {
                 refresh_once: Mutex::new(Some(kind)),
-                ..Self::from_file(file)
-            }
-        }
-
-        fn with_read_block_stamp(file: &'static [u8], block_stamp: u64) -> Self {
-            Self {
-                read_block_stamp: Mutex::new(Some(block_stamp)),
-                ..Self::from_file(file)
-            }
-        }
-
-        fn with_read_committed_length(file: &'static [u8], committed_length: u64) -> Self {
-            Self {
-                read_committed_length: Mutex::new(Some(committed_length)),
                 ..Self::from_file(file)
             }
         }
@@ -2429,16 +2360,6 @@ mod tests {
             let end = start + block_read.len as usize;
             Ok(WorkerReadResult {
                 bytes: self.file.slice(start..end),
-                block_stamp: self
-                    .read_block_stamp
-                    .lock()
-                    .expect("read block stamp")
-                    .unwrap_or(block_read.block_stamp),
-                committed_length: self
-                    .read_committed_length
-                    .lock()
-                    .expect("read committed length")
-                    .unwrap_or(block_read.block_offset + u64::from(block_read.len)),
             })
         }
 

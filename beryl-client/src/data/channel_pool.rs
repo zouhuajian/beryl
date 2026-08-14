@@ -115,13 +115,13 @@ impl GrpcWorkerChannelPool {
         if !self.enabled {
             self.record_pool_metric(ClientMetric::WorkerChannelPoolMiss, operation, "miss");
             return build_lazy_worker_channel(&key.endpoint)
-                .map(WorkerDataServiceClient::new)
+                .map(configure_worker_data_client)
                 .inspect_err(|_err| {
                     self.record_pool_metric(ClientMetric::ChannelBuildError, operation, "error");
                 });
         }
         let channel = self.channel_for_key(key, operation)?;
-        Ok(WorkerDataServiceClient::new(channel))
+        Ok(configure_worker_data_client(channel))
     }
 
     pub(super) fn invalidate_worker_channel(&self, worker: &WorkerEndpointInfo, reason: CacheInvalidationReason) {
@@ -193,6 +193,13 @@ impl GrpcWorkerChannelPool {
                 .with_outcome(outcome),
         ));
     }
+}
+
+/// Applies the shared Worker data-message bound to every pooled or lazy client.
+fn configure_worker_data_client(channel: tonic_net::Channel) -> WorkerDataServiceClient<tonic_net::Channel> {
+    WorkerDataServiceClient::new(channel)
+        .max_decoding_message_size(beryl_proto::MAX_WORKER_DATA_MESSAGE_SIZE)
+        .max_encoding_message_size(beryl_proto::MAX_WORKER_DATA_MESSAGE_SIZE)
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -494,7 +501,7 @@ mod tests {
         let operation = OperationContext::new_named(
             ClientId::new(7),
             "test-client",
-            "OpenReadStream",
+            "ReadBlock",
             Some("/alpha".to_string()),
             OperationDeadline::new(1_000),
         )

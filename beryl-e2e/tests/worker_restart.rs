@@ -3,7 +3,7 @@
 
 use beryl_client::CreateOptions;
 use beryl_common::error::rpc::{ErrorKind, RecoveryAction, WorkerErrorKind};
-use beryl_common::header::RequestHeader;
+use beryl_common::header::{RequestHeader, HEADER_WORKER_DATA_ERROR_DETAIL, WORKER_DATA_ERROR_DETAIL_V1};
 use beryl_e2e::{data::deterministic_bytes, TestCluster, TestResult};
 use beryl_proto::common::{ByteRangeProto, ErrorDetailProto, RequestHeaderProto};
 use beryl_proto::convert::rpc_error_from_proto;
@@ -11,9 +11,10 @@ use beryl_proto::metadata::file_system_service_proto_client::FileSystemServicePr
 use beryl_proto::metadata::get_block_locations_request_proto;
 use beryl_proto::metadata::{FileBlockLocationProto, GetBlockLocationsRequestProto};
 use beryl_proto::worker::worker_data_service_client::WorkerDataServiceClient;
-use beryl_proto::worker::{DataRequestHeaderProto, OpenReadStreamRequestProto};
+use beryl_proto::worker::{DataRequestHeaderProto, DataResponseHeaderProto, ReadBlockRequestProto};
 use beryl_types::{ClientId, WorkerRunId};
 use bytes::Bytes;
+use prost::Message;
 use tonic::Request;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -214,8 +215,8 @@ async fn assert_stale_worker_run_rejected(
         format!("http://{endpoint}")
     };
     let mut worker = WorkerDataServiceClient::connect(endpoint).await?;
-    let response = worker
-        .open_read_stream(Request::new(OpenReadStreamRequestProto {
+    let status = match worker
+        .read_block(Request::new(ReadBlockRequestProto {
             header: Some(data_header(801)),
             group_name: "root".to_string(),
             block_id: location.block_id,
@@ -231,15 +232,22 @@ async fn assert_stale_worker_run_rejected(
             chunk_size: location.chunk_size,
             effective_len: location.effective_len,
         }))
-        .await?
-        .into_inner();
-    let error = response
-        .header
-        .expect("worker response header")
+        .await
+    {
+        Ok(_) => panic!("stale Worker run unexpectedly read a block"),
+        Err(status) => status,
+    };
+    assert_eq!(
+        status
+            .metadata()
+            .get(HEADER_WORKER_DATA_ERROR_DETAIL)
+            .and_then(|value| value.to_str().ok()),
+        Some(WORKER_DATA_ERROR_DETAIL_V1)
+    );
+    let error = DataResponseHeaderProto::decode(status.details())?
         .error
         .expect("stale worker run error");
     assert_refresh_metadata(&error, ErrorKind::Worker(WorkerErrorKind::RunMismatch));
-    assert!(response.stream_id.is_none());
     Ok(())
 }
 
