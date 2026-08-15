@@ -11,27 +11,23 @@ use bytes::{Bytes, BytesMut};
 use futures::stream;
 
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
+use beryl_types::{GroupName, WriteTarget};
 
 use super::channel_pool::GrpcWorkerChannelPool;
 use super::protocol::{
-    build_abort_write_request, build_commit_write_request, build_open_write_stream_request, build_read_block_request,
-    build_sync_committed_block_request, build_tonic_request, build_write_stream_requests,
-    is_transient_worker_transport_status, parse_commit_write_response, parse_open_write_stream_response,
-    parse_sync_committed_block_response, parse_worker_data_status, read_block_stream_to_bytes,
-    validate_abort_write_response, validate_write_stream_response,
+    build_read_block_request, build_tonic_request, build_write_block_command, build_write_block_data,
+    has_structured_worker_error, is_transient_worker_transport_status, parse_worker_data_status,
+    read_block_stream_to_bytes,
 };
-use super::{
-    WorkerBlockSyncResult, WorkerBlockWriteHandle, WorkerCommitResult, WorkerDataClient, WorkerReadResult,
-    WorkerWriteTarget,
-};
+use super::{WorkerDataClient, WorkerReadResult, WorkerWriteTarget};
 use crate::cache::CacheInvalidationReason;
 use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
 use crate::metrics::{ClientMetrics, NoopClientMetrics};
 use crate::planner::{block_location_unavailable_error, PlannedBlockRead};
 use crate::runtime::{classify_error, AttemptContext, ErrorClass};
-use beryl_types::{GroupName, WriteTarget};
 
+/// Concrete gRPC implementation of the client-side Worker data plane.
 #[derive(Debug)]
 struct GrpcWorkerDataClient {
     channel_pool: GrpcWorkerChannelPool,
@@ -50,23 +46,6 @@ impl GrpcWorkerDataClient {
         }
     }
 
-    fn map_side_effect_status(
-        &self,
-        worker: &beryl_types::WorkerEndpointInfo,
-        operation: &'static str,
-        status: tonic::Status,
-    ) -> ClientError {
-        if is_transient_worker_transport_status(&status) {
-            self.channel_pool
-                .mark_worker_unavailable(worker, CacheInvalidationReason::Unavailable);
-        }
-        ClientError::UnknownOutcome(format!(
-            "worker {operation} outcome is unknown after transport status {}: {}",
-            status.code(),
-            status.message()
-        ))
-    }
-
     fn worker_candidates<'a>(
         &self,
         workers: &'a [beryl_types::WorkerEndpointInfo],
@@ -83,17 +62,100 @@ impl GrpcWorkerDataClient {
         if !active.is_empty() {
             return active;
         }
-        // Cooldown is an avoidance preference, not availability authority. If
-        // metadata gives no uncool alternatives, try the cooled candidates.
         for worker in &cooling {
             self.channel_pool.clear_worker_cooldown(worker);
         }
         cooling
     }
+
+    /// Maps a terminal write status. Structured Worker rejection remains
+    /// actionable; unstructured transport loss after request initiation is an
+    /// unknown outcome and must never be replayed on another worker.
+    fn map_write_status(
+        &self,
+        attempt: &AttemptContext,
+        worker: &beryl_types::WorkerEndpointInfo,
+        status: tonic::Status,
+    ) -> ClientError {
+        if has_structured_worker_error(&status) {
+            let error = parse_worker_data_status(attempt, status);
+            self.channel_pool.invalidate_on_worker_run_mismatch(worker, &error);
+            return error;
+        }
+        if is_transient_worker_transport_status(&status) {
+            self.channel_pool
+                .mark_worker_unavailable(worker, CacheInvalidationReason::Unavailable);
+        }
+        ClientError::UnknownOutcome(format!(
+            "worker WriteBlock outcome is unknown after transport status {}: {}",
+            status.code(),
+            status.message()
+        ))
+    }
+
+    /// Drives one block through one bidirectional RPC.
+    ///
+    /// The first response acknowledges staging ownership. After that point,
+    /// unstructured transport loss is an unknown outcome and is never replayed.
+    async fn write_one_block(
+        &self,
+        attempt: &AttemptContext,
+        target: &WorkerWriteTarget,
+        worker: &beryl_types::WorkerEndpointInfo,
+        data: Bytes,
+    ) -> ClientResult<()> {
+        let mut client = self.channel_pool.worker_data_service_client(worker, "WriteBlock")?;
+        let command = build_write_block_command(attempt, target, worker)?;
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .send(command)
+            .await
+            .map_err(|_| ClientError::Worker("WriteBlock request stream closed before command".to_string()))?;
+        let requests = stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|request| (request, receiver))
+        });
+        let mut responses = client
+            .write_block(build_tonic_request(attempt, requests))
+            .await
+            .map_err(|status| self.map_write_status(attempt, worker, status))?
+            .into_inner();
+
+        match responses.message().await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(ClientError::UnknownOutcome(
+                    "worker WriteBlock ended before staging acknowledgement".to_string(),
+                ));
+            }
+            Err(status) => return Err(self.map_write_status(attempt, worker, status)),
+        }
+
+        for offset in (0..data.len()).step_by(beryl_proto::DEFAULT_WORKER_DATA_FRAME_SIZE) {
+            let end = (offset + beryl_proto::DEFAULT_WORKER_DATA_FRAME_SIZE).min(data.len());
+            let request = build_write_block_data(data.slice(offset..end))?;
+            if sender.send(request).await.is_err() {
+                return match responses.message().await {
+                    Err(status) => Err(self.map_write_status(attempt, worker, status)),
+                    Ok(_) => Err(ClientError::UnknownOutcome(
+                        "worker WriteBlock request stream closed after acknowledgement".to_string(),
+                    )),
+                };
+            }
+        }
+        drop(sender);
+
+        match responses.message().await {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => Err(ClientError::UnknownOutcome(
+                "worker WriteBlock returned more than one acknowledgement".to_string(),
+            )),
+            Err(status) => Err(self.map_write_status(attempt, worker, status)),
+        }
+    }
 }
 
-fn is_stale_read_location_error(err: &ClientError) -> bool {
-    match err {
+fn is_stale_read_location_error(error: &ClientError) -> bool {
+    match error {
         ClientError::Action(action) => match action.action() {
             crate::rpc_error::ClientAction::Refresh { rpc_error, .. } => matches!(
                 rpc_error.kind,
@@ -130,43 +192,43 @@ impl WorkerDataClient for GrpcWorkerDataClient {
         for worker in self.worker_candidates(&block_read.workers) {
             let mut client = self.channel_pool.worker_data_service_client(worker, "ReadBlock")?;
             let request = build_read_block_request(&attempt, &group_name, block_read, worker)?;
-            let mut stream = match client.read_block(build_tonic_request(&attempt, request)).await {
+            let mut responses = match client.read_block(build_tonic_request(&attempt, request)).await {
                 Ok(response) => response.into_inner(),
                 Err(status) => {
-                    let err = parse_worker_data_status(&attempt, status);
-                    self.channel_pool.invalidate_on_worker_run_mismatch(worker, &err);
-                    if is_stale_read_location_error(&err) {
-                        last_location_error = Some(err);
+                    let error = parse_worker_data_status(&attempt, status);
+                    self.channel_pool.invalidate_on_worker_run_mismatch(worker, &error);
+                    if is_stale_read_location_error(&error) {
+                        last_location_error = Some(error);
                         continue;
                     }
-                    if classify_error(&err) != ErrorClass::RetryableTransport {
-                        return Err(err);
+                    if classify_error(&error) != ErrorClass::RetryableTransport {
+                        return Err(error);
                     }
                     self.channel_pool
                         .mark_worker_unavailable(worker, CacheInvalidationReason::Unavailable);
-                    last_transport_error = Some(err);
+                    last_transport_error = Some(error);
                     continue;
                 }
             };
-            let bytes = match read_block_stream_to_bytes(&attempt, &mut stream, block_read).await {
+            let bytes = match read_block_stream_to_bytes(&attempt, &mut responses, block_read).await {
                 Ok(bytes) => bytes,
-                Err(err) if is_stale_read_location_error(&err) => {
-                    self.channel_pool.invalidate_on_worker_run_mismatch(worker, &err);
-                    last_location_error = Some(err);
+                Err(error) if is_stale_read_location_error(&error) => {
+                    self.channel_pool.invalidate_on_worker_run_mismatch(worker, &error);
+                    last_location_error = Some(error);
                     continue;
                 }
-                Err(err) if classify_error(&err) == ErrorClass::RetryableTransport => {
+                Err(error) if classify_error(&error) == ErrorClass::RetryableTransport => {
                     self.channel_pool
                         .mark_worker_unavailable(worker, CacheInvalidationReason::Unavailable);
-                    last_transport_error = Some(err);
+                    last_transport_error = Some(error);
                     continue;
                 }
-                Err(err) => return Err(err),
+                Err(error) => return Err(error),
             };
             return Ok(WorkerReadResult { bytes });
         }
-        if let Some(err) = last_transport_error {
-            return Err(err);
+        if let Some(error) = last_transport_error {
+            return Err(error);
         }
         Err(last_location_error.unwrap_or_else(|| {
             block_location_unavailable_error(format!(
@@ -176,125 +238,18 @@ impl WorkerDataClient for GrpcWorkerDataClient {
         }))
     }
 
-    async fn open_block_write(
-        &self,
-        attempt: AttemptContext,
-        target: WorkerWriteTarget,
-    ) -> ClientResult<WorkerBlockWriteHandle> {
-        let mut last_transport_error = None;
-        for worker in self.worker_candidates(&target.target.worker_endpoints) {
-            let mut client = self
-                .channel_pool
-                .worker_data_service_client(worker, "OpenWriteStream")?;
-            let request = build_open_write_stream_request(&attempt, &target, worker)?;
-            let response = match client.open_write_stream(build_tonic_request(&attempt, request)).await {
-                Ok(response) => response.into_inner(),
-                Err(status) if is_transient_worker_transport_status(&status) => {
-                    self.channel_pool
-                        .mark_worker_unavailable(worker, CacheInvalidationReason::Unavailable);
-                    last_transport_error = Some(ClientError::UnknownOutcome(format!(
-                        "worker OpenWriteStream outcome is unknown after transport status {}: {}",
-                        status.code(),
-                        status.message()
-                    )));
-                    continue;
-                }
-                Err(status) => return Err(ClientError::from(status)),
-            };
-            return parse_open_write_stream_response(&attempt, &target, worker, response)
-                .inspect_err(|err| self.channel_pool.invalidate_on_worker_run_mismatch(worker, err));
-        }
-        Err(last_transport_error
-            .unwrap_or_else(|| ClientError::Worker("worker write has no reachable worker candidates".to_string())))
-    }
-
-    async fn write_block_bytes(
-        &self,
-        attempt: AttemptContext,
-        handle: &WorkerBlockWriteHandle,
-        data: Bytes,
-    ) -> ClientResult<beryl_proto::worker::WriteStreamResponseProto> {
+    async fn write_block(&self, attempt: AttemptContext, target: WorkerWriteTarget, data: Bytes) -> ClientResult<()> {
         if data.is_empty() {
-            return Ok(beryl_proto::worker::WriteStreamResponseProto {
-                accepted: true,
-                last_acked_seq: handle.next_seq.saturating_sub(1),
-                written_through: 0,
-            });
-        }
-        let mut client = self
-            .channel_pool
-            .worker_data_service_client(&handle.worker, "WriteStream")?;
-        let expected_written_through = data.len() as u64;
-        let requests = build_write_stream_requests(handle, data)?;
-        let expected_last_seq = requests
-            .last()
-            .map(|request| request.seq)
-            .unwrap_or_else(|| handle.next_seq.saturating_sub(1));
-        let response = client
-            .write_stream(build_tonic_request(&attempt, stream::iter(requests)))
-            .await
-            .map_err(|status| self.map_side_effect_status(&handle.worker, "WriteStream", status))?
-            .into_inner();
-        if !response.accepted {
-            return Err(ClientError::UnknownOutcome(
-                "worker WriteStream did not accept the submitted frames".to_string(),
+            return Err(ClientError::InvalidArgument(
+                "WriteBlock requires at least one data byte".to_string(),
             ));
         }
-        validate_write_stream_response(response, expected_last_seq, expected_written_through)
-    }
-
-    async fn commit_block_write(
-        &self,
-        attempt: AttemptContext,
-        handle: &WorkerBlockWriteHandle,
-        effective_len: u64,
-        commit_seq: u64,
-        require_sync: bool,
-    ) -> ClientResult<WorkerCommitResult> {
-        let mut client = self
-            .channel_pool
-            .worker_data_service_client(&handle.worker, "CommitWrite")?;
-        let request = build_commit_write_request(&attempt, handle, effective_len, commit_seq, require_sync)?;
-        let response = client
-            .commit_write(build_tonic_request(&attempt, request))
-            .await
-            .map_err(|status| self.map_side_effect_status(&handle.worker, "CommitWrite", status))?
-            .into_inner();
-        parse_commit_write_response(&attempt, handle, effective_len, response)
-            .inspect_err(|err| self.channel_pool.invalidate_on_worker_run_mismatch(&handle.worker, err))
-    }
-
-    async fn sync_committed_block(
-        &self,
-        attempt: AttemptContext,
-        handle: &WorkerBlockWriteHandle,
-        expected_len: u64,
-    ) -> ClientResult<WorkerBlockSyncResult> {
-        let mut client = self
-            .channel_pool
-            .worker_data_service_client(&handle.worker, "SyncCommittedBlock")?;
-        let request = build_sync_committed_block_request(&attempt, handle, expected_len)?;
-        let response = client
-            .sync_committed_block(build_tonic_request(&attempt, request))
-            .await
-            .map_err(|status| self.map_side_effect_status(&handle.worker, "SyncCommittedBlock", status))?
-            .into_inner();
-        parse_sync_committed_block_response(&attempt, handle, expected_len, response)
-            .inspect_err(|err| self.channel_pool.invalidate_on_worker_run_mismatch(&handle.worker, err))
-    }
-
-    async fn abort_block_write(&self, attempt: AttemptContext, handle: &WorkerBlockWriteHandle) -> ClientResult<()> {
-        let mut client = self
-            .channel_pool
-            .worker_data_service_client(&handle.worker, "AbortWrite")?;
-        let request = build_abort_write_request(&attempt, handle)?;
-        let response = client
-            .abort_write(build_tonic_request(&attempt, request))
-            .await
-            .map_err(|status| self.map_side_effect_status(&handle.worker, "AbortWrite", status))?
-            .into_inner();
-        validate_abort_write_response(&attempt, response)
-            .inspect_err(|err| self.channel_pool.invalidate_on_worker_run_mismatch(&handle.worker, err))
+        let worker = self
+            .worker_candidates(&target.target.worker_endpoints)
+            .into_iter()
+            .next()
+            .ok_or_else(|| ClientError::Worker("worker write has no candidates".to_string()))?;
+        self.write_one_block(&attempt, &target, worker, data).await
     }
 }
 
@@ -305,21 +260,19 @@ pub(crate) struct WorkerDataPlane {
 }
 
 impl WorkerDataPlane {
-    /// Create a worker data-plane.
     pub(crate) fn new() -> Self {
         Self::with_client(Arc::new(GrpcWorkerDataClient::new()))
     }
 
-    /// Create a worker data-plane from client config.
     pub(crate) fn from_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> Self {
         Self::with_client(Arc::new(GrpcWorkerDataClient::from_config(config, metrics)))
     }
 
-    /// Create a worker data-plane around an already selected worker client implementation.
     pub(crate) fn with_client(client: Arc<dyn WorkerDataClient>) -> Self {
         Self { client }
     }
 
+    /// Reads all planned block-local ranges in file order.
     pub(crate) async fn read_block_ranges(
         &self,
         attempt: AttemptContext,
@@ -336,7 +289,7 @@ impl WorkerDataPlane {
             }
             let expected_end = block_read
                 .file_offset
-                .checked_add(block_read.len as u64)
+                .checked_add(u64::from(block_read.len))
                 .ok_or_else(|| ClientError::InvalidLayout("planned block read end overflow".to_string()))?;
             if expected_end != block_read.end_file_offset {
                 return Err(ClientError::InvalidLayout(
@@ -359,59 +312,23 @@ impl WorkerDataPlane {
         Ok(output.freeze())
     }
 
-    pub(crate) async fn open_block_write(
+    /// Writes one complete metadata-authorized block through one worker RPC.
+    pub(crate) async fn write_block(
         &self,
         attempt: AttemptContext,
         group_name: GroupName,
         target: WriteTarget,
-    ) -> ClientResult<WorkerBlockWriteHandle> {
-        let worker_target = WorkerWriteTarget { group_name, target };
-        self.client.open_block_write(attempt, worker_target).await
-    }
-
-    pub(crate) async fn write_block_bytes(
-        &self,
-        attempt: AttemptContext,
-        handle: &WorkerBlockWriteHandle,
         data: Bytes,
-    ) -> ClientResult<beryl_proto::worker::WriteStreamResponseProto> {
-        self.client.write_block_bytes(attempt, handle, data).await
-    }
-
-    pub(crate) async fn commit_block_write(
-        &self,
-        attempt: AttemptContext,
-        handle: &WorkerBlockWriteHandle,
-        effective_len: u64,
-        commit_seq: u64,
-        require_sync: bool,
-    ) -> ClientResult<WorkerCommitResult> {
-        self.client
-            .commit_block_write(attempt, handle, effective_len, commit_seq, require_sync)
-            .await
-    }
-
-    pub(crate) async fn sync_committed_block(
-        &self,
-        attempt: AttemptContext,
-        handle: &WorkerBlockWriteHandle,
-        expected_len: u64,
-    ) -> ClientResult<WorkerBlockSyncResult> {
-        self.client.sync_committed_block(attempt, handle, expected_len).await
-    }
-
-    pub(crate) async fn abort_block_write(
-        &self,
-        attempt: AttemptContext,
-        handle: &WorkerBlockWriteHandle,
     ) -> ClientResult<()> {
-        self.client.abort_block_write(attempt, handle).await
+        self.client
+            .write_block(attempt, WorkerWriteTarget { group_name, target }, data)
+            .await
     }
 }
 
 impl fmt::Debug for WorkerDataPlane {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WorkerDataPlane").finish_non_exhaustive()
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("WorkerDataPlane").finish_non_exhaustive()
     }
 }
 
@@ -423,334 +340,71 @@ impl Default for WorkerDataPlane {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::sync::Arc;
 
-    use beryl_common::error::rpc::{ErrorKind, RefreshHint as RpcRefreshHint, RpcErrorDetail};
+    use beryl_common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind};
     use beryl_common::header::{HEADER_WORKER_DATA_ERROR_DETAIL, WORKER_DATA_ERROR_DETAIL_V1};
     use beryl_proto::convert::rpc_error_to_proto;
     use beryl_proto::worker::worker_data_service_server::{WorkerDataService, WorkerDataServiceServer};
     use beryl_proto::worker::{
-        AbortWriteRequestProto, AbortWriteResponseProto, CommitWriteRequestProto, CommitWriteResponseProto,
-        DataRequestHeaderProto, DataResponseHeaderProto, OpenWriteStreamRequestProto, OpenWriteStreamResponseProto,
-        ReadBlockChunkProto, ReadBlockRequestProto, SyncCommittedBlockRequestProto, SyncCommittedBlockResponseProto,
-        WriteStreamRequestProto, WriteStreamResponseProto,
+        DataResponseHeaderProto, ReadBlockChunkProto, ReadBlockRequestProto, WriteBlockRequestProto,
+        WriteBlockResponseProto,
     };
     use beryl_types::lease::FencingToken;
-    use beryl_types::{BlockId, BlockIndex, ClientId, InodeId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol};
+    use beryl_types::{
+        BlockId, BlockIndex, ClientId, InodeId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol, WorkerRunId,
+    };
     use prost::Message;
     use tonic::transport::Server;
     use tonic::{Request, Response, Status};
 
-    use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetrics};
-    use crate::runtime::{classify_error, ErrorClass, OperationContext, OperationDeadline};
+    use super::*;
+    use crate::runtime::{OperationContext, OperationDeadline};
 
-    #[derive(Debug, Default)]
-    struct RecordingMetrics {
-        events: Mutex<Vec<ClientMetricEvent>>,
+    #[derive(Clone, Copy)]
+    enum ReadFailure {
+        None,
+        Transport,
+        StructuredLocation,
+        PartialTransport,
+        EmptyChunk,
     }
 
-    impl ClientMetrics for RecordingMetrics {
-        fn record(&self, event: ClientMetricEvent) {
-            self.events.lock().expect("events").push(event);
-        }
+    #[derive(Clone, Copy)]
+    enum WriteBehavior {
+        Success,
+        AckThenUnavailable,
     }
 
-    impl RecordingMetrics {
-        fn events(&self) -> Vec<ClientMetricEvent> {
-            self.events.lock().expect("events").clone()
-        }
-    }
-
-    #[tokio::test]
-    async fn side_effect_transient_status_invalidates_channel_and_returns_unknown_outcome() {
-        for code in [
-            tonic::Code::Unavailable,
-            tonic::Code::DeadlineExceeded,
-            tonic::Code::ResourceExhausted,
-        ] {
-            let metrics = Arc::new(RecordingMetrics::default());
-            let client = grpc_client_with_metrics(metrics.clone());
-            let worker = worker_endpoint("127.0.0.1:19101", 1);
-            client
-                .channel_pool
-                .worker_data_service_client(&worker, "WriteStream")
-                .expect("seed channel");
-
-            let err = client.map_side_effect_status(&worker, "WriteStream", Status::new(code, "transport down"));
-
-            assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("WriteStream")));
-            let err = client
-                .channel_pool
-                .worker_data_service_client(&worker, "WriteStream")
-                .expect_err("worker endpoint should cool down after transient failure");
-            assert!(matches!(err, ClientError::Worker(msg) if msg.contains("cooling down")));
-            let events = metrics.events();
-            assert_metric(&events, ClientMetric::CachePreciseInvalidation);
-            assert_eq!(count_metric(&events, ClientMetric::WorkerChannelPoolMiss), 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn side_effect_non_transient_status_keeps_channel_and_returns_unknown_outcome() {
-        let metrics = Arc::new(RecordingMetrics::default());
-        let client = grpc_client_with_metrics(metrics.clone());
-        let worker = worker_endpoint("127.0.0.1:19101", 1);
-        client
-            .channel_pool
-            .worker_data_service_client(&worker, "CommitWrite")
-            .expect("seed channel");
-
-        let err = client.map_side_effect_status(&worker, "CommitWrite", Status::permission_denied("permission denied"));
-
-        assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("CommitWrite")));
-        client
-            .channel_pool
-            .worker_data_service_client(&worker, "CommitWrite")
-            .expect("cached channel remains usable");
-        let events = metrics.events();
-        assert_no_metric(&events, ClientMetric::CachePreciseInvalidation);
-        assert_metric(&events, ClientMetric::WorkerChannelPoolHit);
-    }
-
-    #[tokio::test]
-    async fn read_block_transport_failure_tries_next_worker_and_cools_first() {
-        let first_state = Arc::new(MockWorkerDataState {
-            read_status: Some(tonic::Code::Unavailable),
-            ..MockWorkerDataState::default()
-        });
-        let second_state = Arc::new(MockWorkerDataState {
-            read_payload: Bytes::from_static(b"data"),
-            ..MockWorkerDataState::default()
-        });
-        let (first_worker, first_shutdown) = start_mock_worker(Arc::clone(&first_state), 1).await;
-        let (second_worker, second_shutdown) = start_mock_worker(Arc::clone(&second_state), 2).await;
-        let metrics = Arc::new(RecordingMetrics::default());
-        let client = grpc_client_with_metrics(metrics.clone());
-        let block_read = planned_block_read(vec![first_worker, second_worker]);
-
-        for _ in 0..2 {
-            let result = client
-                .read_block_range(data_attempt_context("ReadBlock"), test_group_name(), &block_read)
-                .await
-                .expect("healthy worker should satisfy read");
-            assert_eq!(result.bytes, Bytes::from_static(b"data"));
-        }
-
-        assert_eq!(first_state.read_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(second_state.read_calls.load(Ordering::SeqCst), 2);
-        assert_metric(&metrics.events(), ClientMetric::CachePreciseInvalidation);
-        let _ = first_shutdown.send(());
-        let _ = second_shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn read_block_structured_location_error_tries_next_worker() {
-        let first_state = Arc::new(MockWorkerDataState {
-            read_error: Mutex::new(Some(RpcErrorDetail::refresh_metadata(
-                ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
-                RpcRefreshHint::default(),
-                "local block is unavailable",
-            ))),
-            ..MockWorkerDataState::default()
-        });
-        let second_state = Arc::new(MockWorkerDataState {
-            read_payload: Bytes::from_static(b"data"),
-            ..MockWorkerDataState::default()
-        });
-        let (first_worker, first_shutdown) = start_mock_worker(Arc::clone(&first_state), 1).await;
-        let (second_worker, second_shutdown) = start_mock_worker(Arc::clone(&second_state), 2).await;
-        let client = grpc_client_with_metrics(Arc::new(RecordingMetrics::default()));
-        let block_read = planned_block_read(vec![first_worker, second_worker]);
-
-        let result = client
-            .read_block_range(data_attempt_context("ReadBlock"), test_group_name(), &block_read)
-            .await
-            .expect("second worker should satisfy stale first location");
-
-        assert_eq!(result.bytes, Bytes::from_static(b"data"));
-        assert_eq!(first_state.read_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(second_state.read_calls.load(Ordering::SeqCst), 1);
-        let _ = first_shutdown.send(());
-        let _ = second_shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn read_block_partial_transport_failure_discards_bytes_before_failover() {
-        let first_state = Arc::new(MockWorkerDataState {
-            read_chunks: Mutex::new(Some(vec![
-                Ok(ReadBlockChunkProto {
-                    data: Bytes::from_static(b"xx"),
-                }),
-                Err(Status::unavailable("read stream item unavailable")),
-            ])),
-            ..MockWorkerDataState::default()
-        });
-        let second_state = Arc::new(MockWorkerDataState {
-            read_payload: Bytes::from_static(b"data"),
-            ..MockWorkerDataState::default()
-        });
-        let (first_worker, first_shutdown) = start_mock_worker(Arc::clone(&first_state), 1).await;
-        let (second_worker, second_shutdown) = start_mock_worker(Arc::clone(&second_state), 2).await;
-        let client = grpc_client_with_metrics(Arc::new(RecordingMetrics::default()));
-        let block_read = planned_block_read(vec![first_worker, second_worker]);
-
-        let result = client
-            .read_block_range(data_attempt_context("ReadBlock"), test_group_name(), &block_read)
-            .await
-            .expect("second worker should replace the failed partial stream");
-
-        assert_eq!(result.bytes, Bytes::from_static(b"data"));
-        assert_eq!(first_state.read_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(second_state.read_calls.load(Ordering::SeqCst), 1);
-        let _ = first_shutdown.send(());
-        let _ = second_shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn read_block_protocol_corruption_does_not_fail_over() {
-        let first_state = Arc::new(MockWorkerDataState {
-            read_chunks: Mutex::new(Some(vec![Ok(ReadBlockChunkProto { data: Bytes::new() })])),
-            ..MockWorkerDataState::default()
-        });
-        let second_state = Arc::new(MockWorkerDataState {
-            read_payload: Bytes::from_static(b"data"),
-            ..MockWorkerDataState::default()
-        });
-        let (first_worker, first_shutdown) = start_mock_worker(Arc::clone(&first_state), 1).await;
-        let (second_worker, second_shutdown) = start_mock_worker(Arc::clone(&second_state), 2).await;
-        let client = grpc_client_with_metrics(Arc::new(RecordingMetrics::default()));
-        let block_read = planned_block_read(vec![first_worker, second_worker]);
-
-        let err = client
-            .read_block_range(data_attempt_context("ReadBlock"), test_group_name(), &block_read)
-            .await
-            .expect_err("empty chunk must fail closed");
-
-        assert!(matches!(err, ClientError::Worker(msg) if msg.contains("empty chunk")));
-        assert_eq!(first_state.read_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(second_state.read_calls.load(Ordering::SeqCst), 0);
-        let _ = first_shutdown.send(());
-        let _ = second_shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn all_cooling_write_candidates_are_tried_when_no_alternative() {
-        let state = Arc::new(MockWorkerDataState::default());
-        let (worker, shutdown) = start_mock_worker(Arc::clone(&state), 1).await;
-        let metrics = Arc::new(RecordingMetrics::default());
-        let client = grpc_client_with_metrics(metrics);
-        client
-            .channel_pool
-            .mark_worker_unavailable(&worker, CacheInvalidationReason::Unavailable);
-        let target = WorkerWriteTarget {
-            group_name: test_group_name(),
-            target: write_target(worker.clone()),
-        };
-
-        let handle = client
-            .open_block_write(data_attempt_context("OpenWriteStream"), target)
-            .await
-            .expect("single cooled write candidate should still be tried");
-
-        assert_eq!(handle.worker.endpoint, worker.endpoint);
-        assert_eq!(state.open_write_calls.load(Ordering::SeqCst), 1);
-        let _ = shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn commit_write_transient_transport_failure_returns_unknown_outcome_and_invalidates_channel() {
-        let commit_state = Arc::new(MockWorkerDataState {
-            commit_status: Mutex::new(Some(Status::unavailable("commit transport down"))),
-            ..MockWorkerDataState::default()
-        });
-        let (worker, shutdown) = start_mock_worker(Arc::clone(&commit_state), 1).await;
-        let metrics = Arc::new(RecordingMetrics::default());
-        let client = grpc_client_with_metrics(metrics.clone());
-        client
-            .channel_pool
-            .worker_data_service_client(&worker, "CommitWrite")
-            .expect("seed worker channel");
-        assert_worker_channel_cached(&client, &metrics, &worker, true);
-        let handle = worker_block_write_handle(worker.clone());
-
-        let err = client
-            .commit_block_write(data_attempt_context("CommitWrite"), &handle, 4, 1, false)
-            .await
-            .expect_err("transient CommitWrite transport failure must be unknown outcome");
-
-        match &err {
-            ClientError::UnknownOutcome(msg) => {
-                assert!(msg.contains("CommitWrite"), "{msg}");
-                assert!(msg.contains(&tonic::Code::Unavailable.to_string()), "{msg}");
-                assert!(msg.contains("commit transport down"), "{msg}");
-            }
-            other => panic!("expected UnknownOutcome, got {other:?}"),
-        }
-        assert_eq!(classify_error(&err), ErrorClass::UnknownOutcome);
-        assert_ne!(classify_error(&err), ErrorClass::RetryableTransport);
-        assert_eq!(commit_state.commit_calls.load(Ordering::SeqCst), 1);
-        assert_worker_channel_cached(&client, &metrics, &worker, false);
-        assert_metric(&metrics.events(), ClientMetric::CachePreciseInvalidation);
-        let _ = shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn abort_write_worker_run_mismatch_invalidates_channel() {
-        let abort_state = Arc::new(MockWorkerDataState {
-            abort_response: Mutex::new(Some(AbortWriteResponseProto {
-                header: Some(data_header_with_error(RpcErrorDetail::refresh_metadata(
-                    ErrorKind::Worker(WorkerErrorKind::RunMismatch),
-                    RpcRefreshHint::default(),
-                    "worker run mismatch",
-                ))),
-                aborted: false,
-            })),
-            ..MockWorkerDataState::default()
-        });
-        let (worker, shutdown) = start_mock_worker(Arc::clone(&abort_state), 1).await;
-        let metrics = Arc::new(RecordingMetrics::default());
-        let client = grpc_client_with_metrics(metrics.clone());
-        let handle = worker_block_write_handle(worker);
-
-        let err = client
-            .abort_block_write(data_attempt_context("AbortWrite"), &handle)
-            .await
-            .expect_err("worker run mismatch must fail");
-
-        assert_eq!(
-            classify_error(&err),
-            ErrorClass::RefreshMetadata(ErrorKind::Worker(WorkerErrorKind::RunMismatch))
-        );
-        assert_metric(&metrics.events(), ClientMetric::CachePreciseInvalidation);
-        let _ = shutdown.send(());
-    }
-
-    #[derive(Default)]
-    struct MockWorkerDataState {
+    struct MockWorkerState {
         read_calls: AtomicUsize,
-        open_write_calls: AtomicUsize,
-        commit_calls: AtomicUsize,
-        abort_calls: AtomicUsize,
-        read_status: Option<tonic::Code>,
-        read_chunks: Mutex<Option<Vec<Result<ReadBlockChunkProto, Status>>>>,
-        read_payload: Bytes,
-        read_error: Mutex<Option<RpcErrorDetail>>,
-        commit_status: Mutex<Option<Status>>,
-        abort_response: Mutex<Option<AbortWriteResponseProto>>,
+        write_calls: AtomicUsize,
+        read_failure: ReadFailure,
+        write_behavior: WriteBehavior,
+    }
+
+    impl MockWorkerState {
+        fn new(read_failure: ReadFailure, write_behavior: WriteBehavior) -> Self {
+            Self {
+                read_calls: AtomicUsize::new(0),
+                write_calls: AtomicUsize::new(0),
+                read_failure,
+                write_behavior,
+            }
+        }
     }
 
     #[derive(Clone)]
-    struct MockWorkerDataService {
-        state: Arc<MockWorkerDataState>,
+    struct MockWorkerService {
+        state: Arc<MockWorkerState>,
     }
 
     #[tonic::async_trait]
-    impl WorkerDataService for MockWorkerDataService {
+    impl WorkerDataService for MockWorkerService {
         type ReadBlockStream = Pin<Box<dyn futures::Stream<Item = Result<ReadBlockChunkProto, Status>> + Send>>;
+        type WriteBlockStream = Pin<Box<dyn futures::Stream<Item = Result<WriteBlockResponseProto, Status>> + Send>>;
 
         async fn read_block(
             &self,
@@ -758,105 +412,61 @@ mod tests {
         ) -> Result<Response<Self::ReadBlockStream>, Status> {
             self.state.read_calls.fetch_add(1, Ordering::SeqCst);
             let request = request.into_inner();
-            if let Some(code) = self.state.read_status {
-                return Err(Status::new(code, "read block transport failure"));
+            match self.state.read_failure {
+                ReadFailure::Transport => Err(Status::unavailable("read transport unavailable")),
+                ReadFailure::StructuredLocation => Err(structured_location_status(request.header.as_ref())),
+                ReadFailure::PartialTransport => Ok(Response::new(Box::pin(futures::stream::iter(vec![
+                    Ok(ReadBlockChunkProto {
+                        data: Bytes::from_static(b"xx"),
+                    }),
+                    Err(Status::unavailable("partial read transport unavailable")),
+                ])))),
+                ReadFailure::EmptyChunk => Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
+                    ReadBlockChunkProto { data: Bytes::new() },
+                )])))),
+                ReadFailure::None => Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
+                    ReadBlockChunkProto {
+                        data: Bytes::from_static(b"data"),
+                    },
+                )])))),
             }
-            if let Some(error) = self.state.read_error.lock().expect("read error").take() {
-                return Err(structured_read_status(request.header.as_ref(), error));
+        }
+
+        async fn write_block(
+            &self,
+            request: Request<tonic::Streaming<WriteBlockRequestProto>>,
+        ) -> Result<Response<Self::WriteBlockStream>, Status> {
+            self.state.write_calls.fetch_add(1, Ordering::SeqCst);
+            let mut requests = request.into_inner();
+            let first = requests
+                .message()
+                .await?
+                .ok_or_else(|| Status::invalid_argument("missing command"))?;
+            if !matches!(
+                first.payload,
+                Some(beryl_proto::worker::write_block_request_proto::Payload::Command(_))
+            ) {
+                return Err(Status::invalid_argument("first payload must be command"));
             }
-            let chunks = self
-                .state
-                .read_chunks
-                .lock()
-                .expect("read chunks")
-                .take()
-                .unwrap_or_else(|| {
-                    vec![Ok(ReadBlockChunkProto {
-                        data: self.state.read_payload.clone(),
-                    })]
-                });
-            Ok(Response::new(
-                Box::pin(futures::stream::iter(chunks)) as Self::ReadBlockStream
-            ))
-        }
-
-        async fn open_write_stream(
-            &self,
-            request: Request<OpenWriteStreamRequestProto>,
-        ) -> Result<Response<OpenWriteStreamResponseProto>, Status> {
-            self.state.open_write_calls.fetch_add(1, Ordering::SeqCst);
-            let request = request.into_inner();
-            Ok(Response::new(OpenWriteStreamResponseProto {
-                header: Some(ok_data_header(request.header.as_ref())),
-                stream_id: Some(beryl_proto::common::StreamIdProto { high: 1, low: 1 }),
-                frame_size: request.frame_size.max(1),
-                block_stamp: request.block_stamp,
-                committed_length: 0,
-            }))
-        }
-
-        async fn write_stream(
-            &self,
-            _request: Request<tonic::Streaming<WriteStreamRequestProto>>,
-        ) -> Result<Response<WriteStreamResponseProto>, Status> {
-            Err(Status::unimplemented("write stream unused in test"))
-        }
-
-        async fn commit_write(
-            &self,
-            request: Request<CommitWriteRequestProto>,
-        ) -> Result<Response<CommitWriteResponseProto>, Status> {
-            self.state.commit_calls.fetch_add(1, Ordering::SeqCst);
-            if let Some(status) = self.state.commit_status.lock().expect("commit status").take() {
-                return Err(status);
-            }
-            let request = request.into_inner();
-            Ok(Response::new(CommitWriteResponseProto {
-                header: Some(ok_data_header(request.header.as_ref())),
-                effective_len: request.effective_len,
-                block_stamp: request.block_stamp,
-                written_through: request.effective_len,
-            }))
-        }
-
-        async fn sync_committed_block(
-            &self,
-            _request: Request<SyncCommittedBlockRequestProto>,
-        ) -> Result<Response<SyncCommittedBlockResponseProto>, Status> {
-            Err(Status::unimplemented("sync committed block unused in test"))
-        }
-
-        async fn abort_write(
-            &self,
-            request: Request<AbortWriteRequestProto>,
-        ) -> Result<Response<AbortWriteResponseProto>, Status> {
-            self.state.abort_calls.fetch_add(1, Ordering::SeqCst);
-            let request = request.into_inner();
-            let mut response = self
-                .state
-                .abort_response
-                .lock()
-                .expect("abort response")
-                .take()
-                .unwrap_or_else(|| AbortWriteResponseProto {
-                    header: Some(ok_data_header(request.header.as_ref())),
-                    aborted: true,
-                });
-            if let Some(header) = response.header.as_mut() {
-                header.client = request.header.as_ref().and_then(|header| header.client.clone());
-            }
-            Ok(Response::new(response))
+            let responses: Vec<Result<WriteBlockResponseProto, Status>> = match self.state.write_behavior {
+                WriteBehavior::Success => vec![Ok(WriteBlockResponseProto {})],
+                WriteBehavior::AckThenUnavailable => vec![
+                    Ok(WriteBlockResponseProto {}),
+                    Err(Status::unavailable("write transport unavailable after ack")),
+                ],
+            };
+            Ok(Response::new(Box::pin(futures::stream::iter(responses))))
         }
     }
 
     async fn start_mock_worker(
-        state: Arc<MockWorkerDataState>,
+        state: Arc<MockWorkerState>,
         worker_id: u64,
     ) -> (WorkerEndpointInfo, tokio::sync::oneshot::Sender<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("bind mock worker");
-        let addr = listener.local_addr().expect("mock worker local addr");
+            .expect("bind mock Worker");
+        let address = listener.local_addr().expect("mock Worker address");
         let incoming = futures::stream::try_unfold(listener, |listener| async move {
             let (stream, _) = listener.accept().await?;
             Ok::<_, std::io::Error>(Some((stream, listener)))
@@ -864,85 +474,40 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             Server::builder()
-                .add_service(WorkerDataServiceServer::new(MockWorkerDataService { state }))
+                .add_service(WorkerDataServiceServer::new(MockWorkerService { state }))
                 .serve_with_incoming_shutdown(incoming, async {
                     let _ = shutdown_rx.await;
                 })
                 .await
-                .expect("mock worker server");
+                .expect("mock Worker server");
         });
-
-        (worker_endpoint(&addr.to_string(), worker_id), shutdown_tx)
+        (worker_endpoint(&address.to_string(), worker_id), shutdown_tx)
     }
 
-    fn grpc_client_with_metrics(metrics: Arc<dyn ClientMetrics>) -> GrpcWorkerDataClient {
+    fn grpc_client() -> GrpcWorkerDataClient {
         GrpcWorkerDataClient {
-            channel_pool: GrpcWorkerChannelPool::new(true, 8, metrics),
-        }
-    }
-
-    fn planned_block_read(workers: Vec<WorkerEndpointInfo>) -> PlannedBlockRead {
-        PlannedBlockRead {
-            file_offset: 0,
-            len: 4,
-            end_file_offset: 4,
-            block_id: test_block_id(),
-            block_offset: 0,
-            block_stamp: 77,
-            block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
-            block_size: 4096,
-            chunk_size: 4096,
-            effective_len: 4,
-            workers,
-        }
-    }
-
-    fn worker_block_write_handle(worker: WorkerEndpointInfo) -> WorkerBlockWriteHandle {
-        WorkerBlockWriteHandle {
-            group_name: test_group_name(),
-            worker: worker.clone(),
-            target: write_target(worker),
-            stream_id: beryl_proto::common::StreamIdProto { high: 1, low: 1 },
-            frame_size: 1024,
-            next_seq: 1,
-        }
-    }
-
-    fn write_target(worker: WorkerEndpointInfo) -> beryl_types::WriteTarget {
-        let block_id = test_block_id();
-        beryl_types::WriteTarget {
-            block_id,
-            file_offset: 0,
-            block_size: 4096,
-            worker_endpoints: vec![worker],
-            fencing_token: FencingToken::new(block_id, ClientId::new(7), 1),
-            block_stamp: 77,
-            chunk_size: 4096,
-            block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
-            tier: beryl_types::Tier::Mem,
+            channel_pool: GrpcWorkerChannelPool::new(true, 8, Arc::new(NoopClientMetrics)),
         }
     }
 
     fn worker_endpoint(endpoint: &str, worker_id: u64) -> WorkerEndpointInfo {
         WorkerEndpointInfo {
             worker_id: WorkerId::new(worker_id),
+            worker_run_id: WorkerRunId::new(),
             endpoint: endpoint.to_string(),
             worker_net_protocol: WorkerNetProtocol::Grpc,
-            worker_run_id: "550e8400-e29b-41d4-a716-446655440000"
-                .parse()
-                .expect("valid test WorkerRunId"),
         }
     }
 
-    fn test_block_id() -> BlockId {
+    fn block_id() -> BlockId {
         BlockId::new(InodeId::new(202), BlockIndex::new(0))
     }
 
-    fn test_group_name() -> GroupName {
+    fn group_name() -> GroupName {
         GroupName::parse("root").expect("group name")
     }
 
-    fn data_attempt_context(operation_name: &'static str) -> AttemptContext {
+    fn attempt(operation_name: &'static str) -> AttemptContext {
         let operation = OperationContext::new_named(
             ClientId::new(7),
             "test-client",
@@ -954,221 +519,148 @@ mod tests {
         AttemptContext::for_data(&operation, 0)
     }
 
-    fn ok_data_header(request: Option<&DataRequestHeaderProto>) -> DataResponseHeaderProto {
-        DataResponseHeaderProto {
-            client: request.and_then(|header| header.client.clone()),
-            error: None,
+    fn planned_read(workers: Vec<WorkerEndpointInfo>) -> PlannedBlockRead {
+        PlannedBlockRead {
+            file_offset: 0,
+            len: 4,
+            end_file_offset: 4,
+            block_id: block_id(),
+            block_offset: 0,
+            block_stamp: 77,
+            block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
+            block_size: 4096,
+            chunk_size: 4096,
+            effective_len: 4,
+            workers,
         }
     }
 
-    fn data_header_with_error(rpc_error: RpcErrorDetail) -> DataResponseHeaderProto {
-        let attempt = data_attempt_context("AbortWrite");
-        DataResponseHeaderProto {
-            client: Some(attempt.client_info()),
-            error: Some(rpc_error_to_proto(&rpc_error)),
+    fn write_target(workers: Vec<WorkerEndpointInfo>) -> WorkerWriteTarget {
+        let block_id = block_id();
+        WorkerWriteTarget {
+            group_name: group_name(),
+            target: WriteTarget {
+                block_id,
+                file_offset: 0,
+                block_size: 4096,
+                worker_endpoints: workers,
+                fencing_token: FencingToken::new(block_id, ClientId::new(7), 1),
+                block_stamp: 77,
+                chunk_size: 4096,
+                block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
+                tier: beryl_types::Tier::Mem,
+            },
         }
     }
 
-    fn structured_read_status(request: Option<&DataRequestHeaderProto>, rpc_error: RpcErrorDetail) -> Status {
-        let header = DataResponseHeaderProto {
-            client: request.and_then(|header| header.client.clone()),
-            error: Some(rpc_error_to_proto(&rpc_error)),
+    fn structured_location_status(header: Option<&beryl_proto::worker::DataRequestHeaderProto>) -> Status {
+        let error = RpcErrorDetail::refresh_metadata(
+            ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
+            RefreshHint::default(),
+            "local block is unavailable",
+        );
+        let response = DataResponseHeaderProto {
+            client: header.and_then(|header| header.client.clone()),
+            error: Some(rpc_error_to_proto(&error)),
         };
         let mut metadata = tonic::metadata::MetadataMap::new();
         metadata.insert(
             HEADER_WORKER_DATA_ERROR_DETAIL,
-            WORKER_DATA_ERROR_DETAIL_V1.parse().expect("valid detail version"),
+            WORKER_DATA_ERROR_DETAIL_V1.parse().expect("error detail version"),
         );
         Status::with_details_and_metadata(
             tonic::Code::FailedPrecondition,
-            rpc_error.message,
-            Bytes::from(header.encode_to_vec()),
+            error.message,
+            Bytes::from(response.encode_to_vec()),
             metadata,
         )
     }
 
-    fn assert_metric(events: &[ClientMetricEvent], metric: ClientMetric) {
-        assert!(
-            events.iter().any(|event| event.metric == metric),
-            "missing metric {metric:?}: {events:?}"
-        );
-    }
+    #[tokio::test]
+    async fn read_transport_and_structured_location_failures_try_the_next_worker() {
+        for failure in [ReadFailure::Transport, ReadFailure::StructuredLocation] {
+            let first_state = Arc::new(MockWorkerState::new(failure, WriteBehavior::Success));
+            let second_state = Arc::new(MockWorkerState::new(ReadFailure::None, WriteBehavior::Success));
+            let (first, first_shutdown) = start_mock_worker(Arc::clone(&first_state), 1).await;
+            let (second, second_shutdown) = start_mock_worker(Arc::clone(&second_state), 2).await;
 
-    fn assert_no_metric(events: &[ClientMetricEvent], metric: ClientMetric) {
-        assert!(
-            events.iter().all(|event| event.metric != metric),
-            "unexpected metric {metric:?}: {events:?}"
-        );
-    }
-
-    fn assert_worker_channel_cached(
-        client: &GrpcWorkerDataClient,
-        metrics: &RecordingMetrics,
-        worker: &WorkerEndpointInfo,
-        expected_cached: bool,
-    ) {
-        let before = metrics.events();
-        let hits = count_metric(&before, ClientMetric::WorkerChannelPoolHit);
-        let misses = count_metric(&before, ClientMetric::WorkerChannelPoolMiss);
-
-        let result = client.channel_pool.worker_data_service_client(worker, "CacheProbe");
-        if !expected_cached {
-            if let Err(ClientError::Worker(msg)) = &result {
-                assert!(msg.contains("cooling down"), "unexpected worker error: {msg}");
-                return;
-            }
-        }
-        result.expect("cache probe channel");
-
-        let after = metrics.events();
-        let hit_delta = count_metric(&after, ClientMetric::WorkerChannelPoolHit) - hits;
-        let miss_delta = count_metric(&after, ClientMetric::WorkerChannelPoolMiss) - misses;
-        if expected_cached {
-            assert_eq!(hit_delta, 1, "cached channel should record exactly one hit: {after:?}");
-            assert_eq!(miss_delta, 0, "cached channel should not record a miss: {after:?}");
-        } else {
-            assert_eq!(hit_delta, 0, "uncached channel should not record a hit: {after:?}");
-            assert_eq!(
-                miss_delta, 1,
-                "uncached channel should record exactly one miss: {after:?}"
-            );
-        }
-    }
-
-    fn count_metric(events: &[ClientMetricEvent], metric: ClientMetric) -> usize {
-        events.iter().filter(|event| event.metric == metric).count()
-    }
-
-    mod data_plane_validation {
-        use std::sync::Arc;
-
-        use async_trait::async_trait;
-        use beryl_types::{
-            BlockId, BlockIndex, ClientId, GroupName, InodeId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol,
-        };
-        use bytes::Bytes;
-
-        use crate::data::{
-            WorkerBlockSyncResult, WorkerBlockWriteHandle, WorkerCommitResult, WorkerDataClient, WorkerDataPlane,
-            WorkerReadResult, WorkerWriteTarget,
-        };
-        use crate::error::{ClientError, ClientResult};
-        use crate::planner::PlannedBlockRead;
-        use crate::runtime::{AttemptContext, OperationContext, OperationDeadline};
-
-        #[tokio::test]
-        async fn data_plane_rejects_zero_block_stamp_before_worker_io() {
-            let data_plane = WorkerDataPlane::with_client(Arc::new(NoWorkerIo));
-            let block_read = planned_block_read(0);
-
-            let err = data_plane
-                .read_block_ranges(data_attempt_context(), test_group_name(), &[block_read])
+            let result = grpc_client()
+                .read_block_range(attempt("ReadBlock"), group_name(), &planned_read(vec![first, second]))
                 .await
-                .expect_err("zero stamp must fail before worker IO");
+                .expect("second Worker satisfies read");
 
-            assert!(matches!(err, ClientError::InvalidLayout(msg) if msg.contains("block_stamp")));
+            assert_eq!(result.bytes, Bytes::from_static(b"data"));
+            assert_eq!(first_state.read_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(second_state.read_calls.load(Ordering::SeqCst), 1);
+            let _ = first_shutdown.send(());
+            let _ = second_shutdown.send(());
         }
+    }
 
-        struct NoWorkerIo;
+    #[tokio::test]
+    async fn partial_read_is_discarded_before_failover() {
+        let first_state = Arc::new(MockWorkerState::new(
+            ReadFailure::PartialTransport,
+            WriteBehavior::Success,
+        ));
+        let second_state = Arc::new(MockWorkerState::new(ReadFailure::None, WriteBehavior::Success));
+        let (first, first_shutdown) = start_mock_worker(Arc::clone(&first_state), 1).await;
+        let (second, second_shutdown) = start_mock_worker(Arc::clone(&second_state), 2).await;
 
-        #[async_trait]
-        impl WorkerDataClient for NoWorkerIo {
-            async fn read_block_range(
-                &self,
-                _attempt: AttemptContext,
-                _group_name: GroupName,
-                _block_read: &PlannedBlockRead,
-            ) -> ClientResult<WorkerReadResult> {
-                panic!("worker read must not run")
-            }
+        let result = grpc_client()
+            .read_block_range(attempt("ReadBlock"), group_name(), &planned_read(vec![first, second]))
+            .await
+            .expect("second Worker replaces partial stream");
 
-            async fn open_block_write(
-                &self,
-                _attempt: AttemptContext,
-                _target: WorkerWriteTarget,
-            ) -> ClientResult<WorkerBlockWriteHandle> {
-                panic!("worker open write must not run")
-            }
+        assert_eq!(result.bytes, Bytes::from_static(b"data"));
+        assert_eq!(first_state.read_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_state.read_calls.load(Ordering::SeqCst), 1);
+        let _ = first_shutdown.send(());
+        let _ = second_shutdown.send(());
+    }
 
-            async fn write_block_bytes(
-                &self,
-                _attempt: AttemptContext,
-                _handle: &WorkerBlockWriteHandle,
-                _data: Bytes,
-            ) -> ClientResult<beryl_proto::worker::WriteStreamResponseProto> {
-                panic!("worker write must not run")
-            }
+    #[tokio::test]
+    async fn read_protocol_corruption_does_not_fail_over() {
+        let first_state = Arc::new(MockWorkerState::new(ReadFailure::EmptyChunk, WriteBehavior::Success));
+        let second_state = Arc::new(MockWorkerState::new(ReadFailure::None, WriteBehavior::Success));
+        let (first, first_shutdown) = start_mock_worker(Arc::clone(&first_state), 1).await;
+        let (second, second_shutdown) = start_mock_worker(Arc::clone(&second_state), 2).await;
 
-            async fn commit_block_write(
-                &self,
-                _attempt: AttemptContext,
-                _handle: &WorkerBlockWriteHandle,
-                _effective_len: u64,
-                _commit_seq: u64,
-                _require_sync: bool,
-            ) -> ClientResult<WorkerCommitResult> {
-                panic!("worker commit must not run")
-            }
+        let error = grpc_client()
+            .read_block_range(attempt("ReadBlock"), group_name(), &planned_read(vec![first, second]))
+            .await
+            .expect_err("empty chunk fails closed");
 
-            async fn sync_committed_block(
-                &self,
-                _attempt: AttemptContext,
-                _handle: &WorkerBlockWriteHandle,
-                _expected_len: u64,
-            ) -> ClientResult<WorkerBlockSyncResult> {
-                panic!("worker sync must not run")
-            }
+        assert!(matches!(error, ClientError::Worker(message) if message.contains("empty chunk")));
+        assert_eq!(first_state.read_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_state.read_calls.load(Ordering::SeqCst), 0);
+        let _ = first_shutdown.send(());
+        let _ = second_shutdown.send(());
+    }
 
-            async fn abort_block_write(
-                &self,
-                _attempt: AttemptContext,
-                _handle: &WorkerBlockWriteHandle,
-            ) -> ClientResult<()> {
-                panic!("worker abort must not run")
-            }
-        }
+    #[tokio::test]
+    async fn write_failure_after_ack_is_unknown_and_never_tries_another_worker() {
+        let first_state = Arc::new(MockWorkerState::new(
+            ReadFailure::None,
+            WriteBehavior::AckThenUnavailable,
+        ));
+        let second_state = Arc::new(MockWorkerState::new(ReadFailure::None, WriteBehavior::Success));
+        let (first, first_shutdown) = start_mock_worker(Arc::clone(&first_state), 1).await;
+        let (second, second_shutdown) = start_mock_worker(Arc::clone(&second_state), 2).await;
 
-        fn data_attempt_context() -> AttemptContext {
-            let operation = OperationContext::new_named(
-                ClientId::new(7),
-                "test-client",
-                "ReadBlock",
-                Some("/alpha".to_string()),
-                OperationDeadline::new(1_000),
+        let error = grpc_client()
+            .write_block(
+                attempt("WriteBlock"),
+                write_target(vec![first, second]),
+                Bytes::from_static(b"data"),
             )
-            .expect("operation context");
-            AttemptContext::for_data(&operation, 0)
-        }
+            .await
+            .expect_err("transport loss after ack has unknown outcome");
 
-        fn worker_endpoint() -> WorkerEndpointInfo {
-            WorkerEndpointInfo {
-                worker_id: WorkerId::new(1),
-                endpoint: "127.0.0.1:19101".to_string(),
-                worker_net_protocol: WorkerNetProtocol::Grpc,
-                worker_run_id: "550e8400-e29b-41d4-a716-446655440000"
-                    .parse()
-                    .expect("valid test WorkerRunId"),
-            }
-        }
-
-        fn planned_block_read(block_stamp: u64) -> PlannedBlockRead {
-            PlannedBlockRead {
-                file_offset: 0,
-                len: 4,
-                end_file_offset: 4,
-                block_id: BlockId::new(InodeId::new(202), BlockIndex::new(0)),
-                block_offset: 0,
-                workers: vec![worker_endpoint()],
-                block_stamp,
-                block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
-                block_size: 4096,
-                chunk_size: 4096,
-                effective_len: 5,
-            }
-        }
-
-        fn test_group_name() -> GroupName {
-            GroupName::parse("root").unwrap()
-        }
+        assert!(matches!(error, ClientError::UnknownOutcome(message) if message.contains("WriteBlock")));
+        assert_eq!(first_state.write_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_state.write_calls.load(Ordering::SeqCst), 0);
+        let _ = first_shutdown.send(());
+        let _ = second_shutdown.send(());
     }
 }

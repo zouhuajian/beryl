@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::ClientConfig;
-use crate::data::{WorkerBlockSyncResult, WorkerCommitResult, WorkerDataPlane};
+use crate::data::WorkerDataPlane;
 use crate::error::side_effect_response_body_mismatch;
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::MetadataGateway;
@@ -18,7 +18,7 @@ use crate::runtime::{
     classify_error, AttemptContext, ClientIdentity, ErrorClass, MetadataExecutor, MetadataTargets, OperationContext,
     OperationDeadline,
 };
-use crate::session::write_session::{PendingBlock, WorkerCommitLevel, WriteSession};
+use crate::session::write_session::{ReadyBlock, WriteSession};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
 use bytes::Bytes;
 
@@ -92,177 +92,35 @@ impl ClientRuntime {
         let operation = worker_write_context(
             self.executor.client_id(),
             self.executor.client_name(),
-            "OpenWriteStream",
-            session.path(),
-            deadline.clone(),
-        )?;
-        let ctx = self.data_context(&operation, 0);
-        let block_write_handle = match self
-            .worker_rpc_with_timeout(
-                &operation,
-                self.data_plane
-                    .open_block_write(ctx, add_block.group_name.clone(), add_block.target.clone()),
-            )
-            .await
-        {
-            Ok(block_write_handle) => block_write_handle,
-            Err(err) => {
-                mark_session_after_write_error(session, &err);
-                return Err(self.normalize_outcome_error("OpenWriteStream", "worker", err));
-            }
-        };
-        let operation = worker_write_context(
-            self.executor.client_id(),
-            self.executor.client_name(),
-            "WriteStream",
+            "WriteBlock",
             session.path(),
             deadline,
         )?;
         let ctx = self.data_context(&operation, 0);
-        let response = match self
+        match self
             .worker_rpc_with_timeout(
                 &operation,
-                self.data_plane.write_block_bytes(ctx, &block_write_handle, data),
+                self.data_plane
+                    .write_block(ctx, add_block.group_name, add_block.target.clone(), data),
             )
             .await
         {
-            Ok(response) => response,
+            Ok(()) => {}
             Err(err) => {
                 mark_session_after_write_error(session, &err);
-                return Err(self.normalize_outcome_error("WriteStream", "worker", err));
+                return Err(self.normalize_outcome_error("WriteBlock", "worker", err));
             }
-        };
-        if response.written_through != block_len {
-            session.mark_unknown_outcome();
-            self.record_metric(
-                ClientMetric::WorkerResponseBodyMismatch,
-                metric_labels("WriteStream", "worker").with_outcome("unknown"),
-            );
-            self.record_metric(
-                ClientMetric::UnknownOutcome,
-                metric_labels("WriteStream", "worker").with_outcome("unknown"),
-            );
-            return Err(ClientError::UnknownOutcome(format!(
-                "worker WriteStream written_through mismatch: expected {}, got {}",
-                block_len, response.written_through
-            )));
         }
-        if let Err(err) =
-            session.push_pending_block(add_block.target, block_write_handle, block_len, response.last_acked_seq)
-        {
+        if let Err(err) = session.push_ready_block(add_block.target, block_len) {
             session.mark_session_invalid();
             return Err(err);
         }
         Ok(())
     }
 
-    /// Commit pending worker blocks to the level required by the next metadata barrier.
-    pub(crate) async fn commit_pending_blocks_for_barrier(
-        &self,
-        session: &mut WriteSession,
-        required_level: WorkerCommitLevel,
-        deadline: OperationDeadline,
-    ) -> ClientResult<Vec<beryl_types::CommittedBlock>> {
-        let worker_path = session.path().to_string();
-        let mut committed_blocks = Vec::with_capacity(session.pending_blocks_mut().len());
-        for pending in session.pending_blocks_mut() {
-            if pending.worker_commit_level().satisfies(required_level) {
-                committed_blocks.push(committed_block_from_pending(pending));
-                continue;
-            }
-
-            match (pending.worker_commit_level(), required_level) {
-                (WorkerCommitLevel::Uncommitted, WorkerCommitLevel::Visible | WorkerCommitLevel::Durable) => {
-                    let require_sync = required_level.requires_sync();
-                    let operation = worker_write_context(
-                        self.executor.client_id(),
-                        self.executor.client_name(),
-                        "CommitWrite",
-                        &worker_path,
-                        deadline.clone(),
-                    )?;
-                    let ctx = self.data_context(&operation, 0);
-                    let commit_result = match self
-                        .worker_rpc_with_timeout(
-                            &operation,
-                            self.data_plane.commit_block_write(
-                                ctx,
-                                pending.block_write_handle(),
-                                pending.written_len(),
-                                pending.commit_seq(),
-                                require_sync,
-                            ),
-                        )
-                        .await
-                    {
-                        Ok(result) => result,
-                        Err(err) => {
-                            mark_session_after_write_error(session, &err);
-                            return Err(self.normalize_outcome_error("CommitWrite", "worker", err));
-                        }
-                    };
-                    if let Err(err) = validate_worker_commit_result(pending, commit_result) {
-                        session.mark_unknown_outcome();
-                        self.record_metric(
-                            ClientMetric::WorkerResponseBodyMismatch,
-                            metric_labels("CommitWrite", "worker").with_outcome("unknown"),
-                        );
-                        self.record_metric(
-                            ClientMetric::UnknownOutcome,
-                            metric_labels("CommitWrite", "worker").with_outcome("unknown"),
-                        );
-                        return Err(err);
-                    }
-                    pending.mark_worker_committed(require_sync);
-                }
-                (WorkerCommitLevel::Visible, WorkerCommitLevel::Durable) => {
-                    let operation = worker_write_context(
-                        self.executor.client_id(),
-                        self.executor.client_name(),
-                        "SyncCommittedBlock",
-                        &worker_path,
-                        deadline.clone(),
-                    )?;
-                    let ctx = self.data_context(&operation, 0);
-                    let sync_result = match self
-                        .worker_rpc_with_timeout(
-                            &operation,
-                            self.data_plane.sync_committed_block(
-                                ctx,
-                                pending.block_write_handle(),
-                                pending.written_len(),
-                            ),
-                        )
-                        .await
-                    {
-                        Ok(result) => result,
-                        Err(err) => {
-                            mark_session_after_block_sync_error(session, &err);
-                            return Err(self.normalize_outcome_error("SyncCommittedBlock", "worker", err));
-                        }
-                    };
-                    if let Err(err) = validate_worker_block_sync_result(pending, sync_result) {
-                        session.mark_unknown_outcome();
-                        self.record_metric(
-                            ClientMetric::WorkerResponseBodyMismatch,
-                            metric_labels("SyncCommittedBlock", "worker").with_outcome("unknown"),
-                        );
-                        self.record_metric(
-                            ClientMetric::UnknownOutcome,
-                            metric_labels("SyncCommittedBlock", "worker").with_outcome("unknown"),
-                        );
-                        return Err(err);
-                    }
-                    pending.mark_worker_committed(true);
-                }
-                (WorkerCommitLevel::Visible, WorkerCommitLevel::Visible)
-                | (WorkerCommitLevel::Durable, WorkerCommitLevel::Visible | WorkerCommitLevel::Durable)
-                | (WorkerCommitLevel::Uncommitted, WorkerCommitLevel::Uncommitted)
-                | (WorkerCommitLevel::Visible | WorkerCommitLevel::Durable, WorkerCommitLevel::Uncommitted) => {}
-            }
-            committed_blocks.push(committed_block_from_pending(pending));
-        }
-        Ok(committed_blocks)
+    /// Converts durable Worker blocks into the Metadata visibility-barrier shape.
+    pub(crate) fn committed_blocks_for_barrier(&self, session: &WriteSession) -> Vec<beryl_types::CommittedBlock> {
+        session.ready_blocks().iter().map(committed_block_from_ready).collect()
     }
 
     /// Builds a data-plane attempt context under the public operation deadline.
@@ -417,59 +275,14 @@ fn worker_write_context(
     OperationContext::new_named(client_id, client_name, operation_name, Some(path.to_string()), deadline)
 }
 
-/// Converts a pending worker block into the metadata committed-block shape.
-fn committed_block_from_pending(pending: &PendingBlock) -> beryl_types::CommittedBlock {
-    let target = pending.target();
+/// Converts a durable Worker block into the Metadata committed-block shape.
+fn committed_block_from_ready(block: &ReadyBlock) -> beryl_types::CommittedBlock {
+    let target = block.target();
     beryl_types::CommittedBlock {
         block_id: target.block_id,
         file_offset: target.file_offset,
-        len: pending.written_len(),
+        len: block.written_len(),
     }
-}
-
-fn validate_worker_commit_result(pending: &PendingBlock, result: WorkerCommitResult) -> ClientResult<()> {
-    let expected_len = pending.written_len();
-    if result.effective_len != expected_len {
-        return Err(side_effect_response_body_mismatch(
-            "CommitWrite",
-            format!("effective_len expected {}, got {}", expected_len, result.effective_len),
-        ));
-    }
-    if result.written_through != expected_len {
-        return Err(side_effect_response_body_mismatch(
-            "CommitWrite",
-            format!(
-                "written_through expected {}, got {}",
-                expected_len, result.written_through
-            ),
-        ));
-    }
-    let expected_stamp = pending.target().block_stamp;
-    if result.block_stamp != expected_stamp {
-        return Err(side_effect_response_body_mismatch(
-            "CommitWrite",
-            format!("block_stamp expected {}, got {}", expected_stamp, result.block_stamp),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_worker_block_sync_result(pending: &PendingBlock, result: WorkerBlockSyncResult) -> ClientResult<()> {
-    let expected_len = pending.written_len();
-    if result.effective_len != expected_len {
-        return Err(side_effect_response_body_mismatch(
-            "SyncCommittedBlock",
-            format!("effective_len expected {}, got {}", expected_len, result.effective_len),
-        ));
-    }
-    let expected_stamp = pending.target().block_stamp;
-    if result.block_stamp != expected_stamp {
-        return Err(side_effect_response_body_mismatch(
-            "SyncCommittedBlock",
-            format!("block_stamp expected {}, got {}", expected_stamp, result.block_stamp),
-        ));
-    }
-    Ok(())
 }
 
 /// Marks a write session after a worker write or add-block failure.
@@ -480,15 +293,6 @@ fn mark_session_after_write_error(session: &mut WriteSession, err: &ClientError)
         mark_session_after_metadata_error(session, err);
     } else {
         session.mark_session_invalid();
-    }
-}
-
-/// Marks a write session after a durable block-sync failure.
-fn mark_session_after_block_sync_error(session: &mut WriteSession, err: &ClientError) {
-    if is_session_or_fencing_error(err) || is_write_refresh_error(err) {
-        mark_session_after_metadata_error(session, err);
-    } else {
-        session.mark_unknown_outcome();
     }
 }
 

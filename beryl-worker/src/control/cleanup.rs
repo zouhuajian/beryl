@@ -786,12 +786,7 @@ mod tests {
         let run_id = WorkerRunId::new();
         let registrations = registered(run_id);
         let store = Arc::new(ControlledStore::new(ReclaimBehavior::Fail, Duration::ZERO, 101));
-        let core = Arc::new(WorkerCore::with_local_store(
-            1_024,
-            1_024,
-            Duration::from_secs(60),
-            store.clone(),
-        ));
+        let core = Arc::new(WorkerCore::with_local_store(1_024, 1_024, store.clone()));
         let runtime = BlockCleanupRuntime::start(
             core,
             registrations,
@@ -820,12 +815,7 @@ mod tests {
         let run_id = WorkerRunId::new();
         let registrations = registered(run_id);
         let store = Arc::new(ControlledStore::new(ReclaimBehavior::Fail, Duration::ZERO, 101));
-        let core = Arc::new(WorkerCore::with_local_store(
-            1_024,
-            1_024,
-            Duration::from_secs(60),
-            store.clone(),
-        ));
+        let core = Arc::new(WorkerCore::with_local_store(1_024, 1_024, store.clone()));
         let runtime = BlockCleanupRuntime::start(
             core,
             registrations,
@@ -873,12 +863,7 @@ mod tests {
         registrations: Arc<RegistrationSet>,
         options: BlockCleanupOptions,
     ) -> TestExecutor {
-        let core = Arc::new(WorkerCore::with_local_store(
-            1_024,
-            1_024,
-            Duration::from_secs(60),
-            store,
-        ));
+        let core = Arc::new(WorkerCore::with_local_store(1_024, 1_024, store));
         let runtime = BlockCleanupRuntime::start(core, registrations, options).expect("start cleanup executor");
         TestExecutor {
             executor: runtime.executor(),

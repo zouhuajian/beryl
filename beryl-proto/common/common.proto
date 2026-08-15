@@ -24,14 +24,6 @@ message ClientIdProto {
   uint64 low = 2;
 }
 
-/// Stream identity.
-/// Aligns with types::StreamId (u128).
-message StreamIdProto {
-  // u128 encoded as two uint64 (high, low)
-  uint64 high = 1;
-  uint64 low = 2;
-}
-
 // ============================================================================
 // Common Data Structures
 // ============================================================================

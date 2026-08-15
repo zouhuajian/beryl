@@ -26,8 +26,6 @@ pub(crate) const WORKER_STREAM_OPEN_TOTAL: &str = "worker_stream_open_total";
 pub(crate) const WORKER_STREAM_INFLIGHT: &str = "worker_stream_inflight";
 pub(crate) const WORKER_STREAM_FRAME_BYTES: &str = "worker_stream_frame_bytes";
 pub(crate) const WORKER_STREAM_FRAMES_TOTAL: &str = "worker_stream_frames_total";
-pub(crate) const WORKER_STREAM_COMMIT_TOTAL: &str = "worker_stream_commit_total";
-pub(crate) const WORKER_STREAM_ABORT_TOTAL: &str = "worker_stream_abort_total";
 pub(crate) const WORKER_CLEANUP_QUEUE_DEPTH: &str = "worker_cleanup_queue_depth";
 pub(crate) const WORKER_CLEANUP_RECLAIMING_COUNT: &str = "worker_cleanup_reclaiming_count";
 pub(crate) const WORKER_CLEANUP_ENQUEUE_TOTAL: &str = "worker_cleanup_enqueue_total";
@@ -194,24 +192,6 @@ pub(crate) fn record_stream_frame(mode: &str, status: &str, error_kind: &str, by
     .increment(1);
 }
 
-pub(crate) fn record_stream_commit(status: &str, error_kind: &str) {
-    metrics::counter!(
-        WORKER_STREAM_COMMIT_TOTAL,
-        "status" => status.to_string(),
-        "error_kind" => error_kind.to_string()
-    )
-    .increment(1);
-}
-
-pub(crate) fn record_stream_abort(status: &str, error_kind: &str) {
-    metrics::counter!(
-        WORKER_STREAM_ABORT_TOTAL,
-        "status" => status.to_string(),
-        "error_kind" => error_kind.to_string()
-    )
-    .increment(1);
-}
-
 pub(crate) fn worker_error_kind(error: &WorkerError) -> &'static str {
     match error {
         WorkerError::LeaderChanged(_) => "not_leader",
@@ -315,7 +295,7 @@ mod tests {
 
     use super::*;
 
-    fn worker_metric_contract_names() -> [&'static str; 21] {
+    fn worker_metric_contract_names() -> [&'static str; 19] {
         [
             WORKER_UP,
             WORKER_BUILD_INFO,
@@ -336,8 +316,6 @@ mod tests {
             WORKER_STREAM_INFLIGHT,
             WORKER_STREAM_FRAME_BYTES,
             WORKER_STREAM_FRAMES_TOTAL,
-            WORKER_STREAM_COMMIT_TOTAL,
-            WORKER_STREAM_ABORT_TOTAL,
         ]
     }
 
@@ -378,8 +356,6 @@ mod tests {
             "worker_stream_inflight",
             "worker_stream_frame_bytes",
             "worker_stream_frames_total",
-            "worker_stream_commit_total",
-            "worker_stream_abort_total",
         ];
 
         assert_eq!(names, expected);
@@ -450,8 +426,6 @@ mod tests {
         increment_stream_inflight("read");
         decrement_stream_inflight("read");
         record_stream_frame("read", "ok", "none", 1);
-        record_stream_commit("ok", "none");
-        record_stream_abort("ok", "none");
     }
 
     #[test]

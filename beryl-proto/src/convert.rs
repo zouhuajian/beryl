@@ -19,7 +19,7 @@ use ::beryl_common::{
     header::{CallerContext, ClientInfo, RequestHeader, ResponseHeader, TraceContext},
 };
 use beryl_types::chunk::ByteRange;
-use beryl_types::ids::{BlockId, BlockIndex, StreamId, WorkerId};
+use beryl_types::ids::{BlockId, BlockIndex, WorkerId};
 use beryl_types::layout::{BlockShape, FileLayout};
 use beryl_types::lease::FencingToken;
 use beryl_types::{
@@ -73,39 +73,12 @@ impl TryFrom<proto_common::ClientIdProto> for ClientId {
     }
 }
 
-impl From<StreamId> for proto_common::StreamIdProto {
-    fn from(id: StreamId) -> Self {
-        let value = id.as_raw();
-        proto_common::StreamIdProto {
-            high: (value >> 64) as u64,
-            low: value as u64,
-        }
-    }
-}
-
-impl TryFrom<proto_common::StreamIdProto> for StreamId {
-    type Error = ();
-
-    fn try_from(id: proto_common::StreamIdProto) -> Result<Self, Self::Error> {
-        let value = ((id.high as u128) << 64) | (id.low as u128);
-        Ok(StreamId::new(value))
-    }
-}
-
 /// Parse a required block id field without choosing caller error policy.
 pub fn required_block_id(proto: Option<proto_common::BlockIdProto>, field_name: &str) -> Result<BlockId, String> {
     proto
         .ok_or_else(|| format!("missing {field_name}"))?
         .try_into()
         .map_err(|error| format!("invalid {field_name}: {error}"))
-}
-
-/// Parse a required stream id field without choosing caller error policy.
-pub fn required_stream_id(proto: Option<proto_common::StreamIdProto>, field_name: &str) -> Result<StreamId, String> {
-    proto
-        .ok_or_else(|| format!("missing {field_name}"))?
-        .try_into()
-        .map_err(|_| format!("invalid {field_name}"))
 }
 
 /// Parse a required client id field without choosing caller error policy.
@@ -1518,19 +1491,17 @@ mod tests {
         );
         assert_message_fields(
             &descriptors,
-            "worker.OpenWriteStreamRequestProto",
+            "worker.WriteBlockCommandProto",
             &[
                 ("header", 1),
-                ("block_id", 2),
-                ("block_format_id", 3),
-                ("block_size", 4),
-                ("chunk_size", 5),
-                ("block_stamp", 6),
-                ("token", 7),
-                ("frame_size", 8),
-                ("worker_run_id", 9),
-                ("group_name", 10),
-                ("tier", 11),
+                ("group_name", 2),
+                ("block_id", 3),
+                ("worker_run_id", 4),
+                ("block_format_id", 5),
+                ("block_size", 6),
+                ("chunk_size", 7),
+                ("block_stamp", 8),
+                ("tier", 9),
             ],
         );
         assert_message_fields(
@@ -1543,41 +1514,6 @@ mod tests {
                 ("effective_len", 4),
             ],
         );
-        assert_message_fields(
-            &descriptors,
-            "worker.CommitWriteRequestProto",
-            &[
-                ("header", 1),
-                ("block_id", 2),
-                ("stream_id", 3),
-                ("effective_len", 4),
-                ("block_stamp", 5),
-                ("token", 6),
-                ("commit_seq", 7),
-                ("require_sync", 8),
-                ("worker_run_id", 9),
-                ("block_format_id", 10),
-                ("block_size", 11),
-                ("chunk_size", 12),
-                ("group_name", 13),
-            ],
-        );
-        assert_message_fields(
-            &descriptors,
-            "worker.SyncCommittedBlockRequestProto",
-            &[
-                ("header", 1),
-                ("block_id", 2),
-                ("block_stamp", 3),
-                ("expected_block_len", 4),
-                ("worker_run_id", 5),
-                ("block_format_id", 6),
-                ("block_size", 7),
-                ("chunk_size", 8),
-                ("group_name", 9),
-            ],
-        );
-
         assert_message_fields(
             &descriptors,
             "worker.BlockMetaPayloadProto",

@@ -9,7 +9,6 @@ use beryl_proto::metadata::{OpenWriteModeProto, WriteHandleProto};
 use beryl_types::{BlockShape, CallId, ClientId, CommittedBlock, FileLayout, InodeId, WriteTarget};
 use bytes::{Bytes, BytesMut};
 
-use crate::data::WorkerBlockWriteHandle;
 use crate::error::{ClientError, ClientResult};
 use crate::runtime::context::{OperationContext, OperationDeadline};
 
@@ -29,7 +28,7 @@ pub(crate) struct WriteSession {
     flush_cursor: u64,
     buffered: BytesMut,
     expires_at_ms: Option<u64>,
-    pending_blocks: Vec<PendingBlock>,
+    ready_blocks: Vec<ReadyBlock>,
     state: WriteSessionState,
     commit: Option<CommitFileState>,
     abort: Option<AbortCleanupState>,
@@ -67,7 +66,7 @@ impl WriteSession {
             flush_cursor: base_size,
             buffered: BytesMut::new(),
             expires_at_ms: Some(expires_at_ms),
-            pending_blocks: Vec::new(),
+            ready_blocks: Vec::new(),
             state: WriteSessionState::Open,
             commit: None,
             abort: None,
@@ -140,7 +139,7 @@ impl WriteSession {
 
     /// Predecessor that identifies the next logical AddBlock step.
     pub(crate) fn previous_block_id(&self) -> Option<beryl_types::BlockId> {
-        self.pending_blocks.last().map(|pending| pending.target.block_id)
+        self.ready_blocks.last().map(|block| block.target.block_id)
     }
 
     /// Validate a metadata write target before opening the worker stream.
@@ -197,37 +196,20 @@ impl WriteSession {
         Ok(())
     }
 
-    /// Record a worker-accepted block and advance the cursor.
-    pub(crate) fn push_pending_block(
-        &mut self,
-        target: WriteTarget,
-        block_write_handle: WorkerBlockWriteHandle,
-        written_len: u64,
-        commit_seq: u64,
-    ) -> ClientResult<()> {
-        if commit_seq == 0 {
-            return Err(ClientError::Worker(
-                "worker WriteStream acknowledged no non-empty frame".to_string(),
-            ));
-        }
+    /// Records a durable Worker Ready block pending Metadata publication.
+    pub(crate) fn push_ready_block(&mut self, target: WriteTarget, written_len: u64) -> ClientResult<()> {
         let final_offset = self
             .flush_cursor
             .checked_add(written_len)
             .ok_or_else(|| ClientError::InvalidArgument("write flush cursor overflow".to_string()))?;
-        self.pending_blocks.push(PendingBlock {
-            target,
-            block_write_handle,
-            written_len,
-            commit_seq,
-            worker_commit_level: WorkerCommitLevel::Uncommitted,
-        });
+        self.ready_blocks.push(ReadyBlock { target, written_len });
         self.flush_cursor = final_offset;
         Ok(())
     }
 
-    /// Return pending worker blocks.
-    pub(crate) fn pending_blocks_mut(&mut self) -> &mut [PendingBlock] {
-        &mut self.pending_blocks
+    /// Returns durable Worker blocks that may be published by Metadata.
+    pub(crate) fn ready_blocks(&self) -> &[ReadyBlock] {
+        &self.ready_blocks
     }
 
     /// Freeze and return the CommitFile operation for this write session.
@@ -335,27 +317,9 @@ impl WriteSession {
     ) -> ClientResult<AbortCleanupPlan> {
         match self.state {
             WriteSessionState::Open => {
-                if self.pending_blocks.iter().any(PendingBlock::has_worker_commit) {
-                    self.state = WriteSessionState::AbortUnknown;
-                    return Err(ClientError::UnknownOutcome(
-                        "cannot safely abort after a worker block commit succeeded".to_string(),
-                    ));
-                }
-                let worker_cleanups = self
-                    .pending_blocks
-                    .iter()
-                    .map(|pending| {
-                        let block_write_handle = pending.block_write_handle().clone();
-                        AbortWorkerCleanupState {
-                            abort_call_id: CallId::new(),
-                            block_write_handle,
-                        }
-                    })
-                    .collect::<Vec<_>>();
                 self.abort = Some(AbortCleanupState {
                     metadata_call_id: CallId::new(),
                     metadata_write_handle: self.write_handle,
-                    worker_cleanups,
                 });
                 self.state = WriteSessionState::AbortUnknown;
             }
@@ -384,25 +348,9 @@ impl WriteSession {
             Some(self.path.clone()),
             deadline.clone(),
         )?;
-        let mut worker_cleanups = Vec::with_capacity(abort.worker_cleanups.len());
-        for cleanup in &abort.worker_cleanups {
-            let operation = OperationContext::with_call_id_named(
-                client_id,
-                client_name,
-                cleanup.abort_call_id,
-                "AbortWrite",
-                Some(self.path.clone()),
-                deadline.clone(),
-            )?;
-            worker_cleanups.push(AbortWorkerCleanupPlan {
-                operation,
-                block_write_handle: cleanup.block_write_handle.clone(),
-            });
-        }
         Ok(AbortCleanupPlan {
             metadata_operation,
             metadata_write_handle: abort.metadata_write_handle,
-            worker_cleanups,
         })
     }
 
@@ -436,7 +384,8 @@ impl WriteSession {
         self.mode
     }
 
-    /// Mark the session aborted after best-effort cleanup.
+    /// Marks the session aborted after Metadata accepts `AbortFileWrite`.
+    /// Metadata cleanup owns any durable Worker Ready blocks left unpublished.
     pub(crate) fn mark_aborted(&mut self) {
         self.abort = None;
         self.state = WriteSessionState::Aborted;
@@ -586,86 +535,22 @@ impl WriteSession {
     }
 }
 
-/// Pending worker block in a write session.
+/// Durable Worker Ready block pending Metadata publication.
 #[derive(Clone, Debug)]
-pub(crate) struct PendingBlock {
+pub(crate) struct ReadyBlock {
     target: WriteTarget,
-    block_write_handle: WorkerBlockWriteHandle,
     written_len: u64,
-    commit_seq: u64,
-    worker_commit_level: WorkerCommitLevel,
 }
 
-impl PendingBlock {
+impl ReadyBlock {
     /// Metadata write target for this block.
     pub(crate) fn target(&self) -> &WriteTarget {
         &self.target
     }
 
-    /// Worker block write handle for this pending block.
-    pub(crate) fn block_write_handle(&self) -> &WorkerBlockWriteHandle {
-        &self.block_write_handle
-    }
-
-    /// Length accepted by the worker write path.
+    /// Durable effective length established by the Worker.
     pub(crate) fn written_len(&self) -> u64 {
         self.written_len
-    }
-
-    /// Last worker-acknowledged write sequence for CommitWrite.
-    pub(crate) fn commit_seq(&self) -> u64 {
-        self.commit_seq
-    }
-
-    /// Whether any CommitWrite already succeeded for this block.
-    pub(crate) fn has_worker_commit(&self) -> bool {
-        self.worker_commit_level != WorkerCommitLevel::Uncommitted
-    }
-
-    /// Current worker-observed commit level for this block.
-    pub(crate) fn worker_commit_level(&self) -> WorkerCommitLevel {
-        self.worker_commit_level
-    }
-
-    /// Mark worker commit as successful at the visibility or durability level.
-    pub(crate) fn mark_worker_committed(&mut self, require_sync: bool) {
-        self.worker_commit_level = WorkerCommitLevel::from_require_sync(require_sync);
-    }
-}
-
-/// Client-observed worker commit strength for a pending write block.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WorkerCommitLevel {
-    Uncommitted,
-    Visible,
-    Durable,
-}
-
-impl WorkerCommitLevel {
-    /// Required level for the existing non-sync close path.
-    pub(crate) const CLOSE_REQUIRED: Self = Self::Visible;
-
-    /// Return the required worker commit level for a CommitWrite request.
-    pub(crate) fn from_require_sync(require_sync: bool) -> Self {
-        if require_sync {
-            Self::Durable
-        } else {
-            Self::Visible
-        }
-    }
-
-    pub(crate) fn satisfies(self, required: Self) -> bool {
-        matches!(
-            (self, required),
-            (Self::Durable, Self::Durable | Self::Visible)
-                | (Self::Visible, Self::Visible)
-                | (Self::Uncommitted, Self::Uncommitted)
-        )
-    }
-
-    /// Whether CommitWrite must request worker-side sync for this level.
-    pub(crate) fn requires_sync(self) -> bool {
-        matches!(self, Self::Durable)
     }
 }
 
@@ -713,24 +598,11 @@ struct CommitFileState {
 struct AbortCleanupState {
     metadata_call_id: CallId,
     metadata_write_handle: WriteHandleProto,
-    worker_cleanups: Vec<AbortWorkerCleanupState>,
 }
 
 impl std::fmt::Debug for AbortCleanupState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AbortCleanupState").finish_non_exhaustive()
-    }
-}
-
-#[derive(Clone)]
-struct AbortWorkerCleanupState {
-    abort_call_id: CallId,
-    block_write_handle: WorkerBlockWriteHandle,
-}
-
-impl std::fmt::Debug for AbortWorkerCleanupState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AbortWorkerCleanupState").finish_non_exhaustive()
     }
 }
 
@@ -751,7 +623,6 @@ pub(crate) struct CommitFilePlan {
 pub(crate) struct AbortCleanupPlan {
     metadata_operation: OperationContext,
     metadata_write_handle: WriteHandleProto,
-    worker_cleanups: Vec<AbortWorkerCleanupPlan>,
 }
 
 impl AbortCleanupPlan {
@@ -763,30 +634,6 @@ impl AbortCleanupPlan {
     /// Metadata write handle payload frozen before cleanup starts.
     pub(crate) fn metadata_write_handle(&self) -> WriteHandleProto {
         self.metadata_write_handle
-    }
-
-    /// Per-worker cleanup operations frozen before cleanup starts.
-    pub(crate) fn worker_cleanups(&self) -> &[AbortWorkerCleanupPlan] {
-        &self.worker_cleanups
-    }
-}
-
-/// Frozen worker AbortWrite cleanup operation.
-#[derive(Clone)]
-pub(crate) struct AbortWorkerCleanupPlan {
-    operation: OperationContext,
-    block_write_handle: WorkerBlockWriteHandle,
-}
-
-impl AbortWorkerCleanupPlan {
-    /// Worker AbortWrite operation with stable call identity.
-    pub(crate) fn operation(&self) -> OperationContext {
-        self.operation.clone()
-    }
-
-    /// Worker block write handle snapshot to abort.
-    pub(crate) fn block_write_handle(&self) -> &WorkerBlockWriteHandle {
-        &self.block_write_handle
     }
 }
 
@@ -808,14 +655,12 @@ fn validate_write_handle(handle: &WriteHandleProto) -> ClientResult<InodeId> {
 mod tests {
     use super::*;
 
-    use beryl_proto::common::StreamIdProto;
     use beryl_types::lease::FencingToken;
     use beryl_types::{
         BlockId, BlockIndex, ClientId, CommittedBlock, GroupName, InodeId, WorkerEndpointInfo, WorkerId,
         WorkerNetProtocol, WriteTarget,
     };
 
-    use crate::data::WorkerBlockWriteHandle;
     use crate::runtime::AttemptContext;
 
     #[test]
@@ -962,35 +807,24 @@ mod tests {
         )
         .expect("session");
         session
-            .push_pending_block(write_target(302, 0, 0), block_write_handle(302, 0, 0, 9), 5, 1)
-            .expect("pending block");
+            .push_ready_block(write_target(302, 0, 0), 5)
+            .expect("ready block");
 
         let first = session
             .prepare_abort_cleanup(ClientId::new(7), "test-client", OperationDeadline::new(1_000))
             .expect("first abort plan");
         let first_metadata = AttemptContext::for_metadata(&first.metadata_operation(), test_group_name(), 0)
             .expect("first metadata context");
-        let first_worker = first.worker_cleanups()[0].operation();
-        let first_worker_ctx = AttemptContext::for_data(&first_worker, 0);
-        let first_worker_snapshot = block_write_handle_signature(first.worker_cleanups()[0].block_write_handle());
-        session.pending_blocks.clear();
+        session.ready_blocks.clear();
 
         let second = session
             .prepare_abort_cleanup(ClientId::new(7), "test-client", OperationDeadline::new(1_000))
             .expect("retry abort plan");
         let second_metadata = AttemptContext::for_metadata(&second.metadata_operation(), test_group_name(), 0)
             .expect("second metadata context");
-        let second_worker = second.worker_cleanups()[0].operation();
-        let second_worker_ctx = AttemptContext::for_data(&second_worker, 0);
 
         assert_eq!(metadata_call_id(&first_metadata), metadata_call_id(&second_metadata));
         assert_eq!(first.metadata_write_handle(), second.metadata_write_handle());
-        assert_eq!(second.worker_cleanups().len(), 1);
-        assert_eq!(data_call_id(&first_worker_ctx), data_call_id(&second_worker_ctx));
-        assert_eq!(
-            first_worker_snapshot,
-            block_write_handle_signature(second.worker_cleanups()[0].block_write_handle())
-        );
     }
 
     #[test]
@@ -1029,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_abort_cleanup_after_worker_committed_block_is_conservative() {
+    fn prepare_abort_cleanup_after_ready_block_uses_metadata_authority() {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
             test_layout(),
@@ -1041,15 +875,12 @@ mod tests {
         )
         .expect("session");
         session
-            .push_pending_block(write_target(302, 0, 0), block_write_handle(302, 0, 0, 9), 5, 1)
-            .expect("pending block");
-        session.pending_blocks[0].mark_worker_committed(false);
+            .push_ready_block(write_target(302, 0, 0), 5)
+            .expect("ready block");
 
-        let err = match session.prepare_abort_cleanup(ClientId::new(7), "test-client", OperationDeadline::new(1_000)) {
-            Ok(_) => panic!("committed worker block cannot be safely aborted"),
-            Err(err) => err,
-        };
-        assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("worker block commit")));
+        session
+            .prepare_abort_cleanup(ClientId::new(7), "test-client", OperationDeadline::new(1_000))
+            .expect("Metadata abort owns orphan reclamation");
         assert!(matches!(
             session.ensure_operation_allowed_at_ms(WriteSessionOperation::Write, 0),
             Err(ClientError::StaleHandle { reason }) if reason.contains("abort outcome")
@@ -1231,42 +1062,6 @@ mod tests {
         }
     }
 
-    fn block_write_handle(
-        inode_id: u64,
-        block_index: u32,
-        file_offset: u64,
-        stream_low: u64,
-    ) -> WorkerBlockWriteHandle {
-        WorkerBlockWriteHandle {
-            group_name: test_group_name(),
-            worker: worker_endpoint(),
-            target: write_target(inode_id, block_index, file_offset),
-            stream_id: StreamIdProto {
-                high: 1,
-                low: stream_low,
-            },
-            frame_size: 1024,
-            next_seq: 1,
-        }
-    }
-
-    fn block_write_handle_signature(
-        block: &WorkerBlockWriteHandle,
-    ) -> (String, u64, String, u64, u64, u64, u32, u64, u64, u64) {
-        (
-            block.group_name.to_string(),
-            block.worker.worker_id.as_raw(),
-            block.worker.worker_run_id.to_string(),
-            block.target.file_offset,
-            block.target.block_size,
-            block.target.block_stamp,
-            block.target.block_id.index.as_raw(),
-            block.target.block_id.inode_id.as_raw(),
-            block.stream_id.high,
-            block.stream_id.low,
-        )
-    }
-
     fn metadata_call_id(context: &AttemptContext) -> String {
         context
             .metadata_header()
@@ -1274,10 +1069,6 @@ mod tests {
             .client
             .expect("metadata client")
             .call_id
-    }
-
-    fn data_call_id(context: &AttemptContext) -> String {
-        context.data_header().client.expect("data client").call_id
     }
 
     fn test_group_name() -> GroupName {

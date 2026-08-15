@@ -380,7 +380,8 @@ impl FullBlockFileStore {
     }
 
     /// Writes bytes to an unpublished staging block.
-    /// Overwrites are allowed before publication so a write stream can retry frames.
+    /// The storage primitive permits overwriting an existing staging prefix;
+    /// the current ordered `WriteBlock` RPC only appends at its owned cursor.
     /// Ready blocks are immutable in this store, and writes do not change block stamps.
     pub fn write_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, data: Bytes) -> StoreResult<()> {
         let paths = self.paths(group_name, block_id);

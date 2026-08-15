@@ -71,7 +71,12 @@ fn main() -> Result<()> {
 
 /// Builds the asynchronous runtime only for the action that owns Worker lifecycle.
 fn run_async(future: impl Future<Output = Result<()>>) -> Result<()> {
-    tokio::runtime::Runtime::new()?.block_on(future)
+    let runtime = tokio::runtime::Runtime::new()?;
+    let result = runtime.block_on(future);
+    // `run_worker` already gives owned work a bounded drain. Do not let the
+    // runtime's default drop wait forever for store IO that exceeded it.
+    runtime.shutdown_background();
+    result
 }
 
 /// Starts Worker while preserving its bounded shutdown lifecycle.
@@ -177,7 +182,6 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
             return Err(error).context("Failed to build worker registration descriptor");
         }
     };
-    let worker_run_id = descriptor.worker_run_id;
     let block_report_descriptor = descriptor.clone();
     let registrar = match MetadataRegistrar::new(config.metadata.clone(), descriptor, Arc::clone(&registration_state)) {
         Ok(registrar) => Arc::new(registrar),
@@ -207,11 +211,9 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
         signal_result?;
         return Ok(());
     }
-    let core = Arc::new(WorkerCore::with_local_store_for_run(
+    let core = Arc::new(WorkerCore::with_local_store(
         config.default_frame_size,
         config.max_frame_size,
-        Duration::from_millis(config.stream_idle_timeout_ms),
-        worker_run_id,
         block_store.clone(),
     ));
     let cleanup = match BlockCleanupRuntime::start(
@@ -316,10 +318,10 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
         background_shutdown.child_token(),
     );
     let block_report_handle = block_report.spawn_until_shutdown(background_shutdown.child_token());
-    let stream_cleanup_handle = {
+    let write_cleanup_handle = {
         let core = Arc::clone(&core);
         let shutdown = background_shutdown.child_token();
-        tokio::spawn(async move { core.run_idle_stream_cleanup(shutdown).await })
+        tokio::spawn(async move { core.run_block_write_cleanup(shutdown).await })
     };
 
     let mut stop_error = None;
@@ -342,23 +344,23 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
     registration_state.begin_shutdown();
     background_shutdown.cancel();
     let deadline = Instant::now() + Duration::from_millis(config.shutdown_timeout_ms);
-    let rpc_and_streams = async {
+    let rpc_and_writes = async {
         let rpc_result = rpc.shutdown_until(deadline).await;
-        let stream_drain_forced = core.drain_streams_until(deadline).await;
-        (rpc_result, stream_drain_forced)
+        let write_drain_forced = core.drain_block_writes_until(deadline).await;
+        (rpc_result, write_drain_forced)
     };
     let (
-        (rpc_result, stream_drain_forced),
+        (rpc_result, write_drain_forced),
         heartbeat_result,
         block_report_result,
-        stream_cleanup_result,
+        write_cleanup_result,
         cleanup_result,
         http_result,
     ) = tokio::join!(
-        rpc_and_streams,
+        rpc_and_writes,
         stop_task_until(Some(heartbeat_handle), deadline),
         stop_task_until(Some(block_report_handle), deadline),
-        stop_task_until(Some(stream_cleanup_handle), deadline),
+        stop_task_until(Some(write_cleanup_handle), deadline),
         cleanup.shutdown_until(deadline),
         http.shutdown_until(deadline),
     );
@@ -366,14 +368,14 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
     let rpc_forced = rpc_result.as_ref().copied().unwrap_or(false);
     let heartbeat_forced = heartbeat_result.as_ref().is_ok_and(|result| result.1);
     let block_report_forced = block_report_result.as_ref().is_ok_and(|result| result.1);
-    let stream_cleanup_forced = stream_cleanup_result.as_ref().is_ok_and(|result| result.1);
+    let write_cleanup_forced = write_cleanup_result.as_ref().is_ok_and(|result| result.1);
     let cleanup_forced = cleanup_result.as_ref().copied().unwrap_or(false);
     let http_forced = http_result.as_ref().copied().unwrap_or(false);
     if rpc_forced
         || heartbeat_forced
         || block_report_forced
-        || stream_cleanup_forced
-        || stream_drain_forced
+        || write_cleanup_forced
+        || write_drain_forced
         || cleanup_forced
         || http_forced
     {
@@ -381,8 +383,8 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
             rpc_forced,
             heartbeat_forced,
             block_report_forced,
-            stream_cleanup_forced,
-            stream_drain_forced,
+            write_cleanup_forced,
+            write_drain_forced,
             cleanup_forced,
             http_forced,
             timeout_ms = config.shutdown_timeout_ms,
@@ -393,7 +395,7 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
     rpc_result.context("Worker data service task failed")?;
     heartbeat_result.context("Worker heartbeat task failed")?;
     block_report_result.context("Worker block report task failed")?;
-    stream_cleanup_result.context("Worker stream cleanup task failed")?;
+    write_cleanup_result.context("Worker block write cleanup task failed")?;
     cleanup_result.context("Worker cleanup shutdown failed")?;
     http_result.context("Worker HTTP shutdown failed")?;
     if let Some(error) = stop_error {
@@ -478,7 +480,39 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
     use super::*;
+
+    #[test]
+    fn runtime_shutdown_does_not_wait_for_forced_blocking_work() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let fallback_release = release_tx.clone();
+        let (cancel_fallback_tx, cancel_fallback_rx) = mpsc::channel();
+        let fallback = std::thread::spawn(move || {
+            if cancel_fallback_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+                let _ = fallback_release.send(());
+            }
+        });
+
+        let started_at = std::time::Instant::now();
+        run_async(async move {
+            tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+            });
+            started_rx.await.context("blocking task did not start")?;
+            Ok(())
+        })
+        .expect("runtime action");
+        let elapsed = started_at.elapsed();
+
+        let _ = release_tx.send(());
+        let _ = cancel_fallback_tx.send(());
+        fallback.join().expect("fallback release thread");
+        assert!(elapsed < Duration::from_secs(1), "runtime shutdown took {elapsed:?}");
+    }
 
     #[test]
     fn explicit_worker_commands_parse() {

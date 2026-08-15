@@ -2,20 +2,18 @@
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
 //! Worker data service protocol helpers.
-//!
-//! This module builds worker RPC requests, parses and validates worker RPC
-//! responses, and validates worker stream frames. It does not own channel
-//! pooling or data-plane orchestration.
+
 use std::time::Duration;
 
 use beryl_common::header::{HeaderIdentity, HEADER_WORKER_DATA_ERROR_DETAIL, WORKER_DATA_ERROR_DETAIL_V1};
+use beryl_proto::worker::write_block_request_proto::Payload;
 use beryl_types::chunk::ByteRange;
-use beryl_types::{BlockShape, GroupName, WorkerEndpointInfo, WriteTarget};
+use beryl_types::{BlockShape, GroupName, WorkerEndpointInfo};
 use bytes::{Bytes, BytesMut};
 use prost::Message;
 
-use super::{WorkerBlockSyncResult, WorkerBlockWriteHandle, WorkerCommitResult, WorkerWriteTarget};
-use crate::error::{side_effect_response_body_mismatch, ClientError, ClientResult};
+use super::WorkerWriteTarget;
+use crate::error::{ClientError, ClientResult};
 use crate::planner::PlannedBlockRead;
 use crate::rpc_error::{invalid_header_action, validate_data_header_or_action};
 use crate::runtime::AttemptContext;
@@ -37,7 +35,9 @@ pub(super) fn build_read_block_request(
         block_read.chunk_size,
         block_read.effective_len,
     )
-    .map_err(|err| ClientError::InvalidLayout(format!("planned block read has invalid expected block shape: {err}")))?;
+    .map_err(|error| {
+        ClientError::InvalidLayout(format!("planned block read has invalid expected block shape: {error}"))
+    })?;
     Ok(beryl_proto::worker::ReadBlockRequestProto {
         header: Some(attempt.data_header()),
         group_name: group_name.to_string(),
@@ -59,254 +59,48 @@ pub(super) fn build_read_block_request(
     })
 }
 
-pub(super) fn build_open_write_stream_request(
+/// Builds the sole control payload for one block write. Fencing remains a
+/// Metadata concern and is intentionally absent from the Worker wire request.
+pub(super) fn build_write_block_command(
     attempt: &AttemptContext,
     target: &WorkerWriteTarget,
     worker: &WorkerEndpointInfo,
-) -> ClientResult<beryl_proto::worker::OpenWriteStreamRequestProto> {
+) -> ClientResult<beryl_proto::worker::WriteBlockRequestProto> {
     validate_worker_write_target(target)?;
-    Ok(beryl_proto::worker::OpenWriteStreamRequestProto {
-        header: Some(attempt.data_header()),
-        group_name: target.group_name.to_string(),
-        block_id: Some(target.target.block_id.into()),
-        block_size: target.target.block_size,
-        block_stamp: target.target.block_stamp,
-        chunk_size: target.target.chunk_size,
-        token: Some(target.target.fencing_token.into()),
-        frame_size: default_frame_size(target.target.block_size.min(u64::from(u32::MAX)) as u32),
-        block_format_id: target.target.block_format_id.as_raw(),
-        worker_run_id: worker.worker_run_id.to_string(),
-        tier: beryl_proto::common::TierProto::from(target.target.tier) as i32,
+    Ok(beryl_proto::worker::WriteBlockRequestProto {
+        payload: Some(Payload::Command(Box::new(
+            beryl_proto::worker::WriteBlockCommandProto {
+                header: Some(attempt.data_header()),
+                group_name: target.group_name.to_string(),
+                block_id: Some(target.target.block_id.into()),
+                worker_run_id: worker.worker_run_id.to_string(),
+                block_format_id: target.target.block_format_id.as_raw(),
+                block_size: target.target.block_size,
+                chunk_size: target.target.chunk_size,
+                block_stamp: target.target.block_stamp,
+                tier: beryl_proto::common::TierProto::from(target.target.tier) as i32,
+            },
+        ))),
     })
 }
 
-pub(super) fn parse_open_write_stream_response(
-    attempt: &AttemptContext,
-    target: &WorkerWriteTarget,
-    worker: &WorkerEndpointInfo,
-    response: beryl_proto::worker::OpenWriteStreamResponseProto,
-) -> ClientResult<WorkerBlockWriteHandle> {
-    parse_worker_control_header(attempt, response.header.as_ref())?;
-    let stream_id = response
-        .stream_id
-        .ok_or_else(|| side_effect_response_body_mismatch("OpenWriteStream", "missing stream_id"))?;
-    if stream_id.high == 0 && stream_id.low == 0 {
-        return Err(side_effect_response_body_mismatch(
-            "OpenWriteStream",
-            "stream_id is zero",
+/// Builds one ordered data payload without sequence or offset fields.
+pub(super) fn build_write_block_data(data: Bytes) -> ClientResult<beryl_proto::worker::WriteBlockRequestProto> {
+    if data.is_empty() {
+        return Err(ClientError::InvalidArgument(
+            "WriteBlock data payload must be nonempty".to_string(),
         ));
     }
-    if response.block_stamp != target.target.block_stamp {
-        return Err(side_effect_response_body_mismatch(
-            "OpenWriteStream",
-            format!(
-                "block_stamp expected {}, got {}",
-                target.target.block_stamp, response.block_stamp
-            ),
-        ));
-    }
-    if response.committed_length != 0 {
-        return Err(side_effect_response_body_mismatch(
-            "OpenWriteStream",
-            format!("committed_length expected 0, got {}", response.committed_length),
-        ));
-    }
-    Ok(WorkerBlockWriteHandle {
-        group_name: target.group_name.clone(),
-        worker: worker.clone(),
-        target: target.target.clone(),
-        stream_id,
-        frame_size: response.frame_size.max(1),
-        next_seq: 1,
-    })
-}
-
-pub(super) fn build_write_stream_requests(
-    handle: &WorkerBlockWriteHandle,
-    data: Bytes,
-) -> ClientResult<Vec<beryl_proto::worker::WriteStreamRequestProto>> {
-    let frame_size = handle.frame_size.max(1) as usize;
-    let frame_count = data.len().div_ceil(frame_size);
-    let mut requests = Vec::with_capacity(frame_count);
-    let mut offset = 0usize;
-    while offset < data.len() {
-        let end = (offset + frame_size).min(data.len());
-        let seq = handle
-            .next_seq
-            .checked_add(requests.len() as u64)
-            .ok_or_else(|| ClientError::Worker("worker write frame sequence overflow".to_string()))?;
-        requests.push(beryl_proto::worker::WriteStreamRequestProto {
-            stream_id: Some(handle.stream_id),
-            seq,
-            offset_in_block: offset as u64,
-            data: data.slice(offset..end),
-        });
-        offset = end;
-    }
-    Ok(requests)
-}
-
-pub(super) fn validate_write_stream_response(
-    response: beryl_proto::worker::WriteStreamResponseProto,
-    expected_last_seq: u64,
-    expected_written_through: u64,
-) -> ClientResult<beryl_proto::worker::WriteStreamResponseProto> {
-    if response.last_acked_seq != expected_last_seq {
-        return Err(ClientError::UnknownOutcome(format!(
-            "worker WriteStream ack mismatch: expected {}, got {}",
-            expected_last_seq, response.last_acked_seq
+    if data.len() > beryl_proto::MAX_WORKER_DATA_FRAME_SIZE as usize {
+        return Err(ClientError::InvalidArgument(format!(
+            "WriteBlock data exceeds maximum frame size: actual={}, maximum={}",
+            data.len(),
+            beryl_proto::MAX_WORKER_DATA_FRAME_SIZE
         )));
     }
-    if response.written_through != expected_written_through {
-        return Err(ClientError::UnknownOutcome(format!(
-            "worker WriteStream written_through mismatch: expected {}, got {}",
-            expected_written_through, response.written_through
-        )));
-    }
-    Ok(response)
-}
-
-pub(super) fn build_commit_write_request(
-    attempt: &AttemptContext,
-    handle: &WorkerBlockWriteHandle,
-    effective_len: u64,
-    commit_seq: u64,
-    require_sync: bool,
-) -> ClientResult<beryl_proto::worker::CommitWriteRequestProto> {
-    validate_handle_for_worker_control(handle)?;
-    Ok(beryl_proto::worker::CommitWriteRequestProto {
-        header: Some(attempt.data_header()),
-        group_name: handle.group_name.to_string(),
-        block_id: Some(handle.target.block_id.into()),
-        stream_id: Some(handle.stream_id),
-        effective_len,
-        block_stamp: handle.target.block_stamp,
-        token: Some(handle.target.fencing_token.into()),
-        commit_seq,
-        require_sync,
-        worker_run_id: handle.worker.worker_run_id.to_string(),
-        block_format_id: handle.target.block_format_id.as_raw(),
-        block_size: handle.target.block_size,
-        chunk_size: handle.target.chunk_size,
+    Ok(beryl_proto::worker::WriteBlockRequestProto {
+        payload: Some(Payload::Data(data)),
     })
-}
-
-pub(super) fn parse_commit_write_response(
-    attempt: &AttemptContext,
-    handle: &WorkerBlockWriteHandle,
-    effective_len: u64,
-    response: beryl_proto::worker::CommitWriteResponseProto,
-) -> ClientResult<WorkerCommitResult> {
-    parse_worker_control_header(attempt, response.header.as_ref())?;
-    if response.effective_len != effective_len {
-        return Err(side_effect_response_body_mismatch(
-            "CommitWrite",
-            format!(
-                "effective_len expected {}, got {}",
-                effective_len, response.effective_len
-            ),
-        ));
-    }
-    if response.block_stamp != handle.target.block_stamp {
-        return Err(side_effect_response_body_mismatch(
-            "CommitWrite",
-            format!(
-                "block_stamp expected {}, got {}",
-                handle.target.block_stamp, response.block_stamp
-            ),
-        ));
-    }
-    if response.written_through != effective_len {
-        return Err(side_effect_response_body_mismatch(
-            "CommitWrite",
-            format!(
-                "written_through expected {}, got {}",
-                effective_len, response.written_through
-            ),
-        ));
-    }
-    Ok(WorkerCommitResult {
-        effective_len: response.effective_len,
-        block_stamp: response.block_stamp,
-        written_through: response.written_through,
-    })
-}
-
-pub(super) fn build_sync_committed_block_request(
-    attempt: &AttemptContext,
-    handle: &WorkerBlockWriteHandle,
-    expected_len: u64,
-) -> ClientResult<beryl_proto::worker::SyncCommittedBlockRequestProto> {
-    validate_handle_for_worker_sync(handle)?;
-    Ok(beryl_proto::worker::SyncCommittedBlockRequestProto {
-        header: Some(attempt.data_header()),
-        group_name: handle.group_name.to_string(),
-        block_id: Some(handle.target.block_id.into()),
-        block_stamp: handle.target.block_stamp,
-        expected_block_len: expected_len,
-        worker_run_id: handle.worker.worker_run_id.to_string(),
-        block_format_id: handle.target.block_format_id.as_raw(),
-        block_size: handle.target.block_size,
-        chunk_size: handle.target.chunk_size,
-    })
-}
-
-pub(super) fn parse_sync_committed_block_response(
-    attempt: &AttemptContext,
-    handle: &WorkerBlockWriteHandle,
-    expected_len: u64,
-    response: beryl_proto::worker::SyncCommittedBlockResponseProto,
-) -> ClientResult<WorkerBlockSyncResult> {
-    parse_worker_control_header(attempt, response.header.as_ref())?;
-    if response.effective_len != expected_len {
-        return Err(side_effect_response_body_mismatch(
-            "SyncCommittedBlock",
-            format!(
-                "effective_len expected {}, got {}",
-                expected_len, response.effective_len
-            ),
-        ));
-    }
-    if response.block_stamp != handle.target.block_stamp {
-        return Err(side_effect_response_body_mismatch(
-            "SyncCommittedBlock",
-            format!(
-                "block_stamp expected {}, got {}",
-                handle.target.block_stamp, response.block_stamp
-            ),
-        ));
-    }
-    Ok(WorkerBlockSyncResult {
-        effective_len: response.effective_len,
-        block_stamp: response.block_stamp,
-    })
-}
-
-pub(super) fn build_abort_write_request(
-    attempt: &AttemptContext,
-    handle: &WorkerBlockWriteHandle,
-) -> ClientResult<beryl_proto::worker::AbortWriteRequestProto> {
-    validate_handle_for_worker_control(handle)?;
-    Ok(beryl_proto::worker::AbortWriteRequestProto {
-        header: Some(attempt.data_header()),
-        group_name: handle.group_name.to_string(),
-        block_id: Some(handle.target.block_id.into()),
-        stream_id: Some(handle.stream_id),
-        token: Some(handle.target.fencing_token.into()),
-    })
-}
-
-pub(super) fn validate_abort_write_response(
-    attempt: &AttemptContext,
-    response: beryl_proto::worker::AbortWriteResponseProto,
-) -> ClientResult<()> {
-    parse_worker_control_header(attempt, response.header.as_ref())?;
-    if !response.aborted {
-        return Err(ClientError::UnknownOutcome(
-            "worker AbortWrite response did not confirm abort".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 /// Consumes an ordered read stream and accepts only the exact planned byte count.
@@ -326,7 +120,7 @@ pub(super) async fn read_block_stream_to_bytes(
     finish_read_block_output(output, block_read)
 }
 
-/// Appends one nonempty chunk without allowing the planned range to be exceeded.
+/// Appends one nonempty read chunk without exceeding the planned range.
 pub(super) fn append_read_block_chunk(
     output: &mut BytesMut,
     block_read: &PlannedBlockRead,
@@ -338,8 +132,7 @@ pub(super) fn append_read_block_chunk(
     let remaining = block_read.len as usize - output.len();
     if chunk.data.len() > remaining {
         return Err(ClientError::Worker(format!(
-            "worker read chunk exceeded requested block read: remaining {}, got {}",
-            remaining,
+            "worker read chunk exceeded requested block read: remaining {remaining}, got {}",
             chunk.data.len()
         )));
     }
@@ -347,7 +140,7 @@ pub(super) fn append_read_block_chunk(
     Ok(())
 }
 
-/// Accepts normal stream completion only after the exact planned byte count.
+/// Accepts normal read completion only after the exact planned byte count.
 pub(super) fn finish_read_block_output(output: BytesMut, block_read: &PlannedBlockRead) -> ClientResult<Bytes> {
     if output.len() != block_read.len as usize {
         return Err(ClientError::Worker(format!(
@@ -371,18 +164,15 @@ pub(super) fn parse_worker_control_header(
         .as_ref()
         .ok_or_else(|| invalid_worker_header("worker response invalid DataResponseHeader: missing client identity"))?;
     let client_id = beryl_proto::convert::required_client_id(client.client_id, "client_id")
-        .map_err(|err| invalid_worker_header(format!("worker response invalid DataResponseHeader: {err}")))?;
+        .map_err(|error| invalid_worker_header(format!("worker response invalid DataResponseHeader: {error}")))?;
     let call_id = beryl_proto::convert::require_call_id(&client.call_id, "call_id")
-        .map_err(|err| invalid_worker_header(format!("worker response invalid DataResponseHeader: {err}")))?;
+        .map_err(|error| invalid_worker_header(format!("worker response invalid DataResponseHeader: {error}")))?;
     let response_identity = HeaderIdentity {
         call_id,
         client_id,
         group_name: None,
     };
     let request_identity = attempt.header_identity();
-    if response_identity.matches_request(&request_identity) {
-        return validate_data_header_or_action(Some(header)).map_err(ClientError::from);
-    }
     if response_identity.client_id != request_identity.client_id {
         return Err(invalid_worker_header(
             "worker response invalid DataResponseHeader: client_id mismatch",
@@ -397,10 +187,6 @@ pub(super) fn parse_worker_control_header(
 }
 
 /// Restores a structured Worker error from a marked gRPC status.
-///
-/// Unmarked statuses remain transport/framework failures. A present but
-/// unsupported marker or malformed detail fails closed as an invalid Worker
-/// response rather than being retried.
 pub(super) fn parse_worker_data_status(attempt: &AttemptContext, status: tonic::Status) -> ClientError {
     match status.metadata().get(HEADER_WORKER_DATA_ERROR_DETAIL) {
         None => return ClientError::from(status),
@@ -430,6 +216,13 @@ pub(super) fn parse_worker_data_status(attempt: &AttemptContext, status: tonic::
     }
 }
 
+pub(super) fn has_structured_worker_error(status: &tonic::Status) -> bool {
+    status
+        .metadata()
+        .get(HEADER_WORKER_DATA_ERROR_DETAIL)
+        .is_some_and(|value| value == WORKER_DATA_ERROR_DETAIL_V1)
+}
+
 pub(super) fn invalid_worker_header(message: impl Into<String>) -> ClientError {
     ClientError::from(invalid_header_action(message))
 }
@@ -450,12 +243,11 @@ pub(super) fn build_tonic_request<T>(attempt: &AttemptContext, message: T) -> to
 }
 
 pub(super) fn default_frame_size(len: u32) -> u32 {
-    len.clamp(1, 1024 * 1024)
+    len.clamp(1, beryl_proto::DEFAULT_WORKER_DATA_FRAME_SIZE as u32)
 }
 
 fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> {
-    let block = target.target.block_id;
-    if block.inode_id.as_raw() == 0 {
+    if target.target.block_id.inode_id.as_raw() == 0 {
         return Err(ClientError::InvalidLayout(
             "write target block_id inode_id must be non-zero".to_string(),
         ));
@@ -466,7 +258,7 @@ fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> 
         target.target.chunk_size,
         target.target.block_size,
     )
-    .map_err(|err| ClientError::InvalidLayout(format!("write target has invalid shape: {err}")))?;
+    .map_err(|error| ClientError::InvalidLayout(format!("write target has invalid shape: {error}")))?;
     if target.target.worker_endpoints.is_empty() {
         return Err(ClientError::InvalidLayout(
             "write target has no worker endpoints".to_string(),
@@ -477,626 +269,78 @@ fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> 
             "write target block_stamp must be non-zero".to_string(),
         ));
     }
-    validate_fencing_token(&target.target)?;
-    Ok(())
-}
-
-fn validate_handle_for_worker_control(handle: &WorkerBlockWriteHandle) -> ClientResult<()> {
-    if handle.stream_id.high == 0 && handle.stream_id.low == 0 {
-        return Err(ClientError::InvalidArgument(
-            "worker write control requires non-zero stream_id".to_string(),
-        ));
-    }
-    validate_fencing_token(&handle.target)
-}
-
-fn validate_fencing_token(target: &WriteTarget) -> ClientResult<()> {
-    let block = target.block_id;
-    let token = target.fencing_token;
-    if token.owner.is_zero() || token.epoch == 0 {
-        return Err(ClientError::InvalidLayout(
-            "write target fencing_token owner and epoch must be non-zero".to_string(),
-        ));
-    }
-    if token.block_id != block {
-        return Err(ClientError::InvalidLayout(
-            "write target fencing_token block_id must match target block_id".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_handle_for_worker_sync(handle: &WorkerBlockWriteHandle) -> ClientResult<()> {
-    if handle.target.block_stamp == 0 {
-        return Err(ClientError::InvalidArgument(
-            "worker block sync requires non-zero block_stamp".to_string(),
-        ));
-    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use beryl_common::error::rpc::{MetadataErrorKind, ProtocolErrorKind, WorkerErrorKind};
-
-    use beryl_common::error::rpc::{ErrorKind, RefreshHint as RpcRefreshHint, RpcErrorDetail};
-    use beryl_proto::convert::rpc_error_to_proto;
+    use beryl_proto::worker::write_block_request_proto::Payload;
     use beryl_types::lease::FencingToken;
-    use beryl_types::{BlockId, BlockIndex, ClientId, InodeId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol};
-
-    use crate::rpc_error::ClientAction;
-    use crate::runtime::{classify_error, ErrorClass, OperationContext, OperationDeadline};
-
-    #[test]
-    fn invalid_worker_control_headers_are_typed_failures() {
-        let attempt = data_attempt_context();
-        let err = parse_worker_control_header(&attempt, None).expect_err("missing data header must fail");
-
-        assert_ne!(classify_error(&err), ErrorClass::RetryableTransport);
-        match action(&err) {
-            ClientAction::Fail { rpc_error } => {
-                assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
-                assert_eq!(rpc_error.recovery, beryl_common::error::rpc::RecoveryAction::Fail);
-                assert!(rpc_error.message.contains("missing DataResponseHeader"));
-            }
-            other => panic!("expected invalid header failure, got {other:?}"),
-        }
-
-        assert_malformed_worker_control_header_is_invalid();
-        assert_wrong_worker_control_client_id_is_invalid();
-        assert_wrong_worker_control_call_id_is_invalid();
-    }
-
-    fn assert_malformed_worker_control_header_is_invalid() {
-        let attempt = data_attempt_context();
-        let malformed = beryl_proto::worker::DataResponseHeaderProto::default();
-
-        let err = parse_worker_control_header(&attempt, Some(&malformed)).expect_err("malformed data header must fail");
-
-        assert_ne!(classify_error(&err), ErrorClass::RetryableTransport);
-        match action(&err) {
-            ClientAction::Fail { rpc_error } => {
-                assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
-                assert_eq!(rpc_error.recovery, beryl_common::error::rpc::RecoveryAction::Fail);
-                assert!(rpc_error.message.contains("invalid DataResponseHeader"));
-            }
-            other => panic!("expected invalid header failure, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn worker_control_header_preserves_metadata_refresh_cause() {
-        let attempt = data_attempt_context();
-        let rpc_error = RpcErrorDetail::refresh_metadata(
-            ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
-            RpcRefreshHint {
-                worker_resolve_required: true,
-                ..RpcRefreshHint::default()
-            },
-            "worker requires refreshed location",
-        );
-        let header = beryl_proto::worker::DataResponseHeaderProto {
-            client: Some(attempt.client_info()),
-            error: Some(rpc_error_to_proto(&rpc_error)),
-        };
-
-        let err = parse_worker_control_header(&attempt, Some(&header)).expect_err("refresh error must surface");
-
-        match action(&err) {
-            ClientAction::Refresh { hint, .. } => {
-                assert!(hint.worker_resolve_required);
-            }
-            other => panic!("expected refresh action, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn worker_data_status_distinguishes_structured_errors_from_transport_failures() {
-        let attempt = data_attempt_context();
-        let rpc_error = RpcErrorDetail::refresh_metadata(
-            ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
-            RpcRefreshHint::default(),
-            "stale block stamp",
-        );
-        let header = data_header_with_error(&attempt, rpc_error);
-        let mut metadata = tonic::metadata::MetadataMap::new();
-        metadata.insert(
-            HEADER_WORKER_DATA_ERROR_DETAIL,
-            WORKER_DATA_ERROR_DETAIL_V1.parse().expect("valid detail version"),
-        );
-        let status = tonic::Status::with_details_and_metadata(
-            tonic::Code::FailedPrecondition,
-            "worker read rejected",
-            Bytes::from(header.encode_to_vec()),
-            metadata,
-        );
-
-        let structured = parse_worker_data_status(&attempt, status);
-        assert!(matches!(
-            action(&structured),
-            ClientAction::Refresh { rpc_error, .. }
-                if rpc_error.kind == ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch)
-        ));
-
-        let transport = parse_worker_data_status(&attempt, tonic::Status::unavailable("disconnected"));
-        assert_eq!(classify_error(&transport), ErrorClass::RetryableTransport);
-
-        let mut metadata = tonic::metadata::MetadataMap::new();
-        metadata.insert(
-            HEADER_WORKER_DATA_ERROR_DETAIL,
-            "v2".parse().expect("valid unsupported detail version"),
-        );
-        let unsupported = parse_worker_data_status(
-            &attempt,
-            tonic::Status::with_details_and_metadata(
-                tonic::Code::Unavailable,
-                "unsupported detail version",
-                Bytes::new(),
-                metadata,
-            ),
-        );
-        assert_invalid_worker_header(&unsupported);
-        assert_ne!(classify_error(&unsupported), ErrorClass::RetryableTransport);
-
-        let mut metadata = tonic::metadata::MetadataMap::new();
-        metadata.insert(
-            HEADER_WORKER_DATA_ERROR_DETAIL,
-            WORKER_DATA_ERROR_DETAIL_V1.parse().expect("valid detail version"),
-        );
-        let malformed = parse_worker_data_status(
-            &attempt,
-            tonic::Status::with_details_and_metadata(
-                tonic::Code::Internal,
-                "malformed detail",
-                Bytes::from_static(b"not-protobuf"),
-                metadata,
-            ),
-        );
-        assert_invalid_worker_header(&malformed);
-    }
-
-    fn assert_wrong_worker_control_client_id_is_invalid() {
-        let attempt = write_attempt_context();
-        let mut header = ok_data_header(&attempt);
-        header.client.as_mut().expect("client").client_id =
-            Some(ClientId::new(attempt.header_identity().client_id.as_raw() + 1).into());
-
-        let err = parse_worker_control_header(&attempt, Some(&header)).expect_err("wrong client_id must fail");
-
-        assert_invalid_worker_header(&err);
-        match action(&err) {
-            ClientAction::Fail { rpc_error } => assert!(rpc_error.message.contains("client_id")),
-            other => panic!("expected invalid header failure, got {other:?}"),
-        }
-    }
-
-    fn assert_wrong_worker_control_call_id_is_invalid() {
-        let attempt = write_attempt_context();
-        let mut header = ok_data_header(&attempt);
-        header.client.as_mut().expect("client").call_id = beryl_types::CallId::new().to_string();
-
-        let err = parse_worker_control_header(&attempt, Some(&header)).expect_err("wrong call_id must fail");
-
-        assert_invalid_worker_header(&err);
-        match action(&err) {
-            ClientAction::Fail { rpc_error } => assert!(rpc_error.message.contains("call_id")),
-            other => panic!("expected invalid header failure, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn read_block_request_uses_metadata_authority() {
-        let attempt = data_attempt_context();
-        let block_read = planned_block_read(77);
-        let worker = worker_endpoint();
-        let group_name = test_group_name();
-
-        let request = build_read_block_request(&attempt, &group_name, &block_read, &worker).expect("request");
-
-        assert_eq!(request.block_stamp, 77);
-        assert_eq!(request.worker_run_id, test_worker_run_id().to_string());
-        assert_eq!(
-            request.block_format_id,
-            beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw()
-        );
-        assert_eq!(request.block_size, 4096);
-        assert_eq!(request.chunk_size, 4096);
-    }
-
-    #[test]
-    fn read_block_request_rejects_invalid_expected_shape() {
-        let attempt = data_attempt_context();
-        let block_read = planned_block_read(0);
-        let worker = worker_endpoint();
-        let group_name = test_group_name();
-
-        let err =
-            build_read_block_request(&attempt, &group_name, &block_read, &worker).expect_err("zero stamp must fail");
-
-        assert!(matches!(err, ClientError::InvalidLayout(msg) if msg.contains("block_stamp")));
-
-        assert_read_block_request_rejects_zero_shape();
-    }
-
-    fn assert_read_block_request_rejects_zero_shape() {
-        let attempt = data_attempt_context();
-        let mut block_read = planned_block_read(77);
-        block_read.block_size = 0;
-        let worker = worker_endpoint();
-        let group_name = test_group_name();
-
-        let err = build_read_block_request(&attempt, &group_name, &block_read, &worker)
-            .expect_err("zero block_size must not be defaulted");
-
-        assert!(matches!(err, ClientError::InvalidLayout(msg) if msg.contains("expected block shape")));
-    }
-
-    #[test]
-    fn open_write_stream_request_uses_metadata_target_fields() {
-        let attempt = write_attempt_context();
-        let target = worker_write_target();
-        let worker = target.target.worker_endpoints[0].clone();
-
-        let request = build_open_write_stream_request(&attempt, &target, &worker).expect("open write request");
-
-        assert_eq!(request.group_name, "root");
-        assert_eq!(request.block_id.as_ref().map(|block| block.inode_id), Some(202));
-        assert_eq!(request.block_size, 4096);
-        assert_eq!(request.block_stamp, 77);
-        assert_eq!(request.chunk_size, 4096);
-        assert_eq!(
-            request.block_format_id,
-            beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw()
-        );
-        assert_eq!(request.worker_run_id, test_worker_run_id().to_string());
-        assert_eq!(
-            request.token.as_ref().and_then(|token| token.owner),
-            Some(ClientId::new(7).into())
-        );
-    }
-
-    #[test]
-    fn open_write_stream_request_rejects_zero_metadata_target_shape() {
-        let attempt = write_attempt_context();
-        let mut target = worker_write_target();
-        target.target.chunk_size = 0;
-        let worker = target.target.worker_endpoints[0].clone();
-
-        let err = build_open_write_stream_request(&attempt, &target, &worker)
-            .expect_err("zero chunk_size must not be defaulted");
-
-        assert!(matches!(err, ClientError::InvalidLayout(msg) if msg.contains("chunk_size")));
-    }
-
-    #[test]
-    fn write_stream_requests_are_monotonic() {
-        let handle = worker_block_write_handle(4);
-
-        let requests = build_write_stream_requests(&handle, Bytes::from_static(b"abcdef")).expect("requests");
-
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].seq, 1);
-        assert_eq!(requests[0].offset_in_block, 0);
-        assert_eq!(requests[0].data, Bytes::from_static(b"abcd"));
-        assert_eq!(requests[1].seq, 2);
-        assert_eq!(requests[1].offset_in_block, 4);
-        assert_eq!(requests[1].data, Bytes::from_static(b"ef"));
-    }
-
-    #[test]
-    fn commit_write_request_uses_length_and_fencing_token() {
-        let attempt = write_attempt_context();
-        let handle = worker_block_write_handle(1024);
-
-        let request = build_commit_write_request(&attempt, &handle, 5, 1, false).expect("commit write request");
-
-        assert_eq!(request.effective_len, 5);
-        assert_eq!(request.block_stamp, 77);
-        assert_eq!(request.worker_run_id, test_worker_run_id().to_string());
-        assert_eq!(
-            request.block_format_id,
-            beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw()
-        );
-        assert_eq!(request.block_size, 4096);
-        assert_eq!(request.chunk_size, 4096);
-        assert_eq!(request.commit_seq, 1);
-        assert!(!request.require_sync);
-        assert_eq!(
-            request.token.as_ref().and_then(|token| token.owner),
-            Some(ClientId::new(7).into())
-        );
-    }
-
-    #[test]
-    fn side_effect_response_mismatches_are_unknown_outcomes() {
-        let attempt = write_attempt_context();
-        let target = worker_write_target();
-        let worker = target.target.worker_endpoints[0].clone();
-        let response = beryl_proto::worker::OpenWriteStreamResponseProto {
-            header: Some(ok_data_header(&attempt)),
-            stream_id: None,
-            frame_size: 1024,
-            block_stamp: target.target.block_stamp,
-            ..beryl_proto::worker::OpenWriteStreamResponseProto::default()
-        };
-
-        let err = parse_open_write_stream_response(&attempt, &target, &worker, response)
-            .expect_err("missing OpenWriteStream stream_id must be unknown");
-
-        assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("OpenWriteStream")));
-
-        assert_open_write_body_mismatch_is_unknown();
-        assert_commit_write_body_mismatch_is_unknown();
-    }
-
-    fn assert_open_write_body_mismatch_is_unknown() {
-        let attempt = write_attempt_context();
-        let target = worker_write_target();
-        let worker = target.target.worker_endpoints[0].clone();
-        let response = beryl_proto::worker::OpenWriteStreamResponseProto {
-            header: Some(ok_data_header(&attempt)),
-            stream_id: Some(beryl_proto::common::StreamIdProto { high: 1, low: 1 }),
-            frame_size: 1024,
-            block_stamp: target.target.block_stamp + 1,
-            ..beryl_proto::worker::OpenWriteStreamResponseProto::default()
-        };
-
-        let err = parse_open_write_stream_response(&attempt, &target, &worker, response)
-            .expect_err("OpenWriteStream block_stamp mismatch must be unknown");
-
-        assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("OpenWriteStream")));
-    }
-
-    fn assert_commit_write_body_mismatch_is_unknown() {
-        let attempt = write_attempt_context();
-        let handle = worker_block_write_handle(1024);
-        let response = beryl_proto::worker::CommitWriteResponseProto {
-            header: Some(ok_data_header(&attempt)),
-            effective_len: 4,
-            block_stamp: handle.target.block_stamp,
-            written_through: 5,
-        };
-
-        let err = parse_commit_write_response(&attempt, &handle, 5, response)
-            .expect_err("CommitWrite length mismatch must be unknown");
-
-        assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("CommitWrite")));
-    }
-
-    #[test]
-    fn worker_control_errors_preserve_typed_actions() {
-        let attempt = write_attempt_context();
-        let err = parse_worker_control_header(
-            &attempt,
-            Some(&data_header_with_error(
-                &attempt,
-                RpcErrorDetail::fail(ErrorKind::Metadata(MetadataErrorKind::Fencing), "fencing mismatch"),
-            )),
-        )
-        .expect_err("fatal fencing mismatch must fail");
-
-        assert_eq!(classify_error(&err), ErrorClass::Fencing);
-        assert_ne!(classify_error(&err), ErrorClass::RetryableTransport);
-
-        assert_worker_run_mismatch_is_typed_refresh();
-    }
-
-    fn assert_worker_run_mismatch_is_typed_refresh() {
-        let attempt = write_attempt_context();
-        let err = parse_worker_control_header(
-            &attempt,
-            Some(&data_header_with_error(
-                &attempt,
-                RpcErrorDetail::refresh_metadata(
-                    ErrorKind::Worker(WorkerErrorKind::RunMismatch),
-                    RpcRefreshHint::default(),
-                    "worker run mismatch",
-                ),
-            )),
-        )
-        .expect_err("worker run mismatch must fail");
-
-        assert_eq!(
-            classify_error(&err),
-            ErrorClass::RefreshMetadata(ErrorKind::Worker(WorkerErrorKind::RunMismatch))
-        );
-    }
-
-    #[test]
-    fn tonic_request_uses_attempt_timeout_when_present() {
-        let attempt = write_attempt_context();
-
-        let request = build_tonic_request(&attempt, ());
-
-        assert!(request.metadata().get("grpc-timeout").is_some());
-    }
-
-    #[test]
-    fn write_stream_partial_ack_is_unknown_outcome() {
-        let response = beryl_proto::worker::WriteStreamResponseProto {
-            accepted: true,
-            last_acked_seq: 1,
-            written_through: 2,
-        };
-
-        let err = validate_write_stream_response(response, 2, 4).expect_err("partial WriteStream ack must be unknown");
-
-        assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("WriteStream")));
-    }
-
-    #[test]
-    fn read_block_chunks_are_nonempty_bounded_and_exact() {
-        let block_read = planned_block_read(77);
-        let mut output = BytesMut::new();
-
-        append_read_block_chunk(
-            &mut output,
-            &block_read,
-            beryl_proto::worker::ReadBlockChunkProto {
-                data: Bytes::from_static(b"ab"),
-            },
-        )
-        .expect("valid chunk");
-
-        let empty = append_read_block_chunk(
-            &mut output,
-            &block_read,
-            beryl_proto::worker::ReadBlockChunkProto { data: Bytes::new() },
-        )
-        .expect_err("empty chunk must fail");
-        assert!(matches!(empty, ClientError::Worker(msg) if msg.contains("empty chunk")));
-
-        let oversized = append_read_block_chunk(
-            &mut output,
-            &block_read,
-            beryl_proto::worker::ReadBlockChunkProto {
-                data: Bytes::from_static(b"cde"),
-            },
-        )
-        .expect_err("chunk beyond remaining range must fail");
-        assert!(matches!(oversized, ClientError::Worker(msg) if msg.contains("exceeded requested block read")));
-
-        let short = finish_read_block_output(output.clone(), &block_read).expect_err("short stream must fail");
-        assert!(matches!(short, ClientError::Worker(msg) if msg.contains("ended after 2 bytes")));
-
-        append_read_block_chunk(
-            &mut output,
-            &block_read,
-            beryl_proto::worker::ReadBlockChunkProto {
-                data: Bytes::from_static(b"cd"),
-            },
-        )
-        .expect("final exact chunk");
-        assert_eq!(
-            finish_read_block_output(output, &block_read).unwrap(),
-            Bytes::from_static(b"abcd")
-        );
-    }
-
-    fn data_attempt_context() -> AttemptContext {
+    use beryl_types::{
+        BlockId, BlockIndex, ClientId, GroupName, InodeId, Tier, WorkerEndpointInfo, WorkerId, WorkerNetProtocol,
+        WorkerRunId, WriteTarget,
+    };
+    use bytes::Bytes;
+
+    use super::{build_write_block_command, build_write_block_data};
+    use crate::data::WorkerWriteTarget;
+    use crate::runtime::{AttemptContext, OperationContext, OperationDeadline};
+
+    fn attempt() -> AttemptContext {
         let operation = OperationContext::new_named(
-            ClientId::new(7),
-            "test-client",
-            "ReadBlock",
-            Some("/alpha".to_string()),
-            OperationDeadline::new(5_000),
+            ClientId::new(9),
+            "client",
+            "WriteBlock",
+            None,
+            OperationDeadline::new(1_000),
         )
-        .expect("operation context");
+        .expect("operation");
         AttemptContext::for_data(&operation, 0)
     }
 
-    fn write_attempt_context() -> AttemptContext {
-        let operation = OperationContext::new_named(
-            ClientId::new(7),
-            "test-client",
-            "OpenWriteStream",
-            Some("/alpha".to_string()),
-            OperationDeadline::new(5_000),
-        )
-        .expect("operation context");
-        AttemptContext::for_data(&operation, 0)
+    fn worker() -> WorkerEndpointInfo {
+        WorkerEndpointInfo {
+            worker_id: WorkerId::new(5),
+            worker_run_id: WorkerRunId::new(),
+            endpoint: "127.0.0.1:19090".to_string(),
+            worker_net_protocol: WorkerNetProtocol::Grpc,
+        }
     }
 
-    fn worker_write_target() -> WorkerWriteTarget {
+    fn target(worker: WorkerEndpointInfo) -> WorkerWriteTarget {
+        let block_id = BlockId::new(InodeId::new(7), BlockIndex::new(3));
         WorkerWriteTarget {
-            group_name: test_group_name(),
+            group_name: GroupName::parse("root").expect("group"),
             target: WriteTarget {
-                block_id: BlockId::new(InodeId::new(202), BlockIndex::new(0)),
+                block_id,
                 file_offset: 0,
                 block_size: 4096,
-                worker_endpoints: vec![worker_endpoint()],
-                fencing_token: FencingToken {
-                    block_id: BlockId::new(InodeId::new(202), BlockIndex::new(0)),
-                    owner: ClientId::new(7),
-                    epoch: 1,
-                },
-                block_stamp: 77,
-                chunk_size: 4096,
-                block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
-                tier: beryl_types::Tier::Hdd,
+                block_format_id: beryl_types::BlockFormatId::FULL_EFFECTIVE,
+                chunk_size: 1024,
+                block_stamp: 55,
+                fencing_token: FencingToken::new(block_id, ClientId::new(9), 1),
+                tier: Tier::Hdd,
+                worker_endpoints: vec![worker],
             },
         }
     }
 
-    fn worker_block_write_handle(frame_size: u32) -> WorkerBlockWriteHandle {
-        WorkerBlockWriteHandle {
-            group_name: test_group_name(),
-            worker: worker_endpoint(),
-            target: worker_write_target().target,
-            stream_id: beryl_proto::common::StreamIdProto { high: 1, low: 1 },
-            frame_size,
-            next_seq: 1,
-        }
+    #[test]
+    fn write_block_wire_is_one_command_followed_by_plain_data() {
+        let worker = worker();
+        let command = build_write_block_command(&attempt(), &target(worker.clone()), &worker).expect("command");
+        let Payload::Command(command) = command.payload.expect("payload") else {
+            panic!("expected command");
+        };
+        assert_eq!(command.block_stamp, 55);
+        assert_eq!(command.block_size, 4096);
+
+        let data = build_write_block_data(Bytes::from_static(b"abc")).expect("data");
+        assert!(matches!(data.payload, Some(Payload::Data(bytes)) if bytes == b"abc"[..]));
     }
 
-    fn worker_endpoint() -> WorkerEndpointInfo {
-        WorkerEndpointInfo {
-            worker_id: WorkerId::new(1),
-            endpoint: "127.0.0.1:19101".to_string(),
-            worker_net_protocol: WorkerNetProtocol::Grpc,
-            worker_run_id: test_worker_run_id(),
-        }
-    }
-
-    fn planned_block_read(block_stamp: u64) -> PlannedBlockRead {
-        PlannedBlockRead {
-            file_offset: 0,
-            len: 4,
-            end_file_offset: 4,
-            block_id: BlockId::new(InodeId::new(202), BlockIndex::new(0)),
-            block_offset: 0,
-            workers: vec![worker_endpoint()],
-            block_stamp,
-            block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
-            block_size: 4096,
-            chunk_size: 4096,
-            effective_len: 5,
-        }
-    }
-
-    fn data_header_with_error(
-        attempt: &AttemptContext,
-        rpc_error: RpcErrorDetail,
-    ) -> beryl_proto::worker::DataResponseHeaderProto {
-        beryl_proto::worker::DataResponseHeaderProto {
-            client: Some(attempt.client_info()),
-            error: Some(rpc_error_to_proto(&rpc_error)),
-        }
-    }
-
-    fn ok_data_header(attempt: &AttemptContext) -> beryl_proto::worker::DataResponseHeaderProto {
-        beryl_proto::worker::DataResponseHeaderProto {
-            client: Some(attempt.client_info()),
-            error: None,
-        }
-    }
-
-    fn test_worker_run_id() -> beryl_types::WorkerRunId {
-        "550e8400-e29b-41d4-a716-446655440000"
-            .parse()
-            .expect("valid test WorkerRunId")
-    }
-
-    fn test_group_name() -> GroupName {
-        GroupName::parse("root").unwrap()
-    }
-
-    fn assert_invalid_worker_header(err: &ClientError) {
-        assert_ne!(classify_error(err), ErrorClass::RetryableTransport);
-        match action(err) {
-            ClientAction::Fail { rpc_error } => {
-                assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
-                assert_eq!(rpc_error.recovery, beryl_common::error::rpc::RecoveryAction::Fail);
-            }
-            other => panic!("expected invalid header failure, got {other:?}"),
-        }
-    }
-
-    fn action(err: &ClientError) -> &ClientAction {
-        match err {
-            ClientError::Action(action) => action.action(),
-            other => panic!("expected action error, got {other:?}"),
-        }
+    #[test]
+    fn write_block_rejects_empty_data_payload() {
+        assert!(build_write_block_data(Bytes::new()).is_err());
     }
 }
