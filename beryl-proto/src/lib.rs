@@ -19,7 +19,9 @@
 
 /// Maximum payload carried by one Worker data message.
 pub const MAX_WORKER_DATA_FRAME_SIZE: u32 = 4 * 1024 * 1024;
-/// Maximum encoded Worker data message, including bounded identity and offset fields.
+/// Fixed payload size used by the native client when splitting block writes.
+pub const DEFAULT_WORKER_DATA_FRAME_SIZE: usize = 1024 * 1024;
+/// Maximum encoded Worker data message, including a bounded command envelope.
 pub const MAX_WORKER_DATA_MESSAGE_SIZE: usize = MAX_WORKER_DATA_FRAME_SIZE as usize + 1024;
 
 // Common types (IDs, headers, etc.)

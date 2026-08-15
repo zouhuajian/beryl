@@ -28,7 +28,6 @@ const IDENTITY_FILE: &str = "beryl.worker.identity-file";
 const RPC_MAX_CONCURRENT_REQUESTS: &str = "beryl.worker.rpc.max-concurrent-requests";
 const STREAM_FRAME_SIZE: &str = "beryl.worker.stream.frame-size";
 const STREAM_MAX_FRAME_SIZE: &str = "beryl.worker.stream.max-frame-size";
-const STREAM_IDLE_TIMEOUT: &str = "beryl.worker.stream.idle-timeout";
 const STORAGE_DIRS: &str = "beryl.worker.storage.dirs";
 const STORAGE_RESERVED_SPACE: &str = "beryl.worker.storage.reserved-space";
 const STORAGE_CHECK_INTERVAL: &str = "beryl.worker.storage.check-interval";
@@ -56,7 +55,6 @@ const KNOWN_KEYS: &[&str] = &[
     RPC_MAX_CONCURRENT_REQUESTS,
     STREAM_FRAME_SIZE,
     STREAM_MAX_FRAME_SIZE,
-    STREAM_IDLE_TIMEOUT,
     STORAGE_DIRS,
     STORAGE_RESERVED_SPACE,
     STORAGE_CHECK_INTERVAL,
@@ -169,9 +167,10 @@ pub struct WorkerConfig {
     /// Derived RPC bind address retained by the network runtime.
     pub rpc_bind: String,
     pub rpc_max_inflight: usize,
+    /// Default payload size for streamed read responses.
     pub default_frame_size: u32,
+    /// Maximum payload size selected for streamed read responses.
     pub max_frame_size: u32,
-    pub stream_idle_timeout_ms: u64,
     pub store: WorkerStoreConfig,
     pub net: WorkerNetConfig,
     pub metadata: WorkerRegistrationConfig,
@@ -213,7 +212,6 @@ impl Default for WorkerConfig {
             rpc_max_inflight: 100,
             default_frame_size: 1024 * 1024,
             max_frame_size: 4 * 1024 * 1024,
-            stream_idle_timeout_ms: 60_000,
             store: WorkerStoreConfig::default(),
             net: WorkerNetConfig::grpc_from_rpc(rpc_bind, 100, 4 * 1024 * 1024),
             metadata: WorkerRegistrationConfig::default(),
@@ -261,7 +259,6 @@ impl WorkerConfig {
         let rpc_max_inflight = positive_usize_or(flat, RPC_MAX_CONCURRENT_REQUESTS, defaults.rpc_max_inflight)?;
         let default_frame_size = bytes_u32_or(flat, STREAM_FRAME_SIZE, defaults.default_frame_size)?;
         let max_frame_size = bytes_u32_or(flat, STREAM_MAX_FRAME_SIZE, defaults.max_frame_size)?;
-        let stream_idle_timeout_ms = duration_ms_or(flat, STREAM_IDLE_TIMEOUT, defaults.stream_idle_timeout_ms)?;
         let store = parse_store_config(flat, &defaults.store)?;
         let metadata = parse_metadata_config(flat, &defaults.metadata)?;
         let heartbeat_interval_ms = duration_ms_or(flat, HEARTBEAT_INTERVAL, defaults.heartbeat_interval_ms)?;
@@ -306,7 +303,6 @@ impl WorkerConfig {
             rpc_max_inflight,
             default_frame_size,
             max_frame_size,
-            stream_idle_timeout_ms,
             store,
             net: WorkerNetConfig::grpc_from_rpc(rpc_bind, rpc_max_inflight, max_frame_size),
             metadata,

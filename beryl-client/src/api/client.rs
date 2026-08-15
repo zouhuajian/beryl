@@ -225,10 +225,7 @@ mod tests {
     use super::super::options::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_REPLICATION};
     use super::*;
     use crate::config::{ClientConfig, MetadataGroupConfig};
-    use crate::data::{
-        WorkerBlockSyncResult, WorkerBlockWriteHandle, WorkerCommitResult, WorkerDataClient, WorkerDataPlane,
-        WorkerReadResult, WorkerWriteTarget,
-    };
+    use crate::data::{WorkerDataClient, WorkerDataPlane, WorkerReadResult, WorkerWriteTarget};
     use crate::error::{ClientError, ClientResult};
     use crate::metadata::{AddBlockResult, MetadataGateway, ReadLayout};
     use crate::planner::PlannedBlockRead;
@@ -1113,7 +1110,7 @@ mod tests {
 
     #[tokio::test]
     async fn writer_sync_publishes_prefix_and_keeps_writer_usable() {
-        for (durable, expected_sync_flags) in [(false, vec![false, false]), (true, vec![true, false])] {
+        for durable in [false, true] {
             let layout = recorded_layout_values(8, 4);
             let gateway = Arc::new(MockGateway::with_create_response_layout(Some(layout)));
             let worker = Arc::new(MockDataClient::default());
@@ -1147,12 +1144,12 @@ mod tests {
                 .expect("sync_write call");
             assert_eq!(sync_call.target_size, Some(5));
             assert_eq!(sync_call.committed_block_lens, vec![5]);
-            assert_eq!(worker.commit_sync_flags(), expected_sync_flags);
+            assert_eq!(worker.write_lens(), vec![5, 1]);
         }
     }
 
     #[tokio::test]
-    async fn writer_durability_after_visibility_uses_sync_committed_block() {
+    async fn writer_durability_after_visibility_reuses_ready_worker_block() {
         let gateway = Arc::new(MockGateway::default());
         let worker = Arc::new(MockDataClient::default());
         let client = fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone()))
@@ -1167,8 +1164,7 @@ mod tests {
         writer.sync_write_durability().await.expect("durability sync");
 
         assert_eq!(method_count(&gateway.calls(), "sync_write"), 2);
-        assert_eq!(worker.commit_sync_flags(), vec![false]);
-        assert_eq!(worker.block_sync_lens(), vec![5]);
+        assert_eq!(worker.write_lens(), vec![5]);
     }
 
     #[tokio::test]
@@ -1176,7 +1172,7 @@ mod tests {
         let layout = recorded_layout_values(8, 4);
         let gateway = Arc::new(MockGateway::with_create_response_layout(Some(layout)));
         let worker = Arc::new(MockDataClient {
-            write_stream_outcomes: Mutex::new(vec![WorkerWriteOutcome::WorkerError].into()),
+            write_outcomes: Mutex::new(vec![WorkerWriteOutcome::WorkerError].into()),
             ..MockDataClient::default()
         });
         let client =
@@ -1191,7 +1187,7 @@ mod tests {
             .sync_write_visibility()
             .await
             .expect_err("flush failure must fail barrier");
-        assert!(matches!(err, ClientError::Worker(msg) if msg.contains("injected WriteStream failure")));
+        assert!(matches!(err, ClientError::Worker(msg) if msg.contains("injected WriteBlock failure")));
 
         let err = writer
             .write_all(Bytes::from_static(b"!"))
@@ -1213,7 +1209,7 @@ mod tests {
         let layout = recorded_layout_values(8, 4);
         let gateway = Arc::new(MockGateway::with_create_response_layout(Some(layout)));
         let worker = Arc::new(MockDataClient {
-            write_stream_outcomes: Mutex::new(vec![WorkerWriteOutcome::WorkerError].into()),
+            write_outcomes: Mutex::new(vec![WorkerWriteOutcome::WorkerError].into()),
             ..MockDataClient::default()
         });
         let client =
@@ -1225,7 +1221,7 @@ mod tests {
 
         writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
         let err = writer.close().await.expect_err("close-time flush must fail");
-        assert!(matches!(err, ClientError::Worker(msg) if msg.contains("injected WriteStream failure")));
+        assert!(matches!(err, ClientError::Worker(msg) if msg.contains("injected WriteBlock failure")));
 
         let err = writer
             .close()
@@ -1322,7 +1318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_abort_cleans_worker_then_metadata_and_blocks_session() {
+    async fn writer_abort_uses_metadata_authority_and_blocks_session() {
         let events = event_log();
         let layout = recorded_layout_values(5, 5);
         let gateway = Arc::new(MockGateway {
@@ -1342,7 +1338,7 @@ mod tests {
         writer.abort().await.expect("abort");
 
         assert_eq!(method_count(&gateway.calls(), "abort_file_write"), 1);
-        assert_event_order(&events, "abort_block_write", "abort_file_write");
+        assert_event_order(&events, "write_block", "abort_file_write");
         let err = writer
             .write_all(Bytes::from_static(b"!"))
             .await
@@ -2256,11 +2252,7 @@ mod tests {
         calls: Mutex<usize>,
         written: Mutex<Vec<u8>>,
         written_lens: Mutex<Vec<u64>>,
-        committed: Mutex<Vec<u64>>,
-        committed_streams: Mutex<std::collections::HashSet<(u64, u64)>>,
-        write_stream_outcomes: Mutex<VecDeque<WorkerWriteOutcome>>,
-        commit_sync_flags: Mutex<Vec<bool>>,
-        block_syncs: Mutex<Vec<u64>>,
+        write_outcomes: Mutex<VecDeque<WorkerWriteOutcome>>,
         record_written_body: bool,
         events: Option<EventLog>,
     }
@@ -2273,11 +2265,7 @@ mod tests {
                 calls: Mutex::new(0),
                 written: Mutex::new(Vec::new()),
                 written_lens: Mutex::new(Vec::new()),
-                committed: Mutex::new(Vec::new()),
-                committed_streams: Mutex::new(std::collections::HashSet::new()),
-                write_stream_outcomes: Mutex::new(VecDeque::new()),
-                commit_sync_flags: Mutex::new(Vec::new()),
-                block_syncs: Mutex::new(Vec::new()),
+                write_outcomes: Mutex::new(VecDeque::new()),
                 record_written_body: true,
                 events: None,
             }
@@ -2309,24 +2297,16 @@ mod tests {
             self.written_lens.lock().expect("written lens").clone()
         }
 
-        fn commit_sync_flags(&self) -> Vec<bool> {
-            self.commit_sync_flags.lock().expect("commit sync flags").clone()
-        }
-
-        fn block_sync_lens(&self) -> Vec<u64> {
-            self.block_syncs.lock().expect("block syncs").clone()
-        }
-
         fn record_event(&self, event: &'static str) {
             if let Some(events) = &self.events {
                 events.lock().expect("events").push(event);
             }
         }
 
-        fn next_write_stream_outcome(&self) -> WorkerWriteOutcome {
-            self.write_stream_outcomes
+        fn next_write_outcome(&self) -> WorkerWriteOutcome {
+            self.write_outcomes
                 .lock()
-                .expect("write stream outcomes")
+                .expect("write outcomes")
                 .pop_front()
                 .unwrap_or(WorkerWriteOutcome::Ok)
         }
@@ -2363,102 +2343,15 @@ mod tests {
             })
         }
 
-        async fn open_block_write(
-            &self,
-            _ctx: AttemptContext,
-            target: WorkerWriteTarget,
-        ) -> ClientResult<WorkerBlockWriteHandle> {
-            self.record_event("open_block_write");
-            let call_number = {
-                let mut calls = self.calls.lock().expect("calls");
-                *calls += 1;
-                *calls
-            };
-            Ok(WorkerBlockWriteHandle {
-                group_name: target.group_name,
-                worker: worker_endpoint(),
-                target: target.target,
-                stream_id: beryl_proto::common::StreamIdProto {
-                    high: 1,
-                    low: call_number as u64,
-                },
-                frame_size: 1024,
-                next_seq: 1,
-            })
-        }
-
-        async fn write_block_bytes(
-            &self,
-            _ctx: AttemptContext,
-            block: &WorkerBlockWriteHandle,
-            data: Bytes,
-        ) -> ClientResult<beryl_proto::worker::WriteStreamResponseProto> {
-            self.record_event("write_block_bytes");
-            if matches!(self.next_write_stream_outcome(), WorkerWriteOutcome::WorkerError) {
-                return Err(ClientError::Worker("injected WriteStream failure".to_string()));
+        async fn write_block(&self, _ctx: AttemptContext, _target: WorkerWriteTarget, data: Bytes) -> ClientResult<()> {
+            self.record_event("write_block");
+            if matches!(self.next_write_outcome(), WorkerWriteOutcome::WorkerError) {
+                return Err(ClientError::Worker("injected WriteBlock failure".to_string()));
             }
             self.written_lens.lock().expect("written lens").push(data.len() as u64);
             if self.record_written_body {
                 self.written.lock().expect("written").extend_from_slice(&data);
             }
-            let frame_size = block.frame_size.max(1) as usize;
-            let frame_count = data.len().div_ceil(frame_size) as u64;
-            Ok(beryl_proto::worker::WriteStreamResponseProto {
-                accepted: true,
-                last_acked_seq: block.next_seq + frame_count.saturating_sub(1),
-                written_through: data.len() as u64,
-            })
-        }
-
-        async fn commit_block_write(
-            &self,
-            _ctx: AttemptContext,
-            block: &WorkerBlockWriteHandle,
-            effective_len: u64,
-            _commit_seq: u64,
-            require_sync: bool,
-        ) -> ClientResult<WorkerCommitResult> {
-            self.record_event("commit_block_write");
-            let stream_key = (block.stream_id.high, block.stream_id.low);
-            if !self
-                .committed_streams
-                .lock()
-                .expect("committed streams")
-                .insert(stream_key)
-            {
-                return Err(ClientError::Worker(format!(
-                    "CommitWrite stream already committed and removed: high={} low={}",
-                    block.stream_id.high, block.stream_id.low
-                )));
-            }
-            self.committed.lock().expect("committed").push(effective_len);
-            self.commit_sync_flags
-                .lock()
-                .expect("commit sync flags")
-                .push(require_sync);
-            Ok(WorkerCommitResult {
-                effective_len,
-                block_stamp: block.target.block_stamp,
-                written_through: effective_len,
-            })
-        }
-
-        async fn sync_committed_block(
-            &self,
-            _ctx: AttemptContext,
-            block: &WorkerBlockWriteHandle,
-            expected_len: u64,
-        ) -> ClientResult<WorkerBlockSyncResult> {
-            self.record_event("sync_committed_block");
-            self.block_syncs.lock().expect("block syncs").push(expected_len);
-            Ok(WorkerBlockSyncResult {
-                effective_len: expected_len,
-                block_stamp: block.target.block_stamp,
-            })
-        }
-
-        async fn abort_block_write(&self, _ctx: AttemptContext, _block: &WorkerBlockWriteHandle) -> ClientResult<()> {
-            self.record_event("abort_block_write");
             Ok(())
         }
     }

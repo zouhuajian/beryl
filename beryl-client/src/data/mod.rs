@@ -11,16 +11,15 @@ mod protocol;
 mod worker;
 
 use async_trait::async_trait;
-use beryl_proto::worker::WriteStreamResponseProto;
-use beryl_types::{GroupName, WorkerEndpointInfo, WriteTarget};
+use beryl_types::{GroupName, WriteTarget};
 use bytes::Bytes;
 
 use crate::error::ClientResult;
 use crate::planner::PlannedBlockRead;
 use crate::runtime::AttemptContext;
 
-/// Internal worker data client boundary.
-/// Stream identifiers and endpoint details stay inside the implementation.
+/// Internal boundary that isolates Worker RPC transport from client runtime
+/// and provides a narrow seam for orchestration tests.
 #[async_trait]
 pub(crate) trait WorkerDataClient: Send + Sync {
     /// Reads one metadata-planned block-local range with exact-length semantics.
@@ -31,36 +30,8 @@ pub(crate) trait WorkerDataClient: Send + Sync {
         block_read: &PlannedBlockRead,
     ) -> ClientResult<WorkerReadResult>;
 
-    async fn open_block_write(
-        &self,
-        attempt: AttemptContext,
-        target: WorkerWriteTarget,
-    ) -> ClientResult<WorkerBlockWriteHandle>;
-
-    async fn write_block_bytes(
-        &self,
-        attempt: AttemptContext,
-        handle: &WorkerBlockWriteHandle,
-        data: Bytes,
-    ) -> ClientResult<WriteStreamResponseProto>;
-
-    async fn commit_block_write(
-        &self,
-        attempt: AttemptContext,
-        handle: &WorkerBlockWriteHandle,
-        effective_len: u64,
-        commit_seq: u64,
-        require_sync: bool,
-    ) -> ClientResult<WorkerCommitResult>;
-
-    async fn sync_committed_block(
-        &self,
-        attempt: AttemptContext,
-        handle: &WorkerBlockWriteHandle,
-        expected_len: u64,
-    ) -> ClientResult<WorkerBlockSyncResult>;
-
-    async fn abort_block_write(&self, attempt: AttemptContext, handle: &WorkerBlockWriteHandle) -> ClientResult<()>;
+    /// Writes one complete block through one bidirectional RPC.
+    async fn write_block(&self, attempt: AttemptContext, target: WorkerWriteTarget, data: Bytes) -> ClientResult<()>;
 }
 
 /// Internal worker write target derived from metadata AddBlock.
@@ -76,43 +47,6 @@ pub(crate) struct WorkerWriteTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WorkerReadResult {
     pub(crate) bytes: Bytes,
-}
-
-/// Worker block write handle returned by OpenWriteStream.
-#[derive(Clone, Debug)]
-pub(crate) struct WorkerBlockWriteHandle {
-    /// Metadata owner group for the block.
-    pub(crate) group_name: GroupName,
-    /// Stable worker identity selected by metadata.
-    pub(crate) worker: WorkerEndpointInfo,
-    /// Metadata AddBlock target.
-    pub(crate) target: WriteTarget,
-    /// Worker stream identifier.
-    pub(crate) stream_id: beryl_proto::common::StreamIdProto,
-    /// Worker-accepted frame size.
-    pub(crate) frame_size: u32,
-    /// Next frame sequence number.
-    pub(crate) next_seq: u64,
-}
-
-/// Worker CommitWrite result.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct WorkerCommitResult {
-    /// Effective block length published by the worker.
-    pub(crate) effective_len: u64,
-    /// Metadata-assigned block stamp persisted by the worker.
-    pub(crate) block_stamp: u64,
-    /// Contiguous byte prefix written into the staging block.
-    pub(crate) written_through: u64,
-}
-
-/// Worker block-level durable sync result.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct WorkerBlockSyncResult {
-    /// Effective block length validated by the worker.
-    pub(crate) effective_len: u64,
-    /// Metadata-assigned block stamp persisted by the worker.
-    pub(crate) block_stamp: u64,
 }
 
 pub(crate) use worker::WorkerDataPlane;

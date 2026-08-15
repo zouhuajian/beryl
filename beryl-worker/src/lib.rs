@@ -12,11 +12,7 @@ pub mod observe;
 pub mod runtime;
 pub mod store;
 
-pub use data::core::{
-    AbortWriteRequest, AbortWriteResult, CommitWriteRequest, CommitWriteResult, RangeMapper, StorageChunkSlice,
-    WorkerCore, WorkerCoreResult, WriteFrame, WriteOpenRequest, WriteOpenResult, WriteStreamContext,
-};
+pub use data::core::{RangeMapper, StorageChunkSlice, WorkerCore, WorkerCoreResult};
 pub use error::{ErrorMetadata, WorkerError};
 pub use runtime::block::BlockManager;
-pub use runtime::stream::{StreamManager, StreamState};
 pub use store::block::{ReclaimBlockRequest, ReclaimBlockResult};

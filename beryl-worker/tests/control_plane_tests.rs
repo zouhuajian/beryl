@@ -72,7 +72,6 @@ fn test_worker_config() -> WorkerConfig {
         rpc_max_inflight: 100,
         default_frame_size: 1024 * 1024,
         max_frame_size: 4 * 1024 * 1024,
-        stream_idle_timeout_ms: 60_000,
         store: beryl_worker::config::WorkerStoreConfig::default(),
         net: WorkerNetConfig::grpc_from_rpc("0.0.0.0:9090".to_string(), 100, 4 * 1024 * 1024),
         metadata: WorkerRegistrationConfig::default(),
@@ -439,14 +438,13 @@ fn report_store(temp: &TempDir) -> Arc<StoreDirs> {
 }
 
 fn test_worker_core(store: Arc<StoreDirs>) -> Arc<WorkerCore> {
-    Arc::new(WorkerCore::with_local_store(1024, 1024, Duration::from_secs(60), store))
+    Arc::new(WorkerCore::with_local_store(1024, 1024, store))
 }
 
 fn test_cleanup_executor(state: Arc<RegistrationSet>) -> (BlockCleanupExecutor, BlockCleanupRuntime) {
     let core = Arc::new(WorkerCore::with_options(
         1024,
         1024,
-        Duration::from_secs(60),
         std::env::temp_dir().join(format!("beryl-cleanup-test-{}", uuid::Uuid::new_v4())),
     ));
     let runtime = BlockCleanupRuntime::start(core, state, BlockCleanupOptions::default()).expect("cleanup executor");
@@ -650,7 +648,6 @@ beryl.worker.block.cleanup.retry.initial-backoff: 10ms
 beryl.worker.block.cleanup.retry.max-backoff: 100ms
 beryl.worker.stream.frame-size: 1KiB
 beryl.worker.stream.max-frame-size: 4KiB
-beryl.worker.stream.idle-timeout: 5s
 beryl.worker.storage.dirs:
   hdd0:
     path: {store_path:?}

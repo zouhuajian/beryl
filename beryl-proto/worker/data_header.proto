@@ -13,12 +13,10 @@ import "common/errors.proto";
 // ============================================================================
 
 // DataRequestHeaderProto is carried by low-frequency worker data-plane control
-// operations such as ReadBlock, OpenWrite, CommitWrite, AbortWrite, and
-// SyncCommittedBlock.
+// operations such as ReadBlock and the first WriteBlock command.
 //
 // Hot-path stream frames intentionally do not carry this header. Stream
-// identity, sequence, offset, and flow-control fields are carried by the stream
-// frame messages themselves.
+// Layout and target identity facts appear only in the first WriteBlock command.
 message DataRequestHeaderProto {
   /// Client information (call_id, client_id, client_name).
   common.ClientInfoProto client = 1;

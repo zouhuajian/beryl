@@ -19,7 +19,7 @@ use crate::runtime::{
     classify_error, is_unknown_session_barrier_outcome, mark_session_after_metadata_error, metric_labels,
     refresh_hint_from_error, ClientRuntime, ErrorClass, OperationContext, OperationDeadline,
 };
-use crate::session::write_session::{WorkerCommitLevel, WriteSession};
+use crate::session::write_session::WriteSession;
 
 const MAX_CONVENIENCE_READ_CHUNK: u32 = 8 * 1024 * 1024;
 
@@ -243,12 +243,12 @@ impl FileWriter {
 
     /// Publishes the written prefix for visibility while keeping the writer open.
     pub async fn sync_write_visibility(&mut self) -> ClientResult<()> {
-        self.sync_write_barrier(WorkerCommitLevel::Visible).await
+        self.sync_write_barrier().await
     }
 
     /// Publishes the written prefix for durability while keeping the writer open.
     pub async fn sync_write_durability(&mut self) -> ClientResult<()> {
-        self.sync_write_barrier(WorkerCommitLevel::Durable).await
+        self.sync_write_barrier().await
     }
 
     /// Renews the writer lease while keeping the write session open.
@@ -310,10 +310,7 @@ impl FileWriter {
         let path = session.path().to_string();
         self.flush_pending_bytes(&mut session, deadline.clone()).await?;
         let final_size = session.cursor();
-        let committed_blocks = self
-            .runtime
-            .commit_pending_blocks_for_barrier(&mut session, WorkerCommitLevel::CLOSE_REQUIRED, deadline.clone())
-            .await?;
+        let committed_blocks = self.runtime.committed_blocks_for_barrier(&session);
 
         let retrying_unknown_commit = session.is_commit_unknown();
         let plan = session.prepare_commit_file(
@@ -366,61 +363,39 @@ impl FileWriter {
             self.runtime.executor.client_name(),
             self.runtime.executor.operation_deadline(),
         )?;
-        let mut abort_error = None;
         self.runtime.record_metric(
             ClientMetric::AbortAttempt,
             metric_labels("AbortFileWrite", "metadata").with_outcome("attempt"),
         );
-        for cleanup in plan.worker_cleanups() {
-            let operation = cleanup.operation();
-            let ctx = self.runtime.data_context(&operation, 0);
-            if let Err(err) = self
-                .runtime
-                .worker_rpc_with_timeout(
-                    &operation,
-                    self.runtime
-                        .data_plane
-                        .abort_block_write(ctx, cleanup.block_write_handle()),
-                )
-                .await
-            {
-                abort_error.get_or_insert(err);
-            }
-        }
         if let Err(err) = self
             .runtime
             .executor
             .abort_file_write(plan.metadata_operation(), plan.metadata_write_handle())
             .await
         {
-            abort_error.get_or_insert(self.runtime.normalize_outcome_error("AbortFileWrite", "metadata", err));
+            session.mark_abort_unknown();
+            let normalized = self.runtime.normalize_outcome_error("AbortFileWrite", "metadata", err);
+            let metric = if matches!(normalized, ClientError::UnknownOutcome(_)) {
+                ClientMetric::AbortUnknown
+            } else {
+                ClientMetric::AbortFailure
+            };
+            self.runtime.record_metric(
+                metric,
+                metric_labels("AbortFileWrite", "metadata").with_outcome("unknown"),
+            );
+            return Err(normalized);
         }
-        match abort_error {
-            Some(err) => {
-                session.mark_abort_unknown();
-                let normalized = self.runtime.normalize_outcome_error("AbortWrite", "worker", err);
-                let metric = if matches!(normalized, ClientError::UnknownOutcome(_)) {
-                    ClientMetric::AbortUnknown
-                } else {
-                    ClientMetric::AbortFailure
-                };
-                self.runtime
-                    .record_metric(metric, metric_labels("AbortWrite", "worker").with_outcome("unknown"));
-                Err(normalized)
-            }
-            None => {
-                session.mark_aborted();
-                self.runtime.record_metric(
-                    ClientMetric::AbortSuccess,
-                    metric_labels("AbortFileWrite", "metadata").with_outcome("success"),
-                );
-                Ok(())
-            }
-        }
+        session.mark_aborted();
+        self.runtime.record_metric(
+            ClientMetric::AbortSuccess,
+            metric_labels("AbortFileWrite", "metadata").with_outcome("success"),
+        );
+        Ok(())
     }
 
     /// Flushes worker data to the requested level and publishes the metadata sync barrier.
-    async fn sync_write_barrier(&mut self, required_level: WorkerCommitLevel) -> ClientResult<()> {
+    async fn sync_write_barrier(&mut self) -> ClientResult<()> {
         let deadline = self.runtime.executor.operation_deadline();
         let session_ref = self.handle.write_session();
         let mut session = session_ref.lock().await;
@@ -429,10 +404,7 @@ impl FileWriter {
         let path = session.path().to_string();
         self.flush_pending_bytes(&mut session, deadline.clone()).await?;
         let target_size = session.cursor();
-        let committed_blocks = self
-            .runtime
-            .commit_pending_blocks_for_barrier(&mut session, required_level, deadline.clone())
-            .await?;
+        let committed_blocks = self.runtime.committed_blocks_for_barrier(&session);
         match self
             .runtime
             .executor

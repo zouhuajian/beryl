@@ -36,10 +36,9 @@ beryl.worker.block.cleanup.concurrency: 4
 beryl.worker.block.cleanup.retry.initial-backoff: 100ms
 beryl.worker.block.cleanup.retry.max-backoff: 30s
 
-# -------------------- Streams --------------------
+# -------------------- Read response framing --------------------
 beryl.worker.stream.frame-size: 1MiB
 beryl.worker.stream.max-frame-size: 4MiB
-beryl.worker.stream.idle-timeout: 1min
 
 # -------------------- Storage --------------------
 beryl.worker.storage.dirs:

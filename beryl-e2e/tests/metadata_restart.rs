@@ -16,10 +16,8 @@ use beryl_proto::metadata::{
     WriteTargetProto,
 };
 use beryl_proto::worker::worker_data_service_client::WorkerDataServiceClient;
-use beryl_proto::worker::{
-    CommitWriteRequestProto, DataRequestHeaderProto, DataResponseHeaderProto, OpenWriteStreamRequestProto,
-    WriteStreamRequestProto,
-};
+use beryl_proto::worker::write_block_request_proto::Payload;
+use beryl_proto::worker::{DataRequestHeaderProto, WriteBlockCommandProto, WriteBlockRequestProto};
 use beryl_types::{BlockFormatId, ClientId};
 use bytes::Bytes;
 use tokio_stream::iter;
@@ -84,14 +82,14 @@ async fn restart_after_empty_create_allows_noop_close_without_publishing_bytes()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restart_after_add_block_before_worker_commit_rejects_stale_writer_and_hides_data() {
+async fn restart_after_worker_ready_before_metadata_close_rejects_stale_writer_and_hides_data() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let client = cluster.client().clone();
     client.mkdirs("/restart", true).await.expect("create restart dir");
 
     let mut writer = client
         .create(
-            "/restart/add-block-before-worker-commit",
+            "/restart/worker-ready-before-close",
             CreateOptions::create().with_block_size(1024).with_chunk_size(1024),
         )
         .await
@@ -99,27 +97,27 @@ async fn restart_after_add_block_before_worker_commit_rejects_stale_writer_and_h
     writer
         .write_all(Bytes::from(deterministic_bytes(1024)))
         .await
-        .expect("stage worker block without metadata close");
+        .expect("write Worker Ready block without metadata close");
 
     cluster.restart_metadata().await.expect("restart metadata");
 
     let err = writer.renew_lease().await.expect_err("stale writer must fail closed");
     assert_stale_writer_error(&err);
-    assert_no_committed_bytes(&cluster, "/restart/add-block-before-worker-commit")
+    assert_no_committed_bytes(&cluster, "/restart/worker-ready-before-close")
         .await
         .expect("no committed bytes");
-    assert_no_metadata_locations(&cluster, "/restart/add-block-before-worker-commit", 1024)
+    assert_no_metadata_locations(&cluster, "/restart/worker-ready-before-close", 1024)
         .await
         .expect("no metadata locations");
     cluster.shutdown().await.expect("shutdown cluster");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restart_after_worker_commit_before_metadata_commit_hides_uncommitted_block() {
+async fn restart_after_worker_ready_before_metadata_commit_hides_unpublished_block() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
-    let active = raw_create_commit_worker_block(&cluster, "/restart/worker-commit-no-metadata", b"worker-ready")
+    let active = raw_create_worker_ready_block(&cluster, "/restart/worker-ready-no-metadata", b"worker-ready")
         .await
-        .expect("commit worker block without CommitFile");
+        .expect("write Worker Ready block without CommitFile");
     assert_eq!(cluster.ready_block_count().expect("ready blocks before restart"), 1);
 
     cluster.restart_metadata().await.expect("restart metadata");
@@ -128,10 +126,10 @@ async fn restart_after_worker_commit_before_metadata_commit_hides_uncommitted_bl
         .await
         .expect("stale CommitFile must fail");
     assert_eq!(cluster.ready_block_count().expect("ready blocks after restart"), 1);
-    assert_no_committed_bytes(&cluster, "/restart/worker-commit-no-metadata")
+    assert_no_committed_bytes(&cluster, "/restart/worker-ready-no-metadata")
         .await
         .expect("worker-only block not visible");
-    assert_no_metadata_locations(&cluster, "/restart/worker-commit-no-metadata", 11)
+    assert_no_metadata_locations(&cluster, "/restart/worker-ready-no-metadata", 11)
         .await
         .expect("worker-only block has no metadata locations");
     cluster.shutdown().await.expect("shutdown cluster");
@@ -421,9 +419,9 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
         "placement must use one of the two currently registered worker runs"
     );
 
-    write_and_commit_worker_target(&target, &payload)
+    write_worker_target(&target, &payload)
         .await
-        .expect("write and commit restarted target on selected worker");
+        .expect("write restarted target to Ready on selected worker");
     let commit = metadata
         .commit_file(Request::new(CommitFileRequestProto {
             header: Some(metadata_header(900)),
@@ -462,9 +460,9 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
 async fn completed_commit_is_resolved_from_durable_state_after_metadata_restart() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let path = "/restart/durable-publish";
-    let active = raw_create_commit_worker_block(&cluster, path, b"durable-publish")
+    let active = raw_create_worker_ready_block(&cluster, path, b"durable-publish")
         .await
-        .expect("prepare committed worker block");
+        .expect("prepare Worker Ready block");
     let request = CommitFileRequestProto {
         header: Some(metadata_header(401)),
         write_handle: Some(active.write_handle),
@@ -499,7 +497,7 @@ async fn completed_commit_is_resolved_from_durable_state_after_metadata_restart(
     cluster.shutdown().await.expect("shutdown cluster");
 }
 
-struct RawWorkerCommittedWrite {
+struct RawWorkerReadyWrite {
     write_handle: WriteHandleProto,
     committed_block: CommittedBlockProto,
     expected_content_revision: u64,
@@ -507,11 +505,11 @@ struct RawWorkerCommittedWrite {
     write_mode: i32,
 }
 
-async fn raw_create_commit_worker_block(
+async fn raw_create_worker_ready_block(
     cluster: &TestCluster,
     path: &str,
     payload: &[u8],
-) -> TestResult<RawWorkerCommittedWrite> {
+) -> TestResult<RawWorkerReadyWrite> {
     let client = cluster.client();
     client.mkdirs("/restart", true).await.expect("create restart dir");
 
@@ -560,14 +558,14 @@ async fn raw_create_commit_worker_block(
         .into_inner();
     assert_metadata_ok(add_block.header);
     let target = add_block.target.expect("write target");
-    write_and_commit_worker_target(&target, payload).await?;
+    write_worker_target(&target, payload).await?;
     let committed_block = CommittedBlockProto {
         block_id: target.block_id,
         file_offset: target.file_offset,
         len: payload.len() as u64,
     };
 
-    Ok(RawWorkerCommittedWrite {
+    Ok(RawWorkerReadyWrite {
         write_handle,
         committed_block,
         expected_content_revision,
@@ -576,7 +574,7 @@ async fn raw_create_commit_worker_block(
     })
 }
 
-async fn assert_stale_commit_file(cluster: &TestCluster, active: RawWorkerCommittedWrite) -> TestResult<()> {
+async fn assert_stale_commit_file(cluster: &TestCluster, active: RawWorkerReadyWrite) -> TestResult<()> {
     let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint()).await?;
     let final_size = active.committed_block.len;
     let stale_commit = metadata
@@ -602,7 +600,7 @@ async fn assert_stale_commit_file(cluster: &TestCluster, active: RawWorkerCommit
     Ok(())
 }
 
-async fn write_and_commit_worker_target(target: &WriteTargetProto, payload: &[u8]) -> TestResult<()> {
+async fn write_worker_target(target: &WriteTargetProto, payload: &[u8]) -> TestResult<()> {
     let worker = target
         .worker_endpoints
         .first()
@@ -614,57 +612,29 @@ async fn write_and_commit_worker_target(target: &WriteTargetProto, payload: &[u8
         format!("http://{}", worker.endpoint)
     };
     let mut worker_client = WorkerDataServiceClient::connect(endpoint).await?;
-    let open = worker_client
-        .open_write_stream(Request::new(OpenWriteStreamRequestProto {
-            header: Some(data_header(501)),
-            group_name: "root".to_string(),
-            block_id: target.block_id,
-            block_format_id: target.block_format_id,
-            block_size: target.block_size,
-            chunk_size: target.chunk_size,
-            block_stamp: target.block_stamp,
-            token: target.fencing_token,
-            frame_size: payload.len().max(1) as u32,
-            worker_run_id: worker.worker_run_id.clone(),
-            tier: target.tier,
-        }))
+    let mut responses = worker_client
+        .write_block(Request::new(iter(vec![
+            WriteBlockRequestProto {
+                payload: Some(Payload::Command(Box::new(WriteBlockCommandProto {
+                    header: Some(data_header(501)),
+                    group_name: "root".to_string(),
+                    block_id: target.block_id,
+                    worker_run_id: worker.worker_run_id,
+                    block_format_id: target.block_format_id,
+                    block_size: target.block_size,
+                    chunk_size: target.chunk_size,
+                    block_stamp: target.block_stamp,
+                    tier: target.tier,
+                }))),
+            },
+            WriteBlockRequestProto {
+                payload: Some(Payload::Data(Bytes::copy_from_slice(payload))),
+            },
+        ])))
         .await?
         .into_inner();
-    assert_worker_ok(open.header);
-    let stream_id = open.stream_id.expect("stream id");
-    let write = worker_client
-        .write_stream(Request::new(iter(vec![WriteStreamRequestProto {
-            stream_id: Some(stream_id),
-            seq: 1,
-            offset_in_block: 0,
-            data: payload.to_vec().into(),
-        }])))
-        .await?
-        .into_inner();
-    assert_eq!(write.last_acked_seq, 1);
-    assert_eq!(write.written_through, payload.len() as u64);
-
-    let commit = worker_client
-        .commit_write(Request::new(CommitWriteRequestProto {
-            header: Some(data_header(502)),
-            group_name: "root".to_string(),
-            block_id: target.block_id,
-            stream_id: Some(stream_id),
-            effective_len: payload.len() as u64,
-            block_stamp: target.block_stamp,
-            token: target.fencing_token,
-            commit_seq: 1,
-            require_sync: false,
-            worker_run_id: worker.worker_run_id,
-            block_format_id: target.block_format_id,
-            block_size: target.block_size,
-            chunk_size: target.chunk_size,
-        }))
-        .await?
-        .into_inner();
-    assert_worker_ok(commit.header);
-    assert_eq!(commit.effective_len, payload.len() as u64);
-    assert_eq!(commit.block_stamp, target.block_stamp);
+    assert!(responses.message().await?.is_some(), "worker must acknowledge staging");
+    assert!(responses.message().await?.is_none(), "worker must complete after Ready");
     Ok(())
 }
 
@@ -708,13 +678,6 @@ fn data_header(client_id: u128) -> DataRequestHeaderProto {
 fn assert_metadata_ok(header: Option<ResponseHeaderProto>) {
     let error = header.expect("metadata response header").error;
     assert!(error.is_none(), "metadata response carried business error: {error:?}");
-}
-
-fn assert_worker_ok(header: Option<DataResponseHeaderProto>) {
-    assert!(
-        header.expect("worker response header").error.is_none(),
-        "worker response must not carry business error"
-    );
 }
 
 fn assert_stale_writer_error(err: &ClientError) {

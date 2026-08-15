@@ -20,7 +20,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // This allows prost to use bytes::Bytes instead of Vec<u8> for bytes fields
         // Note: bytes() accepts a single path, so we call it for each field
         .bytes("worker.ReadBlockChunkProto.data")
-        .bytes("worker.WriteStreamRequestProto.data")
+        .bytes("worker.WriteBlockRequestProto.data")
+        // Keep the hot data variant compact; the command is allocated only once per RPC.
+        .boxed(".worker.WriteBlockRequestProto.payload.command")
         .compile_protos(
             &[
                 "common/common.proto",

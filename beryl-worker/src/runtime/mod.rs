@@ -4,4 +4,4 @@
 //! Worker runtime state.
 
 pub mod block;
-pub mod stream;
+pub(crate) mod write;

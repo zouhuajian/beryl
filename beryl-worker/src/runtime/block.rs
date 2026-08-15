@@ -305,7 +305,7 @@ pub struct BlockManager {
     /// Transport frame payload size used when a caller does not request one.
     /// This controls network batching and does not define StorageChunk size.
     default_frame_size: u32,
-    /// Upper bound for negotiated transport frame payload size.
+    /// Upper bound for Worker-selected read response payload size.
     max_frame_size: u32,
     access: Arc<BlockAccessRegistry>,
 }
