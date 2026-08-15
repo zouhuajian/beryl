@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::ClientConfig;
-use crate::data::WorkerDataPlane;
+use crate::data::{BlockWrite, WorkerDataPlane};
 use crate::error::side_effect_response_body_mismatch;
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::MetadataGateway;
@@ -53,14 +53,13 @@ impl ClientRuntime {
         })
     }
 
-    /// Allocates one metadata block and writes its payload to the selected worker.
-    pub(crate) async fn write_block(
+    /// Allocates one metadata block and opens its Worker stream through the
+    /// staging acknowledgement boundary.
+    pub(crate) async fn open_block_write(
         &self,
         session: &mut WriteSession,
-        data: Bytes,
         deadline: OperationDeadline,
-    ) -> ClientResult<()> {
-        let block_len = data.len() as u64;
+    ) -> ClientResult<BlockWrite> {
         let add_block = match self
             .executor
             .add_block(
@@ -77,7 +76,7 @@ impl ClientRuntime {
                 return Err(self.normalize_outcome_error("AddBlock", "metadata", err));
             }
         };
-        if let Err(err) = session.validate_target(&add_block.target, block_len) {
+        if let Err(err) = session.validate_target(&add_block.target) {
             session.mark_unknown_outcome();
             self.record_metric(
                 ClientMetric::WorkerResponseBodyMismatch,
@@ -97,25 +96,98 @@ impl ClientRuntime {
             deadline,
         )?;
         let ctx = self.data_context(&operation, 0);
+        let lease_expires_at_ms = session.expires_at_ms()?;
         match self
             .worker_rpc_with_timeout(
                 &operation,
-                self.data_plane
-                    .write_block(ctx, add_block.group_name, add_block.target.clone(), data),
+                self.data_plane.open_write_block(
+                    ctx,
+                    add_block.group_name,
+                    add_block.target.clone(),
+                    lease_expires_at_ms,
+                ),
             )
             .await
         {
-            Ok(()) => {}
+            Ok(block) => Ok(block),
             Err(err) => {
                 mark_session_after_write_error(session, &err);
-                return Err(self.normalize_outcome_error("WriteBlock", "worker", err));
+                Err(self.normalize_outcome_error("WriteBlock", "worker", err))
             }
         }
-        if let Err(err) = session.push_ready_block(add_block.target, block_len) {
-            session.mark_session_invalid();
-            return Err(err);
+    }
+
+    /// Sends one frame on an acknowledged block RPC under the current public
+    /// write call's deadline, then advances the session cursor.
+    pub(crate) async fn write_block_frame(
+        &self,
+        session: &mut WriteSession,
+        block: &mut BlockWrite,
+        data: Bytes,
+        deadline: &OperationDeadline,
+    ) -> ClientResult<()> {
+        let len = data.len();
+        session
+            .cursor()
+            .checked_add(len as u64)
+            .ok_or_else(|| ClientError::InvalidArgument("write cursor overflow".to_string()))?;
+        match self.worker_write_step_with_timeout(deadline, block.write(data)).await {
+            Ok(()) => session.advance_cursor(len),
+            Err(err) => {
+                mark_session_after_write_error(session, &err);
+                Err(self.normalize_outcome_error("WriteBlock", "worker", err))
+            }
         }
-        Ok(())
+    }
+
+    /// Half-closes one block request stream and records the block as Ready only
+    /// after the Worker response stream ends normally.
+    pub(crate) async fn finish_block_write(
+        &self,
+        session: &mut WriteSession,
+        block: BlockWrite,
+        deadline: &OperationDeadline,
+    ) -> ClientResult<()> {
+        match self.worker_write_step_with_timeout(deadline, block.finish()).await {
+            Ok((target, written_len)) => {
+                if let Err(err) = session.push_ready_block(target, written_len) {
+                    session.mark_session_invalid();
+                    return Err(err);
+                }
+                Ok(())
+            }
+            Err(err) => {
+                mark_session_after_write_error(session, &err);
+                Err(self.normalize_outcome_error("WriteBlock", "worker", err))
+            }
+        }
+    }
+
+    /// Observes a terminal Worker result that arrived between public writer
+    /// calls before sending more bytes on the same block RPC.
+    pub(crate) async fn check_block_write(
+        &self,
+        session: &mut WriteSession,
+        block: &mut BlockWrite,
+        deadline: &OperationDeadline,
+    ) -> ClientResult<()> {
+        match self.worker_write_step_with_timeout(deadline, block.check_open()).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                mark_session_after_write_error(session, &err);
+                Err(self.normalize_outcome_error("WriteBlock", "worker", err))
+            }
+        }
+    }
+
+    /// Waits for local block cancellation only within the current public
+    /// operation; the detached completion task retains its lease bound.
+    pub(crate) async fn cancel_block_write(&self, block: BlockWrite, deadline: &OperationDeadline) -> ClientResult<()> {
+        if block.cancel(deadline.remaining()).await {
+            return Ok(());
+        }
+        self.record_worker_timeout("WriteBlock");
+        Err(timeout_error("worker", "WriteBlock cancellation"))
     }
 
     /// Converts durable Worker blocks into the Metadata visibility-barrier shape.
@@ -147,6 +219,26 @@ impl ClientRuntime {
             Err(_) => {
                 self.record_worker_timeout(operation.operation_name());
                 Err(timeout_error("worker", operation.operation_name()))
+            }
+        }
+    }
+
+    /// Bounds one send, status check, or finish step without imposing a fixed
+    /// timeout on the multi-call lifetime of the underlying streaming RPC.
+    async fn worker_write_step_with_timeout<T, Fut>(&self, deadline: &OperationDeadline, future: Fut) -> ClientResult<T>
+    where
+        Fut: Future<Output = ClientResult<T>>,
+    {
+        let timeout = deadline.remaining();
+        if timeout.is_zero() {
+            self.record_worker_timeout("WriteBlock");
+            return Err(timeout_error("worker", "WriteBlock"));
+        }
+        match tokio::time::timeout(timeout, future).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.record_worker_timeout("WriteBlock");
+                Err(timeout_error("worker", "WriteBlock"))
             }
         }
     }

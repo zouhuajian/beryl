@@ -272,10 +272,13 @@ async fn write_more_than_ten_blocks_roundtrip() {
         .await
         .expect("create file");
 
-    writer
-        .write_all(payload.clone())
-        .await
-        .expect("write more than ten blocks");
+    for offset in (0..payload.len()).step_by(127) {
+        let end = (offset + 127).min(payload.len());
+        writer
+            .write_all(payload.slice(offset..end))
+            .await
+            .expect("write small frame across more than ten blocks");
+    }
     writer.close().await.expect("close file");
 
     let actual = client

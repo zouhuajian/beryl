@@ -9,17 +9,20 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::stream;
+use tokio::sync::watch;
 
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
 use beryl_types::{GroupName, WriteTarget};
 
 use super::channel_pool::GrpcWorkerChannelPool;
 use super::protocol::{
-    build_read_block_request, build_tonic_request, build_write_block_command, build_write_block_data,
-    has_structured_worker_error, is_transient_worker_transport_status, parse_worker_data_status,
-    read_block_stream_to_bytes,
+    build_read_block_request, build_tonic_request, build_write_block_command, has_structured_worker_error,
+    is_transient_worker_transport_status, parse_worker_data_status, read_block_stream_to_bytes,
 };
-use super::{WorkerDataClient, WorkerReadResult, WorkerWriteTarget};
+use super::{
+    duration_until_unix_ms, write_lease_expired_error, BlockWrite, BlockWriteInput, BlockWriteLease, WorkerDataClient,
+    WorkerReadResult, WorkerWriteTarget,
+};
 use crate::cache::CacheInvalidationReason;
 use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
@@ -30,19 +33,40 @@ use crate::runtime::{classify_error, AttemptContext, ErrorClass};
 /// Concrete gRPC implementation of the client-side Worker data plane.
 #[derive(Debug)]
 struct GrpcWorkerDataClient {
-    channel_pool: GrpcWorkerChannelPool,
+    channel_pool: Arc<GrpcWorkerChannelPool>,
+}
+
+/// Cancels a request whose open future exits before the staging Ack can
+/// transfer request-stream ownership to `BlockWrite`.
+struct OpeningWriteCancellation {
+    signal: Option<watch::Sender<bool>>,
+}
+
+impl OpeningWriteCancellation {
+    /// Transfers cancellation ownership to the acknowledged block RPC.
+    fn disarm(&mut self) -> watch::Sender<bool> {
+        self.signal.take().expect("opening cancellation signal is present")
+    }
+}
+
+impl Drop for OpeningWriteCancellation {
+    fn drop(&mut self) {
+        if let Some(signal) = self.signal.take() {
+            signal.send_replace(true);
+        }
+    }
 }
 
 impl GrpcWorkerDataClient {
     fn new() -> Self {
         Self {
-            channel_pool: GrpcWorkerChannelPool::new(true, 1, Arc::new(NoopClientMetrics)),
+            channel_pool: Arc::new(GrpcWorkerChannelPool::new(true, 1, Arc::new(NoopClientMetrics))),
         }
     }
 
     fn from_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> Self {
         Self {
-            channel_pool: GrpcWorkerChannelPool::from_config(config, metrics),
+            channel_pool: Arc::new(GrpcWorkerChannelPool::from_config(config, metrics)),
         }
     }
 
@@ -72,19 +96,18 @@ impl GrpcWorkerDataClient {
     /// actionable; unstructured transport loss after request initiation is an
     /// unknown outcome and must never be replayed on another worker.
     fn map_write_status(
-        &self,
+        channel_pool: &GrpcWorkerChannelPool,
         attempt: &AttemptContext,
         worker: &beryl_types::WorkerEndpointInfo,
         status: tonic::Status,
     ) -> ClientError {
         if has_structured_worker_error(&status) {
             let error = parse_worker_data_status(attempt, status);
-            self.channel_pool.invalidate_on_worker_run_mismatch(worker, &error);
+            channel_pool.invalidate_on_worker_run_mismatch(worker, &error);
             return error;
         }
         if is_transient_worker_transport_status(&status) {
-            self.channel_pool
-                .mark_worker_unavailable(worker, CacheInvalidationReason::Unavailable);
+            channel_pool.mark_worker_unavailable(worker, CacheInvalidationReason::Unavailable);
         }
         ClientError::UnknownOutcome(format!(
             "worker WriteBlock outcome is unknown after transport status {}: {}",
@@ -93,63 +116,217 @@ impl GrpcWorkerDataClient {
         ))
     }
 
-    /// Drives one block through one bidirectional RPC.
+    /// Opens one block RPC and returns its concrete client-side owner after the
+    /// Worker acknowledges staging creation.
     ///
-    /// The first response acknowledges staging ownership. After that point,
-    /// unstructured transport loss is an unknown outcome and is never replayed.
-    async fn write_one_block(
+    /// The RPC intentionally has no fixed tonic timeout after the acknowledgement:
+    /// later `write_all`, sync, and close calls apply their own local deadlines,
+    /// while the completion task enforces the renewable write-lease expiry.
+    async fn open_one_block(
         &self,
         attempt: &AttemptContext,
         target: &WorkerWriteTarget,
         worker: &beryl_types::WorkerEndpointInfo,
-        data: Bytes,
-    ) -> ClientResult<()> {
+        lease_expires_at_ms: u64,
+    ) -> ClientResult<BlockWrite> {
         let mut client = self.channel_pool.worker_data_service_client(worker, "WriteBlock")?;
         let command = build_write_block_command(attempt, target, worker)?;
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        sender
-            .send(command)
-            .await
-            .map_err(|_| ClientError::Worker("WriteBlock request stream closed before command".to_string()))?;
-        let requests = stream::unfold(receiver, |mut receiver| async move {
-            receiver.recv().await.map(|request| (request, receiver))
-        });
-        let mut responses = client
-            .write_block(build_tonic_request(attempt, requests))
-            .await
-            .map_err(|status| self.map_write_status(attempt, worker, status))?
+        let (cancellation, cancellation_signal) = watch::channel(false);
+        let mut opening_cancellation = OpeningWriteCancellation {
+            signal: Some(cancellation),
+        };
+        let requests = write_block_requests(command, receiver, cancellation_signal);
+        let response = tokio::select! {
+            biased;
+            _ = tokio::time::sleep(duration_until_unix_ms(lease_expires_at_ms)) => {
+                return Err(write_lease_expired_error());
+            }
+            response = client.write_block(tonic::Request::new(requests)) => response,
+        };
+        let mut responses = response
+            .map_err(|status| Self::map_write_status(self.channel_pool.as_ref(), attempt, worker, status))?
             .into_inner();
 
-        match responses.message().await {
+        let acknowledgement = tokio::select! {
+            biased;
+            _ = tokio::time::sleep(duration_until_unix_ms(lease_expires_at_ms)) => {
+                return Err(write_lease_expired_error());
+            }
+            acknowledgement = responses.message() => acknowledgement,
+        };
+        match acknowledgement {
             Ok(Some(_)) => {}
             Ok(None) => {
                 return Err(ClientError::UnknownOutcome(
                     "worker WriteBlock ended before staging acknowledgement".to_string(),
                 ));
             }
-            Err(status) => return Err(self.map_write_status(attempt, worker, status)),
+            Err(status) => {
+                return Err(Self::map_write_status(
+                    self.channel_pool.as_ref(),
+                    attempt,
+                    worker,
+                    status,
+                ));
+            }
         }
 
-        for offset in (0..data.len()).step_by(beryl_proto::DEFAULT_WORKER_DATA_FRAME_SIZE) {
-            let end = (offset + beryl_proto::DEFAULT_WORKER_DATA_FRAME_SIZE).min(data.len());
-            let request = build_write_block_data(data.slice(offset..end))?;
-            if sender.send(request).await.is_err() {
-                return match responses.message().await {
-                    Err(status) => Err(self.map_write_status(attempt, worker, status)),
-                    Ok(_) => Err(ClientError::UnknownOutcome(
-                        "worker WriteBlock request stream closed after acknowledgement".to_string(),
-                    )),
+        let lease = Arc::new(BlockWriteLease::new(lease_expires_at_ms));
+        let cancellation = opening_cancellation.disarm();
+        let channel_pool = Arc::clone(&self.channel_pool);
+        let attempt = attempt.clone();
+        let worker = worker.clone();
+        let completion = tokio::spawn(wait_for_write_completion(
+            channel_pool,
+            attempt,
+            worker,
+            responses,
+            Arc::clone(&lease),
+            cancellation.clone(),
+        ));
+        Ok(BlockWrite::new(
+            target.target.clone(),
+            sender,
+            cancellation,
+            lease,
+            completion,
+        ))
+    }
+}
+
+/// Physical request-stream state for exactly one Worker block RPC.
+///
+/// The command is emitted once, `Finish` is the only normal EOF, and every
+/// abandoned or expired write emits at most one failure-cleanup frame.
+struct BlockWriteRequestState {
+    command: Option<beryl_proto::worker::WriteBlockRequestProto>,
+    inputs: tokio::sync::mpsc::Receiver<BlockWriteInput>,
+    cancellation: Option<watch::Receiver<bool>>,
+    cancellation_sent: bool,
+}
+
+/// Emits physical command and data frames. Only explicit `Finish` becomes EOF;
+/// cancellation uses Worker's existing invalid-payload cleanup path.
+fn write_block_requests(
+    command: beryl_proto::worker::WriteBlockRequestProto,
+    receiver: tokio::sync::mpsc::Receiver<BlockWriteInput>,
+    cancellation: watch::Receiver<bool>,
+) -> impl futures::Stream<Item = beryl_proto::worker::WriteBlockRequestProto> {
+    let state = BlockWriteRequestState {
+        command: Some(command),
+        inputs: receiver,
+        cancellation: Some(cancellation),
+        cancellation_sent: false,
+    };
+    stream::unfold(state, next_write_block_request)
+}
+
+/// Emits the next command, data, cancellation, or normal-finish event while
+/// preserving the one-terminal-event request-stream invariant.
+async fn next_write_block_request(
+    mut state: BlockWriteRequestState,
+) -> Option<(beryl_proto::worker::WriteBlockRequestProto, BlockWriteRequestState)> {
+    if let Some(command) = state.command.take() {
+        return Some((command, state));
+    }
+    loop {
+        if state
+            .cancellation
+            .as_mut()
+            .is_some_and(|cancellation| *cancellation.borrow_and_update())
+        {
+            if state.cancellation_sent {
+                return std::future::pending().await;
+            }
+            state.cancellation_sent = true;
+            return Some((write_block_failure_cleanup_request(), state));
+        }
+        let Some(cancellation) = state.cancellation.as_mut() else {
+            return match state.inputs.recv().await {
+                Some(BlockWriteInput::Data(request)) => Some((request, state)),
+                Some(BlockWriteInput::Finish) => None,
+                None => std::future::pending().await,
+            };
+        };
+        tokio::select! {
+            biased;
+            changed = cancellation.changed() => {
+                if changed.is_err() {
+                    state.cancellation = None;
+                }
+            }
+            input = state.inputs.recv() => {
+                return match input {
+                    Some(BlockWriteInput::Data(request)) => Some((request, state)),
+                    Some(BlockWriteInput::Finish) => None,
+                    None => std::future::pending().await,
                 };
             }
         }
-        drop(sender);
+    }
+}
 
-        match responses.message().await {
-            Ok(None) => Ok(()),
-            Ok(Some(_)) => Err(ClientError::UnknownOutcome(
-                "worker WriteBlock returned more than one acknowledgement".to_string(),
-            )),
-            Err(status) => Err(self.map_write_status(attempt, worker, status)),
+/// Builds a terminal missing-payload request. Worker already rejects this
+/// shape through its owned failure path, which aborts staging without Ready.
+fn write_block_failure_cleanup_request() -> beryl_proto::worker::WriteBlockRequestProto {
+    beryl_proto::worker::WriteBlockRequestProto { payload: None }
+}
+
+/// Waits for the sole terminal response condition after the staging Ack.
+/// Normal EOF means Worker Ready; every other outcome leaves publication
+/// unproven and is returned to the owning `FileWriter`.
+async fn wait_for_write_completion(
+    channel_pool: Arc<GrpcWorkerChannelPool>,
+    attempt: AttemptContext,
+    worker: beryl_types::WorkerEndpointInfo,
+    mut responses: tonic::Streaming<beryl_proto::worker::WriteBlockResponseProto>,
+    lease: Arc<BlockWriteLease>,
+    cancellation: watch::Sender<bool>,
+) -> ClientResult<()> {
+    let mut lease_updates = lease.subscribe();
+    loop {
+        if lease.expire_if_due() {
+            cancellation.send_replace(true);
+            return Err(ClientError::UnknownOutcome(
+                "worker WriteBlock was cancelled after the write lease expired".to_string(),
+            ));
+        }
+        let expires_at_ms = lease.expires_at_ms();
+        let lease_expiry = tokio::time::sleep(duration_until_unix_ms(expires_at_ms));
+        tokio::pin!(lease_expiry);
+        tokio::select! {
+            biased;
+            changed = lease_updates.changed() => {
+                if changed.is_err() {
+                    return Err(ClientError::UnknownOutcome(
+                        "worker WriteBlock lost its lease owner before completion".to_string(),
+                    ));
+                }
+            }
+            _ = &mut lease_expiry => {
+                if !lease.expire_if_due() {
+                    continue;
+                }
+                cancellation.send_replace(true);
+                return Err(ClientError::UnknownOutcome(
+                    "worker WriteBlock was cancelled after the write lease expired".to_string(),
+                ));
+            }
+            response = responses.message() => {
+                return match response {
+                    Ok(None) => Ok(()),
+                    Ok(Some(_)) => Err(ClientError::UnknownOutcome(
+                        "worker WriteBlock returned more than one acknowledgement".to_string(),
+                    )),
+                    Err(status) => Err(GrpcWorkerDataClient::map_write_status(
+                        channel_pool.as_ref(),
+                        &attempt,
+                        &worker,
+                        status,
+                    )),
+                };
+            }
         }
     }
 }
@@ -238,18 +415,19 @@ impl WorkerDataClient for GrpcWorkerDataClient {
         }))
     }
 
-    async fn write_block(&self, attempt: AttemptContext, target: WorkerWriteTarget, data: Bytes) -> ClientResult<()> {
-        if data.is_empty() {
-            return Err(ClientError::InvalidArgument(
-                "WriteBlock requires at least one data byte".to_string(),
-            ));
-        }
+    async fn open_write_block(
+        &self,
+        attempt: AttemptContext,
+        target: WorkerWriteTarget,
+        lease_expires_at_ms: u64,
+    ) -> ClientResult<BlockWrite> {
         let worker = self
             .worker_candidates(&target.target.worker_endpoints)
             .into_iter()
             .next()
             .ok_or_else(|| ClientError::Worker("worker write has no candidates".to_string()))?;
-        self.write_one_block(&attempt, &target, worker, data).await
+        self.open_one_block(&attempt, &target, worker, lease_expires_at_ms)
+            .await
     }
 }
 
@@ -312,16 +490,16 @@ impl WorkerDataPlane {
         Ok(output.freeze())
     }
 
-    /// Writes one complete metadata-authorized block through one worker RPC.
-    pub(crate) async fn write_block(
+    /// Opens one metadata-authorized block RPC and waits for its staging Ack.
+    pub(crate) async fn open_write_block(
         &self,
         attempt: AttemptContext,
         group_name: GroupName,
         target: WriteTarget,
-        data: Bytes,
-    ) -> ClientResult<()> {
+        lease_expires_at_ms: u64,
+    ) -> ClientResult<BlockWrite> {
         self.client
-            .write_block(attempt, WorkerWriteTarget { group_name, target }, data)
+            .open_write_block(attempt, WorkerWriteTarget { group_name, target }, lease_expires_at_ms)
             .await
     }
 }
@@ -343,6 +521,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use beryl_common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind};
     use beryl_common::header::{HEADER_WORKER_DATA_ERROR_DETAIL, WORKER_DATA_ERROR_DETAIL_V1};
@@ -376,11 +555,15 @@ mod tests {
     enum WriteBehavior {
         Success,
         AckThenUnavailable,
+        DelayedAck,
     }
 
     struct MockWorkerState {
         read_calls: AtomicUsize,
         write_calls: AtomicUsize,
+        write_data_frames: AtomicUsize,
+        write_eofs: AtomicUsize,
+        write_cancellations: AtomicUsize,
         read_failure: ReadFailure,
         write_behavior: WriteBehavior,
     }
@@ -390,6 +573,9 @@ mod tests {
             Self {
                 read_calls: AtomicUsize::new(0),
                 write_calls: AtomicUsize::new(0),
+                write_data_frames: AtomicUsize::new(0),
+                write_eofs: AtomicUsize::new(0),
+                write_cancellations: AtomicUsize::new(0),
                 read_failure,
                 write_behavior,
             }
@@ -448,14 +634,59 @@ mod tests {
             ) {
                 return Err(Status::invalid_argument("first payload must be command"));
             }
-            let responses: Vec<Result<WriteBlockResponseProto, Status>> = match self.state.write_behavior {
-                WriteBehavior::Success => vec![Ok(WriteBlockResponseProto {})],
-                WriteBehavior::AckThenUnavailable => vec![
-                    Ok(WriteBlockResponseProto {}),
-                    Err(Status::unavailable("write transport unavailable after ack")),
-                ],
-            };
-            Ok(Response::new(Box::pin(futures::stream::iter(responses))))
+            let (responses, response_stream) = tokio::sync::mpsc::channel(2);
+            if matches!(self.state.write_behavior, WriteBehavior::DelayedAck) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            responses
+                .send(Ok(WriteBlockResponseProto {}))
+                .await
+                .expect("response receiver is open");
+            match self.state.write_behavior {
+                WriteBehavior::Success | WriteBehavior::DelayedAck => {
+                    let state = Arc::clone(&self.state);
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = responses.closed() => {
+                                    state.write_cancellations.fetch_add(1, Ordering::SeqCst);
+                                    break;
+                                }
+                                request = requests.message() => match request {
+                                    Ok(Some(request)) => match request.payload {
+                                        Some(beryl_proto::worker::write_block_request_proto::Payload::Data(_)) => {
+                                            state.write_data_frames.fetch_add(1, Ordering::SeqCst);
+                                        }
+                                        _ => {
+                                            state.write_cancellations.fetch_add(1, Ordering::SeqCst);
+                                            break;
+                                        }
+                                    },
+                                    Ok(None) => {
+                                        state.write_eofs.fetch_add(1, Ordering::SeqCst);
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        state.write_cancellations.fetch_add(1, Ordering::SeqCst);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        drop(responses);
+                    });
+                }
+                WriteBehavior::AckThenUnavailable => {
+                    responses
+                        .send(Err(Status::unavailable("write transport unavailable after ack")))
+                        .await
+                        .expect("response receiver is open");
+                }
+            }
+            Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
+                response_stream,
+            ))))
         }
     }
 
@@ -486,7 +717,7 @@ mod tests {
 
     fn grpc_client() -> GrpcWorkerDataClient {
         GrpcWorkerDataClient {
-            channel_pool: GrpcWorkerChannelPool::new(true, 8, Arc::new(NoopClientMetrics)),
+            channel_pool: Arc::new(GrpcWorkerChannelPool::new(true, 8, Arc::new(NoopClientMetrics))),
         }
     }
 
@@ -517,6 +748,28 @@ mod tests {
         )
         .expect("operation context");
         AttemptContext::for_data(&operation, 0)
+    }
+
+    fn lease_expiry_after(delay_ms: u64) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_millis() as u64
+            + delay_ms
+    }
+
+    fn lease_expiry() -> u64 {
+        lease_expiry_after(60_000)
+    }
+
+    async fn wait_for_count(counter: &AtomicUsize, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while counter.load(Ordering::SeqCst) < expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("mock Worker observed expected stream event");
     }
 
     fn planned_read(workers: Vec<WorkerEndpointInfo>) -> PlannedBlockRead {
@@ -648,19 +901,160 @@ mod tests {
         let (first, first_shutdown) = start_mock_worker(Arc::clone(&first_state), 1).await;
         let (second, second_shutdown) = start_mock_worker(Arc::clone(&second_state), 2).await;
 
-        let error = grpc_client()
-            .write_block(
-                attempt("WriteBlock"),
-                write_target(vec![first, second]),
-                Bytes::from_static(b"data"),
-            )
+        let mut block = grpc_client()
+            .open_write_block(attempt("WriteBlock"), write_target(vec![first, second]), lease_expiry())
             .await
-            .expect_err("transport loss after ack has unknown outcome");
+            .expect("staging acknowledgement");
+        let error = match block.write(Bytes::from_static(b"data")).await {
+            Ok(()) => block
+                .finish()
+                .await
+                .expect_err("transport loss after ack has unknown outcome"),
+            Err(error) => error,
+        };
 
         assert!(matches!(error, ClientError::UnknownOutcome(message) if message.contains("WriteBlock")));
         assert_eq!(first_state.write_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second_state.write_calls.load(Ordering::SeqCst), 0);
         let _ = first_shutdown.send(());
         let _ = second_shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn write_ack_cannot_cross_lease_expiry() {
+        let state = Arc::new(MockWorkerState::new(ReadFailure::None, WriteBehavior::DelayedAck));
+        let (worker, shutdown) = start_mock_worker(Arc::clone(&state), 1).await;
+
+        let error = match grpc_client()
+            .open_write_block(
+                attempt("WriteBlock"),
+                write_target(vec![worker]),
+                lease_expiry_after(10),
+            )
+            .await
+        {
+            Ok(_) => panic!("delayed acknowledgement cannot outlive the lease"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ClientError::UnknownOutcome(message) if message.contains("lease expired")));
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        wait_for_count(&state.write_cancellations, 1).await;
+        assert_eq!(state.write_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.write_data_frames.load(Ordering::SeqCst), 0);
+        assert_eq!(state.write_eofs.load(Ordering::SeqCst), 0);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn lease_renewal_ordering_extends_live_rpc_without_reviving_expired_rpc() {
+        let state = Arc::new(MockWorkerState::new(ReadFailure::None, WriteBehavior::Success));
+        let (worker, shutdown) = start_mock_worker(Arc::clone(&state), 1).await;
+        let client = grpc_client();
+        let mut block = client
+            .open_write_block(
+                attempt("WriteBlock"),
+                write_target(vec![worker.clone()]),
+                lease_expiry_after(200),
+            )
+            .await
+            .expect("staging acknowledgement");
+
+        block.write(Bytes::from_static(b"a")).await.expect("first frame");
+        block
+            .update_lease_expiry(lease_expiry_after(1_000))
+            .expect("renew before old expiry");
+        // Keep the current-thread runtime from polling the completion task until
+        // both the old timer and the queued renewal are ready.
+        std::thread::sleep(Duration::from_millis(250));
+        block
+            .write(Bytes::from_static(b"b"))
+            .await
+            .expect("frame after renewal");
+        block.finish().await.expect("finish renewed block");
+        wait_for_count(&state.write_eofs, 1).await;
+        assert_eq!(state.write_data_frames.load(Ordering::SeqCst), 2);
+
+        let mut expired = client
+            .open_write_block(
+                attempt("WriteBlock"),
+                write_target(vec![worker]),
+                lease_expiry_after(30),
+            )
+            .await
+            .expect("open block before its lease expires");
+        expired.write(Bytes::from_static(b"c")).await.expect("partial frame");
+        std::thread::sleep(Duration::from_millis(50));
+        let error = expired
+            .update_lease_expiry(lease_expiry_after(1_000))
+            .expect_err("renewal observed after old expiry cannot revive the RPC");
+        assert!(matches!(error, ClientError::UnknownOutcome(message) if message.contains("lease expired")));
+        assert!(expired.cancel(Duration::from_secs(1)).await);
+        wait_for_count(&state.write_cancellations, 1).await;
+
+        assert_eq!(state.write_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.write_eofs.load(Ordering::SeqCst), 1);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn cancel_drop_and_lease_expiry_never_look_like_normal_finish() {
+        let state = Arc::new(MockWorkerState::new(ReadFailure::None, WriteBehavior::Success));
+        let (worker, shutdown) = start_mock_worker(Arc::clone(&state), 1).await;
+        let client = grpc_client();
+
+        let mut cancelled = client
+            .open_write_block(
+                attempt("WriteBlock"),
+                write_target(vec![worker.clone()]),
+                lease_expiry(),
+            )
+            .await
+            .expect("open explicitly cancelled block");
+        cancelled.write(Bytes::from_static(b"a")).await.expect("partial frame");
+        assert!(cancelled.cancel(Duration::from_secs(1)).await);
+        wait_for_count(&state.write_cancellations, 1).await;
+        assert_eq!(state.write_eofs.load(Ordering::SeqCst), 0);
+
+        let mut dropped = client
+            .open_write_block(
+                attempt("WriteBlock"),
+                write_target(vec![worker.clone()]),
+                lease_expiry(),
+            )
+            .await
+            .expect("open dropped block");
+        dropped.write(Bytes::from_static(b"b")).await.expect("partial frame");
+        drop(dropped);
+        wait_for_count(&state.write_cancellations, 2).await;
+        assert_eq!(state.write_eofs.load(Ordering::SeqCst), 0);
+
+        let mut expired = client
+            .open_write_block(
+                attempt("WriteBlock"),
+                write_target(vec![worker.clone()]),
+                lease_expiry_after(30),
+            )
+            .await
+            .expect("open lease-expired block");
+        expired.write(Bytes::from_static(b"c")).await.expect("partial frame");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let error = expired
+            .finish()
+            .await
+            .expect_err("expired block cannot finish normally");
+        assert!(matches!(error, ClientError::UnknownOutcome(message) if message.contains("lease expired")));
+        wait_for_count(&state.write_cancellations, 3).await;
+        assert_eq!(state.write_eofs.load(Ordering::SeqCst), 0);
+
+        let mut finished = client
+            .open_write_block(attempt("WriteBlock"), write_target(vec![worker]), lease_expiry())
+            .await
+            .expect("open normally finished block");
+        finished.write(Bytes::from_static(b"d")).await.expect("final frame");
+        finished.finish().await.expect("normal finish");
+        wait_for_count(&state.write_eofs, 1).await;
+        assert_eq!(state.write_cancellations.load(Ordering::SeqCst), 3);
+        let _ = shutdown.send(());
     }
 }
