@@ -225,7 +225,10 @@ mod tests {
     use super::super::options::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_REPLICATION};
     use super::*;
     use crate::config::{ClientConfig, MetadataGroupConfig};
-    use crate::data::{WorkerDataClient, WorkerDataPlane, WorkerReadResult, WorkerWriteTarget};
+    use crate::data::{
+        BlockWrite, BlockWriteInput, BlockWriteLease, WorkerDataClient, WorkerDataPlane, WorkerReadResult,
+        WorkerWriteTarget,
+    };
     use crate::error::{ClientError, ClientResult};
     use crate::metadata::{AddBlockResult, MetadataGateway, ReadLayout};
     use crate::planner::PlannedBlockRead;
@@ -242,6 +245,7 @@ mod tests {
         DeleteResponseProto, GetStatusResponseProto, ListStatusResponseProto, OpenFileResponseProto,
         OpenWriteResponseProto, RenameResponseProto, RenewLeaseResponseProto, SyncWriteResponseProto, WriteHandleProto,
     };
+    use beryl_proto::worker::write_block_request_proto::Payload;
     use beryl_types::lease::FencingToken;
     use beryl_types::{
         BlockId, BlockIndex, ClientId, FileBlockLocation, GroupName, InodeId, WorkerEndpointInfo, WorkerId,
@@ -251,7 +255,8 @@ mod tests {
     use futures::TryStreamExt;
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio::sync::{mpsc, watch};
 
     type EventLog = Arc<Mutex<Vec<&'static str>>>;
 
@@ -1043,7 +1048,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_multiple_small_writes_coalesce_until_close_flushes_pending_bytes() {
+    async fn writer_small_writes_share_block_rpc_and_cross_block_boundaries() {
         let layout = recorded_layout_values(8, 4);
         let gateway = Arc::new(MockGateway::with_create_response_layout(Some(layout)));
         let worker = Arc::new(MockDataClient::default());
@@ -1054,50 +1059,30 @@ mod tests {
             .await
             .expect("writer");
 
-        writer.write_all(Bytes::from_static(b"hel")).await.expect("first write");
-        writer.write_all(Bytes::from_static(b"lo")).await.expect("second write");
+        let payload = Bytes::from_static(b"abcdefghijklmnopqrst");
+        writer.write_all(payload.slice(0..3)).await.expect("first small write");
+        writer.write_all(payload.slice(3..5)).await.expect("second small write");
 
         assert_eq!(writer.cursor(), 5);
-        assert_eq!(add_block_count(&gateway.calls()), 0);
+        assert_eq!(add_block_count(&gateway.calls()), 1);
         assert_eq!(worker.write_lens(), Vec::<u64>::new());
 
-        writer.close().await.expect("close");
-
-        assert_eq!(writer.cursor(), 5);
-        assert_eq!(worker.written_bytes(), Bytes::from_static(b"hello"));
-        let commit = gateway
-            .calls()
-            .into_iter()
-            .find(|call| call.method == "commit_file")
-            .expect("commit_file call");
-        assert_eq!(commit.final_size, Some(5));
-        assert_eq!(commit.committed_block_offsets, vec![0]);
-        assert_eq!(commit.committed_block_lens, vec![5]);
-    }
-
-    #[tokio::test]
-    async fn writer_write_crossing_block_boundary_emits_full_blocks_and_buffers_tail() {
-        let layout = recorded_layout_values(8, 4);
-        let gateway = Arc::new(MockGateway::with_create_response_layout(Some(layout)));
-        let worker = Arc::new(MockDataClient::default());
-        let client = fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone()))
-            .expect("client");
-        let mut writer = client
-            .create("/created", CreateOptions::create())
-            .await
-            .expect("writer");
-
         writer
-            .write_all(Bytes::from(vec![b'x'; 20]))
+            .write_all(payload.slice(5..13))
             .await
-            .expect("write should flush only complete blocks");
+            .expect("write across first block");
+        writer
+            .write_all(payload.slice(13..))
+            .await
+            .expect("write across second block");
 
         assert_eq!(writer.cursor(), 20);
-        assert_eq!(add_block_count(&gateway.calls()), 2);
+        assert_eq!(add_block_count(&gateway.calls()), 3);
         assert_eq!(worker.write_lens(), vec![8, 8]);
 
         writer.close().await.expect("close");
 
+        assert_eq!(worker.written_bytes(), payload);
         let calls = gateway.calls();
         assert_eq!(add_block_count(&calls), 3);
         let commit = calls
@@ -1123,7 +1108,7 @@ mod tests {
 
             writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
 
-            assert_eq!(add_block_count(&gateway.calls()), 0);
+            assert_eq!(add_block_count(&gateway.calls()), 1);
             assert_eq!(worker.write_lens(), Vec::<u64>::new());
 
             if durable {
@@ -1275,7 +1260,94 @@ mod tests {
 
         writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
 
-        assert_eq!(methods(&gateway.calls()), vec!["renew_lease"]);
+        assert_eq!(methods(&gateway.calls()), vec!["renew_lease", "add_block"]);
+    }
+
+    #[tokio::test]
+    async fn writer_lease_expiry_while_send_is_blocked_cancels_and_invalidates_session() {
+        let events = event_log();
+        let gateway = Arc::new(MockGateway::default());
+        let worker = Arc::new(MockDataClient {
+            write_outcomes: Mutex::new(vec![WorkerWriteOutcome::HoldRequests].into()),
+            events: Some(events.clone()),
+            ..MockDataClient::default()
+        });
+        let mut config = test_config("root");
+        config.write_lease.auto_renew = false;
+        let client = fs_client_with_data_plane(config, gateway.clone(), data_plane(worker)).expect("client");
+        let handle = write_handle_for_tests("/created", 0, unix_now_ms() + 1_200).expect("write handle");
+        let mut writer = FileWriter::new(Arc::clone(&client.runtime), handle);
+
+        let error = writer
+            .write_all(Bytes::from(vec![b'x'; beryl_proto::DEFAULT_WORKER_DATA_FRAME_SIZE + 1]))
+            .await
+            .expect_err("lease expiry must interrupt a blocked frame send");
+
+        assert!(
+            matches!(&error, ClientError::UnknownOutcome(message) if message.contains("lease expired")),
+            "unexpected error: {error:?}"
+        );
+        assert_event_order(&events, "write_block", "cancel_write_block");
+        let error = writer
+            .write_all(Bytes::from_static(b"!"))
+            .await
+            .expect_err("expired in-flight write blocks later writes");
+        assert!(matches!(error, ClientError::StaleHandle { reason } if reason.contains("unknown outcome")));
+        assert_eq!(add_block_count(&gateway.calls()), 1);
+    }
+
+    #[tokio::test]
+    async fn writer_cancellation_wait_uses_the_current_write_and_abort_deadline() {
+        let write_events = event_log();
+        let write_gateway = Arc::new(MockGateway::default());
+        let write_worker = Arc::new(MockDataClient {
+            write_outcomes: Mutex::new(vec![WorkerWriteOutcome::HoldCancellation].into()),
+            events: Some(write_events.clone()),
+            ..MockDataClient::default()
+        });
+        let mut write_config = test_config("root");
+        write_config.retry.operation_timeout_ms = 50;
+        write_config.write_lease.auto_renew = false;
+        let write_client = fs_client_with_data_plane(write_config, write_gateway.clone(), data_plane(write_worker))
+            .expect("write client");
+        let write_handle = write_handle_for_tests("/write", 0, unix_now_ms() + 5_000).expect("write handle");
+        let mut writer = FileWriter::new(Arc::clone(&write_client.runtime), write_handle);
+
+        let write_error = tokio::time::timeout(
+            Duration::from_millis(250),
+            writer.write_all(Bytes::from(vec![b'x'; beryl_proto::DEFAULT_WORKER_DATA_FRAME_SIZE + 1])),
+        )
+        .await
+        .expect("write cancellation stays within the outer bound")
+        .expect_err("blocked write reaches its public deadline");
+        assert!(write_error.to_string().contains("deadline"));
+
+        let abort_events = event_log();
+        let abort_gateway = Arc::new(MockGateway::default());
+        let abort_worker = Arc::new(MockDataClient {
+            write_outcomes: Mutex::new(vec![WorkerWriteOutcome::HoldCancellation].into()),
+            events: Some(abort_events.clone()),
+            ..MockDataClient::default()
+        });
+        let mut abort_config = test_config("root");
+        abort_config.retry.operation_timeout_ms = 50;
+        abort_config.write_lease.auto_renew = false;
+        let abort_client = fs_client_with_data_plane(abort_config, abort_gateway.clone(), data_plane(abort_worker))
+            .expect("abort client");
+        let abort_handle = write_handle_for_tests("/abort", 0, unix_now_ms() + 5_000).expect("abort handle");
+        let mut abort_writer = FileWriter::new(Arc::clone(&abort_client.runtime), abort_handle);
+        abort_writer
+            .write_all(Bytes::from_static(b"x"))
+            .await
+            .expect("partial block write");
+
+        let abort_error = tokio::time::timeout(Duration::from_millis(250), abort_writer.abort())
+            .await
+            .expect("abort cancellation stays within the outer bound")
+            .expect_err("blackholed cancellation reaches the abort deadline");
+        assert!(abort_error.to_string().contains("deadline"));
+        assert_event_order(&abort_events, "write_block", "cancel_write_block");
+        assert_eq!(method_count(&abort_gateway.calls(), "abort_file_write"), 0);
     }
 
     #[tokio::test]
@@ -1320,7 +1392,7 @@ mod tests {
     #[tokio::test]
     async fn writer_abort_uses_metadata_authority_and_blocks_session() {
         let events = event_log();
-        let layout = recorded_layout_values(5, 5);
+        let layout = recorded_layout_values(8, 4);
         let gateway = Arc::new(MockGateway {
             create_response_layout: Mutex::new(Some(Some(layout))),
             events: Some(events.clone()),
@@ -1339,6 +1411,7 @@ mod tests {
 
         assert_eq!(method_count(&gateway.calls(), "abort_file_write"), 1);
         assert_event_order(&events, "write_block", "abort_file_write");
+        assert_event_order(&events, "cancel_write_block", "abort_file_write");
         let err = writer
             .write_all(Bytes::from_static(b"!"))
             .await
@@ -2243,6 +2316,8 @@ mod tests {
     enum WorkerWriteOutcome {
         Ok,
         WorkerError,
+        HoldRequests,
+        HoldCancellation,
     }
 
     #[derive(Debug)]
@@ -2250,8 +2325,8 @@ mod tests {
         file: Bytes,
         refresh_once: Mutex<Option<ErrorKind>>,
         calls: Mutex<usize>,
-        written: Mutex<Vec<u8>>,
-        written_lens: Mutex<Vec<u64>>,
+        written: Arc<Mutex<Vec<u8>>>,
+        written_lens: Arc<Mutex<Vec<u64>>>,
         write_outcomes: Mutex<VecDeque<WorkerWriteOutcome>>,
         record_written_body: bool,
         events: Option<EventLog>,
@@ -2263,8 +2338,8 @@ mod tests {
                 file: Bytes::from_static(file),
                 refresh_once: Mutex::new(None),
                 calls: Mutex::new(0),
-                written: Mutex::new(Vec::new()),
-                written_lens: Mutex::new(Vec::new()),
+                written: Arc::new(Mutex::new(Vec::new())),
+                written_lens: Arc::new(Mutex::new(Vec::new())),
                 write_outcomes: Mutex::new(VecDeque::new()),
                 record_written_body: true,
                 events: None,
@@ -2343,16 +2418,75 @@ mod tests {
             })
         }
 
-        async fn write_block(&self, _ctx: AttemptContext, _target: WorkerWriteTarget, data: Bytes) -> ClientResult<()> {
+        async fn open_write_block(
+            &self,
+            _ctx: AttemptContext,
+            target: WorkerWriteTarget,
+            lease_expires_at_ms: u64,
+        ) -> ClientResult<BlockWrite> {
             self.record_event("write_block");
-            if matches!(self.next_write_outcome(), WorkerWriteOutcome::WorkerError) {
-                return Err(ClientError::Worker("injected WriteBlock failure".to_string()));
-            }
-            self.written_lens.lock().expect("written lens").push(data.len() as u64);
-            if self.record_written_body {
-                self.written.lock().expect("written").extend_from_slice(&data);
-            }
-            Ok(())
+            let outcome = self.next_write_outcome();
+            let written = Arc::clone(&self.written);
+            let written_lens = Arc::clone(&self.written_lens);
+            let record_written_body = self.record_written_body;
+            let events = self.events.clone();
+            let (requests, mut request_stream) = mpsc::channel::<BlockWriteInput>(1);
+            let (transport_cancellation, mut cancellation_signal) = watch::channel(false);
+            let lease = Arc::new(BlockWriteLease::new(lease_expires_at_ms));
+            let completion = tokio::spawn(async move {
+                if matches!(
+                    outcome,
+                    WorkerWriteOutcome::HoldRequests | WorkerWriteOutcome::HoldCancellation
+                ) {
+                    let _ = cancellation_signal.changed().await;
+                    if let Some(events) = &events {
+                        events.lock().expect("events").push("cancel_write_block");
+                    }
+                    if matches!(outcome, WorkerWriteOutcome::HoldCancellation) {
+                        std::future::pending::<()>().await;
+                    }
+                    return Err(ClientError::Worker("mock WriteBlock cancelled".to_string()));
+                }
+                let mut body = Vec::new();
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation_signal.changed() => {
+                            if let Some(events) = &events {
+                                events.lock().expect("events").push("cancel_write_block");
+                            }
+                            return Err(ClientError::Worker("mock WriteBlock cancelled".to_string()));
+                        }
+                        request = request_stream.recv() => match request {
+                            Some(BlockWriteInput::Data(request)) => match request.payload {
+                                Some(Payload::Data(data)) => body.extend_from_slice(&data),
+                                _ => {
+                                    return Err(ClientError::Worker(
+                                        "mock WriteBlock received a non-data frame after acknowledgement".to_string(),
+                                    ));
+                                }
+                            }
+                            Some(BlockWriteInput::Finish) => break,
+                            None => std::future::pending::<()>().await,
+                        }
+                    }
+                }
+                if matches!(outcome, WorkerWriteOutcome::WorkerError) {
+                    return Err(ClientError::Worker("injected WriteBlock failure".to_string()));
+                }
+                written_lens.lock().expect("written lens").push(body.len() as u64);
+                if record_written_body {
+                    written.lock().expect("written").extend_from_slice(&body);
+                }
+                Ok(())
+            });
+            Ok(BlockWrite::new(
+                target.target,
+                requests,
+                transport_cancellation,
+                lease,
+                completion,
+            ))
         }
     }
 

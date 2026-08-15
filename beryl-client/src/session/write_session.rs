@@ -7,7 +7,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use beryl_proto::metadata::{OpenWriteModeProto, WriteHandleProto};
 use beryl_types::{BlockShape, CallId, ClientId, CommittedBlock, FileLayout, InodeId, WriteTarget};
-use bytes::{Bytes, BytesMut};
 
 use crate::error::{ClientError, ClientResult};
 use crate::runtime::context::{OperationContext, OperationDeadline};
@@ -26,7 +25,6 @@ pub(crate) struct WriteSession {
     base_size: u64,
     cursor: u64,
     flush_cursor: u64,
-    buffered: BytesMut,
     expires_at_ms: Option<u64>,
     ready_blocks: Vec<ReadyBlock>,
     state: WriteSessionState,
@@ -64,7 +62,6 @@ impl WriteSession {
             base_size,
             cursor: base_size,
             flush_cursor: base_size,
-            buffered: BytesMut::new(),
             expires_at_ms: Some(expires_at_ms),
             ready_blocks: Vec::new(),
             state: WriteSessionState::Open,
@@ -83,53 +80,14 @@ impl WriteSession {
         self.cursor
     }
 
-    /// Number of locally buffered bytes not yet assigned to a worker block.
-    pub(crate) fn buffered_len(&self) -> usize {
-        self.buffered.len()
-    }
-
-    /// Metadata-confirmed block size as a usize for local buffering decisions.
-    pub(crate) fn block_size_usize(&self) -> usize {
-        self.layout.block_size as usize
-    }
-
-    /// Accept bytes into the SDK-visible write cursor.
+    /// Advances the SDK-visible cursor after the current Worker request stream
+    /// accepts ownership of bytes.
     pub(crate) fn advance_cursor(&mut self, len: usize) -> ClientResult<()> {
         self.cursor = self
             .cursor
             .checked_add(len as u64)
             .ok_or_else(|| ClientError::InvalidArgument("write cursor overflow".to_string()))?;
         Ok(())
-    }
-
-    /// Append bytes to the current local block buffer.
-    pub(crate) fn buffer_bytes(&mut self, data: &[u8]) -> ClientResult<()> {
-        self.advance_cursor(data.len())?;
-        self.buffered.extend_from_slice(data);
-        Ok(())
-    }
-
-    /// Take a full buffered block when the metadata-confirmed boundary is reached.
-    pub(crate) fn take_full_buffered_block(&mut self) -> Option<Bytes> {
-        let block_size = self.block_size_usize();
-        if self.buffered.len() < block_size {
-            return None;
-        }
-        Some(self.buffered.split_to(block_size).freeze())
-    }
-
-    /// Take any remaining buffered tail for a barrier or close.
-    pub(crate) fn take_buffered_tail(&mut self) -> Option<Bytes> {
-        if self.buffered.is_empty() {
-            return None;
-        }
-        let len = self.buffered.len();
-        Some(self.buffered.split_to(len).freeze())
-    }
-
-    /// Discard local bytes that never reached metadata or a worker.
-    pub(crate) fn discard_buffered_bytes(&mut self) {
-        self.buffered.clear();
     }
 
     /// Metadata write handle.
@@ -143,18 +101,12 @@ impl WriteSession {
     }
 
     /// Validate a metadata write target before opening the worker stream.
-    pub(crate) fn validate_target(&mut self, target: &WriteTarget, expected_len: u64) -> ClientResult<()> {
+    pub(crate) fn validate_target(&mut self, target: &WriteTarget) -> ClientResult<()> {
         self.ensure_open_for_write()?;
         if target.file_offset != self.flush_cursor {
             return Err(ClientError::InvalidLayout(format!(
                 "write target file_offset mismatch: expected {}, got {}",
                 self.flush_cursor, target.file_offset
-            )));
-        }
-        if expected_len == 0 || expected_len > target.block_size {
-            return Err(ClientError::InvalidLayout(format!(
-                "write length must be in 1..={}: got {}",
-                target.block_size, expected_len
             )));
         }
         BlockShape::new(
@@ -414,6 +366,12 @@ impl WriteSession {
     /// Record the latest metadata lease expiration returned by RenewLease.
     pub(crate) fn update_expires_at_ms(&mut self, expires_at_ms: u64) {
         self.expires_at_ms = Some(expires_at_ms);
+    }
+
+    /// Current Metadata lease expiry used to bound an open Worker block RPC.
+    pub(crate) fn expires_at_ms(&self) -> ClientResult<u64> {
+        self.expires_at_ms
+            .ok_or_else(|| ClientError::InvalidArgument("write session expiry is missing".to_string()))
     }
 
     /// Return whether the open session should renew before another side-effecting operation.

@@ -12,6 +12,7 @@ use beryl_types::InodeId;
 use bytes::{Bytes, BytesMut};
 use tokio::sync::Mutex;
 
+use crate::data::BlockWrite;
 use crate::error::{invalid_response, ClientError, ClientResult};
 use crate::metrics::ClientMetric;
 use crate::planner;
@@ -205,11 +206,17 @@ pub struct FileWriter {
     /// Shared runtime used to publish metadata barriers and access workers.
     runtime: Arc<ClientRuntime>,
     handle: WriteHandle,
+    /// The sole acknowledged Worker RPC for the block at the current cursor.
+    block_write: Option<BlockWrite>,
 }
 
 impl FileWriter {
     pub(crate) fn new(runtime: Arc<ClientRuntime>, handle: WriteHandle) -> Self {
-        Self { runtime, handle }
+        Self {
+            runtime,
+            handle,
+            block_write: None,
+        }
     }
 
     /// Returns the namespace path associated with this write session.
@@ -227,15 +234,42 @@ impl FileWriter {
         let deadline = self.runtime.executor.operation_deadline();
         let session_ref = self.handle.write_session();
         let mut session = session_ref.lock().await;
+        if let Some(block) = self.block_write.as_mut() {
+            if let Err(error) = self.runtime.check_block_write(&mut session, block, &deadline).await {
+                let _ = self.cancel_block_write(&deadline).await;
+                return Err(error);
+            }
+        }
         self.renew_lease_if_needed(&mut session, deadline.clone()).await?;
         session.ensure_open_for_write()?;
         if data.is_empty() {
             return Ok(());
         }
 
-        let blocks = buffer_write(&mut session, data)?;
-        for block in blocks {
-            self.runtime.write_block(&mut session, block, deadline.clone()).await?;
+        let mut offset = 0usize;
+        while offset < data.len() {
+            if self.block_write.is_none() {
+                self.block_write = Some(self.runtime.open_block_write(&mut session, deadline.clone()).await?);
+            }
+            let block = self.block_write.as_mut().expect("block write was just opened");
+            let remaining = usize::try_from(block.remaining()).unwrap_or(usize::MAX);
+            let frame_len = (data.len() - offset)
+                .min(remaining)
+                .min(beryl_proto::DEFAULT_WORKER_DATA_FRAME_SIZE);
+            let frame = Bytes::copy_from_slice(&data[offset..offset + frame_len]);
+            if let Err(error) = self
+                .runtime
+                .write_block_frame(&mut session, block, frame, &deadline)
+                .await
+            {
+                let _ = self.cancel_block_write(&deadline).await;
+                return Err(error);
+            }
+            offset += frame_len;
+            if self.block_write.as_ref().is_some_and(|block| block.remaining() == 0) {
+                let block = self.block_write.take().expect("full block write is present");
+                self.runtime.finish_block_write(&mut session, block, &deadline).await?;
+            }
         }
         self.handle.store_write_cursor(session.cursor());
         Ok(())
@@ -259,7 +293,11 @@ impl FileWriter {
         self.renew_lease_locked(&mut session, deadline).await
     }
 
-    async fn renew_lease_if_needed(&self, session: &mut WriteSession, deadline: OperationDeadline) -> ClientResult<()> {
+    async fn renew_lease_if_needed(
+        &mut self,
+        session: &mut WriteSession,
+        deadline: OperationDeadline,
+    ) -> ClientResult<()> {
         let config = &self.runtime.config.write_lease;
         if !config.auto_renew || !session.should_renew_lease(config.renew_before_expiry_ms)? {
             return Ok(());
@@ -267,7 +305,11 @@ impl FileWriter {
         self.renew_lease_locked(session, deadline).await
     }
 
-    async fn renew_lease_locked(&self, session: &mut WriteSession, deadline: OperationDeadline) -> ClientResult<()> {
+    async fn renew_lease_locked(
+        &mut self,
+        session: &mut WriteSession,
+        deadline: OperationDeadline,
+    ) -> ClientResult<()> {
         session.ensure_open_for_renew()?;
         let path = session.path().to_string();
         let write_handle = session.write_handle();
@@ -278,11 +320,20 @@ impl FileWriter {
         match self.runtime.executor.renew_lease(&path, write_handle, deadline).await {
             Ok(response) => {
                 let expires_at_ms = valid_write_session_expiry("RenewLease", response.expires_at_ms)?;
+                let block_lease_update = self
+                    .block_write
+                    .as_ref()
+                    .map(|block| block.update_lease_expiry(expires_at_ms))
+                    .transpose();
                 session.update_expires_at_ms(expires_at_ms);
                 self.runtime.record_metric(
                     ClientMetric::LeaseRenewSuccess,
                     metric_labels("RenewLease", "metadata").with_outcome("success"),
                 );
+                if let Err(error) = block_lease_update {
+                    session.mark_unknown_outcome();
+                    return Err(error);
+                }
                 Ok(())
             }
             Err(err) => {
@@ -308,7 +359,7 @@ impl FileWriter {
         self.renew_lease_if_needed(&mut session, deadline.clone()).await?;
         session.ensure_open_for_close()?;
         let path = session.path().to_string();
-        self.flush_pending_bytes(&mut session, deadline.clone()).await?;
+        self.finish_pending_block(&mut session, &deadline).await?;
         let final_size = session.cursor();
         let committed_blocks = self.runtime.committed_blocks_for_barrier(&session);
 
@@ -354,14 +405,15 @@ impl FileWriter {
 
     /// Aborts this writer's open write session and reports cleanup failures.
     pub async fn abort(&mut self) -> ClientResult<()> {
+        let deadline = self.runtime.executor.operation_deadline();
         let session_ref = self.handle.write_session();
         let mut session = session_ref.lock().await;
         session.ensure_open_for_abort()?;
-        session.discard_buffered_bytes();
+        self.cancel_block_write(&deadline).await?;
         let plan = session.prepare_abort_cleanup(
             self.runtime.executor.client_id(),
             self.runtime.executor.client_name(),
-            self.runtime.executor.operation_deadline(),
+            deadline,
         )?;
         self.runtime.record_metric(
             ClientMetric::AbortAttempt,
@@ -402,7 +454,7 @@ impl FileWriter {
         self.renew_lease_if_needed(&mut session, deadline.clone()).await?;
         session.ensure_open_for_barrier()?;
         let path = session.path().to_string();
-        self.flush_pending_bytes(&mut session, deadline.clone()).await?;
+        self.finish_pending_block(&mut session, &deadline).await?;
         let target_size = session.cursor();
         let committed_blocks = self.runtime.committed_blocks_for_barrier(&session);
         match self
@@ -440,10 +492,23 @@ impl FileWriter {
         }
     }
 
-    /// Writes the buffered tail block, if the session currently has one.
-    async fn flush_pending_bytes(&self, session: &mut WriteSession, deadline: OperationDeadline) -> ClientResult<()> {
-        if let Some(block) = session.take_buffered_tail() {
-            self.runtime.write_block(session, block, deadline).await?;
+    /// Half-closes the current partial block and waits for Worker Ready before a
+    /// Metadata visibility or commit barrier.
+    async fn finish_pending_block(
+        &mut self,
+        session: &mut WriteSession,
+        deadline: &OperationDeadline,
+    ) -> ClientResult<()> {
+        if let Some(block) = self.block_write.take() {
+            self.runtime.finish_block_write(session, block, deadline).await?;
+        }
+        Ok(())
+    }
+
+    /// Cancels an unfinished block RPC before abandoning its request stream.
+    async fn cancel_block_write(&mut self, deadline: &OperationDeadline) -> ClientResult<()> {
+        if let Some(block) = self.block_write.take() {
+            self.runtime.cancel_block_write(block, deadline).await?;
         }
         Ok(())
     }
@@ -456,31 +521,6 @@ impl fmt::Debug for FileWriter {
             .field("cursor", &self.cursor())
             .finish()
     }
-}
-
-/// Buffers incoming bytes and returns complete blocks ready for worker writes.
-fn buffer_write(session: &mut WriteSession, data: Bytes) -> ClientResult<Vec<Bytes>> {
-    let mut blocks = Vec::new();
-    let mut offset = 0usize;
-    let block_size = session.block_size_usize();
-    while offset < data.len() {
-        if session.buffered_len() == 0 && data.len() - offset >= block_size {
-            let end = offset + block_size;
-            session.advance_cursor(block_size)?;
-            blocks.push(data.slice(offset..end));
-            offset = end;
-            continue;
-        }
-
-        let needed = block_size - session.buffered_len();
-        let len = needed.min(data.len() - offset);
-        session.buffer_bytes(&data[offset..offset + len])?;
-        offset += len;
-        if let Some(block) = session.take_full_buffered_block() {
-            blocks.push(block);
-        }
-    }
-    Ok(blocks)
 }
 
 fn validate_commit_file_size(committed_size: u64, final_size: u64) -> ClientResult<()> {
