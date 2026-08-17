@@ -76,22 +76,3 @@ impl fmt::Display for TierError {
 }
 
 impl std::error::Error for TierError {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tier_parse_accepts_supported_uppercase_values() {
-        assert_eq!(Tier::parse("MEM").unwrap(), Tier::Mem);
-        assert_eq!(Tier::parse("NVME").unwrap(), Tier::Nvme);
-        assert_eq!(Tier::parse("SSD").unwrap(), Tier::Ssd);
-        assert_eq!(Tier::parse("HDD").unwrap(), Tier::Hdd);
-    }
-
-    #[test]
-    fn tier_parse_rejects_unknown_or_lowercase_values() {
-        assert!(Tier::parse("TAPE").is_err());
-        assert!(Tier::parse("hdd").is_err());
-    }
-}

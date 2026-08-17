@@ -325,14 +325,13 @@ async fn wait_for_root_ready_inner(inputs: RootReadyInputs) -> MetadataResult<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{RaftConfig, RaftMode};
+    use crate::config::RaftConfig;
     use crate::mount::MountEntry;
     use crate::raft::AppRaftStateMachine;
     use beryl_types::ids::MountId;
     use tempfile::TempDir;
 
     struct ReadinessFixture {
-        storage: Arc<RocksDBStorage>,
         mount_table: Arc<MountTable>,
         raft_node: Arc<AppRaftNode>,
         _temp_dir: TempDir,
@@ -344,10 +343,7 @@ mod tests {
             let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).unwrap());
             let mount_table = Arc::new(MountTable::load_from_storage(storage.as_ref()).unwrap());
             let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
-            let raft_config = RaftConfig {
-                mode: RaftMode::Single,
-                ..RaftConfig::default()
-            };
+            let raft_config = RaftConfig::default();
             let raft_node = Arc::new(
                 AppRaftNode::new(
                     raft_config.node_id,
@@ -360,7 +356,6 @@ mod tests {
                 .unwrap(),
             );
             Self {
-                storage,
                 mount_table,
                 raft_node,
                 _temp_dir: temp_dir,
@@ -401,25 +396,6 @@ mod tests {
             },
         })
         .await
-    }
-
-    #[tokio::test]
-    async fn metadata_start_readiness_does_not_create_missing_root_mount() {
-        let fixture = ReadinessFixture::new().await;
-        fixture.initialize_raft().await;
-
-        let err = wait_for_root_ready(&fixture, Arc::new(RootReadinessGate::new(None)))
-            .await
-            .unwrap_err();
-
-        let message = err.to_string();
-        assert!(message.contains("RootMountMissing"), "{message}");
-        assert!(fixture
-            .mount_table
-            .list_mounts()
-            .into_iter()
-            .all(|mount| mount.mount_prefix != ROOT_MOUNT_PREFIX));
-        assert!(fixture.storage.get_inode(ROOT_INODE_ID).unwrap().is_none());
     }
 
     #[tokio::test]

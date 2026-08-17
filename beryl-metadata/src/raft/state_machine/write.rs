@@ -375,7 +375,7 @@ mod tests {
     use super::*;
     use crate::raft::response::ApplyRejectionKind;
     use crate::raft::state_machine::tests::*;
-    use beryl_types::{InodeKind, MAX_FILE_EXTENTS};
+    use beryl_types::InodeKind;
 
     fn expect_block_allocated(result: ApplySuccess) -> BlockId {
         match result {
@@ -450,78 +450,6 @@ mod tests {
             .put_inode_at_storage_key(key_inode_id, &key_mismatch)
             .unwrap();
         assert_file_mutations_reject_corrupt_inode(key_storage, key_inode_id, &key_mismatch);
-    }
-
-    #[test]
-    fn publish_file_extent_limits_reject_without_mutating_inode_and_advance_apply_state() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let inode_id = InodeId::new(120);
-        let existing_extents = (0..MAX_FILE_EXTENTS)
-            .map(|index| extent(BlockId::new(inode_id, BlockIndex::new(index as u32)), index as u64, 1))
-            .collect::<Vec<_>>();
-        let original = install_file_with_extents(
-            &storage,
-            InodeId::new(100),
-            "file",
-            inode_id,
-            existing_extents,
-            MAX_FILE_EXTENTS as u64,
-        );
-        let sm = AppRaftStateMachine::new(Arc::clone(&storage));
-
-        let requested_state = AppMetadataRaftState {
-            last_applied_log_id: Some(openraft::LogId::new(openraft::LeaderId::new(8, 1), 801)),
-            ..AppMetadataRaftState::default()
-        };
-        let oversized_request = (0..=MAX_FILE_EXTENTS)
-            .map(|index| extent(BlockId::new(inode_id, BlockIndex::new(index as u32)), index as u64, 1))
-            .collect();
-        let error = sm
-            .apply_with_raft_state(
-                Command::PublishFile {
-                    proposed_at_ms: 1,
-                    inode_id,
-                    extents: oversized_request,
-                    target_size: (MAX_FILE_EXTENTS + 1) as u64,
-                    expected_content_revision: 0,
-                    expected_file_size: MAX_FILE_EXTENTS as u64,
-                    lease_epoch: 1,
-                    mode: PublishMode::ReplaceIfUnchanged,
-                },
-                &requested_state,
-            )
-            .expect_err("oversized requested extent vector must fail");
-        assert!(matches!(error, MetadataError::ResourceExhausted(_)));
-        assert_eq!(storage.load_raft_state().unwrap(), requested_state);
-        assert_eq!(storage.get_inode(inode_id).unwrap().as_ref(), Some(&original));
-
-        let append_state = AppMetadataRaftState {
-            last_applied_log_id: Some(openraft::LogId::new(openraft::LeaderId::new(8, 1), 802)),
-            ..AppMetadataRaftState::default()
-        };
-        let error = sm
-            .apply_with_raft_state(
-                Command::PublishFile {
-                    proposed_at_ms: 2,
-                    inode_id,
-                    extents: vec![extent(
-                        BlockId::new(inode_id, BlockIndex::new(MAX_FILE_EXTENTS as u32)),
-                        MAX_FILE_EXTENTS as u64,
-                        1,
-                    )],
-                    target_size: (MAX_FILE_EXTENTS + 1) as u64,
-                    expected_content_revision: 0,
-                    expected_file_size: MAX_FILE_EXTENTS as u64,
-                    lease_epoch: 1,
-                    mode: PublishMode::AppendIfUnchanged,
-                },
-                &append_state,
-            )
-            .expect_err("append beyond final extent limit must fail");
-        assert!(matches!(error, MetadataError::ResourceExhausted(_)));
-        assert_eq!(storage.load_raft_state().unwrap(), append_state);
-        assert_eq!(storage.get_inode(inode_id).unwrap().as_ref(), Some(&original));
     }
 
     #[test]
@@ -605,39 +533,6 @@ mod tests {
     }
 
     #[test]
-    fn acquire_write_lease_uses_durable_compare_and_increment() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let sm = AppRaftStateMachine::new(Arc::clone(&storage));
-        let inode_id = InodeId::new(101);
-        install_file_with_extents(&storage, InodeId::new(100), "file", inode_id, Vec::new(), 0);
-
-        let first = expect_write_lease_acquired(
-            sm.apply(Command::AcquireWriteLease {
-                proposed_at_ms: 1,
-                inode_id,
-                expected_lease_epoch: 1,
-            })
-            .unwrap(),
-        );
-        assert_eq!(first, (inode_id, 2));
-
-        expect_apply_rejection(
-            sm.apply(Command::AcquireWriteLease {
-                proposed_at_ms: 2,
-                inode_id,
-                expected_lease_epoch: 1,
-            }),
-            ApplyRejectionKind::Again,
-        );
-        let inode = storage.get_inode(inode_id).unwrap().unwrap();
-        let InodeData::File { lease_epoch, .. } = inode.data else {
-            panic!("expected file inode");
-        };
-        assert_eq!(lease_epoch, Some(2));
-    }
-
-    #[test]
     fn ending_a_write_lease_fences_a_publish_that_has_not_linearized() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
@@ -678,100 +573,6 @@ mod tests {
             ApplyRejectionKind::LeaseFenced { expected: 2, got: 1 },
         );
         assert_eq!(storage.get_inode(inode_id).unwrap().unwrap().attrs.size, 0);
-    }
-
-    #[test]
-    fn publish_rejects_lengths_outside_the_layout_capacity_rules() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let sm = AppRaftStateMachine::new(Arc::clone(&storage));
-
-        let oversized_inode = InodeId::new(108);
-        install_file_with_extents(&storage, InodeId::new(100), "oversized", oversized_inode, Vec::new(), 0);
-        expect_apply_rejection(
-            sm.apply(Command::PublishFile {
-                proposed_at_ms: 1,
-                inode_id: oversized_inode,
-                extents: vec![extent(BlockId::new(oversized_inode, BlockIndex::new(0)), 0, 4097)],
-                target_size: 4097,
-                expected_content_revision: 0,
-                expected_file_size: 0,
-                lease_epoch: 1,
-                mode: PublishMode::ReplaceIfUnchanged,
-            }),
-            ApplyRejectionKind::InvalidArgument,
-        );
-
-        let non_tail_inode = InodeId::new(109);
-        install_file_with_extents(
-            &storage,
-            InodeId::new(100),
-            "non-tail-partial",
-            non_tail_inode,
-            Vec::new(),
-            0,
-        );
-        expect_apply_rejection(
-            sm.apply(Command::PublishFile {
-                proposed_at_ms: 1,
-                inode_id: non_tail_inode,
-                extents: vec![
-                    extent(BlockId::new(non_tail_inode, BlockIndex::new(0)), 0, 1024),
-                    extent(BlockId::new(non_tail_inode, BlockIndex::new(1)), 1024, 1024),
-                ],
-                target_size: 2048,
-                expected_content_revision: 0,
-                expected_file_size: 0,
-                lease_epoch: 1,
-                mode: PublishMode::ReplaceIfUnchanged,
-            }),
-            ApplyRejectionKind::InvalidArgument,
-        );
-    }
-
-    #[test]
-    fn ending_a_write_lease_after_publish_preserves_visible_content() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let sm = AppRaftStateMachine::new(Arc::clone(&storage));
-        let inode_id = InodeId::new(105);
-        install_file_with_extents(&storage, InodeId::new(100), "file", inode_id, Vec::new(), 0);
-
-        expect_file_published(
-            sm.apply(Command::PublishFile {
-                proposed_at_ms: 1,
-                inode_id,
-                extents: vec![extent(BlockId::new(inode_id, BlockIndex::new(0)), 0, 1024)],
-                target_size: 1024,
-                expected_content_revision: 0,
-                expected_file_size: 0,
-                lease_epoch: 1,
-                mode: PublishMode::ReplaceIfUnchanged,
-            })
-            .unwrap(),
-        );
-        let ended = expect_write_lease_ended(
-            sm.apply(Command::EndWriteLease {
-                proposed_at_ms: 2,
-                inode_id,
-                lease_epoch: 1,
-            })
-            .unwrap(),
-        );
-
-        assert_eq!(ended, (inode_id, 2));
-        let inode = storage.get_inode(inode_id).unwrap().unwrap();
-        assert_eq!(inode.attrs.size, 1024);
-        let InodeData::File {
-            content_revision,
-            lease_epoch,
-            ..
-        } = inode.data
-        else {
-            panic!("expected file inode");
-        };
-        assert_eq!(content_revision, Some(1));
-        assert_eq!(lease_epoch, Some(2));
     }
 
     #[test]

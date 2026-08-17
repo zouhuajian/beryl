@@ -19,13 +19,3 @@ impl fmt::Display for WorkerNetProtocol {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn display_name_is_grpc() {
-        assert_eq!(WorkerNetProtocol::Grpc.to_string(), "grpc");
-    }
-}

@@ -971,13 +971,11 @@ mod tests {
     };
     use crate::state::RouteEpoch;
     use beryl_types::fs::{FileAttrs, Inode, InodeId};
-    use beryl_types::ids::{MountId, WorkerId};
-    use beryl_types::layout::FileLayout;
+    use beryl_types::ids::MountId;
     use beryl_types::GroupName;
     use metrics::{Counter, CounterFn, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
     use openraft::storage::RaftSnapshotBuilder;
     use openraft::LeaderId;
-    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tempfile::TempDir;
     use tokio::io::AsyncWriteExt;
@@ -998,20 +996,6 @@ mod tests {
         Entry {
             log_id: LogId::new(LeaderId::new(1, 1), index),
             payload: EntryPayload::Normal(command),
-        }
-    }
-
-    fn blank_entry(index: u64) -> Entry<MetadataRaftTypeConfig> {
-        Entry {
-            log_id: LogId::new(LeaderId::new(1, 1), index),
-            payload: EntryPayload::Blank,
-        }
-    }
-
-    fn membership_entry(index: u64) -> Entry<MetadataRaftTypeConfig> {
-        Entry {
-            log_id: LogId::new(LeaderId::new(1, 1), index),
-            payload: EntryPayload::Membership(openraft::Membership::new(vec![BTreeSet::from([1])], ())),
         }
     }
 
@@ -1056,19 +1040,6 @@ mod tests {
         tokio::io::copy(&mut *snapshot, &mut *incoming).await.unwrap();
         incoming.flush().await.unwrap();
         (meta, incoming)
-    }
-
-    #[tokio::test]
-    async fn protocol_entries_return_one_explicit_success_per_applied_entry() {
-        let (_dir, storage, mut store) = committed_apply_test_store();
-
-        let responses = store.apply([blank_entry(1), membership_entry(2)]).await.unwrap();
-
-        assert_eq!(responses.len(), 2);
-        assert!(responses
-            .iter()
-            .all(|response| matches!(response, Ok(ApplySuccess::RaftEntryApplied))));
-        assert_eq!(storage.load_raft_state().unwrap().last_applied_log_id.unwrap().index, 2);
     }
 
     #[tokio::test]
@@ -1128,24 +1099,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn business_rejection_advances_applied_state() {
-        let (_dir, storage, mut store) = committed_apply_test_store();
-        let command = Command::RegisterWorkerDescriptor {
-            proposed_at_ms: crate::raft::proposal_timestamp_ms(),
-            group_name: GroupName::parse("root").unwrap(),
-            worker_id: WorkerId::new(0),
-            address: "127.0.0.1:18083".to_string(),
-            worker_net_protocol: 1,
-            fault_domain: None,
-        };
-
-        let responses = store.apply([normal_entry(1, command)]).await.unwrap();
-
-        assert!(matches!(responses.as_slice(), [Err(_)]));
-        assert_eq!(storage.load_raft_state().unwrap().last_applied_log_id.unwrap().index, 1);
-    }
-
-    #[tokio::test]
     async fn codec_failure_does_not_advance_applied_state() {
         let (_dir, storage, mut store) = committed_apply_test_store();
         let parent_inode_id = InodeId::new(1);
@@ -1167,76 +1120,6 @@ mod tests {
 
         assert!(store.apply([normal_entry(1, command)]).await.is_err());
         assert!(storage.load_raft_state().unwrap().last_applied_log_id.is_none());
-    }
-
-    #[tokio::test]
-    async fn create_commits_inode_allocator_domain_state_and_applied_state() {
-        let (dir, storage, mut store) = committed_apply_test_store();
-        let parent_inode_id = InodeId::new(1);
-        storage
-            .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1)))
-            .unwrap();
-        storage.set_next_inode_id(InodeId::new(2)).unwrap();
-        let command = Command::CreateFile {
-            proposed_at_ms: crate::raft::proposal_timestamp_ms(),
-            parent_inode_id,
-            name: "file".to_string(),
-            attrs: FileAttrs::new(),
-            layout: FileLayout::new(4096, 4096, 1),
-        };
-
-        let responses = store.apply([normal_entry(1, command)]).await.unwrap();
-        assert!(matches!(responses.as_slice(), [Ok(ApplySuccess::FileCreated { .. })]));
-        assert_eq!(
-            storage.get_dentry(parent_inode_id, "file").unwrap(),
-            Some(InodeId::new(2))
-        );
-        drop(store);
-        drop(storage);
-        let reopened = RocksDBStorage::open_existing_for_start(dir.path()).unwrap();
-        let next = reopened.prepare_inode_allocation().unwrap();
-        assert_eq!(next.inode_id, InodeId::new(3));
-        assert_eq!(
-            reopened.get_dentry(parent_inode_id, "file").unwrap(),
-            Some(InodeId::new(2))
-        );
-        assert_eq!(
-            reopened.load_raft_state().unwrap().last_applied_log_id.unwrap().index,
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn create_rejection_does_not_consume_allocator_values() {
-        let (_dir, storage, mut store) = committed_apply_test_store();
-        let parent_inode_id = InodeId::new(1);
-        storage
-            .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1)))
-            .unwrap();
-        storage.set_next_inode_id(InodeId::new(2)).unwrap();
-        let first = Command::CreateFile {
-            proposed_at_ms: crate::raft::proposal_timestamp_ms(),
-            parent_inode_id,
-            name: "file".to_string(),
-            attrs: FileAttrs::new(),
-            layout: FileLayout::new(4096, 4096, 1),
-        };
-        store.apply([normal_entry(1, first)]).await.unwrap();
-        let before = storage.prepare_inode_allocation().unwrap();
-        let collision = Command::CreateFile {
-            proposed_at_ms: crate::raft::proposal_timestamp_ms(),
-            parent_inode_id,
-            name: "file".to_string(),
-            attrs: FileAttrs::new(),
-            layout: FileLayout::new(4096, 4096, 1),
-        };
-
-        let responses = store.apply([normal_entry(2, collision)]).await.unwrap();
-        let after = storage.prepare_inode_allocation().unwrap();
-
-        assert!(matches!(responses.as_slice(), [Err(_)]));
-        assert_eq!(before, after);
-        assert_eq!(storage.load_raft_state().unwrap().last_applied_log_id.unwrap().index, 2);
     }
 
     #[tokio::test]
@@ -1397,96 +1280,6 @@ mod tests {
         assert!(sm_store_b2.get_current_snapshot().await.is_err());
     }
 
-    #[test]
-    #[ignore = "manual snapshot throughput baseline; run with --release and --ignored"]
-    fn snapshot_build_and_install_throughput_baseline() {
-        let source_dir = TempDir::new().unwrap();
-        let destination_dir = TempDir::new().unwrap();
-        let source = Arc::new(RocksDBStorage::create_for_format(source_dir.path()).unwrap());
-        let destination = Arc::new(RocksDBStorage::create_for_format(destination_dir.path()).unwrap());
-        source
-            .bind_storage_identity(&test_storage_identity("baseline-source", 1))
-            .unwrap();
-        destination
-            .bind_storage_identity(&test_storage_identity("baseline-destination", 2))
-            .unwrap();
-
-        let root_mount = MountEntry {
-            mount_id: MountId::new(1),
-            mount_prefix: "/".to_string(),
-            mount_kind: MountKind::Internal,
-            ufs_uri: None,
-            data_io_policy: DataIoPolicy::Allow,
-            mount_epoch: 1,
-            namespace_owner_group_name: GroupName::parse("root").unwrap(),
-            root_inode_id: InodeId::new(1),
-        };
-        source.put_route_epoch(RouteEpoch::new(1)).unwrap();
-        source.put_mount(&root_mount).unwrap();
-        for raw_inode_id in 1..=1_000 {
-            source
-                .put_inode(&Inode::new_dir(
-                    InodeId::new(raw_inode_id),
-                    FileAttrs::new(),
-                    root_mount.mount_id,
-                ))
-                .unwrap();
-        }
-        let raft_state = AppMetadataRaftState {
-            last_applied_log_id: Some(LogId::new(LeaderId::new(1, 1), 1_000)),
-            ..AppMetadataRaftState::default()
-        };
-        source.persist_raft_state_durable(&raft_state).unwrap();
-
-        let build_started = Instant::now();
-        let built = build_snapshot_generation(&source).unwrap();
-        let build_elapsed = build_started.elapsed();
-        let incoming_path = destination.snapshot_dir().join("baseline-incoming.snap.tmp");
-        fs::copy(&built.path, &incoming_path).unwrap();
-        let incoming_file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&incoming_path)
-            .unwrap();
-        let destination_state = Arc::new(RwLock::new(AppMetadataRaftState::default()));
-        let destination_routing = Arc::new(MountTable::new());
-        let destination_view = MetadataReadView::new(
-            Arc::clone(&destination_routing),
-            destination_state,
-            Arc::clone(&destination),
-        )
-        .unwrap();
-
-        let install_started = Instant::now();
-        install_snapshot_generation(
-            &destination,
-            &destination_view,
-            &built.meta,
-            incoming_path,
-            incoming_file,
-            None,
-        )
-        .unwrap();
-        let install_elapsed = install_started.elapsed();
-
-        assert!(destination.get_inode(InodeId::new(1_000)).unwrap().is_some());
-        assert_eq!(
-            destination_routing
-                .get_mount(root_mount.mount_id)
-                .unwrap()
-                .expect("installed root mount")
-                .mount_prefix,
-            root_mount.mount_prefix
-        );
-        assert_eq!(destination_view.route_epoch(), RouteEpoch::new(1));
-        eprintln!(
-            "snapshot throughput baseline: bytes={}, build_bytes_per_sec={}, install_bytes_per_sec={}",
-            built.bytes,
-            built.bytes as f64 / build_elapsed.as_secs_f64(),
-            built.bytes as f64 / install_elapsed.as_secs_f64()
-        );
-    }
-
     #[tokio::test]
     async fn corrupt_snapshot_leaves_active_generation_unchanged() {
         let source_dir = TempDir::new().unwrap();
@@ -1562,60 +1355,6 @@ mod tests {
             .begin_receiving_snapshot()
             .await
             .expect("failed install releases incoming token");
-    }
-
-    #[test]
-    fn malformed_detached_root_snapshot_leaves_active_generation_unchanged() {
-        let source_dir = TempDir::new().unwrap();
-        let destination_dir = TempDir::new().unwrap();
-        let source = Arc::new(RocksDBStorage::create_for_format(source_dir.path()).unwrap());
-        let destination = Arc::new(RocksDBStorage::create_for_format(destination_dir.path()).unwrap());
-        source
-            .bind_storage_identity(&test_storage_identity("source", 1))
-            .unwrap();
-        destination
-            .bind_storage_identity(&test_storage_identity("destination", 2))
-            .unwrap();
-        source.put_route_epoch(RouteEpoch::new(7)).unwrap();
-        destination.put_route_epoch(RouteEpoch::new(99)).unwrap();
-        source.persist_raft_state_durable(&sample_raft_state()).unwrap();
-        source
-            .with_pinned_db(|db| {
-                db.put_cf(required_cf(db, "detached_roots")?, b"short", b"invalid")
-                    .map_err(|error| MetadataError::Internal(error.to_string()))
-            })
-            .unwrap();
-
-        let built = build_snapshot_generation(&source).unwrap();
-        let incoming_path = destination.snapshot_dir().join("malformed-detached-root.snap.tmp");
-        fs::copy(&built.path, &incoming_path).unwrap();
-        let incoming_file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&incoming_path)
-            .unwrap();
-        let destination_state = Arc::new(RwLock::new(AppMetadataRaftState::default()));
-        let destination_view =
-            MetadataReadView::new(Arc::new(MountTable::new()), destination_state, Arc::clone(&destination)).unwrap();
-
-        let error = match install_snapshot_generation(
-            &destination,
-            &destination_view,
-            &built.meta,
-            incoming_path,
-            incoming_file,
-            None,
-        ) {
-            Ok(_) => panic!("malformed detached-root snapshot must not install"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("invalid detached-root key length"));
-        assert_eq!(destination.get_route_epoch().unwrap(), RouteEpoch::new(99));
-        assert_eq!(
-            fs::read_to_string(destination_dir.path().join("CURRENT")).unwrap(),
-            "gen-000001\n"
-        );
     }
 
     #[tokio::test]

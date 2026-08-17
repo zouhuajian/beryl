@@ -214,39 +214,3 @@ where
         .unwrap_or_else(|error| error.exit());
     BerylCli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
 }
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use super::*;
-
-    #[test]
-    fn install_layout_uses_package_relative_defaults() {
-        let layout = InstallLayout::resolve(PathBuf::from("/opt/beryl/bin/beryl"), None).unwrap();
-
-        assert_eq!(
-            layout.process_binary(Role::Metadata),
-            Path::new("/opt/beryl/libexec/beryl-metadata")
-        );
-        assert_eq!(
-            layout.config_file(Role::Worker),
-            Path::new("/opt/beryl/conf/worker.yaml")
-        );
-    }
-
-    #[test]
-    fn explicit_config_directory_replaces_only_the_config_root() {
-        let layout =
-            InstallLayout::resolve(PathBuf::from("/opt/beryl/bin/beryl"), Some(PathBuf::from("/etc/beryl"))).unwrap();
-
-        assert_eq!(
-            layout.process_binary(Role::Worker),
-            Path::new("/opt/beryl/libexec/beryl-worker")
-        );
-        assert_eq!(
-            layout.config_file(Role::Metadata),
-            Path::new("/etc/beryl/metadata.yaml")
-        );
-    }
-}

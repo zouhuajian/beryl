@@ -196,11 +196,6 @@ impl FatalApplyError {
         Self(error)
     }
 
-    #[cfg(test)]
-    pub(crate) fn into_inner(self) -> MetadataError {
-        self.0
-    }
-
     pub(crate) fn as_inner(&self) -> &MetadataError {
         &self.0
     }
@@ -212,7 +207,7 @@ mod tests {
     use crate::error::MetadataError;
 
     #[test]
-    fn recoverable_apply_errors_round_trip_without_becoming_internal() {
+    fn apply_rejections_preserve_domain_errors_and_keep_fatal_errors_separate() {
         let rejection = ApplyRejection::from_metadata_error(MetadataError::NotFound("inode 7".to_string())).unwrap();
 
         assert!(matches!(
@@ -226,27 +221,19 @@ mod tests {
             rejection.into_metadata_error(),
             MetadataError::ResourceExhausted(message) if message == "extent limit"
         ));
-    }
 
-    #[test]
-    fn internal_apply_error_is_fatal() {
-        let fatal =
-            ApplyRejection::from_metadata_error(MetadataError::Internal("decode failed".to_string())).unwrap_err();
-
-        assert!(matches!(
-            fatal.into_inner(),
-            MetadataError::Internal(message) if message == "decode failed"
-        ));
-    }
-
-    #[test]
-    fn lease_fencing_round_trip_preserves_epochs() {
         let rejection =
             ApplyRejection::from_metadata_error(MetadataError::LeaseFenced { expected: 11, got: 9 }).unwrap();
-
         assert!(matches!(
             rejection.into_metadata_error(),
             MetadataError::LeaseFenced { expected: 11, got: 9 }
+        ));
+
+        let fatal =
+            ApplyRejection::from_metadata_error(MetadataError::Internal("decode failed".to_string())).unwrap_err();
+        assert!(matches!(
+            fatal.as_inner(),
+            MetadataError::Internal(message) if message == "decode failed"
         ));
     }
 }

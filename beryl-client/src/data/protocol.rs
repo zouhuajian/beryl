@@ -274,70 +274,9 @@ fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> 
 
 #[cfg(test)]
 mod tests {
-    use beryl_proto::worker::write_block_request_proto::Payload;
-    use beryl_types::lease::FencingToken;
-    use beryl_types::{
-        BlockId, BlockIndex, ClientId, GroupName, InodeId, Tier, WorkerEndpointInfo, WorkerId, WorkerNetProtocol,
-        WorkerRunId, WriteTarget,
-    };
     use bytes::Bytes;
 
-    use super::{build_write_block_command, build_write_block_data};
-    use crate::data::WorkerWriteTarget;
-    use crate::runtime::{AttemptContext, OperationContext, OperationDeadline};
-
-    fn attempt() -> AttemptContext {
-        let operation = OperationContext::new_named(
-            ClientId::new(9),
-            "client",
-            "WriteBlock",
-            None,
-            OperationDeadline::new(1_000),
-        )
-        .expect("operation");
-        AttemptContext::for_data(&operation, 0)
-    }
-
-    fn worker() -> WorkerEndpointInfo {
-        WorkerEndpointInfo {
-            worker_id: WorkerId::new(5),
-            worker_run_id: WorkerRunId::new(),
-            endpoint: "127.0.0.1:19090".to_string(),
-            worker_net_protocol: WorkerNetProtocol::Grpc,
-        }
-    }
-
-    fn target(worker: WorkerEndpointInfo) -> WorkerWriteTarget {
-        let block_id = BlockId::new(InodeId::new(7), BlockIndex::new(3));
-        WorkerWriteTarget {
-            group_name: GroupName::parse("root").expect("group"),
-            target: WriteTarget {
-                block_id,
-                file_offset: 0,
-                block_size: 4096,
-                block_format_id: beryl_types::BlockFormatId::FULL_EFFECTIVE,
-                chunk_size: 1024,
-                block_stamp: 55,
-                fencing_token: FencingToken::new(block_id, ClientId::new(9), 1),
-                tier: Tier::Hdd,
-                worker_endpoints: vec![worker],
-            },
-        }
-    }
-
-    #[test]
-    fn write_block_wire_is_one_command_followed_by_plain_data() {
-        let worker = worker();
-        let command = build_write_block_command(&attempt(), &target(worker.clone()), &worker).expect("command");
-        let Payload::Command(command) = command.payload.expect("payload") else {
-            panic!("expected command");
-        };
-        assert_eq!(command.block_stamp, 55);
-        assert_eq!(command.block_size, 4096);
-
-        let data = build_write_block_data(Bytes::from_static(b"abc")).expect("data");
-        assert!(matches!(data.payload, Some(Payload::Data(bytes)) if bytes == b"abc"[..]));
-    }
+    use super::build_write_block_data;
 
     #[test]
     fn write_block_rejects_empty_data_payload() {

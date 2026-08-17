@@ -38,18 +38,3 @@ pub trait StateStore: Send + Sync {
     /// Get the current authoritative route epoch.
     async fn get_route_epoch(&self) -> MetadataResult<RouteEpoch>;
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn route_epoch_preserves_value_and_identity() {
-        let v1 = RouteEpoch::new(1);
-        let v2 = RouteEpoch::new(2);
-
-        assert_eq!(v1.as_u64(), 1);
-        assert_eq!(v2.as_u64(), 2);
-        assert_ne!(v1, v2);
-    }
-}

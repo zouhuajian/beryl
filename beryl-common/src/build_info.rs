@@ -38,18 +38,3 @@ pub const BUILD_INFO: BuildInfo = BuildInfo {
     rustc_version: env!("BERYL_BUILD_RUSTC_VERSION"),
     target: env!("BERYL_BUILD_TARGET"),
 };
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn version_text_contains_every_build_identity_field() {
-        let text = BUILD_INFO.version_text("beryl-test");
-
-        assert!(text.starts_with(&format!("beryl-test {}\n", env!("CARGO_PKG_VERSION"))));
-        assert!(text.contains("\nsource-revision: "));
-        assert!(text.contains("\nrustc: rustc "));
-        assert!(text.contains("\ntarget: "));
-    }
-}

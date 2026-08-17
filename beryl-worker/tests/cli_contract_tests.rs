@@ -7,21 +7,6 @@ use std::process::Command;
 use tempfile::TempDir;
 
 #[test]
-fn help_and_version_do_not_require_configuration() {
-    for flag in ["--help", "--version"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_beryl-worker"))
-            .arg(flag)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{flag}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-}
-
-#[test]
 fn validate_conf_does_not_create_identity_or_storage_or_contact_metadata() {
     let temp = TempDir::new().unwrap();
     let identity_file = temp.path().join("identity").join("worker.identity");

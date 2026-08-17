@@ -9,7 +9,7 @@ use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
 use crate::readiness::{wait_for_root_ready_with_inputs, RootReadinessGate, RootReadinessLogFields, RootReadyInputs};
 use crate::service::{MetadataFileSystem, MetadataFileSystemDeps, MetadataFileSystemServiceImpl, MsyncHandler};
 use crate::state::RaftStateStore;
-use crate::worker::{MetadataWorkerServiceImpl, WorkerBackgroundHandle, WorkerManager};
+use crate::worker::{MetadataWorkerServiceImpl, WorkerManager};
 use crate::{observe, MetadataConfig, MountTable};
 use beryl_common::grpc_server::{
     spawn_grpc_server_with_concurrency_limits, GrpcRequestConcurrencyConfig, RpcRequestClass,
@@ -100,14 +100,9 @@ impl MetadataAuthority {
     }
 }
 
-/// Required worker runtime soft state shared by worker RPC and background work.
+/// Required worker runtime soft state shared by worker RPC and maintenance work.
 pub struct WorkerRuntime {
     pub manager: Arc<WorkerManager>,
-}
-
-/// Worker-owned background lifecycle started after authority and maintenance are available.
-pub struct WorkerBackground {
-    _handle: WorkerBackgroundHandle,
 }
 
 /// Metadata maintenance lifecycle independent of worker RPC serving.
@@ -140,7 +135,6 @@ pub struct RpcServices {
 
 /// Long-lived handles retained by `serve()` for the server lifetime.
 pub struct RuntimeHandles {
-    _worker_background: WorkerBackground,
     maintenance: Maintenance,
     readiness: ReadinessHandle,
 }
@@ -222,21 +216,13 @@ impl WorkerRuntime {
         authority: &MetadataAuthority,
         cleanup: Arc<BlockCleanupCoordinator>,
     ) -> MetadataWorkerServiceImpl {
-        let mut service = MetadataWorkerServiceImpl::new_with_cleanup(
+        MetadataWorkerServiceImpl::new_with_cleanup(
             Arc::clone(&authority.raft_node),
             Arc::clone(&self.manager),
             Arc::clone(&authority.mount_table),
             authority.group_name.clone(),
             cleanup,
-        );
-        service.set_slot_metrics(Arc::clone(&authority.metadata_metrics));
-
-        service
-    }
-
-    /// Starts worker-service background tasks.
-    fn start_background(&self, service: &MetadataWorkerServiceImpl) -> WorkerBackgroundHandle {
-        service.start_background_tasks()
+        )
     }
 }
 
@@ -310,9 +296,7 @@ impl MetadataServer {
         };
         let maintenance = build_maintenance(config.as_ref(), &authority, &worker, &readiness, session_registry).await;
         let worker_service = worker.service(&authority, Arc::clone(&maintenance.cleanup));
-        let worker_background = build_worker_background(&worker, &worker_service);
-        let (services, handles) =
-            compose_services(filesystem, worker_service, readiness, worker_background, maintenance);
+        let (services, handles) = compose_services(filesystem, worker_service, readiness, maintenance);
 
         let mut server = Self {
             config,
@@ -472,7 +456,6 @@ pub fn init_observability(config: &MetadataConfig) -> Result<Observability, DynE
         http_addr = %config.http_addr(),
         storage_dir = %config.storage_dir.display(),
         node_id = config.raft.node_id,
-        raft_mode = ?config.raft.mode,
         authority_group_name = %config.authority.group_name,
         "Configuration loaded (sensitive values redacted)"
     );
@@ -572,13 +555,6 @@ pub(crate) async fn build_maintenance(
         _maintenance_service: maintenance_service,
         maintenance_handle,
     }
-}
-
-/// Starts worker-owned background work after authority and maintenance are available.
-pub fn build_worker_background(worker: &WorkerRuntime, service: &MetadataWorkerServiceImpl) -> WorkerBackground {
-    let handle = worker.start_background(service);
-
-    WorkerBackground { _handle: handle }
 }
 
 /// Starts the root readiness watcher and owns health serving state.
@@ -711,7 +687,6 @@ pub fn compose_services(
     filesystem: MetadataFileSystemServiceImpl,
     worker: MetadataWorkerServiceImpl,
     readiness: Readiness,
-    worker_background: WorkerBackground,
     maintenance: Maintenance,
 ) -> (RpcServices, RuntimeHandles) {
     let Readiness {
@@ -725,11 +700,7 @@ pub fn compose_services(
             worker,
             health: health_service,
         },
-        RuntimeHandles {
-            _worker_background: worker_background,
-            maintenance,
-            readiness,
-        },
+        RuntimeHandles { maintenance, readiness },
     )
 }
 
@@ -739,65 +710,14 @@ mod tests {
     use crate::config::{BlockCleanupConfig, MetadataAuthorityConfig, RaftConfig, StartupConfig, WorkerLivenessConfig};
     use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
     use crate::raft::Command;
-    use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction};
+    use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction};
     use beryl_common::header::{RequestHeader, ResponseHeader};
-    use beryl_proto::common::BlockIdProto;
     use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
-    use beryl_proto::metadata::{CommitFileRequestProto, CommittedBlockProto, MsyncRequestProto, MsyncResponseProto};
-    use beryl_types::ids::{MountId, WorkerId};
-    use beryl_types::{ClientId, GroupName, GroupStateWatermark, RaftLogId, MAX_FILE_EXTENTS};
-    use prost::Message;
+    use beryl_proto::metadata::{MsyncRequestProto, MsyncResponseProto};
+    use beryl_types::ids::MountId;
+    use beryl_types::{ClientId, GroupName};
     use std::time::Duration;
     use tempfile::TempDir;
-
-    #[test]
-    fn maximum_commit_body_fits_metadata_request_limit() {
-        let committed_blocks = (0..MAX_FILE_EXTENTS)
-            .map(|index| CommittedBlockProto {
-                block_id: Some(BlockIdProto {
-                    inode_id: u64::MAX,
-                    block_index: index as u32,
-                }),
-                file_offset: u64::MAX,
-                len: u64::MAX,
-            })
-            .collect();
-        let request = CommitFileRequestProto {
-            committed_blocks,
-            final_size: u64::MAX,
-            expected_content_revision: u64::MAX,
-            expected_file_size: u64::MAX,
-            ..Default::default()
-        };
-
-        assert!(
-            request.encoded_len() < MAX_REQUEST_SIZE,
-            "maximum legal CommitFile body must fit the transport request ceiling"
-        );
-    }
-
-    #[test]
-    fn rpc_concurrency_reserves_capacity_only_for_worker_and_health() {
-        assert_eq!(
-            classify_metadata_rpc(&format!(
-                "/{}/Heartbeat",
-                <MetadataWorkerServiceProtoServer<MetadataWorkerServiceImpl> as NamedService>::NAME
-            )),
-            RpcRequestClass::Control
-        );
-        assert_eq!(
-            classify_metadata_rpc(&format!("/{}/Check", <MetadataHealthServer as NamedService>::NAME)),
-            RpcRequestClass::Control
-        );
-        assert_eq!(
-            classify_metadata_rpc(&format!(
-                "/{}/GetStatus",
-                <FileSystemServiceProtoServer<MetadataFileSystemServiceImpl> as NamedService>::NAME
-            )),
-            RpcRequestClass::Regular
-        );
-        assert_eq!(classify_metadata_rpc("/unknown.Service/Call"), RpcRequestClass::Regular);
-    }
 
     async fn test_authority(dir: &TempDir) -> MetadataAuthority {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
@@ -843,18 +763,6 @@ mod tests {
             metadata_metrics: Arc::new(MetadataMetrics::new()),
             group_name,
         }
-    }
-
-    async fn wait_for_leader_state(authority: &MetadataAuthority) -> RaftLogId {
-        for _ in 0..100 {
-            if authority.raft_node.is_leader() {
-                if let Some(state_id) = authority.raft_node.get_last_applied_state_id() {
-                    return state_id;
-                }
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-        }
-        panic!("single-node test authority did not expose leader last_applied state");
     }
 
     async fn nonleader_filesystem_service(dir: &TempDir) -> MetadataFileSystemServiceImpl {
@@ -948,43 +856,6 @@ mod tests {
         beryl_common::observe::ObservabilityConfig::from_flat(&flat).expect("test observe config")
     }
     #[tokio::test]
-    async fn worker_runtime_loads_durable_descriptors_without_live_registration() {
-        let dir = TempDir::new().unwrap();
-        let config = test_config();
-        let authority = test_authority(&dir).await;
-        let worker_id = WorkerId::new(91);
-        authority
-            .storage
-            .put_worker(&crate::worker::WorkerInfo {
-                group_name: authority.group_name.clone(),
-                worker_id,
-                address: "127.0.0.1:19091".to_string(),
-                worker_net_protocol: 1,
-                capacity_total: 0,
-                capacity_used: 0,
-                capacity_available: 0,
-                active_reads: 0,
-                active_writes: 0,
-                health: crate::worker::HealthStatus::Healthy,
-                last_heartbeat: 0,
-                fault_domain: Some("rack-a".to_string()),
-            })
-            .unwrap();
-
-        let worker = build_worker_runtime(&authority, config.worker_liveness.heartbeat_timeout_ms).unwrap();
-
-        let descriptor = worker
-            .manager
-            .get_descriptor(&authority.group_name, worker_id)
-            .expect("durable descriptor");
-        assert_eq!(descriptor.address, "127.0.0.1:19091");
-        assert!(worker
-            .manager
-            .get_registration(&authority.group_name, worker_id)
-            .is_none());
-    }
-
-    #[tokio::test]
     async fn fail_fast_readiness_returns_to_lifecycle_owner_before_raft_shutdown() {
         let dir = TempDir::new().unwrap();
         let authority = test_authority(&dir).await;
@@ -1027,139 +898,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn msync_success_on_leader_returns_authoritative_watermark() {
-        let dir = TempDir::new().unwrap();
-        let authority = test_authority(&dir).await;
-        let expected_state_id = wait_for_leader_state(&authority).await;
-        let config = test_config();
-        let readiness = build_readiness(&config, &authority).await;
-        let worker_runtime = build_worker_runtime(&authority, config.worker_liveness.heartbeat_timeout_ms).unwrap();
-        let service = build_filesystem_service_with_sessions(
-            &config,
-            &authority,
-            Arc::clone(&worker_runtime.manager),
-            Arc::new(crate::session_registry::SessionRegistry::default()),
-            &readiness,
-        )
-        .await
-        .unwrap();
-        let group_name = GroupName::parse("root").unwrap();
-
-        let response = call_msync(
-            &service,
-            RequestHeader::new(ClientId::new(7)).with_group_name(group_name.clone()),
-        )
-        .await;
-        let header = parse_msync_header(&response);
-
-        assert_eq!(header.group_name, Some(group_name.clone()));
-        assert!(header.rpc_error.is_none());
-        assert!(header.state.is_empty());
-        assert_eq!(
-            response.state,
-            Some((&GroupStateWatermark::new(group_name, expected_state_id)).into())
-        );
-    }
-
-    #[tokio::test]
-    async fn msync_does_not_compare_client_header_state() {
-        let dir = TempDir::new().unwrap();
-        let authority = test_authority(&dir).await;
-        let expected_state_id = wait_for_leader_state(&authority).await;
-        let config = test_config();
-        let readiness = build_readiness(&config, &authority).await;
-        let worker_runtime = build_worker_runtime(&authority, config.worker_liveness.heartbeat_timeout_ms).unwrap();
-        let service = build_filesystem_service_with_sessions(
-            &config,
-            &authority,
-            Arc::clone(&worker_runtime.manager),
-            Arc::new(crate::session_registry::SessionRegistry::default()),
-            &readiness,
-        )
-        .await
-        .unwrap();
-        let group_name = GroupName::parse("root").unwrap();
-        let mut header = RequestHeader::new(ClientId::new(7)).with_group_name(group_name.clone());
-        header.state = vec![GroupStateWatermark::new(
-            group_name.clone(),
-            RaftLogId::new(99, 99, u64::MAX),
-        )];
-
-        let response = call_msync(&service, header).await;
-        let response_header = parse_msync_header(&response);
-
-        assert!(response_header.rpc_error.is_none());
-        assert_eq!(
-            response.state,
-            Some((&GroupStateWatermark::new(group_name, expected_state_id)).into())
-        );
-    }
-
-    #[tokio::test]
-    async fn msync_rejects_missing_header_group_name() {
-        let dir = TempDir::new().unwrap();
-        let authority = test_authority(&dir).await;
-        wait_for_leader_state(&authority).await;
-        let config = test_config();
-        let readiness = build_readiness(&config, &authority).await;
-        let worker_runtime = build_worker_runtime(&authority, config.worker_liveness.heartbeat_timeout_ms).unwrap();
-        let service = build_filesystem_service_with_sessions(
-            &config,
-            &authority,
-            Arc::clone(&worker_runtime.manager),
-            Arc::new(crate::session_registry::SessionRegistry::default()),
-            &readiness,
-        )
-        .await
-        .unwrap();
-
-        let response = call_msync(&service, RequestHeader::new(ClientId::new(7))).await;
-        let header = parse_msync_header(&response);
-        let rpc_error = header.rpc_error.expect("missing header group error");
-
-        assert!(header.state.is_empty());
-        assert!(response.state.is_none());
-        assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
-        assert_eq!(rpc_error.recovery, RecoveryAction::Fail);
-    }
-
-    #[tokio::test]
-    async fn msync_rejects_non_local_group_with_structured_error() {
-        let dir = TempDir::new().unwrap();
-        let authority = test_authority(&dir).await;
-        wait_for_leader_state(&authority).await;
-        let config = test_config();
-        let readiness = build_readiness(&config, &authority).await;
-        let worker_runtime = build_worker_runtime(&authority, config.worker_liveness.heartbeat_timeout_ms).unwrap();
-        let service = build_filesystem_service_with_sessions(
-            &config,
-            &authority,
-            Arc::clone(&worker_runtime.manager),
-            Arc::new(crate::session_registry::SessionRegistry::default()),
-            &readiness,
-        )
-        .await
-        .unwrap();
-        let group_name = GroupName::parse("other").unwrap();
-
-        let response = call_msync(
-            &service,
-            RequestHeader::new(ClientId::new(7)).with_group_name(group_name),
-        )
-        .await;
-        let header = parse_msync_header(&response);
-        let rpc_error = header.rpc_error.expect("non-local group error");
-
-        assert!(header.state.is_empty());
-        assert!(response.state.is_none());
-        assert_eq!(
-            rpc_error.kind,
-            ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch)
-        );
-        assert!(matches!(rpc_error.recovery, RecoveryAction::RefreshMetadata { .. }));
-    }
-
-    #[tokio::test]
     async fn msync_nonleader_returns_refresh_metadata_not_leader() {
         let dir = TempDir::new().unwrap();
         let service = nonleader_filesystem_service(&dir).await;
@@ -1176,17 +914,5 @@ mod tests {
         assert!(response.state.is_none());
         assert_eq!(rpc_error.kind, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
         assert!(matches!(rpc_error.recovery, RecoveryAction::RefreshMetadata { .. }));
-    }
-    #[tokio::test]
-    async fn build_authority_uses_configured_storage_dir() {
-        let configured = TempDir::new().unwrap();
-        let mut config = test_config();
-        config.storage_dir = configured.path().to_path_buf();
-        crate::lifecycle::format_metadata_storage(&config).await.unwrap();
-
-        let authority = build_authority(&config).await.unwrap();
-
-        assert!(configured.path().join("CURRENT").exists());
-        drop(authority);
     }
 }

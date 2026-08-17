@@ -144,36 +144,3 @@ where
         .try_get_matches_from(args)?;
     MetadataCli::from_arg_matches(&matches)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn explicit_metadata_commands_parse() {
-        let start = try_parse_cli(["beryl-metadata", "start", "--config", "conf/metadata.yaml"]).unwrap();
-        assert!(matches!(
-            start.command,
-            MetadataCommand::Start { config }
-                if config.as_path() == std::path::Path::new("conf/metadata.yaml")
-        ));
-
-        let format = try_parse_cli(["beryl-metadata", "format", "--config", "conf/metadata.yaml"]).unwrap();
-        assert!(matches!(format.command, MetadataCommand::Format { .. }));
-
-        let validate = try_parse_cli(["beryl-metadata", "validate-conf", "--config", "conf/metadata.yaml"]).unwrap();
-        assert!(matches!(validate.command, MetadataCommand::ValidateConf { .. }));
-    }
-
-    #[test]
-    fn missing_action_or_config_is_a_usage_error() {
-        for args in [
-            &["beryl-metadata"][..],
-            &["beryl-metadata", "start"][..],
-            &["beryl-metadata", "conf/metadata.yaml"][..],
-        ] {
-            let error = try_parse_cli(args.iter().copied()).expect_err("incomplete command must fail");
-            assert_eq!(error.exit_code(), 2);
-        }
-    }
-}

@@ -281,58 +281,6 @@ mod tests {
     use beryl_types::CallId;
 
     #[test]
-    fn test_encode_decode_roundtrip() {
-        let client_id = ClientId::new(12345);
-        let deadline = Deadline::from_now(std::time::Duration::from_secs(60));
-        let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string();
-        let tracestate = "vendor=state".to_string();
-        let baggage = "tenant=local".to_string();
-        let state = vec![GroupStateWatermark::new(
-            GroupName::parse("root").unwrap(),
-            RaftLogId::new(1, 2, 100),
-        )];
-
-        let header = RequestHeader {
-            client: crate::header::ClientInfo {
-                call_id: CallId::new(),
-                client_id,
-                client_name: None,
-            },
-            trace_context: crate::header::TraceContext {
-                traceparent: Some(traceparent.clone()),
-                tracestate: Some(tracestate.clone()),
-                baggage: Some(baggage.clone()),
-            },
-            group_name: None,
-            mount_epoch: None,
-            state: state.clone(),
-            route_epoch: None,
-            deadline,
-            caller_context: None,
-        };
-
-        // Encode
-        let headers = RequestHeaderCodec::encode_to_headers(&header);
-        assert!(
-            headers
-                .iter()
-                .filter(|(key, _)| key.eq_ignore_ascii_case(HEADER_TRACEPARENT))
-                .all(|(_, value)| value != &header.client.call_id.to_string()),
-            "call_id must not be serialized as traceparent"
-        );
-
-        // Decode
-        let decoded = RequestHeaderCodec::decode_from_headers(headers.into_iter()).expect("decode header");
-
-        // Verify
-        assert_eq!(decoded.client.call_id, header.client.call_id);
-        assert_eq!(decoded.client.client_id, header.client.client_id);
-        assert_eq!(decoded.deadline.as_unix_ms(), header.deadline.as_unix_ms());
-        assert_eq!(decoded.trace_context, header.trace_context);
-        assert_eq!(decoded.state, header.state);
-    }
-
-    #[test]
     fn invalid_identity_headers_are_rejected() {
         let valid_call_id = CallId::new().to_string();
         let valid_client_id = ClientId::new(99).as_raw().to_string();

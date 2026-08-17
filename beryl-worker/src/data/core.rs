@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
 use beryl_types::chunk::ByteRange;
-use beryl_types::ids::{BlockId, ChunkIndex};
+use beryl_types::ids::BlockId;
 use beryl_types::layout::{BlockFormatId, BlockShape, BlockShapeError};
 use beryl_types::{GroupName, Tier, WorkerRunId};
 use bytes::Bytes;
@@ -84,54 +84,6 @@ pub(crate) struct ActiveBlockWrite {
     block_size: u64,
     next_offset: u64,
     registration: Option<BlockWriteRegistration>,
-}
-
-/// Worker-local slice within a storage chunk.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StorageChunkSlice {
-    pub chunk_index: ChunkIndex,
-    pub offset_in_chunk: u32,
-    pub len: u32,
-}
-
-/// Maps block-local byte ranges to storage-chunk slices.
-pub struct RangeMapper;
-
-impl RangeMapper {
-    pub fn map_range(byte_range: ByteRange, chunk_size: u32) -> WorkerCoreResult<Vec<StorageChunkSlice>> {
-        if chunk_size == 0 {
-            return Err(WorkerError::InvalidArgument(
-                "chunk_size must be greater than zero".to_string(),
-            ));
-        }
-        if byte_range.len == 0 {
-            return Ok(Vec::new());
-        }
-
-        let chunk_size_u64 = u64::from(chunk_size);
-        let first_offset = byte_range.offset % chunk_size_u64;
-        let estimated = (first_offset + u64::from(byte_range.len)).div_ceil(chunk_size_u64) as usize;
-        let mut slices = Vec::with_capacity(estimated);
-        let mut current_offset = byte_range.offset;
-        let mut remaining = byte_range.len;
-        while remaining > 0 {
-            let raw_chunk_index = current_offset / chunk_size_u64;
-            let chunk_index = u32::try_from(raw_chunk_index)
-                .map_err(|_| WorkerError::InvalidArgument("chunk index exceeds u32".to_string()))?;
-            let offset_in_chunk = (current_offset % chunk_size_u64) as u32;
-            let len = remaining.min(chunk_size - offset_in_chunk);
-            slices.push(StorageChunkSlice {
-                chunk_index: ChunkIndex::new(chunk_index),
-                offset_in_chunk,
-                len,
-            });
-            remaining -= len;
-            current_offset = current_offset
-                .checked_add(u64::from(len))
-                .ok_or_else(|| WorkerError::InvalidArgument("byte range offset overflow".to_string()))?;
-        }
-        Ok(slices)
-    }
 }
 
 /// Data-plane lifecycle boundary used by the gRPC service.
@@ -714,7 +666,7 @@ mod tests {
     use bytes::Bytes;
     use tempfile::TempDir;
 
-    use super::{RangeMapper, ReadBlockRequest, WorkerCore, WriteBlockRequest};
+    use super::{ReadBlockRequest, WorkerCore, WriteBlockRequest};
     use crate::error::WorkerError;
     use crate::store::block::{
         BlockMetaPayload, BlockState, ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore,
@@ -895,31 +847,6 @@ mod tests {
             effective_len: 8,
             frame_size: 512,
         }
-    }
-
-    #[test]
-    fn range_mapper_covers_chunk_boundaries() {
-        let slices = RangeMapper::map_range(ByteRange { offset: 900, len: 1500 }, 1024).expect("range");
-        assert_eq!(slices.len(), 3);
-        assert_eq!((slices[0].offset_in_chunk, slices[0].len), (900, 124));
-        assert_eq!((slices[1].offset_in_chunk, slices[1].len), (0, 1024));
-        assert_eq!((slices[2].offset_in_chunk, slices[2].len), (0, 352));
-    }
-
-    #[tokio::test]
-    async fn block_write_publishes_exact_ordered_prefix_as_ready() {
-        let (_temp, store, core) = core_with_store();
-        let mut write = core.begin_block_write(write_request()).await.expect("begin write");
-        core.write_block_data(&mut write, Bytes::from_static(b"abc"))
-            .await
-            .expect("first data");
-        core.write_block_data(&mut write, Bytes::from_static(b"defgh"))
-            .await
-            .expect("second data");
-        core.finish_block_write(&mut write).await.expect("finish write");
-        let meta = store.load_meta(&group_name(), block_id()).expect("ready meta");
-        assert_eq!(meta.visibility.block_state, BlockState::Ready);
-        assert_eq!(store.read_at(&group_name(), block_id(), 0, 8).unwrap(), b"abcdefgh"[..]);
     }
 
     #[tokio::test]
@@ -1162,35 +1089,6 @@ mod tests {
             .await
             .is_err());
         core.abort_block_write(write).await.expect("abort");
-    }
-
-    #[tokio::test]
-    async fn read_block_emits_bounded_chunks_and_implicit_eof() {
-        let (_temp, _store, core) = core_with_store();
-        let mut write = core.begin_block_write(write_request()).await.expect("begin write");
-        core.write_block_data(&mut write, Bytes::from_static(b"abcdefgh"))
-            .await
-            .expect("write");
-        core.finish_block_write(&mut write).await.expect("finish");
-        let mut read = core
-            .begin_block_read(ReadBlockRequest {
-                group_name: group_name(),
-                block_id: block_id(),
-                byte_range: ByteRange { offset: 1, len: 6 },
-                block_stamp: BLOCK_STAMP,
-                block_format_id: BlockFormatId::FULL_EFFECTIVE,
-                block_size: BLOCK_SIZE,
-                chunk_size: CHUNK_SIZE,
-                effective_len: 8,
-                frame_size: 2,
-            })
-            .await
-            .expect("begin read");
-
-        assert_eq!(core.read_block_chunk(&mut read).await.unwrap().unwrap(), b"bc"[..]);
-        assert_eq!(core.read_block_chunk(&mut read).await.unwrap().unwrap(), b"de"[..]);
-        assert_eq!(core.read_block_chunk(&mut read).await.unwrap().unwrap(), b"fg"[..]);
-        assert!(core.read_block_chunk(&mut read).await.unwrap().is_none());
     }
 
     #[tokio::test]

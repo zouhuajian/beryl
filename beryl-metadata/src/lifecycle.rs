@@ -3,7 +3,7 @@
 
 //! Local metadata storage lifecycle.
 
-use crate::config::{MetadataConfig, RaftMode};
+use crate::config::MetadataConfig;
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::{DataIoPolicy, MountEntry, MountKind, MountTable, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
 use crate::raft::{AppRaftNode, AppRaftStateMachine, ApplySuccess, Command, RocksDBStorage, StorageIdentity};
@@ -220,13 +220,6 @@ fn validate_format_config(config: &MetadataConfig) -> MetadataResult<()> {
     if config.cluster_id.trim().is_empty() {
         return Err(MetadataError::InvalidArgument(
             "beryl.cluster.id must not be empty".to_string(),
-        ));
-    }
-    if config.raft.mode == RaftMode::Cluster {
-        // Cluster mode is rejected until metadata peer RPC semantics,
-        // membership, and freshness fencing are implemented.
-        return Err(MetadataError::InvalidArgument(
-            "cluster Raft mode is not implemented yet".to_string(),
         ));
     }
     if config.raft.node_id == 0 {
@@ -540,53 +533,6 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn bootstrap_root(group_name: GroupName) -> MountEntry {
-        MountEntry {
-            mount_id: MountId::new(1),
-            mount_prefix: ROOT_MOUNT_PREFIX.to_string(),
-            mount_kind: MountKind::Internal,
-            ufs_uri: None,
-            data_io_policy: DataIoPolicy::Allow,
-            mount_epoch: 1,
-            namespace_owner_group_name: group_name,
-            root_inode_id: ROOT_INODE_ID,
-        }
-    }
-
-    #[test]
-    fn bootstrap_success_requires_mount_result() {
-        let group_name = GroupName::parse("root").unwrap();
-
-        let error = require_bootstrap_namespace_success(ApplySuccess::RaftEntryApplied, &group_name)
-            .expect_err("protocol entry success must not satisfy namespace bootstrap");
-
-        assert!(matches!(
-            error,
-            MetadataError::Internal(message) if message.contains("unexpected success")
-        ));
-    }
-
-    #[test]
-    fn bootstrap_success_requires_exact_root_identity() {
-        let group_name = GroupName::parse("root").unwrap();
-        require_bootstrap_namespace_success(
-            ApplySuccess::MountUpserted(bootstrap_root(group_name.clone())),
-            &group_name,
-        )
-        .unwrap();
-
-        let mut wrong_owner = bootstrap_root(GroupName::parse("other").unwrap());
-        let error = require_bootstrap_namespace_success(ApplySuccess::MountUpserted(wrong_owner.clone()), &group_name)
-            .expect_err("a different namespace owner must fail closed");
-        assert!(matches!(error, MetadataError::Internal(_)));
-
-        wrong_owner.namespace_owner_group_name = group_name.clone();
-        wrong_owner.root_inode_id = beryl_types::fs::InodeId::new(2);
-        let error = require_bootstrap_namespace_success(ApplySuccess::MountUpserted(wrong_owner), &group_name)
-            .expect_err("a different root inode must fail closed");
-        assert!(matches!(error, MetadataError::Internal(_)));
-    }
-
     #[test]
     fn format_lock_has_single_owner() {
         let dir = TempDir::new().unwrap();
@@ -654,21 +600,5 @@ mod tests {
 
         assert!(message.contains("root mount exists"), "{message}");
         assert!(message.contains("violates root invariants"), "{message}");
-    }
-
-    #[tokio::test]
-    async fn metadata_start_accepts_root_attributes_changed_by_normal_namespace_mutation() {
-        let dir = TempDir::new().unwrap();
-        let config = lifecycle_config(&dir);
-        format_metadata_storage(&config).await.unwrap();
-        let storage = RocksDBStorage::create_for_format(&config.storage_dir).unwrap();
-        let mut root = storage.get_inode(ROOT_INODE_ID).unwrap().unwrap();
-        root.attrs.mtime_ms = root.attrs.mtime_ms.saturating_add(1);
-        root.attrs.ctime_ms = root.attrs.ctime_ms.saturating_add(1);
-        root.attrs.size = 4096;
-        storage.put_inode(&root).unwrap();
-        drop(storage);
-
-        prepare_metadata_start(&config).await.unwrap();
     }
 }

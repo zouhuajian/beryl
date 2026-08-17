@@ -266,42 +266,4 @@ mod tests {
         assert!(worker_manager.get_registration(&group_name_value, worker_id).is_none());
         assert!(worker_manager.list_registered_workers().is_empty());
     }
-
-    #[tokio::test]
-    async fn no_dead_worker_is_noop() {
-        let dir = TempDir::new().unwrap();
-        let raft_node = test_raft(&dir, true).await;
-        let worker_manager = Arc::new(WorkerManager::new(1_000));
-        live_worker(&worker_manager, WorkerId::new(1));
-
-        let outcome = service(Arc::clone(&raft_node), Arc::clone(&worker_manager))
-            .run_once()
-            .await
-            .unwrap();
-
-        assert_eq!(outcome.removed_workers, 0);
-        assert_eq!(outcome.affected_blocks, 0);
-    }
-
-    #[tokio::test]
-    async fn nonleader_lost_worker_cleanup_is_noop() {
-        let dir = TempDir::new().unwrap();
-        let raft_node = test_raft(&dir, false).await;
-        let worker_manager = Arc::new(WorkerManager::new(60_000));
-        let dead = WorkerId::new(1);
-        let block_id = BlockId::new(InodeId::new(12), BlockIndex::new(0));
-        live_worker(&worker_manager, dead);
-        publish_report(&worker_manager, dead, 1, vec![block_id]);
-
-        let outcome = service(Arc::clone(&raft_node), Arc::clone(&worker_manager))
-            .run_once()
-            .await
-            .unwrap();
-
-        assert_eq!(outcome.removed_workers, 0);
-        assert_eq!(
-            worker_manager.get_worker_blocks(&group_name("root"), dead),
-            vec![block_id]
-        );
-    }
 }

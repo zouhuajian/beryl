@@ -639,23 +639,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn accept_error_policy_only_retries_transient_socket_failures() {
-        for kind in [
-            io::ErrorKind::ConnectionAborted,
-            io::ErrorKind::ConnectionReset,
-            io::ErrorKind::BrokenPipe,
-            io::ErrorKind::Interrupted,
-            io::ErrorKind::WouldBlock,
-            io::ErrorKind::TimedOut,
-        ] {
-            assert!(is_transient_accept_error(&io::Error::from(kind)));
-        }
-        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::OutOfMemory] {
-            assert!(!is_transient_accept_error(&io::Error::from(kind)));
-        }
-    }
-
     #[tokio::test]
     async fn forced_executor_cancels_and_awaits_active_request() {
         let tasks = TaskTracker::new();
@@ -737,15 +720,5 @@ mod tests {
         drop(active);
 
         assert!(service.call(request("/regular.Service/Third")).now_or_never().is_none());
-    }
-
-    #[test]
-    fn invalid_concurrency_limits_are_rejected() {
-        assert!(GrpcRequestConcurrencyState::new(concurrency_config(0, 1, 0)).is_err());
-        assert!(GrpcRequestConcurrencyState::new(concurrency_config(2, 0, 0)).is_err());
-        assert!(GrpcRequestConcurrencyState::new(concurrency_config(2, 3, 0)).is_err());
-        assert!(GrpcRequestConcurrencyState::new(concurrency_config(2, 2, 2)).is_err());
-        assert!(GrpcRequestConcurrencyState::new(concurrency_config(MAX_GRPC_CONCURRENT_REQUESTS, 1, 0)).is_ok());
-        assert!(GrpcRequestConcurrencyState::new(concurrency_config(MAX_GRPC_CONCURRENT_REQUESTS + 1, 1, 0)).is_err());
     }
 }

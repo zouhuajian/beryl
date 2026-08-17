@@ -450,7 +450,7 @@ pub(crate) mod tests {
                     response: Err(rejection),
                     ..
                 }) => Err(rejection.into_metadata_error()),
-                Err(fatal) => Err(fatal.into_inner()),
+                Err(fatal) => Err(fatal.as_inner().clone()),
             }
         }
     }
@@ -483,13 +483,6 @@ pub(crate) mod tests {
     pub(crate) fn expect_delete_applied(raw: ApplySuccess) {
         assert!(
             matches!(&raw, ApplySuccess::DeleteApplied),
-            "unexpected apply response: {raw:?}"
-        );
-    }
-
-    pub(crate) fn expect_rename_applied(raw: ApplySuccess) {
-        assert!(
-            matches!(&raw, ApplySuccess::RenameApplied),
             "unexpected apply response: {raw:?}"
         );
     }

@@ -12,7 +12,7 @@ pub mod observe;
 pub mod runtime;
 pub mod store;
 
-pub use data::core::{RangeMapper, StorageChunkSlice, WorkerCore, WorkerCoreResult};
+pub use data::core::{WorkerCore, WorkerCoreResult};
 pub use error::{ErrorMetadata, WorkerError};
 pub use runtime::block::BlockManager;
 pub use store::block::{ReclaimBlockRequest, ReclaimBlockResult};

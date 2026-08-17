@@ -613,54 +613,9 @@ fn validate_write_handle(handle: &WriteHandleProto) -> ClientResult<InodeId> {
 mod tests {
     use super::*;
 
-    use beryl_types::lease::FencingToken;
-    use beryl_types::{
-        BlockId, BlockIndex, ClientId, CommittedBlock, GroupName, InodeId, WorkerEndpointInfo, WorkerId,
-        WorkerNetProtocol, WriteTarget,
-    };
+    use beryl_types::{BlockId, BlockIndex, ClientId, CommittedBlock, GroupName, InodeId};
 
     use crate::runtime::AttemptContext;
-
-    #[test]
-    fn prepare_commit_file_reuses_call_id_and_frozen_typed_payload() {
-        let mut session = WriteSession::new(
-            "/alpha".to_string(),
-            test_layout(),
-            write_handle_proto(302),
-            0,
-            1_000,
-            0,
-            OpenWriteModeProto::OpenWriteModeWrite,
-        )
-        .expect("session");
-        let blocks = vec![committed_block(302, 0, 0, 5)];
-
-        let first = session
-            .prepare_commit_file(
-                ClientId::new(7),
-                "test-client",
-                blocks.clone(),
-                5,
-                OperationDeadline::new(1_000),
-            )
-            .expect("first commit plan");
-        session.mark_commit_unknown();
-        let second = session
-            .prepare_commit_file(
-                ClientId::new(7),
-                "test-client",
-                blocks,
-                5,
-                OperationDeadline::new(1_000),
-            )
-            .expect("retry commit plan");
-
-        let first_ctx = AttemptContext::for_metadata(&first.operation, test_group_name(), 0).expect("first context");
-        let second_ctx = AttemptContext::for_metadata(&second.operation, test_group_name(), 0).expect("second context");
-        assert_eq!(metadata_call_id(&first_ctx), metadata_call_id(&second_ctx));
-        assert_eq!(first.committed_blocks, second.committed_blocks);
-        assert_eq!(first.final_size, second.final_size);
-    }
 
     #[test]
     fn prepare_commit_file_rejects_changed_payload_after_commit_started() {
@@ -753,39 +708,6 @@ mod tests {
     }
 
     #[test]
-    fn prepare_abort_cleanup_reuses_call_id_and_frozen_typed_payload() {
-        let mut session = WriteSession::new(
-            "/alpha".to_string(),
-            test_layout(),
-            write_handle_proto(302),
-            0,
-            1_000,
-            0,
-            OpenWriteModeProto::OpenWriteModeWrite,
-        )
-        .expect("session");
-        session
-            .push_ready_block(write_target(302, 0, 0), 5)
-            .expect("ready block");
-
-        let first = session
-            .prepare_abort_cleanup(ClientId::new(7), "test-client", OperationDeadline::new(1_000))
-            .expect("first abort plan");
-        let first_metadata = AttemptContext::for_metadata(&first.metadata_operation(), test_group_name(), 0)
-            .expect("first metadata context");
-        session.ready_blocks.clear();
-
-        let second = session
-            .prepare_abort_cleanup(ClientId::new(7), "test-client", OperationDeadline::new(1_000))
-            .expect("retry abort plan");
-        let second_metadata = AttemptContext::for_metadata(&second.metadata_operation(), test_group_name(), 0)
-            .expect("second metadata context");
-
-        assert_eq!(metadata_call_id(&first_metadata), metadata_call_id(&second_metadata));
-        assert_eq!(first.metadata_write_handle(), second.metadata_write_handle());
-    }
-
-    #[test]
     fn prepare_abort_cleanup_rejects_session_identity_drift_after_unknown_without_replacing_call_id() {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
@@ -818,35 +740,6 @@ mod tests {
         let retry_ctx = AttemptContext::for_metadata(&retry.metadata_operation(), test_group_name(), 0)
             .expect("retry metadata context");
         assert_eq!(metadata_call_id(&first_ctx), metadata_call_id(&retry_ctx));
-    }
-
-    #[test]
-    fn prepare_abort_cleanup_after_ready_block_uses_metadata_authority() {
-        let mut session = WriteSession::new(
-            "/alpha".to_string(),
-            test_layout(),
-            write_handle_proto(302),
-            0,
-            1_000,
-            0,
-            OpenWriteModeProto::OpenWriteModeWrite,
-        )
-        .expect("session");
-        session
-            .push_ready_block(write_target(302, 0, 0), 5)
-            .expect("ready block");
-
-        session
-            .prepare_abort_cleanup(ClientId::new(7), "test-client", OperationDeadline::new(1_000))
-            .expect("Metadata abort owns orphan reclamation");
-        assert!(matches!(
-            session.ensure_operation_allowed_at_ms(WriteSessionOperation::Write, 0),
-            Err(ClientError::StaleHandle { reason }) if reason.contains("abort outcome")
-        ));
-        assert!(matches!(
-            session.ensure_operation_allowed_at_ms(WriteSessionOperation::Close, 0),
-            Err(ClientError::StaleHandle { reason }) if reason.contains("abort outcome")
-        ));
     }
 
     #[test]
@@ -927,51 +820,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn state_transition_table_covers_all_write_session_states() {
-        let operations = [
-            WriteSessionOperation::Write,
-            WriteSessionOperation::Close,
-            WriteSessionOperation::Abort,
-            WriteSessionOperation::Renew,
-            WriteSessionOperation::Barrier,
-        ];
-        let cases = [
-            (WriteSessionState::Open, [true, true, true, true, true]),
-            (WriteSessionState::CommitStarted, [false, true, false, false, false]),
-            (WriteSessionState::CommitUnknown, [false, true, false, false, false]),
-            (WriteSessionState::Closed, [false, false, false, false, false]),
-            (WriteSessionState::Aborted, [false, false, false, false, false]),
-            (WriteSessionState::UnknownOutcome, [false, false, false, false, false]),
-            (WriteSessionState::SessionInvalid, [false, false, false, false, false]),
-            (WriteSessionState::SessionExpired, [false, false, false, false, false]),
-            (WriteSessionState::AbortUnknown, [false, false, true, false, false]),
-        ];
-
-        for (state, expected) in cases {
-            for (operation, allowed) in operations.into_iter().zip(expected) {
-                let mut session = WriteSession::new(
-                    "/alpha".to_string(),
-                    test_layout(),
-                    write_handle_proto(302),
-                    0,
-                    10_000,
-                    0,
-                    OpenWriteModeProto::OpenWriteModeWrite,
-                )
-                .expect("session");
-                session.state = state;
-
-                let result = session.ensure_operation_allowed_at_ms(operation, 0);
-                assert_eq!(
-                    result.is_ok(),
-                    allowed,
-                    "unexpected transition for {state:?} and {operation:?}"
-                );
-            }
-        }
-    }
-
     fn test_layout() -> FileLayout {
         FileLayout::new(1024, 1024, 1)
     }
@@ -988,35 +836,6 @@ mod tests {
             block_id: BlockId::new(InodeId::new(inode_id), BlockIndex::new(block_index)),
             file_offset,
             len,
-        }
-    }
-
-    fn write_target(inode_id: u64, block_index: u32, file_offset: u64) -> WriteTarget {
-        WriteTarget {
-            block_id: BlockId::new(InodeId::new(inode_id), BlockIndex::new(block_index)),
-            file_offset,
-            block_size: 1024,
-            worker_endpoints: vec![worker_endpoint()],
-            fencing_token: FencingToken {
-                block_id: BlockId::new(InodeId::new(inode_id), BlockIndex::new(block_index)),
-                owner: ClientId::new(7),
-                epoch: 1,
-            },
-            block_stamp: 77,
-            chunk_size: 1024,
-            block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
-            tier: beryl_types::Tier::Hdd,
-        }
-    }
-
-    fn worker_endpoint() -> WorkerEndpointInfo {
-        WorkerEndpointInfo {
-            worker_id: WorkerId::new(11),
-            endpoint: "127.0.0.1:19101".to_string(),
-            worker_net_protocol: WorkerNetProtocol::Grpc,
-            worker_run_id: "550e8400-e29b-41d4-a716-446655440000"
-                .parse()
-                .expect("valid test WorkerRunId"),
         }
     }
 

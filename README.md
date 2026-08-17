@@ -18,7 +18,7 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
 - Data made visible by metadata is Beryl resident data.
 - Namespace delete removes the metadata namespace entry and visible layout; physical blocks are reclaimed asynchronously after the configured cleanup grace.
 - Metadata dispatches report-derived cleanup commands through worker heartbeats by default; workers fence readers, validate block stamps, and reclaim exact local block versions with crash recovery.
-- External storage integration is adapter-only today, not the active read/write path.
+- External storage integration is not implemented in the current workspace.
 
 ## Architecture
 
@@ -31,9 +31,6 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
 - Worker
   - Stores local blocks and executes read/write streams.
   - Handles block commit, abort, sync, heartbeat, and block reports.
-- External storage / UFS boundary
-  - Provides the adapter boundary for external backends.
-  - Current reads and writes do not use it.
 - Shared crates
   - `beryl-types`, `beryl-common`, and `beryl-proto` provide stable domain values, shared infrastructure, and wire contracts.
 
@@ -45,7 +42,7 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
 - Reads and writes currently go through metadata-authorized worker storage.
 - Worker registration, heartbeat, and full block-report convergence are active runtime paths.
 - `route_epoch`, `mount_epoch`, and `GroupStateWatermark` are active freshness checks.
-- UFS is present as an adapter boundary, but current reads and writes do not use it.
+- UFS-backed IO and external backend adapters are not implemented.
 - Multi-group metadata is future work.
 - The internal writable namespace is rooted at `/`; `/local` has no special namespace semantics.
 
@@ -74,7 +71,7 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
 
 - Recursive listing is not supported; metadata rejects recursive list requests.
 - Namespace delete and worker-side physical reclamation are active. Cleanup dispatch is enabled by default and can be disabled through metadata configuration.
-- UFS remains an adapter boundary; active UFS read-through/write-through is future work.
+- UFS read-through/write-through and its adapter boundary are deferred future work.
 - Admin and metadata-peer schemas are not active runtime services.
 - Multi-group metadata, multiple metadata leaders, and metadata peer RPC are future work.
 - Worker peer transfer and alternate worker transports such as QUIC or RDMA are future work.
@@ -89,7 +86,7 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
   publication procedure.
 - Keep the supported Rust client -> metadata -> worker path stable under default validation.
 - Complete recovery soak and controlled default enablement for resident-block reclamation.
-- Design UFS read-through/write-through integration without changing metadata-owned visibility.
+- Reintroduce an external adapter only with a complete, metadata-authorized read-through design.
 - Design multi-group metadata, metadata peer RPC, admin APIs, and ecosystem compatibility as future product work.
 - Design replication, repair, and rebalancing only as complete future lifecycles.
 
@@ -120,10 +117,6 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
 - `beryl-client`
   - Rust native API and orchestration for metadata and worker RPCs.
   - Does not provide POSIX, FUSE, or Hadoop compatibility today.
-- `beryl-ufs`
-  - External backend adapter boundary.
-  - Current reads and writes do not use it.
-
 ## Quick Start
 
 Beryl requires local metadata and worker configuration. The repository provides one local-ready default profile.

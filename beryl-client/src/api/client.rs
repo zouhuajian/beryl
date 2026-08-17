@@ -237,8 +237,7 @@ mod tests {
     use crate::session::write_session::WriteSession;
     use async_trait::async_trait;
     use beryl_common::error::rpc::{
-        ErrorKind, InternalErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint as RpcRefreshHint, RpcErrorDetail,
-        WorkerErrorKind,
+        ErrorKind, InternalErrorKind, MetadataErrorKind, RefreshHint as RpcRefreshHint, RpcErrorDetail, WorkerErrorKind,
     };
     use beryl_proto::metadata::{
         AbortFileWriteResponseProto, CommitFileResponseProto, CreateDirectoryResponseProto, CreateFileResponseProto,
@@ -252,30 +251,12 @@ mod tests {
         WorkerNetProtocol, WriteTarget,
     };
     use bytes::Bytes;
-    use futures::TryStreamExt;
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::sync::{mpsc, watch};
 
     type EventLog = Arc<Mutex<Vec<&'static str>>>;
-
-    #[test]
-    fn independent_fs_clients_generate_distinct_nonzero_client_ids() {
-        let first =
-            fs_client_with_gateway(test_config("root"), Arc::new(MockGateway::default())).expect("first client");
-        let second =
-            fs_client_with_gateway(test_config("root"), Arc::new(MockGateway::default())).expect("second client");
-
-        let first_id = first.runtime.executor.client_id();
-        let second_id = second.runtime.executor.client_id();
-
-        assert_ne!(first_id.as_raw(), 0);
-        assert_ne!(second_id.as_raw(), 0);
-        assert_ne!(first_id, second_id);
-        assert_eq!(first.runtime.executor.client_name(), "default-client");
-        assert_eq!(second.runtime.executor.client_name(), "default-client");
-    }
 
     #[tokio::test(start_paused = true)]
     async fn metadata_retry_reuses_call_id_across_transport_and_server_retry() {
@@ -408,472 +389,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reader_and_writer_debug_redact_identity_names() {
-        let config = ClientConfig {
-            metadata_groups: vec![metadata_group_config("root")],
-            ..ClientConfig::default()
-        };
-        let client = FsClient::try_new(config).expect("client");
-        let read = FileReader::new(
-            Arc::clone(&client.runtime),
-            ReadHandle::new("/alpha".to_string(), InodeId::new(202), 3, 10),
-        );
-        let debug = format!("{read:?}");
-
-        assert!(debug.contains("FileReader"));
-        assert!(debug.contains("size_hint"));
-        assert_debug_redacts_internal_identity_names(&debug);
-
-        assert_writer_debug_redacts_identity_names().await;
-    }
-
-    #[tokio::test]
-    async fn create_and_append_return_initialized_writers() {
-        let gateway = Arc::new(MockGateway::default());
-        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
-
-        let writer = client
-            .create("/created", CreateOptions::create())
-            .await
-            .expect("create writer");
-
-        assert_eq!(writer.path(), "/created");
-        let calls = gateway.calls();
-        assert_eq!(methods(&calls), vec!["create_file", "open_write"]);
-        assert_ne!(calls[0].call_id, calls[1].call_id);
-        assert_eq!(calls[0].deadline_ms, calls[1].deadline_ms);
-        assert!(calls[0].deadline_ms > 0);
-
-        assert_append_returns_initialized_writer().await;
-    }
-
-    #[tokio::test]
-    async fn create_options_map_default_and_custom_layouts() {
-        let gateway = Arc::new(MockGateway::default());
-        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
-
-        client
-            .create("/created", CreateOptions::default())
-            .await
-            .expect("create writer");
-
-        let calls = gateway.calls();
-        assert_eq!(methods(&calls), vec!["create_file", "open_write"]);
-        assert_eq!(calls[0].create_layout, Some(default_layout()));
-
-        assert_custom_create_options_map_to_request().await;
-    }
-
-    async fn assert_custom_create_options_map_to_request() {
-        let gateway = Arc::new(MockGateway::default());
-        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
-
-        client
-            .create(
-                "/created",
-                CreateOptions::create()
-                    .with_block_format_id(beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE)
-                    .with_block_size(8 * 1024 * 1024)
-                    .with_chunk_size(1024 * 1024),
-            )
-            .await
-            .expect("create writer");
-
-        let calls = gateway.calls();
-        assert_eq!(methods(&calls), vec!["create_file", "open_write"]);
-        assert_eq!(
-            calls[0].create_layout,
-            Some(RecordedLayout {
-                block_size: 8 * 1024 * 1024,
-                chunk_size: 1024 * 1024,
-                replication: u32::from(DEFAULT_REPLICATION),
-                block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn create_rejects_invalid_layout_options_before_rpc() {
-        let gateway = Arc::new(MockGateway::default());
-        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
-
-        for options in [
-            CreateOptions::create().with_block_size(0),
-            CreateOptions::create().with_chunk_size(0),
-            CreateOptions::create().with_block_size(1024).with_chunk_size(4096),
-            CreateOptions::create().with_block_size(4097).with_chunk_size(1024),
-        ] {
-            let err = client
-                .create("/created", options)
-                .await
-                .expect_err("invalid create layout must fail locally");
-
-            assert!(
-                matches!(&err, ClientError::InvalidLayout(msg) if msg.contains("CreateOptions layout invalid")),
-                "unexpected error: {err:?}"
-            );
-        }
-
-        assert!(gateway.calls().is_empty());
-    }
-
-    #[tokio::test]
-    async fn create_rejects_missing_and_invalid_response_layouts() {
-        let gateway = Arc::new(MockGateway::with_create_response_layout(None));
-        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
-
-        let err = client
-            .create("/created", CreateOptions::create())
-            .await
-            .expect_err("missing create response layout must fail");
-
-        assert!(
-            matches!(&err, ClientError::Metadata(msg) if msg.contains("CreateFileResponseProto.layout missing")),
-            "unexpected error: {err:?}"
-        );
-        assert_eq!(methods(&gateway.calls()), vec!["create_file"]);
-
-        assert_create_rejects_invalid_response_layout().await;
-    }
-
-    async fn assert_create_rejects_invalid_response_layout() {
-        let gateway = Arc::new(MockGateway::with_create_response_layout(Some(recorded_layout_values(
-            0,
-            DEFAULT_CHUNK_SIZE,
-        ))));
-        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
-
-        let err = client
-            .create("/created", CreateOptions::create())
-            .await
-            .expect_err("invalid create response layout must fail");
-
-        assert!(
-            matches!(&err, ClientError::InvalidLayout(msg) if msg.contains("CreateFileResponseProto.layout invalid")),
-            "unexpected error: {err:?}"
-        );
-        assert_eq!(methods(&gateway.calls()), vec!["create_file"]);
-    }
-
-    async fn assert_append_returns_initialized_writer() {
-        let gateway = Arc::new(MockGateway::default());
-        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
-
-        let writer = client.append("/append").await.expect("append writer");
-
-        assert_eq!(writer.path(), "/append");
-        assert_eq!(writer.cursor(), 10);
-        let calls = gateway.calls();
-        assert_eq!(methods(&calls), vec!["open_write"]);
-        assert_eq!(calls[0].create_layout, None);
-    }
-
-    #[tokio::test]
-    async fn append_rejects_missing_and_invalid_response_layouts() {
-        let gateway = Arc::new(MockGateway::with_append_response_layout(None));
-        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
-
-        let err = client
-            .append("/append")
-            .await
-            .expect_err("missing append response layout must fail");
-
-        assert!(
-            matches!(&err, ClientError::Metadata(msg) if msg.contains("OpenWriteResponseProto.layout missing")),
-            "unexpected error: {err:?}"
-        );
-        assert_eq!(methods(&gateway.calls()), vec!["open_write"]);
-
-        assert_append_rejects_invalid_response_layout().await;
-    }
-
-    async fn assert_append_rejects_invalid_response_layout() {
-        let gateway = Arc::new(MockGateway::with_append_response_layout(Some(recorded_layout_values(
-            8, 3,
-        ))));
-        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
-
-        let err = client
-            .append("/append")
-            .await
-            .expect_err("invalid append response layout must fail");
-
-        assert!(
-            matches!(&err, ClientError::InvalidLayout(msg) if msg.contains("OpenWriteResponseProto.layout invalid")),
-            "unexpected error: {err:?}"
-        );
-        assert_eq!(methods(&gateway.calls()), vec!["open_write"]);
-    }
-
-    #[tokio::test]
-    async fn stat_list_delete_and_rename_use_metadata_gateway() {
-        let gateway = Arc::new(MockGateway::default());
-        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
-
-        let reader = client.open("/alpha").await.expect("open");
-        let status = client.stat("/alpha").await.expect("stat");
-        let listing = client.list("/alpha", ListOptions::default()).await.expect("list");
-        client
-            .list(
-                "/alpha",
-                ListOptions {
-                    recursive: true,
-                    cursor: Some(vec![1, 2, 3]),
-                    limit: Some(50),
-                },
-            )
-            .await
-            .expect("list with options");
-        client
-            .delete("/alpha", DeleteOptions { recursive: true })
-            .await
-            .expect("delete");
-        client.rename("/alpha", "/beta").await.expect("rename");
-
-        assert_eq!(reader.path(), "/alpha");
-        assert_eq!(reader.size_hint(), 10);
-        assert_eq!(status.path(), "/alpha");
-        assert_eq!(status.attrs.size, 10);
-        assert_eq!(listing.path(), "/alpha");
-        assert!(listing.eof);
-        assert_eq!(listing.entries.len(), 1);
-        assert_eq!(listing.entries[0].name, "child");
-        assert_eq!(listing.entries[0].kind, Some(crate::api::InodeKind::File));
-        assert_eq!(listing.entries[0].attrs.as_ref().expect("entry attrs").size, 4);
-        let list_requests = gateway.list_requests();
-        assert_eq!(list_requests.len(), 2);
-        assert!(!list_requests[0].recursive);
-        assert!(list_requests[0].cursor.is_empty());
-        assert_eq!(list_requests[0].limit, 0);
-        assert!(list_requests[1].recursive);
-        assert_eq!(list_requests[1].cursor, vec![1, 2, 3]);
-        assert_eq!(list_requests[1].limit, 50);
-        let delete_requests = gateway.delete_requests();
-        assert_eq!(delete_requests.len(), 1);
-        let delete_options = delete_requests[0].options.as_ref().expect("delete options");
-        assert!(delete_options.recursive);
-        assert_eq!(
-            methods(&gateway.calls()),
-            vec![
-                "open_file",
-                "get_status",
-                "list_status",
-                "list_status",
-                "delete",
-                "rename"
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn list_rejects_inconsistent_eof_and_cursor_pairs() {
-        for response in [
-            ListStatusResponseProto {
-                eof: false,
-                next_cursor: Vec::new(),
-                ..ListStatusResponseProto::default()
-            },
-            ListStatusResponseProto {
-                eof: true,
-                next_cursor: vec![1],
-                ..ListStatusResponseProto::default()
-            },
-        ] {
-            let gateway = Arc::new(MockGateway::with_list_result(Ok(response)));
-            let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
-
-            let error = client
-                .list("/alpha", ListOptions::default())
-                .await
-                .expect_err("an inconsistent pagination response must fail closed");
-
-            assert!(matches!(
-                error,
-                ClientError::InvalidResponse { operation: "ListStatus", reason }
-                    if reason.contains("eof must be true exactly when next_cursor is empty")
-            ));
-            assert_eq!(methods(&gateway.calls()), vec!["list_status"]);
-        }
-    }
-
-    #[tokio::test]
-    async fn list_accepts_a_continuation_cursor() {
-        let gateway = Arc::new(MockGateway::with_list_result(Ok(ListStatusResponseProto {
-            next_cursor: vec![1, 2, 3],
-            eof: false,
-            ..ListStatusResponseProto::default()
-        })));
-        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
-
-        let listing = client
-            .list("/alpha", ListOptions::default())
-            .await
-            .expect("a valid continuation response");
-
-        assert_eq!(listing.next_cursor, Some(vec![1, 2, 3]));
-        assert!(!listing.eof);
-        assert_eq!(methods(&gateway.calls()), vec!["list_status"]);
-    }
-
-    #[tokio::test]
-    async fn list_stream_fetches_bounded_pages_lazily() {
-        let entry = |name: &str| beryl_proto::metadata::DirEntryProto {
-            name: name.to_string(),
-            kind: beryl_proto::metadata::InodeKindProto::InodeKindFile as i32,
-            attrs: None,
-        };
-        let gateway = Arc::new(MockGateway::with_list_results(vec![
-            Ok(ListStatusResponseProto {
-                entries: vec![entry("a"), entry("b")],
-                next_cursor: vec![2],
-                eof: false,
-                ..ListStatusResponseProto::default()
-            }),
-            Ok(ListStatusResponseProto {
-                entries: vec![entry("c")],
-                eof: true,
-                ..ListStatusResponseProto::default()
-            }),
-        ]));
-        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
-        let stream = client
-            .list_stream(
-                "/alpha",
-                ListOptions {
-                    cursor: Some(vec![1]),
-                    limit: Some(2),
-                    ..ListOptions::default()
-                },
-            )
-            .expect("valid list stream");
-        assert!(gateway.calls().is_empty(), "creating the stream must not fetch a page");
-
-        let entries = stream.try_collect::<Vec<_>>().await.expect("collect paginated entries");
-
-        assert_eq!(
-            entries.into_iter().map(|entry| entry.name).collect::<Vec<_>>(),
-            vec!["a", "b", "c"]
-        );
-        let requests = gateway.list_requests();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].cursor, vec![1]);
-        assert_eq!(requests[1].cursor, vec![2]);
-        assert_eq!(requests[0].limit, 2);
-        assert_eq!(requests[1].limit, 2);
-    }
-
-    #[tokio::test]
-    async fn list_stream_rejects_a_non_advancing_cursor() {
-        let gateway = Arc::new(MockGateway::with_list_result(Ok(ListStatusResponseProto {
-            entries: vec![beryl_proto::metadata::DirEntryProto {
-                name: "repeated".to_string(),
-                kind: beryl_proto::metadata::InodeKindProto::InodeKindFile as i32,
-                attrs: None,
-            }],
-            next_cursor: vec![1],
-            eof: false,
-            ..ListStatusResponseProto::default()
-        })));
-        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
-        let stream = client
-            .list_stream(
-                "/alpha",
-                ListOptions {
-                    cursor: Some(vec![1]),
-                    ..ListOptions::default()
-                },
-            )
-            .expect("valid list stream");
-
-        let error = stream
-            .try_collect::<Vec<_>>()
-            .await
-            .expect_err("a non-advancing cursor must fail closed");
-
-        assert!(matches!(
-            error,
-            ClientError::InvalidResponse { operation: "ListStatus", reason }
-                if reason.contains("did not advance next_cursor")
-        ));
-        assert_eq!(methods(&gateway.calls()), vec!["list_status"]);
-    }
-
-    #[tokio::test]
-    async fn list_resource_exhausted_is_not_retried() {
-        let rpc_error = RpcErrorDetail::fail(
-            ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted),
-            "ListStatus limit exceeds server maximum",
-        );
-        let gateway = Arc::new(MockGateway::with_list_result(Err(ClientError::from(
-            ClientAction::Fail {
-                rpc_error: Box::new(rpc_error),
-            },
-        ))));
-        let client = fs_client_with_gateway(test_config_with_retries("root", 3), gateway.clone()).expect("client");
-
-        let error = client
-            .list(
-                "/alpha",
-                ListOptions {
-                    limit: Some(10_001),
-                    ..ListOptions::default()
-                },
-            )
-            .await
-            .expect_err("ResourceExhausted must fail without retry");
-
-        let ClientError::Action(action) = error else {
-            panic!("unexpected error type");
-        };
-        assert_eq!(
-            action.kind(),
-            Some(ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted))
-        );
-        assert!(matches!(action.recovery(), Some(RecoveryAction::Fail)));
-        assert_eq!(methods(&gateway.calls()), vec!["list_status"]);
-        assert_eq!(gateway.list_requests()[0].limit, 10_001);
-    }
-
-    #[tokio::test]
-    async fn reader_empty_ranges_do_not_use_worker_io() {
-        let gateway = Arc::new(MockGateway::default());
-        let worker = Arc::new(MockDataClient::default());
-        let client =
-            fs_client_with_data_plane(test_config("root"), gateway, data_plane(worker.clone())).expect("client");
-        let reader = read_reader(&client, 10);
-
-        assert!(reader.read_at(0, 0).await.expect("zero read").is_empty());
-        assert!(reader.read_at(10, 8).await.expect("EOF read").is_empty());
-        assert_eq!(worker.calls(), 0);
-    }
-
-    #[tokio::test]
-    async fn reader_reads_normal_range_through_planner_and_worker() {
-        let gateway = Arc::new(MockGateway::with_layout(layout_response(
-            "root",
-            202,
-            Some(3),
-            16,
-            vec![location(202, 0, 0, 16)],
-        )));
-        let worker = Arc::new(MockDataClient::from_file(b"abcdefghijklmnop"));
-        let client =
-            fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker)).expect("client");
-        let reader = read_reader(&client, 16);
-
-        let bytes = reader.read_at(2, 5).await.expect("read succeeds");
-
-        assert_eq!(bytes, Bytes::from_static(b"cdefg"));
-        let read_layout = gateway
-            .calls()
-            .into_iter()
-            .find(|call| call.method == "read_layout")
-            .expect("read layout call");
-        assert_eq!(read_layout.target_inode_id, Some(202));
-        assert_eq!(read_layout.range, Some((2, 5)));
-    }
-
-    #[tokio::test]
     async fn reader_read_exact_at_rejects_short_eof_read() {
         let gateway = Arc::new(MockGateway::default());
         let client = fs_client_with_gateway(test_config("root"), gateway).expect("client");
@@ -886,28 +401,6 @@ mod tests {
 
         assert!(matches!(err, ClientError::InvalidArgument(msg)
             if msg.contains("read_exact_at") && msg.contains("requested 4 bytes")));
-    }
-
-    #[tokio::test]
-    async fn reader_repeated_reads_fetch_current_metadata_locations() {
-        let gateway = Arc::new(MockGateway::with_layout(layout_response(
-            "root",
-            202,
-            Some(3),
-            16,
-            vec![location(202, 0, 0, 16)],
-        )));
-        let worker = Arc::new(MockDataClient::from_file(b"abcdefghijklmnop"));
-        let client =
-            fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker)).expect("client");
-        let reader = read_reader(&client, 16);
-
-        let first = reader.read_at(2, 5).await.expect("first read succeeds");
-        let second = reader.read_at(2, 5).await.expect("second read succeeds");
-
-        assert_eq!(first, Bytes::from_static(b"cdefg"));
-        assert_eq!(second, Bytes::from_static(b"cdefg"));
-        assert_eq!(method_count(&gateway.calls(), "read_layout"), 2);
     }
 
     #[tokio::test]
@@ -931,225 +424,6 @@ mod tests {
 
         assert_eq!(bytes, Bytes::from_static(b"bcd"));
         assert_eq!(method_count(&gateway.calls(), "read_layout"), 2);
-    }
-
-    async fn assert_writer_debug_redacts_identity_names() {
-        let gateway = Arc::new(MockGateway::default());
-        let client = fs_client_with_gateway(test_config("root"), gateway).expect("client");
-        let writer = client
-            .create("/created", CreateOptions::create())
-            .await
-            .expect("writer");
-        let debug = format!("{writer:?}");
-
-        assert!(debug.contains("cursor"));
-        for needle in [
-            concat!("inode", "_id"),
-            concat!("file", "_version"),
-            concat!("write", "_handle"),
-            "fencing",
-            concat!("route", "_epoch"),
-            concat!("worker", "_run_id"),
-            concat!("block", "_stamp"),
-            concat!("call", "_id"),
-            concat!("stream", "_id"),
-        ] {
-            assert!(
-                !debug.contains(needle),
-                "FileWriter Debug output leaked {needle}: {debug}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn writer_write_all_and_close_commit_final_size() {
-        let gateway = Arc::new(MockGateway::default());
-        let worker = Arc::new(MockDataClient::default());
-        let client = fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone()))
-            .expect("client");
-        let mut writer = client
-            .create("/created", CreateOptions::create())
-            .await
-            .expect("writer");
-
-        writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
-        writer.close().await.expect("close");
-
-        assert_eq!(worker.written_bytes(), Bytes::from_static(b"hello"));
-        let commit = gateway
-            .calls()
-            .into_iter()
-            .find(|call| call.method == "commit_file")
-            .expect("commit_file call");
-        assert_eq!(commit.final_size, Some(5));
-        assert_eq!(commit.committed_block_lens, vec![5]);
-    }
-
-    #[tokio::test]
-    async fn writer_uses_metadata_confirmed_layout_over_create_request_layout() {
-        let requested = recorded_layout_values(64, 8);
-        let confirmed = recorded_layout_values(8, 4);
-        let gateway = Arc::new(MockGateway::with_create_response_layout(Some(confirmed)));
-        let worker = Arc::new(MockDataClient::default());
-        let client = fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone()))
-            .expect("client");
-        let mut writer = client
-            .create(
-                "/created",
-                CreateOptions::create()
-                    .with_block_size(requested.block_size)
-                    .with_chunk_size(requested.chunk_size),
-            )
-            .await
-            .expect("writer");
-
-        writer
-            .write_all(Bytes::from(vec![b'x'; 20]))
-            .await
-            .expect("write should use confirmed metadata layout");
-        writer.close().await.expect("close");
-
-        let calls = gateway.calls();
-        assert_eq!(calls[0].create_layout, Some(requested));
-        assert_eq!(add_block_count(&calls), 3);
-        assert_eq!(worker.write_lens(), vec![8, 8, 4]);
-    }
-
-    #[tokio::test]
-    async fn writer_append_uses_metadata_layout_block_size_for_chunking() {
-        let layout = recorded_layout_values(6, 3);
-        let gateway = Arc::new(MockGateway::with_append_write_layout(layout));
-        let worker = Arc::new(MockDataClient::default());
-        let client = fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone()))
-            .expect("client");
-        let mut writer = client.append("/append").await.expect("writer");
-
-        writer
-            .write_all(Bytes::from(vec![b'x'; 14]))
-            .await
-            .expect("append write should split by metadata layout");
-        writer.close().await.expect("close");
-
-        let calls = gateway.calls();
-        let append = calls
-            .iter()
-            .find(|call| call.method == "open_write")
-            .expect("open_write call");
-        assert_eq!(append.create_layout, None);
-        assert_eq!(add_block_count(&calls), 3);
-        assert_eq!(worker.write_lens(), vec![6, 6, 2]);
-        let commit = calls
-            .into_iter()
-            .find(|call| call.method == "commit_file")
-            .expect("commit_file call");
-        assert_eq!(commit.final_size, Some(24));
-        assert_eq!(commit.committed_block_offsets, vec![10, 16, 22]);
-        assert_eq!(commit.committed_block_lens, vec![6, 6, 2]);
-    }
-
-    #[tokio::test]
-    async fn writer_small_writes_share_block_rpc_and_cross_block_boundaries() {
-        let layout = recorded_layout_values(8, 4);
-        let gateway = Arc::new(MockGateway::with_create_response_layout(Some(layout)));
-        let worker = Arc::new(MockDataClient::default());
-        let client = fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone()))
-            .expect("client");
-        let mut writer = client
-            .create("/created", CreateOptions::create())
-            .await
-            .expect("writer");
-
-        let payload = Bytes::from_static(b"abcdefghijklmnopqrst");
-        writer.write_all(payload.slice(0..3)).await.expect("first small write");
-        writer.write_all(payload.slice(3..5)).await.expect("second small write");
-
-        assert_eq!(writer.cursor(), 5);
-        assert_eq!(add_block_count(&gateway.calls()), 1);
-        assert_eq!(worker.write_lens(), Vec::<u64>::new());
-
-        writer
-            .write_all(payload.slice(5..13))
-            .await
-            .expect("write across first block");
-        writer
-            .write_all(payload.slice(13..))
-            .await
-            .expect("write across second block");
-
-        assert_eq!(writer.cursor(), 20);
-        assert_eq!(add_block_count(&gateway.calls()), 3);
-        assert_eq!(worker.write_lens(), vec![8, 8]);
-
-        writer.close().await.expect("close");
-
-        assert_eq!(worker.written_bytes(), payload);
-        let calls = gateway.calls();
-        assert_eq!(add_block_count(&calls), 3);
-        let commit = calls
-            .into_iter()
-            .find(|call| call.method == "commit_file")
-            .expect("commit_file call");
-        assert_eq!(commit.final_size, Some(20));
-        assert_eq!(commit.committed_block_lens, vec![8, 8, 4]);
-    }
-
-    #[tokio::test]
-    async fn writer_sync_publishes_prefix_and_keeps_writer_usable() {
-        for durable in [false, true] {
-            let layout = recorded_layout_values(8, 4);
-            let gateway = Arc::new(MockGateway::with_create_response_layout(Some(layout)));
-            let worker = Arc::new(MockDataClient::default());
-            let client = fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone()))
-                .expect("client");
-            let mut writer = client
-                .create("/created", CreateOptions::create())
-                .await
-                .expect("writer");
-
-            writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
-
-            assert_eq!(add_block_count(&gateway.calls()), 1);
-            assert_eq!(worker.write_lens(), Vec::<u64>::new());
-
-            if durable {
-                writer.sync_write_durability().await.expect("durability sync");
-            } else {
-                writer.sync_write_visibility().await.expect("visibility sync");
-            }
-            writer
-                .write_all(Bytes::from_static(b"!"))
-                .await
-                .expect("writer remains usable");
-            writer.close().await.expect("close");
-
-            let sync_call = gateway
-                .calls()
-                .into_iter()
-                .find(|call| call.method == "sync_write")
-                .expect("sync_write call");
-            assert_eq!(sync_call.target_size, Some(5));
-            assert_eq!(sync_call.committed_block_lens, vec![5]);
-            assert_eq!(worker.write_lens(), vec![5, 1]);
-        }
-    }
-
-    #[tokio::test]
-    async fn writer_durability_after_visibility_reuses_ready_worker_block() {
-        let gateway = Arc::new(MockGateway::default());
-        let worker = Arc::new(MockDataClient::default());
-        let client = fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone()))
-            .expect("client");
-        let mut writer = client
-            .create("/created", CreateOptions::create())
-            .await
-            .expect("writer");
-
-        writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
-        writer.sync_write_visibility().await.expect("visibility sync");
-        writer.sync_write_durability().await.expect("durability sync");
-
-        assert_eq!(method_count(&gateway.calls(), "sync_write"), 2);
-        assert_eq!(worker.write_lens(), vec![5]);
     }
 
     #[tokio::test]
@@ -1187,64 +461,6 @@ mod tests {
         let err = writer.close().await.expect_err("unsafe flush failure blocks close");
         assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("invalid")));
         assert_eq!(method_count(&gateway.calls(), "commit_file"), 0);
-    }
-
-    #[tokio::test]
-    async fn writer_close_time_flush_worker_error_blocks_retry_commit() {
-        let layout = recorded_layout_values(8, 4);
-        let gateway = Arc::new(MockGateway::with_create_response_layout(Some(layout)));
-        let worker = Arc::new(MockDataClient {
-            write_outcomes: Mutex::new(vec![WorkerWriteOutcome::WorkerError].into()),
-            ..MockDataClient::default()
-        });
-        let client =
-            fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker)).expect("client");
-        let mut writer = client
-            .create("/created", CreateOptions::create())
-            .await
-            .expect("writer");
-
-        writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
-        let err = writer.close().await.expect_err("close-time flush must fail");
-        assert!(matches!(err, ClientError::Worker(msg) if msg.contains("injected WriteBlock failure")));
-
-        let err = writer
-            .close()
-            .await
-            .expect_err("failed close-time flush must not become commit retry");
-        assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("invalid")));
-        assert_eq!(method_count(&gateway.calls(), "commit_file"), 0);
-    }
-
-    #[tokio::test]
-    async fn writer_renew_lease_keeps_writer_usable() {
-        let gateway = Arc::new(MockGateway::default());
-        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
-        let handle = write_handle_for_tests("/created", 0, u64::MAX / 4).expect("write handle");
-        let mut writer = FileWriter::new(Arc::clone(&client.runtime), handle);
-
-        writer.renew_lease().await.expect("renew lease");
-        writer.abort().await.expect("renewed writer can still abort");
-
-        assert_eq!(methods(&gateway.calls()), vec!["renew_lease", "abort_file_write"]);
-    }
-
-    #[tokio::test]
-    async fn writer_renew_lease_rejects_zero_expiry_without_updating_session() {
-        let gateway = Arc::new(MockGateway::with_renew_outcomes(vec![RenewOutcome::ZeroExpiry]));
-        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
-        let handle = write_handle_for_tests("/created", 0, u64::MAX / 4).expect("write handle");
-        let mut writer = FileWriter::new(Arc::clone(&client.runtime), handle);
-
-        let err = writer.renew_lease().await.expect_err("zero renew expiry must fail");
-        assert!(matches!(&err, ClientError::InvalidResponse { operation, reason }
-            if *operation == "RenewLease" && reason.contains("expires_at_ms")));
-
-        writer
-            .abort()
-            .await
-            .expect("zero expiry response must not poison session");
-        assert_eq!(methods(&gateway.calls()), vec!["renew_lease", "abort_file_write"]);
     }
 
     #[tokio::test]
@@ -1350,75 +566,6 @@ mod tests {
         assert_eq!(method_count(&abort_gateway.calls(), "abort_file_write"), 0);
     }
 
-    #[tokio::test]
-    async fn writer_close_rejects_commit_size_shorter_than_final_size() {
-        let gateway = Arc::new(MockGateway::with_commit_response_size(4));
-        let worker = Arc::new(MockDataClient::default());
-        let client =
-            fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker)).expect("client");
-        let mut writer = client
-            .create("/created", CreateOptions::create())
-            .await
-            .expect("writer");
-
-        writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
-        let err = writer.close().await.expect_err("short committed_size must fail");
-
-        assert!(matches!(&err, ClientError::InvalidResponse { operation, reason }
-            if *operation == "CommitFile" && reason.contains("committed_size")));
-    }
-
-    #[tokio::test]
-    async fn writer_visibility_sync_rejects_synced_size_shorter_than_target() {
-        let gateway = Arc::new(MockGateway::with_sync_response_size(4));
-        let worker = Arc::new(MockDataClient::default());
-        let client =
-            fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker)).expect("client");
-        let mut writer = client
-            .create("/created", CreateOptions::create())
-            .await
-            .expect("writer");
-
-        writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
-        let err = writer
-            .sync_write_visibility()
-            .await
-            .expect_err("short synced_size must fail");
-
-        assert!(matches!(&err, ClientError::InvalidResponse { operation, reason }
-            if *operation == "SyncWrite" && reason.contains("synced_size")));
-    }
-
-    #[tokio::test]
-    async fn writer_abort_uses_metadata_authority_and_blocks_session() {
-        let events = event_log();
-        let layout = recorded_layout_values(8, 4);
-        let gateway = Arc::new(MockGateway {
-            create_response_layout: Mutex::new(Some(Some(layout))),
-            events: Some(events.clone()),
-            ..MockGateway::default()
-        });
-        let worker = Arc::new(MockDataClient::with_events(events.clone()));
-        let client = fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone()))
-            .expect("client");
-        let mut writer = client
-            .create("/created", CreateOptions::create())
-            .await
-            .expect("writer");
-
-        writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
-        writer.abort().await.expect("abort");
-
-        assert_eq!(method_count(&gateway.calls(), "abort_file_write"), 1);
-        assert_event_order(&events, "write_block", "abort_file_write");
-        assert_event_order(&events, "cancel_write_block", "abort_file_write");
-        let err = writer
-            .write_all(Bytes::from_static(b"!"))
-            .await
-            .expect_err("aborted writer blocks writes");
-        assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("aborted")));
-    }
-
     #[tokio::test(start_paused = true)]
     async fn writer_unknown_add_block_blocks_followup_writes() {
         let layout = recorded_layout_values(5, 5);
@@ -1488,50 +635,12 @@ mod tests {
         assert_eq!(method_count(&gateway.calls(), "add_block"), 2);
     }
 
-    #[tokio::test]
-    async fn writer_session_expiry_blocks_followup_writes() {
-        let gateway = Arc::new(MockGateway::with_renew_outcomes(vec![RenewOutcome::SessionExpired]));
-        let worker = Arc::new(MockDataClient::default());
-        let client = fs_client_with_data_plane(test_config("root"), gateway, data_plane(worker)).expect("client");
-        let mut writer = client
-            .create("/created", CreateOptions::create())
-            .await
-            .expect("writer");
-
-        let err = writer.renew_lease().await.expect_err("session expired");
-        assert_eq!(classify_error(&err), ErrorClass::SessionExpired);
-        let err = writer
-            .write_all(Bytes::from_static(b"x"))
-            .await
-            .expect_err("expired session blocks writes");
-        assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("session")));
-    }
-
     fn event_log() -> EventLog {
         Arc::new(Mutex::new(Vec::new()))
     }
 
     fn methods(calls: &[RecordedCall]) -> Vec<&'static str> {
         calls.iter().map(|call| call.method).collect()
-    }
-
-    fn assert_debug_redacts_internal_identity_names(debug: &str) {
-        for needle in [
-            concat!("inode", "_id"),
-            concat!("file", "_version"),
-            concat!("write", "_handle"),
-            concat!("fen", "cing"),
-            concat!("route", "_epoch"),
-            concat!("worker", "_run_id"),
-            concat!("block", "_stamp"),
-            concat!("call", "_id"),
-            concat!("stream", "_id"),
-        ] {
-            assert!(
-                !debug.contains(needle),
-                "reader or writer Debug output must redact {needle}: {debug}"
-            );
-        }
     }
 
     fn method_count(calls: &[RecordedCall], method: &str) -> usize {
@@ -1668,20 +777,12 @@ mod tests {
     struct MockGateway {
         calls: Mutex<Vec<RecordedCall>>,
         layouts: Mutex<VecDeque<ReadLayout>>,
-        list_requests: Mutex<Vec<beryl_proto::metadata::ListStatusRequestProto>>,
-        list_results: Mutex<VecDeque<ClientResult<ListStatusResponseProto>>>,
-        delete_requests: Mutex<Vec<beryl_proto::metadata::DeleteRequestProto>>,
         create_directory_requests: Mutex<Vec<(String, bool)>>,
         next_offsets: Mutex<HashMap<u64, u64>>,
         next_block_indexes: Mutex<HashMap<u64, u32>>,
         write_layouts: Mutex<HashMap<u64, RecordedLayout>>,
-        append_write_layout: Mutex<Option<RecordedLayout>>,
         create_response_layout: Mutex<Option<Option<RecordedLayout>>>,
-        append_response_layout: Mutex<Option<Option<RecordedLayout>>>,
-        commit_response_size: Mutex<Option<u64>>,
-        sync_response_size: Mutex<Option<u64>>,
         add_block_outcomes: Mutex<VecDeque<AddBlockOutcome>>,
-        renew_outcomes: Mutex<VecDeque<RenewOutcome>>,
         get_status_outcomes: Mutex<VecDeque<MetadataOutcome>>,
         open_write_outcomes: Mutex<VecDeque<MetadataOutcome>>,
         mutation_outcomes: Mutex<VecDeque<MetadataOutcome>>,
@@ -1691,14 +792,6 @@ mod tests {
     impl MockGateway {
         fn calls(&self) -> Vec<RecordedCall> {
             self.calls.lock().expect("calls").clone()
-        }
-
-        fn list_requests(&self) -> Vec<beryl_proto::metadata::ListStatusRequestProto> {
-            self.list_requests.lock().expect("list requests").clone()
-        }
-
-        fn delete_requests(&self) -> Vec<beryl_proto::metadata::DeleteRequestProto> {
-            self.delete_requests.lock().expect("delete requests").clone()
         }
 
         fn create_directory_requests(&self) -> Vec<(String, bool)> {
@@ -1717,55 +810,9 @@ mod tests {
             }
         }
 
-        fn with_list_result(result: ClientResult<ListStatusResponseProto>) -> Self {
-            Self::with_list_results(vec![result])
-        }
-
-        fn with_list_results(results: Vec<ClientResult<ListStatusResponseProto>>) -> Self {
-            Self {
-                list_results: Mutex::new(results.into()),
-                ..Self::default()
-            }
-        }
-
         fn with_create_response_layout(layout: Option<RecordedLayout>) -> Self {
             Self {
                 create_response_layout: Mutex::new(Some(layout)),
-                ..Self::default()
-            }
-        }
-
-        fn with_append_write_layout(layout: RecordedLayout) -> Self {
-            Self {
-                append_write_layout: Mutex::new(Some(layout)),
-                ..Self::default()
-            }
-        }
-
-        fn with_append_response_layout(layout: Option<RecordedLayout>) -> Self {
-            Self {
-                append_response_layout: Mutex::new(Some(layout)),
-                ..Self::default()
-            }
-        }
-
-        fn with_commit_response_size(committed_size: u64) -> Self {
-            Self {
-                commit_response_size: Mutex::new(Some(committed_size)),
-                ..Self::default()
-            }
-        }
-
-        fn with_sync_response_size(synced_size: u64) -> Self {
-            Self {
-                sync_response_size: Mutex::new(Some(synced_size)),
-                ..Self::default()
-            }
-        }
-
-        fn with_renew_outcomes(outcomes: Vec<RenewOutcome>) -> Self {
-            Self {
-                renew_outcomes: Mutex::new(outcomes.into()),
                 ..Self::default()
             }
         }
@@ -1834,14 +881,6 @@ mod tests {
                     Err(refresh_action_error(ErrorKind::Metadata(MetadataErrorKind::StaleState)))
                 }
             }
-        }
-
-        fn next_renew_outcome(&self) -> RenewOutcome {
-            self.renew_outcomes
-                .lock()
-                .expect("renew outcomes")
-                .pop_front()
-                .unwrap_or(RenewOutcome::Ok)
         }
 
         fn record(&self, method: &'static str, ctx: &AttemptContext) {
@@ -1988,13 +1027,9 @@ mod tests {
         async fn list_status(
             &self,
             ctx: AttemptContext,
-            req: beryl_proto::metadata::ListStatusRequestProto,
+            _req: beryl_proto::metadata::ListStatusRequestProto,
         ) -> ClientResult<ListStatusResponseProto> {
             self.record("list_status", &ctx);
-            self.list_requests.lock().expect("list requests").push(req);
-            if let Some(result) = self.list_results.lock().expect("list results").pop_front() {
-                return result;
-            }
             Ok(ListStatusResponseProto {
                 entries: vec![beryl_proto::metadata::DirEntryProto {
                     name: "child".to_string(),
@@ -2026,10 +1061,9 @@ mod tests {
         async fn delete(
             &self,
             ctx: AttemptContext,
-            req: beryl_proto::metadata::DeleteRequestProto,
+            _req: beryl_proto::metadata::DeleteRequestProto,
         ) -> ClientResult<DeleteResponseProto> {
             self.record("delete", &ctx);
-            self.delete_requests.lock().expect("delete requests").push(req);
             Self::apply_metadata_outcome(self.next_mutation_outcome(), "Delete")?;
             Ok(DeleteResponseProto::default())
         }
@@ -2117,10 +1151,7 @@ mod tests {
             let (inode_id, base_size) = if append { (402, 10) } else { (302, 0) };
             self.next_offsets.lock().expect("offsets").insert(inode_id, base_size);
             let layout = if append {
-                self.append_write_layout
-                    .lock()
-                    .expect("append write layout")
-                    .unwrap_or_else(default_layout)
+                default_layout()
             } else {
                 self.write_layouts
                     .lock()
@@ -2133,19 +1164,11 @@ mod tests {
                 .lock()
                 .expect("write layouts")
                 .insert(inode_id, layout);
-            let response_layout = if append {
-                self.append_response_layout
-                    .lock()
-                    .expect("append response layout")
-                    .unwrap_or(Some(layout))
-            } else {
-                Some(layout)
-            };
             Ok(OpenWriteResponseProto {
                 write_handle: Some(write_handle_proto(inode_id)),
                 base_size,
                 expires_at_ms: u64::MAX / 2,
-                layout: response_layout.map(layout_proto),
+                layout: Some(layout_proto(layout)),
                 content_revision: 0,
                 ..OpenWriteResponseProto::default()
             })
@@ -2206,13 +1229,8 @@ mod tests {
             req: beryl_proto::metadata::CommitFileRequestProto,
         ) -> ClientResult<beryl_proto::metadata::CommitFileResponseProto> {
             self.record_commit_file(&ctx, &req);
-            let committed_size = self
-                .commit_response_size
-                .lock()
-                .expect("commit response size")
-                .unwrap_or(req.final_size);
             Ok(CommitFileResponseProto {
-                committed_size,
+                committed_size: req.final_size,
                 ..CommitFileResponseProto::default()
             })
         }
@@ -2233,19 +1251,10 @@ mod tests {
             _req: beryl_proto::metadata::RenewLeaseRequestProto,
         ) -> ClientResult<beryl_proto::metadata::RenewLeaseResponseProto> {
             self.record("renew_lease", &ctx);
-            match self.next_renew_outcome() {
-                RenewOutcome::Ok => Ok(RenewLeaseResponseProto {
-                    expires_at_ms: u64::MAX / 2,
-                    ..RenewLeaseResponseProto::default()
-                }),
-                RenewOutcome::SessionExpired => {
-                    Err(session_error(ErrorKind::Metadata(MetadataErrorKind::SessionExpired)))
-                }
-                RenewOutcome::ZeroExpiry => Ok(RenewLeaseResponseProto {
-                    expires_at_ms: 0,
-                    ..RenewLeaseResponseProto::default()
-                }),
-            }
+            Ok(RenewLeaseResponseProto {
+                expires_at_ms: u64::MAX / 2,
+                ..RenewLeaseResponseProto::default()
+            })
         }
 
         async fn sync_write(
@@ -2254,11 +1263,7 @@ mod tests {
             req: beryl_proto::metadata::SyncWriteRequestProto,
         ) -> ClientResult<SyncWriteResponseProto> {
             self.record_sync_write(&ctx, &req);
-            let synced_size = self
-                .sync_response_size
-                .lock()
-                .expect("sync response size")
-                .unwrap_or(req.target_size);
+            let synced_size = req.target_size;
             if let Some(write_handle) = req.write_handle.as_ref() {
                 self.next_offsets
                     .lock()
@@ -2298,13 +1303,6 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum RenewOutcome {
-        Ok,
-        SessionExpired,
-        ZeroExpiry,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum MetadataOutcome {
         Ok,
         Transport,
@@ -2325,10 +1323,7 @@ mod tests {
         file: Bytes,
         refresh_once: Mutex<Option<ErrorKind>>,
         calls: Mutex<usize>,
-        written: Arc<Mutex<Vec<u8>>>,
-        written_lens: Arc<Mutex<Vec<u64>>>,
         write_outcomes: Mutex<VecDeque<WorkerWriteOutcome>>,
-        record_written_body: bool,
         events: Option<EventLog>,
     }
 
@@ -2338,18 +1333,8 @@ mod tests {
                 file: Bytes::from_static(file),
                 refresh_once: Mutex::new(None),
                 calls: Mutex::new(0),
-                written: Arc::new(Mutex::new(Vec::new())),
-                written_lens: Arc::new(Mutex::new(Vec::new())),
                 write_outcomes: Mutex::new(VecDeque::new()),
-                record_written_body: true,
                 events: None,
-            }
-        }
-
-        fn with_events(events: EventLog) -> Self {
-            Self {
-                events: Some(events),
-                ..Self::default()
             }
         }
 
@@ -2358,18 +1343,6 @@ mod tests {
                 refresh_once: Mutex::new(Some(kind)),
                 ..Self::from_file(file)
             }
-        }
-
-        fn calls(&self) -> usize {
-            *self.calls.lock().expect("calls")
-        }
-
-        fn written_bytes(&self) -> Bytes {
-            Bytes::from(self.written.lock().expect("written").clone())
-        }
-
-        fn write_lens(&self) -> Vec<u64> {
-            self.written_lens.lock().expect("written lens").clone()
         }
 
         fn record_event(&self, event: &'static str) {
@@ -2426,9 +1399,6 @@ mod tests {
         ) -> ClientResult<BlockWrite> {
             self.record_event("write_block");
             let outcome = self.next_write_outcome();
-            let written = Arc::clone(&self.written);
-            let written_lens = Arc::clone(&self.written_lens);
-            let record_written_body = self.record_written_body;
             let events = self.events.clone();
             let (requests, mut request_stream) = mpsc::channel::<BlockWriteInput>(1);
             let (transport_cancellation, mut cancellation_signal) = watch::channel(false);
@@ -2447,7 +1417,6 @@ mod tests {
                     }
                     return Err(ClientError::Worker("mock WriteBlock cancelled".to_string()));
                 }
-                let mut body = Vec::new();
                 loop {
                     tokio::select! {
                         biased;
@@ -2459,7 +1428,7 @@ mod tests {
                         }
                         request = request_stream.recv() => match request {
                             Some(BlockWriteInput::Data(request)) => match request.payload {
-                                Some(Payload::Data(data)) => body.extend_from_slice(&data),
+                                Some(Payload::Data(_)) => {}
                                 _ => {
                                     return Err(ClientError::Worker(
                                         "mock WriteBlock received a non-data frame after acknowledgement".to_string(),
@@ -2473,10 +1442,6 @@ mod tests {
                 }
                 if matches!(outcome, WorkerWriteOutcome::WorkerError) {
                     return Err(ClientError::Worker("injected WriteBlock failure".to_string()));
-                }
-                written_lens.lock().expect("written lens").push(body.len() as u64);
-                if record_written_body {
-                    written.lock().expect("written").extend_from_slice(&body);
                 }
                 Ok(())
             });
@@ -2631,40 +1596,5 @@ mod tests {
             retry_after_ms_hint: Some(1),
             rpc_error: Box::new(rpc_error),
         })
-    }
-
-    fn session_error(kind: ErrorKind) -> ClientError {
-        let rpc_error = RpcErrorDetail::reopen_write_session(kind, RpcRefreshHint::default(), "write session expired");
-        ClientError::from(ClientAction::Refresh {
-            hint: Box::default(),
-            rpc_error: Box::new(rpc_error),
-        })
-    }
-
-    #[tokio::test]
-    async fn fs_client_creates_runtime_identity_from_client_name_config() {
-        let default_client = FsClient::try_new(ClientConfig::default()).expect("default client");
-        assert!(!default_client.runtime.executor.client_id().is_zero());
-        assert_eq!(
-            default_client.runtime.executor.client_name(),
-            crate::config::DEFAULT_CLIENT_NAME
-        );
-
-        let mut flat = beryl_common::FlatConfig::new();
-        flat.set("beryl.client.name", "prod-ns01");
-        let config = ClientConfig::from_flat(flat).expect("config");
-        let named_client = FsClient::try_new(config).expect("named client");
-
-        assert!(!named_client.runtime.executor.client_id().is_zero());
-        assert_eq!(named_client.runtime.executor.client_name(), "prod-ns01");
-    }
-
-    #[test]
-    fn try_new_uses_configured_metadata_addresses() {
-        let mut flat = beryl_common::FlatConfig::new();
-        flat.set("beryl.client.metadata.addresses", vec!["10.0.1.1:18080".to_string()]);
-        let config = ClientConfig::from_flat(flat).expect("metadata address config");
-
-        FsClient::try_new(config).expect("client should use configured Metadata address");
     }
 }

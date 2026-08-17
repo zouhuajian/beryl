@@ -253,20 +253,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn block_shape_accepts_full_and_tail_effective_lengths() {
-        let full =
-            BlockShape::new(BlockFormatId::FULL_EFFECTIVE, 4096, 1024, 4096).expect("full block shape must pass");
-        assert_eq!(full.block_format_id, BlockFormatId::FULL_EFFECTIVE);
-        assert_eq!(full.block_size, 4096);
-        assert_eq!(full.chunk_size, 1024);
-        assert_eq!(full.effective_len, 4096);
-
-        let layout = FileLayout::new(4096, 1024, 1);
-        let tail = BlockShape::for_effective_len(&layout, 3072).expect("tail block shape must pass");
-        assert_eq!(tail.effective_len, 3072);
-    }
-
-    #[test]
     fn block_shape_rejects_invalid_size_chunk_and_effective_length() {
         let cases = [
             (

@@ -7,7 +7,7 @@
 ## How It Fits Into Beryl
 
 - Provides the shared error, header, config, retry/time, and observability foundation used by current services.
-- Keeps infrastructure mechanics separate from metadata, worker, client, and UFS policy.
+- Keeps infrastructure mechanics separate from metadata, worker, client, and external-backend policy.
 - Supports structured operational behavior without owning runtime decisions.
 
 ## Main Responsibilities
@@ -18,14 +18,14 @@
 
 ## Current Active Use
 
-The current runtime uses `beryl-common` for config mechanics, structured error/header handling, retry/time utilities, and tracing/metrics setup across metadata, worker, client, proto, and UFS code.
+The current runtime uses `beryl-common` for config mechanics, structured error/header handling, retry/time utilities, and tracing/metrics setup across metadata, worker, client, and proto code.
 
 ## Not in Current Scope
 
 - Metadata authority policy.
 - Worker execution policy.
 - Client retry/cache decisions.
-- UFS backend policy.
+- External-backend policy.
 - Generated proto types or gRPC adapters.
 
 ## Contributor Notes

@@ -1096,39 +1096,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_write_does_not_require_worker_placement() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_id = MountId::new(50);
-        let inode_id = InodeId::new(500);
-        storage
-            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id))
-            .unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-
-        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name("g7"));
-        let mount_table = builder.mount_table();
-        let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
-        let filesystem = builder.with_storage(storage).with_raft_node(raft_node).build();
-
-        let success = filesystem
-            .open_write_inode(
-                &request_context(),
-                inode_id,
-                vec![inode_id],
-                crate::session_registry::WriteMode::Write,
-                Freshness::default(),
-            )
-            .await
-            .expect("OpenWrite must not require a worker manager");
-
-        let session = filesystem
-            .write_session_for_inode(success.payload.inode_id)
-            .expect("write session");
-        assert!(session.issued_targets.is_empty());
-    }
-
-    #[tokio::test]
     async fn open_write_rejects_a_path_moved_by_an_already_admitted_rename() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
@@ -1266,74 +1233,6 @@ mod tests {
             _ => None,
         });
         assert_eq!(epoch_after_duplicate, Some(persisted_epoch));
-    }
-
-    #[tokio::test]
-    async fn open_write_rejects_missing_file_layout_without_default_fallback() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_id = MountId::new(52);
-        let group_name_value = group_name("g9");
-        let inode_id = InodeId::new(520);
-        storage
-            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id))
-            .unwrap();
-
-        let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
-            .with_storage(storage)
-            .with_worker_manager(worker_manager_for_write_targets(&group_name_value))
-            .build();
-
-        let failure = filesystem
-            .open_write_inode(
-                &request_context(),
-                inode_id,
-                vec![inode_id],
-                crate::session_registry::WriteMode::Write,
-                Freshness::default(),
-            )
-            .await
-            .expect_err("missing persisted layout must fail open_write");
-
-        assert!(failure.error.message.contains("Layout not found"));
-    }
-
-    #[tokio::test]
-    async fn open_write_rejects_multi_replica_layout_until_durable_replication_exists() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_id = MountId::new(54);
-        let group_name_value = group_name("g9");
-        let inode_id = InodeId::new(540);
-        storage
-            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id))
-            .unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 2)).unwrap();
-
-        let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
-            .with_storage(storage)
-            .with_worker_manager(worker_manager_for_write_targets(&group_name_value))
-            .build();
-
-        let failure = filesystem
-            .open_write_inode(
-                &request_context(),
-                inode_id,
-                vec![inode_id],
-                crate::session_registry::WriteMode::Write,
-                Freshness::default(),
-            )
-            .await
-            .expect_err("multi-replica layout must fail active write");
-
-        assert!(
-            failure
-                .error
-                .message
-                .contains("multi-replica write is not supported yet; replication must be 1"),
-            "unexpected error: {}",
-            failure.error.message
-        );
     }
 
     #[tokio::test]

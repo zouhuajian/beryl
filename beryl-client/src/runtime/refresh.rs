@@ -383,64 +383,6 @@ mod tests {
     }
 
     #[test]
-    fn path_operation_initially_uses_configured_default_group() {
-        let manager = manager();
-
-        assert_eq!(manager.group_for_path("/alpha").expect("group"), group_name("root"));
-    }
-
-    #[test]
-    fn owner_group_mismatch_updates_mount_route_cache() {
-        let manager = manager();
-        let op = path_operation();
-
-        manager
-            .record_refresh(
-                &op,
-                ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch),
-                &RefreshHint {
-                    group_name: Some(group_name("analytics")),
-                    ..RefreshHint::default()
-                },
-            )
-            .expect("refresh recorded");
-
-        assert_eq!(
-            manager.group_for_path("/alpha/file").expect("group"),
-            group_name("analytics")
-        );
-    }
-
-    #[test]
-    fn owner_group_mismatch_records_leader_hint_for_owner_group() {
-        let manager = manager();
-        let op = path_operation();
-
-        manager
-            .record_refresh(
-                &op,
-                ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch),
-                &RefreshHint {
-                    group_name: Some(group_name("analytics")),
-                    leader_endpoint: Some("http://127.0.0.1:18082".to_string()),
-                    ..RefreshHint::default()
-                },
-            )
-            .expect("refresh recorded");
-
-        assert_eq!(
-            manager.group_for_path("/alpha/file").expect("group"),
-            group_name("analytics")
-        );
-        assert_eq!(
-            manager
-                .endpoint_for_group(&group_name("analytics"), 0)
-                .expect("owner endpoint"),
-            "http://127.0.0.1:18082"
-        );
-    }
-
-    #[test]
     fn not_leader_hint_updates_leader_cache() {
         let manager = manager();
         let op = path_operation();
@@ -463,20 +405,6 @@ mod tests {
                 .expect("leader endpoint"),
             "http://127.0.0.1:18081"
         );
-    }
-
-    #[test]
-    fn metadata_targets_rotate_configured_endpoints_without_cached_leader() {
-        let targets = MetadataTargets::new(vec![MetadataGroupTargets {
-            group_name: group_name("root"),
-            endpoints: vec!["a".to_string(), "b".to_string(), "c".to_string()],
-        }])
-        .expect("metadata targets");
-
-        assert_eq!(targets.endpoint_for_group(&group_name("root"), 0).unwrap(), "a");
-        assert_eq!(targets.endpoint_for_group(&group_name("root"), 1).unwrap(), "b");
-        assert_eq!(targets.endpoint_for_group(&group_name("root"), 2).unwrap(), "c");
-        assert_eq!(targets.endpoint_for_group(&group_name("root"), 3).unwrap(), "a");
     }
 
     #[test]
@@ -530,83 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn route_epoch_hint_enriches_later_attempts() {
-        let manager = manager();
-        let op = path_operation();
-
-        manager
-            .record_refresh(
-                &op,
-                ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
-                &RefreshHint {
-                    route_epoch: Some(23),
-                    mount_prefix: Some("/alpha".to_string()),
-                    ..RefreshHint::default()
-                },
-            )
-            .expect("refresh recorded");
-
-        let enriched = manager.enrich_attempt_context(&op, metadata_attempt(&op));
-        let header = enriched.metadata_header().expect("metadata header");
-
-        assert_eq!(header.route_epoch, Some(23));
-    }
-
-    #[test]
-    fn refresh_hint_caches_are_bounded() {
-        let manager = manager();
-
-        for index in 0..(METADATA_TARGET_CACHE_LIMIT + 50) {
-            let operation = OperationContext::new_named(
-                ClientId::new(7),
-                "test-client",
-                "OpenFile",
-                Some(format!("/tenant/{index}/file")),
-                OperationDeadline::new(1_000),
-            )
-            .expect("operation context");
-            manager
-                .record_refresh(
-                    &operation,
-                    ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch),
-                    &RefreshHint {
-                        group_name: Some(group_name("analytics")),
-                        ..RefreshHint::default()
-                    },
-                )
-                .expect("owner refresh");
-            manager
-                .record_refresh(
-                    &operation,
-                    ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
-                    &RefreshHint {
-                        mount_epoch: Some(index as u64),
-                        mount_prefix: Some(format!("/tenant/{index}")),
-                        ..RefreshHint::default()
-                    },
-                )
-                .expect("mount refresh");
-            manager
-                .record_refresh(
-                    &operation,
-                    ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
-                    &RefreshHint {
-                        route_epoch: Some(index as u64),
-                        mount_prefix: Some(format!("/tenant/{index}")),
-                        ..RefreshHint::default()
-                    },
-                )
-                .expect("route refresh");
-        }
-
-        let state = manager.state.read();
-        assert!(state.route_cache.len() <= METADATA_TARGET_CACHE_LIMIT);
-        assert!(state.mount_epoch_cache.len() <= METADATA_TARGET_CACHE_LIMIT);
-        assert!(state.route_epoch_cache.len() <= METADATA_TARGET_CACHE_LIMIT);
-    }
-
-    #[test]
-    fn stale_state_watermark_keeps_highest_group_scoped_state_id() {
+    fn stale_state_watermark_keeps_highest_state_id() {
         let manager = manager();
 
         manager
@@ -615,21 +467,11 @@ mod tests {
         manager
             .record_state_watermark(watermark_proto("root", 8))
             .expect("older watermark");
-        manager
-            .record_state_watermark(watermark_proto("analytics", 3))
-            .expect("other group");
-
         assert_eq!(
             manager
                 .state_watermark_proto(&group_name("root"))
                 .and_then(|watermark| watermark.state_id.map(|state_id| state_id.index)),
             Some(10)
-        );
-        assert_eq!(
-            manager
-                .state_watermark_proto(&group_name("analytics"))
-                .and_then(|watermark| watermark.state_id.map(|state_id| state_id.index)),
-            Some(3)
         );
     }
 

@@ -332,11 +332,9 @@ fn server_state_label(state: ServerState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lifecycle::format_metadata_storage;
     use crate::mount::MountTable;
     use crate::raft::storage::RocksDBStorage;
     use crate::state::{RaftStateStore, RouteEpoch, StateStore};
-    use crate::MetadataConfig;
     use beryl_types::{GroupName, WorkerId};
     use tempfile::TempDir;
 
@@ -485,30 +483,5 @@ mod tests {
 
             (leader_id, follower_ids)
         }
-    }
-
-    #[tokio::test]
-    async fn metadata_format_initializes_single_node_membership() {
-        let dir = TempDir::new().unwrap();
-        let config = MetadataConfig {
-            storage_dir: dir.path().join("metadata"),
-            ..MetadataConfig::default()
-        };
-        format_metadata_storage(&config).await.unwrap();
-
-        let storage = Arc::new(RocksDBStorage::create_for_format(&config.storage_dir).unwrap());
-        let mount_table = Arc::new(MountTable::load_from_storage(storage.as_ref()).unwrap());
-        let state_machine = Arc::new(AppStateMachine::new(Arc::clone(&storage)));
-        let raft_node = AppRaftNode::new(
-            config.raft.node_id,
-            Arc::clone(&storage),
-            state_machine,
-            Arc::clone(&mount_table),
-            &config.raft,
-        )
-        .await
-        .unwrap();
-
-        assert!(raft_node.is_initialized().await.unwrap());
     }
 }

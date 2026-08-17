@@ -18,41 +18,6 @@ use prost::Message;
 use tonic::Request;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn committed_file_is_readable_after_worker_restart_full_report_convergence() {
-    let mut cluster = TestCluster::start().await.expect("start cluster");
-    let client = cluster.client().clone();
-    let path = "/worker-restart/committed";
-    let payload = write_closed_file(&mut cluster, path, 1_537, 1024)
-        .await
-        .expect("write committed file");
-
-    let before = client.open(path).await.expect("open before restart").read_all().await;
-    assert_eq!(before.expect("read before restart"), payload);
-    let before_locations = metadata_locations(&cluster, path, payload.len() as u32)
-        .await
-        .expect("pre-restart metadata locations");
-    let old_run = single_location_run_id(&before_locations);
-    assert_eq!(cluster.current_worker_run_id(), Some(old_run));
-
-    cluster.restart_worker().await.expect("restart worker");
-
-    let new_run = cluster.current_worker_run_id().expect("new worker run id");
-    assert!(
-        !old_run.matches(new_run),
-        "worker restart must create a new WorkerRunId"
-    );
-    let after_locations = metadata_locations(&cluster, path, payload.len() as u32)
-        .await
-        .expect("post-restart metadata locations");
-    assert_locations_use_only_run(&after_locations, new_run);
-    assert_locations_do_not_use_run(&after_locations, old_run);
-
-    let after = client.open(path).await.expect("open after restart").read_all().await;
-    assert_eq!(after.expect("read after restart"), payload);
-    cluster.shutdown().await.expect("shutdown cluster");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_locations_before_full_report_convergence_are_unavailable_then_recover() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let client = cluster.client().clone();
@@ -90,7 +55,7 @@ async fn stale_old_worker_run_is_rejected_after_restart() {
     let before_locations = metadata_locations(&cluster, path, payload.len() as u32)
         .await
         .expect("pre-restart metadata locations");
-    let old_run = single_location_run_id(&before_locations);
+    let old_run = first_location_run_id(&before_locations);
     let old_location = before_locations.first().expect("pre-restart location").clone();
     let old_worker = old_location.workers.first().expect("pre-restart worker").clone();
 
@@ -127,13 +92,22 @@ async fn multi_block_file_is_readable_after_worker_restart_full_report_convergen
         before_locations.len() >= 2,
         "test payload must produce multiple block locations"
     );
+    let old_run = first_location_run_id(&before_locations);
+    assert_eq!(cluster.current_worker_run_id(), Some(old_run));
 
     cluster.restart_worker().await.expect("restart worker");
 
+    let new_run = cluster.current_worker_run_id().expect("new worker run id");
+    assert!(
+        !old_run.matches(new_run),
+        "worker restart must create a new WorkerRunId"
+    );
     let after_locations = metadata_locations(&cluster, path, payload.len() as u32)
         .await
         .expect("post-restart metadata locations");
     assert_eq!(after_locations.len(), before_locations.len());
+    assert_locations_use_only_run(&after_locations, new_run);
+    assert_locations_do_not_use_run(&after_locations, old_run);
     let after = client.open(path).await.expect("open after restart").read_all().await;
     assert_eq!(after.expect("read multi-block after restart"), payload);
     cluster.shutdown().await.expect("shutdown cluster");
@@ -257,7 +231,7 @@ fn assert_refresh_metadata(error: &ErrorDetailProto, expected_kind: ErrorKind) {
     assert!(matches!(rpc_error.recovery, RecoveryAction::RefreshMetadata { .. }));
 }
 
-fn single_location_run_id(locations: &[FileBlockLocationProto]) -> WorkerRunId {
+fn first_location_run_id(locations: &[FileBlockLocationProto]) -> WorkerRunId {
     let workers = locations.first().expect("at least one location").workers.as_slice();
     let worker = workers.first().expect("location has worker");
     WorkerRunId::parse(&worker.worker_run_id).expect("valid worker run id")

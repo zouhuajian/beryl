@@ -428,10 +428,9 @@ mod tests {
     pub(super) use crate::service::filesystem::write::OpenWriteOutput;
     pub(super) use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerManager};
     pub(super) use beryl_common::error::rpc::{
-        ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RefreshHint,
-        RpcErrorDetail, WorkerErrorKind,
+        ErrorKind, InternalErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail, WorkerErrorKind,
     };
-    pub(super) use beryl_common::header::{CallerContext, RequestHeader};
+    pub(super) use beryl_common::header::RequestHeader;
     pub(super) use beryl_types::fs::{FileAttrs, Inode};
     pub(super) use beryl_types::ids::{BlockId, BlockIndex, ClientId, InodeId, MountId, WorkerId};
     pub(super) use beryl_types::layout::FileLayout;
@@ -450,11 +449,6 @@ mod tests {
             Self {
                 route_epoch: std::sync::atomic::AtomicU64::new(1),
             }
-        }
-
-        pub(super) fn set_route_epoch(&self, route_epoch: u64) {
-            self.route_epoch
-                .store(route_epoch, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -769,16 +763,6 @@ mod tests {
         }
     }
 
-    pub(super) fn publish_report_locations(
-        manager: &WorkerManager,
-        group_name: &GroupName,
-        worker_id: WorkerId,
-        report_seq: u64,
-        blocks: Vec<BlockId>,
-    ) {
-        publish_report_locations_with_stamp(manager, group_name, worker_id, report_seq, None, blocks);
-    }
-
     pub(super) fn publish_report_locations_with_stamp(
         manager: &WorkerManager,
         group_name: &GroupName,
@@ -849,10 +833,6 @@ mod tests {
         manager
     }
 
-    pub(super) fn filesystem_builder_without_mount() -> TestFilesystemBuilder {
-        TestFilesystemBuilder::new(Arc::new(MountTable::new()))
-    }
-
     pub(super) fn assert_block_location_unavailable(failure: &FsFailure, block_id: BlockId) {
         assert_refresh_metadata(
             &failure.error,
@@ -885,10 +865,6 @@ mod tests {
             RecoveryAction::RefreshMetadata { hint } | RecoveryAction::ReopenWriteSession { hint } => hint,
             other => panic!("expected refresh-like recovery, got {other:?}"),
         }
-    }
-
-    pub(super) fn install_write_session(filesystem: &TestFilesystem, inode_id: InodeId, mount_id: MountId) {
-        install_write_session_with_ancestors(filesystem, inode_id, mount_id, vec![inode_id])
     }
 
     pub(super) fn install_write_session_with_ancestors(
@@ -1006,7 +982,6 @@ mod tests {
         pub(super) filesystem: TestFilesystem,
         pub(super) inode_id: InodeId,
         pub(super) group_name: GroupName,
-        pub(super) state_store: Arc<MemoryStateStore>,
     }
 
     pub(super) async fn write_flow_env(base_size: u64) -> WriteFlowEnv {
@@ -1044,52 +1019,7 @@ mod tests {
             filesystem,
             inode_id,
             group_name,
-            state_store,
         }
-    }
-
-    pub(super) fn seed_committed_content_revision(env: &WriteFlowEnv, content_revision: u64, lease_epoch: u64) {
-        let block_id = BlockId::new(env.inode_id, BlockIndex::new(0));
-        let mut inode = env
-            .storage
-            .get_inode(env.inode_id)
-            .unwrap()
-            .expect("test inode should exist");
-        inode.attrs.size = 64;
-        match &mut inode.data {
-            beryl_types::fs::InodeData::File {
-                extents,
-                content_revision: stored_content_revision,
-                lease_epoch: stored_lease_epoch,
-                next_block_index,
-            } => {
-                *extents = vec![beryl_types::fs::Extent {
-                    file_offset: 0,
-                    block_id,
-                    block_offset: 0,
-                    len: 64,
-                    content_revision: Some(content_revision),
-                    block_stamp: Some(content_revision),
-                }];
-                *stored_content_revision = Some(content_revision);
-                *stored_lease_epoch = Some(lease_epoch);
-                *next_block_index = 1;
-            }
-            other => panic!("unexpected inode data: {:?}", other),
-        }
-        env.storage.put_inode(&inode).unwrap();
-    }
-
-    pub(super) fn publish_env_block_location(env: &WriteFlowEnv, block_id: BlockId, block_stamp: u64, report_seq: u64) {
-        let worker_manager = env.filesystem.worker_manager.as_ref().expect("worker manager");
-        publish_report_locations_with_stamp(
-            worker_manager,
-            &env.group_name,
-            WorkerId::new(1),
-            report_seq,
-            Some(block_stamp),
-            vec![block_id],
-        );
     }
 
     pub(super) fn publish_env_write_target(env: &WriteFlowEnv, target: &WriteTarget, report_seq: u64) {

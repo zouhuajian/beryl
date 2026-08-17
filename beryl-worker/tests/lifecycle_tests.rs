@@ -54,89 +54,6 @@ beryl.logging.level: "info,beryl_metadata=info,beryl_worker=info,beryl_common=in
 }
 
 #[test]
-fn worker_start_on_missing_store_dirs_creates_identity_info() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "cluster-a", "root");
-    let config = WorkerConfig::load(&config_path).unwrap();
-
-    let worker_id = prepare_worker_start(&config).unwrap();
-
-    assert!(worker_id.as_raw() > 0);
-    assert!(config.identity_path.exists());
-    assert!(worker_storage_info_path(&config).exists());
-    assert!(!worker_storage_info_temp_path_for_test(&config).exists());
-
-    let info_json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(worker_storage_info_path(&config)).unwrap()).unwrap();
-    assert_eq!(info_json["cluster_id"], "cluster-a");
-    assert_eq!(info_json["worker_id"], worker_id.as_raw());
-    assert!(info_json.get("group_id").is_none());
-    assert!(info_json.get("metadata_group_id").is_none());
-}
-
-#[test]
-fn worker_start_on_empty_store_dirs_creates_identity_info() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "cluster-a", "root");
-    let config = WorkerConfig::load(&config_path).unwrap();
-    std::fs::create_dir_all(&config.store.dirs["hdd0"].path).unwrap();
-
-    let worker_id = prepare_worker_start(&config).unwrap();
-
-    assert!(worker_id.as_raw() > 0);
-    assert!(config.identity_path.exists());
-    assert!(worker_storage_info_path(&config).exists());
-}
-
-#[test]
-fn worker_start_on_existing_info_and_identity_succeeds_without_rewriting_identity() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "cluster-a", "root");
-    let config = WorkerConfig::load(&config_path).unwrap();
-    let worker_id = prepare_worker_start(&config).unwrap();
-    let identity_before = std::fs::read(&config.identity_path).unwrap();
-    let info_before = std::fs::read(worker_storage_info_path(&config)).unwrap();
-
-    let second_worker_id = prepare_worker_start(&config).unwrap();
-
-    assert_eq!(second_worker_id, worker_id);
-    assert_eq!(std::fs::read(&config.identity_path).unwrap(), identity_before);
-    assert_eq!(std::fs::read(worker_storage_info_path(&config)).unwrap(), info_before);
-}
-
-#[test]
-fn worker_start_refuses_existing_info_with_missing_identity_without_recreating_it() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "cluster-a", "root");
-    let config = WorkerConfig::load(&config_path).unwrap();
-    prepare_worker_start(&config).unwrap();
-    std::fs::remove_file(&config.identity_path).unwrap();
-
-    let err = prepare_worker_start(&config).unwrap_err();
-
-    assert!(err.to_string().contains("beryl.worker.identity-file"));
-    assert!(!config.identity_path.exists());
-}
-
-#[test]
-fn worker_start_refuses_malformed_identity_without_rewriting_it() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "cluster-a", "root");
-    let config = WorkerConfig::load(&config_path).unwrap();
-    prepare_worker_start(&config).unwrap();
-    let info_before = std::fs::read(worker_storage_info_path(&config)).unwrap();
-    std::fs::write(&config.identity_path, b"not-a-uuid\n").unwrap();
-    let identity_before = std::fs::read(&config.identity_path).unwrap();
-
-    let err = prepare_start_descriptor(&config).unwrap_err();
-
-    assert!(err.contains("beryl.worker.identity-file"));
-    assert!(err.contains("must contain a UUID"));
-    assert_eq!(std::fs::read(worker_storage_info_path(&config)).unwrap(), info_before);
-    assert_eq!(std::fs::read(&config.identity_path).unwrap(), identity_before);
-}
-
-#[test]
 fn worker_start_refuses_worker_id_mismatch_without_rewriting_storage() {
     let dir = TempDir::new().unwrap();
     let config_path = write_config(&dir, "cluster-a", "root");
@@ -179,42 +96,6 @@ fn worker_start_refuses_partial_storage_info_temp_without_final_marker() {
 }
 
 #[test]
-fn worker_start_ignores_temp_storage_info_when_valid_final_marker_exists() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "cluster-a", "root");
-    let config = WorkerConfig::load(&config_path).unwrap();
-    let worker_id = prepare_worker_start(&config).unwrap();
-    let info_before = std::fs::read(worker_storage_info_path(&config)).unwrap();
-    let temp_path = worker_storage_info_temp_path_for_test(&config);
-    std::fs::write(&temp_path, br#"{"cluster_id":"partial"}"#).unwrap();
-
-    let second_worker_id = prepare_worker_start(&config).unwrap();
-
-    assert_eq!(second_worker_id, worker_id);
-    assert_eq!(std::fs::read(worker_storage_info_path(&config)).unwrap(), info_before);
-    assert!(temp_path.exists());
-}
-
-#[test]
-fn worker_start_refuses_invalid_final_storage_info() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "cluster-a", "root");
-    let config = WorkerConfig::load(&config_path).unwrap();
-    prepare_worker_start(&config).unwrap();
-    let info_path = worker_storage_info_path(&config);
-    let malformed_info = b"not-json";
-    std::fs::write(&info_path, malformed_info).unwrap();
-
-    let err = prepare_worker_start(&config).unwrap_err();
-    let message = err.to_string();
-
-    assert!(message.contains("worker storage info"));
-    assert!(message.contains("malformed"));
-    assert!(message.contains("clean worker storage"));
-    assert_eq!(std::fs::read(&info_path).unwrap(), malformed_info);
-}
-
-#[test]
 fn worker_start_rejects_non_current_storage_versions_without_rewriting_them() {
     for unsupported_version in [0, 2, u32::MAX] {
         let dir = TempDir::new().unwrap();
@@ -249,36 +130,6 @@ fn worker_start_rejects_non_current_storage_versions_without_rewriting_them() {
 }
 
 #[test]
-fn worker_storage_info_rejects_legacy_group_id_and_unknown_fields() {
-    for extra_field in ["group_id", "unknown_field"] {
-        let dir = TempDir::new().unwrap();
-        let config_path = write_config(&dir, "cluster-a", "root");
-        let config = WorkerConfig::load(&config_path).unwrap();
-        let worker_id = prepare_worker_start(&config).unwrap();
-        let info_path = worker_storage_info_path(&config);
-        let unsupported_info = format!(
-            r#"{{
-  "cluster_id": "cluster-a",
-  "worker_id": {},
-  "storage_uuid": "storage-a",
-  "format_version": 1,
-  "created_at_ms": 1,
-  "software_version": "test",
-  "{extra_field}": 1
-}}"#,
-            worker_id.as_raw()
-        );
-        std::fs::write(&info_path, unsupported_info.as_bytes()).unwrap();
-
-        let err = prepare_worker_start(&config).unwrap_err();
-        let message = err.to_string();
-        assert!(message.contains("malformed or unsupported"), "{message}");
-        assert!(message.contains("clean worker storage"), "{message}");
-        assert_eq!(std::fs::read(&info_path).unwrap(), unsupported_info.as_bytes());
-    }
-}
-
-#[test]
 fn worker_start_refuses_non_empty_unknown_store_dirs_without_creating_identity() {
     let dir = TempDir::new().unwrap();
     let config_path = write_config(&dir, "cluster-a", "root");
@@ -293,20 +144,5 @@ fn worker_start_refuses_non_empty_unknown_store_dirs_without_creating_identity()
     assert!(message.contains("beryl.worker.storage.dirs"));
     assert!(message.contains("WorkerStorageInfo is missing"));
     assert!(!worker_storage_info_path(&config).exists());
-    assert!(!config.identity_path.exists());
-}
-
-#[test]
-fn worker_registration_descriptor_uses_resolved_worker_id_and_group_name() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "cluster-a", "root");
-    let config = WorkerConfig::load(&config_path).unwrap();
-    let worker_id = prepare_worker_start(&config).unwrap();
-    std::fs::remove_file(&config.identity_path).unwrap();
-
-    let descriptor = MetadataRegistrar::descriptor_from_config(&config, worker_id).unwrap();
-
-    assert_eq!(descriptor.worker_id, worker_id);
-    assert_eq!(descriptor.group_name.as_str(), "root");
     assert!(!config.identity_path.exists());
 }

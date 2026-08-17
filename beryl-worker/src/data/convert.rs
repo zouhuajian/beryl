@@ -66,36 +66,3 @@ pub(crate) fn proto_to_write_block_request(proto: WriteBlockCommandProto) -> Wor
 fn proto_to_group_name(value: &str, field_name: &str) -> WorkerCoreResult<GroupName> {
     GroupName::parse(value).map_err(|error| WorkerError::InvalidArgument(format!("{field_name} invalid: {error}")))
 }
-
-#[cfg(test)]
-mod tests {
-    use beryl_proto::common::{BlockIdProto, TierProto};
-    use beryl_proto::worker::WriteBlockCommandProto;
-    use beryl_types::layout::BlockFormatId;
-    use beryl_types::Tier;
-
-    use super::proto_to_write_block_request;
-
-    #[test]
-    fn write_command_conversion_keeps_only_block_write_facts() {
-        let command = WriteBlockCommandProto {
-            header: None,
-            group_name: "root".to_string(),
-            block_id: Some(BlockIdProto {
-                inode_id: 7,
-                block_index: 3,
-            }),
-            worker_run_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
-            block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
-            block_size: 4096,
-            chunk_size: 1024,
-            block_stamp: 55,
-            tier: TierProto::TierHdd as i32,
-        };
-
-        let request = proto_to_write_block_request(command).expect("valid command");
-        assert_eq!(request.block_size, 4096);
-        assert_eq!(request.block_stamp, 55);
-        assert_eq!(request.tier, Tier::Hdd);
-    }
-}

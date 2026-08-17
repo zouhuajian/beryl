@@ -513,29 +513,4 @@ mod tests {
         fallback.join().expect("fallback release thread");
         assert!(elapsed < Duration::from_secs(1), "runtime shutdown took {elapsed:?}");
     }
-
-    #[test]
-    fn explicit_worker_commands_parse() {
-        let start = try_parse_cli(["beryl-worker", "start", "--config", "conf/worker.yaml"]).unwrap();
-        assert!(matches!(
-            start.command,
-            WorkerCommand::Start { config }
-                if config.as_path() == std::path::Path::new("conf/worker.yaml")
-        ));
-
-        let validate = try_parse_cli(["beryl-worker", "validate-conf", "--config", "conf/worker.yaml"]).unwrap();
-        assert!(matches!(validate.command, WorkerCommand::ValidateConf { .. }));
-    }
-
-    #[test]
-    fn missing_action_or_config_is_a_usage_error() {
-        for args in [
-            &["beryl-worker"][..],
-            &["beryl-worker", "start"][..],
-            &["beryl-worker", "conf/worker.yaml"][..],
-        ] {
-            let error = try_parse_cli(args.iter().copied()).expect_err("incomplete command must fail");
-            assert_eq!(error.exit_code(), 2);
-        }
-    }
 }

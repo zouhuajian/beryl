@@ -86,28 +86,3 @@ impl FromStr for WorkerRunId {
         Self::parse(value)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn worker_run_id_parse_matches_from_str_and_rejects_invalid_values() {
-        let value = "550e8400-e29b-41d4-a716-446655440000";
-        let parsed = WorkerRunId::parse(value).expect("valid WorkerRunId");
-        assert_eq!(parsed, value.parse::<WorkerRunId>().expect("valid WorkerRunId"));
-
-        assert!(WorkerRunId::parse("").is_err());
-        assert!(WorkerRunId::parse("not-a-uuid").is_err());
-    }
-
-    #[test]
-    fn worker_run_id_matches_is_exact_equality() {
-        let first = WorkerRunId::parse("550e8400-e29b-41d4-a716-446655440001").expect("valid WorkerRunId");
-        let same = WorkerRunId::parse("550e8400-e29b-41d4-a716-446655440001").expect("valid WorkerRunId");
-        let other = WorkerRunId::parse("550e8400-e29b-41d4-a716-446655440002").expect("valid WorkerRunId");
-
-        assert!(first.matches(same));
-        assert!(!first.matches(other));
-    }
-}

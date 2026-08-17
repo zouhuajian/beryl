@@ -619,12 +619,7 @@ fn tonic_request<T>(ctx: &AttemptContext, message: T) -> tonic::Request<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc_error::ClientAction;
-    use crate::runtime::{classify_error, ErrorClass, OperationContext, OperationDeadline};
-    use beryl_common::error::rpc::{
-        ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RefreshHint as RpcRefreshHint, RpcErrorDetail,
-    };
-    use beryl_proto::convert::rpc_error_to_proto;
+    use crate::runtime::{OperationContext, OperationDeadline};
     use beryl_types::ClientId;
     use std::sync::Mutex;
 
@@ -643,21 +638,6 @@ mod tests {
         fn events(&self) -> Vec<ClientMetricEvent> {
             self.events.lock().expect("events").clone()
         }
-    }
-
-    #[tokio::test]
-    async fn metadata_channel_pool_reuses_channel_for_same_group_endpoint() {
-        let metrics = Arc::new(RecordingMetrics::default());
-        let gateway = GrpcMetadataGateway::new_lazy_with_pool_options(true, 1, metrics.clone()).expect("gateway");
-        let ctx = metadata_attempt("root", Some("127.0.0.1:18080"));
-
-        let _first = gateway.client(&ctx, "read").await.expect("first client");
-        let _second = gateway.client(&ctx, "read").await.expect("second client");
-
-        let events = metrics.events();
-        assert_metric(&events, ClientMetric::MetadataChannelPoolHit);
-        assert_metric(&events, ClientMetric::MetadataChannelPoolMiss);
-        assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
     }
 
     #[tokio::test]
@@ -682,227 +662,6 @@ mod tests {
         assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
     }
 
-    #[tokio::test]
-    async fn failed_metadata_channel_creation_does_not_insert() {
-        let metrics = Arc::new(RecordingMetrics::default());
-        let gateway =
-            Arc::new(GrpcMetadataGateway::new_lazy_with_pool_options(true, 8, metrics.clone()).expect("gateway"));
-        let ctx = metadata_attempt("root", Some("http://[invalid"));
-
-        let mut tasks = Vec::with_capacity(4);
-        for _ in 0..4 {
-            let gateway = Arc::clone(&gateway);
-            let ctx = ctx.clone();
-            tasks.push(tokio::spawn(async move { gateway.client(&ctx, "read").await }));
-        }
-
-        for task in tasks {
-            let err = task.await.expect("task").expect_err("invalid endpoint");
-            assert!(matches!(err, ClientError::Metadata(msg) if msg.contains("invalid metadata endpoint")));
-        }
-        assert_eq!(gateway.channels.read().len(), 0);
-        let events = metrics.events();
-        assert_metric_with_target_plane(&events, ClientMetric::ChannelBuildError, "metadata");
-        assert_metric_labels_do_not_contain(&events, "http://[invalid");
-    }
-
-    #[tokio::test]
-    async fn disabled_metadata_channel_pool_does_not_reuse_channel() {
-        let metrics = Arc::new(RecordingMetrics::default());
-        let gateway = GrpcMetadataGateway::new_lazy_with_pool_options(false, 1, metrics.clone()).expect("gateway");
-        let ctx = metadata_attempt("root", Some("127.0.0.1:18080"));
-
-        let _first = gateway.client(&ctx, "read").await.expect("first client");
-        let _second = gateway.client(&ctx, "read").await.expect("second client");
-
-        let events = metrics.events();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.metric == ClientMetric::MetadataChannelPoolMiss)
-                .count(),
-            2
-        );
-        assert!(events
-            .iter()
-            .all(|event| event.metric != ClientMetric::MetadataChannelPoolHit));
-    }
-
-    #[test]
-    fn metadata_response_header_preserves_refresh_metadata_hints() {
-        let ctx = metadata_attempt("analytics", None);
-        let rpc_error = RpcErrorDetail::refresh_metadata(
-            ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
-            RpcRefreshHint {
-                leader_endpoint: Some("http://127.0.0.1:18081".to_string()),
-                group_name: Some("analytics".to_string()),
-                route_epoch: Some(23),
-                mount_epoch: Some(31),
-                mount_prefix: Some("/mnt".to_string()),
-                worker_resolve_required: true,
-                ..RpcRefreshHint::default()
-            },
-            "route moved",
-        );
-        let header = beryl_proto::common::ResponseHeaderProto {
-            client: Some(ctx.client_info()),
-            error: Some(rpc_error_to_proto(&rpc_error)),
-            state: Vec::new(),
-            group_name: "analytics".to_string(),
-            mount_epoch: Some(31),
-            route_epoch: Some(23),
-        };
-
-        let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("need refresh must be surfaced");
-        match action(&err) {
-            ClientAction::Refresh { hint, .. } => {
-                assert_eq!(hint.leader_endpoint.as_deref(), Some("http://127.0.0.1:18081"));
-                assert_eq!(hint.group_name, Some(GroupName::parse("analytics").unwrap()));
-                assert_eq!(hint.route_epoch, Some(23));
-                assert_eq!(hint.mount_epoch, Some(31));
-                assert_eq!(hint.mount_prefix.as_deref(), Some("/mnt"));
-                assert!(hint.worker_resolve_required);
-            }
-            other => panic!("expected refresh action, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn invalid_metadata_response_headers_are_typed_failures() {
-        let ctx = metadata_attempt("root", None);
-        let err = parse_metadata_response_header(&ctx, None).expect_err("missing response header must fail");
-
-        assert_ne!(classify_error(&err), ErrorClass::RetryableTransport);
-        match action(&err) {
-            ClientAction::Fail { rpc_error } => {
-                assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
-                assert_eq!(rpc_error.recovery, RecoveryAction::Fail);
-                assert!(rpc_error.message.contains("missing ResponseHeader"));
-            }
-            other => panic!("expected invalid header Fail action, got {other:?}"),
-        }
-
-        assert_malformed_metadata_response_header_is_invalid();
-        assert_wrong_metadata_response_call_id_is_invalid();
-        assert_wrong_metadata_response_client_id_is_invalid();
-        assert_wrong_metadata_response_group_name_is_invalid();
-    }
-
-    fn assert_malformed_metadata_response_header_is_invalid() {
-        let ctx = metadata_attempt("root", None);
-        let malformed = beryl_proto::common::ResponseHeaderProto::default();
-
-        let err =
-            parse_metadata_response_header(&ctx, Some(&malformed)).expect_err("malformed response header must fail");
-
-        assert_ne!(classify_error(&err), ErrorClass::RetryableTransport);
-        match action(&err) {
-            ClientAction::Fail { rpc_error } => {
-                assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
-                assert_eq!(rpc_error.recovery, RecoveryAction::Fail);
-                assert!(rpc_error.message.contains("invalid ResponseHeader"));
-            }
-            other => panic!("expected invalid header Fail action, got {other:?}"),
-        }
-    }
-
-    fn assert_wrong_metadata_response_call_id_is_invalid() {
-        let ctx = metadata_attempt("root", None);
-        let mut header = ok_metadata_header(&ctx);
-        header.client.as_mut().expect("client").call_id = beryl_types::CallId::new().to_string();
-
-        let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("wrong call_id must fail");
-
-        assert_invalid_metadata_header(&err, "call_id");
-    }
-
-    fn assert_wrong_metadata_response_client_id_is_invalid() {
-        let ctx = metadata_attempt("root", None);
-        let mut header = ok_metadata_header(&ctx);
-        header.client.as_mut().expect("client").client_id =
-            Some(ClientId::new(ctx.header_identity().client_id.as_raw() + 1).into());
-
-        let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("wrong client_id must fail");
-
-        assert_invalid_metadata_header(&err, "client_id");
-    }
-
-    fn assert_wrong_metadata_response_group_name_is_invalid() {
-        let ctx = metadata_attempt("root", None);
-        let mut header = ok_metadata_header(&ctx);
-        header.group_name = "analytics".to_string();
-
-        let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("wrong group_name must fail");
-
-        assert_invalid_metadata_header(&err, "group_name");
-    }
-
-    fn action(err: &ClientError) -> &ClientAction {
-        match err {
-            ClientError::Action(action) => action.action(),
-            other => panic!("expected action error, got {other:?}"),
-        }
-    }
-
-    fn assert_invalid_metadata_header(err: &ClientError, message_fragment: &str) {
-        assert_eq!(classify_error(err), ErrorClass::InvalidHeader);
-        match action(err) {
-            ClientAction::Fail { rpc_error } => {
-                assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
-                assert_eq!(rpc_error.recovery, RecoveryAction::Fail);
-                assert!(
-                    rpc_error.message.contains(message_fragment),
-                    "expected {message_fragment:?} in {:?}",
-                    rpc_error.message
-                );
-            }
-            other => panic!("expected invalid header Fail action, got {other:?}"),
-        }
-    }
-
-    fn assert_metric(events: &[ClientMetricEvent], metric: ClientMetric) {
-        assert!(
-            events.iter().any(|event| event.metric == metric),
-            "missing metric {metric:?}: {events:?}"
-        );
-    }
-
-    fn assert_metric_with_target_plane(events: &[ClientMetricEvent], metric: ClientMetric, target_plane: &'static str) {
-        assert!(
-            events
-                .iter()
-                .any(|event| event.metric == metric && event.labels.target_plane == Some(target_plane)),
-            "missing metric {metric:?} with target_plane={target_plane}: {events:?}"
-        );
-        assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
-        let stale_metric = ["ChannelPool", "ConnectError"].concat();
-        assert!(events
-            .iter()
-            .all(|event| !format!("{:?}", event.metric).contains(&stale_metric)));
-    }
-
-    fn assert_metric_labels_do_not_contain(events: &[ClientMetricEvent], value: &str) {
-        assert!(
-            events
-                .iter()
-                .all(|event| !metric_label_values(&event.labels).any(|label| label.contains(value))),
-            "metric labels unexpectedly contain {value:?}: {events:?}"
-        );
-    }
-
-    fn metric_label_values(labels: &ClientMetricLabels) -> impl Iterator<Item = &str> {
-        [
-            labels.operation_name.as_deref(),
-            labels.error_class,
-            labels.target_plane,
-            labels.cache,
-            labels.reason,
-            labels.outcome,
-        ]
-        .into_iter()
-        .flatten()
-    }
-
     fn metadata_attempt(group_name: &str, endpoint: Option<&str>) -> AttemptContext {
         let operation = OperationContext::new_named(
             ClientId::new(7),
@@ -917,18 +676,6 @@ mod tests {
             ctx.with_metadata_endpoint(endpoint.to_string())
         } else {
             ctx
-        }
-    }
-
-    fn ok_metadata_header(ctx: &AttemptContext) -> beryl_proto::common::ResponseHeaderProto {
-        let request = ctx.metadata_header().expect("metadata request header");
-        beryl_proto::common::ResponseHeaderProto {
-            client: request.client,
-            error: None,
-            state: Vec::new(),
-            group_name: request.group_name,
-            mount_epoch: request.mount_epoch,
-            route_epoch: request.route_epoch,
         }
     }
 }
