@@ -245,21 +245,11 @@ pub struct WorkerLivenessConfig {
 #[derive(Clone, Debug)]
 pub struct RaftConfig {
     pub node_id: u64,
-    pub mode: RaftMode,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RaftMode {
-    Single,
-    Cluster,
 }
 
 impl Default for RaftConfig {
     fn default() -> Self {
-        Self {
-            node_id: 1,
-            mode: RaftMode::Single,
-        }
+        Self { node_id: 1 }
     }
 }
 

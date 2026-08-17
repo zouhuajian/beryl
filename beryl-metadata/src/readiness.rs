@@ -325,7 +325,7 @@ async fn wait_for_root_ready_inner(inputs: RootReadyInputs) -> MetadataResult<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{RaftConfig, RaftMode};
+    use crate::config::RaftConfig;
     use crate::mount::MountEntry;
     use crate::raft::AppRaftStateMachine;
     use beryl_types::ids::MountId;
@@ -344,10 +344,7 @@ mod tests {
             let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).unwrap());
             let mount_table = Arc::new(MountTable::load_from_storage(storage.as_ref()).unwrap());
             let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
-            let raft_config = RaftConfig {
-                mode: RaftMode::Single,
-                ..RaftConfig::default()
-            };
+            let raft_config = RaftConfig::default();
             let raft_node = Arc::new(
                 AppRaftNode::new(
                     raft_config.node_id,

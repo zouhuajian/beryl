@@ -3,7 +3,7 @@
 
 //! Local metadata storage lifecycle.
 
-use crate::config::{MetadataConfig, RaftMode};
+use crate::config::MetadataConfig;
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::{DataIoPolicy, MountEntry, MountKind, MountTable, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
 use crate::raft::{AppRaftNode, AppRaftStateMachine, ApplySuccess, Command, RocksDBStorage, StorageIdentity};
@@ -220,13 +220,6 @@ fn validate_format_config(config: &MetadataConfig) -> MetadataResult<()> {
     if config.cluster_id.trim().is_empty() {
         return Err(MetadataError::InvalidArgument(
             "beryl.cluster.id must not be empty".to_string(),
-        ));
-    }
-    if config.raft.mode == RaftMode::Cluster {
-        // Cluster mode is rejected until metadata peer RPC semantics,
-        // membership, and freshness fencing are implemented.
-        return Err(MetadataError::InvalidArgument(
-            "cluster Raft mode is not implemented yet".to_string(),
         ));
     }
     if config.raft.node_id == 0 {

@@ -574,7 +574,7 @@ impl TestCluster {
                     return false;
                 }
                 if !external_metadata {
-                    return self.worker_manager.get_all_locations_count() == expected_physical_blocks;
+                    return self.worker_manager.list_reported_blocks().len() == expected_physical_blocks;
                 }
 
                 if send_full_block_report_to_external_metadata(&self.heartbeat, &self.block_report, &self.block_store)

@@ -19,7 +19,6 @@ rust-version = "1.95.0"
 
 [workspace.dependencies]
 # Config / serialization
-config = "0.15.19"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.148"
 serde_yaml = "0.9.34"
@@ -28,10 +27,8 @@ bincode = { version = "2.0.1", features = ["serde"] }
 # Async runtime / futures
 tokio = { version = "1.48.0", features = ["full"] }
 tokio-util = "0.7.17"
-tokio-test = "0.4.4"
 futures = "0.3.31"
 async-trait = "0.1.89"
-async-stream = "0.3.5"
 
 # RPC / transport
 tonic = { version = "0.14.2", features = ["transport"] }
@@ -41,7 +38,6 @@ prost-types = "0.14.1"
 tonic-prost = "0.14.2"
 tonic-prost-build = "0.14.2"
 tower = "0.5"
-glommio = "0.9"
 
 # Raft / consensus
 openraft = { version = "0.9.21", features = ["serde", "storage-v2"] }
@@ -79,7 +75,5 @@ lru = "0.12.3"
 sha2 = "0.10.8"
 
 # Testing / tooling
-insta = { version = "1.45.1", features = ["yaml", "redactions"] }
-assert_fs = "1.1.3"
 tempfile = "3.10.1"
 clap = { version = "4.5.53", features = ["derive", "string"] }

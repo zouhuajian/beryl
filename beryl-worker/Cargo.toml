@@ -19,7 +19,6 @@ beryl-common = { path = "../beryl-common" }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
 futures = { workspace = true }
-async-trait = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }

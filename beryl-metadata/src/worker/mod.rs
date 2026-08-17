@@ -9,7 +9,6 @@
 //! - Block locations convergence
 
 mod manager;
-pub(crate) mod metrics;
 mod service;
 
 pub use manager::{
@@ -17,4 +16,4 @@ pub use manager::{
     WorkerManager,
 };
 pub(crate) use manager::{PublishReadyConflict, PublishReadyStatus, PublishReadyTarget, ReadyReplicaCursor};
-pub use service::{MetadataWorkerServiceImpl, WorkerBackgroundHandle};
+pub use service::MetadataWorkerServiceImpl;

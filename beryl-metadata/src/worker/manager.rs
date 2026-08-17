@@ -313,23 +313,6 @@ pub(crate) enum PublishReadyConflict {
     },
 }
 
-/// Block report convergence snapshot for maintenance safety gate.
-#[derive(Debug, Clone)]
-pub struct BlockReportConvergenceSnapshot {
-    pub active_workers: usize,
-    pub full_reported_workers: usize,
-    pub ratio: f64,
-    pub converged: bool,
-}
-
-#[derive(Debug)]
-pub struct WorkerManagerStats {
-    pub total_workers: usize,
-    pub live_workers: usize,
-    pub total_blocks: usize,
-    pub total_locations: usize,
-}
-
 fn ready_block_ids<'a>(blocks: impl Iterator<Item = &'a BlockReportBlock>) -> HashSet<BlockId> {
     blocks
         .filter(|block| block.block_state == BlockReportBlockState::Ready)
@@ -1324,12 +1307,6 @@ impl WorkerManager {
         views
     }
 
-    /// Get total number of block locations (for metrics).
-    pub fn get_all_locations_count(&self) -> usize {
-        let locations = self.locations.read();
-        locations.len()
-    }
-
     /// List group-qualified reported blocks for background scans.
     pub fn list_reported_blocks(&self) -> Vec<BlockLocationKey> {
         let locations = self.locations.read();
@@ -1764,94 +1741,6 @@ impl WorkerManager {
         }
 
         PublishReadyStatus::Ready
-    }
-
-    /// Get statistics.
-    pub fn stats(&self) -> WorkerManagerStats {
-        let descriptors = self.descriptors.read();
-        let runtime = self.runtime.read();
-        let locations = self.locations.read();
-
-        let now = Instant::now();
-        let timeout = self.heartbeat_timeout();
-
-        let live_count = runtime
-            .values()
-            .filter(|r| now.duration_since(r.last_seen_at) < timeout)
-            .count();
-
-        WorkerManagerStats {
-            total_workers: descriptors.len(),
-            live_workers: live_count,
-            total_blocks: locations.len(),
-            total_locations: locations.values().map(|v| v.len()).sum(),
-        }
-    }
-
-    /// Get block report convergence snapshot for maintenance safety gate.
-    ///
-    /// Returns a snapshot of block report convergence status:
-    /// - active_workers: number of workers that have sent heartbeat within active_ttl_ms
-    /// - full_reported_workers: number of active workers with a published report baseline
-    /// - ratio: full_reported_workers / active_workers (1.0 if active_workers == 0)
-    /// - converged: true if ratio >= threshold
-    pub fn blockreport_convergence_snapshot(
-        &self,
-        now_ms: u64,
-        active_ttl_ms: u64,
-        threshold: f64,
-    ) -> BlockReportConvergenceSnapshot {
-        let runtime = self.runtime.read();
-        let reports = self.block_reports.read();
-
-        // Count active workers (last_seen_ms within active_ttl_ms)
-        let active_workers: Vec<WorkerRegistrationKey> = runtime
-            .iter()
-            .filter(|(_, r)| now_ms.saturating_sub(r.last_seen_ms) < active_ttl_ms)
-            .map(|(key, _)| key.clone())
-            .collect();
-
-        let active_count = active_workers.len();
-
-        // Count full reported workers against the in-memory report baseline.
-        let full_reported_count = active_workers
-            .iter()
-            .filter(|key| {
-                reports
-                    .get(key)
-                    .map(|report| {
-                        report.state == BlockReportState::Ready
-                            && report.worker_run_id.is_some_and(|report_worker_run_id| {
-                                report_worker_run_id.matches(runtime.get(key).expect("active runtime").worker_run_id)
-                            })
-                    })
-                    .unwrap_or(false)
-            })
-            .count();
-
-        // Calculate ratio (1.0 if no active workers to avoid division by zero)
-        let ratio = if active_count == 0 {
-            1.0
-        } else {
-            full_reported_count as f64 / active_count as f64
-        };
-
-        let converged = ratio >= threshold;
-
-        BlockReportConvergenceSnapshot {
-            active_workers: active_count,
-            full_reported_workers: full_reported_count,
-            ratio,
-            converged,
-        }
-    }
-
-    /// Check if block report is converged (convenience method with default parameters).
-    pub fn is_blockreport_converged(&self, now_ms: u64) -> BlockReportConvergenceSnapshot {
-        const DEFAULT_THRESHOLD: f64 = 0.80;
-
-        let active_ttl_ms = u64::from(self.heartbeat_timeout_ms);
-        self.blockreport_convergence_snapshot(now_ms, active_ttl_ms, DEFAULT_THRESHOLD)
     }
 }
 
@@ -2538,33 +2427,6 @@ mod tests {
     }
 
     #[test]
-    fn final_full_report_marks_active_worker_converged() {
-        let manager = WorkerManager::new(60_000);
-        let group_name_value = group_name("g22");
-        let worker_id = WorkerId::new(6);
-        let run_id = report_run_id();
-        register_live_report_worker(&manager, &group_name_value, worker_id, run_id);
-
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let before = manager.blockreport_convergence_snapshot(now_ms, 60_000, 0.80);
-        assert_eq!(before.active_workers, 1);
-        assert_eq!(before.full_reported_workers, 0);
-        assert!(!before.converged);
-
-        manager
-            .receive_full_block_report(&group_name_value, worker_id, run_id, 1, 0, true, vec![report_block(0)])
-            .unwrap();
-
-        let after = manager.blockreport_convergence_snapshot(now_ms, 60_000, 0.80);
-        assert_eq!(after.active_workers, 1);
-        assert_eq!(after.full_reported_workers, 1);
-        assert!(after.converged);
-    }
-
-    #[test]
     fn stale_full_report_seq_cannot_roll_back_published_view() {
         let manager = WorkerManager::new(60_000);
         let group_name_value = group_name("g25");
@@ -3111,17 +2973,6 @@ mod tests {
         assert!(manager
             .get_block_locations(&group_name_value, report_block(0).block_id)
             .is_empty());
-        let after_restart_snapshot = manager.blockreport_convergence_snapshot(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
-            60_000,
-            0.80,
-        );
-        assert_eq!(after_restart_snapshot.active_workers, 0);
-        assert_eq!(after_restart_snapshot.full_reported_workers, 0);
-
         let old_heartbeat = manager
             .record_heartbeat(
                 &group_name_value,
@@ -3171,18 +3022,6 @@ mod tests {
                 HealthStatus::Healthy,
             )
             .unwrap();
-        let before_new_full_report = manager.blockreport_convergence_snapshot(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
-            60_000,
-            0.80,
-        );
-        assert_eq!(before_new_full_report.active_workers, 1);
-        assert_eq!(before_new_full_report.full_reported_workers, 0);
-        assert!(!before_new_full_report.converged);
-
         let delta = manager
             .apply_delta_block_report(
                 &group_name_value,

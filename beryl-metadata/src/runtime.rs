@@ -9,7 +9,7 @@ use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
 use crate::readiness::{wait_for_root_ready_with_inputs, RootReadinessGate, RootReadinessLogFields, RootReadyInputs};
 use crate::service::{MetadataFileSystem, MetadataFileSystemDeps, MetadataFileSystemServiceImpl, MsyncHandler};
 use crate::state::RaftStateStore;
-use crate::worker::{MetadataWorkerServiceImpl, WorkerBackgroundHandle, WorkerManager};
+use crate::worker::{MetadataWorkerServiceImpl, WorkerManager};
 use crate::{observe, MetadataConfig, MountTable};
 use beryl_common::grpc_server::{
     spawn_grpc_server_with_concurrency_limits, GrpcRequestConcurrencyConfig, RpcRequestClass,
@@ -100,14 +100,9 @@ impl MetadataAuthority {
     }
 }
 
-/// Required worker runtime soft state shared by worker RPC and background work.
+/// Required worker runtime soft state shared by worker RPC and maintenance work.
 pub struct WorkerRuntime {
     pub manager: Arc<WorkerManager>,
-}
-
-/// Worker-owned background lifecycle started after authority and maintenance are available.
-pub struct WorkerBackground {
-    _handle: WorkerBackgroundHandle,
 }
 
 /// Metadata maintenance lifecycle independent of worker RPC serving.
@@ -140,7 +135,6 @@ pub struct RpcServices {
 
 /// Long-lived handles retained by `serve()` for the server lifetime.
 pub struct RuntimeHandles {
-    _worker_background: WorkerBackground,
     maintenance: Maintenance,
     readiness: ReadinessHandle,
 }
@@ -222,21 +216,13 @@ impl WorkerRuntime {
         authority: &MetadataAuthority,
         cleanup: Arc<BlockCleanupCoordinator>,
     ) -> MetadataWorkerServiceImpl {
-        let mut service = MetadataWorkerServiceImpl::new_with_cleanup(
+        MetadataWorkerServiceImpl::new_with_cleanup(
             Arc::clone(&authority.raft_node),
             Arc::clone(&self.manager),
             Arc::clone(&authority.mount_table),
             authority.group_name.clone(),
             cleanup,
-        );
-        service.set_slot_metrics(Arc::clone(&authority.metadata_metrics));
-
-        service
-    }
-
-    /// Starts worker-service background tasks.
-    fn start_background(&self, service: &MetadataWorkerServiceImpl) -> WorkerBackgroundHandle {
-        service.start_background_tasks()
+        )
     }
 }
 
@@ -310,9 +296,7 @@ impl MetadataServer {
         };
         let maintenance = build_maintenance(config.as_ref(), &authority, &worker, &readiness, session_registry).await;
         let worker_service = worker.service(&authority, Arc::clone(&maintenance.cleanup));
-        let worker_background = build_worker_background(&worker, &worker_service);
-        let (services, handles) =
-            compose_services(filesystem, worker_service, readiness, worker_background, maintenance);
+        let (services, handles) = compose_services(filesystem, worker_service, readiness, maintenance);
 
         let mut server = Self {
             config,
@@ -472,7 +456,6 @@ pub fn init_observability(config: &MetadataConfig) -> Result<Observability, DynE
         http_addr = %config.http_addr(),
         storage_dir = %config.storage_dir.display(),
         node_id = config.raft.node_id,
-        raft_mode = ?config.raft.mode,
         authority_group_name = %config.authority.group_name,
         "Configuration loaded (sensitive values redacted)"
     );
@@ -572,13 +555,6 @@ pub(crate) async fn build_maintenance(
         _maintenance_service: maintenance_service,
         maintenance_handle,
     }
-}
-
-/// Starts worker-owned background work after authority and maintenance are available.
-pub fn build_worker_background(worker: &WorkerRuntime, service: &MetadataWorkerServiceImpl) -> WorkerBackground {
-    let handle = worker.start_background(service);
-
-    WorkerBackground { _handle: handle }
 }
 
 /// Starts the root readiness watcher and owns health serving state.
@@ -711,7 +687,6 @@ pub fn compose_services(
     filesystem: MetadataFileSystemServiceImpl,
     worker: MetadataWorkerServiceImpl,
     readiness: Readiness,
-    worker_background: WorkerBackground,
     maintenance: Maintenance,
 ) -> (RpcServices, RuntimeHandles) {
     let Readiness {
@@ -725,11 +700,7 @@ pub fn compose_services(
             worker,
             health: health_service,
         },
-        RuntimeHandles {
-            _worker_background: worker_background,
-            maintenance,
-            readiness,
-        },
+        RuntimeHandles { maintenance, readiness },
     )
 }
 

@@ -127,7 +127,7 @@ pub async fn converge_block_reports(
             registration_state.is_ready(group_name)
                 && worker_manager.is_worker_live(group_name, worker_id)
                 && !worker_manager.needs_full_block_report(group_name, worker_id)
-                && worker_manager.get_all_locations_count() >= ready_block_count
+                && worker_manager.list_reported_blocks().len() >= ready_block_count
         })
         .await
 }

@@ -5,5 +5,4 @@
 
 pub mod block;
 pub mod dirs;
-pub mod io;
 mod meta_codec;

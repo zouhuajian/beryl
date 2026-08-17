@@ -7,7 +7,6 @@ use super::manager::{
     worker_net_protocol_label, BlockReportBlock, BlockReportBlockState, BlockReportDeltaEntry, BlockReportDeltaOp,
     WorkerManager, WORKER_NET_PROTOCOL_GRPC,
 };
-use super::metrics::WorkerMetrics;
 use crate::error::{to_rpc_error, MetadataError, MetadataResult};
 use crate::maintenance::BlockCleanupCoordinator;
 use crate::observe;
@@ -26,15 +25,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn};
-
-/// Worker service background task handles.
-pub struct WorkerBackgroundHandle {}
-
-impl WorkerBackgroundHandle {
-    pub fn task_count(&self) -> usize {
-        0
-    }
-}
 
 fn register_worker_response_with_header(
     header: beryl_proto::common::ResponseHeaderProto,
@@ -86,8 +76,6 @@ enum MetadataWorkerMetric {
 pub struct MetadataWorkerServiceImpl {
     raft_node: Arc<AppRaftNode>,
     worker_manager: Arc<WorkerManager>,
-    metrics: Arc<WorkerMetrics>,
-    slot_metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
     /// Mount table used to compute mount_epoch for lease gating.
     _mount_table: Arc<crate::mount::MountTable>,
     served_group_name: GroupName,
@@ -122,23 +110,14 @@ impl MetadataWorkerServiceImpl {
         served_group_name: GroupName,
         cleanup: Option<Arc<BlockCleanupCoordinator>>,
     ) -> Self {
-        let metrics = Arc::new(WorkerMetrics::new());
-
         Self {
             raft_node,
             worker_manager,
-            metrics,
-            slot_metrics: None, // Will be set via set_slot_metrics
             _mount_table: mount_table,
             served_group_name,
             cleanup,
             registration_serial: tokio::sync::Mutex::new(()),
         }
-    }
-
-    /// Set slot metrics (called after metrics are available).
-    pub(crate) fn set_slot_metrics(&mut self, metrics: Arc<crate::metrics::MetadataMetrics>) {
-        self.slot_metrics = Some(metrics);
     }
 
     /// Helper: create a response header from request header with group name.
@@ -266,11 +245,6 @@ impl MetadataWorkerServiceImpl {
             RpcErrorDetail::register_worker(ErrorKind::Worker(WorkerErrorKind::DescriptorMismatch), message),
             make_response,
         )
-    }
-
-    /// Start worker-local background tasks.
-    pub(crate) fn start_background_tasks(&self) -> WorkerBackgroundHandle {
-        WorkerBackgroundHandle {}
     }
 
     fn liveness_timeout_ms(&self) -> u32 {
@@ -888,9 +862,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 Err(error) => return self.metadata_error_response(&req.header, heartbeat_response_with_header, error),
             };
 
-            // Update metrics (all nodes)
             let live_count = self.worker_manager.list_live_workers().len();
-            self.metrics.update_worker_live(live_count);
             observe::set_worker_live(live_count);
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1200,12 +1172,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     (result, "delta", None, Some(delta_seq), None)
                 }
             };
-
-            // In-memory worker state counters.
-            let total_blocks = result.added_blocks.len() + result.removed_blocks.len();
-            self.metrics.record_blockreport_blocks(total_blocks as u64);
-            let locations_size = self.worker_manager.get_all_locations_count();
-            self.metrics.update_locations_size(locations_size);
 
             observe::record_worker_block_report_blocks("added", result.added_blocks.len());
             observe::record_worker_block_report_blocks("removed", result.removed_blocks.len());
