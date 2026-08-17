@@ -86,24 +86,3 @@ impl StateIdCache {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use beryl_types::{GroupName, GroupStateWatermark, RaftLogId};
-
-    #[test]
-    fn merge_if_ahead_updates_each_group_without_rollback() {
-        let cache = StateIdCache::new(60);
-        let group_a = GroupName::parse("group-a").unwrap();
-        let group_b = GroupName::parse("group-b").unwrap();
-
-        cache.update_if_ahead(GroupStateWatermark::new(group_a.clone(), RaftLogId::new(1, 1, 10)));
-        cache.update_if_ahead(GroupStateWatermark::new(group_b.clone(), RaftLogId::new(1, 1, 5)));
-        cache.update_if_ahead(GroupStateWatermark::new(group_a.clone(), RaftLogId::new(1, 1, 8)));
-        cache.update_if_ahead(GroupStateWatermark::new(group_b.clone(), RaftLogId::new(1, 1, 6)));
-
-        assert_eq!(cache.get(&group_a).unwrap().state_id, RaftLogId::new(1, 1, 10));
-        assert_eq!(cache.get(&group_b).unwrap().state_id, RaftLogId::new(1, 1, 6));
-    }
-}

@@ -51,7 +51,8 @@ Do not make implicit trade-offs between these priorities.
   leader.
 - The Rust native client is the supported client interface.
 - Reads and writes go through metadata-authorized worker storage.
-- UFS is an adapter boundary, not the active read or write path.
+- External/UFS-backed IO has no adapter in the current workspace and is not an
+  active read or write path.
 - The internal writable namespace is rooted at `/`; `/local` has no special
   namespace semantics.
 - Multi-group metadata, multiple metadata leaders, metadata peer RPC, admin
@@ -77,7 +78,6 @@ capabilities.
 - `beryl-worker`: local block storage, stream execution, block lifecycle,
   registration, heartbeat, and block reports.
 - `beryl-client`: Rust native API and metadata/worker RPC orchestration.
-- `beryl-ufs`: external backend and adapter boundary.
 - `beryl-e2e`: black-box coverage of the supported runtime path.
 
 Production dependency direction must remain clean:
@@ -87,8 +87,6 @@ Production dependency direction must remain clean:
 - `beryl-client` must not production-depend on `beryl-metadata` or
   `beryl-worker`.
 - `beryl-worker` must not production-depend on `beryl-metadata` or
-  `beryl-client`.
-- `beryl-ufs` must not depend on `beryl-metadata`, `beryl-worker`, or
   `beryl-client`.
 - Shared contracts belong in `beryl-types`, `beryl-common`, or `beryl-proto`
   according to their ownership.

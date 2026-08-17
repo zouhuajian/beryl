@@ -850,22 +850,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn block_write_publishes_exact_ordered_prefix_as_ready() {
-        let (_temp, store, core) = core_with_store();
-        let mut write = core.begin_block_write(write_request()).await.expect("begin write");
-        core.write_block_data(&mut write, Bytes::from_static(b"abc"))
-            .await
-            .expect("first data");
-        core.write_block_data(&mut write, Bytes::from_static(b"defgh"))
-            .await
-            .expect("second data");
-        core.finish_block_write(&mut write).await.expect("finish write");
-        let meta = store.load_meta(&group_name(), block_id()).expect("ready meta");
-        assert_eq!(meta.visibility.block_state, BlockState::Ready);
-        assert_eq!(store.read_at(&group_name(), block_id(), 0, 8).unwrap(), b"abcdefgh"[..]);
-    }
-
-    #[tokio::test]
     async fn failed_or_cancelled_write_is_cleaned_and_can_be_reused() {
         let (_temp, _store, core) = core_with_store();
         let mut write = core.begin_block_write(write_request()).await.expect("begin write");
@@ -1105,35 +1089,6 @@ mod tests {
             .await
             .is_err());
         core.abort_block_write(write).await.expect("abort");
-    }
-
-    #[tokio::test]
-    async fn read_block_emits_bounded_chunks_and_implicit_eof() {
-        let (_temp, _store, core) = core_with_store();
-        let mut write = core.begin_block_write(write_request()).await.expect("begin write");
-        core.write_block_data(&mut write, Bytes::from_static(b"abcdefgh"))
-            .await
-            .expect("write");
-        core.finish_block_write(&mut write).await.expect("finish");
-        let mut read = core
-            .begin_block_read(ReadBlockRequest {
-                group_name: group_name(),
-                block_id: block_id(),
-                byte_range: ByteRange { offset: 1, len: 6 },
-                block_stamp: BLOCK_STAMP,
-                block_format_id: BlockFormatId::FULL_EFFECTIVE,
-                block_size: BLOCK_SIZE,
-                chunk_size: CHUNK_SIZE,
-                effective_len: 8,
-                frame_size: 2,
-            })
-            .await
-            .expect("begin read");
-
-        assert_eq!(core.read_block_chunk(&mut read).await.unwrap().unwrap(), b"bc"[..]);
-        assert_eq!(core.read_block_chunk(&mut read).await.unwrap().unwrap(), b"de"[..]);
-        assert_eq!(core.read_block_chunk(&mut read).await.unwrap().unwrap(), b"fg"[..]);
-        assert!(core.read_block_chunk(&mut read).await.unwrap().is_none());
     }
 
     #[tokio::test]

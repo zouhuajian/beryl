@@ -48,8 +48,8 @@ and Raft/RocksDB-backed metadata authority.
 
 - Use `beryl-types`, `beryl-common`, and `beryl-proto` for shared contracts.
 - `beryl-worker` and `beryl-client` must not be production dependencies.
-- `beryl-ufs` may be used only as an adapter boundary; metadata remains the
-  authority for namespace and visibility.
+- Mount metadata must not perform external-backend IO; any future adapter
+  remains outside Metadata namespace and visibility authority.
 - Keep independent freshness domains separate unless a replacement invariant is
   designed and tested.
 

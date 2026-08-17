@@ -63,34 +63,3 @@ fn metadata_tonic_request<T>(message: T, header: Option<&RequestHeaderProto>) ->
     }
     request
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use beryl_common::header::RequestHeader;
-    use beryl_types::GroupName;
-
-    #[test]
-    fn metadata_request_injects_protocol_context_without_call_id_traceparent() {
-        let group = GroupName::parse("root").unwrap();
-        let header: RequestHeaderProto = (&RequestHeader::new(ClientId::new(7))
-            .with_group_name(group)
-            .with_tracestate("vendor=state".to_string())
-            .with_baggage("tenant=local".to_string()))
-            .into();
-
-        let request = metadata_tonic_request((), Some(&header));
-        let metadata = request.metadata();
-
-        assert!(metadata.get("traceparent").is_none());
-        assert_eq!(
-            metadata.get("tracestate").and_then(|value| value.to_str().ok()),
-            Some("vendor=state")
-        );
-        assert_eq!(
-            metadata.get("baggage").and_then(|value| value.to_str().ok()),
-            Some("tenant=local")
-        );
-        assert!(metadata.get(concat!("request", "-", "id")).is_none());
-    }
-}

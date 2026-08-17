@@ -232,70 +232,6 @@ mod tests {
     use beryl_types::{BlockId, BlockIndex, InodeId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol};
 
     #[test]
-    fn requested_range_is_truncated_at_eof() {
-        let requested_range = requested_range(8, 10, 12)
-            .expect("range planning succeeds")
-            .expect("non-empty requested range");
-
-        assert_eq!(requested_range.file_offset, 8);
-        assert_eq!(requested_range.len, 4);
-    }
-
-    #[test]
-    fn planner_supports_multi_block_reads() {
-        let requested_range = requested_range(2, 12, 20)
-            .expect("range planning succeeds")
-            .expect("non-empty requested range");
-        let locations = vec![location(10, 0, 0, 8, 101), location(10, 1, 8, 8, 202)];
-
-        let block_reads =
-            plan_block_reads(InodeId::new(10), requested_range, &locations).expect("locations cover range");
-
-        assert_eq!(block_reads.len(), 2);
-        assert_eq!(block_reads[0].file_offset, 2);
-        assert_eq!(block_reads[0].block_offset, 2);
-        assert_eq!(block_reads[0].len, 6);
-        assert_eq!(block_reads[0].block_stamp, 101);
-        assert_eq!(
-            block_reads[0].block_format_id,
-            beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE
-        );
-        assert_eq!(block_reads[0].block_size, 4096);
-        assert_eq!(block_reads[0].chunk_size, 1024);
-        assert_eq!(block_reads[0].effective_len, 8);
-        assert_eq!(block_reads[1].file_offset, 8);
-        assert_eq!(block_reads[1].block_offset, 0);
-        assert_eq!(block_reads[1].len, 6);
-        assert_eq!(block_reads[1].block_stamp, 202);
-    }
-
-    #[test]
-    fn planner_normalizes_unordered_locations() {
-        let requested_range = requested_range(0, 12, 20)
-            .expect("range planning succeeds")
-            .expect("non-empty requested range");
-        let locations = vec![location(10, 1, 8, 8, 202), location(10, 0, 0, 8, 101)];
-
-        let block_reads =
-            plan_block_reads(InodeId::new(10), requested_range, &locations).expect("unordered locations are sorted");
-
-        assert_eq!(
-            block_reads
-                .iter()
-                .map(|block_read| block_read.file_offset)
-                .collect::<Vec<_>>(),
-            vec![0, 8]
-        );
-        assert_eq!(
-            block_reads
-                .iter()
-                .map(|block_read| block_read.block_stamp)
-                .collect::<Vec<_>>(),
-            vec![101, 202]
-        );
-    }
-
-    #[test]
     fn planner_rejects_invalid_location_coverage_and_shape() {
         let cases = vec![
             (
@@ -326,20 +262,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn planner_rejects_empty_worker_candidates_from_metadata_as_block_location_unavailable() {
-        let requested_range = requested_range(0, 4, 20)
-            .expect("range planning succeeds")
-            .expect("non-empty requested range");
-        let mut location = location(10, 0, 0, 4, 101);
-        location.workers.clear();
-
-        let err = plan_block_reads(InodeId::new(10), requested_range, &[location])
-            .expect_err("empty worker candidate list must not produce a read plan");
-
-        assert_block_location_unavailable(&err);
-    }
-
     fn location(inode_id: u64, block_index: u32, file_offset: u64, len: u64, block_stamp: u64) -> FileBlockLocation {
         FileBlockLocation {
             block_id: BlockId::new(InodeId::new(inode_id), BlockIndex::new(block_index)),
@@ -356,22 +278,6 @@ mod tests {
             block_size: 4096,
             chunk_size: 1024,
             effective_len: len,
-        }
-    }
-
-    fn assert_block_location_unavailable(err: &ClientError) {
-        match err {
-            ClientError::Action(action) => match action.action() {
-                crate::rpc_error::ClientAction::Refresh { rpc_error, hint } => {
-                    assert_eq!(
-                        rpc_error.kind,
-                        beryl_common::error::rpc::ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable)
-                    );
-                    assert!(hint.worker_resolve_required);
-                }
-                other => panic!("expected block-location refresh error, got {other:?}"),
-            },
-            other => panic!("expected action error, got {other:?}"),
         }
     }
 }

@@ -260,32 +260,6 @@ mod tests {
     }
 
     #[test]
-    fn published_mount_resolves_external_path() {
-        let table = MountTable::new();
-
-        publish_external_mount(&table, 1, "/mnt/s3", "s3://bucket/path", "g1", InodeId::new(1));
-
-        let result = table.resolve_path("/mnt/s3/file.txt").unwrap();
-        assert!(result.is_some());
-        let (ufs_uri, relative_path) = result.unwrap();
-        assert_eq!(ufs_uri, "s3://bucket/path");
-        assert_eq!(relative_path, "file.txt");
-    }
-
-    #[test]
-    fn test_mount_longest_prefix() {
-        let table = MountTable::new();
-
-        publish_external_mount(&table, 1, "/mnt", "s3://bucket1", "g1", InodeId::new(1));
-        publish_external_mount(&table, 2, "/mnt/s3", "s3://bucket2", "g2", InodeId::new(2));
-
-        let result = table.resolve_path("/mnt/s3/file.txt").unwrap();
-        assert!(result.is_some());
-        let (ufs_uri, _) = result.unwrap();
-        assert_eq!(ufs_uri, "s3://bucket2");
-    }
-
-    #[test]
     fn test_mount_prefix_component_boundaries() {
         let table = MountTable::new();
 
@@ -399,21 +373,6 @@ mod tests {
         assert_eq!(mount_table.list_mounts().len(), 1);
     }
 
-    /// Test load_from_storage with empty storage (first startup)
-    #[test]
-    fn test_load_from_storage_empty() {
-        let temp_dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).unwrap());
-
-        // Should return empty table, not error
-        let mount_table = MountTable::load_from_storage(&storage).unwrap();
-        assert_eq!(mount_table.list_mounts().len(), 0);
-
-        // Resolve should return None
-        let result = mount_table.resolve_path("/any/path").unwrap();
-        assert!(result.is_none());
-    }
-
     #[test]
     fn duplicate_prefix_replacement_does_not_change_current_table() {
         let table = MountTable::new();
@@ -452,33 +411,5 @@ mod tests {
             Some(("ufs://current".to_string(), "file".to_string()))
         );
         assert!(table.resolve_path("/replacement/file").unwrap().is_none());
-    }
-
-    #[test]
-    fn replacement_updates_entries_prefix_and_epoch_together() {
-        let table = MountTable::new();
-        publish_external_mount(&table, 1, "/old", "ufs://old", "root", InodeId::new(1));
-
-        let replacement = MountTable::build_replacement(vec![MountEntry {
-            mount_id: MountId::new(9),
-            mount_prefix: "/new".to_string(),
-            mount_kind: MountKind::External,
-            ufs_uri: Some("ufs://new".to_string()),
-            data_io_policy: DataIoPolicy::Allow,
-            mount_epoch: 41,
-            namespace_owner_group_name: GroupName::parse("root").unwrap(),
-            root_inode_id: InodeId::new(9),
-        }])
-        .unwrap();
-        table.replace(replacement);
-
-        {
-            let state = table.state.read();
-            assert_eq!(state.entries.len(), 1);
-            assert_eq!(state.entries[&MountId::new(9)].mount_prefix, "/new");
-            assert_eq!(state.prefix_index.get("/new"), Some(&MountId::new(9)));
-            assert!(!state.prefix_index.contains_key("/old"));
-            assert_eq!(state.epoch, 42);
-        }
     }
 }

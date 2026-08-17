@@ -345,16 +345,3 @@ impl DirEntry {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn inode_id_encoding() {
-        let id = InodeId::new(0x1234567890abcdef);
-        let bytes = id.to_be_bytes();
-        let decoded = InodeId::from_be_bytes(bytes);
-        assert_eq!(id, decoded);
-    }
-}

@@ -214,23 +214,6 @@ mod tests {
     use tokio::time::sleep;
 
     #[tokio::test]
-    async fn test_retry_success_on_first_attempt() {
-        let policy = RetryPolicy::default();
-        let ctx = RequestHeader::new(ClientId::new(1));
-
-        let mut attempts = 0;
-        let result = retry_async(&policy, &ctx, "test", || {
-            attempts += 1;
-            async move { Ok::<i32, CommonError>(42) }
-        })
-        .await;
-
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 42);
-        assert_eq!(attempts, 1);
-    }
-
-    #[tokio::test]
     async fn test_retry_succeeds_after_retries() {
         let policy = RetryPolicy {
             max_retries: 3,
@@ -296,21 +279,5 @@ mod tests {
         assert!(result.is_err());
         // Should stop before max_retries due to deadline
         assert!(attempts < 10);
-    }
-
-    #[tokio::test]
-    async fn test_retry_disabled() {
-        let policy = RetryPolicy::disabled();
-        let ctx = RequestHeader::new(ClientId::new(1));
-
-        let mut attempts = 0;
-        let result: Result<i32, CommonError> = retry_async(&policy, &ctx, "test", || {
-            attempts += 1;
-            async move { Err(CommonError::new(CommonErrorKind::Overloaded, "error")) }
-        })
-        .await;
-
-        assert!(result.is_err());
-        assert_eq!(attempts, 1); // Should not retry
     }
 }

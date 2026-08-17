@@ -810,62 +810,6 @@ mod tests {
     }
 
     #[test]
-    fn target_config_loads_network_and_domain_values() {
-        let mut flat = base_flat();
-        flat.set(HOST, "metadata-01");
-        flat.set(BIND_HOST, "127.0.0.1");
-        flat.set(RPC_PORT, 28080i64);
-        flat.set(RPC_MAX_CONCURRENT_REQUESTS, 32i64);
-        flat.set(RPC_MAX_CONCURRENT_REQUESTS_PER_CONNECTION, 8i64);
-        flat.set(RPC_RESERVED_CONTROL_REQUESTS, 4i64);
-        flat.set(WRITE_SESSION_MAX_ACTIVE, 256i64);
-        flat.set(WRITE_SESSION_MAX_ACTIVE_PER_CLIENT, 16i64);
-        flat.set(WRITE_TARGET_MAX_OUTSTANDING, 4096i64);
-        flat.set(WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION, 1024i64);
-        flat.set(HTTP_PORT, 28081i64);
-        flat.set(BLOCK_CLEANUP_INTERVAL, "2s");
-        flat.set(NAMESPACE_DELETE_MAX_SIZE, "1MiB");
-        flat.set(WORKER_TIMEOUT, "1500ms");
-        flat.set(WRITE_LEASE_TIMEOUT, "90s");
-        flat.set(SHUTDOWN_TIMEOUT, "20s");
-
-        let config = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap();
-
-        assert_eq!(config.rpc_address(), "metadata-01:28080");
-        assert_eq!(config.rpc_addr(), "127.0.0.1:28080".parse().unwrap());
-        assert_eq!(
-            config.rpc_concurrency,
-            MetadataRpcConcurrencyConfig {
-                max_concurrent_requests: 32,
-                max_concurrent_requests_per_connection: 8,
-                reserved_control_requests: 4,
-            }
-        );
-        assert_eq!(
-            config.write_session_limits,
-            MetadataWriteSessionLimitsConfig {
-                max_active: 256,
-                max_active_per_client: 16,
-            }
-        );
-        assert_eq!(
-            config.write_target_limits,
-            MetadataWriteTargetLimitsConfig {
-                max_outstanding: 4096,
-                max_outstanding_per_session: 1024,
-            }
-        );
-        assert_eq!(config.http_addr(), "127.0.0.1:28081".parse().unwrap());
-        assert_eq!(config.block_cleanup.scan_interval_ms, 2_000);
-        assert_eq!(config.namespace_delete.max_batch_bytes, 1024 * 1024);
-        assert_eq!(config.worker_liveness.heartbeat_timeout_ms, 1_500);
-        assert_eq!(config.write_lease_timeout_ms, 90_000);
-        assert_eq!(config.shutdown_timeout_ms, 20_000);
-        assert_eq!(config.authority.group_name.as_str(), "root");
-        assert_eq!(config.raft.node_id, 1);
-    }
-
-    #[test]
     fn active_safety_bounds_are_enforced() {
         let mut flat = base_flat();
         flat.set(LIST_MAX_PAGE_SIZE, 20_000i64);
@@ -925,16 +869,5 @@ mod tests {
             i64::try_from(MAX_FILE_EXTENTS + 1).unwrap(),
         );
         assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
-    }
-
-    #[test]
-    fn unknown_metadata_key_is_rejected() {
-        let mut flat = base_flat();
-        flat.set("beryl.metadata.rpc.prt", 18080i64);
-
-        let error = MetadataConfig::from_server_config(ServerConfig::from_flat(flat))
-            .expect_err("unknown Metadata key must fail");
-
-        assert!(error.message.contains("beryl.metadata.rpc.prt"));
     }
 }

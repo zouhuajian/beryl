@@ -63,4 +63,3 @@ path = "src/bin/main.rs"
 beryl-client = { path = "../beryl-client" }
 tempfile = { workspace = true }
 tokio-stream = { version = "0.1", features = ["net"] }
-tracing-subscriber = { workspace = true, features = ["fmt", "json", "registry"] }

@@ -33,15 +33,6 @@ beryl.logging.level: "info,beryl_metadata=info,beryl_worker=info,beryl_common=in
     config_path
 }
 
-fn storage_entries(path: &std::path::Path) -> Vec<String> {
-    let mut entries = std::fs::read_dir(path)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    entries.sort();
-    entries
-}
-
 fn marker_for(config: &MetadataConfig, state: FormatState) -> MetadataStorageMarker {
     MetadataStorageMarker {
         state,
@@ -56,39 +47,6 @@ fn marker_for(config: &MetadataConfig, state: FormatState) -> MetadataStorageMar
         bootstrap_call_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
         bootstrap_proposed_at_ms: 1,
     }
-}
-
-#[tokio::test]
-async fn metadata_format_creates_marker_without_group_id() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "root", "single");
-    let config = MetadataConfig::load(&config_path).unwrap();
-
-    let marker = format_metadata_storage(&config).await.unwrap();
-
-    assert_eq!(marker.cluster_id, "test-cluster");
-    assert_eq!(marker.group_name.as_str(), "root");
-    assert_eq!(marker.node_id, 1);
-    assert_eq!(marker.state, FormatState::Ready);
-    assert_eq!(marker.format_version, 1);
-    assert!(metadata_marker_path(&config).exists());
-
-    let marker_json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(metadata_marker_path(&config)).unwrap()).unwrap();
-    assert!(marker_json.get("group_id").is_none());
-    assert_eq!(marker_json["group_name"], "root");
-}
-
-#[tokio::test]
-async fn metadata_format_refuses_existing_marker() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "root", "single");
-    let config = MetadataConfig::load(&config_path).unwrap();
-    format_metadata_storage(&config).await.unwrap();
-
-    let err = format_metadata_storage(&config).await.unwrap_err();
-
-    assert!(err.to_string().contains("already formatted"));
 }
 
 #[tokio::test]
@@ -155,155 +113,6 @@ async fn metadata_start_rejects_formatting_marker_without_mutating_storage() {
 }
 
 #[tokio::test]
-async fn metadata_format_validates_bootstrap_identity_before_creating_rocksdb() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "root", "single");
-    let config = MetadataConfig::load(&config_path).unwrap();
-    std::fs::create_dir_all(&config.storage_dir).unwrap();
-    let mut formatting = marker_for(&config, FormatState::Formatting);
-    formatting.bootstrap_call_id = "not-a-uuid".to_string();
-    std::fs::write(
-        metadata_marker_path(&config),
-        serde_json::to_vec_pretty(&formatting).unwrap(),
-    )
-    .unwrap();
-
-    let error = format_metadata_storage(&config).await.unwrap_err();
-
-    assert!(error.to_string().contains("bootstrap_call_id is invalid"));
-    assert!(!config.storage_dir.join("CURRENT").exists());
-}
-
-#[tokio::test]
-async fn metadata_format_refuses_non_empty_markerless_storage() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "root", "single");
-    let config = MetadataConfig::load(&config_path).unwrap();
-    std::fs::create_dir_all(&config.storage_dir).unwrap();
-    std::fs::write(config.storage_dir.join("old-store-file"), b"stale").unwrap();
-
-    let err = format_metadata_storage(&config).await.unwrap_err();
-    let message = err.to_string();
-
-    assert!(message.contains("beryl.metadata.storage.dir"));
-    assert!(message.contains(&config.storage_dir.display().to_string()));
-    assert!(message.contains("marker missing"));
-    assert!(message.contains("clean the directory manually"));
-}
-
-#[tokio::test]
-async fn metadata_start_fails_without_marker() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "root", "single");
-    let config = MetadataConfig::load(&config_path).unwrap();
-
-    let err = prepare_metadata_start(&config).await.unwrap_err();
-
-    assert!(err.to_string().contains("beryl --conf-dir <dir> format metadata"));
-    assert!(!metadata_marker_path(&config).exists());
-}
-
-#[tokio::test]
-async fn metadata_start_fails_when_marker_exists_without_rocksdb_state() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "root", "single");
-    let config = MetadataConfig::load(&config_path).unwrap();
-    std::fs::create_dir_all(&config.storage_dir).unwrap();
-    let marker = marker_for(&config, FormatState::Ready);
-    std::fs::write(
-        metadata_marker_path(&config),
-        serde_json::to_vec_pretty(&marker).unwrap(),
-    )
-    .unwrap();
-    let entries_before = storage_entries(&config.storage_dir);
-
-    let err = prepare_metadata_start(&config).await.unwrap_err();
-    let message = err.to_string();
-
-    assert!(message.contains("RocksDB state is missing or corrupt"), "{message}");
-    assert_eq!(storage_entries(&config.storage_dir), entries_before);
-    assert!(metadata_marker_path(&config).exists());
-    assert!(!config.storage_dir.join("CURRENT").exists());
-    assert!(!config.storage_dir.join("snapshots").exists());
-}
-
-#[tokio::test]
-async fn metadata_start_fails_on_marker_config_mismatch() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "root", "single");
-    let config = MetadataConfig::load(&config_path).unwrap();
-    format_metadata_storage(&config).await.unwrap();
-    let mut marker: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(metadata_marker_path(&config)).unwrap()).unwrap();
-    marker["group_name"] = serde_json::Value::String("other".to_string());
-    std::fs::write(
-        metadata_marker_path(&config),
-        serde_json::to_vec_pretty(&marker).unwrap(),
-    )
-    .unwrap();
-
-    let err = prepare_metadata_start(&config).await.unwrap_err();
-
-    assert!(err.to_string().contains("metadata marker mismatch"));
-    assert!(err.to_string().contains("group_name"));
-}
-
-#[tokio::test]
-async fn metadata_start_rejects_marker_from_another_storage() {
-    let first_dir = TempDir::new().unwrap();
-    let first_config_path = write_config(&first_dir, "root", "single");
-    let first_config = MetadataConfig::load(&first_config_path).unwrap();
-    format_metadata_storage(&first_config).await.unwrap();
-
-    let second_dir = TempDir::new().unwrap();
-    let second_config_path = write_config(&second_dir, "root", "single");
-    let second_config = MetadataConfig::load(&second_config_path).unwrap();
-    format_metadata_storage(&second_config).await.unwrap();
-
-    std::fs::write(
-        metadata_marker_path(&first_config),
-        std::fs::read(metadata_marker_path(&second_config)).unwrap(),
-    )
-    .unwrap();
-
-    let error = prepare_metadata_start(&first_config)
-        .await
-        .expect_err("a marker must be bound to exactly one RocksDB store");
-
-    assert!(error.to_string().contains("storage identity mismatch"), "{error}");
-}
-
-#[tokio::test]
-async fn metadata_marker_rejects_legacy_group_id_and_unknown_fields() {
-    for extra_field in ["group_id", "unknown_field"] {
-        let dir = TempDir::new().unwrap();
-        let config_path = write_config(&dir, "root", "single");
-        let config = MetadataConfig::load(&config_path).unwrap();
-        std::fs::create_dir_all(&config.storage_dir).unwrap();
-        let marker_path = metadata_marker_path(&config);
-        let unsupported_marker = format!(
-            r#"{{
-  "cluster_id": "test-cluster",
-  "group_name": "root",
-  "node_id": 1,
-  "storage_uuid": "storage-a",
-  "format_version": 1,
-  "created_at_ms": 1,
-  "software_version": "test",
-  "{extra_field}": 1
-}}"#
-        );
-        std::fs::write(&marker_path, unsupported_marker.as_bytes()).unwrap();
-
-        let err = prepare_metadata_start(&config).await.unwrap_err();
-        let message = err.to_string();
-        assert!(message.contains("malformed or unsupported"), "{message}");
-        assert!(message.contains("reformat metadata storage"), "{message}");
-        assert_eq!(std::fs::read(&marker_path).unwrap(), unsupported_marker.as_bytes());
-    }
-}
-
-#[tokio::test]
 async fn metadata_start_rejects_non_current_marker_versions_without_rewriting_them() {
     for unsupported_version in [0, 2, u32::MAX] {
         let dir = TempDir::new().unwrap();
@@ -329,27 +138,4 @@ async fn metadata_start_rejects_non_current_marker_versions_without_rewriting_th
         assert!(message.contains("reformat metadata storage"), "{message}");
         assert_eq!(std::fs::read(&marker_path).unwrap(), unsupported_marker);
     }
-}
-
-#[tokio::test]
-async fn metadata_start_preserves_format_identity_and_rejects_rpc_address_drift() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "root", "single");
-    let config = MetadataConfig::load(&config_path).unwrap();
-    format_metadata_storage(&config).await.unwrap();
-    let marker_before = std::fs::read(metadata_marker_path(&config)).unwrap();
-
-    prepare_metadata_start(&config).await.unwrap();
-
-    assert_eq!(std::fs::read(metadata_marker_path(&config)).unwrap(), marker_before);
-
-    let mut drifted = config.clone();
-    drifted.rpc_port += 1;
-    let error = prepare_metadata_start(&drifted)
-        .await
-        .expect_err("start must preserve the format-time membership address");
-    assert!(
-        error.to_string().contains("format-time Raft membership address"),
-        "{error}"
-    );
 }

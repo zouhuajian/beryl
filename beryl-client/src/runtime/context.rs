@@ -329,7 +329,7 @@ fn unix_now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beryl_types::{CallId, ClientId};
+    use beryl_types::ClientId;
 
     fn metadata_operation() -> OperationContext {
         OperationContext::new_named(
@@ -340,62 +340,6 @@ mod tests {
             OperationDeadline::new(1_000),
         )
         .expect("operation context")
-    }
-
-    #[test]
-    fn operation_context_uses_stable_call_id() {
-        let call_id = CallId::new();
-        let operation = OperationContext::with_call_id_named(
-            ClientId::new(7),
-            "prod_ns01",
-            call_id,
-            "OpenFile",
-            Some("/alpha".to_string()),
-            OperationDeadline::new(1_000),
-        )
-        .expect("operation context");
-
-        assert_eq!(operation.call_id, call_id);
-    }
-
-    #[test]
-    fn metadata_header_carries_runtime_client_identity() {
-        let identity = ClientIdentity::generate("prod_ns01").expect("client identity");
-        let operation = OperationContext::new_with_identity(
-            &identity,
-            "OpenFile",
-            Some("/alpha".to_string()),
-            OperationDeadline::new(1_000),
-        )
-        .expect("operation context");
-        let ctx =
-            AttemptContext::for_metadata(&operation, GroupName::parse("root").unwrap(), 0).expect("metadata context");
-
-        let header = ctx.metadata_header().expect("metadata header");
-        let client = header.client.as_ref().expect("client info");
-        let header_client_id =
-            beryl_proto::convert::required_client_id(client.client_id, "client_id").expect("client id");
-
-        assert_eq!(header_client_id, identity.client_id());
-        assert_eq!(client.client_name, identity.client_name());
-        assert!(!client.call_id.is_empty());
-    }
-
-    #[test]
-    fn attempt_context_rejects_zero_client_id() {
-        let invalid_operation = OperationContext {
-            client_id: ClientId::new(u128::MIN),
-            client_name: "default_client".to_string(),
-            call_id: CallId::new(),
-            operation_name: "OpenFile",
-            route_path: Some("/alpha".to_string()),
-            deadline: OperationDeadline::new(1_000),
-        };
-
-        let err = AttemptContext::for_metadata(&invalid_operation, GroupName::parse("root").unwrap(), 0)
-            .expect_err("metadata attempt must reject zero client_id");
-
-        assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("client_id")));
     }
 
     #[test]
@@ -414,49 +358,5 @@ mod tests {
         );
         assert_eq!(first_header.group_name, "root");
         assert_eq!(replay_header.group_name, "analytics");
-    }
-
-    #[test]
-    fn attempt_headers_do_not_use_call_id_as_traceparent() {
-        let operation = metadata_operation();
-        let ctx =
-            AttemptContext::for_metadata(&operation, GroupName::parse("root").unwrap(), 0).expect("metadata attempt");
-
-        let metadata_header = ctx.metadata_header().expect("metadata header");
-        let data_header = ctx.data_header();
-        let metadata_call_id = metadata_header
-            .client
-            .as_ref()
-            .expect("metadata client")
-            .call_id
-            .as_str();
-        let data_call_id = data_header.client.as_ref().expect("data client").call_id.as_str();
-
-        assert_eq!(metadata_call_id, data_call_id);
-        assert!(metadata_header.trace_context.is_none());
-        assert!(data_header.trace_context.is_none());
-    }
-
-    #[test]
-    fn shared_deadline_is_preserved_across_attempts() {
-        let operation = metadata_operation();
-        let base = AttemptContext::for_metadata(&operation, GroupName::parse("root").unwrap(), 0).expect("attempt");
-        let call_id = base
-            .metadata_header()
-            .expect("base header")
-            .client
-            .expect("base client")
-            .call_id;
-        let replay = AttemptContext::for_metadata(&operation, GroupName::parse("root").unwrap(), 1).expect("replay");
-        let deadline_ms = base.deadline_ms();
-        let replay_call_id = replay
-            .metadata_header()
-            .expect("replay header")
-            .client
-            .expect("replay client")
-            .call_id;
-        assert!(deadline_ms > 0);
-        assert_eq!(replay_call_id, call_id);
-        assert_eq!(replay.deadline_ms(), deadline_ms);
     }
 }

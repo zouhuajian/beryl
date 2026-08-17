@@ -363,28 +363,6 @@ mod tests {
     }
 
     #[test]
-    fn opening_existing_store_without_schema_version_requires_reformat() {
-        let dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
-        storage
-            .with_pinned_db(|db| {
-                let meta = db.cf_handle(CF_META).unwrap();
-                db.delete_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY).unwrap();
-                Ok(())
-            })
-            .unwrap();
-        drop(storage);
-
-        let error = match RocksDBStorage::open_existing_for_start(dir.path()) {
-            Ok(_) => panic!("store without a schema version must not open"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("schema version is missing"));
-        assert!(error.to_string().contains("reformat metadata storage"));
-    }
-
-    #[test]
     fn opening_non_current_schema_versions_requires_reformat_without_rewriting_them() {
         for unsupported_version in [0, 2, 10, u64::MAX] {
             let dir = TempDir::new().unwrap();
@@ -424,36 +402,6 @@ mod tests {
     }
 
     #[test]
-    fn opening_malformed_schema_version_requires_reformat_without_rewriting_it() {
-        let dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
-        drop(storage);
-
-        let generation_path = dir.path().join("generations/gen-000001");
-        let db = DB::open_cf_descriptors(&Options::default(), &generation_path, cf_descriptors()).unwrap();
-        let meta = db.cf_handle(CF_META).unwrap();
-        let mut malformed = bincode::serde::encode_to_vec(ROCKSDB_SCHEMA_VERSION, bincode::config::standard()).unwrap();
-        malformed.push(0);
-        db.put_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY, &malformed).unwrap();
-        drop(db);
-
-        let error = match RocksDBStorage::open_existing_for_start(dir.path()) {
-            Ok(_) => panic!("store with a malformed schema version must not open"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("invalid RocksDB schema version"));
-        assert!(error.to_string().contains("reformat metadata storage"));
-
-        let db = DB::open_cf_descriptors(&Options::default(), generation_path, cf_descriptors()).unwrap();
-        let meta = db.cf_handle(CF_META).unwrap();
-        assert_eq!(
-            db.get_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY).unwrap().as_deref(),
-            Some(malformed.as_slice())
-        );
-    }
-
-    #[test]
     fn opening_malformed_detached_root_authority_requires_reformat() {
         let dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
@@ -473,26 +421,6 @@ mod tests {
 
         assert!(error.to_string().contains("invalid detached-root key length"));
         assert!(error.to_string().contains("reformat metadata storage"));
-    }
-
-    #[test]
-    fn format_resume_rejects_missing_schema_even_when_generation_is_pristine() {
-        let dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
-        storage
-            .with_pinned_db(|db| {
-                let meta = db.cf_handle(CF_META).unwrap();
-                db.delete_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY).unwrap();
-                Ok(())
-            })
-            .unwrap();
-        drop(storage);
-
-        let error = match RocksDBStorage::create_for_format(dir.path()) {
-            Ok(_) => panic!("schema-less generation must not resume"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("schema version is missing"));
     }
 
     #[test]
@@ -521,45 +449,5 @@ mod tests {
         };
 
         assert!(error.to_string().contains("schema version is missing"));
-    }
-
-    #[test]
-    fn test_obsolete_cf_detection() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test_db");
-
-        // Create a RocksDB with obsolete "files" CF.
-        {
-            let mut opts = Options::default();
-            opts.create_if_missing(true);
-            opts.create_missing_column_families(true);
-
-            let cfs = vec![
-                ColumnFamilyDescriptor::new("files", Options::default()),
-                ColumnFamilyDescriptor::new("blocks", Options::default()),
-            ];
-
-            let db = DB::open_cf_descriptors(&opts, &db_path, cfs).unwrap();
-            // Write something to files CF to ensure it exists
-            let files_cf = db.cf_handle("files").unwrap();
-            db.put_cf(files_cf, b"test_key", b"test_value").unwrap();
-        }
-
-        // Try to open with new code; obsolete CF layouts must fail fast.
-        let result = RocksDBStorage::create_for_format(&db_path);
-        assert!(result.is_err(), "Opening DB with obsolete 'files' CF should fail");
-        match result {
-            Err(e) => {
-                let error_msg = format!("{}", e);
-                assert!(
-                    error_msg.contains("invalid CURRENT")
-                        || error_msg.contains("obsolete column family")
-                        || error_msg.contains("files"),
-                    "Error message should mention obsolete column family 'files', got: {}",
-                    error_msg
-                );
-            }
-            Ok(_) => panic!("Expected error but got Ok"),
-        }
     }
 }

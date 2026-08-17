@@ -27,8 +27,6 @@ use tokio_util::sync::CancellationToken;
 /// requests. Dropping the handle cancels and aborts all remaining HTTP work,
 /// which prevents connection tasks from outliving their process owner.
 pub struct ServiceHttpHandle {
-    #[cfg(test)]
-    local_addr: SocketAddr,
     shutdown: CancellationToken,
     force: CancellationToken,
     task: Option<JoinHandle<()>>,
@@ -81,6 +79,15 @@ pub fn spawn_service_http(
     let listener = std::net::TcpListener::bind(bind)?;
     listener.set_nonblocking(true)?;
     let listener = TcpListener::from_std(listener)?;
+
+    spawn_service_http_with_listener(listener, metrics, is_ready)
+}
+
+fn spawn_service_http_with_listener(
+    listener: TcpListener,
+    metrics: PrometheusHandle,
+    is_ready: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> io::Result<ServiceHttpHandle> {
     let local_addr = listener.local_addr()?;
 
     let shutdown = CancellationToken::new();
@@ -141,8 +148,6 @@ pub fn spawn_service_http(
         }
     });
     Ok(ServiceHttpHandle {
-        #[cfg(test)]
-        local_addr,
         shutdown,
         force,
         task: Some(task),
@@ -241,8 +246,9 @@ mod tests {
     #[tokio::test]
     async fn shutdown_closes_listener_and_awaits_connection_tasks() {
         let recorder = PrometheusBuilder::new().build_recorder();
-        let server = spawn_service_http("127.0.0.1:0".parse().unwrap(), recorder.handle(), Arc::new(|| true)).unwrap();
-        let address = server.local_addr;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = spawn_service_http_with_listener(listener, recorder.handle(), Arc::new(|| true)).unwrap();
         let connection = TcpStream::connect(address).await.unwrap();
         drop(connection);
 

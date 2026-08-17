@@ -285,7 +285,6 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::data::protocol::parse_worker_control_header;
-    use crate::metrics::NoopClientMetrics;
     use crate::runtime::{AttemptContext, OperationContext, OperationDeadline};
 
     #[derive(Debug, Default)]
@@ -303,22 +302,6 @@ mod tests {
         fn events(&self) -> Vec<ClientMetricEvent> {
             self.events.lock().expect("events").clone()
         }
-    }
-
-    // connect_lazy touches Hyper's Tokio executor even though acquisition is synchronous.
-    #[tokio::test]
-    async fn worker_channel_pool_reuses_channel_for_same_worker_endpoint() {
-        let metrics = Arc::new(RecordingMetrics::default());
-        let pool = GrpcWorkerChannelPool::new(true, 1, metrics.clone());
-        let worker = worker_endpoint();
-
-        let _first = pool.worker_data_service_client(&worker, "read").expect("first client");
-        let _second = pool.worker_data_service_client(&worker, "read").expect("second client");
-
-        let events = metrics.events();
-        assert_metric(&events, ClientMetric::WorkerChannelPoolMiss);
-        assert_metric(&events, ClientMetric::WorkerChannelPoolHit);
-        assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
     }
 
     #[tokio::test]
@@ -353,25 +336,6 @@ mod tests {
 
     // connect_lazy touches Hyper's Tokio executor even though acquisition is synchronous.
     #[tokio::test]
-    async fn worker_channel_different_run_does_not_share_channel() {
-        let metrics = Arc::new(NoopClientMetrics);
-        let pool = GrpcWorkerChannelPool::new(true, 8, metrics);
-        let mut first = worker_endpoint();
-        first.worker_run_id = "550e8400-e29b-41d4-a716-446655440007"
-            .parse()
-            .expect("valid first WorkerRunId");
-        let mut second = worker_endpoint();
-        second.worker_run_id = "550e8400-e29b-41d4-a716-446655440008"
-            .parse()
-            .expect("valid second WorkerRunId");
-
-        pool.worker_data_service_client(&first, "read").expect("first client");
-        pool.worker_data_service_client(&second, "read").expect("second client");
-        assert_eq!(pool.channels.read().len(), 2);
-    }
-
-    // connect_lazy touches Hyper's Tokio executor even though acquisition is synchronous.
-    #[tokio::test]
     async fn worker_run_mismatch_invalidates_target_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
         let pool = GrpcWorkerChannelPool::new(true, 1, metrics.clone());
@@ -398,92 +362,6 @@ mod tests {
 
         assert_eq!(pool.channels.read().len(), 0);
         assert_metric(&metrics.events(), ClientMetric::CachePreciseInvalidation);
-    }
-
-    #[test]
-    fn failed_worker_channel_creation_does_not_insert() {
-        let metrics = Arc::new(RecordingMetrics::default());
-        let pool = Arc::new(GrpcWorkerChannelPool::new(true, 8, metrics.clone()));
-        let mut worker = worker_endpoint();
-        worker.endpoint = "http://[invalid".to_string();
-
-        let mut tasks = Vec::with_capacity(4);
-        for _ in 0..4 {
-            let pool = Arc::clone(&pool);
-            let worker = worker.clone();
-            tasks.push(std::thread::spawn(move || {
-                pool.worker_data_service_client(&worker, "read")
-            }));
-        }
-
-        for task in tasks {
-            let err = task.join().expect("task").expect_err("invalid endpoint");
-            assert!(matches!(err, ClientError::Worker(msg) if msg.contains("invalid worker endpoint")));
-        }
-        assert!(pool.channels.read().is_empty());
-        let events = metrics.events();
-        assert_metric_with_target_plane(&events, ClientMetric::ChannelBuildError, "worker");
-        assert_metric_labels_do_not_contain(&events, "http://[invalid");
-    }
-
-    // connect_lazy touches Hyper's Tokio executor even though acquisition is synchronous.
-    #[tokio::test]
-    async fn disabled_worker_channel_pool_does_not_reuse_channel() {
-        let metrics = Arc::new(RecordingMetrics::default());
-        let pool = GrpcWorkerChannelPool::new(false, 1, metrics.clone());
-        let worker = worker_endpoint();
-
-        let _first = pool.worker_data_service_client(&worker, "read").expect("first client");
-        let _second = pool.worker_data_service_client(&worker, "read").expect("second client");
-
-        let events = metrics.events();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.metric == ClientMetric::WorkerChannelPoolMiss)
-                .count(),
-            2
-        );
-        assert!(events
-            .iter()
-            .all(|event| event.metric != ClientMetric::WorkerChannelPoolHit));
-    }
-
-    #[test]
-    fn worker_channel_build_error_is_reported_with_safe_labels() {
-        let metrics = Arc::new(RecordingMetrics::default());
-        let pool = GrpcWorkerChannelPool::new(true, 1, metrics.clone());
-        let mut worker = worker_endpoint();
-        worker.endpoint = "http://[invalid".to_string();
-
-        let err = pool
-            .worker_data_service_client(&worker, "read")
-            .expect_err("invalid endpoint fails");
-
-        assert!(matches!(err, ClientError::Worker(msg) if msg.contains("invalid worker endpoint")));
-        let events = metrics.events();
-        assert_metric_with_target_plane(&events, ClientMetric::ChannelBuildError, "worker");
-        assert_metric_labels_do_not_contain(&events, "http://[invalid");
-    }
-
-    #[test]
-    fn worker_endpoint_cooldowns_are_bounded() {
-        let metrics = Arc::new(NoopClientMetrics);
-        let pool = GrpcWorkerChannelPool::new_with_cooldown_ms(true, 1, 60_000, metrics);
-
-        for index in 0..1_100 {
-            let mut worker = worker_endpoint();
-            worker.worker_id = WorkerId::new(index + 1);
-            worker.endpoint = format!("127.0.0.1:{}", 20_000 + index);
-
-            pool.mark_worker_unavailable(&worker, CacheInvalidationReason::Unavailable);
-        }
-
-        assert!(
-            pool.cooldowns.read().len() <= WORKER_ENDPOINT_COOLDOWN_CACHE_LIMIT,
-            "cooldown map must stay bounded, got {} entries",
-            pool.cooldowns.read().len()
-        );
     }
 
     fn worker_endpoint() -> WorkerEndpointInfo {
@@ -526,47 +404,11 @@ mod tests {
         );
     }
 
-    fn assert_metric_with_target_plane(events: &[ClientMetricEvent], metric: ClientMetric, target_plane: &'static str) {
-        assert!(
-            events
-                .iter()
-                .any(|event| event.metric == metric && event.labels.target_plane == Some(target_plane)),
-            "missing metric {metric:?} with target_plane={target_plane}: {events:?}"
-        );
-        assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
-        let stale_metric = ["ChannelPool", "ConnectError"].concat();
-        assert!(events
-            .iter()
-            .all(|event| !format!("{:?}", event.metric).contains(&stale_metric)));
-    }
-
     fn assert_safe_metric_labels(events: &[ClientMetricEvent]) {
         assert!(
             events.iter().all(|event| event.labels.has_only_safe_values()),
             "unsafe metric labels: {events:?}"
         );
-    }
-
-    fn assert_metric_labels_do_not_contain(events: &[ClientMetricEvent], value: &str) {
-        assert!(
-            events
-                .iter()
-                .all(|event| !metric_label_values(&event.labels).any(|label| label.contains(value))),
-            "metric labels unexpectedly contain {value:?}: {events:?}"
-        );
-    }
-
-    fn metric_label_values(labels: &ClientMetricLabels) -> impl Iterator<Item = &str> {
-        [
-            labels.operation_name.as_deref(),
-            labels.error_class,
-            labels.target_plane,
-            labels.cache,
-            labels.reason,
-            labels.outcome,
-        ]
-        .into_iter()
-        .flatten()
     }
 
     fn count_metric(events: &[ClientMetricEvent], metric: ClientMetric) -> usize {

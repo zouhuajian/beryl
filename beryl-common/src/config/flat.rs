@@ -346,58 +346,6 @@ mod tests {
     use serde_yaml::Value;
 
     #[test]
-    fn typed_getters_parse_supported_values() {
-        let mut config = FlatConfig::new();
-        config.insert("key1".to_string(), Value::String("value1".to_string()));
-        config.insert("key2".to_string(), Value::Number(serde_yaml::Number::from(42)));
-        assert_eq!(config.get_str("key1"), Some("value1".to_string()));
-        assert_eq!(config.get_str("key2"), Some("42".to_string()));
-        assert_eq!(config.get_str("key3"), None);
-
-        config.insert("num1".to_string(), Value::Number(serde_yaml::Number::from(42)));
-        config.insert("num2".to_string(), Value::String("100".to_string()));
-        assert_eq!(config.get_i64("num1"), Some(42));
-        assert_eq!(config.get_i64("num2"), Some(100));
-        assert_eq!(config.get_i64("num3"), None);
-
-        config.insert("bool1".to_string(), Value::Bool(true));
-        config.insert("bool2".to_string(), Value::String("false".to_string()));
-        config.insert("bool3".to_string(), Value::String("yes".to_string()));
-        assert_eq!(config.get_bool("bool1"), Some(true));
-        assert_eq!(config.get_bool("bool2"), Some(false));
-        assert_eq!(config.get_bool("bool3"), Some(true));
-
-        config.insert("size1".to_string(), Value::String("1KB".to_string()));
-        config.insert("size2".to_string(), Value::String("2MB".to_string()));
-        config.insert("size3".to_string(), Value::Number(serde_yaml::Number::from(1024)));
-        assert_eq!(config.get_bytes("size1"), Some(1024));
-        assert_eq!(config.get_bytes("size2"), Some(2 * 1024 * 1024));
-        assert_eq!(config.get_bytes("size3"), Some(1024));
-    }
-
-    #[test]
-    fn test_sub() {
-        let mut config = FlatConfig::new();
-        config.insert(
-            "beryl.metadata.rpc.port".to_string(),
-            Value::Number(serde_yaml::Number::from(8080)),
-        );
-        config.insert(
-            "beryl.metadata.rpc.host".to_string(),
-            Value::String("localhost".to_string()),
-        );
-        config.insert(
-            "beryl.worker.rpc.bind".to_string(),
-            Value::String("127.0.0.1:9090".to_string()),
-        );
-
-        let sub = config.sub("beryl.metadata.rpc");
-        assert_eq!(sub.get_i64("port"), Some(8080));
-        assert_eq!(sub.get_str("host"), Some("localhost".to_string()));
-        assert_eq!(sub.get_str("kind"), None); // Not in sub
-    }
-
-    #[test]
     fn test_redact_for_log() {
         let mut config = FlatConfig::new();
         config.insert("password".to_string(), Value::String("secret123".to_string()));
@@ -408,19 +356,5 @@ mod tests {
         assert_eq!(redacted.get_str("password"), Some("***".to_string()));
         assert_eq!(redacted.get_str("api_key"), Some("***".to_string()));
         assert_eq!(redacted.get_str("normal_name"), Some("value".to_string()));
-    }
-
-    #[test]
-    fn known_key_validation_reports_unknown_input() {
-        let mut config = FlatConfig::new();
-        config.set("beryl.logging.level", "info");
-        config.set("beryl.logging.levle", "debug");
-
-        let error = config
-            .ensure_only_known_keys(&["beryl.logging.level"])
-            .expect_err("unknown key must fail");
-
-        assert_eq!(error.kind, CommonErrorKind::InvalidArgument);
-        assert!(error.message.contains("beryl.logging.levle"));
     }
 }

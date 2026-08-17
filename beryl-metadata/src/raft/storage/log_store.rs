@@ -426,7 +426,6 @@ mod tests {
     use super::*;
     use crate::mount::MountTable;
     use crate::raft::state_machine::AppRaftStateMachine;
-    use crate::raft::storage::AuthorityBatch;
     use crate::raft::storage::{StateMachineStorage, StorageIdentity};
     use crate::raft::MetadataReadView;
     use openraft::testing::{StoreBuilder, Suite};
@@ -492,38 +491,6 @@ mod tests {
         assert!(storage.get_raft_log(1).unwrap().is_some());
         assert!(state.read().last_purged_log_id.is_none());
         assert_eq!(token.complete().unwrap().unwrap().index, 1);
-    }
-
-    #[test]
-    #[ignore = "manual durability latency baseline; run with --release and --ignored"]
-    fn raft_durable_append_and_apply_latency_baseline() {
-        const SAMPLES: u64 = 50;
-
-        let temp_dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
-        let append_started = std::time::Instant::now();
-        for index in 1..=SAMPLES {
-            storage.append_raft_logs_durable(&[(index, vec![0; 256])]).unwrap();
-        }
-        let append_elapsed = append_started.elapsed();
-
-        let apply_started = std::time::Instant::now();
-        for index in 1..=SAMPLES {
-            let raft_state = AppMetadataRaftState {
-                last_applied_log_id: Some(LogId::new(LeaderId::new(1, 1), index)),
-                ..AppMetadataRaftState::default()
-            };
-            storage
-                .commit_authority_batch(AuthorityBatch::default(), &raft_state)
-                .unwrap();
-        }
-        let apply_elapsed = apply_started.elapsed();
-
-        eprintln!(
-            "raft durability baseline: sync_append_ns_per_op={}, apply_batch_ns_per_op={}",
-            append_elapsed.as_nanos() / SAMPLES as u128,
-            apply_elapsed.as_nanos() / SAMPLES as u128
-        );
     }
 
     #[test]

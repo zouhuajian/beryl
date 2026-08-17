@@ -5,7 +5,6 @@ members = [
     "beryl-types",
     "beryl-proto",
     "beryl-metadata",
-    "beryl-ufs",
     "beryl-worker",
     "beryl-client",
     "beryl-e2e",
@@ -34,7 +33,6 @@ async-trait = "0.1.89"
 tonic = { version = "0.14.2", features = ["transport"] }
 tonic-health = "0.14.2"
 prost = "0.14.1"
-prost-types = "0.14.1"
 tonic-prost = "0.14.2"
 tonic-prost-build = "0.14.2"
 tower = "0.5"
@@ -45,7 +43,6 @@ openraft = { version = "0.9.21", features = ["serde", "storage-v2"] }
 # Storage
 rocksdb = { version = "0.22.0", default-features = false, features = ["snappy"] }
 fs2 = "0.4.3"
-opendal = { version = "0.55.0", features = ["services-fs", "services-s3", "services-oss"] }
 tikv-jemalloc-ctl = "0.6.1"
 
 # Observability (metrics / tracing)

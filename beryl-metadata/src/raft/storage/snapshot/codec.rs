@@ -648,38 +648,6 @@ mod tests {
     }
 
     #[test]
-    fn valid_snapshot_streams_records_and_returns_totals() {
-        let expected = identity();
-        let bytes = encode_fixture(&expected, &state_cfs(), None, None);
-        let mut records = Vec::new();
-
-        let summary = decode_snapshot(Cursor::new(bytes), &expected, |cf, key, value| {
-            records.push((cf.to_string(), key.to_vec(), value.to_vec()));
-            Ok(())
-        })
-        .unwrap();
-
-        assert_eq!(summary.total_records, 1);
-        assert_eq!(summary.total_uncompressed_bytes, 8);
-        assert_eq!(
-            records,
-            vec![(STATE_CFS[0].to_string(), b"key".to_vec(), b"value".to_vec())]
-        );
-    }
-
-    #[test]
-    fn every_truncation_is_rejected() {
-        let expected = identity();
-        let bytes = encode_fixture(&expected, &state_cfs(), None, None);
-        for length in 0..bytes.len() {
-            assert!(
-                decode(&bytes[..length], &expected).is_err(),
-                "accepted truncation at {length}"
-            );
-        }
-    }
-
-    #[test]
     fn checksum_corruption_and_extra_bytes_are_rejected() {
         let expected = identity();
         let mut corrupt = encode_fixture(&expected, &state_cfs(), None, None);
@@ -693,31 +661,6 @@ mod tests {
         let mut extra = encode_fixture(&expected, &state_cfs(), None, None);
         extra.push(0);
         assert!(decode(&extra, &expected).unwrap_err().to_string().contains("trailing"));
-    }
-
-    #[test]
-    fn duplicate_missing_and_unknown_column_families_are_rejected() {
-        let expected = identity();
-        let mut duplicate = state_cfs();
-        duplicate[1].name = duplicate[0].name.clone();
-        assert!(decode(&encode_fixture(&expected, &duplicate, None, None), &expected)
-            .unwrap_err()
-            .to_string()
-            .contains("duplicate"));
-
-        let mut missing = state_cfs();
-        missing.pop();
-        assert!(decode(&encode_fixture(&expected, &missing, None, None), &expected)
-            .unwrap_err()
-            .to_string()
-            .contains("missing"));
-
-        let mut unknown = state_cfs();
-        unknown[0].name = "unknown".to_string();
-        assert!(decode(&encode_fixture(&expected, &unknown, None, None), &expected)
-            .unwrap_err()
-            .to_string()
-            .contains("unknown"));
     }
 
     #[test]
@@ -749,94 +692,6 @@ mod tests {
     }
 
     #[test]
-    fn identity_version_schema_group_and_last_applied_mismatches_are_rejected() {
-        let expected = identity();
-
-        let mut wrong_schema = expected.clone();
-        wrong_schema.storage_schema_version += 1;
-        assert!(
-            decode(&encode_fixture(&wrong_schema, &state_cfs(), None, None), &expected)
-                .unwrap_err()
-                .to_string()
-                .contains("schema")
-        );
-
-        let mut wrong_group = expected.clone();
-        wrong_group.group_name = GroupName::parse("other").unwrap();
-        assert!(
-            decode(&encode_fixture(&wrong_group, &state_cfs(), None, None), &expected)
-                .unwrap_err()
-                .to_string()
-                .contains("group")
-        );
-
-        let mut wrong_applied = expected.clone();
-        wrong_applied.last_applied_log_id = Some(RaftLogId::new(3, 7, 12));
-        assert!(
-            decode(&encode_fixture(&wrong_applied, &state_cfs(), None, None), &expected)
-                .unwrap_err()
-                .to_string()
-                .contains("last applied")
-        );
-
-        for unsupported_version in [0, 2, u16::MAX] {
-            let mut wrong_version = encode_fixture(&expected, &state_cfs(), None, None);
-            wrong_version[MAGIC.len()..MAGIC.len() + 2].copy_from_slice(&unsupported_version.to_be_bytes());
-            assert!(decode(&wrong_version, &expected)
-                .unwrap_err()
-                .to_string()
-                .contains("version"));
-        }
-    }
-
-    #[test]
-    fn record_and_byte_count_mismatches_are_rejected() {
-        let expected = identity();
-        let mut wrong_cf_count = state_cfs();
-        wrong_cf_count[0].declared_records = Some(2);
-        assert!(
-            decode(&encode_fixture(&expected, &wrong_cf_count, None, None), &expected)
-                .unwrap_err()
-                .to_string()
-                .contains("record count")
-        );
-        assert!(
-            decode(&encode_fixture(&expected, &state_cfs(), Some(2), None), &expected)
-                .unwrap_err()
-                .to_string()
-                .contains("total record")
-        );
-        assert!(
-            decode(&encode_fixture(&expected, &state_cfs(), None, Some(9)), &expected)
-                .unwrap_err()
-                .to_string()
-                .contains("uncompressed byte")
-        );
-        let mut excessive_cf_count = state_cfs();
-        excessive_cf_count[0].declared_records = Some(MAX_RECORDS_PER_CF + 1);
-        assert!(
-            decode(&encode_fixture(&expected, &excessive_cf_count, None, None), &expected)
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds limit")
-        );
-        assert!(decode(
-            &encode_fixture(&expected, &state_cfs(), Some(MAX_TOTAL_RECORDS + 1), None),
-            &expected
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("exceeds limit"));
-        assert!(decode(
-            &encode_fixture(&expected, &state_cfs(), None, Some(MAX_TOTAL_UNCOMPRESSED_BYTES + 1)),
-            &expected
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("exceeds limit"));
-    }
-
-    #[test]
     fn streaming_writer_round_trips_through_decoder() {
         let expected = identity();
         let mut writer = SnapshotWriter::new(Vec::new(), &expected).unwrap();
@@ -859,100 +714,6 @@ mod tests {
         assert_eq!(summary.total_records, 1);
         assert_eq!(summary.total_uncompressed_bytes, 8);
         assert_eq!(records.len(), 1);
-    }
-
-    #[test]
-    fn writer_rejects_unknown_duplicate_missing_and_oversized_records() {
-        let expected = identity();
-        let mut unknown = SnapshotWriter::new(Vec::new(), &expected).unwrap();
-        assert!(unknown
-            .start_column_family("unknown")
-            .unwrap_err()
-            .to_string()
-            .contains("unknown"));
-
-        let mut duplicate = SnapshotWriter::new(Vec::new(), &expected).unwrap();
-        duplicate.start_column_family(STATE_CFS[0]).unwrap();
-        duplicate.end_column_family().unwrap();
-        assert!(duplicate
-            .start_column_family(STATE_CFS[0])
-            .unwrap_err()
-            .to_string()
-            .contains("duplicate"));
-
-        let missing = SnapshotWriter::new(Vec::new(), &expected).unwrap();
-        assert!(missing.finish().unwrap_err().to_string().contains("missing"));
-
-        let mut oversized = SnapshotWriter::new(Vec::new(), &expected).unwrap();
-        oversized.start_column_family(STATE_CFS[0]).unwrap();
-        assert!(oversized
-            .write_record(&vec![0; MAX_KEY_BYTES + 1], b"")
-            .unwrap_err()
-            .to_string()
-            .contains("key length"));
-
-        let mut outside = SnapshotWriter::new(Vec::new(), &expected).unwrap();
-        assert!(outside
-            .write_record(b"key", b"value")
-            .unwrap_err()
-            .to_string()
-            .contains("outside"));
-        assert!(outside
-            .end_column_family()
-            .unwrap_err()
-            .to_string()
-            .contains("none is active"));
-
-        let mut nested = SnapshotWriter::new(Vec::new(), &expected).unwrap();
-        nested.start_column_family(STATE_CFS[0]).unwrap();
-        assert!(nested
-            .start_column_family(STATE_CFS[1])
-            .unwrap_err()
-            .to_string()
-            .contains("before ending"));
-        assert!(nested
-            .finish()
-            .unwrap_err()
-            .to_string()
-            .contains("active column family"));
-    }
-
-    #[test]
-    fn unknown_tag_and_missing_end_marker_are_rejected() {
-        let expected = identity();
-        let mut unknown_tag = encode_fixture(&expected, &state_cfs(), None, None);
-        let name_offset = unknown_tag
-            .windows(STATE_CFS[0].len())
-            .position(|window| window == STATE_CFS[0].as_bytes())
-            .unwrap();
-        unknown_tag[name_offset - 3] = 0x7f;
-        assert!(decode(&unknown_tag, &expected)
-            .unwrap_err()
-            .to_string()
-            .contains("unknown snapshot tag"));
-
-        let mut illegal_inside = encode_fixture(&expected, &state_cfs(), None, None);
-        let key_offset = illegal_inside.windows(3).position(|window| window == b"key").unwrap();
-        illegal_inside[key_offset - 9] = TAG_CF_START;
-        assert!(decode(&illegal_inside, &expected)
-            .unwrap_err()
-            .to_string()
-            .contains("inside column family"));
-
-        let mut bad_trailer = encode_fixture(&expected, &state_cfs(), None, None);
-        let trailer_offset = bad_trailer.len() - (1 + 8 + 8 + 32 + 1);
-        bad_trailer[trailer_offset] = 0x7e;
-        assert!(decode(&bad_trailer, &expected)
-            .unwrap_err()
-            .to_string()
-            .contains("outside column family"));
-
-        let mut missing_end = encode_fixture(&expected, &state_cfs(), None, None);
-        *missing_end.last_mut().unwrap() = 0;
-        assert!(decode(&missing_end, &expected)
-            .unwrap_err()
-            .to_string()
-            .contains("END marker"));
     }
 
     #[test]

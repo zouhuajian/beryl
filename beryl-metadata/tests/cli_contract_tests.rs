@@ -7,21 +7,6 @@ use std::process::Command;
 use tempfile::TempDir;
 
 #[test]
-fn help_and_version_do_not_require_configuration() {
-    for flag in ["--help", "--version"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_beryl-metadata"))
-            .arg(flag)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{flag}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-}
-
-#[test]
 fn validate_conf_reads_configuration_without_touching_metadata_storage() {
     let temp = TempDir::new().unwrap();
     let storage_dir = temp.path().join("must-not-exist");

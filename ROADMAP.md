@@ -12,7 +12,7 @@ Long-term target: a multi-Metadata-group distributed cache.
 | Metadata | One Metadata group, one leader |
 | Worker | Metadata-authorized local block storage |
 | Client | Rust native Client |
-| UFS | Adapter boundary only; no active read or write path |
+| UFS | No adapter in the workspace; external IO is deferred |
 | Release topology | 1 Metadata + 1 Worker on Anolis 8 |
 | Active work | Metadata, Worker, Client, and multi-Worker operation within one Metadata group |
 | External cache | Starts after the single-group storage path is complete |
