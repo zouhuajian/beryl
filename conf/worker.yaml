@@ -13,7 +13,8 @@ beryl.worker.identity-file: "data/worker/worker.identity"
 beryl.worker.host: "127.0.0.1"
 beryl.worker.bind-host: "0.0.0.0"
 beryl.worker.rpc.port: 19090
-beryl.worker.rpc.max-concurrent-requests: 100
+beryl.worker.rpc.max-concurrent-read-requests: 64
+beryl.worker.rpc.max-concurrent-write-requests: 32
 beryl.worker.http.port: 19091
 
 # -------------------- Metadata RPC --------------------

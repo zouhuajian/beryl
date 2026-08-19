@@ -6,7 +6,10 @@
 use crate::error::ClientError;
 use crate::rpc_error::ClientAction;
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RpcErrorDetail};
-use beryl_common::header::{HEADER_PRE_HANDLER_REJECTION, PRE_HANDLER_REJECTION_RPC_CONCURRENCY};
+use beryl_common::header::{
+    HEADER_PRE_HANDLER_REJECTION, HEADER_WORKER_DATA_REJECTION, PRE_HANDLER_REJECTION_RPC_CONCURRENCY,
+    WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT,
+};
 
 /// Runtime error classification used by the metadata executor.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,7 +88,10 @@ pub(crate) fn classify_error(err: &ClientError) -> ErrorClass {
 
 fn classify_action(action: &ClientAction) -> ErrorClass {
     match action {
-        ClientAction::TransportFail { status } if is_pre_handler_concurrency_rejection(status) => {
+        ClientAction::TransportFail { status }
+            if is_pre_handler_concurrency_rejection(status)
+                || is_worker_capacity_before_side_effect_rejection(status) =>
+        {
             ErrorClass::ServerRetry
         }
         ClientAction::TransportFail { status } if is_retryable_transport(status) => ErrorClass::RetryableTransport,
@@ -107,6 +113,29 @@ fn is_pre_handler_concurrency_rejection(status: &tonic::Status) -> bool {
             .get(HEADER_PRE_HANDLER_REJECTION)
             .and_then(|value| value.to_str().ok())
             == Some(PRE_HANDLER_REJECTION_RPC_CONCURRENCY)
+}
+
+/// Identifies a Worker capacity rejection made before staging or read IO begins.
+pub(crate) fn is_worker_capacity_before_side_effect_rejection(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::ResourceExhausted
+        && status
+            .metadata()
+            .get(HEADER_WORKER_DATA_REJECTION)
+            .and_then(|value| value.to_str().ok())
+            == Some(WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT)
+}
+
+/// Returns true only for a server-marked rejection that occurred before write side effects.
+pub(crate) fn is_definite_worker_capacity_rejection(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Action(action)
+            if matches!(
+                action.action(),
+                ClientAction::TransportFail { status }
+                    if is_worker_capacity_before_side_effect_rejection(status)
+            )
+    )
 }
 
 fn classify_refresh_action(rpc_error: &RpcErrorDetail) -> ErrorClass {

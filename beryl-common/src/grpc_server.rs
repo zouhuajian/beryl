@@ -380,8 +380,9 @@ impl Drop for GrpcServerHandle {
 
 /// Binds and starts one HTTP/2 gRPC listener with tracked connections.
 ///
-/// `max_inflight_per_connection` preserves Worker request-concurrency bounds;
-/// callers that need immediate server-wide rejection use
+/// `max_inflight_per_connection` optionally backpressures request futures on
+/// each connection. Stream-lifecycle admission belongs in the owning service;
+/// callers that need immediate generic RPC rejection use
 /// [`spawn_grpc_server_with_concurrency_limits`].
 pub fn spawn_grpc_server(
     bind: SocketAddr,

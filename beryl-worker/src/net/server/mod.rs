@@ -20,12 +20,21 @@ pub fn spawn_worker_data_with_registration(
     core: Arc<WorkerCore>,
     registration_state: Arc<RegistrationSet>,
 ) -> anyhow::Result<GrpcServerHandle> {
-    let (bind, max_inflight) = grpc_listener(config)?;
-    let routes = grpc::worker_data_routes(core, registration_state);
-    spawn_grpc_server(bind, routes, Some(max_inflight)).context("failed to bind Worker gRPC listener")
+    let listener = grpc_listener(config)?;
+    let routes = grpc::worker_data_routes(
+        core,
+        registration_state,
+        listener.max_concurrent_reads,
+        listener.max_concurrent_writes,
+    );
+    let bind = listener
+        .bind
+        .parse()
+        .with_context(|| format!("invalid worker gRPC listener bind address: {}", listener.bind))?;
+    spawn_grpc_server(bind, routes, None).context("failed to bind Worker gRPC listener")
 }
 
-fn grpc_listener(config: &WorkerNetConfig) -> anyhow::Result<(std::net::SocketAddr, usize)> {
+fn grpc_listener(config: &WorkerNetConfig) -> anyhow::Result<&crate::net::config::WorkerListenerConfig> {
     if config.listeners.is_empty() {
         bail!("worker net listeners must not be empty");
     }
@@ -34,9 +43,5 @@ fn grpc_listener(config: &WorkerNetConfig) -> anyhow::Result<(std::net::SocketAd
     }
 
     let listener = &config.listeners[0];
-    let bind = listener
-        .bind
-        .parse()
-        .with_context(|| format!("invalid worker gRPC listener bind address: {}", listener.bind))?;
-    Ok((bind, listener.max_inflight))
+    Ok(listener)
 }

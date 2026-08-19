@@ -156,6 +156,21 @@ the per-connection value at or below the service-wide value and the control
 reserve below the service-wide value. The shipped defaults are `64`, `16`, and
 `8`, respectively.
 
+Worker data RPC capacity is configured with two independent restart-only
+limits:
+
+- `beryl.worker.rpc.max-concurrent-read-requests` bounds read RPC lifecycles.
+- `beryl.worker.rpc.max-concurrent-write-requests` bounds write RPC lifecycles.
+
+Both limits are process-wide across connections and reject immediately instead
+of queuing. A read slot remains owned through the last blocking read after
+cancellation. A write slot remains owned through Ready completion or successful
+staging cleanup. The shipped defaults are `64` reads and `32` writes. Rejections
+increment `worker_data_rpc_capacity_rejections_total{mode=...}`. The Rust client
+retries only the Worker-specific capacity rejection marked before local side
+effects; for writes this is before staging acknowledgement. Generic
+`ResourceExhausted` and failures after acknowledgement are not replayed.
+
 Write-session limits are also restart-only:
 
 - `beryl.metadata.write-session.max-active` bounds opening plus active

@@ -24,6 +24,7 @@ pub(crate) const WORKER_DATA_RPC_TOTAL: &str = "worker_data_rpc_total";
 pub(crate) const WORKER_DATA_RPC_DURATION_SECONDS: &str = "worker_data_rpc_duration_seconds";
 pub(crate) const WORKER_STREAM_OPEN_TOTAL: &str = "worker_stream_open_total";
 pub(crate) const WORKER_STREAM_INFLIGHT: &str = "worker_stream_inflight";
+pub(crate) const WORKER_DATA_RPC_CAPACITY_REJECTIONS_TOTAL: &str = "worker_data_rpc_capacity_rejections_total";
 pub(crate) const WORKER_STREAM_FRAME_BYTES: &str = "worker_stream_frame_bytes";
 pub(crate) const WORKER_STREAM_FRAMES_TOTAL: &str = "worker_stream_frames_total";
 pub(crate) const WORKER_CLEANUP_QUEUE_DEPTH: &str = "worker_cleanup_queue_depth";
@@ -177,6 +178,10 @@ pub(crate) fn increment_stream_inflight(mode: &str) {
 
 pub(crate) fn decrement_stream_inflight(mode: &str) {
     metrics::gauge!(WORKER_STREAM_INFLIGHT, "mode" => mode.to_string()).decrement(1.0);
+}
+
+pub(crate) fn record_data_rpc_capacity_rejection(mode: &str) {
+    metrics::counter!(WORKER_DATA_RPC_CAPACITY_REJECTIONS_TOTAL, "mode" => mode.to_string()).increment(1);
 }
 
 pub(crate) fn record_stream_frame(mode: &str, status: &str, error_kind: &str, bytes: u64) {

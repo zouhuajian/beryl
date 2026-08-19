@@ -15,8 +15,8 @@ use crate::metadata::MetadataGateway;
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
 use crate::rpc_error::{ClientAction, RefreshHint};
 use crate::runtime::{
-    classify_error, AttemptContext, ClientIdentity, ErrorClass, MetadataExecutor, MetadataTargets, OperationContext,
-    OperationDeadline,
+    classify_error, is_definite_worker_capacity_rejection, AttemptContext, ClientIdentity, ErrorClass,
+    MetadataExecutor, MetadataTargets, OperationContext, OperationDeadline,
 };
 use crate::session::write_session::{ReadyBlock, WriteSession};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
@@ -53,8 +53,9 @@ impl ClientRuntime {
         })
     }
 
-    /// Allocates one metadata block and opens its Worker stream through the
-    /// staging acknowledgement boundary.
+    /// Allocates one metadata block, then opens its Worker stream through the
+    /// staging acknowledgement boundary. Only a marked capacity rejection
+    /// before Worker side effects is retried; all attempts reuse one target.
     pub(crate) async fn open_block_write(
         &self,
         session: &mut WriteSession,
@@ -95,26 +96,43 @@ impl ClientRuntime {
             session.path(),
             deadline,
         )?;
-        let ctx = self.data_context(&operation, 0);
         let lease_expires_at_ms = session.expires_at_ms()?;
-        match self
-            .worker_rpc_with_timeout(
-                &operation,
-                self.data_plane.open_write_block(
-                    ctx,
-                    add_block.group_name,
-                    add_block.target.clone(),
-                    lease_expires_at_ms,
-                ),
-            )
-            .await
-        {
-            Ok(block) => Ok(block),
-            Err(err) => {
-                mark_session_after_write_error(session, &err);
-                Err(self.normalize_outcome_error("WriteBlock", "worker", err))
+        for attempt_index in 0..self.config.retry.max_attempts() {
+            let ctx = self.data_context(&operation, attempt_index as u32);
+            match self
+                .worker_rpc_with_timeout(
+                    &operation,
+                    self.data_plane.open_write_block(
+                        ctx,
+                        add_block.group_name.clone(),
+                        add_block.target.clone(),
+                        lease_expires_at_ms,
+                    ),
+                )
+                .await
+            {
+                Ok(block) => return Ok(block),
+                Err(err) if is_definite_worker_capacity_rejection(&err) => {
+                    let class = ErrorClass::ServerRetry;
+                    let has_next = attempt_index + 1 < self.config.retry.max_attempts();
+                    if !has_next {
+                        return Err(err);
+                    }
+                    self.record_metric(
+                        ClientMetric::RetryAttempt,
+                        metric_labels("WriteBlock", "worker").with_error_class(class.label()),
+                    );
+                    if self.sleep_before_retry(attempt_index, &operation).await.is_err() {
+                        return Err(err);
+                    }
+                }
+                Err(err) => {
+                    mark_session_after_write_error(session, &err);
+                    return Err(self.normalize_outcome_error("WriteBlock", "worker", err));
+                }
             }
         }
+        unreachable!("client retry configuration requires at least one attempt")
     }
 
     /// Sends one frame on an acknowledged block RPC under the current public

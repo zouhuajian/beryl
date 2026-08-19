@@ -140,7 +140,7 @@ impl WorkerServiceInstance {
     pub fn start(listener: TcpListener, core: Arc<WorkerCore>, registration_state: Arc<RegistrationSet>) -> Self {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let service = WorkerDataServiceImpl::new(core, registration_state);
+            let service = WorkerDataServiceImpl::new(core, registration_state, 64, 32);
             Server::builder()
                 .add_service(WorkerDataServiceServer::new(service))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {

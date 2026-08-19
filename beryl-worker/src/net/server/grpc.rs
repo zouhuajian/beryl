@@ -8,7 +8,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
-use beryl_common::header::{HEADER_WORKER_DATA_ERROR_DETAIL, WORKER_DATA_ERROR_DETAIL_V1};
+use beryl_common::header::{
+    HEADER_WORKER_DATA_ERROR_DETAIL, HEADER_WORKER_DATA_REJECTION, WORKER_DATA_ERROR_DETAIL_V1,
+    WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT,
+};
 use beryl_common::observe::propagation::{extract_trace_context, ExtractedContext};
 use beryl_proto::common::{ClientInfoProto, ErrorDetailProto};
 use beryl_proto::convert::require_worker_run_id;
@@ -21,6 +24,7 @@ use beryl_proto::worker::{
 use bytes::Bytes;
 use futures::{stream, Stream, StreamExt};
 use prost::Message;
+use tokio::sync::Semaphore;
 use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::service::Routes;
 use tonic::{Request, Response, Status};
@@ -31,19 +35,60 @@ use crate::data::convert::{proto_to_read_block_request, proto_to_write_block_req
 use crate::data::core::{ActiveBlockRead, ActiveBlockWrite, WorkerCore};
 use crate::error::WorkerError;
 use crate::observe;
+use crate::runtime::DataRpcPermit;
 
-/// Worker data service implementation.
+/// Worker data service with independent process-wide read and write admission.
 #[derive(Clone)]
 pub struct WorkerDataServiceImpl {
     core: Arc<WorkerCore>,
     registration_state: Arc<RegistrationSet>,
+    read_slots: Arc<Semaphore>,
+    write_slots: Arc<Semaphore>,
 }
 
 impl WorkerDataServiceImpl {
-    pub fn new(core: Arc<WorkerCore>, registration_state: Arc<RegistrationSet>) -> Self {
+    /// Creates independent process-wide admission pools for the two data modes.
+    pub fn new(
+        core: Arc<WorkerCore>,
+        registration_state: Arc<RegistrationSet>,
+        max_concurrent_reads: usize,
+        max_concurrent_writes: usize,
+    ) -> Self {
         Self {
             core,
             registration_state,
+            read_slots: Arc::new(Semaphore::new(max_concurrent_reads)),
+            write_slots: Arc::new(Semaphore::new(max_concurrent_writes)),
+        }
+    }
+
+    /// Acquires one read slot without queuing so write saturation cannot block reads.
+    fn acquire_read_rpc(&self) -> Result<DataRpcPermit, Status> {
+        Self::acquire_data_rpc(Arc::clone(&self.read_slots), "read")
+    }
+
+    /// Acquires one write slot without queuing so read saturation cannot block writes.
+    fn acquire_write_rpc(&self) -> Result<DataRpcPermit, Status> {
+        Self::acquire_data_rpc(Arc::clone(&self.write_slots), "write")
+    }
+
+    /// Rejects one mode before Worker staging or read IO begins when its pool is full.
+    fn acquire_data_rpc(slots: Arc<Semaphore>, mode: &'static str) -> Result<DataRpcPermit, Status> {
+        match slots.try_acquire_owned() {
+            Ok(permit) => Ok(DataRpcPermit::new(permit, mode)),
+            Err(_) => {
+                observe::record_data_rpc_capacity_rejection(mode);
+                let mut metadata = MetadataMap::new();
+                metadata.insert(
+                    HEADER_WORKER_DATA_REJECTION,
+                    MetadataValue::from_static(WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT),
+                );
+                Err(Status::with_metadata(
+                    tonic::Code::ResourceExhausted,
+                    format!("Worker {mode} RPC capacity exhausted"),
+                    metadata,
+                ))
+            }
         }
     }
 
@@ -116,6 +161,7 @@ impl WorkerDataServiceImpl {
     async fn begin_write_block<S>(
         &self,
         mut requests: S,
+        rpc_permit: DataRpcPermit,
         transport_context: &ExtractedContext,
         started: Instant,
     ) -> Result<WriteBlockState<S>, Status>
@@ -171,7 +217,7 @@ impl WorkerDataServiceImpl {
             observe::record_data_rpc("write_block", "error", error_kind, started.elapsed().as_secs_f64());
             Self::data_error_status(header.clone(), error)
         })?;
-        let write = self.core.begin_block_write(domain).await.map_err(|error| {
+        let write = self.core.begin_block_write(domain, rpc_permit).await.map_err(|error| {
             let error_kind = observe::worker_error_kind(&error);
             observe::record_stream_open("write", "error", error_kind);
             observe::record_data_rpc("write_block", "error", error_kind, started.elapsed().as_secs_f64());
@@ -234,7 +280,6 @@ impl ReadBlockState {
 impl Drop for ReadBlockState {
     fn drop(&mut self) {
         let (status, error_kind) = outcome_labels(self.outcome);
-        observe::decrement_stream_inflight("read");
         observe::record_data_rpc("read_block", status, error_kind, self.started.elapsed().as_secs_f64());
     }
 }
@@ -346,6 +391,14 @@ impl WorkerDataService for WorkerDataServiceImpl {
         request: Request<ReadBlockRequestProto>,
     ) -> Result<Response<Self::ReadBlockStream>, Status> {
         let started = Instant::now();
+        let rpc_permit = Arc::new(self.acquire_read_rpc().inspect_err(|status| {
+            observe::record_data_rpc(
+                "read_block",
+                "error",
+                status_error_kind(status),
+                started.elapsed().as_secs_f64(),
+            );
+        })?);
         let transport_context = extract_trace_context(request.metadata());
         let mut request = request.into_inner();
         merge_data_header_transport_context(&mut request.header, &transport_context);
@@ -360,12 +413,11 @@ impl WorkerDataService for WorkerDataServiceImpl {
             observe::record_data_rpc("read_block", "error", error_kind, started.elapsed().as_secs_f64());
             Self::data_error_status(header.clone(), error)
         })?;
-        let read = self.core.begin_block_read(domain).await.map_err(|error| {
+        let read = self.core.begin_block_read(domain, rpc_permit).await.map_err(|error| {
             let error_kind = observe::worker_error_kind(&error);
             observe::record_data_rpc("read_block", "error", error_kind, started.elapsed().as_secs_f64());
             Self::data_error_status(header.clone(), error)
         })?;
-        observe::increment_stream_inflight("read");
         let state = ReadBlockState {
             core: Arc::clone(&self.core),
             read,
@@ -383,9 +435,17 @@ impl WorkerDataService for WorkerDataServiceImpl {
         request: Request<tonic::Streaming<WriteBlockRequestProto>>,
     ) -> Result<Response<Self::WriteBlockStream>, Status> {
         let started = Instant::now();
+        let rpc_permit = self.acquire_write_rpc().inspect_err(|status| {
+            observe::record_data_rpc(
+                "write_block",
+                "error",
+                status_error_kind(status),
+                started.elapsed().as_secs_f64(),
+            );
+        })?;
         let transport_context = extract_trace_context(request.metadata());
         let state = self
-            .begin_write_block(request.into_inner(), &transport_context, started)
+            .begin_write_block(request.into_inner(), rpc_permit, &transport_context, started)
             .await?;
         Ok(Response::new(Box::pin(stream::unfold(state, |state| state.next()))))
     }
@@ -450,8 +510,13 @@ fn status_error_kind(status: &Status) -> &'static str {
 }
 
 /// Builds the Worker data-plane routes retained by the process-owned listener.
-pub fn worker_data_routes(core: Arc<WorkerCore>, registration_state: Arc<RegistrationSet>) -> Routes {
-    let service = WorkerDataServiceImpl::new(core, registration_state);
+pub fn worker_data_routes(
+    core: Arc<WorkerCore>,
+    registration_state: Arc<RegistrationSet>,
+    max_concurrent_reads: usize,
+    max_concurrent_writes: usize,
+) -> Routes {
+    let service = WorkerDataServiceImpl::new(core, registration_state, max_concurrent_reads, max_concurrent_writes);
     Routes::new(
         WorkerDataServiceServer::new(service)
             .max_decoding_message_size(beryl_proto::MAX_WORKER_DATA_MESSAGE_SIZE)
@@ -476,7 +541,9 @@ mod tests {
     use tempfile::TempDir;
     use tonic::metadata::MetadataMap;
 
-    use super::WorkerDataServiceImpl;
+    use super::{
+        WorkerDataServiceImpl, HEADER_WORKER_DATA_REJECTION, WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT,
+    };
     use crate::control::{Registration, RegistrationSet};
     use crate::data::core::WorkerCore;
     use crate::store::block::{BlockState, FullBlockFileStore, FullBlockFileStoreConfig};
@@ -507,7 +574,7 @@ mod tests {
         (
             temp,
             store,
-            WorkerDataServiceImpl::new(core, registrations),
+            WorkerDataServiceImpl::new(core, registrations, 1, 1),
             worker_run_id,
         )
     }
@@ -544,8 +611,9 @@ mod tests {
             }),
         ]);
         let context = extract_trace_context(&MetadataMap::new());
+        let rpc_permit = service.acquire_write_rpc().expect("write capacity");
         let state = service
-            .begin_write_block(requests, &context, Instant::now())
+            .begin_write_block(requests, rpc_permit, &context, Instant::now())
             .await
             .expect("begin write");
         let (ack, state) = state.next().await.expect("acknowledgement");
@@ -562,8 +630,9 @@ mod tests {
         let (_temp, _store, service, worker_run_id) = registered_service();
         let requests = stream::iter(vec![Ok(command(worker_run_id))]);
         let context = extract_trace_context(&MetadataMap::new());
+        let rpc_permit = service.acquire_write_rpc().expect("write capacity");
         let state = service
-            .begin_write_block(requests, &context, Instant::now())
+            .begin_write_block(requests, rpc_permit, &context, Instant::now())
             .await
             .expect("begin write");
         let (_ack, state) = state.next().await.expect("acknowledgement");
@@ -576,8 +645,9 @@ mod tests {
         );
 
         let replacement = stream::iter(vec![Ok(command(worker_run_id))]);
+        let rpc_permit = service.acquire_write_rpc().expect("released write capacity");
         let state = service
-            .begin_write_block(replacement, &context, Instant::now())
+            .begin_write_block(replacement, rpc_permit, &context, Instant::now())
             .await
             .expect("replacement write");
         let (_ack, state) = state.next().await.expect("replacement acknowledgement");
@@ -589,8 +659,9 @@ mod tests {
         let (_temp, _store, service, worker_run_id) = registered_service();
         let requests = stream::iter(vec![Ok(command(worker_run_id)), Ok(command(worker_run_id))]);
         let context = extract_trace_context(&MetadataMap::new());
+        let rpc_permit = service.acquire_write_rpc().expect("write capacity");
         let state = service
-            .begin_write_block(requests, &context, Instant::now())
+            .begin_write_block(requests, rpc_permit, &context, Instant::now())
             .await
             .expect("begin write");
         let (_ack, state) = state.next().await.expect("acknowledgement");
@@ -599,5 +670,30 @@ mod tests {
             error.expect_err("second command must fail").code(),
             tonic::Code::InvalidArgument
         );
+    }
+
+    #[test]
+    fn read_and_write_capacity_are_independent() {
+        let (_temp, _store, service, _worker_run_id) = registered_service();
+        let read = service.acquire_read_rpc().expect("read capacity");
+        let write = service.acquire_write_rpc().expect("write capacity");
+        let assert_capacity_rejection = |status: tonic::Status| {
+            assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+            assert_eq!(
+                status
+                    .metadata()
+                    .get(HEADER_WORKER_DATA_REJECTION)
+                    .and_then(|value| value.to_str().ok()),
+                Some(WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT)
+            );
+        };
+
+        assert_capacity_rejection(service.acquire_read_rpc().expect_err("read limit"));
+        assert_capacity_rejection(service.acquire_write_rpc().expect_err("write limit"));
+
+        drop(read);
+        service.acquire_read_rpc().expect("read capacity released");
+        assert_capacity_rejection(service.acquire_write_rpc().expect_err("write remains full"));
+        drop(write);
     }
 }

@@ -13,10 +13,11 @@ use beryl_common::observe::config::{LogConfig, ResourceConfig};
 use beryl_common::observe::ObservabilityConfig;
 use beryl_types::{GroupName, Tier};
 use serde_yaml::{Mapping, Value};
+use tokio::sync::Semaphore;
 use tonic::transport::Endpoint;
 use tracing::info;
 
-use crate::net::config::WorkerNetConfig;
+use crate::net::config::{WorkerNetConfig, DEFAULT_GRPC_MAX_CONCURRENT_READS, DEFAULT_GRPC_MAX_CONCURRENT_WRITES};
 use crate::net::protocol::WorkerNetProtocol;
 
 const CLUSTER_ID: &str = "beryl.cluster.id";
@@ -25,7 +26,8 @@ const BIND_HOST: &str = "beryl.worker.bind-host";
 const RPC_PORT: &str = "beryl.worker.rpc.port";
 const HTTP_PORT: &str = "beryl.worker.http.port";
 const IDENTITY_FILE: &str = "beryl.worker.identity-file";
-const RPC_MAX_CONCURRENT_REQUESTS: &str = "beryl.worker.rpc.max-concurrent-requests";
+const RPC_MAX_CONCURRENT_READ_REQUESTS: &str = "beryl.worker.rpc.max-concurrent-read-requests";
+const RPC_MAX_CONCURRENT_WRITE_REQUESTS: &str = "beryl.worker.rpc.max-concurrent-write-requests";
 const STREAM_FRAME_SIZE: &str = "beryl.worker.stream.frame-size";
 const STREAM_MAX_FRAME_SIZE: &str = "beryl.worker.stream.max-frame-size";
 const STORAGE_DIRS: &str = "beryl.worker.storage.dirs";
@@ -52,7 +54,8 @@ const KNOWN_KEYS: &[&str] = &[
     RPC_PORT,
     HTTP_PORT,
     IDENTITY_FILE,
-    RPC_MAX_CONCURRENT_REQUESTS,
+    RPC_MAX_CONCURRENT_READ_REQUESTS,
+    RPC_MAX_CONCURRENT_WRITE_REQUESTS,
     STREAM_FRAME_SIZE,
     STREAM_MAX_FRAME_SIZE,
     STORAGE_DIRS,
@@ -166,7 +169,6 @@ pub struct WorkerConfig {
     pub identity_path: PathBuf,
     /// Derived RPC bind address retained by the network runtime.
     pub rpc_bind: String,
-    pub rpc_max_inflight: usize,
     /// Default payload size for streamed read responses.
     pub default_frame_size: u32,
     /// Maximum payload size selected for streamed read responses.
@@ -209,11 +211,15 @@ impl Default for WorkerConfig {
             http_port: 19091,
             identity_path: PathBuf::from("data/worker/worker.identity"),
             rpc_bind: rpc_bind.clone(),
-            rpc_max_inflight: 100,
             default_frame_size: 1024 * 1024,
             max_frame_size: 4 * 1024 * 1024,
             store: WorkerStoreConfig::default(),
-            net: WorkerNetConfig::grpc_from_rpc(rpc_bind, 100, 4 * 1024 * 1024),
+            net: WorkerNetConfig::grpc_from_rpc(
+                rpc_bind,
+                DEFAULT_GRPC_MAX_CONCURRENT_READS,
+                DEFAULT_GRPC_MAX_CONCURRENT_WRITES,
+                4 * 1024 * 1024,
+            ),
             metadata: WorkerRegistrationConfig::default(),
             heartbeat_interval_ms: 1_000,
             block_report_interval_ms: 1_000,
@@ -256,7 +262,16 @@ impl WorkerConfig {
             IDENTITY_FILE,
             defaults.identity_path.to_str().unwrap(),
         )?);
-        let rpc_max_inflight = positive_usize_or(flat, RPC_MAX_CONCURRENT_REQUESTS, defaults.rpc_max_inflight)?;
+        let rpc_max_concurrent_reads = positive_usize_or(
+            flat,
+            RPC_MAX_CONCURRENT_READ_REQUESTS,
+            DEFAULT_GRPC_MAX_CONCURRENT_READS,
+        )?;
+        let rpc_max_concurrent_writes = positive_usize_or(
+            flat,
+            RPC_MAX_CONCURRENT_WRITE_REQUESTS,
+            DEFAULT_GRPC_MAX_CONCURRENT_WRITES,
+        )?;
         let default_frame_size = bytes_u32_or(flat, STREAM_FRAME_SIZE, defaults.default_frame_size)?;
         let max_frame_size = bytes_u32_or(flat, STREAM_MAX_FRAME_SIZE, defaults.max_frame_size)?;
         let store = parse_store_config(flat, &defaults.store)?;
@@ -300,11 +315,15 @@ impl WorkerConfig {
             http_port,
             identity_path,
             rpc_bind: rpc_bind.clone(),
-            rpc_max_inflight,
             default_frame_size,
             max_frame_size,
             store,
-            net: WorkerNetConfig::grpc_from_rpc(rpc_bind, rpc_max_inflight, max_frame_size),
+            net: WorkerNetConfig::grpc_from_rpc(
+                rpc_bind,
+                rpc_max_concurrent_reads,
+                rpc_max_concurrent_writes,
+                max_frame_size,
+            ),
             metadata,
             heartbeat_interval_ms,
             block_report_interval_ms,
@@ -367,6 +386,18 @@ impl WorkerConfig {
         for listener in &self.net.listeners {
             if listener.protocol == WorkerNetProtocol::Grpc && listener.bind.parse::<SocketAddr>().is_err() {
                 return Err(invalid_config(BIND_HOST, "does not form a valid RPC bind address"));
+            }
+            if listener.max_concurrent_reads == 0 || listener.max_concurrent_reads > Semaphore::MAX_PERMITS {
+                return Err(invalid_config(
+                    RPC_MAX_CONCURRENT_READ_REQUESTS,
+                    "must fit the process semaphore capacity",
+                ));
+            }
+            if listener.max_concurrent_writes == 0 || listener.max_concurrent_writes > Semaphore::MAX_PERMITS {
+                return Err(invalid_config(
+                    RPC_MAX_CONCURRENT_WRITE_REQUESTS,
+                    "must fit the process semaphore capacity",
+                ));
             }
         }
         Ok(())

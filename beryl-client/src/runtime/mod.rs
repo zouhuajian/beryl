@@ -13,7 +13,9 @@ pub(crate) mod context;
 pub(crate) mod executor;
 pub(crate) mod refresh;
 
-pub(crate) use classify::{classify_error, ErrorClass};
+pub(crate) use classify::{
+    classify_error, is_definite_worker_capacity_rejection, is_worker_capacity_before_side_effect_rejection, ErrorClass,
+};
 pub(crate) use client_runtime::{
     is_unknown_session_barrier_outcome, mark_session_after_metadata_error, metric_labels, refresh_hint_from_error,
     ClientRuntime,

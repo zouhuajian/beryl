@@ -138,7 +138,6 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
         rpc_bind = %config.rpc_bind,
         rpc_address = %config.rpc_address(),
         http_bind = %config.http_addr(),
-        rpc_max_inflight = config.rpc_max_inflight,
         default_frame_size = config.default_frame_size,
         max_frame_size = config.max_frame_size,
         store_dirs = config.store.dirs.len(),
@@ -152,7 +151,8 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
             event = "worker_net_listener_configured",
             protocol = %listener.protocol,
             bind = %listener.bind,
-            max_inflight = listener.max_inflight,
+            max_concurrent_reads = listener.max_concurrent_reads,
+            max_concurrent_writes = listener.max_concurrent_writes,
             max_frame_size = listener.max_frame_size,
             "Configured worker net listener"
         );

@@ -20,6 +20,7 @@ use crate::error::WorkerError;
 use crate::observe;
 use crate::runtime::block::{BlockManager, ReadPin, ReclaimingBlock};
 use crate::runtime::write::{BlockWriteIoGuard, BlockWriteKey, BlockWriteRegistration, BlockWriteRegistry};
+use crate::runtime::DataRpcPermit;
 use crate::store::block::{
     BlockState, ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
     PublishReadyRequest, ReclaimBlockRequest, ReclaimBlockResult,
@@ -46,8 +47,9 @@ pub(crate) struct ReadBlockRequest {
     pub(crate) frame_size: u32,
 }
 
-/// RPC-owned read cursor and pin. The pin spans the response stream and every
-/// blocking read so reclamation cannot pass unfinished filesystem access.
+/// RPC-owned read cursor, pin, and admission permit. The pin and permit span
+/// the response stream and every blocking read so reclamation and new admission
+/// cannot pass unfinished filesystem access.
 #[derive(Debug)]
 pub(crate) struct ActiveBlockRead {
     group_name: GroupName,
@@ -56,6 +58,7 @@ pub(crate) struct ActiveBlockRead {
     end_offset: u64,
     frame_size: u32,
     read_pin: ReadPin,
+    rpc_permit: Arc<DataRpcPermit>,
 }
 
 /// Metadata-issued facts fixed by the first message of one `WriteBlock` RPC.
@@ -125,16 +128,22 @@ impl WorkerCore {
     }
 
     /// Validates one metadata-authorized range and binds its pin to an RPC-owned read.
-    pub(crate) async fn begin_block_read(&self, req: ReadBlockRequest) -> WorkerCoreResult<ActiveBlockRead> {
+    pub(crate) async fn begin_block_read(
+        &self,
+        req: ReadBlockRequest,
+        rpc_permit: Arc<DataRpcPermit>,
+    ) -> WorkerCoreResult<ActiveBlockRead> {
         let frame_size = self.negotiate_read_frame_size(req.frame_size)?;
         self.block_manager.validate_read_request(&req)?;
         let read_pin = self.block_manager.pin_read(&req.group_name, req.block_id)?;
         let validation_pin = read_pin.clone();
+        let validation_rpc_permit = Arc::clone(&rpc_permit);
         let block_manager = Arc::clone(&self.block_manager);
         let block_store = Arc::clone(&self.block_store);
         let validation_request = req.clone();
         tokio::task::spawn_blocking(move || {
             let _pin = validation_pin;
+            let _rpc_permit = validation_rpc_permit;
             block_manager.validate_read(block_store.as_ref(), &validation_request)
         })
         .await
@@ -151,20 +160,25 @@ impl WorkerCore {
             end_offset,
             frame_size,
             read_pin,
+            rpc_permit,
         })
     }
 
-    /// Creates staging state and transfers its exact cleanup ownership to one RPC.
+    /// Creates staging state and transfers the RPC permit to its cleanup-owned entry.
     ///
     /// Success is the first local side effect acknowledged to the client. Any
     /// later transport failure therefore has an unknown outcome at the client.
-    pub(crate) async fn begin_block_write(&self, req: WriteBlockRequest) -> WorkerCoreResult<ActiveBlockWrite> {
+    pub(crate) async fn begin_block_write(
+        &self,
+        req: WriteBlockRequest,
+        rpc_permit: DataRpcPermit,
+    ) -> WorkerCoreResult<ActiveBlockWrite> {
         validate_write_block_request(&req)?;
         let key = BlockWriteKey {
             group_name: req.group_name.clone(),
             block_id: req.block_id,
         };
-        let registration = self.block_writes.register(key).ok_or_else(|| {
+        let registration = self.block_writes.register(key, rpc_permit).ok_or_else(|| {
             WorkerError::ResourceExhausted(format!(
                 "block already has an active write: group_name={}, block_id={}",
                 req.group_name, req.block_id
@@ -478,9 +492,11 @@ impl WorkerCore {
         let block_id = read.block_id;
         let offset = read.next_offset;
         let io_pin = read.read_pin.clone();
+        let io_rpc_permit = Arc::clone(&read.rpc_permit);
         let store_started = Instant::now();
         let result = tokio::task::spawn_blocking(move || {
             let _pin = io_pin;
+            let _rpc_permit = io_rpc_permit;
             block_store.read_at(&group_name, block_id, offset, read_len)
         })
         .await
@@ -665,9 +681,11 @@ mod tests {
     use beryl_types::{GroupName, Tier, WorkerRunId};
     use bytes::Bytes;
     use tempfile::TempDir;
+    use tokio::sync::Semaphore;
 
     use super::{ReadBlockRequest, WorkerCore, WriteBlockRequest};
     use crate::error::WorkerError;
+    use crate::runtime::DataRpcPermit;
     use crate::store::block::{
         BlockMetaPayload, BlockState, ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore,
         FullBlockFileStoreConfig, LocalBlockStore, PublishReadyRequest, ReclaimBlockRequest, ReclaimBlockResult,
@@ -705,6 +723,18 @@ mod tests {
             block_id,
             ..write_request()
         }
+    }
+
+    fn rpc_permit(slots: Arc<Semaphore>, mode: &'static str) -> DataRpcPermit {
+        DataRpcPermit::new(slots.try_acquire_owned().expect("test RPC capacity"), mode)
+    }
+
+    fn write_rpc_permit() -> DataRpcPermit {
+        rpc_permit(Arc::new(Semaphore::new(1)), "write")
+    }
+
+    fn read_rpc_permit() -> Arc<DataRpcPermit> {
+        Arc::new(rpc_permit(Arc::new(Semaphore::new(1)), "read"))
     }
 
     fn core_with_store() -> (TempDir, Arc<FullBlockFileStore>, WorkerCore) {
@@ -852,7 +882,10 @@ mod tests {
     #[tokio::test]
     async fn failed_or_cancelled_write_is_cleaned_and_can_be_reused() {
         let (_temp, _store, core) = core_with_store();
-        let mut write = core.begin_block_write(write_request()).await.expect("begin write");
+        let mut write = core
+            .begin_block_write(write_request(), write_rpc_permit())
+            .await
+            .expect("begin write");
         core.write_block_data(&mut write, Bytes::from_static(b"partial"))
             .await
             .expect("partial data");
@@ -863,7 +896,10 @@ mod tests {
                 .await
         );
 
-        let reused = core.begin_block_write(write_request()).await.expect("reuse block");
+        let reused = core
+            .begin_block_write(write_request(), write_rpc_permit())
+            .await
+            .expect("reuse block");
         core.abort_block_write(reused).await.expect("abort reuse");
     }
 
@@ -877,8 +913,10 @@ mod tests {
             release,
             abort_calls: _abort_calls,
         } = blocking_core(BlockingOperation::Create);
+        let write_slots = Arc::new(Semaphore::new(1));
+        let rpc_permit = rpc_permit(Arc::clone(&write_slots), "write");
         let task_core = Arc::clone(&core);
-        let write = tokio::spawn(async move { task_core.begin_block_write(write_request()).await });
+        let write = tokio::spawn(async move { task_core.begin_block_write(write_request(), rpc_permit).await });
         tokio::task::spawn_blocking(move || started.recv().expect("blocking create started"))
             .await
             .expect("wait for create");
@@ -888,6 +926,7 @@ mod tests {
             Err(error) => assert!(error.is_cancelled()),
             Ok(_) => panic!("begin write task must be cancelled"),
         }
+        assert_eq!(write_slots.available_permits(), 0);
         assert!(
             core.drain_block_writes_until(tokio::time::Instant::now() + Duration::from_millis(50))
                 .await,
@@ -900,8 +939,9 @@ mod tests {
                 .drain_block_writes_until(tokio::time::Instant::now() + Duration::from_secs(1))
                 .await
         );
+        assert_eq!(write_slots.available_permits(), 1);
         let reused = core
-            .begin_block_write(write_request())
+            .begin_block_write(write_request(), write_rpc_permit())
             .await
             .expect("reuse after cleanup");
         core.abort_block_write(reused).await.expect("abort reused write");
@@ -917,7 +957,10 @@ mod tests {
             release,
             abort_calls: _abort_calls,
         } = blocking_core(BlockingOperation::Publish);
-        let mut write = core.begin_block_write(write_request()).await.expect("begin write");
+        let mut write = core
+            .begin_block_write(write_request(), write_rpc_permit())
+            .await
+            .expect("begin write");
         core.write_block_data(&mut write, Bytes::from_static(b"ready"))
             .await
             .expect("write data");
@@ -956,7 +999,10 @@ mod tests {
             release,
             abort_calls,
         } = blocking_core(BlockingOperation::Abort);
-        let write = core.begin_block_write(write_request()).await.expect("begin write");
+        let write = core
+            .begin_block_write(write_request(), write_rpc_permit())
+            .await
+            .expect("begin write");
         drop(write);
 
         let cleanup_core = Arc::clone(&core);
@@ -973,7 +1019,7 @@ mod tests {
             "a second cleanup pass must wait for the claimed abort"
         );
         assert_eq!(abort_calls.load(Ordering::SeqCst), 1);
-        match core.begin_block_write(write_request()).await {
+        match core.begin_block_write(write_request(), write_rpc_permit()).await {
             Err(WorkerError::ResourceExhausted(_)) => {}
             Err(error) => panic!("unexpected reuse error while cleanup is claimed: {error:?}"),
             Ok(_) => panic!("new write must not replace an entry with cleanup in progress"),
@@ -986,7 +1032,7 @@ mod tests {
                 .await
         );
         let reused = core
-            .begin_block_write(write_request())
+            .begin_block_write(write_request(), write_rpc_permit())
             .await
             .expect("reuse after claimed cleanup exits");
         core.abort_block_write(reused).await.expect("abort reused write");
@@ -1002,7 +1048,10 @@ mod tests {
             release,
             abort_calls,
         } = blocking_core(BlockingOperation::Abort);
-        let write = core.begin_block_write(write_request()).await.expect("begin write");
+        let write = core
+            .begin_block_write(write_request(), write_rpc_permit())
+            .await
+            .expect("begin write");
         drop(write);
 
         let drain_core = Arc::clone(&core);
@@ -1031,7 +1080,7 @@ mod tests {
                 .await
         );
         let reused = core
-            .begin_block_write(write_request())
+            .begin_block_write(write_request(), write_rpc_permit())
             .await
             .expect("reuse after detached cleanup exits");
         core.abort_block_write(reused).await.expect("abort reused write");
@@ -1048,9 +1097,12 @@ mod tests {
             abort_calls,
         } = blocking_core(BlockingOperation::PanicFirstAbort);
         let other_block_id = BlockId::new(InodeId::new(7), BlockIndex::new(4));
-        let first = core.begin_block_write(write_request()).await.expect("first write");
+        let first = core
+            .begin_block_write(write_request(), write_rpc_permit())
+            .await
+            .expect("first write");
         let second = core
-            .begin_block_write(write_request_for(other_block_id))
+            .begin_block_write(write_request_for(other_block_id), write_rpc_permit())
             .await
             .expect("second write");
         drop((first, second));
@@ -1065,12 +1117,12 @@ mod tests {
         assert_eq!(abort_calls.load(Ordering::SeqCst), 3);
 
         let first = core
-            .begin_block_write(write_request())
+            .begin_block_write(write_request(), write_rpc_permit())
             .await
             .expect("reuse first block");
         core.abort_block_write(first).await.expect("abort first reuse");
         let second = core
-            .begin_block_write(write_request_for(other_block_id))
+            .begin_block_write(write_request_for(other_block_id), write_rpc_permit())
             .await
             .expect("reuse second block");
         core.abort_block_write(second).await.expect("abort second reuse");
@@ -1082,7 +1134,10 @@ mod tests {
         let mut request = write_request();
         request.block_size = 3;
         request.chunk_size = 1;
-        let mut write = core.begin_block_write(request).await.expect("begin write");
+        let mut write = core
+            .begin_block_write(request, write_rpc_permit())
+            .await
+            .expect("begin write");
         assert!(core.write_block_data(&mut write, Bytes::new()).await.is_err());
         assert!(core
             .write_block_data(&mut write, Bytes::from_static(b"four"))
@@ -1094,7 +1149,10 @@ mod tests {
     #[tokio::test]
     async fn cancelled_blocking_read_keeps_reclaim_pin_until_io_exits() {
         let (_temp, store, core) = core_with_store();
-        let mut write = core.begin_block_write(write_request()).await.expect("begin write");
+        let mut write = core
+            .begin_block_write(write_request(), write_rpc_permit())
+            .await
+            .expect("begin write");
         core.write_block_data(&mut write, Bytes::from_static(b"abcdefgh"))
             .await
             .expect("write data");
@@ -1111,7 +1169,12 @@ mod tests {
             abort_calls: Arc::new(AtomicUsize::new(0)),
         });
         let core = Arc::new(WorkerCore::with_local_store(512, 2048, blocking_store));
-        let mut read = core.begin_block_read(read_request(8)).await.expect("begin read");
+        let read_slots = Arc::new(Semaphore::new(1));
+        let rpc_permit = Arc::new(rpc_permit(Arc::clone(&read_slots), "read"));
+        let mut read = core
+            .begin_block_read(read_request(8), rpc_permit)
+            .await
+            .expect("begin read");
         let read_core = Arc::clone(&core);
         let read_task = tokio::spawn(async move { read_core.read_block_chunk(&mut read).await });
         tokio::task::spawn_blocking(move || started_rx.recv().expect("blocking read started"))
@@ -1119,6 +1182,7 @@ mod tests {
             .expect("wait for read");
         read_task.abort();
         assert!(read_task.await.expect_err("read task cancelled").is_cancelled());
+        assert_eq!(read_slots.available_permits(), 0);
 
         let reclaim_core = Arc::clone(&core);
         let reclaim = tokio::spawn(async move {
@@ -1132,7 +1196,7 @@ mod tests {
         });
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                match core.begin_block_read(read_request(1)).await {
+                match core.begin_block_read(read_request(1), read_rpc_permit()).await {
                     Err(WorkerError::RefreshMetadata {
                         kind: ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
                         ..
@@ -1153,5 +1217,6 @@ mod tests {
             .expect("reclaim completes")
             .expect("reclaim task")
             .is_ok());
+        assert_eq!(read_slots.available_permits(), 1);
     }
 }
