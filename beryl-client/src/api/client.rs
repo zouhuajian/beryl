@@ -239,6 +239,7 @@ mod tests {
     use beryl_common::error::rpc::{
         ErrorKind, InternalErrorKind, MetadataErrorKind, RefreshHint as RpcRefreshHint, RpcErrorDetail, WorkerErrorKind,
     };
+    use beryl_common::header::{HEADER_WORKER_DATA_REJECTION, WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT};
     use beryl_proto::metadata::{
         AbortFileWriteResponseProto, CommitFileResponseProto, CreateDirectoryResponseProto, CreateFileResponseProto,
         DeleteResponseProto, GetStatusResponseProto, ListStatusResponseProto, OpenFileResponseProto,
@@ -461,6 +462,52 @@ mod tests {
         let err = writer.close().await.expect_err("unsafe flush failure blocks close");
         assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("invalid")));
         assert_eq!(method_count(&gateway.calls(), "commit_file"), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_retries_only_marked_before_side_effect_capacity_without_invalidating_session() {
+        let events = event_log();
+        let gateway = Arc::new(MockGateway::default());
+        let worker = Arc::new(MockDataClient {
+            write_outcomes: Mutex::new(
+                vec![
+                    WorkerWriteOutcome::CapacityRejected,
+                    WorkerWriteOutcome::CapacityRejected,
+                    WorkerWriteOutcome::CapacityRejected,
+                ]
+                .into(),
+            ),
+            events: Some(events.clone()),
+            ..MockDataClient::default()
+        });
+        let client =
+            fs_client_with_data_plane(test_config_with_retries("root", 3), gateway.clone(), data_plane(worker))
+                .expect("client");
+        let mut writer = client
+            .create("/created", CreateOptions::create())
+            .await
+            .expect("writer");
+
+        let error = writer
+            .write_all(Bytes::from_static(b"x"))
+            .await
+            .expect_err("marked capacity must stop after the configured attempts");
+
+        assert_eq!(classify_error(&error), ErrorClass::ServerRetry);
+        assert_eq!(add_block_count(&gateway.calls()), 1);
+        assert_eq!(
+            events
+                .lock()
+                .expect("events")
+                .iter()
+                .filter(|event| **event == "write_block")
+                .count(),
+            3
+        );
+        writer
+            .write_all(Bytes::new())
+            .await
+            .expect("definite rejection before Worker side effects keeps the session open");
     }
 
     #[tokio::test]
@@ -1313,6 +1360,7 @@ mod tests {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum WorkerWriteOutcome {
         Ok,
+        CapacityRejected,
         WorkerError,
         HoldRequests,
         HoldCancellation,
@@ -1399,6 +1447,18 @@ mod tests {
         ) -> ClientResult<BlockWrite> {
             self.record_event("write_block");
             let outcome = self.next_write_outcome();
+            if matches!(outcome, WorkerWriteOutcome::CapacityRejected) {
+                let mut metadata = tonic::metadata::MetadataMap::new();
+                metadata.insert(
+                    HEADER_WORKER_DATA_REJECTION,
+                    tonic::metadata::MetadataValue::from_static(WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT),
+                );
+                return Err(ClientError::from(tonic::Status::with_metadata(
+                    tonic::Code::ResourceExhausted,
+                    "injected Worker RPC capacity exhaustion",
+                    metadata,
+                )));
+            }
             let events = self.events.clone();
             let (requests, mut request_stream) = mpsc::channel::<BlockWriteInput>(1);
             let (transport_cancellation, mut cancellation_signal) = watch::channel(false);

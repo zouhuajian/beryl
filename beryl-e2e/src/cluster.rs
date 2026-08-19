@@ -909,7 +909,6 @@ fn worker_config(
         http_port: rpc_addr.port().saturating_add(1),
         identity_path,
         rpc_bind: rpc_addr.to_string(),
-        rpc_max_inflight: 100,
         default_frame_size: 1024 * 1024,
         max_frame_size: 4 * 1024 * 1024,
         store: WorkerStoreConfig {
@@ -917,7 +916,7 @@ fn worker_config(
             reserve_space_bytes: 0,
             check_interval_ms: 30_000,
         },
-        net: WorkerNetConfig::grpc_from_rpc(rpc_addr.to_string(), 100, 4 * 1024 * 1024),
+        net: WorkerNetConfig::grpc_from_rpc(rpc_addr.to_string(), 64, 32, 4 * 1024 * 1024),
         metadata: WorkerRegistrationConfig {
             group_name,
             endpoints: vec![format!("http://{metadata_addr}")],

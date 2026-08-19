@@ -526,7 +526,8 @@ beryl.worker.identity-file: {identity_path:?}
 beryl.worker.host: "127.0.0.1"
 beryl.worker.bind-host: "127.0.0.1"
 beryl.worker.rpc.port: {rpc_port}
-beryl.worker.rpc.max-concurrent-requests: 16
+beryl.worker.rpc.max-concurrent-read-requests: 8
+beryl.worker.rpc.max-concurrent-write-requests: 8
 beryl.worker.http.port: {http_port}
 beryl.worker.metadata.addresses: [{endpoint:?}]
 beryl.worker.metadata.request-timeout: 1s
@@ -714,7 +715,7 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_remove() {
     )
     .expect("block reporter");
 
-    let service = WorkerDataServiceImpl::new(Arc::clone(&core), Arc::clone(&state));
+    let service = WorkerDataServiceImpl::new(Arc::clone(&core), Arc::clone(&state), 64, 32);
     let read = service
         .read_block(Request::new(ReadBlockRequestProto {
             header: None,

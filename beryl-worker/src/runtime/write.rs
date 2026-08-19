@@ -10,7 +10,7 @@ use beryl_types::ids::BlockId;
 use beryl_types::GroupName;
 use parking_lot::Mutex;
 
-use crate::observe;
+use crate::runtime::DataRpcPermit;
 
 /// Exact worker-local identity of staging state owned by one write RPC.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -21,18 +21,19 @@ pub(crate) struct BlockWriteKey {
 
 struct BlockWriteEntry {
     io: Mutex<BlockWriteIoState>,
-    _inflight: BlockWriteInflightGuard,
+    /// Retained until Ready completion or successful cleanup removes this entry.
+    _rpc_permit: DataRpcPermit,
 }
 
 impl BlockWriteEntry {
-    fn new() -> Self {
+    fn new(rpc_permit: DataRpcPermit) -> Self {
         Self {
             io: Mutex::new(BlockWriteIoState {
                 retiring: false,
                 inflight: 0,
                 cleanup_running: false,
             }),
-            _inflight: BlockWriteInflightGuard::new(),
+            _rpc_permit: rpc_permit,
         }
     }
 
@@ -171,12 +172,16 @@ impl BlockWriteRegistry {
 
     /// Acquires exclusive process-local ownership without replacing an active
     /// write for the same group and block.
-    pub(crate) fn register(self: &Arc<Self>, key: BlockWriteKey) -> Option<BlockWriteRegistration> {
+    pub(crate) fn register(
+        self: &Arc<Self>,
+        key: BlockWriteKey,
+        rpc_permit: DataRpcPermit,
+    ) -> Option<BlockWriteRegistration> {
         let mut inner = self.inner.lock();
         if inner.writes.contains_key(&key) {
             return None;
         }
-        let entry = Arc::new(BlockWriteEntry::new());
+        let entry = Arc::new(BlockWriteEntry::new(rpc_permit));
         inner.writes.insert(key.clone(), Arc::clone(&entry));
         inner.cleanup_order.push_back(key.clone());
         Some(BlockWriteRegistration {
@@ -264,29 +269,16 @@ impl BlockWriteRegistry {
     }
 }
 
-struct BlockWriteInflightGuard;
-
-impl BlockWriteInflightGuard {
-    fn new() -> Self {
-        observe::increment_stream_inflight("write");
-        Self
-    }
-}
-
-impl Drop for BlockWriteInflightGuard {
-    fn drop(&mut self) {
-        observe::decrement_stream_inflight("write");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use beryl_types::ids::{BlockId, BlockIndex, InodeId};
     use beryl_types::GroupName;
+    use tokio::sync::Semaphore;
 
     use super::{BlockWriteKey, BlockWriteRegistry};
+    use crate::runtime::DataRpcPermit;
 
     fn key() -> BlockWriteKey {
         BlockWriteKey {
@@ -295,16 +287,21 @@ mod tests {
         }
     }
 
+    fn rpc_permit() -> DataRpcPermit {
+        let slots = Arc::new(Semaphore::new(1));
+        DataRpcPermit::new(slots.try_acquire_owned().expect("test write capacity"), "write")
+    }
+
     #[test]
     fn cancellation_retires_exact_owner_and_allows_reuse_after_cleanup() {
         let registry = Arc::new(BlockWriteRegistry::new());
-        let registration = registry.register(key()).expect("first owner");
-        assert!(registry.register(key()).is_none());
+        let registration = registry.register(key(), rpc_permit()).expect("first owner");
+        assert!(registry.register(key(), rpc_permit()).is_none());
 
         drop(registration);
         let candidates = registry.take_cleanup_batch(1, false);
         assert_eq!(candidates.len(), 1);
         assert!(candidates.into_iter().next().expect("cleanup claim").complete());
-        assert!(registry.register(key()).is_some());
+        assert!(registry.register(key(), rpc_permit()).is_some());
     }
 }

@@ -28,7 +28,7 @@ use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
 use crate::metrics::{ClientMetrics, NoopClientMetrics};
 use crate::planner::{block_location_unavailable_error, PlannedBlockRead};
-use crate::runtime::{classify_error, AttemptContext, ErrorClass};
+use crate::runtime::{classify_error, is_worker_capacity_before_side_effect_rejection, AttemptContext, ErrorClass};
 
 /// Concrete gRPC implementation of the client-side Worker data plane.
 #[derive(Debug)]
@@ -101,6 +101,9 @@ impl GrpcWorkerDataClient {
         worker: &beryl_types::WorkerEndpointInfo,
         status: tonic::Status,
     ) -> ClientError {
+        if is_worker_capacity_before_side_effect_rejection(&status) {
+            return ClientError::from(status);
+        }
         if has_structured_worker_error(&status) {
             let error = parse_worker_data_status(attempt, status);
             channel_pool.invalidate_on_worker_run_mismatch(worker, &error);
@@ -524,7 +527,10 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use beryl_common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind};
-    use beryl_common::header::{HEADER_WORKER_DATA_ERROR_DETAIL, WORKER_DATA_ERROR_DETAIL_V1};
+    use beryl_common::header::{
+        HEADER_WORKER_DATA_ERROR_DETAIL, HEADER_WORKER_DATA_REJECTION, WORKER_DATA_ERROR_DETAIL_V1,
+        WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT,
+    };
     use beryl_proto::convert::rpc_error_to_proto;
     use beryl_proto::worker::worker_data_service_server::{WorkerDataService, WorkerDataServiceServer};
     use beryl_proto::worker::{
@@ -554,6 +560,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum WriteBehavior {
         Success,
+        CapacityRejected,
         AckThenUnavailable,
         DelayedAck,
     }
@@ -623,6 +630,18 @@ mod tests {
             request: Request<tonic::Streaming<WriteBlockRequestProto>>,
         ) -> Result<Response<Self::WriteBlockStream>, Status> {
             self.state.write_calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.state.write_behavior, WriteBehavior::CapacityRejected) {
+                let mut metadata = tonic::metadata::MetadataMap::new();
+                metadata.insert(
+                    HEADER_WORKER_DATA_REJECTION,
+                    tonic::metadata::MetadataValue::from_static(WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT),
+                );
+                return Err(Status::with_metadata(
+                    tonic::Code::ResourceExhausted,
+                    "mock Worker write capacity exhausted",
+                    metadata,
+                ));
+            }
             let mut requests = request.into_inner();
             let first = requests
                 .message()
@@ -683,6 +702,7 @@ mod tests {
                         .await
                         .expect("response receiver is open");
                 }
+                WriteBehavior::CapacityRejected => unreachable!("capacity rejection returned before stream setup"),
             }
             Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
                 response_stream,
@@ -918,6 +938,24 @@ mod tests {
         assert_eq!(second_state.write_calls.load(Ordering::SeqCst), 0);
         let _ = first_shutdown.send(());
         let _ = second_shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn marked_before_side_effect_write_capacity_survives_the_grpc_boundary() {
+        let state = Arc::new(MockWorkerState::new(ReadFailure::None, WriteBehavior::CapacityRejected));
+        let (worker, shutdown) = start_mock_worker(Arc::clone(&state), 1).await;
+
+        let error = match grpc_client()
+            .open_write_block(attempt("WriteBlock"), write_target(vec![worker]), lease_expiry())
+            .await
+        {
+            Ok(_) => panic!("capacity rejection before Worker side effects must precede acknowledgement"),
+            Err(error) => error,
+        };
+
+        assert_eq!(classify_error(&error), ErrorClass::ServerRetry);
+        assert_eq!(state.write_calls.load(Ordering::SeqCst), 1);
+        let _ = shutdown.send(());
     }
 
     #[tokio::test]
