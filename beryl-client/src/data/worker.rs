@@ -597,8 +597,6 @@ mod tests {
     #[tonic::async_trait]
     impl WorkerDataService for MockWorkerService {
         type ReadBlockStream = Pin<Box<dyn futures::Stream<Item = Result<ReadBlockChunkProto, Status>> + Send>>;
-        type WriteBlockStream = Pin<Box<dyn futures::Stream<Item = Result<WriteBlockResponseProto, Status>> + Send>>;
-
         async fn read_block(
             &self,
             request: Request<ReadBlockRequestProto>,
@@ -624,6 +622,8 @@ mod tests {
                 )])))),
             }
         }
+
+        type WriteBlockStream = Pin<Box<dyn futures::Stream<Item = Result<WriteBlockResponseProto, Status>> + Send>>;
 
         async fn write_block(
             &self,
