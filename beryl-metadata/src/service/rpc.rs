@@ -184,15 +184,6 @@ impl MetadataFileSystemServiceImpl {
 
 #[tonic::async_trait]
 impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
-    async fn msync(&self, request: Request<MsyncRequestProto>) -> Result<Response<MsyncResponseProto>, Status> {
-        let req = request.into_inner();
-        let response = match self.msync.as_ref() {
-            Some(msync) => msync.handle(req),
-            None => MsyncHandler::unavailable(req),
-        };
-        Ok(Response::new(response))
-    }
-
     #[instrument(skip_all)]
     async fn get_status(
         &self,
@@ -219,6 +210,67 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 ok_header_from_fs_success(&req_ctx, &success)
             ),
             Err(failure) => error_response!(GetStatusResponseProto, header_from_fs_failure(&req_ctx, &failure)),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn list_status(
+        &self,
+        request: Request<ListStatusRequestProto>,
+    ) -> Result<Response<ListStatusResponseProto>, Status> {
+        let req = request.into_inner();
+        let req_ctx = request_context_or_error!(req, ListStatusResponseProto);
+        let max_entries = match self.list_status_page_size(req.limit) {
+            Ok(max_entries) => max_entries,
+            Err(err) => {
+                return error_response!(
+                    ListStatusResponseProto,
+                    Self::header_from_conversion_error(&req.header, err)
+                );
+            }
+        };
+        match self
+            .filesystem
+            .list_status(
+                &req_ctx,
+                ListStatusArgs {
+                    path: req.path,
+                    recursive: req.recursive,
+                    cursor_key: (!req.cursor.is_empty()).then_some(req.cursor),
+                    max_entries,
+                    freshness: Self::freshness_from_header(&req.header),
+                },
+            )
+            .await
+        {
+            Ok(success) => {
+                let header = ok_header_from_fs_success(&req_ctx, &success);
+                let payload = success.payload;
+                let entries = payload
+                    .entries
+                    .into_iter()
+                    .map(|entry| DirEntryProto {
+                        name: entry.name,
+                        kind: match entry.kind {
+                            Some(beryl_types::fs::InodeKind::File) => InodeKindProto::InodeKindFile as i32,
+                            Some(beryl_types::fs::InodeKind::Dir) => InodeKindProto::InodeKindDir as i32,
+                            Some(beryl_types::fs::InodeKind::Symlink) => InodeKindProto::InodeKindSymlink as i32,
+                            None => InodeKindProto::InodeKindUnspecified as i32,
+                        },
+                        attrs: entry.attrs.as_ref().map(file_attrs_to_proto),
+                    })
+                    .collect();
+                response_with_header!(
+                    ListStatusResponseProto {
+                        entries,
+                        next_cursor: payload.next_cursor_key,
+                        eof: payload.eof,
+                        ..Default::default()
+                    },
+                    header
+                )
+            }
+            Err(failure) => error_response!(ListStatusResponseProto, header_from_fs_failure(&req_ctx, &failure)),
         }
     }
 
@@ -317,67 +369,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 ok_header_from_fs_success(&req_ctx, &success)
             ),
             Err(failure) => error_response!(RenameResponseProto, header_from_fs_failure(&req_ctx, &failure)),
-        }
-    }
-
-    #[instrument(skip_all)]
-    async fn list_status(
-        &self,
-        request: Request<ListStatusRequestProto>,
-    ) -> Result<Response<ListStatusResponseProto>, Status> {
-        let req = request.into_inner();
-        let req_ctx = request_context_or_error!(req, ListStatusResponseProto);
-        let max_entries = match self.list_status_page_size(req.limit) {
-            Ok(max_entries) => max_entries,
-            Err(err) => {
-                return error_response!(
-                    ListStatusResponseProto,
-                    Self::header_from_conversion_error(&req.header, err)
-                );
-            }
-        };
-        match self
-            .filesystem
-            .list_status(
-                &req_ctx,
-                ListStatusArgs {
-                    path: req.path,
-                    recursive: req.recursive,
-                    cursor_key: (!req.cursor.is_empty()).then_some(req.cursor),
-                    max_entries,
-                    freshness: Self::freshness_from_header(&req.header),
-                },
-            )
-            .await
-        {
-            Ok(success) => {
-                let header = ok_header_from_fs_success(&req_ctx, &success);
-                let payload = success.payload;
-                let entries = payload
-                    .entries
-                    .into_iter()
-                    .map(|entry| DirEntryProto {
-                        name: entry.name,
-                        kind: match entry.kind {
-                            Some(beryl_types::fs::InodeKind::File) => InodeKindProto::InodeKindFile as i32,
-                            Some(beryl_types::fs::InodeKind::Dir) => InodeKindProto::InodeKindDir as i32,
-                            Some(beryl_types::fs::InodeKind::Symlink) => InodeKindProto::InodeKindSymlink as i32,
-                            None => InodeKindProto::InodeKindUnspecified as i32,
-                        },
-                        attrs: entry.attrs.as_ref().map(file_attrs_to_proto),
-                    })
-                    .collect();
-                response_with_header!(
-                    ListStatusResponseProto {
-                        entries,
-                        next_cursor: payload.next_cursor_key,
-                        eof: payload.eof,
-                        ..Default::default()
-                    },
-                    header
-                )
-            }
-            Err(failure) => error_response!(ListStatusResponseProto, header_from_fs_failure(&req_ctx, &failure)),
         }
     }
 
@@ -836,6 +827,15 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             ),
             Err(failure) => error_response!(SyncWriteResponseProto, header_from_fs_failure(&req_ctx, &failure)),
         }
+    }
+
+    async fn msync(&self, request: Request<MsyncRequestProto>) -> Result<Response<MsyncResponseProto>, Status> {
+        let req = request.into_inner();
+        let response = match self.msync.as_ref() {
+            Some(msync) => msync.handle(req),
+            None => MsyncHandler::unavailable(req),
+        };
+        Ok(Response::new(response))
     }
 }
 
