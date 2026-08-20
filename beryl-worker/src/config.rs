@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use beryl_common::config::{keys::logging, FlatConfig, ServerConfig};
+use beryl_common::config::{keys::logging, load_from_yaml_file, FlatConfig};
 use beryl_common::error::{CommonError, CommonErrorKind};
 use beryl_common::observe::config::{LogConfig, ResourceConfig};
 use beryl_common::observe::ObservabilityConfig;
@@ -241,12 +241,12 @@ impl Default for WorkerConfig {
 impl WorkerConfig {
     /// Load Worker configuration from one YAML file.
     pub fn load<P: AsRef<Path>>(config_path: P) -> Result<Self, CommonError> {
-        Self::from_server_config(&ServerConfig::load(config_path)?)
+        Self::from_flat(load_from_yaml_file(config_path)?)
     }
 
     /// Build typed Worker configuration from shared YAML mechanics.
-    pub fn from_server_config(server_config: &ServerConfig) -> Result<Self, CommonError> {
-        let flat = server_config.as_flat();
+    pub fn from_flat(flat: FlatConfig) -> Result<Self, CommonError> {
+        let flat = &flat;
         flat.ensure_only_known_keys(KNOWN_KEYS)?;
         let defaults = Self::default();
 

@@ -8,7 +8,7 @@ use crate::raft::{
     MIN_RECLAIM_DETACHED_ROOT_BATCH_BYTES,
 };
 use crate::readiness::RootReadinessConfig;
-use beryl_common::config::{keys::logging, FlatConfig, ServerConfig};
+use beryl_common::config::{keys::logging, load_from_yaml_file, FlatConfig};
 use beryl_common::error::{CommonError, CommonErrorKind};
 use beryl_common::grpc_server::MAX_GRPC_CONCURRENT_REQUESTS;
 use beryl_common::observe::config::{LogConfig, ResourceConfig};
@@ -415,12 +415,12 @@ impl Default for MetadataConfig {
 impl MetadataConfig {
     /// Load metadata configuration from a YAML file.
     pub fn load<P: AsRef<Path>>(config_path: P) -> Result<Self, CommonError> {
-        Self::from_server_config(ServerConfig::load(config_path)?)
+        Self::from_flat(load_from_yaml_file(config_path)?)
     }
 
     /// Build the typed Metadata configuration from shared YAML mechanics.
-    pub fn from_server_config(server_config: ServerConfig) -> Result<Self, CommonError> {
-        let flat = server_config.as_flat();
+    pub fn from_flat(flat: FlatConfig) -> Result<Self, CommonError> {
+        let flat = &flat;
         flat.ensure_only_known_keys(KNOWN_KEYS)?;
         let defaults = Self::default();
 
@@ -813,61 +813,61 @@ mod tests {
     fn active_safety_bounds_are_enforced() {
         let mut flat = base_flat();
         flat.set(LIST_MAX_PAGE_SIZE, 20_000i64);
-        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
+        assert!(MetadataConfig::from_flat(flat).is_err());
 
         let mut flat = base_flat();
         flat.set(NAMESPACE_DELETE_MAX_SIZE, "2MiB");
-        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
+        assert!(MetadataConfig::from_flat(flat).is_err());
 
         for host in [" metadata-01", "http://metadata-01", "metadata-01:18080"] {
             let mut flat = base_flat();
             flat.set(HOST, host);
-            assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
+            assert!(MetadataConfig::from_flat(flat).is_err());
         }
 
         let mut flat = base_flat();
         flat.set(RPC_MAX_CONCURRENT_REQUESTS, 8i64);
         flat.set(RPC_MAX_CONCURRENT_REQUESTS_PER_CONNECTION, 9i64);
-        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
+        assert!(MetadataConfig::from_flat(flat).is_err());
 
         let mut flat = base_flat();
         flat.set(RPC_MAX_CONCURRENT_REQUESTS, 8i64);
         flat.set(RPC_RESERVED_CONTROL_REQUESTS, 8i64);
-        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
+        assert!(MetadataConfig::from_flat(flat).is_err());
 
         let mut flat = base_flat();
         flat.set(RPC_RESERVED_CONTROL_REQUESTS, 0i64);
-        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
+        assert!(MetadataConfig::from_flat(flat).is_err());
 
         let mut flat = base_flat();
         flat.set(
             RPC_MAX_CONCURRENT_REQUESTS,
             i64::try_from(MAX_GRPC_CONCURRENT_REQUESTS).unwrap(),
         );
-        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_ok());
+        assert!(MetadataConfig::from_flat(flat).is_ok());
 
         let mut flat = base_flat();
         flat.set(
             RPC_MAX_CONCURRENT_REQUESTS,
             i64::try_from(MAX_GRPC_CONCURRENT_REQUESTS + 1).unwrap(),
         );
-        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
+        assert!(MetadataConfig::from_flat(flat).is_err());
 
         let mut flat = base_flat();
         flat.set(WRITE_SESSION_MAX_ACTIVE, 8i64);
         flat.set(WRITE_SESSION_MAX_ACTIVE_PER_CLIENT, 9i64);
-        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
+        assert!(MetadataConfig::from_flat(flat).is_err());
 
         let mut flat = base_flat();
         flat.set(WRITE_TARGET_MAX_OUTSTANDING, 8i64);
         flat.set(WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION, 9i64);
-        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
+        assert!(MetadataConfig::from_flat(flat).is_err());
 
         let mut flat = base_flat();
         flat.set(
             WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION,
             i64::try_from(MAX_FILE_EXTENTS + 1).unwrap(),
         );
-        assert!(MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).is_err());
+        assert!(MetadataConfig::from_flat(flat).is_err());
     }
 }

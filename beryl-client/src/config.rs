@@ -3,7 +3,8 @@
 
 //! Client configuration loading and validation.
 
-use beryl_common::{ClientConfig as CommonClientConfig, CommonError, FlatConfig};
+use beryl_common::config::load_from_yaml_file;
+use beryl_common::{CommonError, FlatConfig};
 use beryl_types::GroupName;
 use std::path::Path;
 
@@ -15,8 +16,8 @@ pub const DEFAULT_WORKER_ENDPOINT_COOLDOWN_MS: u64 = 1_000;
 /// Client-specific configuration.
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
-    /// Underlying common client config.
-    pub inner: CommonClientConfig,
+    /// Underlying flat configuration.
+    pub inner: FlatConfig,
     /// Low-cardinality display identity carried in request headers.
     pub client_name: String,
     /// Retry configuration.
@@ -118,13 +119,7 @@ impl Default for ClientConfig {
 impl ClientConfig {
     /// Load client configuration from a file.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, CommonError> {
-        let common_config = CommonClientConfig::load(path)?;
-        Self::from_common_config(common_config)
-    }
-
-    /// Create from CommonClientConfig.
-    pub fn from_common_config(common_config: CommonClientConfig) -> Result<Self, CommonError> {
-        Self::from_flat(common_config.inner.clone())
+        Self::from_flat(load_from_yaml_file(path)?)
     }
 
     /// Create from FlatConfig.
@@ -137,7 +132,7 @@ impl ClientConfig {
         let metadata_groups = parse_metadata_endpoints(&flat)?;
 
         Ok(Self {
-            inner: CommonClientConfig::from_flat(flat),
+            inner: flat,
             client_name,
             retry,
             write_lease,
@@ -146,8 +141,8 @@ impl ClientConfig {
         })
     }
 
-    /// Get the underlying CommonClientConfig.
-    pub fn as_common(&self) -> &CommonClientConfig {
+    /// Get the underlying flat configuration.
+    pub fn as_flat(&self) -> &FlatConfig {
         &self.inner
     }
 

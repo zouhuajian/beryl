@@ -15,7 +15,7 @@ pub mod termination;
 pub mod time;
 
 pub use audit::{AuditLogger, AuditRecord};
-pub use config::{ClientConfig, FlatConfig, ServerConfig, load_client_config, load_server_config};
+pub use config::FlatConfig;
 pub use error::{CommonError, CommonErrorKind};
 pub use header::{CallerContext, CallerContextFields, RequestHeader, RequestHeaderCodec, ResponseHeader};
 pub use limit::{ConcurrencyLimiter, Permit};
