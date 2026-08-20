@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use beryl_common::config::{keys::logging, load_from_yaml_file, FlatConfig};
+use beryl_common::config::{format_host_port, keys::logging, load_from_yaml_file, validate_public_host, FlatConfig};
 use beryl_common::error::{CommonError, CommonErrorKind};
 use beryl_common::observe::config::{LogConfig, ResourceConfig};
 use beryl_common::observe::ObservabilityConfig;
@@ -250,51 +250,38 @@ impl WorkerConfig {
         flat.ensure_only_known_keys(KNOWN_KEYS)?;
         let defaults = Self::default();
 
-        let cluster_id = string_or(flat, CLUSTER_ID, &defaults.cluster_id)?;
-        let host = string_or(flat, HOST, &defaults.host)?;
-        let bind_host = string_or(flat, BIND_HOST, &defaults.bind_host.to_string())?
+        let cluster_id = flat.string_or(CLUSTER_ID, &defaults.cluster_id)?;
+        let host = flat.string_or(HOST, &defaults.host)?;
+        let bind_host = flat
+            .string_or(BIND_HOST, &defaults.bind_host.to_string())?
             .parse::<IpAddr>()
             .map_err(|_| invalid_config(BIND_HOST, "must be an IP address"))?;
-        let rpc_port = port_or(flat, RPC_PORT, defaults.rpc_port)?;
-        let http_port = port_or(flat, HTTP_PORT, defaults.http_port)?;
-        let identity_path = PathBuf::from(string_or(
-            flat,
-            IDENTITY_FILE,
-            defaults.identity_path.to_str().unwrap(),
-        )?);
-        let rpc_max_concurrent_reads = positive_usize_or(
-            flat,
-            RPC_MAX_CONCURRENT_READ_REQUESTS,
-            DEFAULT_GRPC_MAX_CONCURRENT_READS,
-        )?;
-        let rpc_max_concurrent_writes = positive_usize_or(
-            flat,
-            RPC_MAX_CONCURRENT_WRITE_REQUESTS,
-            DEFAULT_GRPC_MAX_CONCURRENT_WRITES,
-        )?;
-        let default_frame_size = bytes_u32_or(flat, STREAM_FRAME_SIZE, defaults.default_frame_size)?;
-        let max_frame_size = bytes_u32_or(flat, STREAM_MAX_FRAME_SIZE, defaults.max_frame_size)?;
+        let rpc_port = flat.port_or(RPC_PORT, defaults.rpc_port)?;
+        let http_port = flat.port_or(HTTP_PORT, defaults.http_port)?;
+        let identity_path = PathBuf::from(flat.string_or(IDENTITY_FILE, defaults.identity_path.to_str().unwrap())?);
+        let rpc_max_concurrent_reads =
+            flat.positive_usize_or(RPC_MAX_CONCURRENT_READ_REQUESTS, DEFAULT_GRPC_MAX_CONCURRENT_READS)?;
+        let rpc_max_concurrent_writes =
+            flat.positive_usize_or(RPC_MAX_CONCURRENT_WRITE_REQUESTS, DEFAULT_GRPC_MAX_CONCURRENT_WRITES)?;
+        let default_frame_size = flat.bytes_u32_or(STREAM_FRAME_SIZE, defaults.default_frame_size)?;
+        let max_frame_size = flat.bytes_u32_or(STREAM_MAX_FRAME_SIZE, defaults.max_frame_size)?;
         let store = parse_store_config(flat, &defaults.store)?;
         let metadata = parse_metadata_config(flat, &defaults.metadata)?;
-        let heartbeat_interval_ms = duration_ms_or(flat, HEARTBEAT_INTERVAL, defaults.heartbeat_interval_ms)?;
-        let block_report_interval_ms = duration_ms_or(flat, BLOCK_REPORT_INTERVAL, defaults.block_report_interval_ms)?;
+        let heartbeat_interval_ms = flat.duration_ms_or(HEARTBEAT_INTERVAL, defaults.heartbeat_interval_ms)?;
+        let block_report_interval_ms = flat.duration_ms_or(BLOCK_REPORT_INTERVAL, defaults.block_report_interval_ms)?;
         let block_report_batch_size =
-            positive_usize_or(flat, BLOCK_REPORT_BATCH_SIZE, defaults.block_report_batch_size)?;
-        let shutdown_timeout_ms = duration_ms_or(flat, SHUTDOWN_TIMEOUT, defaults.shutdown_timeout_ms)?;
+            flat.positive_usize_or(BLOCK_REPORT_BATCH_SIZE, defaults.block_report_batch_size)?;
+        let shutdown_timeout_ms = flat.duration_ms_or(SHUTDOWN_TIMEOUT, defaults.shutdown_timeout_ms)?;
         let cleanup_defaults = WorkerBlockCleanupConfig::default();
         let block_cleanup = WorkerBlockCleanupConfig {
-            queue_capacity: positive_usize_or(flat, BLOCK_CLEANUP_QUEUE_CAPACITY, cleanup_defaults.queue_capacity)?,
-            concurrency: positive_usize_or(flat, BLOCK_CLEANUP_CONCURRENCY, cleanup_defaults.concurrency)?,
-            retry_initial_backoff_ms: duration_ms_or(
-                flat,
+            queue_capacity: flat.positive_usize_or(BLOCK_CLEANUP_QUEUE_CAPACITY, cleanup_defaults.queue_capacity)?,
+            concurrency: flat.positive_usize_or(BLOCK_CLEANUP_CONCURRENCY, cleanup_defaults.concurrency)?,
+            retry_initial_backoff_ms: flat.duration_ms_or(
                 BLOCK_CLEANUP_RETRY_INITIAL_BACKOFF,
                 cleanup_defaults.retry_initial_backoff_ms,
             )?,
-            retry_max_backoff_ms: duration_ms_or(
-                flat,
-                BLOCK_CLEANUP_RETRY_MAX_BACKOFF,
-                cleanup_defaults.retry_max_backoff_ms,
-            )?,
+            retry_max_backoff_ms: flat
+                .duration_ms_or(BLOCK_CLEANUP_RETRY_MAX_BACKOFF, cleanup_defaults.retry_max_backoff_ms)?,
         };
         if block_cleanup.retry_max_backoff_ms < block_cleanup.retry_initial_backoff_ms {
             return Err(invalid_config(
@@ -427,13 +414,10 @@ fn parse_metadata_config(
     let config = WorkerRegistrationConfig {
         group_name: GroupName::parse("root").expect("the supported metadata group is valid"),
         endpoints,
-        request_timeout_ms: duration_ms_or(flat, METADATA_REQUEST_TIMEOUT, defaults.request_timeout_ms)?,
-        retry_initial_backoff_ms: duration_ms_or(
-            flat,
-            METADATA_RETRY_INITIAL_BACKOFF,
-            defaults.retry_initial_backoff_ms,
-        )?,
-        retry_max_backoff_ms: duration_ms_or(flat, METADATA_RETRY_MAX_BACKOFF, defaults.retry_max_backoff_ms)?,
+        request_timeout_ms: flat.duration_ms_or(METADATA_REQUEST_TIMEOUT, defaults.request_timeout_ms)?,
+        retry_initial_backoff_ms: flat
+            .duration_ms_or(METADATA_RETRY_INITIAL_BACKOFF, defaults.retry_initial_backoff_ms)?,
+        retry_max_backoff_ms: flat.duration_ms_or(METADATA_RETRY_MAX_BACKOFF, defaults.retry_max_backoff_ms)?,
     };
     config.validate()?;
     Ok(config)
@@ -457,8 +441,8 @@ fn parse_store_config(flat: &FlatConfig, defaults: &WorkerStoreConfig) -> Result
     };
     Ok(WorkerStoreConfig {
         dirs,
-        reserve_space_bytes: bytes_u64_or(flat, STORAGE_RESERVED_SPACE, defaults.reserve_space_bytes)?,
-        check_interval_ms: duration_ms_or(flat, STORAGE_CHECK_INTERVAL, defaults.check_interval_ms)?,
+        reserve_space_bytes: flat.bytes_u64_or(STORAGE_RESERVED_SPACE, defaults.reserve_space_bytes)?,
+        check_interval_ms: flat.duration_ms_or(STORAGE_CHECK_INTERVAL, defaults.check_interval_ms)?,
     })
 }
 
@@ -570,89 +554,6 @@ impl WorkerRegistrationConfig {
     }
 }
 
-fn string_or(flat: &FlatConfig, key: &'static str, default: &str) -> Result<String, CommonError> {
-    if !flat.contains_key(key) {
-        return Ok(default.to_string());
-    }
-    flat.get_str(key).ok_or_else(|| invalid_config(key, "must be a string"))
-}
-
-fn port_or(flat: &FlatConfig, key: &'static str, default: u16) -> Result<u16, CommonError> {
-    if !flat.contains_key(key) {
-        return Ok(default);
-    }
-    let value = flat
-        .get_i64(key)
-        .ok_or_else(|| invalid_config(key, "must be an integer"))?;
-    u16::try_from(value)
-        .ok()
-        .filter(|port| *port != 0)
-        .ok_or_else(|| invalid_config(key, "must be in range 1-65535"))
-}
-
-fn positive_usize_or(flat: &FlatConfig, key: &'static str, default: usize) -> Result<usize, CommonError> {
-    if !flat.contains_key(key) {
-        return Ok(default);
-    }
-    flat.get_usize(key)
-        .filter(|value| *value != 0)
-        .ok_or_else(|| invalid_config(key, "must be greater than zero"))
-}
-
-fn duration_ms_or(flat: &FlatConfig, key: &'static str, default: u64) -> Result<u64, CommonError> {
-    if !flat.contains_key(key) {
-        return Ok(default);
-    }
-    let duration = flat
-        .get_duration(key)
-        .filter(|duration| !duration.is_zero())
-        .ok_or_else(|| invalid_config(key, "must be a positive duration"))?;
-    u64::try_from(duration.as_millis()).map_err(|_| invalid_config(key, "is too large"))
-}
-
-fn bytes_u32_or(flat: &FlatConfig, key: &'static str, default: u32) -> Result<u32, CommonError> {
-    if !flat.contains_key(key) {
-        return Ok(default);
-    }
-    let bytes = flat
-        .get_bytes(key)
-        .ok_or_else(|| invalid_config(key, "must be a size such as 1MiB"))?;
-    u32::try_from(bytes).map_err(|_| invalid_config(key, "is too large"))
-}
-
-fn bytes_u64_or(flat: &FlatConfig, key: &'static str, default: u64) -> Result<u64, CommonError> {
-    if !flat.contains_key(key) {
-        return Ok(default);
-    }
-    flat.get_bytes(key)
-        .and_then(|bytes| u64::try_from(bytes).ok())
-        .ok_or_else(|| invalid_config(key, "must be a size such as 1GiB"))
-}
-
 fn invalid_config(key: &'static str, detail: &'static str) -> CommonError {
     CommonError::new(CommonErrorKind::InvalidArgument, format!("{key} {detail}"))
-}
-
-fn validate_public_host(key: &'static str, host: &str) -> Result<(), CommonError> {
-    if host.is_empty() || host != host.trim() || host.chars().any(char::is_whitespace) {
-        return Err(invalid_config(key, "must be a host or IP without whitespace"));
-    }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return if ip.is_unspecified() {
-            Err(invalid_config(key, "must be a routable host or IP"))
-        } else {
-            Ok(())
-        };
-    }
-    if host.contains("://") || host.contains([':', '/', '\\']) {
-        return Err(invalid_config(key, "must not include a scheme, port, or path"));
-    }
-    Ok(())
-}
-
-fn format_host_port(host: &str, port: u16) -> String {
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V6(_)) => format!("[{host}]:{port}"),
-        _ => format!("{host}:{port}"),
-    }
 }

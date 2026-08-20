@@ -8,7 +8,7 @@ use crate::raft::{
     MIN_RECLAIM_DETACHED_ROOT_BATCH_BYTES,
 };
 use crate::readiness::RootReadinessConfig;
-use beryl_common::config::{keys::logging, load_from_yaml_file, FlatConfig};
+use beryl_common::config::{format_host_port, keys::logging, load_from_yaml_file, validate_public_host, FlatConfig};
 use beryl_common::error::{CommonError, CommonErrorKind};
 use beryl_common::grpc_server::MAX_GRPC_CONCURRENT_REQUESTS;
 use beryl_common::observe::config::{LogConfig, ResourceConfig};
@@ -424,34 +424,32 @@ impl MetadataConfig {
         flat.ensure_only_known_keys(KNOWN_KEYS)?;
         let defaults = Self::default();
 
-        let cluster_id = string_or(flat, CLUSTER_ID, &defaults.cluster_id)?;
+        let cluster_id = flat.string_or(CLUSTER_ID, &defaults.cluster_id)?;
         if cluster_id.trim().is_empty() {
             return Err(invalid_config(CLUSTER_ID, "must not be empty"));
         }
-        let host = string_or(flat, HOST, &defaults.host)?;
+        let host = flat.string_or(HOST, &defaults.host)?;
         validate_public_host(HOST, &host)?;
-        let bind_host = string_or(flat, BIND_HOST, &defaults.bind_host.to_string())?
+        let bind_host = flat
+            .string_or(BIND_HOST, &defaults.bind_host.to_string())?
             .parse::<IpAddr>()
             .map_err(|_| invalid_config(BIND_HOST, "must be an IP address"))?;
-        let rpc_port = port_or(flat, RPC_PORT, defaults.rpc_port)?;
-        let http_port = port_or(flat, HTTP_PORT, defaults.http_port)?;
+        let rpc_port = flat.port_or(RPC_PORT, defaults.rpc_port)?;
+        let http_port = flat.port_or(HTTP_PORT, defaults.http_port)?;
         if rpc_port == http_port {
             return Err(invalid_config(HTTP_PORT, "must differ from the RPC port"));
         }
         let rpc_concurrency_defaults = MetadataRpcConcurrencyConfig::default();
         let rpc_concurrency = MetadataRpcConcurrencyConfig {
-            max_concurrent_requests: positive_usize_or(
-                flat,
+            max_concurrent_requests: flat.positive_usize_or(
                 RPC_MAX_CONCURRENT_REQUESTS,
                 rpc_concurrency_defaults.max_concurrent_requests,
             )?,
-            max_concurrent_requests_per_connection: positive_usize_or(
-                flat,
+            max_concurrent_requests_per_connection: flat.positive_usize_or(
                 RPC_MAX_CONCURRENT_REQUESTS_PER_CONNECTION,
                 rpc_concurrency_defaults.max_concurrent_requests_per_connection,
             )?,
-            reserved_control_requests: positive_usize_or(
-                flat,
+            reserved_control_requests: flat.positive_usize_or(
                 RPC_RESERVED_CONTROL_REQUESTS,
                 rpc_concurrency_defaults.reserved_control_requests,
             )?,
@@ -459,9 +457,8 @@ impl MetadataConfig {
         validate_rpc_concurrency(&rpc_concurrency)?;
         let write_session_defaults = MetadataWriteSessionLimitsConfig::default();
         let write_session_limits = MetadataWriteSessionLimitsConfig {
-            max_active: positive_usize_or(flat, WRITE_SESSION_MAX_ACTIVE, write_session_defaults.max_active)?,
-            max_active_per_client: positive_usize_or(
-                flat,
+            max_active: flat.positive_usize_or(WRITE_SESSION_MAX_ACTIVE, write_session_defaults.max_active)?,
+            max_active_per_client: flat.positive_usize_or(
                 WRITE_SESSION_MAX_ACTIVE_PER_CLIENT,
                 write_session_defaults.max_active_per_client,
             )?,
@@ -469,52 +466,38 @@ impl MetadataConfig {
         validate_write_session_limits(&write_session_limits)?;
         let write_target_defaults = MetadataWriteTargetLimitsConfig::default();
         let write_target_limits = MetadataWriteTargetLimitsConfig {
-            max_outstanding: positive_usize_or(
-                flat,
-                WRITE_TARGET_MAX_OUTSTANDING,
-                write_target_defaults.max_outstanding,
-            )?,
-            max_outstanding_per_session: positive_usize_or(
-                flat,
+            max_outstanding: flat
+                .positive_usize_or(WRITE_TARGET_MAX_OUTSTANDING, write_target_defaults.max_outstanding)?,
+            max_outstanding_per_session: flat.positive_usize_or(
                 WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION,
                 write_target_defaults.max_outstanding_per_session,
             )?,
         };
         validate_write_target_limits(&write_target_limits)?;
-        let storage_dir = PathBuf::from(string_or(flat, STORAGE_DIR, defaults.storage_dir.to_str().unwrap())?);
+        let storage_dir = PathBuf::from(flat.string_or(STORAGE_DIR, defaults.storage_dir.to_str().unwrap())?);
         let observability = ObservabilityConfig::from_flat(flat)?;
 
         let namespace_list = NamespaceListConfig::try_new(
-            positive_u32_or(flat, LIST_DEFAULT_PAGE_SIZE, DEFAULT_LIST_STATUS_PAGE_SIZE)?,
-            positive_u32_or(flat, LIST_MAX_PAGE_SIZE, MAX_LIST_STATUS_PAGE_SIZE)?,
+            flat.positive_u32_or(LIST_DEFAULT_PAGE_SIZE, DEFAULT_LIST_STATUS_PAGE_SIZE)?,
+            flat.positive_u32_or(LIST_MAX_PAGE_SIZE, MAX_LIST_STATUS_PAGE_SIZE)?,
         )?;
 
         let cleanup_defaults = BlockCleanupConfig::default();
         let block_cleanup = BlockCleanupConfig {
-            scan_interval_ms: duration_ms_or(flat, BLOCK_CLEANUP_INTERVAL, cleanup_defaults.scan_interval_ms)?,
-            reclaim_grace_ms: duration_ms_or(flat, BLOCK_CLEANUP_GRACE_PERIOD, cleanup_defaults.reclaim_grace_ms)?,
-            max_replicas_per_scan: positive_usize_or(
-                flat,
-                BLOCK_CLEANUP_SCAN_LIMIT,
-                cleanup_defaults.max_replicas_per_scan,
-            )?,
-            max_candidates: positive_usize_or(flat, BLOCK_CLEANUP_QUEUE_CAPACITY, cleanup_defaults.max_candidates)?,
-            enabled: bool_or(flat, BLOCK_CLEANUP_ENABLED, cleanup_defaults.enabled)?,
-            max_commands_per_heartbeat: positive_usize_or(
-                flat,
-                BLOCK_CLEANUP_BATCH_SIZE,
-                cleanup_defaults.max_commands_per_heartbeat,
-            )?,
-            retry_initial_backoff_ms: duration_ms_or(
-                flat,
+            scan_interval_ms: flat.duration_ms_or(BLOCK_CLEANUP_INTERVAL, cleanup_defaults.scan_interval_ms)?,
+            reclaim_grace_ms: flat.duration_ms_or(BLOCK_CLEANUP_GRACE_PERIOD, cleanup_defaults.reclaim_grace_ms)?,
+            max_replicas_per_scan: flat
+                .positive_usize_or(BLOCK_CLEANUP_SCAN_LIMIT, cleanup_defaults.max_replicas_per_scan)?,
+            max_candidates: flat.positive_usize_or(BLOCK_CLEANUP_QUEUE_CAPACITY, cleanup_defaults.max_candidates)?,
+            enabled: flat.bool_or(BLOCK_CLEANUP_ENABLED, cleanup_defaults.enabled)?,
+            max_commands_per_heartbeat: flat
+                .positive_usize_or(BLOCK_CLEANUP_BATCH_SIZE, cleanup_defaults.max_commands_per_heartbeat)?,
+            retry_initial_backoff_ms: flat.duration_ms_or(
                 BLOCK_CLEANUP_RETRY_INITIAL_BACKOFF,
                 cleanup_defaults.retry_initial_backoff_ms,
             )?,
-            retry_max_backoff_ms: duration_ms_or(
-                flat,
-                BLOCK_CLEANUP_RETRY_MAX_BACKOFF,
-                cleanup_defaults.retry_max_backoff_ms,
-            )?,
+            retry_max_backoff_ms: flat
+                .duration_ms_or(BLOCK_CLEANUP_RETRY_MAX_BACKOFF, cleanup_defaults.retry_max_backoff_ms)?,
         };
         ensure_backoff_order(
             BLOCK_CLEANUP_RETRY_INITIAL_BACKOFF,
@@ -524,43 +507,36 @@ impl MetadataConfig {
         )?;
         let delete_defaults = NamespaceDeleteConfig::default();
         let namespace_delete = NamespaceDeleteConfig {
-            scan_interval_ms: duration_ms_or(flat, NAMESPACE_DELETE_INTERVAL, delete_defaults.scan_interval_ms)?,
-            max_candidates: positive_u32_or(flat, NAMESPACE_DELETE_MAX_ROOTS, delete_defaults.max_candidates)?,
-            max_entries: positive_u32_or(flat, NAMESPACE_DELETE_MAX_ENTRIES, delete_defaults.max_entries)?,
-            max_batch_bytes: bytes_u32_or(flat, NAMESPACE_DELETE_MAX_SIZE, delete_defaults.max_batch_bytes)?,
-            retry_initial_backoff_ms: duration_ms_or(
-                flat,
+            scan_interval_ms: flat.duration_ms_or(NAMESPACE_DELETE_INTERVAL, delete_defaults.scan_interval_ms)?,
+            max_candidates: flat.positive_u32_or(NAMESPACE_DELETE_MAX_ROOTS, delete_defaults.max_candidates)?,
+            max_entries: flat.positive_u32_or(NAMESPACE_DELETE_MAX_ENTRIES, delete_defaults.max_entries)?,
+            max_batch_bytes: flat.bytes_u32_or(NAMESPACE_DELETE_MAX_SIZE, delete_defaults.max_batch_bytes)?,
+            retry_initial_backoff_ms: flat.duration_ms_or(
                 NAMESPACE_DELETE_RETRY_INITIAL_BACKOFF,
                 delete_defaults.retry_initial_backoff_ms,
             )?,
-            retry_max_backoff_ms: duration_ms_or(
-                flat,
-                NAMESPACE_DELETE_RETRY_MAX_BACKOFF,
-                delete_defaults.retry_max_backoff_ms,
-            )?,
+            retry_max_backoff_ms: flat
+                .duration_ms_or(NAMESPACE_DELETE_RETRY_MAX_BACKOFF, delete_defaults.retry_max_backoff_ms)?,
         };
         validate_namespace_delete(&namespace_delete)?;
 
         let worker_defaults = WorkerLivenessConfig::default();
         let heartbeat_timeout_ms =
-            duration_ms_or(flat, WORKER_TIMEOUT, u64::from(worker_defaults.heartbeat_timeout_ms))?;
+            flat.duration_ms_or(WORKER_TIMEOUT, u64::from(worker_defaults.heartbeat_timeout_ms))?;
         let worker_liveness = WorkerLivenessConfig {
             heartbeat_timeout_ms: u32::try_from(heartbeat_timeout_ms)
                 .map_err(|_| invalid_config(WORKER_TIMEOUT, "exceeds the heartbeat protocol maximum"))?,
-            scan_interval_ms: duration_ms_or(flat, WORKER_SCAN_INTERVAL, worker_defaults.scan_interval_ms)?,
+            scan_interval_ms: flat.duration_ms_or(WORKER_SCAN_INTERVAL, worker_defaults.scan_interval_ms)?,
         };
         let readiness_defaults = RootReadinessConfig::default();
         let startup = StartupConfig {
             root_readiness: RootReadinessConfig {
-                initial_backoff_ms: duration_ms_or(
-                    flat,
-                    STARTUP_INITIAL_BACKOFF,
-                    readiness_defaults.initial_backoff_ms,
-                )?,
-                max_backoff_ms: duration_ms_or(flat, STARTUP_MAX_BACKOFF, readiness_defaults.max_backoff_ms)?,
-                warn_after_ms: duration_ms_or(flat, STARTUP_WARN_AFTER, readiness_defaults.warn_after_ms)?,
-                timeout_ms: duration_ms_or(flat, STARTUP_TIMEOUT, readiness_defaults.timeout_ms)?,
-                fail_fast: bool_or(flat, STARTUP_FAIL_FAST, readiness_defaults.fail_fast)?,
+                initial_backoff_ms: flat
+                    .duration_ms_or(STARTUP_INITIAL_BACKOFF, readiness_defaults.initial_backoff_ms)?,
+                max_backoff_ms: flat.duration_ms_or(STARTUP_MAX_BACKOFF, readiness_defaults.max_backoff_ms)?,
+                warn_after_ms: flat.duration_ms_or(STARTUP_WARN_AFTER, readiness_defaults.warn_after_ms)?,
+                timeout_ms: flat.duration_ms_or(STARTUP_TIMEOUT, readiness_defaults.timeout_ms)?,
+                fail_fast: flat.bool_or(STARTUP_FAIL_FAST, readiness_defaults.fail_fast)?,
             },
         };
         ensure_backoff_order(
@@ -575,8 +551,8 @@ impl MetadataConfig {
                 "must not exceed the startup timeout",
             ));
         }
-        let write_lease_timeout_ms = duration_ms_or(flat, WRITE_LEASE_TIMEOUT, defaults.write_lease_timeout_ms)?;
-        let shutdown_timeout_ms = duration_ms_or(flat, SHUTDOWN_TIMEOUT, defaults.shutdown_timeout_ms)?;
+        let write_lease_timeout_ms = flat.duration_ms_or(WRITE_LEASE_TIMEOUT, defaults.write_lease_timeout_ms)?;
+        let shutdown_timeout_ms = flat.duration_ms_or(SHUTDOWN_TIMEOUT, defaults.shutdown_timeout_ms)?;
 
         Ok(Self {
             cluster_id,
@@ -694,107 +670,8 @@ fn ensure_backoff_order(
     Ok(())
 }
 
-fn string_or(flat: &FlatConfig, key: &'static str, default: &str) -> Result<String, CommonError> {
-    if !flat.contains_key(key) {
-        return Ok(default.to_string());
-    }
-    flat.get_str(key).ok_or_else(|| invalid_config(key, "must be a string"))
-}
-
-fn bool_or(flat: &FlatConfig, key: &'static str, default: bool) -> Result<bool, CommonError> {
-    if !flat.contains_key(key) {
-        return Ok(default);
-    }
-    flat.get_bool(key)
-        .ok_or_else(|| invalid_config(key, "must be a boolean"))
-}
-
-fn port_or(flat: &FlatConfig, key: &'static str, default: u16) -> Result<u16, CommonError> {
-    if !flat.contains_key(key) {
-        return Ok(default);
-    }
-    let value = flat
-        .get_i64(key)
-        .ok_or_else(|| invalid_config(key, "must be an integer"))?;
-    u16::try_from(value)
-        .ok()
-        .filter(|port| *port != 0)
-        .ok_or_else(|| invalid_config(key, "must be in range 1-65535"))
-}
-
-fn positive_u32_or(flat: &FlatConfig, key: &'static str, default: u32) -> Result<u32, CommonError> {
-    if !flat.contains_key(key) {
-        return Ok(default);
-    }
-    let value = flat
-        .get_i64(key)
-        .ok_or_else(|| invalid_config(key, "must be an integer"))?;
-    u32::try_from(value)
-        .ok()
-        .filter(|value| *value != 0)
-        .ok_or_else(|| invalid_config(key, "must be greater than zero and fit u32"))
-}
-
-fn positive_usize_or(flat: &FlatConfig, key: &'static str, default: usize) -> Result<usize, CommonError> {
-    if !flat.contains_key(key) {
-        return Ok(default);
-    }
-    let value = flat
-        .get_i64(key)
-        .ok_or_else(|| invalid_config(key, "must be an integer"))?;
-    usize::try_from(value)
-        .ok()
-        .filter(|value| *value != 0)
-        .ok_or_else(|| invalid_config(key, "must be greater than zero"))
-}
-
-fn duration_ms_or(flat: &FlatConfig, key: &'static str, default: u64) -> Result<u64, CommonError> {
-    if !flat.contains_key(key) {
-        return Ok(default);
-    }
-    let duration = flat
-        .get_duration(key)
-        .filter(|duration| !duration.is_zero())
-        .ok_or_else(|| invalid_config(key, "must be a positive duration"))?;
-    u64::try_from(duration.as_millis()).map_err(|_| invalid_config(key, "is too large"))
-}
-
-fn bytes_u32_or(flat: &FlatConfig, key: &'static str, default: u32) -> Result<u32, CommonError> {
-    if !flat.contains_key(key) {
-        return Ok(default);
-    }
-    let bytes = flat
-        .get_bytes(key)
-        .ok_or_else(|| invalid_config(key, "must be a size such as 1MiB"))?;
-    u32::try_from(bytes).map_err(|_| invalid_config(key, "is too large"))
-}
-
 fn invalid_config(key: &'static str, detail: &'static str) -> CommonError {
     CommonError::new(CommonErrorKind::InvalidArgument, format!("{key} {detail}"))
-}
-
-fn validate_public_host(key: &'static str, host: &str) -> Result<(), CommonError> {
-    if host.is_empty() || host != host.trim() || host.chars().any(char::is_whitespace) {
-        return Err(invalid_config(key, "must be a host or IP without whitespace"));
-    }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return if ip.is_unspecified() {
-            Err(invalid_config(key, "must be a routable host or IP"))
-        } else {
-            Ok(())
-        };
-    }
-    if host.contains("://") || host.contains([':', '/', '\\']) {
-        return Err(invalid_config(key, "must not include a scheme, port, or path"));
-    }
-    Ok(())
-}
-
-fn format_host_port(host: &str, port: u16) -> String {
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V6(_)) => format!("[{host}]:{port}"),
-        _ => format!("{host}:{port}"),
-    }
 }
 
 #[cfg(test)]
