@@ -155,6 +155,98 @@ impl FlatConfig {
         self.data.get(key).and_then(Value::as_mapping)
     }
 
+    /// Get a string value or return the provided default when the key is absent.
+    pub fn string_or(&self, key: &str, default: &str) -> Result<String, CommonError> {
+        if !self.contains_key(key) {
+            return Ok(default.to_string());
+        }
+        self.get_str(key).ok_or_else(|| invalid_config(key, "must be a string"))
+    }
+
+    /// Get a boolean value or return the provided default when the key is absent.
+    pub fn bool_or(&self, key: &str, default: bool) -> Result<bool, CommonError> {
+        if !self.contains_key(key) {
+            return Ok(default);
+        }
+        self.get_bool(key)
+            .ok_or_else(|| invalid_config(key, "must be a boolean"))
+    }
+
+    /// Get a non-zero TCP/UDP port or return the provided default when the key is absent.
+    pub fn port_or(&self, key: &str, default: u16) -> Result<u16, CommonError> {
+        if !self.contains_key(key) {
+            return Ok(default);
+        }
+        let value = self
+            .get_i64(key)
+            .ok_or_else(|| invalid_config(key, "must be an integer"))?;
+        u16::try_from(value)
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| invalid_config(key, "must be in range 1-65535"))
+    }
+
+    /// Get a positive u32 value or return the provided default when the key is absent.
+    pub fn positive_u32_or(&self, key: &str, default: u32) -> Result<u32, CommonError> {
+        if !self.contains_key(key) {
+            return Ok(default);
+        }
+        let value = self
+            .get_i64(key)
+            .ok_or_else(|| invalid_config(key, "must be an integer"))?;
+        u32::try_from(value)
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or_else(|| invalid_config(key, "must be greater than zero and fit u32"))
+    }
+
+    /// Get a positive usize value or return the provided default when the key is absent.
+    pub fn positive_usize_or(&self, key: &str, default: usize) -> Result<usize, CommonError> {
+        if !self.contains_key(key) {
+            return Ok(default);
+        }
+        let value = self
+            .get_i64(key)
+            .ok_or_else(|| invalid_config(key, "must be an integer"))?;
+        usize::try_from(value)
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or_else(|| invalid_config(key, "must be greater than zero"))
+    }
+
+    /// Get a positive duration in milliseconds or return the provided default when the key is absent.
+    pub fn duration_ms_or(&self, key: &str, default: u64) -> Result<u64, CommonError> {
+        if !self.contains_key(key) {
+            return Ok(default);
+        }
+        let duration = self
+            .get_duration(key)
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| invalid_config(key, "must be a positive duration"))?;
+        u64::try_from(duration.as_millis()).map_err(|_| invalid_config(key, "is too large"))
+    }
+
+    /// Get a byte size that fits u32 or return the provided default when the key is absent.
+    pub fn bytes_u32_or(&self, key: &str, default: u32) -> Result<u32, CommonError> {
+        if !self.contains_key(key) {
+            return Ok(default);
+        }
+        let bytes = self
+            .get_bytes(key)
+            .ok_or_else(|| invalid_config(key, "must be a size such as 1MiB"))?;
+        u32::try_from(bytes).map_err(|_| invalid_config(key, "is too large"))
+    }
+
+    /// Get a byte size that fits u64 or return the provided default when the key is absent.
+    pub fn bytes_u64_or(&self, key: &str, default: u64) -> Result<u64, CommonError> {
+        if !self.contains_key(key) {
+            return Ok(default);
+        }
+        self.get_bytes(key)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| invalid_config(key, "must be a size such as 1GiB"))
+    }
+
     /// Get a sub-configuration with the given prefix.
     ///
     /// Returns a new FlatConfig containing only keys that start with `prefix.`.
@@ -228,17 +320,10 @@ impl FlatConfig {
     pub fn contains_key(&self, key: &str) -> bool {
         self.data.contains_key(key)
     }
+}
 
-    /// Rejects the first key not owned by the typed configuration consumer.
-    pub fn ensure_only_known_keys(&self, known_keys: &[&str]) -> Result<(), CommonError> {
-        if let Some(key) = self.data.keys().find(|key| !known_keys.contains(&key.as_str())) {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!("unknown config key: {key}"),
-            ));
-        }
-        Ok(())
-    }
+fn invalid_config(key: &str, detail: &str) -> CommonError {
+    CommonError::new(CommonErrorKind::InvalidArgument, format!("{key} {detail}"))
 }
 
 fn parse_duration(value: &Value) -> Option<Duration> {
@@ -356,5 +441,51 @@ mod tests {
         assert_eq!(redacted.get_str("password"), Some("***".to_string()));
         assert_eq!(redacted.get_str("api_key"), Some("***".to_string()));
         assert_eq!(redacted.get_str("normal_name"), Some("value".to_string()));
+    }
+
+    #[test]
+    fn typed_values_use_defaults_and_parse_supported_units() {
+        let mut config = FlatConfig::new();
+        config.set("string", "value");
+        config.set("bool", "yes");
+        config.set("port", 19090i64);
+        config.set("u32", 10i64);
+        config.set("usize", 20i64);
+        config.set("duration", "2s");
+        config.set("bytes-u32", "1MiB");
+        config.set("bytes-u64", "1GiB");
+
+        assert_eq!(config.string_or("string", "default").unwrap(), "value");
+        assert!(config.bool_or("bool", false).unwrap());
+        assert_eq!(config.port_or("port", 1).unwrap(), 19090);
+        assert_eq!(config.positive_u32_or("u32", 1).unwrap(), 10);
+        assert_eq!(config.positive_usize_or("usize", 1).unwrap(), 20);
+        assert_eq!(config.duration_ms_or("duration", 1).unwrap(), 2_000);
+        assert_eq!(config.bytes_u32_or("bytes-u32", 1).unwrap(), 1024 * 1024);
+        assert_eq!(config.bytes_u64_or("bytes-u64", 1).unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(config.string_or("missing", "default").unwrap(), "default");
+    }
+
+    #[test]
+    fn typed_values_reject_invalid_and_non_positive_input() {
+        let mut config = FlatConfig::new();
+        config.set("bool", "sometimes");
+        config.set("port", 0i64);
+        config.set("u32", -1i64);
+        config.set("usize", 0i64);
+        config.set("duration", "0s");
+        config.set("bytes", "large");
+
+        for result in [
+            config.bool_or("bool", true).map(|_| ()),
+            config.port_or("port", 1).map(|_| ()),
+            config.positive_u32_or("u32", 1).map(|_| ()),
+            config.positive_usize_or("usize", 1).map(|_| ()),
+            config.duration_ms_or("duration", 1).map(|_| ()),
+            config.bytes_u32_or("bytes", 1).map(|_| ()),
+            config.bytes_u64_or("bytes", 1).map(|_| ()),
+        ] {
+            assert_eq!(result.unwrap_err().kind, CommonErrorKind::InvalidArgument);
+        }
     }
 }

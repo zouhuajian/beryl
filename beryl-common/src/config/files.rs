@@ -58,19 +58,3 @@ fn flat_mapping(value: Value) -> Result<BTreeMap<String, Value>, CommonError> {
 
     Ok(result)
 }
-
-/// Load configuration from defaults and an optional YAML file.
-///
-/// Sources are merged in order (later sources override earlier ones):
-/// 1. Default values
-/// 2. YAML file (if provided)
-pub fn load_merged(default: FlatConfig, yaml_path: Option<&Path>) -> Result<FlatConfig, CommonError> {
-    let mut config = default;
-
-    if let Some(path) = yaml_path {
-        let file_config = load_from_yaml_file(path)?;
-        config.merge(file_config);
-    }
-
-    Ok(config)
-}

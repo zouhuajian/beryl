@@ -3,7 +3,8 @@
 
 //! Client configuration loading and validation.
 
-use beryl_common::{ClientConfig as CommonClientConfig, CommonError, FlatConfig};
+use beryl_common::config::load_from_yaml_file;
+use beryl_common::{CommonError, FlatConfig};
 use beryl_types::GroupName;
 use std::path::Path;
 
@@ -15,8 +16,8 @@ pub const DEFAULT_WORKER_ENDPOINT_COOLDOWN_MS: u64 = 1_000;
 /// Client-specific configuration.
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
-    /// Underlying common client config.
-    pub inner: CommonClientConfig,
+    /// Underlying flat configuration.
+    pub inner: FlatConfig,
     /// Low-cardinality display identity carried in request headers.
     pub client_name: String,
     /// Retry configuration.
@@ -118,13 +119,7 @@ impl Default for ClientConfig {
 impl ClientConfig {
     /// Load client configuration from a file.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, CommonError> {
-        let common_config = CommonClientConfig::load(path)?;
-        Self::from_common_config(common_config)
-    }
-
-    /// Create from CommonClientConfig.
-    pub fn from_common_config(common_config: CommonClientConfig) -> Result<Self, CommonError> {
-        Self::from_flat(common_config.inner.clone())
+        Self::from_flat(load_from_yaml_file(path)?)
     }
 
     /// Create from FlatConfig.
@@ -137,7 +132,7 @@ impl ClientConfig {
         let metadata_groups = parse_metadata_endpoints(&flat)?;
 
         Ok(Self {
-            inner: CommonClientConfig::from_flat(flat),
+            inner: flat,
             client_name,
             retry,
             write_lease,
@@ -146,8 +141,8 @@ impl ClientConfig {
         })
     }
 
-    /// Get the underlying CommonClientConfig.
-    pub fn as_common(&self) -> &CommonClientConfig {
+    /// Get the underlying flat configuration.
+    pub fn as_flat(&self) -> &FlatConfig {
         &self.inner
     }
 
@@ -159,12 +154,7 @@ impl ClientConfig {
 
 fn client_name_from_flat(flat: &FlatConfig) -> Result<String, CommonError> {
     const KEY: &str = "beryl.client.name";
-    if !flat.contains_key(KEY) {
-        return Ok(DEFAULT_CLIENT_NAME.to_string());
-    }
-    let name = flat
-        .get_str(KEY)
-        .ok_or_else(|| invalid_config(KEY, "must be a string"))?;
+    let name = flat.string_or(KEY, DEFAULT_CLIENT_NAME)?;
     if name.trim().is_empty() {
         return Err(invalid_config(KEY, "must not be blank"));
     }
@@ -174,46 +164,19 @@ fn client_name_from_flat(flat: &FlatConfig) -> Result<String, CommonError> {
 fn connection_config_from_flat(flat: &FlatConfig) -> Result<ConnectionConfig, CommonError> {
     let defaults = ConnectionConfig::default();
     let config = ConnectionConfig {
-        metadata_enabled: get_bool_or(
-            flat,
-            "beryl.client.metadata.connections.enabled",
-            defaults.metadata_enabled,
-        )?,
-        metadata_max_per_group: get_usize_or_strict(
-            flat,
-            "beryl.client.metadata.connections.max",
-            defaults.metadata_max_per_group,
-        )?,
-        worker_enabled: get_bool_or(flat, "beryl.client.worker.connections.enabled", defaults.worker_enabled)?,
-        worker_max_per_worker: get_usize_or_strict(
-            flat,
+        metadata_enabled: flat.bool_or("beryl.client.metadata.connections.enabled", defaults.metadata_enabled)?,
+        metadata_max_per_group: flat
+            .positive_usize_or("beryl.client.metadata.connections.max", defaults.metadata_max_per_group)?,
+        worker_enabled: flat.bool_or("beryl.client.worker.connections.enabled", defaults.worker_enabled)?,
+        worker_max_per_worker: flat.positive_usize_or(
             "beryl.client.worker.connections.max-per-worker",
             defaults.worker_max_per_worker,
         )?,
-        worker_failure_cooldown_ms: get_duration_ms_or(
-            flat,
+        worker_failure_cooldown_ms: flat.duration_ms_or(
             "beryl.client.worker.connections.failure-cooldown",
             defaults.worker_failure_cooldown_ms,
         )?,
     };
-    if config.metadata_max_per_group == 0 {
-        return Err(invalid_config(
-            "beryl.client.metadata.connections.max",
-            "must be greater than zero",
-        ));
-    }
-    if config.worker_max_per_worker == 0 {
-        return Err(invalid_config(
-            "beryl.client.worker.connections.max-per-worker",
-            "must be greater than zero",
-        ));
-    }
-    if config.worker_failure_cooldown_ms == 0 {
-        return Err(invalid_config(
-            "beryl.client.worker.connections.failure-cooldown",
-            "must be greater than zero",
-        ));
-    }
     Ok(config)
 }
 
@@ -236,20 +199,8 @@ fn parse_metadata_endpoints(flat: &FlatConfig) -> Result<Vec<MetadataGroupConfig
 
 fn retry_config_from_flat(flat: &FlatConfig) -> Result<RetryConfig, CommonError> {
     let defaults = RetryConfig::default();
-    let max_attempts = get_usize_or_strict(flat, "beryl.client.request.max-attempts", defaults.max_attempts)?;
-    if max_attempts == 0 {
-        return Err(invalid_config(
-            "beryl.client.request.max-attempts",
-            "must be greater than zero",
-        ));
-    }
-    let operation_timeout_ms = get_duration_ms_or(flat, "beryl.client.request.timeout", defaults.operation_timeout_ms)?;
-    if operation_timeout_ms == 0 {
-        return Err(invalid_config(
-            "beryl.client.request.timeout",
-            "must be greater than zero",
-        ));
-    }
+    let max_attempts = flat.positive_usize_or("beryl.client.request.max-attempts", defaults.max_attempts)?;
+    let operation_timeout_ms = flat.duration_ms_or("beryl.client.request.timeout", defaults.operation_timeout_ms)?;
     Ok(RetryConfig {
         max_attempts,
         operation_timeout_ms,
@@ -259,55 +210,13 @@ fn retry_config_from_flat(flat: &FlatConfig) -> Result<RetryConfig, CommonError>
 fn write_lease_config_from_flat(flat: &FlatConfig) -> Result<WriteLeaseConfig, CommonError> {
     let defaults = WriteLeaseConfig::default();
     let config = WriteLeaseConfig {
-        auto_renew: get_bool_or(flat, "beryl.client.write-lease.auto-renew", defaults.auto_renew)?,
-        renew_before_expiry_ms: get_duration_ms_or(
-            flat,
+        auto_renew: flat.bool_or("beryl.client.write-lease.auto-renew", defaults.auto_renew)?,
+        renew_before_expiry_ms: flat.duration_ms_or(
             "beryl.client.write-lease.renew-before-expiry",
             defaults.renew_before_expiry_ms,
         )?,
     };
-    if config.renew_before_expiry_ms == 0 {
-        return Err(invalid_config(
-            "beryl.client.write-lease.renew-before-expiry",
-            "must be greater than zero",
-        ));
-    }
     Ok(config)
-}
-
-fn get_usize_or_strict(flat: &FlatConfig, key: &'static str, default: usize) -> Result<usize, CommonError> {
-    match get_i64_or_strict(flat, key)? {
-        Some(value) if value >= 0 => Ok(value as usize),
-        Some(_) => Err(invalid_config(key, "must be non-negative")),
-        None => Ok(default),
-    }
-}
-
-fn get_duration_ms_or(flat: &FlatConfig, key: &'static str, default: u64) -> Result<u64, CommonError> {
-    if !flat.contains_key(key) {
-        return Ok(default);
-    }
-    let duration = flat
-        .get_duration(key)
-        .ok_or_else(|| invalid_config(key, "must be a duration such as 500ms or 30s"))?;
-    u64::try_from(duration.as_millis()).map_err(|_| invalid_config(key, "is too large"))
-}
-
-fn get_i64_or_strict(flat: &FlatConfig, key: &'static str) -> Result<Option<i64>, CommonError> {
-    if !flat.contains_key(key) {
-        return Ok(None);
-    }
-    flat.get_i64(key)
-        .map(Some)
-        .ok_or_else(|| invalid_config(key, "must be an integer"))
-}
-
-fn get_bool_or(flat: &FlatConfig, key: &'static str, default: bool) -> Result<bool, CommonError> {
-    if !flat.contains_key(key) {
-        return Ok(default);
-    }
-    flat.get_bool(key)
-        .ok_or_else(|| invalid_config(key, "must be a boolean"))
 }
 
 fn invalid_config(key: &'static str, detail: impl Into<String>) -> CommonError {
