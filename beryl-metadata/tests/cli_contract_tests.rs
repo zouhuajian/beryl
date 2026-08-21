@@ -7,7 +7,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 #[test]
-fn validate_conf_reads_configuration_without_touching_metadata_storage() {
+fn validate_conf_ignores_unrecognized_keys_without_touching_metadata_storage() {
     let temp = TempDir::new().unwrap();
     let storage_dir = temp.path().join("must-not-exist");
     let config_path = temp.path().join("metadata.yaml");
@@ -19,6 +19,7 @@ beryl.metadata.storage.dir: "{}"
 beryl.logging.format: compact
 beryl.logging.output: stderr
 beryl.logging.level: warn
+beryl.future.metadata-option: ignored
 "#,
             storage_dir.display()
         ),

@@ -7,7 +7,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 #[test]
-fn validate_conf_does_not_create_identity_or_storage_or_contact_metadata() {
+fn validate_conf_ignores_unrecognized_keys_without_external_side_effects() {
     let temp = TempDir::new().unwrap();
     let identity_file = temp.path().join("identity").join("worker.identity");
     let storage_dir = temp.path().join("storage").join("hdd0");
@@ -22,11 +22,13 @@ beryl.worker.storage.dirs:
     path: "{}"
     tier: hdd
     capacity: 10GiB
+    future-option: ignored
 beryl.worker.metadata.addresses:
   - "203.0.113.1:1"
 beryl.logging.format: compact
 beryl.logging.output: stderr
 beryl.logging.level: warn
+beryl.future.worker-option: ignored
 "#,
             identity_file.display(),
             storage_dir.display()

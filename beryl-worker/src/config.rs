@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use beryl_common::config::{format_host_port, keys::logging, load_from_yaml_file, validate_public_host, FlatConfig};
+use beryl_common::config::{format_host_port, load_from_yaml_file, validate_public_host, FlatConfig};
 use beryl_common::error::{CommonError, CommonErrorKind};
 use beryl_common::observe::config::{LogConfig, ResourceConfig};
 use beryl_common::observe::ObservabilityConfig;
@@ -45,38 +45,6 @@ const BLOCK_CLEANUP_CONCURRENCY: &str = "beryl.worker.block.cleanup.concurrency"
 const BLOCK_CLEANUP_RETRY_INITIAL_BACKOFF: &str = "beryl.worker.block.cleanup.retry.initial-backoff";
 const BLOCK_CLEANUP_RETRY_MAX_BACKOFF: &str = "beryl.worker.block.cleanup.retry.max-backoff";
 const SHUTDOWN_TIMEOUT: &str = "beryl.worker.shutdown.timeout";
-
-/// Complete public key set consumed by one Worker configuration file.
-const KNOWN_KEYS: &[&str] = &[
-    CLUSTER_ID,
-    HOST,
-    BIND_HOST,
-    RPC_PORT,
-    HTTP_PORT,
-    IDENTITY_FILE,
-    RPC_MAX_CONCURRENT_READ_REQUESTS,
-    RPC_MAX_CONCURRENT_WRITE_REQUESTS,
-    STREAM_FRAME_SIZE,
-    STREAM_MAX_FRAME_SIZE,
-    STORAGE_DIRS,
-    STORAGE_RESERVED_SPACE,
-    STORAGE_CHECK_INTERVAL,
-    METADATA_ADDRESSES,
-    METADATA_REQUEST_TIMEOUT,
-    METADATA_RETRY_INITIAL_BACKOFF,
-    METADATA_RETRY_MAX_BACKOFF,
-    HEARTBEAT_INTERVAL,
-    BLOCK_REPORT_INTERVAL,
-    BLOCK_REPORT_BATCH_SIZE,
-    BLOCK_CLEANUP_QUEUE_CAPACITY,
-    BLOCK_CLEANUP_CONCURRENCY,
-    BLOCK_CLEANUP_RETRY_INITIAL_BACKOFF,
-    BLOCK_CLEANUP_RETRY_MAX_BACKOFF,
-    SHUTDOWN_TIMEOUT,
-    logging::FORMAT,
-    logging::OUTPUT,
-    logging::LEVEL,
-];
 
 /// Worker-to-Metadata request and retry configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -247,7 +215,6 @@ impl WorkerConfig {
     /// Build typed Worker configuration from shared YAML mechanics.
     pub fn from_flat(flat: FlatConfig) -> Result<Self, CommonError> {
         let flat = &flat;
-        flat.ensure_only_known_keys(KNOWN_KEYS)?;
         let defaults = Self::default();
 
         let cluster_id = flat.string_or(CLUSTER_ID, &defaults.cluster_id)?;
@@ -446,7 +413,7 @@ fn parse_store_config(flat: &FlatConfig, defaults: &WorkerStoreConfig) -> Result
     })
 }
 
-/// Parses each configured storage directory and rejects fields the Worker does not consume.
+/// Parses each configured storage directory while ignoring unrecognized string fields.
 fn parse_store_dirs(mapping: &Mapping) -> Result<BTreeMap<String, StoreDirConfig>, CommonError> {
     if mapping.is_empty() {
         return Err(invalid_config(STORAGE_DIRS, "must not be empty"));
@@ -461,16 +428,10 @@ fn parse_store_dirs(mapping: &Mapping) -> Result<BTreeMap<String, StoreDirConfig
             .as_mapping()
             .ok_or_else(|| invalid_config(STORAGE_DIRS, "entries must be mappings"))?;
         for field in fields.keys() {
-            let Some(field_name) = field.as_str() else {
+            if field.as_str().is_none() {
                 return Err(CommonError::new(
                     CommonErrorKind::InvalidArgument,
-                    format!("unknown config key under {STORAGE_DIRS}.{id}: {field:?}; field names must be strings"),
-                ));
-            };
-            if !matches!(field_name, "path" | "tier" | "capacity") {
-                return Err(CommonError::new(
-                    CommonErrorKind::InvalidArgument,
-                    format!("unknown config key: {STORAGE_DIRS}.{id}.{field_name}"),
+                    format!("config key under {STORAGE_DIRS}.{id} must be a string: {field:?}"),
                 ));
             }
         }

@@ -320,17 +320,6 @@ impl FlatConfig {
     pub fn contains_key(&self, key: &str) -> bool {
         self.data.contains_key(key)
     }
-
-    /// Rejects the first key not owned by the typed configuration consumer.
-    pub fn ensure_only_known_keys(&self, known_keys: &[&str]) -> Result<(), CommonError> {
-        if let Some(key) = self.data.keys().find(|key| !known_keys.contains(&key.as_str())) {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!("unknown config key: {key}"),
-            ));
-        }
-        Ok(())
-    }
 }
 
 fn invalid_config(key: &str, detail: &str) -> CommonError {
