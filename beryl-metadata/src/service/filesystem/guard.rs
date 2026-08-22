@@ -44,58 +44,45 @@ impl AdmissionFailure {
 
 #[derive(Clone)]
 pub struct AdmissionGuard {
-    readiness: ReadinessGuard,
-    leadership: LeadershipGuard,
-    data_io: DataIoPolicyGuard,
+    readiness_gate: Option<Arc<RootReadinessGate>>,
+    raft_node: Option<Arc<AppRaftNode>>,
+    mount_table: Arc<MountTable>,
 }
 
 impl AdmissionGuard {
-    pub fn new(mount_table: Arc<MountTable>) -> Self {
+    pub fn new(
+        mount_table: Arc<MountTable>,
+        readiness_gate: Option<Arc<RootReadinessGate>>,
+        raft_node: Option<Arc<AppRaftNode>>,
+    ) -> Self {
         Self {
-            readiness: ReadinessGuard { readiness_gate: None },
-            leadership: LeadershipGuard { raft_node: None },
-            data_io: DataIoPolicyGuard { mount_table },
+            readiness_gate,
+            raft_node,
+            mount_table,
         }
     }
 
-    pub(crate) fn with_readiness_gate(mut self, gate: Option<Arc<RootReadinessGate>>) -> Self {
-        self.readiness.readiness_gate = gate;
-        self
+    pub fn check_meta_read(&self) -> Result<(), AdmissionFailure> {
+        self.check_readiness()
     }
 
-    pub(crate) fn with_raft_node(mut self, raft_node: Option<Arc<AppRaftNode>>) -> Self {
-        self.leadership.raft_node = raft_node;
-        self
+    pub fn check_meta_write(&self, ctx: &RequestContext) -> Result<(), AdmissionFailure> {
+        self.check_readiness()?;
+        self.check_leadership(ctx)
     }
 
-    pub async fn check_meta_read(&self, _ctx: &RequestContext) -> Result<(), AdmissionFailure> {
-        self.readiness.check()
+    pub fn check_data_read(&self, mount_id: MountId) -> Result<(), AdmissionFailure> {
+        self.check_readiness()?;
+        self.check_data_io_policy(mount_id, DataIoOp::Read)
     }
 
-    pub async fn check_meta_write(&self, ctx: &RequestContext) -> Result<(), AdmissionFailure> {
-        self.readiness.check()?;
-        self.leadership.check(ctx)
+    pub fn check_data_write(&self, ctx: &RequestContext, mount_id: MountId) -> Result<(), AdmissionFailure> {
+        self.check_readiness()?;
+        self.check_leadership(ctx)?;
+        self.check_data_io_policy(mount_id, DataIoOp::Write)
     }
 
-    pub async fn check_data_read(&self, _ctx: &RequestContext, mount_id: MountId) -> Result<(), AdmissionFailure> {
-        self.readiness.check()?;
-        self.data_io.check(mount_id, DataIoOp::Read)
-    }
-
-    pub async fn check_data_write(&self, ctx: &RequestContext, mount_id: MountId) -> Result<(), AdmissionFailure> {
-        self.readiness.check()?;
-        self.leadership.check(ctx)?;
-        self.data_io.check(mount_id, DataIoOp::Write)
-    }
-}
-
-#[derive(Clone)]
-struct ReadinessGuard {
-    readiness_gate: Option<Arc<RootReadinessGate>>,
-}
-
-impl ReadinessGuard {
-    fn check(&self) -> Result<(), AdmissionFailure> {
+    fn check_readiness(&self) -> Result<(), AdmissionFailure> {
         let Some(gate) = self.readiness_gate.as_ref() else {
             return Ok(());
         };
@@ -106,15 +93,8 @@ impl ReadinessGuard {
             MetadataError::ServiceUnavailable("root mount not ready".to_string()),
         ))
     }
-}
 
-#[derive(Clone)]
-struct LeadershipGuard {
-    raft_node: Option<Arc<AppRaftNode>>,
-}
-
-impl LeadershipGuard {
-    fn check(&self, ctx: &RequestContext) -> Result<(), AdmissionFailure> {
+    fn check_leadership(&self, ctx: &RequestContext) -> Result<(), AdmissionFailure> {
         let Some(raft_node) = self.raft_node.as_ref() else {
             return Err(AdmissionFailure::from_rpc_metadata_error(
                 MetadataError::ServiceUnavailable("raft node not available".to_string()),
@@ -135,22 +115,8 @@ impl LeadershipGuard {
             )))
         }
     }
-}
 
-fn leader_endpoint(raft_node: &AppRaftNode) -> Option<String> {
-    let leader_id = raft_node.get_leader_id()?;
-    let membership = raft_node.get_membership()?;
-    let leader_node = membership.nodes().find(|(node_id, _)| **node_id == leader_id)?.1;
-    Some(leader_node.address.clone())
-}
-
-#[derive(Clone)]
-struct DataIoPolicyGuard {
-    mount_table: Arc<MountTable>,
-}
-
-impl DataIoPolicyGuard {
-    fn check(&self, mount_id: MountId, op: DataIoOp) -> Result<(), AdmissionFailure> {
+    fn check_data_io_policy(&self, mount_id: MountId, op: DataIoOp) -> Result<(), AdmissionFailure> {
         let mount_entry = self
             .mount_table
             .get_mount(mount_id)
@@ -179,6 +145,13 @@ impl DataIoPolicyGuard {
             Some(mount_entry.mount_epoch),
         ))
     }
+}
+
+fn leader_endpoint(raft_node: &AppRaftNode) -> Option<String> {
+    let leader_id = raft_node.get_leader_id()?;
+    let membership = raft_node.get_membership()?;
+    let leader_node = membership.nodes().find(|(node_id, _)| **node_id == leader_id)?.1;
+    Some(leader_node.address.clone())
 }
 
 #[derive(Clone)]
@@ -365,9 +338,9 @@ mod tests {
         async fn readiness_guard_blocks_when_not_ready() {
             let mount_table = Arc::new(MountTable::new());
             let gate = Arc::new(RootReadinessGate::new(None));
-            let chain = AdmissionGuard::new(mount_table).with_readiness_gate(Some(Arc::clone(&gate)));
+            let chain = AdmissionGuard::new(mount_table, Some(Arc::clone(&gate)), None);
 
-            let err = chain.check_meta_read(&request_context(1)).await.unwrap_err();
+            let err = chain.check_meta_read().unwrap_err();
             assert_eq!(err.err.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
             assert_eq!(err.err.recovery, RecoveryAction::Retry { after_ms: Some(1000) });
             assert!(!gate.is_ready());
@@ -386,9 +359,9 @@ mod tests {
                     .unwrap(),
             );
             assert!(!raft_node.is_leader());
-            let chain = AdmissionGuard::new(mount_table).with_raft_node(Some(raft_node));
+            let chain = AdmissionGuard::new(mount_table, None, Some(raft_node));
 
-            let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
+            let err = chain.check_meta_write(&request_context(2)).unwrap_err();
 
             assert_eq!(err.err.kind, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
             assert!(matches!(err.err.recovery, RecoveryAction::RefreshMetadata { .. }));

@@ -63,7 +63,7 @@ pub(crate) struct RenewLeaseArgs {
 
 impl MetadataFileSystem {
     pub(crate) async fn add_block(&self, ctx: &RequestContext, args: AddBlockArgs) -> FsResult<AddBlockOutput> {
-        if let Some(failure) = self.session_write_admission_failure(ctx, args.handle.inode_id).await {
+        if let Some(failure) = self.session_write_admission_failure(ctx, args.handle.inode_id) {
             return self.failure_from_admission(failure);
         }
         let handle = args.handle;
@@ -116,7 +116,7 @@ impl MetadataFileSystem {
     }
 
     pub(crate) async fn abort_file_write(&self, ctx: &RequestContext, args: AbortFileWriteArgs) -> FsResult<()> {
-        if let Some(failure) = self.session_write_admission_failure(ctx, args.handle.inode_id).await {
+        if let Some(failure) = self.session_write_admission_failure(ctx, args.handle.inode_id) {
             return self.failure_from_admission(failure);
         }
         let handle = args.handle;
@@ -159,7 +159,7 @@ impl MetadataFileSystem {
     /// The shared topology guard keeps ownership validation and every session
     /// expiry index update within one namespace admission interval.
     pub(crate) async fn renew_lease(&self, ctx: &RequestContext, args: RenewLeaseArgs) -> FsResult<RenewLeaseOutput> {
-        if let Some(failure) = self.session_write_admission_failure(ctx, args.handle.inode_id).await {
+        if let Some(failure) = self.session_write_admission_failure(ctx, args.handle.inode_id) {
             return self.failure_from_admission(failure);
         }
         let _topology_guard = self.namespace_topology.read().await;
@@ -199,15 +199,15 @@ impl MetadataFileSystem {
     }
 
     /// Resolve data-write admission from lightweight session identity only.
-    pub(super) async fn session_write_admission_failure(
+    pub(super) fn session_write_admission_failure(
         &self,
         ctx: &RequestContext,
         inode_id: InodeId,
     ) -> Option<AdmissionFailure> {
         if let Some(session) = self.session_registry.get_session_identity(inode_id) {
-            self.admission.check_data_write(ctx, session.mount_id).await.err()
+            self.admission.check_data_write(ctx, session.mount_id).err()
         } else {
-            self.admission.check_meta_write(ctx).await.err()
+            self.admission.check_meta_write(ctx).err()
         }
     }
 }
@@ -222,7 +222,7 @@ impl MetadataFileSystem {
     ) -> FsResult<()> {
         let session = match self.session_registry.get_session_identity(inode_id) {
             Some(session) => session,
-            None => return self.success(ctx, (), None, None),
+            None => return self.success((), None, None),
         };
         if session.open_client_id != ctx.caller.client.client_id {
             return self.session_terminal_failure(
@@ -288,7 +288,7 @@ impl MetadataFileSystem {
         }
         self.session_registry.remove_session_if_epoch(inode_id, lease_epoch);
 
-        self.success_with_route_epoch(ctx, (), group_name, mount_epoch, route_epoch)
+        self.success_with_route_epoch((), group_name, mount_epoch, route_epoch)
     }
 
     async fn renew_session(
@@ -368,17 +368,11 @@ impl MetadataFileSystem {
                 }
             };
 
-        let route_epoch = match self.authoritative_route_epoch().await {
+        let route_epoch = match self.freshness_validator.authoritative_route_epoch().await {
             Ok(route_epoch) => Some(route_epoch),
             Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
         };
-        self.success_with_route_epoch(
-            ctx,
-            RenewLeaseOutput { expires_at_ms },
-            group_name,
-            mount_epoch,
-            route_epoch,
-        )
+        self.success_with_route_epoch(RenewLeaseOutput { expires_at_ms }, group_name, mount_epoch, route_epoch)
     }
 
     /// Install an opening, persist its fencing epoch, and atomically activate it.
@@ -587,7 +581,7 @@ impl MetadataFileSystem {
             }
         };
 
-        self.success_with_route_epoch(ctx, open_write_output(&session), group_name, mount_epoch, route_epoch)
+        self.success_with_route_epoch(open_write_output(&session), group_name, mount_epoch, route_epoch)
     }
 
     /// Replay an issued target or reserve leader-local capacity before Raft allocation.
@@ -665,13 +659,7 @@ impl MetadataFileSystem {
             .begin_add_block(inode_id, lease_epoch, previous_block_id)
         {
             Ok(BeginAddBlock::Replay(target)) => {
-                return self.success_with_route_epoch(
-                    ctx,
-                    AddBlockOutput { target },
-                    group_name,
-                    mount_epoch,
-                    route_epoch,
-                )
+                return self.success_with_route_epoch(AddBlockOutput { target }, group_name, mount_epoch, route_epoch)
             }
             Ok(BeginAddBlock::Reserved(reservation)) => reservation,
             Err(BeginAddBlockError::Session(message)) => {
@@ -851,7 +839,7 @@ impl MetadataFileSystem {
                 )
             }
         };
-        self.success_with_route_epoch(ctx, AddBlockOutput { target }, group_name, mount_epoch, route_epoch)
+        self.success_with_route_epoch(AddBlockOutput { target }, group_name, mount_epoch, route_epoch)
     }
 }
 
@@ -915,7 +903,7 @@ impl MetadataFileSystem {
     /// The shared guard spans resolution, Raft fencing-epoch acquisition, session
     /// creation, and the final topology safety predicate.
     async fn open_write_inner(&self, ctx: &RequestContext, args: OpenWriteArgs) -> FsResult<OpenWriteOutput> {
-        if let Err(failure) = self.admission.check_meta_write(ctx).await {
+        if let Err(failure) = self.admission.check_meta_write(ctx) {
             return self.failure_from_admission(failure);
         }
         let _topology_guard = self.namespace_topology.read().await;
@@ -934,7 +922,7 @@ impl MetadataFileSystem {
                 Some(&resolved.mount_ctx),
             );
         };
-        if let Err(failure) = self.admission.check_data_write(ctx, resolved.mount_ctx.mount_id).await {
+        if let Err(failure) = self.admission.check_data_write(ctx, resolved.mount_ctx.mount_id) {
             return self.failure_from_admission(failure);
         }
         let opened = self

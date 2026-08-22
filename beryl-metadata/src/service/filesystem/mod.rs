@@ -203,9 +203,11 @@ pub(crate) struct MetadataFileSystem {
 impl MetadataFileSystem {
     pub(crate) fn new(deps: MetadataFileSystemDeps) -> Self {
         let path_resolver = PathResolver::new(Arc::clone(&deps.mount_table), Arc::clone(&deps.storage));
-        let admission = AdmissionGuard::new(Arc::clone(&deps.mount_table))
-            .with_readiness_gate(deps.readiness_gate)
-            .with_raft_node(deps.raft_node.clone());
+        let admission = AdmissionGuard::new(
+            Arc::clone(&deps.mount_table),
+            deps.readiness_gate,
+            deps.raft_node.clone(),
+        );
         let freshness_validator = FreshnessValidator::new(Arc::clone(&deps.state_store), Arc::clone(&deps.mount_table));
 
         Self {
@@ -220,10 +222,6 @@ impl MetadataFileSystem {
             session_registry: deps.session_registry,
             worker_manager: deps.worker_manager,
         }
-    }
-
-    async fn authoritative_route_epoch(&self) -> MetadataResult<u64> {
-        self.freshness_validator.authoritative_route_epoch().await
     }
 
     fn response_state_for_success(&self, group_name: Option<&GroupName>) -> Vec<GroupStateWatermark> {
@@ -241,19 +239,12 @@ impl MetadataFileSystem {
             .collect()
     }
 
-    fn success<T>(
-        &self,
-        ctx: &RequestContext,
-        payload: T,
-        group_name: Option<GroupName>,
-        mount_epoch: Option<u64>,
-    ) -> FsResult<T> {
-        self.success_with_route_epoch(ctx, payload, group_name, mount_epoch, None)
+    fn success<T>(&self, payload: T, group_name: Option<GroupName>, mount_epoch: Option<u64>) -> FsResult<T> {
+        self.success_with_route_epoch(payload, group_name, mount_epoch, None)
     }
 
     fn success_with_route_epoch<T>(
         &self,
-        _ctx: &RequestContext,
         payload: T,
         group_name: Option<GroupName>,
         mount_epoch: Option<u64>,

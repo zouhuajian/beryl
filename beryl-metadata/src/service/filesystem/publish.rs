@@ -59,7 +59,7 @@ pub(crate) struct SyncWriteArgs {
 
 impl MetadataFileSystem {
     pub(crate) async fn commit_file(&self, ctx: &RequestContext, args: CommitFileArgs) -> FsResult<CloseWriteOutput> {
-        if let Some(failure) = self.session_write_admission_failure(ctx, args.handle.inode_id).await {
+        if let Some(failure) = self.session_write_admission_failure(ctx, args.handle.inode_id) {
             return self.failure_from_admission(failure);
         }
         let inode_id = args.handle.inode_id;
@@ -131,7 +131,7 @@ impl MetadataFileSystem {
     }
 
     pub(crate) async fn sync_write(&self, ctx: &RequestContext, args: SyncWriteArgs) -> FsResult<SyncWriteOutput> {
-        if let Some(failure) = self.session_write_admission_failure(ctx, args.handle.inode_id).await {
+        if let Some(failure) = self.session_write_admission_failure(ctx, args.handle.inode_id) {
             return self.failure_from_admission(failure);
         }
         let inode_id = args.handle.inode_id;
@@ -741,7 +741,7 @@ impl MetadataFileSystem {
         operation: &'static str,
     ) -> Result<crate::session_registry::WriteSession, FsFailure> {
         let expected = publication.session();
-        if let Some(failure) = self.session_write_admission_failure(ctx, expected.inode_id).await {
+        if let Some(failure) = self.session_write_admission_failure(ctx, expected.inode_id) {
             return Err(self
                 .failure_from_admission::<()>(failure)
                 .expect_err("failure_from_admission always returns Err"));
@@ -846,7 +846,6 @@ impl MetadataFileSystem {
                     }
                 }
                 return self.success_with_route_epoch(
-                    ctx,
                     SyncWriteOutput {
                         synced_size: intent.final_size,
                         content_revision: Some(content_revision),
@@ -951,7 +950,7 @@ impl MetadataFileSystem {
         let extents = match Self::validate_committed_blocks(&intent, &session) {
             Ok(extents) => extents,
             Err(err) => {
-                return Err(self.invalid_sync_write_failure(ctx, err.to_string(), group_name, mount_epoch));
+                return Err(self.invalid_publication_failure(ctx, err.to_string(), group_name, mount_epoch));
             }
         };
         if let Err(error) = self.validate_final_extent_count(session.inode_id, &extents, publish_mode) {
@@ -963,7 +962,7 @@ impl MetadataFileSystem {
             match self.publication_ready_targets(&session, &intent.committed_blocks, expected_content_revision) {
                 Ok(targets) => targets,
                 Err(err) => {
-                    return Err(self.invalid_sync_write_failure(ctx, err.to_string(), group_name, mount_epoch));
+                    return Err(self.invalid_publication_failure(ctx, err.to_string(), group_name, mount_epoch));
                 }
             };
         self.wait_for_publish_ready(ctx, &worker_lookup_group_name, mount_epoch, route_epoch, &new_targets)
@@ -1043,7 +1042,6 @@ impl MetadataFileSystem {
         }
 
         self.success_with_route_epoch(
-            ctx,
             SyncWriteOutput {
                 synced_size: intent.final_size,
                 content_revision: Some(content_revision),
@@ -1054,23 +1052,7 @@ impl MetadataFileSystem {
         )
     }
 
-    fn invalid_commit_failure(
-        &self,
-        ctx: &RequestContext,
-        message: impl Into<String>,
-        group_name: Option<GroupName>,
-        mount_epoch: Option<u64>,
-    ) -> FsFailure {
-        fs_failure_from_metadata_error(
-            ctx,
-            MetadataError::InvalidArgument(message.into()),
-            group_name,
-            mount_epoch,
-            None,
-        )
-    }
-
-    fn invalid_sync_write_failure(
+    fn invalid_publication_failure(
         &self,
         ctx: &RequestContext,
         message: impl Into<String>,
@@ -1337,7 +1319,6 @@ impl MetadataFileSystem {
                     }
                 }
                 return self.success_with_route_epoch(
-                    ctx,
                     CloseWriteOutput {
                         committed_size: intent.final_size,
                     },
@@ -1420,7 +1401,9 @@ impl MetadataFileSystem {
 
         let extents = match Self::validate_committed_blocks(&intent, &session) {
             Ok(extents) => extents,
-            Err(err) => return Err(self.invalid_commit_failure(ctx, err.to_string(), group_name.clone(), mount_epoch)),
+            Err(err) => {
+                return Err(self.invalid_publication_failure(ctx, err.to_string(), group_name.clone(), mount_epoch))
+            }
         };
         if let Err(error) = self.validate_final_extent_count(session.inode_id, &extents, publish_mode) {
             return self.failure_from_error_with_route_epoch(ctx, error, group_name, mount_epoch, route_epoch);
@@ -1431,7 +1414,12 @@ impl MetadataFileSystem {
             match self.publication_ready_targets(&session, &intent.committed_blocks, expected_content_revision) {
                 Ok(targets) => targets,
                 Err(err) => {
-                    return Err(self.invalid_commit_failure(ctx, err.to_string(), group_name.clone(), mount_epoch));
+                    return Err(self.invalid_publication_failure(
+                        ctx,
+                        err.to_string(),
+                        group_name.clone(),
+                        mount_epoch,
+                    ));
                 }
             };
         self.wait_for_publish_ready(ctx, &worker_lookup_group_name, mount_epoch, route_epoch, &new_targets)
@@ -1518,7 +1506,6 @@ impl MetadataFileSystem {
         }
 
         self.success_with_route_epoch(
-            ctx,
             CloseWriteOutput {
                 committed_size: intent.final_size,
             },
