@@ -22,11 +22,6 @@ pub struct MaintenanceHandle {
 }
 
 impl MaintenanceHandle {
-    /// Returns the number of background maintenance loops owned by this handle.
-    pub fn task_count(&self) -> usize {
-        self.tasks.len()
-    }
-
     /// Cancels and awaits every maintenance loop owned by Metadata.
     pub async fn shutdown(mut self) -> Result<(), tokio::task::JoinError> {
         self.shutdown.cancel();

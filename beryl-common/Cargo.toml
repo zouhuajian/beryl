@@ -12,7 +12,6 @@ thiserror = { workspace = true }
 bytes = { workspace = true }
 parking_lot = { workspace = true }
 uuid = { workspace = true, features = ["serde"] }
-fastrand = { workspace = true }
 chrono = { workspace = true }
 beryl-types = { path = "../beryl-types" }
 futures = { workspace = true }

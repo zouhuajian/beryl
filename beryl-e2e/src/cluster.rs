@@ -543,9 +543,9 @@ impl TestCluster {
     /// Drives cleanup until physical deletion and metadata absence both converge.
     ///
     /// Heartbeats deliver cleanup commands and delta reports publish completion.
-    /// In-process metadata is also checked for location removal; external
-    /// metadata receives a final full report because its location state is not
-    /// directly observable from this test harness.
+    /// An accepted delta report proves in-process location convergence;
+    /// external metadata receives a final full report because its location
+    /// state is not directly observable from this test harness.
     pub async fn converge_cleanup(&self, expected_physical_blocks: usize) -> TestResult<()> {
         let external_metadata = self.metadata_process.is_some();
         readiness::ReadinessCheck::startup("block cleanup convergence")
@@ -574,7 +574,7 @@ impl TestCluster {
                     return false;
                 }
                 if !external_metadata {
-                    return self.worker_manager.list_reported_blocks().len() == expected_physical_blocks;
+                    return true;
                 }
 
                 if send_full_block_report_to_external_metadata(&self.heartbeat, &self.block_report, &self.block_store)

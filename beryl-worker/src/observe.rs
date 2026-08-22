@@ -199,19 +199,15 @@ pub(crate) fn record_stream_frame(mode: &str, status: &str, error_kind: &str, by
 
 pub(crate) fn worker_error_kind(error: &WorkerError) -> &'static str {
     match error {
-        WorkerError::LeaderChanged(_) => "not_leader",
         WorkerError::Timeout(_) => "timeout",
         WorkerError::Unavailable(_) => "unavailable",
-        WorkerError::ChunkConflict(_) => "chunk_conflict",
         WorkerError::DiskError(_) => "disk_error",
         WorkerError::Cancelled(_) => "cancelled",
         WorkerError::InvalidArgument(_) => "invalid_argument",
         WorkerError::NotFound(_) => "not_found",
         WorkerError::Corrupt(_) => "corrupt",
         WorkerError::RefreshMetadata { kind, .. } => error_kind_label(*kind),
-        WorkerError::Fencing(_) => "fencing",
         WorkerError::PermissionDenied(_) => "permission_denied",
-        WorkerError::Unimplemented(_) => "unimplemented",
         WorkerError::Internal(_) => "internal",
         WorkerError::ResourceExhausted(_) => "resource_exhausted",
     }

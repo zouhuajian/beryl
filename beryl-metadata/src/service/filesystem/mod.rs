@@ -426,7 +426,7 @@ mod tests {
     pub(super) use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
     pub(super) use crate::service::filesystem::publish::{CloseWriteIntent, CloseWriteOutput};
     pub(super) use crate::service::filesystem::write::OpenWriteOutput;
-    pub(super) use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerManager};
+    pub(super) use crate::worker::{BlockReportBlock, BlockReportBlockState, WorkerDescriptor, WorkerManager};
     pub(super) use beryl_common::error::rpc::{
         ErrorKind, InternalErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail, WorkerErrorKind,
     };
@@ -641,47 +641,28 @@ mod tests {
             .expect("valid test WorkerRunId")
     }
 
-    #[allow(clippy::too_many_arguments)]
+    pub(super) fn register_worker_descriptor(
+        manager: &WorkerManager,
+        group_name: &GroupName,
+        worker_id: WorkerId,
+        address: String,
+    ) {
+        manager
+            .upsert_descriptor(WorkerDescriptor {
+                group_name: group_name.clone(),
+                worker_id,
+                address,
+                worker_net_protocol: 1,
+                fault_domain: None,
+            })
+            .expect("worker descriptor should register");
+    }
+
     pub(super) fn record_worker_heartbeat(
         manager: &WorkerManager,
         group_name: &GroupName,
         worker_id: WorkerId,
-        capacity_total: u64,
-        capacity_used: u64,
-        capacity_available: u64,
-        active_reads: u32,
-        active_writes: u32,
-        health: HealthStatus,
-    ) {
-        record_worker_heartbeat_with_tiers(
-            manager,
-            group_name,
-            worker_id,
-            capacity_total,
-            capacity_used,
-            capacity_available,
-            vec![TierFree {
-                tier: Tier::Hdd,
-                free_bytes: capacity_available,
-            }],
-            active_reads,
-            active_writes,
-            health,
-        );
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn record_worker_heartbeat_with_tiers(
-        manager: &WorkerManager,
-        group_name: &GroupName,
-        worker_id: WorkerId,
-        capacity_total: u64,
-        capacity_used: u64,
-        capacity_available: u64,
-        tier_free: Vec<TierFree>,
-        active_reads: u32,
-        active_writes: u32,
-        health: HealthStatus,
+        free_bytes: u64,
     ) {
         let descriptor = manager
             .get_descriptor(group_name, worker_id)
@@ -711,13 +692,10 @@ mod tests {
                 1,
                 &descriptor.address,
                 descriptor.worker_net_protocol,
-                capacity_total,
-                capacity_used,
-                capacity_available,
-                tier_free,
-                active_reads,
-                active_writes,
-                health,
+                vec![TierFree {
+                    tier: Tier::Hdd,
+                    free_bytes,
+                }],
             )
             .expect("heartbeat should be accepted");
         manager
@@ -815,20 +793,8 @@ mod tests {
         let manager = Arc::new(WorkerManager::new(60_000));
         for raw in 1..=3 {
             let worker_id = beryl_types::ids::WorkerId::new(raw);
-            manager
-                .register_worker(group_name, worker_id, format!("127.0.0.1:{}", 9000 + raw), 1, None)
-                .unwrap();
-            record_worker_heartbeat(
-                &manager,
-                group_name,
-                worker_id,
-                1024 * 1024,
-                0,
-                1024 * 1024,
-                0,
-                0,
-                HealthStatus::Healthy,
-            );
+            register_worker_descriptor(&manager, group_name, worker_id, format!("127.0.0.1:{}", 9000 + raw));
+            record_worker_heartbeat(&manager, group_name, worker_id, 1024 * 1024);
         }
         manager
     }

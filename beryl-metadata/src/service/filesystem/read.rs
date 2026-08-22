@@ -985,20 +985,13 @@ mod tests {
             }));
 
             if !matches!(case, Case::MissingReport) {
-                worker_manager
-                    .register_worker(&group_name_value, worker_id, "127.0.0.1:9101".to_string(), 1, None)
-                    .unwrap();
-                record_worker_heartbeat(
+                register_worker_descriptor(
                     &worker_manager,
                     &group_name_value,
                     worker_id,
-                    1024,
-                    0,
-                    1024,
-                    0,
-                    0,
-                    HealthStatus::Healthy,
+                    "127.0.0.1:9101".to_string(),
                 );
+                record_worker_heartbeat(&worker_manager, &group_name_value, worker_id, 1024);
             }
             match case {
                 Case::MissingReport => {}

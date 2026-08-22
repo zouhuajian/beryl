@@ -34,7 +34,6 @@ fn worker(group_name: &GroupName, worker_id: u64, worker_run_id: WorkerRunId, ho
         az: None,
         rack: None,
         region: None,
-        free_bytes: Some(4096),
         tier_free: vec![TierFree {
             tier: Tier::Hdd,
             free_bytes: 4096,

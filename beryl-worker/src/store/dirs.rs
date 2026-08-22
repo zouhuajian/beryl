@@ -21,8 +21,7 @@ use crate::config::StoreDirConfig;
 use crate::error::WorkerError;
 use crate::store::block::{
     BlockMetaPayload, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
-    PublishReadyRequest, ReclaimBlockRequest, ReclaimBlockResult, ReclaimBlockState, RecoveredBlock, StoreResult,
-    SyncReadyBlockRequest,
+    PublishReadyRequest, ReclaimBlockRequest, ReclaimBlockResult, ReclaimBlockState, StoreResult,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -454,26 +453,6 @@ impl LocalBlockStore for StoreDirs {
             )));
         };
         store.load_meta(group_name, block_id)
-    }
-
-    fn sync_ready_block(&self, req: SyncReadyBlockRequest) -> StoreResult<BlockMetaPayload> {
-        let Some((_, store)) = self.find_final_store(&req.group_name, req.block_id) else {
-            return Err(WorkerError::NotFound(format!(
-                "ready block not found: group_name={}, block_id={}",
-                req.group_name, req.block_id
-            )));
-        };
-        store.sync_ready_block(req)
-    }
-
-    fn recover_block(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<RecoveredBlock> {
-        let Some((_, store)) = self.find_final_store(group_name, block_id) else {
-            return Err(WorkerError::NotFound(format!(
-                "block not found: group_name={}, block_id={}",
-                group_name, block_id
-            )));
-        };
-        store.recover_block(group_name, block_id)
     }
 
     fn inspect_reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockState> {

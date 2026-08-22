@@ -7,7 +7,7 @@
 //! to gRPC Status codes with retry information and details.
 
 use beryl_common::error::rpc::{
-    ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind,
+    ErrorKind, InternalErrorKind, ProtocolErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind,
 };
 use thiserror::Error;
 use tonic::Status;
@@ -15,14 +15,6 @@ use tonic::Status;
 /// Worker error types.
 #[derive(Error, Debug, Clone)]
 pub enum WorkerError {
-    /// Leader changed (raft group leader election).
-    #[error("Leader changed: {0}")]
-    LeaderChanged(String),
-
-    /// Chunk conflict (e.g., concurrent write to same chunk).
-    #[error("Chunk conflict: {0}")]
-    ChunkConflict(String),
-
     /// Resource exhausted (e.g., disk full, quota exceeded).
     #[error("Resource exhausted: {0}")]
     ResourceExhausted(String),
@@ -59,17 +51,9 @@ pub enum WorkerError {
     #[error("Refresh metadata ({kind:?}): {message}")]
     RefreshMetadata { kind: ErrorKind, message: String },
 
-    /// Fencing token is missing, malformed, or does not match the active writer.
-    #[error("Fencing: {0}")]
-    Fencing(String),
-
     /// Permission denied.
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
-
-    /// Operation is part of the defined contract but has no execution path yet.
-    #[error("Unimplemented: {0}")]
-    Unimplemented(String),
 
     /// Internal error.
     #[error("Internal error: {0}")]
@@ -88,30 +72,23 @@ impl WorkerError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            WorkerError::LeaderChanged(_)
-                | WorkerError::Timeout(_)
-                | WorkerError::ResourceExhausted(_)
-                | WorkerError::Unavailable(_)
+            WorkerError::Timeout(_) | WorkerError::ResourceExhausted(_) | WorkerError::Unavailable(_)
         )
     }
 
     /// Get error metadata.
     pub fn metadata(&self) -> ErrorMetadata {
         let retry_after_ms = match self {
-            WorkerError::LeaderChanged(_) => Some(500),
             WorkerError::Timeout(_) => Some(100),
             WorkerError::ResourceExhausted(_) => Some(5000),
             WorkerError::Unavailable(_) => Some(500),
-            WorkerError::ChunkConflict(_)
-            | WorkerError::DiskError(_)
+            WorkerError::DiskError(_)
             | WorkerError::Cancelled(_)
             | WorkerError::InvalidArgument(_)
             | WorkerError::NotFound(_)
             | WorkerError::Corrupt(_)
             | WorkerError::RefreshMetadata { .. }
-            | WorkerError::Fencing(_)
             | WorkerError::PermissionDenied(_)
-            | WorkerError::Unimplemented(_)
             | WorkerError::Internal(_) => None,
         };
 
@@ -128,8 +105,6 @@ impl WorkerError {
     /// Convert to gRPC status code.
     fn to_grpc_code(&self) -> tonic::Code {
         match self {
-            WorkerError::LeaderChanged(_) => tonic::Code::Unavailable,
-            WorkerError::ChunkConflict(_) => tonic::Code::FailedPrecondition,
             WorkerError::ResourceExhausted(_) => tonic::Code::ResourceExhausted,
             WorkerError::DiskError(_) => tonic::Code::Internal,
             WorkerError::Timeout(_) => tonic::Code::DeadlineExceeded,
@@ -139,9 +114,7 @@ impl WorkerError {
             WorkerError::NotFound(_) => tonic::Code::NotFound,
             WorkerError::Corrupt(_) => tonic::Code::DataLoss,
             WorkerError::RefreshMetadata { .. } => tonic::Code::FailedPrecondition,
-            WorkerError::Fencing(_) => tonic::Code::FailedPrecondition,
             WorkerError::PermissionDenied(_) => tonic::Code::PermissionDenied,
-            WorkerError::Unimplemented(_) => tonic::Code::Unimplemented,
             WorkerError::Internal(_) => tonic::Code::Internal,
         }
     }
@@ -174,11 +147,6 @@ impl From<WorkerError> for RpcErrorDetail {
     fn from(err: WorkerError) -> Self {
         let metadata = err.metadata();
         match err {
-            WorkerError::LeaderChanged(msg) => RpcErrorDetail::refresh_metadata(
-                ErrorKind::Metadata(MetadataErrorKind::NotLeader),
-                RefreshHint::default(),
-                msg,
-            ),
             WorkerError::Timeout(msg) => RpcErrorDetail::retry(
                 ErrorKind::Worker(WorkerErrorKind::Timeout),
                 metadata.retry_after_ms,
@@ -193,10 +161,6 @@ impl From<WorkerError> for RpcErrorDetail {
                 ErrorKind::Worker(WorkerErrorKind::NodeUnavailable),
                 metadata.retry_after_ms,
                 msg,
-            ),
-            WorkerError::ChunkConflict(msg) => RpcErrorDetail::fail(
-                ErrorKind::Worker(WorkerErrorKind::Conflict),
-                format!("chunk conflict: {}", msg),
             ),
             WorkerError::DiskError(msg) => RpcErrorDetail::fail(
                 ErrorKind::Worker(WorkerErrorKind::Io),
@@ -220,16 +184,9 @@ impl From<WorkerError> for RpcErrorDetail {
             WorkerError::RefreshMetadata { kind, message } => {
                 RpcErrorDetail::refresh_metadata(kind, RefreshHint::default(), message)
             }
-            WorkerError::Fencing(msg) => {
-                RpcErrorDetail::fail(ErrorKind::Worker(WorkerErrorKind::Fencing), format!("fencing: {}", msg))
-            }
             WorkerError::PermissionDenied(msg) => RpcErrorDetail::fail(
                 ErrorKind::Worker(WorkerErrorKind::Io),
                 format!("permission denied: {}", msg),
-            ),
-            WorkerError::Unimplemented(msg) => RpcErrorDetail::fail(
-                ErrorKind::Protocol(ProtocolErrorKind::Unsupported),
-                format!("unimplemented: {}", msg),
             ),
             WorkerError::Internal(msg) => RpcErrorDetail::fail(
                 ErrorKind::Internal(InternalErrorKind::Internal),

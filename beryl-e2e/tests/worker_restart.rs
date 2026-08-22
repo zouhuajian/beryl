@@ -269,5 +269,9 @@ fn metadata_header(client_id: u128) -> RequestHeaderProto {
 }
 
 fn data_header(client_id: u128) -> DataRequestHeaderProto {
-    (&RequestHeader::new(ClientId::new(client_id))).into()
+    let header = RequestHeader::new(ClientId::new(client_id));
+    DataRequestHeaderProto {
+        client: Some((&header.client).into()),
+        trace_context: None,
+    }
 }

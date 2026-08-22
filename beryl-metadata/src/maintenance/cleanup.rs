@@ -663,7 +663,7 @@ mod tests {
     use super::*;
     use crate::raft::{AppMetadataRaftState, AppRaftStateMachine};
     use crate::session_registry::{BeginSessionInput, WriteMode};
-    use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus};
+    use crate::worker::{BlockReportBlock, BlockReportBlockState};
     use crate::MountTable;
     use beryl_types::fs::{Extent, FileAttrs, Inode, InodeData, InodeId};
     use beryl_types::ids::{BlockId, BlockIndex, MountId, WorkerId};
@@ -799,19 +799,17 @@ mod tests {
             .register_worker_run(&group_name, worker_id, address.clone(), 1, run_id, None)
             .unwrap();
         manager
-            .record_heartbeat(
+            .record_heartbeat_with_tier_free(
                 &group_name,
                 worker_id,
                 run_id,
                 report_seq,
                 &address,
                 1,
-                1_000,
-                100,
-                900,
-                0,
-                0,
-                HealthStatus::Healthy,
+                vec![beryl_types::TierFree {
+                    tier: beryl_types::Tier::Hdd,
+                    free_bytes: 900,
+                }],
             )
             .unwrap();
         manager

@@ -19,7 +19,6 @@ const WRITE_TIER_ORDER: [Tier; 3] = [Tier::Nvme, Tier::Ssd, Tier::Hdd];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlacementOp {
     Read,
-    Load,
     Write,
 }
 
@@ -59,7 +58,6 @@ pub struct WorkerPlacementView {
     pub az: Option<String>,
     pub rack: Option<String>,
     pub region: Option<String>,
-    pub free_bytes: Option<u64>,
     pub tier_free: Vec<TierFree>,
     /// Metadata-visible block format capabilities. StoreBackend / IoEngine
     /// details remain worker-local and are not part of placement input.
@@ -85,7 +83,6 @@ pub enum PlacementStatus {
     InsufficientCapacity,
     NoLiveReplica,
     NotEnoughReplicas,
-    Unsupported,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -147,8 +144,7 @@ impl PlacementPlanner {
     pub fn plan(&self, req: &PlacementRequest, workers: &[WorkerPlacementView]) -> PlacementPlan {
         match req.op {
             PlacementOp::Read => choose_read(req, workers),
-            PlacementOp::Load => choose_live_targets(req, workers, 1, false),
-            PlacementOp::Write => choose_live_targets(req, workers, req.target_replicas.max(1), true),
+            PlacementOp::Write => choose_live_targets(req, workers, req.target_replicas.max(1)),
         }
     }
 }
@@ -191,14 +187,8 @@ fn choose_read(req: &PlacementRequest, workers: &[WorkerPlacementView]) -> Place
     plan(req, selected, status)
 }
 
-fn choose_live_targets(
-    req: &PlacementRequest,
-    workers: &[WorkerPlacementView],
-    target_replicas: u8,
-    use_locality: bool,
-) -> PlacementPlan {
+fn choose_live_targets(req: &PlacementRequest, workers: &[WorkerPlacementView], target_replicas: u8) -> PlacementPlan {
     let exclude: HashSet<WorkerId> = req.exclude_workers.iter().copied().collect();
-    let required_len = u64::from(req.layout.block_size);
     let mut stats = PlacementStats::default();
     let live_candidates: Vec<_> = workers
         .iter()
@@ -227,41 +217,13 @@ fn choose_live_targets(
         return plan_with_stats(req, Vec::new(), PlacementStatus::UnsupportedBlockFormat, stats);
     }
 
-    if req.op == PlacementOp::Write {
-        return choose_write_targets(req, format_candidates, target_replicas, use_locality, stats);
-    }
-
-    stats.tier_count = format_candidates.len();
-    for worker in &format_candidates {
-        if let Some(free_bytes) = worker.free_bytes {
-            record_max_free(&mut stats, worker.worker_id, None, free_bytes);
-        }
-    }
-    let mut candidates: Vec<_> = format_candidates
-        .into_iter()
-        .filter(|worker| has_capacity(worker, required_len))
-        .collect();
-    stats.capacity_count = candidates.len();
-    sort_workers(req, &mut candidates, use_locality);
-    if candidates.is_empty() {
-        return plan_with_stats(req, Vec::new(), PlacementStatus::InsufficientCapacity, stats);
-    }
-
-    let target = usize::from(target_replicas.max(1));
-    let selected = workers_from_views(candidates.into_iter().take(target).collect());
-    let status = if selected.len() < target {
-        PlacementStatus::NotEnoughReplicas
-    } else {
-        PlacementStatus::Ok
-    };
-    plan_with_stats(req, selected, status, stats)
+    choose_write_targets(req, format_candidates, target_replicas, stats)
 }
 
 fn choose_write_targets(
     req: &PlacementRequest,
     workers: Vec<&WorkerPlacementView>,
     target_replicas: u8,
-    use_locality: bool,
     mut stats: PlacementStats,
 ) -> PlacementPlan {
     let required_len = u64::from(req.layout.block_size);
@@ -296,7 +258,7 @@ fn choose_write_targets(
     }
 
     stats.capacity_count = candidates.len();
-    sort_write_candidates(req, &mut candidates, use_locality);
+    sort_write_candidates(req, &mut candidates, true);
     if candidates.is_empty() {
         return plan_with_stats(req, Vec::new(), PlacementStatus::InsufficientCapacity, stats);
     }
@@ -332,13 +294,6 @@ fn choose_write_targets(
 
 fn is_live(worker: &WorkerPlacementView) -> bool {
     worker.registered && worker.lease_valid && worker.worker_run_id.is_some()
-}
-
-fn has_capacity(worker: &WorkerPlacementView, required_len: u64) -> bool {
-    worker
-        .free_bytes
-        .map(|free_bytes| free_bytes >= required_len)
-        .unwrap_or(true)
 }
 
 fn tier_free_bytes(worker: &WorkerPlacementView, tier: Tier) -> Option<u64> {

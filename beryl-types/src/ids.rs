@@ -164,52 +164,6 @@ impl std::str::FromStr for BlockId {
 }
 
 id_new_uint!(
-    /// A chunk index within a block: 0..N-1 (derived from block_size/chunk_size).
-    ChunkIndex(u32)
-);
-
-impl fmt::Display for ChunkIndex {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Chunk identity: (BlockId, ChunkIndex).
-///
-/// Deterministic and scope-unique under a BlockId.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ChunkId {
-    /// The block this chunk belongs to.
-    pub block: BlockId,
-    /// The index of this chunk within the block.
-    pub index: ChunkIndex,
-}
-
-impl ChunkId {
-    /// Creates a new `ChunkId` from a block ID and chunk index.
-    #[inline]
-    pub const fn new(block: BlockId, index: ChunkIndex) -> Self {
-        Self { block, index }
-    }
-}
-
-impl fmt::Debug for ChunkId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "ChunkId(inode={}, block={}, chunk={})",
-            self.block.inode_id.0, self.block.index.0, self.index.0
-        )
-    }
-}
-impl fmt::Display for ChunkId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // "<inode>:<block>:<chunk>"
-        write!(f, "{}:{}:{}", self.block.inode_id.0, self.block.index.0, self.index.0)
-    }
-}
-
-id_new_uint!(
     /// Worker identity.
     ///
     /// Stable logical worker identity. This must not be confused with
@@ -364,19 +318,6 @@ impl FromStr for CallId {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::parse(s)
-    }
-}
-
-id_new_uint!(
-    /// Shard identity within a shard group.
-    ///
-    /// A shard is a logical partition of the metadata namespace.
-    ShardId(u64)
-);
-
-impl fmt::Display for ShardId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
     }
 }
 

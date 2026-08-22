@@ -81,12 +81,7 @@ pub struct MetadataAuthority {
 impl MetadataAuthority {
     /// Build the worker control-plane service without exposing Raft/storage internals.
     pub fn worker_service(&self, manager: Arc<WorkerManager>) -> MetadataWorkerServiceImpl {
-        MetadataWorkerServiceImpl::new(
-            Arc::clone(&self.raft_node),
-            manager,
-            Arc::clone(&self.mount_table),
-            self.group_name.clone(),
-        )
+        MetadataWorkerServiceImpl::new(Arc::clone(&self.raft_node), manager, self.group_name.clone())
     }
 
     /// Return durable worker descriptors needed to rebuild process-local soft state.
@@ -219,7 +214,6 @@ impl WorkerRuntime {
         MetadataWorkerServiceImpl::new_with_cleanup(
             Arc::clone(&authority.raft_node),
             Arc::clone(&self.manager),
-            Arc::clone(&authority.mount_table),
             authority.group_name.clone(),
             cleanup,
         )

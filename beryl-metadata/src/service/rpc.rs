@@ -846,7 +846,7 @@ mod tests {
     use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
     use crate::service::{MetadataFileSystem, MetadataFileSystemDeps, MetadataFileSystemServiceImpl, MsyncHandler};
     use crate::state::RouteEpoch;
-    use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerManager};
+    use crate::worker::{BlockReportBlock, BlockReportBlockState, WorkerManager};
     use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RpcErrorDetail};
     use beryl_common::header::RequestHeader;
     use beryl_proto::common::{RequestHeaderProto, ResponseHeaderProto};
@@ -1057,28 +1057,20 @@ mod tests {
                 .parse()
                 .expect("valid test worker run id");
             manager
-                .register_worker(&group_name("root"), worker_id, endpoint.clone(), 1, None)
-                .expect("register worker descriptor");
-            manager
                 .register_worker_run(&group_name("root"), worker_id, endpoint.clone(), 1, worker_run_id, None)
                 .expect("register worker run");
             manager
-                .register_worker(&group_name("root"), worker_id, endpoint.clone(), 1, None)
-                .expect("restore worker descriptor");
-            manager
-                .record_heartbeat(
+                .record_heartbeat_with_tier_free(
                     &group_name("root"),
                     worker_id,
                     worker_run_id,
                     1,
                     &endpoint,
                     1,
-                    1024 * 1024,
-                    0,
-                    1024 * 1024,
-                    0,
-                    0,
-                    HealthStatus::Healthy,
+                    vec![beryl_types::TierFree {
+                        tier: beryl_types::Tier::Hdd,
+                        free_bytes: 1024 * 1024,
+                    }],
                 )
                 .expect("record worker heartbeat");
         }

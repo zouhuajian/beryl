@@ -213,19 +213,6 @@ pub struct CreateStagingBlockRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExpectedBlockShape {
-    pub group_name: GroupName,
-    pub block_id: BlockId,
-    pub block_format_id: BlockFormatId,
-    /// Expected full logical block size persisted in BlockMeta.format.block_size.
-    pub block_size: u64,
-    pub chunk_size: u32,
-    pub block_stamp: Option<u64>,
-    /// Optional expected valid block length persisted in BlockMeta.source.effective_len.
-    pub effective_len: Option<u64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublishReadyRequest {
     pub group_name: GroupName,
     pub block_id: BlockId,
@@ -234,12 +221,6 @@ pub struct PublishReadyRequest {
     /// Metadata-assigned logical block stamp.
     /// The local store persists this value at publish time and never generates it.
     pub block_stamp: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SyncReadyBlockRequest {
-    pub group_name: GroupName,
-    pub block_id: BlockId,
 }
 
 /// Exact local Ready block version authorized for physical reclamation.
@@ -274,11 +255,6 @@ pub struct BlockPaths {
     pub staging_meta_path: PathBuf,
     pub deleting_marker_path: PathBuf,
     pub temp_deleting_marker_path: PathBuf,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecoveredBlock {
-    pub meta: BlockMetaPayload,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -467,40 +443,6 @@ impl FullBlockFileStore {
         file.read_exact(&mut buf)
             .map_err(|err| map_data_read_error(err, "ready range is not present in block data file"))?;
         Ok(Bytes::from(buf))
-    }
-
-    /// Durably syncs an already Ready block's data and sidecar metadata.
-    pub fn sync_ready_block(&self, req: SyncReadyBlockRequest) -> StoreResult<BlockMetaPayload> {
-        let paths = self.paths(&req.group_name, req.block_id);
-        let meta = self.load_meta(&req.group_name, req.block_id)?;
-        ensure_readable(&meta)?;
-        validate_ready_data_file(&paths, &meta)?;
-
-        let data = OpenOptions::new()
-            .read(true)
-            .open(&paths.data_path)
-            .map_err(|err| map_data_open_error(err, "ready block data file is missing"))?;
-        data.sync_all()?;
-
-        let meta_file = OpenOptions::new()
-            .read(true)
-            .open(&paths.meta_path)
-            .map_err(|err| map_meta_open_error(err, "ready block meta file is missing"))?;
-        meta_file.sync_all()?;
-        Ok(meta)
-    }
-
-    pub fn recover_block(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<RecoveredBlock> {
-        let paths = self.paths(group_name, block_id);
-        let meta = self.load_meta(group_name, block_id)?;
-        match meta.visibility.block_state {
-            BlockState::Ready => {
-                validate_ready_data_file(&paths, &meta)?;
-                Ok(RecoveredBlock { meta })
-            }
-            BlockState::Loading => Err(corrupt("loading block metadata is not valid final metadata")),
-            BlockState::Corrupt => Err(corrupt("block metadata marks local block corrupt")),
-        }
     }
 
     /// Scan final block metadata under one local group directory.
@@ -920,10 +862,6 @@ pub trait LocalBlockStore {
 
     fn load_meta(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<BlockMetaPayload>;
 
-    fn sync_ready_block(&self, req: SyncReadyBlockRequest) -> StoreResult<BlockMetaPayload>;
-
-    fn recover_block(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<RecoveredBlock>;
-
     fn inspect_reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockState>;
 
     fn reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockResult>;
@@ -950,14 +888,6 @@ impl LocalBlockStore for FullBlockFileStore {
 
     fn load_meta(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<BlockMetaPayload> {
         FullBlockFileStore::load_meta(self, group_name, block_id)
-    }
-
-    fn sync_ready_block(&self, req: SyncReadyBlockRequest) -> StoreResult<BlockMetaPayload> {
-        FullBlockFileStore::sync_ready_block(self, req)
-    }
-
-    fn recover_block(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<RecoveredBlock> {
-        FullBlockFileStore::recover_block(self, group_name, block_id)
     }
 
     fn inspect_reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockState> {
@@ -1322,35 +1252,6 @@ fn validate_common_meta_shape(meta: &BlockMetaPayload, group_name: &GroupName, b
     Ok(())
 }
 
-pub fn validate_expected_block_shape(expected: &ExpectedBlockShape, actual: &BlockMetaPayload) -> StoreResult<()> {
-    if expected.group_name != actual.identity.group_name {
-        return Err(invalid_argument("block group_name does not match expected shape"));
-    }
-    if expected.block_id != actual.identity.block_id {
-        return Err(invalid_argument("block_id does not match expected shape"));
-    }
-    if expected.block_format_id != actual.format.format_id {
-        return Err(invalid_argument("block_format_id does not match expected shape"));
-    }
-    if expected.block_size != actual.format.block_size {
-        return Err(invalid_argument("block_size does not match expected shape"));
-    }
-    if u64::from(expected.chunk_size) != actual.format.chunk_size {
-        return Err(invalid_argument("chunk_size does not match expected shape"));
-    }
-    if let Some(block_stamp) = expected.block_stamp {
-        if block_stamp != actual.visibility.block_stamp {
-            return Err(invalid_argument("block_stamp does not match expected shape"));
-        }
-    }
-    if let Some(effective_len) = expected.effective_len {
-        if effective_len != actual.source.effective_len {
-            return Err(invalid_argument("effective_len does not match expected shape"));
-        }
-    }
-    Ok(())
-}
-
 fn validate_store_block_shape(
     block_format_id: BlockFormatId,
     block_size: u64,
@@ -1527,14 +1428,6 @@ fn map_data_open_error(err: std::io::Error, message: &str) -> WorkerError {
 fn map_staging_data_open_error(err: std::io::Error, message: &str) -> WorkerError {
     if err.kind() == std::io::ErrorKind::NotFound {
         not_found(message)
-    } else {
-        WorkerError::from(err)
-    }
-}
-
-fn map_meta_open_error(err: std::io::Error, message: &str) -> WorkerError {
-    if err.kind() == std::io::ErrorKind::NotFound {
-        corrupt(message)
     } else {
         WorkerError::from(err)
     }

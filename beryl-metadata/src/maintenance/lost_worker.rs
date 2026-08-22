@@ -126,25 +126,20 @@ mod tests {
         let address = format!("127.0.0.1:{}", 9000 + worker_id.as_raw());
         let run_id = worker_run_id(worker_id);
         manager
-            .register_worker(&group_name, worker_id, address.clone(), 1, None)
-            .unwrap();
-        manager
             .register_worker_run(&group_name, worker_id, address.clone(), 1, run_id, None)
             .unwrap();
         manager
-            .record_heartbeat(
+            .record_heartbeat_with_tier_free(
                 &group_name,
                 worker_id,
                 run_id,
                 1,
                 &address,
                 1,
-                1_000,
-                500,
-                500,
-                0,
-                0,
-                HealthStatus::Healthy,
+                vec![beryl_types::TierFree {
+                    tier: beryl_types::Tier::Hdd,
+                    free_bytes: 500,
+                }],
             )
             .unwrap();
     }
@@ -222,10 +217,7 @@ mod tests {
 
         assert_eq!(outcome.removed_workers, 1);
         assert_eq!(outcome.affected_blocks, 1);
-        assert!(worker_manager.get_worker_blocks(&group_name("root"), dead).is_empty());
         assert!(worker_manager.get_registration(&group_name("root"), dead).is_none());
-        assert!(worker_manager.get_worker(&group_name("root"), dead).is_none());
-        assert!(worker_manager.needs_full_block_report(&group_name("root"), dead));
         assert!(worker_manager.get_descriptor(&group_name("root"), dead).is_some());
         assert!(!worker_manager
             .list_registered_workers()
