@@ -76,8 +76,6 @@ enum MetadataWorkerMetric {
 pub struct MetadataWorkerServiceImpl {
     raft_node: Arc<AppRaftNode>,
     worker_manager: Arc<WorkerManager>,
-    /// Mount table used to compute mount_epoch for lease gating.
-    _mount_table: Arc<crate::mount::MountTable>,
     served_group_name: GroupName,
     cleanup: Option<Arc<BlockCleanupCoordinator>>,
     registration_serial: tokio::sync::Mutex<()>,
@@ -87,33 +85,29 @@ impl MetadataWorkerServiceImpl {
     pub(crate) fn new(
         raft_node: Arc<AppRaftNode>,
         worker_manager: Arc<WorkerManager>,
-        mount_table: Arc<crate::mount::MountTable>,
         served_group_name: GroupName,
     ) -> Self {
-        Self::build(raft_node, worker_manager, mount_table, served_group_name, None)
+        Self::build(raft_node, worker_manager, served_group_name, None)
     }
 
     pub(crate) fn new_with_cleanup(
         raft_node: Arc<AppRaftNode>,
         worker_manager: Arc<WorkerManager>,
-        mount_table: Arc<crate::mount::MountTable>,
         served_group_name: GroupName,
         cleanup: Arc<BlockCleanupCoordinator>,
     ) -> Self {
-        Self::build(raft_node, worker_manager, mount_table, served_group_name, Some(cleanup))
+        Self::build(raft_node, worker_manager, served_group_name, Some(cleanup))
     }
 
     fn build(
         raft_node: Arc<AppRaftNode>,
         worker_manager: Arc<WorkerManager>,
-        mount_table: Arc<crate::mount::MountTable>,
         served_group_name: GroupName,
         cleanup: Option<Arc<BlockCleanupCoordinator>>,
     ) -> Self {
         Self {
             raft_node,
             worker_manager,
-            _mount_table: mount_table,
             served_group_name,
             cleanup,
             registration_serial: tokio::sync::Mutex::new(()),
@@ -670,14 +664,14 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 }
             };
 
-            let load = match req.load {
+            let _load = match req.load {
                 Some(load) => load,
                 None => {
                     return self.invalid_request_response(&req.header, heartbeat_response_with_header, "Missing load")
                 }
             };
 
-            let health_proto = req.health();
+            let _health_status = super::manager::HealthStatus::from(req.health() as i32);
             let worker_net_protocol = WORKER_NET_PROTOCOL_GRPC;
             let endpoint = match req.advertised_endpoint {
                 Some(endpoint) => endpoint,
@@ -796,9 +790,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 );
             }
 
-            use super::manager::HealthStatus;
-            let health_status = HealthStatus::from(health_proto as i32);
-
             let live_state = match self.worker_manager.record_heartbeat_with_tier_free(
                 &group_name,
                 worker_id,
@@ -806,13 +797,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 req.heartbeat_seq,
                 &advertised_endpoint,
                 worker_net_protocol,
-                capacity.total_bytes,
-                capacity.used_bytes,
-                capacity.available_bytes,
                 tier_free,
-                load.active_reads,
-                load.active_writes,
-                health_status,
             ) {
                 Ok(live_state) => live_state,
                 Err(MetadataError::NotFound(message)) => {
@@ -1248,7 +1233,6 @@ mod tests {
     use crate::config::BlockCleanupConfig;
     use crate::raft::{AppRaftStateMachine, RocksDBStorage};
     use crate::session_registry::SessionRegistry;
-    use crate::worker::HealthStatus;
     use crate::MountTable;
     use ::beryl_common::error::rpc::RecoveryAction;
     use beryl_proto::convert::rpc_error_from_proto;
@@ -1380,18 +1364,7 @@ mod tests {
             .expect("valid test WorkerRunId")
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn record_heartbeat(
-        worker_manager: &WorkerManager,
-        group_name: &GroupName,
-        worker_id: WorkerId,
-        capacity_total: u64,
-        capacity_used: u64,
-        capacity_available: u64,
-        active_reads: u32,
-        active_writes: u32,
-        health: HealthStatus,
-    ) -> WorkerRunId {
+    fn record_heartbeat(worker_manager: &WorkerManager, group_name: &GroupName, worker_id: WorkerId) -> WorkerRunId {
         let descriptor = worker_manager
             .get_descriptor(group_name, worker_id)
             .expect("worker descriptor should be registered");
@@ -1413,19 +1386,17 @@ mod tests {
                 worker_run_id
             });
         worker_manager
-            .record_heartbeat(
+            .record_heartbeat_with_tier_free(
                 group_name,
                 worker_id,
                 worker_run_id,
                 1,
                 &descriptor.address,
                 descriptor.worker_net_protocol,
-                capacity_total,
-                capacity_used,
-                capacity_available,
-                active_reads,
-                active_writes,
-                health,
+                vec![beryl_types::TierFree {
+                    tier: beryl_types::Tier::Hdd,
+                    free_bytes: 500,
+                }],
             )
             .expect("heartbeat should be accepted");
         worker_manager
@@ -1479,19 +1450,16 @@ mod tests {
         let worker_id = WorkerId::new(8);
         let block_id = BlockId::from_u64_u32(80, 0);
         worker_manager
-            .register_worker(&group_name("root"), worker_id, "127.0.0.1:9091".to_string(), 1, None)
+            .register_worker_run(
+                &group_name("root"),
+                worker_id,
+                "127.0.0.1:9091".to_string(),
+                1,
+                worker_run_id_for(&group_name("root"), worker_id),
+                None,
+            )
             .unwrap();
-        let worker_run_id = record_heartbeat(
-            &worker_manager,
-            &group_name("root"),
-            worker_id,
-            1_000,
-            500,
-            500,
-            0,
-            0,
-            HealthStatus::Healthy,
-        );
+        let worker_run_id = record_heartbeat(&worker_manager, &group_name("root"), worker_id);
         worker_manager
             .receive_full_block_report(
                 &group_name("root"),
@@ -1508,12 +1476,7 @@ mod tests {
                 }],
             )
             .unwrap();
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            Arc::clone(&worker_manager),
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
+        let service = MetadataWorkerServiceImpl::new(raft_node, Arc::clone(&worker_manager), group_name("root"));
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
             &service,
@@ -1543,12 +1506,7 @@ mod tests {
         let raft_node = leader_raft(&dir).await;
         let worker_manager = Arc::new(WorkerManager::new(60_000));
         let worker_run_id = test_worker_run_id();
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            Arc::clone(&worker_manager),
-            Arc::new(MountTable::new()),
-            group_name("root"),
-        );
+        let service = MetadataWorkerServiceImpl::new(raft_node, Arc::clone(&worker_manager), group_name("root"));
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
             &service,
@@ -1609,12 +1567,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let service = MetadataWorkerServiceImpl::new(
-            raft_node,
-            worker_manager,
-            Arc::new(MountTable::new()),
-            group_name.clone(),
-        );
+        let service = MetadataWorkerServiceImpl::new(raft_node, worker_manager, group_name.clone());
 
         let run_mismatch = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
             &service,
@@ -1670,12 +1623,8 @@ mod tests {
                     None,
                 )
                 .unwrap();
-            let service = MetadataWorkerServiceImpl::new(
-                Arc::clone(&raft_node),
-                Arc::clone(&worker_manager),
-                Arc::new(MountTable::new()),
-                group_name("root"),
-            );
+            let service =
+                MetadataWorkerServiceImpl::new(Arc::clone(&raft_node), Arc::clone(&worker_manager), group_name("root"));
 
             let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
                 &service,
@@ -1731,7 +1680,6 @@ mod tests {
         let service = MetadataWorkerServiceImpl::new_with_cleanup(
             raft_node,
             Arc::clone(&worker_manager),
-            Arc::new(MountTable::new()),
             group.clone(),
             Arc::clone(&cleanup),
         );

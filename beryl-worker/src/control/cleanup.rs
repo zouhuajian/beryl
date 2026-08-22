@@ -459,7 +459,7 @@ mod tests {
     use super::*;
     use crate::store::block::{
         BlockMetaPayload, CreateStagingBlockRequest, LocalBlockStore, PublishReadyRequest, ReclaimBlockState,
-        RecoveredBlock, StoreResult, SyncReadyBlockRequest,
+        StoreResult,
     };
     use beryl_types::{BlockIndex, InodeId};
 
@@ -515,14 +515,6 @@ mod tests {
         }
 
         fn load_meta(&self, _group_name: &GroupName, _block_id: BlockId) -> StoreResult<BlockMetaPayload> {
-            panic!("unused test operation")
-        }
-
-        fn sync_ready_block(&self, _req: SyncReadyBlockRequest) -> StoreResult<BlockMetaPayload> {
-            panic!("unused test operation")
-        }
-
-        fn recover_block(&self, _group_name: &GroupName, _block_id: BlockId) -> StoreResult<RecoveredBlock> {
             panic!("unused test operation")
         }
 

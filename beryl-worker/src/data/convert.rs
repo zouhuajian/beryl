@@ -5,6 +5,7 @@
 
 use beryl_proto::convert as proto_convert;
 use beryl_proto::worker::{ReadBlockRequestProto, WriteBlockCommandProto};
+use beryl_types::chunk::ByteRange;
 use beryl_types::layout::BlockFormatId;
 use beryl_types::{GroupName, WorkerRunId};
 
@@ -26,7 +27,10 @@ pub(crate) fn proto_to_read_block_request(proto: ReadBlockRequestProto) -> Worke
     Ok(ReadBlockRequest {
         group_name,
         block_id,
-        byte_range: (&byte_range).into(),
+        byte_range: ByteRange {
+            offset: byte_range.offset,
+            len: byte_range.len,
+        },
         block_stamp: proto.block_stamp,
         block_format_id,
         block_size: proto.block_size,

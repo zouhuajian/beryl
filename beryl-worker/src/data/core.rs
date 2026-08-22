@@ -3,7 +3,6 @@
 
 //! Worker core domain types and data-plane facade.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,8 +21,8 @@ use crate::runtime::block::{BlockManager, ReadPin, ReclaimingBlock};
 use crate::runtime::write::{BlockWriteIoGuard, BlockWriteKey, BlockWriteRegistration, BlockWriteRegistry};
 use crate::runtime::DataRpcPermit;
 use crate::store::block::{
-    BlockState, ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
-    PublishReadyRequest, ReclaimBlockRequest, ReclaimBlockResult,
+    BlockState, ChecksumKind, CreateStagingBlockRequest, LocalBlockStore, PublishReadyRequest, ReclaimBlockRequest,
+    ReclaimBlockResult,
 };
 
 pub type WorkerCoreResult<T> = Result<T, WorkerError>;
@@ -98,12 +97,6 @@ pub struct WorkerCore {
 }
 
 impl WorkerCore {
-    /// Creates a Worker data core backed by one filesystem block store.
-    pub fn with_options(default_frame_size: u32, max_frame_size: u32, store_dir: PathBuf) -> Self {
-        let block_store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(store_dir)));
-        Self::with_local_store(default_frame_size, max_frame_size, block_store)
-    }
-
     /// Creates a Worker data core around the configured local-store boundary.
     pub fn with_local_store(
         default_frame_size: u32,
@@ -689,7 +682,7 @@ mod tests {
     use crate::store::block::{
         BlockMetaPayload, BlockState, ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore,
         FullBlockFileStoreConfig, LocalBlockStore, PublishReadyRequest, ReclaimBlockRequest, ReclaimBlockResult,
-        ReclaimBlockState, RecoveredBlock, StoreResult, SyncReadyBlockRequest,
+        ReclaimBlockState, StoreResult,
     };
 
     const BLOCK_SIZE: u64 = 4096;
@@ -802,14 +795,6 @@ mod tests {
 
         fn load_meta(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<BlockMetaPayload> {
             self.inner.load_meta(group_name, block_id)
-        }
-
-        fn sync_ready_block(&self, req: SyncReadyBlockRequest) -> StoreResult<BlockMetaPayload> {
-            self.inner.sync_ready_block(req)
-        }
-
-        fn recover_block(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<RecoveredBlock> {
-            self.inner.recover_block(group_name, block_id)
         }
 
         fn inspect_reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockState> {

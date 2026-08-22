@@ -44,13 +44,7 @@ pub struct WorkerRuntime {
     pub heartbeat_seq: u64,
     pub last_seen_at: Instant,
     pub last_seen_ms: u64, // Unix timestamp in milliseconds
-    pub capacity_total: u64,
-    pub capacity_used: u64,
-    pub capacity_available: u64,
     pub tier_free: Vec<TierFree>,
-    pub active_reads: u32,
-    pub active_writes: u32,
-    pub health: HealthStatus,
 }
 
 /// Worker information persisted by RocksDB storage.
@@ -559,25 +553,6 @@ impl WorkerManager {
         Ok(())
     }
 
-    /// Register or update a worker descriptor in runtime soft state after Raft apply succeeds.
-    pub fn register_worker(
-        &self,
-        group_name: &GroupName,
-        worker_id: WorkerId,
-        address: String,
-        worker_net_protocol: i32,
-        fault_domain: Option<String>,
-    ) -> MetadataResult<()> {
-        let descriptor = WorkerDescriptor {
-            group_name: group_name.clone(),
-            worker_id,
-            address,
-            worker_net_protocol,
-            fault_domain,
-        };
-        self.upsert_descriptor(descriptor)
-    }
-
     /// Register or update live startup-registration state after Raft apply succeeds.
     pub fn register_worker_run(
         &self,
@@ -860,15 +835,6 @@ impl WorkerManager {
         })
     }
 
-    /// True when the worker has no published full-report baseline in memory.
-    pub fn needs_full_block_report(&self, group_name: &GroupName, worker_id: WorkerId) -> bool {
-        self.block_reports
-            .read()
-            .get(&WorkerRegistrationKey::new(group_name, worker_id))
-            .map(|report| report.state != BlockReportState::Ready)
-            .unwrap_or(true)
-    }
-
     fn validate_report_source(
         &self,
         group_name: &GroupName,
@@ -978,46 +944,6 @@ impl WorkerManager {
         self.heartbeat_rejections.write().remove(key);
     }
 
-    /// Record a validated group-scoped heartbeat in volatile live state.
-    ///
-    /// Stale sequence numbers renew the local liveness lease but do not replace
-    /// the last accepted resource snapshot.
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_heartbeat(
-        &self,
-        group_name: &GroupName,
-        worker_id: WorkerId,
-        worker_run_id: WorkerRunId,
-        heartbeat_seq: u64,
-        advertised_endpoint: &str,
-        worker_net_protocol: i32,
-        capacity_total: u64,
-        capacity_used: u64,
-        capacity_available: u64,
-        active_reads: u32,
-        active_writes: u32,
-        health: HealthStatus,
-    ) -> MetadataResult<WorkerLiveState> {
-        self.record_heartbeat_with_tier_free(
-            group_name,
-            worker_id,
-            worker_run_id,
-            heartbeat_seq,
-            advertised_endpoint,
-            worker_net_protocol,
-            capacity_total,
-            capacity_used,
-            capacity_available,
-            vec![TierFree {
-                tier: beryl_types::Tier::Hdd,
-                free_bytes: capacity_available,
-            }],
-            active_reads,
-            active_writes,
-            health,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn record_heartbeat_with_tier_free(
         &self,
@@ -1027,13 +953,7 @@ impl WorkerManager {
         heartbeat_seq: u64,
         advertised_endpoint: &str,
         worker_net_protocol: i32,
-        capacity_total: u64,
-        capacity_used: u64,
-        capacity_available: u64,
         tier_free: Vec<TierFree>,
-        active_reads: u32,
-        active_writes: u32,
-        health: HealthStatus,
     ) -> MetadataResult<WorkerLiveState> {
         self.expire_liveness();
         let key = WorkerRegistrationKey::new(group_name, worker_id);
@@ -1095,13 +1015,7 @@ impl WorkerManager {
                     heartbeat_seq,
                     last_seen_at: now,
                     last_seen_ms: now_ms,
-                    capacity_total,
-                    capacity_used,
-                    capacity_available,
                     tier_free,
-                    active_reads,
-                    active_writes,
-                    health,
                 };
                 match existing {
                     Some(slot) => *slot = worker_runtime,
@@ -1192,31 +1106,6 @@ impl WorkerManager {
         (removed, affected_blocks)
     }
 
-    /// Get worker info by combining persisted descriptor and current runtime state.
-    pub fn get_worker(&self, group_name: &GroupName, worker_id: WorkerId) -> Option<WorkerInfo> {
-        let descriptors = self.descriptors.read();
-        let runtime = self.runtime.read();
-        let key = WorkerRegistrationKey::new(group_name, worker_id);
-
-        let descriptor = descriptors.get(&key)?;
-        let runtime_data = runtime.get(&key)?;
-
-        Some(WorkerInfo {
-            group_name: descriptor.group_name.clone(),
-            worker_id: descriptor.worker_id,
-            address: descriptor.address.clone(),
-            worker_net_protocol: descriptor.worker_net_protocol,
-            capacity_total: runtime_data.capacity_total,
-            capacity_used: runtime_data.capacity_used,
-            capacity_available: runtime_data.capacity_available,
-            active_reads: runtime_data.active_reads,
-            active_writes: runtime_data.active_writes,
-            health: runtime_data.health,
-            last_heartbeat: runtime_data.last_seen_ms / 1000, // Convert ms to seconds
-            fault_domain: descriptor.fault_domain.clone(),
-        })
-    }
-
     /// List all live workers (based on runtime last_seen_ms), preserving group identity.
     pub fn list_live_workers(&self) -> Vec<WorkerRegistrationKey> {
         let runtime = self.runtime.read();
@@ -1262,12 +1151,6 @@ impl WorkerManager {
             .unwrap_or(false)
     }
 
-    /// List persisted worker descriptors. Descriptors are not active runtime state.
-    pub fn list_worker_descriptors(&self) -> Vec<WorkerRegistrationKey> {
-        let descriptors = self.descriptors.read();
-        descriptors.keys().cloned().collect()
-    }
-
     /// Build the placement worker view from group-scoped registration and heartbeat state.
     pub fn collect_worker_placement_views(&self, group_name: &GroupName) -> Vec<WorkerPlacementView> {
         let descriptors = self.descriptors.read();
@@ -1298,19 +1181,12 @@ impl WorkerManager {
                 az: None,
                 rack: descriptor.fault_domain.clone(),
                 region: None,
-                free_bytes: live.map(|runtime| runtime.capacity_available),
                 tier_free: live.map(|runtime| runtime.tier_free.clone()).unwrap_or_default(),
                 supported_block_formats: vec![BlockFormatId::CURRENT_FOR_NEW_FILE],
             });
         }
         views.sort_by_key(|view| view.worker_id.as_raw());
         views
-    }
-
-    /// List group-qualified reported blocks for background scans.
-    pub fn list_reported_blocks(&self) -> Vec<BlockLocationKey> {
-        let locations = self.locations.read();
-        locations.keys().cloned().collect()
     }
 
     /// Get block locations for one metadata group (only live workers in that group).
@@ -1369,15 +1245,6 @@ impl WorkerManager {
         }
         reported.sort_by_key(|location| location.worker_id.as_raw());
         reported
-    }
-
-    /// Get all blocks for a worker.
-    pub fn get_worker_blocks(&self, group_name: &GroupName, worker_id: WorkerId) -> Vec<BlockId> {
-        self.block_reports
-            .read()
-            .get(&WorkerRegistrationKey::new(group_name, worker_id))
-            .map(|report| report.ready_blocks.iter().copied().collect())
-            .unwrap_or_default()
     }
 
     /// Captures the inclusive Worker end of the group's current report keyspace.
@@ -1749,14 +1616,15 @@ mod tests {
     //! Tests for worker manager and registration.
 
     use super::{
-        BlockReportBlock, BlockReportBlockState, BlockReportDeltaEntry, BlockReportDeltaOp, HealthStatus,
-        PublishReadyConflict, PublishReadyStatus, PublishReadyTarget, WorkerManager, WorkerRegistrationKey,
+        BlockReportBlock, BlockReportBlockState, BlockReportDeltaEntry, BlockReportDeltaOp, PublishReadyConflict,
+        PublishReadyStatus, PublishReadyTarget, WorkerManager, WorkerRegistrationKey,
     };
     use crate::error::MetadataError;
     use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
     use beryl_types::lease::FencingToken;
     use beryl_types::{
-        BlockFormatId, ClientId, GroupName, Tier, WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId, WriteTarget,
+        BlockFormatId, ClientId, GroupName, Tier, TierFree, WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId,
+        WriteTarget,
     };
     use std::time::{Duration, Instant};
 
@@ -1782,6 +1650,31 @@ mod tests {
         }
     }
 
+    fn record_heartbeat(
+        manager: &WorkerManager,
+        group_name: &GroupName,
+        worker_id: WorkerId,
+        worker_run_id: WorkerRunId,
+        heartbeat_seq: u64,
+        free_bytes: u64,
+    ) -> crate::MetadataResult<super::WorkerLiveState> {
+        let descriptor = manager
+            .get_descriptor(group_name, worker_id)
+            .expect("worker descriptor should be registered");
+        manager.record_heartbeat_with_tier_free(
+            group_name,
+            worker_id,
+            worker_run_id,
+            heartbeat_seq,
+            &descriptor.address,
+            descriptor.worker_net_protocol,
+            vec![TierFree {
+                tier: Tier::Hdd,
+                free_bytes,
+            }],
+        )
+    }
+
     fn register_live_report_worker(
         manager: &WorkerManager,
         group_name: &GroupName,
@@ -1791,22 +1684,7 @@ mod tests {
         manager
             .register_worker_run(group_name, worker_id, "127.0.0.1:9090".to_string(), 1, run_id, None)
             .unwrap();
-        manager
-            .record_heartbeat(
-                group_name,
-                worker_id,
-                run_id,
-                1,
-                "127.0.0.1:9090",
-                1,
-                1_000,
-                100,
-                900,
-                0,
-                0,
-                HealthStatus::Healthy,
-            )
-            .unwrap();
+        record_heartbeat(manager, group_name, worker_id, run_id, 1, 900).unwrap();
     }
 
     fn publication_target(
@@ -2190,26 +2068,10 @@ mod tests {
             second_run_id
         );
         assert!(!manager.is_worker_live(&group_name_value, worker_id));
-        assert!(manager.needs_full_block_report(&group_name_value, worker_id));
-        assert!(manager.get_worker_blocks(&group_name_value, worker_id).is_empty());
         assert!(manager
             .get_block_locations(&group_name_value, report_block(0).block_id)
             .is_empty());
-        let old_heartbeat = manager
-            .record_heartbeat(
-                &group_name_value,
-                worker_id,
-                first_run_id,
-                2,
-                "127.0.0.1:9090",
-                1,
-                1_000,
-                100,
-                900,
-                0,
-                0,
-                HealthStatus::Healthy,
-            )
+        let old_heartbeat = record_heartbeat(&manager, &group_name_value, worker_id, first_run_id, 2, 900)
             .expect_err("old worker_run_id must be fenced after replacement");
         assert!(matches!(old_heartbeat, MetadataError::StaleState(_)));
         assert!(old_heartbeat.to_string().contains("worker_run_id mismatch"));
@@ -2228,22 +2090,7 @@ mod tests {
         assert!(matches!(old_report, MetadataError::StaleState(_)));
         assert!(old_report.to_string().contains("worker_run_id mismatch"));
 
-        manager
-            .record_heartbeat(
-                &group_name_value,
-                worker_id,
-                second_run_id,
-                1,
-                "127.0.0.1:9090",
-                1,
-                1_000,
-                100,
-                900,
-                0,
-                0,
-                HealthStatus::Healthy,
-            )
-            .unwrap();
+        record_heartbeat(&manager, &group_name_value, worker_id, second_run_id, 1, 900).unwrap();
         let delta = manager
             .apply_delta_block_report(
                 &group_name_value,
@@ -2278,49 +2125,22 @@ mod tests {
             )
             .unwrap();
 
-        let first = manager
-            .record_heartbeat(
-                &group_name_value,
-                worker_id,
-                run_id,
-                10,
-                "127.0.0.1:9090",
-                1,
-                1_000,
-                100,
-                900,
-                2,
-                1,
-                HealthStatus::Healthy,
-            )
-            .unwrap();
+        let first = record_heartbeat(&manager, &group_name_value, worker_id, run_id, 10, 900).unwrap();
         assert_eq!(first.heartbeat_seq, 10);
-        assert_eq!(
-            manager.get_worker(&group_name_value, worker_id).unwrap().capacity_total,
-            1_000
-        );
 
-        let stale = manager
-            .record_heartbeat(
-                &group_name_value,
-                worker_id,
-                run_id,
-                9,
-                "127.0.0.1:9090",
-                1,
-                2_000,
-                1_000,
-                1_000,
-                9,
-                9,
-                HealthStatus::Unhealthy,
-            )
-            .unwrap();
+        let stale = record_heartbeat(&manager, &group_name_value, worker_id, run_id, 9, 1_000).unwrap();
         assert_eq!(stale.heartbeat_seq, 10);
 
-        let worker = manager.get_worker(&group_name_value, worker_id).unwrap();
-        assert_eq!(worker.capacity_total, 1_000);
-        assert_eq!(worker.active_reads, 2);
-        assert_eq!(worker.health, HealthStatus::Healthy);
+        let runtime = manager.runtime.read();
+        let worker = runtime
+            .get(&WorkerRegistrationKey::new(&group_name_value, worker_id))
+            .unwrap();
+        assert_eq!(
+            worker.tier_free,
+            vec![TierFree {
+                tier: Tier::Hdd,
+                free_bytes: 900,
+            }]
+        );
     }
 }

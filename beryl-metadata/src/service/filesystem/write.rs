@@ -1284,20 +1284,13 @@ mod tests {
         assert_eq!(first_next_index, Some(1));
 
         let worker_id = WorkerId::new(1);
-        worker_manager
-            .register_worker(&group_name_value, worker_id, "127.0.0.1:9001".to_string(), 1, None)
-            .unwrap();
-        record_worker_heartbeat(
+        register_worker_descriptor(
             &worker_manager,
             &group_name_value,
             worker_id,
-            1024 * 1024,
-            0,
-            1024 * 1024,
-            0,
-            0,
-            HealthStatus::Healthy,
+            "127.0.0.1:9001".to_string(),
         );
+        record_worker_heartbeat(&worker_manager, &group_name_value, worker_id, 1024 * 1024);
 
         let target = filesystem
             .add_block_session(

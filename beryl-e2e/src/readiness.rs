@@ -121,13 +121,16 @@ pub async fn converge_block_reports(
     if round.accepted_peers == 0 || round.needs_register || round.worker_run_mismatch {
         return Err(format!("full block report did not converge: {round:?}").into());
     }
-    let ready_block_count = block_store.scan_group_blocks(group_name)?.len();
+    let ready_blocks = block_store.scan_group_blocks(group_name)?;
     ReadinessCheck::startup("block report convergence")
         .wait_for(|| {
             registration_state.is_ready(group_name)
                 && worker_manager.is_worker_live(group_name, worker_id)
-                && !worker_manager.needs_full_block_report(group_name, worker_id)
-                && worker_manager.list_reported_blocks().len() >= ready_block_count
+                && ready_blocks.iter().all(|block| {
+                    worker_manager
+                        .get_block_locations(group_name, block.identity.block_id)
+                        .contains(&worker_id)
+                })
         })
         .await
 }

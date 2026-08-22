@@ -106,21 +106,6 @@ impl From<ByteRange> for proto_common::ByteRangeProto {
     }
 }
 
-impl From<&proto_common::ByteRangeProto> for ByteRange {
-    fn from(range: &proto_common::ByteRangeProto) -> Self {
-        ByteRange {
-            offset: range.offset,
-            len: range.len,
-        }
-    }
-}
-
-impl From<proto_common::ByteRangeProto> for ByteRange {
-    fn from(range: proto_common::ByteRangeProto) -> Self {
-        ByteRange::from(&range)
-    }
-}
-
 impl TryFrom<proto_common::FileLayoutProto> for FileLayout {
     type Error = String;
 
@@ -740,37 +725,6 @@ impl From<&ResponseHeader> for proto_common::ResponseHeaderProto {
             mount_epoch: header.mount_epoch,
             route_epoch: header.route_epoch,
             group_name: header.group_name.as_ref().map(ToString::to_string).unwrap_or_default(),
-        }
-    }
-}
-
-// ============================================================================
-// CallerContextProto Conversions
-// ============================================================================
-
-impl From<&CallerContext> for proto_common::CallerContextProto {
-    fn from(ctx: &CallerContext) -> Self {
-        proto_common::CallerContextProto {
-            context: ctx.context.clone(),
-        }
-    }
-}
-
-impl From<proto_common::CallerContextProto> for CallerContext {
-    fn from(proto: proto_common::CallerContextProto) -> Self {
-        CallerContext { context: proto.context }
-    }
-}
-
-// ============================================================================
-// DataRequestHeaderProto Conversions
-// ============================================================================
-
-impl From<&RequestHeader> for crate::worker::DataRequestHeaderProto {
-    fn from(header: &RequestHeader) -> Self {
-        crate::worker::DataRequestHeaderProto {
-            client: Some((&header.client).into()),
-            trace_context: proto_trace_context(&header.trace_context),
         }
     }
 }

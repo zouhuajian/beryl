@@ -14,7 +14,6 @@ use rand::Rng;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Notify;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -79,17 +78,6 @@ pub struct RootReadinessLogFields {
     pub storage_dir: String,
 }
 
-impl RootReadinessLogFields {
-    pub fn unknown(namespace_owner_group_name: &GroupName) -> Self {
-        Self {
-            cluster_id: "unknown".to_string(),
-            group_name: namespace_owner_group_name.to_string(),
-            node_id: 0,
-            storage_dir: "unknown".to_string(),
-        }
-    }
-}
-
 /// Sticky authority gate shared by filesystem RPCs and process readiness.
 ///
 /// Ready transitions hold the state lock through atomic publication, while a
@@ -98,7 +86,6 @@ pub struct RootReadinessGate {
     ready: AtomicUsize,
     shutting_down: AtomicBool,
     state: RwLock<RootReadinessState>,
-    notify: Notify,
     metrics: Option<Arc<MetadataMetrics>>,
 }
 
@@ -112,7 +99,6 @@ impl RootReadinessGate {
             ready: AtomicUsize::new(0),
             shutting_down: AtomicBool::new(false),
             state: RwLock::new(RootReadinessState::Starting),
-            notify: Notify::new(),
             metrics,
         }
     }
@@ -132,7 +118,6 @@ impl RootReadinessGate {
                 metrics.root_ready.store(1, Ordering::Relaxed);
                 observe::record_root_ready(true);
             }
-            self.notify.notify_waiters();
         }
         drop(state);
     }
@@ -167,13 +152,6 @@ impl RootReadinessGate {
 
     pub fn state(&self) -> RootReadinessState {
         self.state.read().clone()
-    }
-
-    pub async fn wait_ready(&self) {
-        if self.is_ready() {
-            return;
-        }
-        self.notify.notified().await;
     }
 }
 
