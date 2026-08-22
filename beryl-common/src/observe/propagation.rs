@@ -3,7 +3,6 @@
 
 //! Context propagation for distributed tracing.
 
-use std::collections::HashMap;
 use std::str::FromStr;
 
 /// Trait for setting trace context in a carrier (e.g., gRPC metadata).
@@ -73,89 +72,5 @@ impl CarrierGet for tonic::metadata::MetadataMap {
     fn get(&self, key: &str) -> Option<&str> {
         let key = tonic::metadata::MetadataKey::from_bytes(key.as_bytes()).ok()?;
         self.get(key)?.to_str().ok()
-    }
-}
-
-/// gRPC metadata adapter for context propagation.
-///
-/// Note: This module requires tonic to be available in the crate using it.
-pub mod grpc {
-    use super::{CarrierGet, CarrierSet};
-
-    /// gRPC metadata carrier for setting context.
-    ///
-    /// Usage:
-    /// ```ignore
-    /// use tonic::metadata::MetadataMap;
-    /// let mut metadata = MetadataMap::new();
-    /// let mut carrier = GrpcMetadataSet::new(&mut metadata);
-    /// carrier.set("traceparent", "...");
-    /// ```
-    pub struct GrpcMetadataSet<'a> {
-        metadata: &'a mut dyn GrpcMetadataMapMut,
-    }
-
-    pub trait GrpcMetadataMapMut {
-        fn insert_str(&mut self, key: &str, value: &str);
-    }
-
-    impl<'a> GrpcMetadataSet<'a> {
-        pub fn new(metadata: &'a mut dyn GrpcMetadataMapMut) -> Self {
-            Self { metadata }
-        }
-    }
-
-    impl<'a> CarrierSet for GrpcMetadataSet<'a> {
-        fn set(&mut self, key: &str, value: &str) {
-            self.metadata.insert_str(key, value);
-        }
-    }
-
-    /// gRPC metadata carrier for getting context.
-    pub struct GrpcMetadataGet<'a> {
-        metadata: &'a dyn GrpcMetadataMap,
-    }
-
-    pub trait GrpcMetadataMap {
-        fn get_str(&self, key: &str) -> Option<&str>;
-    }
-
-    impl<'a> GrpcMetadataGet<'a> {
-        pub fn new(metadata: &'a dyn GrpcMetadataMap) -> Self {
-            Self { metadata }
-        }
-    }
-
-    impl<'a> CarrierGet for GrpcMetadataGet<'a> {
-        fn get(&self, key: &str) -> Option<&str> {
-            self.metadata.get_str(key)
-        }
-    }
-}
-
-/// Simple HashMap-based carrier for testing.
-pub struct HashMapCarrier(HashMap<String, String>);
-
-impl HashMapCarrier {
-    pub fn new() -> Self {
-        Self(HashMap::new())
-    }
-}
-
-impl CarrierSet for HashMapCarrier {
-    fn set(&mut self, key: &str, value: &str) {
-        self.0.insert(key.to_string(), value.to_string());
-    }
-}
-
-impl CarrierGet for HashMapCarrier {
-    fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key).map(|s| s.as_str())
-    }
-}
-
-impl Default for HashMapCarrier {
-    fn default() -> Self {
-        Self::new()
     }
 }

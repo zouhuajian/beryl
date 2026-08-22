@@ -259,7 +259,6 @@ dependencies = [
  "beryl-types",
  "bytes",
  "chrono",
- "fastrand",
  "futures",
  "http",
  "http-body-util",

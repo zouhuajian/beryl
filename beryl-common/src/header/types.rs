@@ -295,38 +295,6 @@ impl RequestHeader {
             caller_context: self.caller_context.clone(),
         }
     }
-
-    /// Convert RequestHeader to gRPC metadata for propagation.
-    ///
-    /// This function creates metadata entries for:
-    /// - x-call-id: Call ID (UUID string)
-    /// - x-client-id: Client ID (u128 as string)
-    /// - x-state-id: Group state watermarks as group:term:leader_node_id:index entries
-    /// - traceparent/tracestate/baggage: W3C Trace Context (if present)
-    /// - grpc-timeout: Deadline as gRPC timeout format (e.g., "30S")
-    ///
-    /// Returns a vector of (key, value) pairs suitable for use with tonic::metadata::MetadataMap.
-    pub fn to_grpc_metadata(&self) -> Vec<(String, String)> {
-        use crate::header::RequestHeaderCodec;
-        RequestHeaderCodec::encode_to_headers(self)
-    }
-
-    /// Parse RequestHeader from gRPC metadata.
-    ///
-    /// This function extracts:
-    /// - x-call-id: Call ID
-    /// - x-client-id: Client ID
-    /// - x-state-id: Group state watermarks as group:term:leader_node_id:index entries
-    /// - traceparent/tracestate/baggage: W3C Trace Context
-    /// - grpc-timeout: Deadline (converted from timeout to absolute deadline)
-    ///
-    pub fn from_grpc_metadata<I>(iter: I) -> Result<Self, String>
-    where
-        I: Iterator<Item = (String, String)>,
-    {
-        use crate::header::RequestHeaderCodec;
-        RequestHeaderCodec::decode_from_headers(iter)
-    }
 }
 
 impl ResponseHeader {
