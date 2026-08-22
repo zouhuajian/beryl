@@ -39,7 +39,7 @@ impl MetadataFileSystem {
         ctx: &RequestContext,
         args: CreateDirectoryArgs,
     ) -> FsResult<CreateDirectoryOutput> {
-        if let Err(failure) = self.admission.check_meta_write(ctx).await {
+        if let Err(failure) = self.admission.check_meta_write(ctx) {
             return self.failure_from_admission(failure);
         }
         let _topology_guard = self.namespace_topology.read().await;
@@ -191,7 +191,7 @@ impl MetadataFileSystem {
                 return self.failure_from_error(ctx, err, Some(routed.group_name.clone()), Some(routed.mount_epoch));
             }
         };
-        self.success(ctx, result, Some(routed.group_name), Some(routed.mount_epoch))
+        self.success(result, Some(routed.group_name), Some(routed.mount_epoch))
     }
 
     /// Resolve and commit a rename under exclusive namespace-topology admission.
@@ -199,7 +199,7 @@ impl MetadataFileSystem {
     /// The exclusive guard prevents new path-bound sessions or creates from
     /// crossing the subtree writer checks and the Raft proposal.
     pub(crate) async fn rename(&self, ctx: &RequestContext, args: RenameArgs) -> FsResult<()> {
-        if let Err(failure) = self.admission.check_meta_write(ctx).await {
+        if let Err(failure) = self.admission.check_meta_write(ctx) {
             return self.failure_from_admission(failure);
         }
         let _topology_guard = self.namespace_topology.write().await;
@@ -438,17 +438,17 @@ impl MetadataFileSystem {
             })
             .await;
 
-        self.rename_result(request_ctx, &ctx, result)
+        self.routed_unit_result(request_ctx, &ctx, result)
     }
 
-    fn rename_result(
+    fn routed_unit_result(
         &self,
         request_ctx: &RequestContext,
         ctx: &super::RoutedFsWriteCtx,
         result: MetadataResult<()>,
     ) -> FsResult<()> {
         match result {
-            Ok(()) => self.success(request_ctx, (), Some(ctx.group_name.clone()), Some(ctx.mount_epoch)),
+            Ok(()) => self.success((), Some(ctx.group_name.clone()), Some(ctx.mount_epoch)),
             Err(error) => {
                 self.failure_from_error(request_ctx, error, Some(ctx.group_name.clone()), Some(ctx.mount_epoch))
             }
@@ -510,7 +510,7 @@ impl MetadataFileSystem {
     }
 
     async fn create_file_inner(&self, ctx: &RequestContext, args: CreateFileArgs) -> FsResult<CreatedFileOutput> {
-        if let Err(failure) = self.admission.check_meta_write(ctx).await {
+        if let Err(failure) = self.admission.check_meta_write(ctx) {
             return self.failure_from_admission(failure);
         }
         let _topology_guard = self.namespace_topology.read().await;
@@ -553,7 +553,7 @@ impl MetadataFileSystem {
                 Some(&resolved.mount_ctx),
             );
         };
-        if let Err(failure) = self.admission.check_data_write(ctx, resolved.mount_ctx.mount_id).await {
+        if let Err(failure) = self.admission.check_data_write(ctx, resolved.mount_ctx.mount_id) {
             return self.failure_from_admission(failure);
         }
         let success = self
@@ -602,7 +602,7 @@ impl MetadataFileSystem {
             }
         };
 
-        self.success(request_ctx, result, Some(ctx.group_name.clone()), Some(ctx.mount_epoch))
+        self.success(result, Some(ctx.group_name.clone()), Some(ctx.mount_epoch))
     }
 }
 
@@ -621,7 +621,7 @@ impl MetadataFileSystem {
     /// A successful result means the namespace mutation committed. Physical
     /// block reclamation follows the configured cleanup grace asynchronously.
     pub(crate) async fn delete(&self, ctx: &RequestContext, args: DeleteArgs) -> FsResult<()> {
-        if let Err(failure) = self.admission.check_meta_write(ctx).await {
+        if let Err(failure) = self.admission.check_meta_write(ctx) {
             return self.failure_from_admission(failure);
         }
         let _topology_guard = self.namespace_topology.write().await;
@@ -753,7 +753,7 @@ impl MetadataFileSystem {
                 unexpected => Err(unexpected_raft_apply_success("Delete", unexpected)),
             })
             .await;
-        self.delete_result(request_ctx, &ctx, result)
+        self.routed_unit_result(request_ctx, &ctx, result)
     }
 
     /// Read the persisted file fencing epoch used by delete apply preconditions.
@@ -761,20 +761,6 @@ impl MetadataFileSystem {
         match &inode.data {
             beryl_types::fs::InodeData::File { lease_epoch, .. } => lease_epoch.unwrap_or(0),
             _ => 0,
-        }
-    }
-
-    fn delete_result(
-        &self,
-        request_ctx: &RequestContext,
-        ctx: &super::RoutedFsWriteCtx,
-        result: MetadataResult<()>,
-    ) -> FsResult<()> {
-        match result {
-            Ok(()) => self.success(request_ctx, (), Some(ctx.group_name.clone()), Some(ctx.mount_epoch)),
-            Err(error) => {
-                self.failure_from_error(request_ctx, error, Some(ctx.group_name.clone()), Some(ctx.mount_epoch))
-            }
         }
     }
 }

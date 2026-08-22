@@ -84,34 +84,11 @@ fn client_from_request_header(
         .and_then(|client| beryl_common::header::ClientInfo::try_from(client).ok())
 }
 
-pub(crate) fn ok_header_from_context(
-    ctx: &RequestContext,
-    group_name: Option<GroupName>,
-    mount_epoch: Option<u64>,
-    route_epoch: Option<u64>,
-    state: Vec<GroupStateWatermark>,
-) -> beryl_proto::common::ResponseHeaderProto {
-    build_base_response_header(ctx, group_name, mount_epoch, route_epoch, state)
-}
-
-pub(crate) fn header_from_rpc_error_with_context(
-    ctx: &RequestContext,
-    group_name: Option<GroupName>,
-    mount_epoch: Option<u64>,
-    route_epoch: Option<u64>,
-    state: Vec<GroupStateWatermark>,
-    err: &RpcErrorDetail,
-) -> beryl_proto::common::ResponseHeaderProto {
-    let mut header = build_base_response_header(ctx, group_name, mount_epoch, route_epoch, state);
-    header.error = error_detail_from_rpc_error(err);
-    header
-}
-
 pub(crate) fn ok_header_from_fs_success<T>(
     ctx: &RequestContext,
     success: &FsSuccess<T>,
 ) -> beryl_proto::common::ResponseHeaderProto {
-    ok_header_from_context(
+    build_base_response_header(
         ctx,
         success.group_name.clone(),
         success.mount_epoch,
@@ -124,14 +101,15 @@ pub(crate) fn header_from_fs_failure(
     ctx: &RequestContext,
     failure: &FsFailure,
 ) -> beryl_proto::common::ResponseHeaderProto {
-    header_from_rpc_error_with_context(
+    let mut header = build_base_response_header(
         ctx,
         failure.group_name.clone(),
         failure.mount_epoch,
         failure.route_epoch,
         failure.state.clone(),
-        &failure.error,
-    )
+    );
+    header.error = error_detail_from_rpc_error(&failure.error);
+    header
 }
 
 pub(crate) fn ok_header_from_request(

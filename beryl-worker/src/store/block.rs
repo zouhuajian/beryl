@@ -441,7 +441,7 @@ impl FullBlockFileStore {
         let len = usize::try_from(len).map_err(|_| invalid_argument("read length does not fit in usize"))?;
         let mut buf = vec![0; len];
         file.read_exact(&mut buf)
-            .map_err(|err| map_data_read_error(err, "ready range is not present in block data file"))?;
+            .map_err(|err| map_truncated_read_error(err, "ready range is not present in block data file"))?;
         Ok(Bytes::from(buf))
     }
 
@@ -1179,14 +1179,14 @@ fn read_meta_payload(path: &Path) -> StoreResult<Vec<u8>> {
     let mut file = File::open(path)?;
     let mut encoded_header = [0u8; BLOCK_META_HEADER_LEN];
     file.read_exact(&mut encoded_header)
-        .map_err(|err| map_meta_read_error(err, "block meta file is shorter than the header"))?;
+        .map_err(|err| map_truncated_read_error(err, "block meta file is shorter than the header"))?;
 
     let header = BlockMetaHeader::decode(&encoded_header)?;
     header.validate()?;
     let payload_len = usize::try_from(header.payload_len).map_err(|_| corrupt("meta payload length is too large"))?;
     let mut payload = vec![0; payload_len];
     file.read_exact(&mut payload)
-        .map_err(|err| map_meta_read_error(err, "block meta payload is shorter than declared length"))?;
+        .map_err(|err| map_truncated_read_error(err, "block meta payload is shorter than declared length"))?;
     let mut trailing = [0u8; 1];
     if file.read(&mut trailing)? != 0 {
         return Err(corrupt("block meta file has trailing bytes"));
@@ -1433,15 +1433,7 @@ fn map_staging_data_open_error(err: std::io::Error, message: &str) -> WorkerErro
     }
 }
 
-fn map_data_read_error(err: std::io::Error, message: &str) -> WorkerError {
-    if err.kind() == std::io::ErrorKind::UnexpectedEof {
-        corrupt(message)
-    } else {
-        WorkerError::from(err)
-    }
-}
-
-fn map_meta_read_error(err: std::io::Error, message: &str) -> WorkerError {
+fn map_truncated_read_error(err: std::io::Error, message: &str) -> WorkerError {
     if err.kind() == std::io::ErrorKind::UnexpectedEof {
         corrupt(message)
     } else {

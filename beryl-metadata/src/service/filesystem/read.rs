@@ -132,7 +132,7 @@ pub(crate) struct GetBlockLocationsOutput {
 
 impl MetadataFileSystem {
     pub(crate) async fn get_status(&self, ctx: &RequestContext, args: GetStatusArgs) -> FsResult<GetStatusOutput> {
-        if let Err(failure) = self.admission.check_meta_read(ctx).await {
+        if let Err(failure) = self.admission.check_meta_read() {
             return self.failure_from_admission(failure);
         }
         let resolved = match self.path_resolver.resolve_path(&args.path) {
@@ -166,7 +166,7 @@ impl MetadataFileSystem {
 
     /// Resolves a directory path and returns one bounded weakly consistent page.
     pub(crate) async fn list_status(&self, ctx: &RequestContext, args: ListStatusArgs) -> FsResult<ListStatusOutput> {
-        if let Err(failure) = self.admission.check_meta_read(ctx).await {
+        if let Err(failure) = self.admission.check_meta_read() {
             return self.failure_from_admission(failure);
         }
         let resolved = match self.path_resolver.resolve_path(&args.path) {
@@ -210,7 +210,7 @@ impl MetadataFileSystem {
     }
 
     pub(crate) async fn open_file(&self, ctx: &RequestContext, args: OpenFileArgs) -> FsResult<OpenFileOutput> {
-        if let Err(failure) = self.admission.check_meta_read(ctx).await {
+        if let Err(failure) = self.admission.check_meta_read() {
             return self.failure_from_admission(failure);
         }
         let resolved = match self.path_resolver.resolve_path(&args.path) {
@@ -224,7 +224,7 @@ impl MetadataFileSystem {
                 Some(&resolved.mount_ctx),
             );
         };
-        if let Err(failure) = self.admission.check_data_read(ctx, resolved.mount_ctx.mount_id).await {
+        if let Err(failure) = self.admission.check_data_read(resolved.mount_ctx.mount_id) {
             return self.failure_from_admission(failure);
         }
 
@@ -253,7 +253,7 @@ impl MetadataFileSystem {
         ctx: &RequestContext,
         args: GetBlockLocationsArgs,
     ) -> FsResult<GetBlockLocationsOutput> {
-        if let Err(failure) = self.admission.check_meta_read(ctx).await {
+        if let Err(failure) = self.admission.check_meta_read() {
             return self.failure_from_admission(failure);
         }
 
@@ -270,14 +270,14 @@ impl MetadataFileSystem {
                         Some(&resolved.mount_ctx),
                     );
                 };
-                if let Err(failure) = self.admission.check_data_read(ctx, resolved.mount_ctx.mount_id).await {
+                if let Err(failure) = self.admission.check_data_read(resolved.mount_ctx.mount_id) {
                     return self.failure_from_admission(failure);
                 }
                 inode_id
             }
             BlockLocationsTarget::InodeId(inode_id) => {
                 let mount_id = self.plan_inode_mount(ctx, inode_id).await?.payload.mount_id;
-                if let Err(failure) = self.admission.check_data_read(ctx, mount_id).await {
+                if let Err(failure) = self.admission.check_data_read(mount_id) {
                     return self.failure_from_admission(failure);
                 }
                 inode_id
@@ -483,7 +483,6 @@ impl MetadataFileSystem {
             );
         }
         self.success(
-            req_ctx,
             InodeMountGuardInputs {
                 mount_id: inode.mount_id,
             },
@@ -512,7 +511,6 @@ impl MetadataFileSystem {
                 .validate_read_freshness_for_mount(&req.ctx, req.freshness, inode.mount_id, "GetStatus")
                 .await?;
             self.success_with_route_epoch(
-                &req.ctx,
                 GetAttrOutput {
                     attrs: inode.attrs.clone(),
                 },
@@ -599,7 +597,6 @@ impl MetadataFileSystem {
             }
 
             self.success_with_route_epoch(
-                &req.ctx,
                 ReadDirOutput {
                     entries: dir_entries,
                     next_cursor_key: next_cursor_key.unwrap_or_default(),
@@ -866,7 +863,6 @@ impl MetadataFileSystem {
             }
 
             self.success_with_route_epoch(
-                &req.ctx,
                 GetFileLayoutOutput {
                     file_size: inode.attrs.size,
                     content_revision,
