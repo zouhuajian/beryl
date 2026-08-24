@@ -12,4 +12,4 @@ pub(crate) mod gateway;
 pub(crate) mod model;
 
 pub(crate) use gateway::{GrpcMetadataGateway, MetadataGateway};
-pub(crate) use model::{AddBlockResult, ReadLayout};
+pub(crate) use model::{AddBlockResult, MetadataAuthorityUpdate, ReadLayout, ValidatedMetadataResponse};

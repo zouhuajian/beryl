@@ -3,10 +3,6 @@
 
 //! Client-side caching for metadata freshness.
 
-pub(crate) mod state_id;
-
-pub(crate) use state_id::StateIdCache;
-
 /// Low-cardinality cache invalidation reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CacheInvalidationReason {
