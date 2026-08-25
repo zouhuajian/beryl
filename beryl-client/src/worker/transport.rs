@@ -1,18 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Worker data-plane orchestration owned by the client crate.
+//! Worker transport implementation and block-local RPC lifecycle.
 
-use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures::stream;
 use tokio::sync::watch;
 
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
-use beryl_types::{GroupName, WriteTarget};
+use beryl_types::GroupName;
 
 use super::channel_pool::GrpcWorkerChannelPool;
 use super::protocol::{
@@ -20,19 +18,20 @@ use super::protocol::{
     is_transient_worker_transport_status, parse_worker_data_status, read_block_stream_to_bytes,
 };
 use super::{
-    duration_until_unix_ms, write_lease_expired_error, BlockWrite, BlockWriteInput, BlockWriteLease, WorkerDataClient,
-    WorkerReadResult, WorkerWriteTarget,
+    duration_until_unix_ms, write_lease_expired_error, BlockWrite, BlockWriteInput, BlockWriteLease, WorkerReadResult,
+    WorkerTransport, WorkerWriteTarget,
 };
 use crate::cache::CacheInvalidationReason;
 use crate::config::ClientConfig;
-use crate::error::{read_buffer_reservation_failed, ClientError, ClientResult};
-use crate::metrics::{ClientMetrics, NoopClientMetrics};
+use crate::error::{ClientError, ClientResult};
+use crate::metrics::ClientMetrics;
 use crate::planner::{block_location_unavailable_error, PlannedBlockRead};
 use crate::runtime::{classify_error, is_worker_capacity_before_side_effect_rejection, AttemptContext, ErrorClass};
 
-/// Concrete gRPC implementation of the client-side Worker data plane.
+/// Executes one block-local operation against Metadata-authorized Worker
+/// candidates and owns channel health plus wire validation.
 #[derive(Debug)]
-struct GrpcWorkerDataClient {
+pub(super) struct GrpcWorkerTransport {
     channel_pool: Arc<GrpcWorkerChannelPool>,
 }
 
@@ -57,19 +56,16 @@ impl Drop for OpeningWriteCancellation {
     }
 }
 
-impl GrpcWorkerDataClient {
-    fn new() -> Self {
-        Self {
-            channel_pool: Arc::new(GrpcWorkerChannelPool::new(true, 1, Arc::new(NoopClientMetrics))),
-        }
-    }
-
-    fn from_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> Self {
+impl GrpcWorkerTransport {
+    /// Builds the production Worker transport and its bounded channel pool.
+    pub(super) fn from_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> Self {
         Self {
             channel_pool: Arc::new(GrpcWorkerChannelPool::from_config(config, metrics)),
         }
     }
 
+    /// Orders candidates by observed channel health without inventing targets
+    /// beyond Metadata's authorized list.
     fn worker_candidates<'a>(
         &self,
         workers: &'a [beryl_types::WorkerEndpointInfo],
@@ -322,7 +318,7 @@ async fn wait_for_write_completion(
                     Ok(Some(_)) => Err(ClientError::UnknownOutcome(
                         "worker WriteBlock returned more than one acknowledgement".to_string(),
                     )),
-                    Err(status) => Err(GrpcWorkerDataClient::map_write_status(
+                    Err(status) => Err(GrpcWorkerTransport::map_write_status(
                         channel_pool.as_ref(),
                         &attempt,
                         &worker,
@@ -354,7 +350,7 @@ fn is_stale_read_location_error(error: &ClientError) -> bool {
 }
 
 #[async_trait]
-impl WorkerDataClient for GrpcWorkerDataClient {
+impl WorkerTransport for GrpcWorkerTransport {
     async fn read_block_range(
         &self,
         attempt: AttemptContext,
@@ -434,98 +430,6 @@ impl WorkerDataClient for GrpcWorkerDataClient {
     }
 }
 
-/// Internal worker data-plane holder used by the public facade.
-#[derive(Clone)]
-pub(crate) struct WorkerDataPlane {
-    client: Arc<dyn WorkerDataClient>,
-}
-
-impl WorkerDataPlane {
-    pub(crate) fn new() -> Self {
-        Self::with_client(Arc::new(GrpcWorkerDataClient::new()))
-    }
-
-    pub(crate) fn from_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> Self {
-        Self::with_client(Arc::new(GrpcWorkerDataClient::from_config(config, metrics)))
-    }
-
-    pub(crate) fn with_client(client: Arc<dyn WorkerDataClient>) -> Self {
-        Self { client }
-    }
-
-    /// Reads all planned block-local ranges in file order.
-    pub(crate) async fn read_block_ranges(
-        &self,
-        attempt: AttemptContext,
-        group_name: GroupName,
-        block_reads: &[PlannedBlockRead],
-    ) -> ClientResult<Bytes> {
-        let total_len = block_reads.iter().try_fold(0usize, |total, block_read| {
-            total
-                .checked_add(block_read.len as usize)
-                .ok_or_else(|| ClientError::InvalidLayout("planned read length overflow".to_string()))
-        })?;
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(total_len)
-            .map_err(|error| read_buffer_reservation_failed("read_at", total_len, error))?;
-        for block_read in block_reads {
-            if block_read.block_stamp == 0 {
-                return Err(ClientError::InvalidLayout(
-                    "planned block read has zero block_stamp".to_string(),
-                ));
-            }
-            let expected_end = block_read
-                .file_offset
-                .checked_add(u64::from(block_read.len))
-                .ok_or_else(|| ClientError::InvalidLayout("planned block read end overflow".to_string()))?;
-            if expected_end != block_read.end_file_offset {
-                return Err(ClientError::InvalidLayout(
-                    "planned block read coverage is inconsistent".to_string(),
-                ));
-            }
-            let result = self
-                .client
-                .read_block_range(attempt.clone(), group_name.clone(), block_read)
-                .await?;
-            if result.bytes.len() != block_read.len as usize {
-                return Err(ClientError::Worker(format!(
-                    "worker read returned {} bytes for {} byte block range",
-                    result.bytes.len(),
-                    block_read.len
-                )));
-            }
-            output.extend_from_slice(&result.bytes);
-        }
-        Ok(Bytes::from(output))
-    }
-
-    /// Opens one metadata-authorized block RPC and waits for its staging Ack.
-    pub(crate) async fn open_write_block(
-        &self,
-        attempt: AttemptContext,
-        group_name: GroupName,
-        target: WriteTarget,
-        lease_expires_at_ms: u64,
-    ) -> ClientResult<BlockWrite> {
-        self.client
-            .open_write_block(attempt, WorkerWriteTarget { group_name, target }, lease_expires_at_ms)
-            .await
-    }
-}
-
-impl fmt::Debug for WorkerDataPlane {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("WorkerDataPlane").finish_non_exhaustive()
-    }
-}
-
-impl Default for WorkerDataPlane {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
@@ -547,12 +451,15 @@ mod tests {
     use beryl_types::lease::FencingToken;
     use beryl_types::{
         BlockId, BlockIndex, ClientId, InodeId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol, WorkerRunId,
+        WriteTarget,
     };
+    use bytes::Bytes;
     use prost::Message;
     use tonic::transport::Server;
     use tonic::{Request, Response, Status};
 
     use super::*;
+    use crate::metrics::NoopClientMetrics;
     use crate::runtime::{OperationContext, OperationDeadline};
 
     #[derive(Clone, Copy)]
@@ -742,9 +649,12 @@ mod tests {
         (worker_endpoint(&address.to_string(), worker_id), shutdown_tx)
     }
 
-    fn grpc_client() -> GrpcWorkerDataClient {
-        GrpcWorkerDataClient {
-            channel_pool: Arc::new(GrpcWorkerChannelPool::new(true, 8, Arc::new(NoopClientMetrics))),
+    fn grpc_client() -> GrpcWorkerTransport {
+        let mut config = ClientConfig::default();
+        config.connections.worker_enabled = true;
+        config.connections.worker_max_per_worker = 8;
+        GrpcWorkerTransport {
+            channel_pool: Arc::new(GrpcWorkerChannelPool::from_config(&config, Arc::new(NoopClientMetrics))),
         }
     }
 
