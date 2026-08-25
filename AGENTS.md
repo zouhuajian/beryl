@@ -129,6 +129,10 @@ Production dependency direction must remain clean:
   `#[cfg(test)] mod tests` at the end of the file.
 - When tests are split into separate files, keep the `#[cfg(test)] mod tests;`
   declaration at the end of the production module.
+- Except for the single `#[cfg(test)] mod tests { ... }` or
+  `#[cfg(test)] mod tests;` at the end of a production module, do not place any
+  `#[cfg(test)]` item in production code, including imports, impl blocks,
+  methods, types, constants, or helper functions.
 - Keep test helpers, fixtures, helper implementations, and test-only types
   inside test modules or dedicated test files.
 - Do not add test-only re-exports, visibility widening, getters, injection
