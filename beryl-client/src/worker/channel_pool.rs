@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! gRPC worker channel cache for the client data plane.
+//! gRPC channel ownership and endpoint failure tracking for Worker transport.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,15 +32,6 @@ pub(super) struct GrpcWorkerChannelPool {
 }
 
 impl GrpcWorkerChannelPool {
-    pub(super) fn new(enabled: bool, max_cached_keys_per_worker: usize, metrics: Arc<dyn ClientMetrics>) -> Self {
-        Self::new_with_cooldown_ms(
-            enabled,
-            max_cached_keys_per_worker,
-            crate::config::DEFAULT_WORKER_ENDPOINT_COOLDOWN_MS,
-            metrics,
-        )
-    }
-
     pub(super) fn new_with_cooldown_ms(
         enabled: bool,
         max_cached_keys_per_worker: usize,
@@ -284,8 +275,8 @@ mod tests {
     use beryl_types::{ClientId, WorkerEndpointInfo, WorkerId};
     use std::sync::Mutex;
 
-    use crate::data::protocol::parse_worker_control_header;
     use crate::runtime::{AttemptContext, OperationContext, OperationDeadline};
+    use crate::worker::protocol::parse_worker_control_header;
 
     #[derive(Debug, Default)]
     struct RecordingMetrics {
@@ -304,11 +295,24 @@ mod tests {
         }
     }
 
+    fn test_pool(
+        enabled: bool,
+        max_cached_keys_per_worker: usize,
+        metrics: Arc<dyn ClientMetrics>,
+    ) -> GrpcWorkerChannelPool {
+        GrpcWorkerChannelPool::new_with_cooldown_ms(
+            enabled,
+            max_cached_keys_per_worker,
+            crate::config::DEFAULT_WORKER_ENDPOINT_COOLDOWN_MS,
+            metrics,
+        )
+    }
+
     #[tokio::test]
     async fn concurrent_worker_channel_requests_same_key_reuse_inserted_channel() {
         let task_count = 8;
         let metrics = Arc::new(RecordingMetrics::default());
-        let pool = Arc::new(GrpcWorkerChannelPool::new(true, 8, metrics.clone()));
+        let pool = Arc::new(test_pool(true, 8, metrics.clone()));
         let worker = worker_endpoint();
 
         let mut tasks = Vec::with_capacity(task_count);
@@ -338,7 +342,7 @@ mod tests {
     #[tokio::test]
     async fn worker_run_mismatch_invalidates_target_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let pool = GrpcWorkerChannelPool::new(true, 1, metrics.clone());
+        let pool = test_pool(true, 1, metrics.clone());
         let worker = worker_endpoint();
         let attempt = data_attempt_context();
 

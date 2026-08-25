@@ -3,13 +3,14 @@
 
 //! Client-owned metadata control-plane boundary.
 //!
-//! [`MetadataGateway`] is the metadata RPC boundary used by the public
-//! [`crate::FsClient`] facade. It builds request headers from runtime attempt
-//! context and preserves structured refresh hints for executor replay
-//! decisions. Worker data reads stay behind the internal data boundary.
+//! [`MetadataClient`] owns operation execution, retry, and authority state.
+//! [`MetadataTransport`] owns one selected-endpoint RPC attempt, including
+//! request-header construction and validated wire-response conversion.
 
-pub(crate) mod gateway;
+pub(crate) mod client;
 pub(crate) mod model;
+pub(crate) mod transport;
 
-pub(crate) use gateway::{GrpcMetadataGateway, MetadataGateway};
-pub(crate) use model::{AddBlockResult, MetadataAuthorityUpdate, ReadLayout, ValidatedMetadataResponse};
+pub(crate) use client::MetadataClient;
+pub(crate) use model::{AddBlockResult, MetadataAuthorityUpdate, ReadLayout, ReadSnapshot, ValidatedMetadataResponse};
+pub(crate) use transport::{GrpcMetadataTransport, MetadataTransport};

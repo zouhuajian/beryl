@@ -13,18 +13,16 @@ use super::{
     CreateOptions, DeleteOptions, DirectoryEntry, DirectoryListing, FileReader, FileStatus, FileWriter, ListOptions,
 };
 use crate::api::path::NamespacePathBuf;
+use crate::client_inner::ClientInner;
 use crate::config::ClientConfig;
-use crate::data::WorkerDataPlane;
 use crate::error::{invalid_response, ClientResult};
-use crate::metadata::{GrpcMetadataGateway, MetadataGateway};
 use crate::metrics::{ClientMetrics, NoopClientMetrics};
-use crate::runtime::{ClientRuntime, MetadataTargets};
 
 /// Public filesystem-facing client facade.
 #[derive(Clone)]
 pub struct FsClient {
-    /// Shared runtime state reused by this facade and the handles it opens.
-    pub(crate) runtime: Arc<ClientRuntime>,
+    /// Shared client owner reused by this facade and the handles it opens.
+    pub(crate) inner: Arc<ClientInner>,
 }
 
 /// Owned state for a lazily paginated public directory-entry stream.
@@ -50,44 +48,20 @@ impl FsClient {
 
     /// Create a new filesystem client facade with an injected metrics recorder.
     pub fn try_new_with_metrics(config: ClientConfig, metrics: Arc<dyn ClientMetrics>) -> ClientResult<Self> {
-        let metadata_targets = MetadataTargets::from_config(&config)?;
-        let gateway = Arc::new(GrpcMetadataGateway::new_lazy_with_config(
-            &config,
-            Arc::clone(&metrics),
-        )?);
-        let data_plane = WorkerDataPlane::from_config(&config, Arc::clone(&metrics));
-
-        Self::with_runtime_hooks(config, gateway, metadata_targets, data_plane, metrics)
-    }
-
-    /// Builds a client with injected runtime dependencies for tests and internal wiring.
-    pub(crate) fn with_runtime_hooks(
-        config: ClientConfig,
-        gateway: Arc<dyn MetadataGateway>,
-        metadata_targets: MetadataTargets,
-        data_plane: WorkerDataPlane,
-        metrics: Arc<dyn ClientMetrics>,
-    ) -> ClientResult<Self> {
         Ok(Self {
-            runtime: Arc::new(ClientRuntime::new(
-                config,
-                gateway,
-                metadata_targets,
-                data_plane,
-                metrics,
-            )?),
+            inner: Arc::new(ClientInner::from_config(config, metrics)?),
         })
     }
 
     /// Return the client configuration.
     pub fn config(&self) -> &ClientConfig {
-        &self.runtime.config
+        &self.inner.config
     }
 
-    /// Return file or directory status through the metadata runtime.
+    /// Return file or directory status through the metadata client.
     pub async fn stat(&self, path: &str) -> ClientResult<FileStatus> {
         let path = NamespacePathBuf::parse(path)?;
-        self.runtime.executor.stat(path).await
+        self.inner.metadata.stat(path).await
     }
 
     /// Lists one bounded directory page using explicit pagination options.
@@ -99,7 +73,7 @@ impl FsClient {
     /// A cursor is valid only for the same directory path.
     pub async fn list(&self, path: &str, options: ListOptions) -> ClientResult<DirectoryListing> {
         let path = NamespacePathBuf::parse(path)?;
-        self.runtime.executor.list(path, options).await
+        self.inner.metadata.list(path, options).await
     }
 
     /// Lazily lists directory entries across bounded unary RPC pages.
@@ -136,8 +110,8 @@ impl FsClient {
                 let previous_cursor = state.options.cursor.clone();
                 let page = state
                     .client
-                    .runtime
-                    .executor
+                    .inner
+                    .metadata
                     .list(state.path.clone(), state.options.clone())
                     .await?;
                 if !page.eof && page.next_cursor == previous_cursor {
@@ -155,27 +129,27 @@ impl FsClient {
         .boxed())
     }
 
-    /// Create a directory through the metadata runtime.
+    /// Create a directory through the metadata client.
     /// When `recursive` is true, missing parent directories are created.
     pub async fn mkdirs(&self, path: &str, recursive: bool) -> ClientResult<FileStatus> {
         let path = NamespacePathBuf::parse(path)?;
-        self.runtime.executor.create_directory(path, recursive).await
+        self.inner.metadata.create_directory(path, recursive).await
     }
 
-    /// Delete a file, symlink, or directory through the metadata runtime.
+    /// Delete a file, symlink, or directory through the metadata client.
     ///
     /// Namespace visibility changes atomically at metadata. Physical block
     /// reclamation follows the configured metadata grace period asynchronously.
     pub async fn delete(&self, path: &str, options: DeleteOptions) -> ClientResult<()> {
         let path = NamespacePathBuf::parse(path)?;
-        self.runtime.executor.delete(path, options).await
+        self.inner.metadata.delete(path, options).await
     }
 
-    /// Rename a namespace entry through the metadata runtime.
+    /// Rename a namespace entry through the metadata client.
     pub async fn rename(&self, src: &str, dst: &str) -> ClientResult<()> {
         let src = NamespacePathBuf::parse(src)?;
         let dst = NamespacePathBuf::parse(dst)?;
-        self.runtime.executor.rename(src, dst).await
+        self.inner.metadata.rename(src, dst).await
     }
 
     /// Opens an existing file for reads and returns a file reader.
@@ -184,8 +158,8 @@ impl FsClient {
     /// public read-open options until they carry real behavior.
     pub async fn open(&self, path: &str) -> ClientResult<FileReader> {
         let path = NamespacePathBuf::parse(path)?;
-        let handle = self.runtime.executor.open_file(path).await?;
-        Ok(FileReader::new(Arc::clone(&self.runtime), handle))
+        let handle = self.inner.metadata.open_file(path).await?;
+        Ok(FileReader::new(Arc::clone(&self.inner), handle))
     }
 
     /// Creates a file write session according to the supplied creation options.
@@ -194,8 +168,8 @@ impl FsClient {
     /// creation. Metadata validates and persists the accepted `FileLayout`.
     pub async fn create(&self, path: &str, options: CreateOptions) -> ClientResult<FileWriter> {
         let path = NamespacePathBuf::parse(path)?;
-        let response = self.runtime.executor.create_file(path, options).await?;
-        Ok(FileWriter::new(Arc::clone(&self.runtime), response))
+        let response = self.inner.metadata.create_file(path, options).await?;
+        Ok(FileWriter::new(Arc::clone(&self.inner), response))
     }
 
     /// Opens an append write session for an existing file.
@@ -204,39 +178,40 @@ impl FsClient {
     /// layout override.
     pub async fn append(&self, path: &str) -> ClientResult<FileWriter> {
         let path = NamespacePathBuf::parse(path)?;
-        let response = self.runtime.executor.open_append(path).await?;
-        Ok(FileWriter::new(Arc::clone(&self.runtime), response))
+        let response = self.inner.metadata.open_append(path).await?;
+        Ok(FileWriter::new(Arc::clone(&self.inner), response))
     }
 }
 
 impl fmt::Debug for FsClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FsClient")
-            .field("config", &self.runtime.config)
-            .field("executor", &self.runtime.executor)
-            .field("data_plane", &self.runtime.data_plane)
+            .field("config", &self.inner.config)
+            .field("metadata", &self.inner.metadata)
+            .field("worker", &self.inner.worker)
             .finish_non_exhaustive()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::handle::{ReadHandle, WriteHandle};
+
     use super::super::options::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_REPLICATION};
     use super::*;
     use crate::config::{ClientConfig, MetadataGroupConfig, ReadConfig};
-    use crate::data::{
-        BlockWrite, BlockWriteInput, BlockWriteLease, WorkerDataClient, WorkerDataPlane, WorkerReadResult,
-        WorkerWriteTarget,
-    };
     use crate::error::{ClientError, ClientResult};
     use crate::metadata::{
-        AddBlockResult, MetadataAuthorityUpdate, MetadataGateway, ReadLayout, ValidatedMetadataResponse,
+        AddBlockResult, MetadataAuthorityUpdate, MetadataClient, MetadataTransport, ReadLayout, ReadSnapshot,
+        ValidatedMetadataResponse,
     };
     use crate::planner::PlannedBlockRead;
     use crate::rpc_error::{ClientAction, RefreshHint};
-    use crate::runtime::{classify_error, AttemptContext, ErrorClass, MetadataTargets};
+    use crate::runtime::{classify_error, AttemptContext, ClientIdentity, ErrorClass, MetadataTargets};
     use crate::session::write_session::WriteSession;
+    use crate::worker::{
+        BlockWrite, BlockWriteInput, BlockWriteLease, WorkerClient, WorkerReadResult, WorkerTransport,
+        WorkerWriteTarget,
+    };
     use async_trait::async_trait;
     use beryl_common::error::rpc::{
         ErrorKind, InternalErrorKind, MetadataErrorKind, RefreshHint as RpcRefreshHint, RpcErrorDetail, WorkerErrorKind,
@@ -263,16 +238,17 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn metadata_retry_reuses_call_id_across_transport_and_server_retry() {
-        let gateway = Arc::new(MockGateway::with_get_status_outcomes(vec![
+        let metadata_transport = Arc::new(MockMetadataTransport::with_get_status_outcomes(vec![
             MetadataOutcome::Transport,
             MetadataOutcome::ServerRetry,
             MetadataOutcome::Ok,
         ]));
-        let client = fs_client_with_gateway(test_config_with_retries("root", 3), gateway.clone()).expect("client");
+        let client = fs_client_with_metadata_transport(test_config_with_retries("root", 3), metadata_transport.clone())
+            .expect("client");
 
         client.stat("/alpha").await.expect("third primary attempt succeeds");
 
-        let calls = gateway.calls();
+        let calls = metadata_transport.calls();
         assert_eq!(methods(&calls), vec!["get_status", "get_status", "get_status"]);
         assert!(calls.iter().all(|call| call.call_id == calls[0].call_id));
         assert!(calls.iter().all(|call| call.deadline_ms == calls[0].deadline_ms));
@@ -280,12 +256,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn read_transport_exhaustion_remains_a_transport_error() {
-        let gateway = Arc::new(MockGateway::with_get_status_outcomes(vec![
+        let metadata_transport = Arc::new(MockMetadataTransport::with_get_status_outcomes(vec![
             MetadataOutcome::Transport,
             MetadataOutcome::Transport,
             MetadataOutcome::Transport,
         ]));
-        let client = fs_client_with_gateway(test_config_with_retries("root", 3), gateway.clone()).expect("client");
+        let client = fs_client_with_metadata_transport(test_config_with_retries("root", 3), metadata_transport.clone())
+            .expect("client");
 
         let err = client
             .stat("/alpha")
@@ -293,18 +270,19 @@ mod tests {
             .expect_err("read transport attempts exhausted");
 
         assert_eq!(classify_error(&err), ErrorClass::RetryableTransport);
-        let calls = gateway.calls();
+        let calls = metadata_transport.calls();
         assert_eq!(methods(&calls), vec!["get_status", "get_status", "get_status"]);
         assert!(calls.iter().all(|call| call.call_id == calls[0].call_id));
     }
 
     #[tokio::test(start_paused = true)]
     async fn open_write_transport_ambiguity_fails_closed_without_replay() {
-        let gateway = Arc::new(MockGateway::with_open_write_outcomes(vec![
+        let metadata_transport = Arc::new(MockMetadataTransport::with_open_write_outcomes(vec![
             MetadataOutcome::Transport,
             MetadataOutcome::Ok,
         ]));
-        let client = fs_client_with_gateway(test_config_with_retries("root", 3), gateway.clone()).expect("client");
+        let client = fs_client_with_metadata_transport(test_config_with_retries("root", 3), metadata_transport.clone())
+            .expect("client");
 
         let err = client
             .append("/alpha")
@@ -312,17 +290,19 @@ mod tests {
             .expect_err("OpenWrite transport ambiguity must fail closed");
 
         assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("OpenWrite")));
-        assert_eq!(methods(&gateway.calls()), vec!["open_write"]);
+        assert_eq!(methods(&metadata_transport.calls()), vec!["open_write"]);
     }
 
     #[tokio::test(start_paused = true)]
     async fn unsafe_namespace_mutations_fail_closed_without_transport_replay() {
         for operation in ["create_file", "create_directory", "delete", "rename"] {
-            let gateway = Arc::new(MockGateway::with_mutation_outcomes(vec![
+            let metadata_transport = Arc::new(MockMetadataTransport::with_mutation_outcomes(vec![
                 MetadataOutcome::Transport,
                 MetadataOutcome::Ok,
             ]));
-            let client = fs_client_with_gateway(test_config_with_retries("root", 3), gateway.clone()).expect("client");
+            let client =
+                fs_client_with_metadata_transport(test_config_with_retries("root", 3), metadata_transport.clone())
+                    .expect("client");
 
             let err = match operation {
                 "create_file" => client
@@ -348,69 +328,74 @@ mod tests {
                 matches!(err, ClientError::UnknownOutcome(_)),
                 "unexpected error for {operation}: {err:?}"
             );
-            assert_eq!(methods(&gateway.calls()), vec![operation]);
+            assert_eq!(methods(&metadata_transport.calls()), vec![operation]);
         }
     }
 
     #[tokio::test(start_paused = true)]
     async fn recursive_create_directory_retries_as_an_ensure_operation() {
-        let gateway = Arc::new(MockGateway::with_mutation_outcomes(vec![
+        let metadata_transport = Arc::new(MockMetadataTransport::with_mutation_outcomes(vec![
             MetadataOutcome::Transport,
             MetadataOutcome::Ok,
         ]));
-        let client = fs_client_with_gateway(test_config_with_retries("root", 3), gateway.clone()).expect("client");
+        let client = fs_client_with_metadata_transport(test_config_with_retries("root", 3), metadata_transport.clone())
+            .expect("client");
 
         client
             .mkdirs("/alpha/beta", true)
             .await
             .expect("recursive CreateDirectory converges after retry");
 
-        let calls = gateway.calls();
+        let calls = metadata_transport.calls();
         assert_eq!(methods(&calls), vec!["create_directory", "create_directory"]);
         assert_eq!(calls[0].call_id, calls[1].call_id);
         assert_eq!(
-            gateway.create_directory_requests(),
+            metadata_transport.create_directory_requests(),
             vec![("/alpha/beta".to_string(), true), ("/alpha/beta".to_string(), true),]
         );
     }
 
     #[tokio::test]
     async fn stale_state_refresh_uses_distinct_msync_call_id_and_shared_deadline() {
-        let gateway = Arc::new(MockGateway::with_get_status_outcomes(vec![
+        let metadata_transport = Arc::new(MockMetadataTransport::with_get_status_outcomes(vec![
             MetadataOutcome::StaleState,
             MetadataOutcome::Ok,
         ]));
-        let client = fs_client_with_gateway(test_config_with_retries("root", 2), gateway.clone()).expect("client");
+        let client = fs_client_with_metadata_transport(test_config_with_retries("root", 2), metadata_transport.clone())
+            .expect("client");
 
         client.stat("/alpha").await.expect("retry after one Msync succeeds");
 
-        let calls = gateway.calls();
+        let calls = metadata_transport.calls();
         assert_eq!(methods(&calls), vec!["get_status", "msync", "get_status"]);
         assert_eq!(calls[0].call_id, calls[2].call_id);
         assert_ne!(calls[0].call_id, calls[1].call_id);
         assert!(calls.iter().all(|call| call.deadline_ms == calls[0].deadline_ms));
-        let headers = gateway.get_status_headers();
+        let headers = metadata_transport.get_status_headers();
         assert!(headers[0].state.is_empty());
         assert_eq!(headers[1].state[0].state_id.as_ref().map(|state| state.index), Some(1));
     }
 
     #[tokio::test]
     async fn successful_metadata_authority_enriches_the_next_request() {
-        let gateway = Arc::new(MockGateway::with_get_status_authority(MetadataAuthorityUpdate {
-            group_name: group_name_from("root"),
-            state: vec![GroupStateWatermark::new(
-                group_name_from("root"),
-                RaftLogId::new(2, 1, 9),
-            )],
-            mount_epoch: Some(31),
-            route_epoch: Some(41),
-        }));
-        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
+        let metadata_transport = Arc::new(MockMetadataTransport::with_get_status_authority(
+            MetadataAuthorityUpdate {
+                group_name: group_name_from("root"),
+                state: vec![GroupStateWatermark::new(
+                    group_name_from("root"),
+                    RaftLogId::new(2, 1, 9),
+                )],
+                mount_epoch: Some(31),
+                route_epoch: Some(41),
+            },
+        ));
+        let client =
+            fs_client_with_metadata_transport(test_config("root"), metadata_transport.clone()).expect("client");
 
         client.stat("/alpha").await.expect("first stat");
         client.stat("/alpha").await.expect("second stat");
 
-        let headers = gateway.get_status_headers();
+        let headers = metadata_transport.get_status_headers();
         assert_eq!(headers.len(), 2);
         assert!(headers[0].state.is_empty());
         assert_eq!(headers[1].mount_epoch, Some(31));
@@ -422,7 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn reader_replans_after_worker_refresh() {
-        let gateway = Arc::new(MockGateway::with_layout(layout_response(
+        let metadata_transport = Arc::new(MockMetadataTransport::with_layout(layout_response(
             "root",
             202,
             Some(3),
@@ -433,18 +418,22 @@ mod tests {
             b"abcdefghijklmnop",
             ErrorKind::Worker(WorkerErrorKind::RunMismatch),
         ));
-        let client =
-            fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker)).expect("client");
+        let client = fs_client_with_worker_transport(
+            test_config("root"),
+            metadata_transport.clone(),
+            worker_transport(worker),
+        )
+        .expect("client");
         let reader = read_reader(&client, 16);
 
         let bytes = reader.read_at(1, 3).await.expect("read succeeds after refresh");
 
         assert_eq!(bytes, Bytes::from_static(b"bcd"));
-        assert_eq!(method_count(&gateway.calls(), "read_layout"), 2);
+        assert_eq!(method_count(&metadata_transport.calls(), "read_layout"), 2);
     }
 
-    #[test]
-    fn client_rejects_zero_programmatic_read_bounds() {
+    #[tokio::test]
+    async fn reader_enforces_validated_exact_and_bounded_reads_before_rpc() {
         for (max_request_bytes, max_buffered_bytes, key) in [
             (0, 1, "beryl.client.read.max-request-bytes"),
             (1, 0, "beryl.client.read.max-buffered-bytes"),
@@ -459,11 +448,8 @@ mod tests {
                         && common.message.contains(key)
             ));
         }
-    }
 
-    #[tokio::test]
-    async fn reader_enforces_exactness_and_configured_bounds_before_rpc() {
-        let gateway = Arc::new(MockGateway::with_layout(layout_response(
+        let metadata_transport = Arc::new(MockMetadataTransport::with_layout(layout_response(
             "root",
             202,
             Some(3),
@@ -471,10 +457,10 @@ mod tests {
             vec![location(202, 0, 0, 8)],
         )));
         let worker = Arc::new(MockDataClient::from_file(b"abcdefgh"));
-        let client = fs_client_with_data_plane(
+        let client = fs_client_with_worker_transport(
             test_config_with_read_bounds("root", 3, 8),
-            gateway.clone(),
-            data_plane(worker.clone()),
+            metadata_transport.clone(),
+            worker_transport(worker.clone()),
         )
         .expect("client");
 
@@ -487,10 +473,10 @@ mod tests {
             reader.read_all().await.expect("boundary-sized read_all"),
             b"abcdefgh"[..]
         );
-        assert_eq!(method_count(&gateway.calls(), "read_layout"), 3);
+        assert_eq!(method_count(&metadata_transport.calls(), "read_layout"), 3);
         assert_eq!(*worker.calls.lock().expect("worker calls"), 3);
 
-        let metadata_calls = gateway.calls().len();
+        let metadata_calls = metadata_transport.calls().len();
         let worker_calls = *worker.calls.lock().expect("worker calls");
         let oversized_reader = read_reader(&client, 9);
         assert!(matches!(
@@ -501,14 +487,15 @@ mod tests {
             reader.read_at(0, 4).await,
             Err(ClientError::InvalidArgument(message)) if message.contains("configured maximum")
         ));
-        assert_eq!(gateway.calls().len(), metadata_calls);
+        assert_eq!(metadata_transport.calls().len(), metadata_calls);
         assert_eq!(*worker.calls.lock().expect("worker calls"), worker_calls);
     }
 
     #[tokio::test]
     async fn publication_body_mismatch_preserves_only_safe_recovery_paths() {
-        let commit_gateway = Arc::new(MockGateway::with_commit_response_sizes(vec![1, 0]));
-        let commit_client = fs_client_with_gateway(test_config("root"), commit_gateway.clone()).expect("client");
+        let commit_metadata_transport = Arc::new(MockMetadataTransport::with_commit_response_sizes(vec![1, 0]));
+        let commit_client =
+            fs_client_with_metadata_transport(test_config("root"), commit_metadata_transport.clone()).expect("client");
         let mut commit_writer = commit_client
             .create("/commit", CreateOptions::create())
             .await
@@ -519,7 +506,7 @@ mod tests {
             Err(ClientError::UnknownOutcome(message)) if message.contains("committed_size")
         ));
         commit_writer.close().await.expect("frozen CommitFile retry");
-        let commit_calls: Vec<_> = commit_gateway
+        let commit_calls: Vec<_> = commit_metadata_transport
             .calls()
             .into_iter()
             .filter(|call| call.method == "commit_file")
@@ -529,8 +516,9 @@ mod tests {
         assert_eq!(commit_calls[0].final_size, commit_calls[1].final_size);
 
         for response in [(1, Some(1)), (0, None)] {
-            let sync_gateway = Arc::new(MockGateway::with_sync_responses(vec![response]));
-            let sync_client = fs_client_with_gateway(test_config("root"), sync_gateway).expect("client");
+            let sync_metadata_transport = Arc::new(MockMetadataTransport::with_sync_responses(vec![response]));
+            let sync_client =
+                fs_client_with_metadata_transport(test_config("root"), sync_metadata_transport).expect("client");
             let mut sync_writer = sync_client
                 .create("/sync", CreateOptions::create())
                 .await
@@ -550,13 +538,17 @@ mod tests {
     #[tokio::test]
     async fn writer_barrier_flush_worker_error_blocks_later_write_and_close() {
         let layout = recorded_layout_values(8, 4);
-        let gateway = Arc::new(MockGateway::with_create_response_layout(Some(layout)));
+        let metadata_transport = Arc::new(MockMetadataTransport::with_create_response_layout(Some(layout)));
         let worker = Arc::new(MockDataClient {
             write_outcomes: Mutex::new(vec![WorkerWriteOutcome::WorkerError].into()),
             ..MockDataClient::default()
         });
-        let client =
-            fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker)).expect("client");
+        let client = fs_client_with_worker_transport(
+            test_config("root"),
+            metadata_transport.clone(),
+            worker_transport(worker),
+        )
+        .expect("client");
         let mut writer = client
             .create("/created", CreateOptions::create())
             .await
@@ -581,13 +573,13 @@ mod tests {
         assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("invalid")));
         let err = writer.close().await.expect_err("unsafe flush failure blocks close");
         assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("invalid")));
-        assert_eq!(method_count(&gateway.calls(), "commit_file"), 0);
+        assert_eq!(method_count(&metadata_transport.calls(), "commit_file"), 0);
     }
 
     #[tokio::test(start_paused = true)]
     async fn writer_retries_only_marked_before_side_effect_capacity_without_invalidating_session() {
         let events = event_log();
-        let gateway = Arc::new(MockGateway::default());
+        let metadata_transport = Arc::new(MockMetadataTransport::default());
         let worker = Arc::new(MockDataClient {
             write_outcomes: Mutex::new(
                 vec![
@@ -600,9 +592,12 @@ mod tests {
             events: Some(events.clone()),
             ..MockDataClient::default()
         });
-        let client =
-            fs_client_with_data_plane(test_config_with_retries("root", 3), gateway.clone(), data_plane(worker))
-                .expect("client");
+        let client = fs_client_with_worker_transport(
+            test_config_with_retries("root", 3),
+            metadata_transport.clone(),
+            worker_transport(worker),
+        )
+        .expect("client");
         let mut writer = client
             .create("/created", CreateOptions::create())
             .await
@@ -614,7 +609,7 @@ mod tests {
             .expect_err("marked capacity must stop after the configured attempts");
 
         assert_eq!(classify_error(&error), ErrorClass::ServerRetry);
-        assert_eq!(add_block_count(&gateway.calls()), 1);
+        assert_eq!(method_count(&metadata_transport.calls(), "add_block"), 1);
         assert_eq!(
             events
                 .lock()
@@ -632,24 +627,25 @@ mod tests {
 
     #[tokio::test]
     async fn writer_auto_renews_near_expiry_before_write() {
-        let gateway = Arc::new(MockGateway::default());
+        let metadata_transport = Arc::new(MockMetadataTransport::default());
         let worker = Arc::new(MockDataClient::default());
         let mut config = test_config("root");
         config.write_lease.auto_renew = true;
         config.write_lease.renew_before_expiry_ms = 120_000;
-        let client = fs_client_with_data_plane(config, gateway.clone(), data_plane(worker)).expect("client");
-        let handle = write_handle_for_tests("/created", 0, unix_now_ms() + 60_000).expect("write handle");
-        let mut writer = FileWriter::new(Arc::clone(&client.runtime), handle);
+        let client = fs_client_with_worker_transport(config, metadata_transport.clone(), worker_transport(worker))
+            .expect("client");
+        let handle = write_session_for_tests("/created", 0, unix_now_ms() + 60_000).expect("write handle");
+        let mut writer = FileWriter::new(Arc::clone(&client.inner), handle);
 
         writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
 
-        assert_eq!(methods(&gateway.calls()), vec!["renew_lease", "add_block"]);
+        assert_eq!(methods(&metadata_transport.calls()), vec!["renew_lease", "add_block"]);
     }
 
     #[tokio::test]
     async fn writer_lease_expiry_while_send_is_blocked_cancels_and_invalidates_session() {
         let events = event_log();
-        let gateway = Arc::new(MockGateway::default());
+        let metadata_transport = Arc::new(MockMetadataTransport::default());
         let worker = Arc::new(MockDataClient {
             write_outcomes: Mutex::new(vec![WorkerWriteOutcome::HoldRequests].into()),
             events: Some(events.clone()),
@@ -657,9 +653,10 @@ mod tests {
         });
         let mut config = test_config("root");
         config.write_lease.auto_renew = false;
-        let client = fs_client_with_data_plane(config, gateway.clone(), data_plane(worker)).expect("client");
-        let handle = write_handle_for_tests("/created", 0, unix_now_ms() + 1_200).expect("write handle");
-        let mut writer = FileWriter::new(Arc::clone(&client.runtime), handle);
+        let client = fs_client_with_worker_transport(config, metadata_transport.clone(), worker_transport(worker))
+            .expect("client");
+        let handle = write_session_for_tests("/created", 0, unix_now_ms() + 1_200).expect("write handle");
+        let mut writer = FileWriter::new(Arc::clone(&client.inner), handle);
 
         let error = writer
             .write_all(Bytes::from(vec![b'x'; beryl_proto::DEFAULT_WORKER_DATA_FRAME_SIZE + 1]))
@@ -676,13 +673,13 @@ mod tests {
             .await
             .expect_err("expired in-flight write blocks later writes");
         assert!(matches!(error, ClientError::StaleHandle { reason } if reason.contains("unknown outcome")));
-        assert_eq!(add_block_count(&gateway.calls()), 1);
+        assert_eq!(method_count(&metadata_transport.calls(), "add_block"), 1);
     }
 
     #[tokio::test]
     async fn writer_cancellation_wait_uses_the_current_write_and_abort_deadline() {
         let write_events = event_log();
-        let write_gateway = Arc::new(MockGateway::default());
+        let write_metadata_transport = Arc::new(MockMetadataTransport::default());
         let write_worker = Arc::new(MockDataClient {
             write_outcomes: Mutex::new(vec![WorkerWriteOutcome::HoldCancellation].into()),
             events: Some(write_events.clone()),
@@ -691,10 +688,14 @@ mod tests {
         let mut write_config = test_config("root");
         write_config.retry.operation_timeout_ms = 50;
         write_config.write_lease.auto_renew = false;
-        let write_client = fs_client_with_data_plane(write_config, write_gateway.clone(), data_plane(write_worker))
-            .expect("write client");
-        let write_handle = write_handle_for_tests("/write", 0, unix_now_ms() + 5_000).expect("write handle");
-        let mut writer = FileWriter::new(Arc::clone(&write_client.runtime), write_handle);
+        let write_client = fs_client_with_worker_transport(
+            write_config,
+            write_metadata_transport.clone(),
+            worker_transport(write_worker),
+        )
+        .expect("write client");
+        let write_handle = write_session_for_tests("/write", 0, unix_now_ms() + 5_000).expect("write handle");
+        let mut writer = FileWriter::new(Arc::clone(&write_client.inner), write_handle);
 
         let write_error = tokio::time::timeout(
             Duration::from_millis(250),
@@ -706,7 +707,7 @@ mod tests {
         assert!(write_error.to_string().contains("deadline"));
 
         let abort_events = event_log();
-        let abort_gateway = Arc::new(MockGateway::default());
+        let abort_metadata_transport = Arc::new(MockMetadataTransport::default());
         let abort_worker = Arc::new(MockDataClient {
             write_outcomes: Mutex::new(vec![WorkerWriteOutcome::HoldCancellation].into()),
             events: Some(abort_events.clone()),
@@ -715,10 +716,14 @@ mod tests {
         let mut abort_config = test_config("root");
         abort_config.retry.operation_timeout_ms = 50;
         abort_config.write_lease.auto_renew = false;
-        let abort_client = fs_client_with_data_plane(abort_config, abort_gateway.clone(), data_plane(abort_worker))
-            .expect("abort client");
-        let abort_handle = write_handle_for_tests("/abort", 0, unix_now_ms() + 5_000).expect("abort handle");
-        let mut abort_writer = FileWriter::new(Arc::clone(&abort_client.runtime), abort_handle);
+        let abort_client = fs_client_with_worker_transport(
+            abort_config,
+            abort_metadata_transport.clone(),
+            worker_transport(abort_worker),
+        )
+        .expect("abort client");
+        let abort_handle = write_session_for_tests("/abort", 0, unix_now_ms() + 5_000).expect("abort handle");
+        let mut abort_writer = FileWriter::new(Arc::clone(&abort_client.inner), abort_handle);
         abort_writer
             .write_all(Bytes::from_static(b"x"))
             .await
@@ -730,13 +735,13 @@ mod tests {
             .expect_err("blackholed cancellation reaches the abort deadline");
         assert!(abort_error.to_string().contains("deadline"));
         assert_event_order(&abort_events, "write_block", "cancel_write_block");
-        assert_eq!(method_count(&abort_gateway.calls(), "abort_file_write"), 0);
+        assert_eq!(method_count(&abort_metadata_transport.calls(), "abort_file_write"), 0);
     }
 
     #[tokio::test(start_paused = true)]
     async fn writer_unknown_add_block_blocks_followup_writes() {
         let layout = recorded_layout_values(5, 5);
-        let gateway = Arc::new(MockGateway {
+        let metadata_transport = Arc::new(MockMetadataTransport {
             create_response_layout: Mutex::new(Some(Some(layout))),
             add_block_outcomes: Mutex::new(
                 vec![
@@ -746,12 +751,15 @@ mod tests {
                 ]
                 .into(),
             ),
-            ..MockGateway::default()
+            ..MockMetadataTransport::default()
         });
         let worker = Arc::new(MockDataClient::default());
-        let client =
-            fs_client_with_data_plane(test_config_with_retries("root", 3), gateway.clone(), data_plane(worker))
-                .expect("client");
+        let client = fs_client_with_worker_transport(
+            test_config_with_retries("root", 3),
+            metadata_transport.clone(),
+            worker_transport(worker),
+        )
+        .expect("client");
         let mut writer = client
             .create("/created", CreateOptions::create())
             .await
@@ -768,7 +776,7 @@ mod tests {
             .await
             .expect_err("unknown outcome blocks writes");
         assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("unknown outcome")));
-        let calls = gateway.calls();
+        let calls = metadata_transport.calls();
         let add_calls: Vec<_> = calls.iter().filter(|call| call.method == "add_block").collect();
         assert_eq!(add_calls.len(), 3);
         assert!(add_calls.iter().all(|call| call.call_id == add_calls[0].call_id));
@@ -777,17 +785,20 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn mutation_terminal_error_after_transport_ambiguity_remains_unknown() {
         let layout = recorded_layout_values(5, 5);
-        let gateway = Arc::new(MockGateway {
+        let metadata_transport = Arc::new(MockMetadataTransport {
             create_response_layout: Mutex::new(Some(Some(layout))),
             add_block_outcomes: Mutex::new(
                 vec![AddBlockOutcome::TransportUnknown, AddBlockOutcome::TerminalFailure].into(),
             ),
-            ..MockGateway::default()
+            ..MockMetadataTransport::default()
         });
         let worker = Arc::new(MockDataClient::default());
-        let client =
-            fs_client_with_data_plane(test_config_with_retries("root", 3), gateway.clone(), data_plane(worker))
-                .expect("client");
+        let client = fs_client_with_worker_transport(
+            test_config_with_retries("root", 3),
+            metadata_transport.clone(),
+            worker_transport(worker),
+        )
+        .expect("client");
         let mut writer = client
             .create("/created", CreateOptions::create())
             .await
@@ -799,7 +810,7 @@ mod tests {
             .expect_err("a later terminal response cannot resolve the earlier mutation attempt");
 
         assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("AddBlock")));
-        assert_eq!(method_count(&gateway.calls(), "add_block"), 2);
+        assert_eq!(method_count(&metadata_transport.calls(), "add_block"), 2);
     }
 
     fn event_log() -> EventLog {
@@ -818,7 +829,7 @@ mod tests {
         GroupName::parse(raw).unwrap()
     }
 
-    /// Builds the successful response envelope used by the executor-facing mock.
+    /// Builds the successful response envelope used by the Metadata-client-facing mock.
     fn metadata_response<T>(ctx: &AttemptContext, body: T) -> ValidatedMetadataResponse<T> {
         let group_name = ctx.group_name().cloned().expect("metadata attempt group");
         ValidatedMetadataResponse::new(
@@ -881,25 +892,38 @@ mod tests {
         config
     }
 
-    fn fs_client_with_gateway(config: ClientConfig, gateway: Arc<dyn MetadataGateway>) -> ClientResult<FsClient> {
-        let metrics: Arc<dyn crate::metrics::ClientMetrics> = Arc::new(crate::metrics::NoopClientMetrics);
-        let data_plane = WorkerDataPlane::from_config(&config, metrics);
-        fs_client_with_data_plane(config, gateway, data_plane)
+    fn fs_client_with_metadata_transport(
+        config: ClientConfig,
+        metadata_transport: Arc<dyn MetadataTransport>,
+    ) -> ClientResult<FsClient> {
+        fs_client_with_worker_transport(config, metadata_transport, Arc::new(MockDataClient::default()))
     }
 
-    fn fs_client_with_data_plane(
+    fn fs_client_with_worker_transport(
         config: ClientConfig,
-        gateway: Arc<dyn MetadataGateway>,
-        data_plane: WorkerDataPlane,
+        metadata_transport: Arc<dyn MetadataTransport>,
+        worker_transport: Arc<dyn WorkerTransport>,
     ) -> ClientResult<FsClient> {
         let metadata_targets = MetadataTargets::from_config(&config)?;
-        FsClient::with_runtime_hooks(
-            config,
-            gateway,
+        config.read.validate()?;
+        let identity = ClientIdentity::generate(config.client_name.clone())?;
+        let metrics: Arc<dyn ClientMetrics> = Arc::new(crate::metrics::NoopClientMetrics);
+        let metadata = MetadataClient::new(
+            identity,
+            metadata_transport,
             metadata_targets,
-            data_plane,
-            Arc::new(crate::metrics::NoopClientMetrics),
-        )
+            &config,
+            Arc::clone(&metrics),
+        )?;
+        let worker = WorkerClient::new(worker_transport);
+        Ok(FsClient {
+            inner: Arc::new(ClientInner {
+                config,
+                metadata,
+                worker,
+                metrics,
+            }),
+        })
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -956,10 +980,6 @@ mod tests {
         }
     }
 
-    fn add_block_count(calls: &[RecordedCall]) -> usize {
-        calls.iter().filter(|call| call.method == "add_block").count()
-    }
-
     fn unix_now_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -968,7 +988,7 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
-    struct MockGateway {
+    struct MockMetadataTransport {
         calls: Mutex<Vec<RecordedCall>>,
         get_status_headers: Mutex<Vec<beryl_proto::common::RequestHeaderProto>>,
         get_status_authority: Mutex<VecDeque<MetadataAuthorityUpdate>>,
@@ -987,7 +1007,7 @@ mod tests {
         events: Option<EventLog>,
     }
 
-    impl MockGateway {
+    impl MockMetadataTransport {
         fn calls(&self) -> Vec<RecordedCall> {
             self.calls.lock().expect("calls").clone()
         }
@@ -1107,8 +1127,12 @@ mod tests {
         }
 
         fn record(&self, method: &'static str, ctx: &AttemptContext) {
+            self.push_call(Self::recorded_call(method, ctx));
+        }
+
+        fn recorded_call(method: &'static str, ctx: &AttemptContext) -> RecordedCall {
             let header = ctx.metadata_header().expect("metadata header");
-            self.calls.lock().expect("calls").push(RecordedCall {
+            RecordedCall {
                 method,
                 group_name: group_name_from(&header.group_name),
                 call_id: header.client.as_ref().expect("client").call_id.clone(),
@@ -1120,98 +1144,50 @@ mod tests {
                 committed_block_offsets: Vec::new(),
                 committed_block_lens: Vec::new(),
                 create_layout: None,
-            });
+            }
+        }
+
+        fn push_call(&self, call: RecordedCall) {
+            self.calls.lock().expect("calls").push(call);
         }
 
         fn record_create_file(&self, ctx: &AttemptContext, req: &beryl_proto::metadata::CreateFileRequestProto) {
-            let header = ctx.metadata_header().expect("metadata header");
-            self.calls.lock().expect("calls").push(RecordedCall {
-                method: "create_file",
-                group_name: group_name_from(&header.group_name),
-                call_id: header.client.as_ref().expect("client").call_id.clone(),
-                deadline_ms: header.deadline_ms,
-                target_inode_id: None,
-                range: None,
-                target_size: None,
-                final_size: None,
-                committed_block_offsets: Vec::new(),
-                committed_block_lens: Vec::new(),
-                create_layout: req.layout.as_ref().map(recorded_layout),
-            });
+            let mut call = Self::recorded_call("create_file", ctx);
+            call.create_layout = req.layout.as_ref().map(recorded_layout);
+            self.push_call(call);
         }
 
         fn record_read_layout(&self, ctx: &AttemptContext, req: &beryl_proto::metadata::GetBlockLocationsRequestProto) {
-            let header = ctx.metadata_header().expect("metadata header");
-            let target_inode_id = match req.target.as_ref() {
+            let mut call = Self::recorded_call("read_layout", ctx);
+            call.target_inode_id = match req.target.as_ref() {
                 Some(beryl_proto::metadata::get_block_locations_request_proto::Target::InodeId(id)) => Some(*id),
                 _ => None,
             };
-            let range = req.range.as_ref().map(|range| (range.offset, range.len));
-            self.calls.lock().expect("calls").push(RecordedCall {
-                method: "read_layout",
-                group_name: group_name_from(&header.group_name),
-                call_id: header.client.as_ref().expect("client").call_id.clone(),
-                deadline_ms: header.deadline_ms,
-                target_inode_id,
-                range,
-                target_size: None,
-                final_size: None,
-                committed_block_offsets: Vec::new(),
-                committed_block_lens: Vec::new(),
-                create_layout: None,
-            });
+            call.range = req.range.as_ref().map(|range| (range.offset, range.len));
+            self.push_call(call);
         }
 
         fn record_commit_file(&self, ctx: &AttemptContext, req: &beryl_proto::metadata::CommitFileRequestProto) {
             self.record_event("commit_file");
-            let header = ctx.metadata_header().expect("metadata header");
-            self.calls.lock().expect("calls").push(RecordedCall {
-                method: "commit_file",
-                group_name: group_name_from(&header.group_name),
-                call_id: header.client.as_ref().expect("client").call_id.clone(),
-                deadline_ms: header.deadline_ms,
-                target_inode_id: req.write_handle.as_ref().map(|handle| handle.inode_id),
-                range: None,
-                target_size: None,
-                final_size: Some(req.final_size),
-                committed_block_offsets: req.committed_blocks.iter().map(|block| block.file_offset).collect(),
-                committed_block_lens: req.committed_blocks.iter().map(|block| block.len).collect(),
-                create_layout: None,
-            });
+            let mut call = Self::recorded_call("commit_file", ctx);
+            call.target_inode_id = req.write_handle.as_ref().map(|handle| handle.inode_id);
+            call.final_size = Some(req.final_size);
+            call.committed_block_offsets = req.committed_blocks.iter().map(|block| block.file_offset).collect();
+            call.committed_block_lens = req.committed_blocks.iter().map(|block| block.len).collect();
+            self.push_call(call);
         }
 
         fn record_sync_write(&self, ctx: &AttemptContext, req: &beryl_proto::metadata::SyncWriteRequestProto) {
-            let header = ctx.metadata_header().expect("metadata header");
-            self.calls.lock().expect("calls").push(RecordedCall {
-                method: "sync_write",
-                group_name: group_name_from(&header.group_name),
-                call_id: header.client.as_ref().expect("client").call_id.clone(),
-                deadline_ms: header.deadline_ms,
-                target_inode_id: req.write_handle.as_ref().map(|handle| handle.inode_id),
-                range: None,
-                target_size: Some(req.target_size),
-                final_size: None,
-                committed_block_offsets: req.committed_blocks.iter().map(|block| block.file_offset).collect(),
-                committed_block_lens: req.committed_blocks.iter().map(|block| block.len).collect(),
-                create_layout: None,
-            });
+            let mut call = Self::recorded_call("sync_write", ctx);
+            call.target_inode_id = req.write_handle.as_ref().map(|handle| handle.inode_id);
+            call.target_size = Some(req.target_size);
+            call.committed_block_offsets = req.committed_blocks.iter().map(|block| block.file_offset).collect();
+            call.committed_block_lens = req.committed_blocks.iter().map(|block| block.len).collect();
+            self.push_call(call);
         }
 
         fn record_add_block(&self, ctx: &AttemptContext, _req: &beryl_proto::metadata::AddBlockRequestProto) {
-            let header = ctx.metadata_header().expect("metadata header");
-            self.calls.lock().expect("calls").push(RecordedCall {
-                method: "add_block",
-                group_name: group_name_from(&header.group_name),
-                call_id: header.client.as_ref().expect("client").call_id.clone(),
-                deadline_ms: header.deadline_ms,
-                target_inode_id: None,
-                range: None,
-                target_size: None,
-                final_size: None,
-                committed_block_offsets: Vec::new(),
-                committed_block_lens: Vec::new(),
-                create_layout: None,
-            });
+            self.record("add_block", ctx);
         }
 
         fn record_event(&self, event: &'static str) {
@@ -1222,7 +1198,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl MetadataGateway for MockGateway {
+    impl MetadataTransport for MockMetadataTransport {
         async fn get_status(
             &self,
             ctx: AttemptContext,
@@ -1652,7 +1628,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl WorkerDataClient for MockDataClient {
+    impl WorkerTransport for MockDataClient {
         async fn read_block_range(
             &self,
             _ctx: AttemptContext,
@@ -1752,14 +1728,14 @@ mod tests {
         }
     }
 
-    fn data_plane(client: Arc<MockDataClient>) -> WorkerDataPlane {
-        WorkerDataPlane::with_client(client)
+    fn worker_transport(client: Arc<MockDataClient>) -> Arc<dyn WorkerTransport> {
+        client
     }
 
     fn read_reader(client: &FsClient, file_size: u64) -> FileReader {
         FileReader::new(
-            Arc::clone(&client.runtime),
-            ReadHandle::new("/alpha".to_string(), InodeId::new(202), 3, file_size),
+            Arc::clone(&client.inner),
+            ReadSnapshot::new("/alpha".to_string(), InodeId::new(202), 3, file_size),
         )
     }
 
@@ -1803,11 +1779,11 @@ mod tests {
         handle.inode_id
     }
 
-    fn write_handle_for_tests(path: &str, base_size: u64, expires_at_ms: u64) -> ClientResult<WriteHandle> {
+    fn write_session_for_tests(path: &str, base_size: u64, expires_at_ms: u64) -> ClientResult<WriteSession> {
         let inode_id = InodeId::new(302);
         let layout = beryl_types::FileLayout::try_from(layout_proto(default_layout()))
             .map_err(|err| ClientError::InvalidLayout(err.to_string()))?;
-        let session = WriteSession::new(
+        WriteSession::new(
             path.to_string(),
             layout,
             write_handle_proto(inode_id.as_raw()),
@@ -1815,8 +1791,7 @@ mod tests {
             expires_at_ms,
             0,
             beryl_proto::metadata::OpenWriteModeProto::OpenWriteModeWrite,
-        )?;
-        Ok(WriteHandle::new(path.to_string(), base_size, session))
+        )
     }
 
     fn write_target_with_layout(

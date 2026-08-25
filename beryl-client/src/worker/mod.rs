@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Internal worker data-plane boundary.
+//! Client-owned Worker orchestration, transport, and block-stream state.
 //!
 //! This module stays private to the crate, so stream handles and block-local
 //! worker operations do not appear in the public API.
 
 mod channel_pool;
+mod client;
 mod protocol;
-mod worker;
+mod transport;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -27,7 +28,7 @@ use crate::runtime::AttemptContext;
 /// Internal boundary that isolates Worker RPC transport from client runtime
 /// and provides a narrow seam for orchestration tests.
 #[async_trait]
-pub(crate) trait WorkerDataClient: Send + Sync {
+pub(crate) trait WorkerTransport: Send + Sync {
     /// Reads one metadata-planned block-local range with exact-length semantics.
     async fn read_block_range(
         &self,
@@ -344,7 +345,7 @@ impl Drop for BlockWrite {
     }
 }
 
-pub(crate) use worker::WorkerDataPlane;
+pub(crate) use client::WorkerClient;
 
 pub(super) fn duration_until_unix_ms(expires_at_ms: u64) -> Duration {
     Duration::from_millis(expires_at_ms.saturating_sub(unix_now_ms()))

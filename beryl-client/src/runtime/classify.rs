@@ -11,7 +11,7 @@ use beryl_common::header::{
     WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT,
 };
 
-/// Runtime error classification used by the metadata executor.
+/// Internal error classification used by Metadata and Worker orchestration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ErrorClass {
     /// Unrecoverable error.

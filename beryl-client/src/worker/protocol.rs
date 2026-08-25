@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Worker data service protocol helpers.
+//! Worker data-service wire conversion and response validation helpers.
 
 use std::time::Duration;
 
