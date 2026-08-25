@@ -10,8 +10,15 @@ use std::path::Path;
 
 pub const DEFAULT_CLIENT_NAME: &str = "default-client";
 pub const DEFAULT_OPERATION_TIMEOUT_MS: u64 = 30_000;
+/// Default maximum result size for one positioned owned-buffer read.
+pub const DEFAULT_READ_MAX_REQUEST_BYTES: u32 = 8 * 1024 * 1024;
+/// Default maximum file size accepted by the whole-file convenience read.
+pub const DEFAULT_READ_MAX_BUFFERED_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_WRITE_LEASE_RENEW_BEFORE_EXPIRY_MS: u64 = 30_000;
 pub const DEFAULT_WORKER_ENDPOINT_COOLDOWN_MS: u64 = 1_000;
+
+const READ_MAX_REQUEST_BYTES_KEY: &str = "beryl.client.read.max-request-bytes";
+const READ_MAX_BUFFERED_BYTES_KEY: &str = "beryl.client.read.max-buffered-bytes";
 
 /// Client-specific configuration.
 #[derive(Clone, Debug)]
@@ -22,6 +29,8 @@ pub struct ClientConfig {
     pub client_name: String,
     /// Retry configuration.
     pub retry: RetryConfig,
+    /// Bounds for public APIs that return owned read buffers.
+    pub read: ReadConfig,
     /// Client-side write lease renewal policy.
     pub write_lease: WriteLeaseConfig,
     /// Metadata and Worker connection reuse configuration.
@@ -63,6 +72,28 @@ pub struct RetryConfig {
     pub operation_timeout_ms: u64,
 }
 
+/// Memory bounds for the current owned-buffer read APIs.
+#[derive(Clone, Debug)]
+pub struct ReadConfig {
+    /// Maximum byte count accepted by one `read_at` or `read_exact_at` call.
+    pub max_request_bytes: u32,
+    /// Maximum file size accepted by `read_all`.
+    pub max_buffered_bytes: u64,
+}
+
+impl ReadConfig {
+    /// Ensures both owned-buffer limits admit nonempty reads.
+    pub(crate) fn validate(&self) -> Result<(), CommonError> {
+        if self.max_request_bytes == 0 {
+            return Err(invalid_config(READ_MAX_REQUEST_BYTES_KEY, "must be greater than zero"));
+        }
+        if self.max_buffered_bytes == 0 {
+            return Err(invalid_config(READ_MAX_BUFFERED_BYTES_KEY, "must be greater than zero"));
+        }
+        Ok(())
+    }
+}
+
 /// Write lease renewal configuration.
 #[derive(Clone, Debug)]
 pub struct WriteLeaseConfig {
@@ -84,6 +115,15 @@ impl Default for RetryConfig {
         Self {
             max_attempts: 3,
             operation_timeout_ms: DEFAULT_OPERATION_TIMEOUT_MS,
+        }
+    }
+}
+
+impl Default for ReadConfig {
+    fn default() -> Self {
+        Self {
+            max_request_bytes: DEFAULT_READ_MAX_REQUEST_BYTES,
+            max_buffered_bytes: DEFAULT_READ_MAX_BUFFERED_BYTES,
         }
     }
 }
@@ -127,6 +167,7 @@ impl ClientConfig {
         let client_name = client_name_from_flat(&flat)?;
 
         let retry = retry_config_from_flat(&flat)?;
+        let read = read_config_from_flat(&flat)?;
         let write_lease = write_lease_config_from_flat(&flat)?;
         let connections = connection_config_from_flat(&flat)?;
         let metadata_groups = parse_metadata_endpoints(&flat)?;
@@ -135,6 +176,7 @@ impl ClientConfig {
             inner: flat,
             client_name,
             retry,
+            read,
             write_lease,
             connections,
             metadata_groups,
@@ -205,6 +247,16 @@ fn retry_config_from_flat(flat: &FlatConfig) -> Result<RetryConfig, CommonError>
         max_attempts,
         operation_timeout_ms,
     })
+}
+
+fn read_config_from_flat(flat: &FlatConfig) -> Result<ReadConfig, CommonError> {
+    let defaults = ReadConfig::default();
+    let config = ReadConfig {
+        max_request_bytes: flat.bytes_u32_or(READ_MAX_REQUEST_BYTES_KEY, defaults.max_request_bytes)?,
+        max_buffered_bytes: flat.bytes_u64_or(READ_MAX_BUFFERED_BYTES_KEY, defaults.max_buffered_bytes)?,
+    };
+    config.validate()?;
+    Ok(config)
 }
 
 fn write_lease_config_from_flat(flat: &FlatConfig) -> Result<WriteLeaseConfig, CommonError> {
