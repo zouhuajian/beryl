@@ -21,6 +21,10 @@ beryl.client.worker.connections.failure-cooldown: 1s
 beryl.client.request.timeout: 30s
 beryl.client.request.max-attempts: 3
 
+# -------------------- Read buffers --------------------
+beryl.client.read.max-request-bytes: 8MiB
+beryl.client.read.max-buffered-bytes: 64MiB
+
 # -------------------- Write leases --------------------
 beryl.client.write-lease.auto-renew: true
 beryl.client.write-lease.renew-before-expiry: 30s

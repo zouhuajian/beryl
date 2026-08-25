@@ -39,7 +39,7 @@ struct DirectoryListStreamState {
 impl FsClient {
     /// Create a new filesystem client facade.
     pub fn new(config: ClientConfig) -> Self {
-        Self::try_new(config).expect("valid client metadata configuration")
+        Self::try_new(config).expect("valid client configuration")
     }
 
     /// Create a new filesystem client facade and return configuration errors.
@@ -224,7 +224,7 @@ mod tests {
     use super::super::handle::{ReadHandle, WriteHandle};
     use super::super::options::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_REPLICATION};
     use super::*;
-    use crate::config::{ClientConfig, MetadataGroupConfig};
+    use crate::config::{ClientConfig, MetadataGroupConfig, ReadConfig};
     use crate::data::{
         BlockWrite, BlockWriteInput, BlockWriteLease, WorkerDataClient, WorkerDataPlane, WorkerReadResult,
         WorkerWriteTarget,
@@ -421,21 +421,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reader_read_exact_at_rejects_short_eof_read() {
-        let gateway = Arc::new(MockGateway::default());
-        let client = fs_client_with_gateway(test_config("root"), gateway).expect("client");
-        let reader = read_reader(&client, 10);
-
-        let err = reader
-            .read_exact_at(10, 4)
-            .await
-            .expect_err("short EOF read must fail exact read");
-
-        assert!(matches!(err, ClientError::InvalidArgument(msg)
-            if msg.contains("read_exact_at") && msg.contains("requested 4 bytes")));
-    }
-
-    #[tokio::test]
     async fn reader_replans_after_worker_refresh() {
         let gateway = Arc::new(MockGateway::with_layout(layout_response(
             "root",
@@ -456,6 +441,110 @@ mod tests {
 
         assert_eq!(bytes, Bytes::from_static(b"bcd"));
         assert_eq!(method_count(&gateway.calls(), "read_layout"), 2);
+    }
+
+    #[test]
+    fn client_rejects_zero_programmatic_read_bounds() {
+        for (max_request_bytes, max_buffered_bytes, key) in [
+            (0, 1, "beryl.client.read.max-request-bytes"),
+            (1, 0, "beryl.client.read.max-buffered-bytes"),
+        ] {
+            let config = test_config_with_read_bounds("root", max_request_bytes, max_buffered_bytes);
+            let error = FsClient::try_new(config).expect_err("zero read bound must be rejected");
+
+            assert!(matches!(
+                error,
+                ClientError::Common(common)
+                    if common.kind == beryl_common::CommonErrorKind::InvalidArgument
+                        && common.message.contains(key)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_enforces_exactness_and_configured_bounds_before_rpc() {
+        let gateway = Arc::new(MockGateway::with_layout(layout_response(
+            "root",
+            202,
+            Some(3),
+            8,
+            vec![location(202, 0, 0, 8)],
+        )));
+        let worker = Arc::new(MockDataClient::from_file(b"abcdefgh"));
+        let client = fs_client_with_data_plane(
+            test_config_with_read_bounds("root", 3, 8),
+            gateway.clone(),
+            data_plane(worker.clone()),
+        )
+        .expect("client");
+
+        let reader = read_reader(&client, 8);
+        assert!(matches!(
+            reader.read_exact_at(8, 1).await,
+            Err(ClientError::InvalidArgument(message)) if message.contains("read_exact_at")
+        ));
+        assert_eq!(
+            reader.read_all().await.expect("boundary-sized read_all"),
+            b"abcdefgh"[..]
+        );
+        assert_eq!(method_count(&gateway.calls(), "read_layout"), 3);
+        assert_eq!(*worker.calls.lock().expect("worker calls"), 3);
+
+        let metadata_calls = gateway.calls().len();
+        let worker_calls = *worker.calls.lock().expect("worker calls");
+        let oversized_reader = read_reader(&client, 9);
+        assert!(matches!(
+            oversized_reader.read_all().await,
+            Err(ClientError::InvalidArgument(message)) if message.contains("read_all maximum")
+        ));
+        assert!(matches!(
+            reader.read_at(0, 4).await,
+            Err(ClientError::InvalidArgument(message)) if message.contains("configured maximum")
+        ));
+        assert_eq!(gateway.calls().len(), metadata_calls);
+        assert_eq!(*worker.calls.lock().expect("worker calls"), worker_calls);
+    }
+
+    #[tokio::test]
+    async fn publication_body_mismatch_preserves_only_safe_recovery_paths() {
+        let commit_gateway = Arc::new(MockGateway::with_commit_response_sizes(vec![1, 0]));
+        let commit_client = fs_client_with_gateway(test_config("root"), commit_gateway.clone()).expect("client");
+        let mut commit_writer = commit_client
+            .create("/commit", CreateOptions::create())
+            .await
+            .expect("writer");
+
+        assert!(matches!(
+            commit_writer.close().await,
+            Err(ClientError::UnknownOutcome(message)) if message.contains("committed_size")
+        ));
+        commit_writer.close().await.expect("frozen CommitFile retry");
+        let commit_calls: Vec<_> = commit_gateway
+            .calls()
+            .into_iter()
+            .filter(|call| call.method == "commit_file")
+            .collect();
+        assert_eq!(commit_calls.len(), 2);
+        assert_eq!(commit_calls[0].call_id, commit_calls[1].call_id);
+        assert_eq!(commit_calls[0].final_size, commit_calls[1].final_size);
+
+        for response in [(1, Some(1)), (0, None)] {
+            let sync_gateway = Arc::new(MockGateway::with_sync_responses(vec![response]));
+            let sync_client = fs_client_with_gateway(test_config("root"), sync_gateway).expect("client");
+            let mut sync_writer = sync_client
+                .create("/sync", CreateOptions::create())
+                .await
+                .expect("writer");
+
+            assert!(matches!(
+                sync_writer.sync_write_visibility().await,
+                Err(ClientError::UnknownOutcome(_))
+            ));
+            assert!(matches!(
+                sync_writer.write_all(Bytes::from_static(b"x")).await,
+                Err(ClientError::StaleHandle { reason }) if reason.contains("unknown outcome")
+            ));
+        }
     }
 
     #[tokio::test]
@@ -783,6 +872,15 @@ mod tests {
         config
     }
 
+    fn test_config_with_read_bounds(group_name: &str, max_request_bytes: u32, max_buffered_bytes: u64) -> ClientConfig {
+        let mut config = test_config(group_name);
+        config.read = ReadConfig {
+            max_request_bytes,
+            max_buffered_bytes,
+        };
+        config
+    }
+
     fn fs_client_with_gateway(config: ClientConfig, gateway: Arc<dyn MetadataGateway>) -> ClientResult<FsClient> {
         let metrics: Arc<dyn crate::metrics::ClientMetrics> = Arc::new(crate::metrics::NoopClientMetrics);
         let data_plane = WorkerDataPlane::from_config(&config, metrics);
@@ -884,6 +982,8 @@ mod tests {
         get_status_outcomes: Mutex<VecDeque<MetadataOutcome>>,
         open_write_outcomes: Mutex<VecDeque<MetadataOutcome>>,
         mutation_outcomes: Mutex<VecDeque<MetadataOutcome>>,
+        commit_response_sizes: Mutex<VecDeque<u64>>,
+        sync_responses: Mutex<VecDeque<(u64, Option<u64>)>>,
         events: Option<EventLog>,
     }
 
@@ -943,6 +1043,20 @@ mod tests {
         fn with_mutation_outcomes(outcomes: Vec<MetadataOutcome>) -> Self {
             Self {
                 mutation_outcomes: Mutex::new(outcomes.into()),
+                ..Self::default()
+            }
+        }
+
+        fn with_commit_response_sizes(sizes: Vec<u64>) -> Self {
+            Self {
+                commit_response_sizes: Mutex::new(sizes.into()),
+                ..Self::default()
+            }
+        }
+
+        fn with_sync_responses(responses: Vec<(u64, Option<u64>)>) -> Self {
+            Self {
+                sync_responses: Mutex::new(responses.into()),
                 ..Self::default()
             }
         }
@@ -1370,10 +1484,16 @@ mod tests {
             req: beryl_proto::metadata::CommitFileRequestProto,
         ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::CommitFileResponseProto>> {
             self.record_commit_file(&ctx, &req);
+            let committed_size = self
+                .commit_response_sizes
+                .lock()
+                .expect("commit response sizes")
+                .pop_front()
+                .unwrap_or(req.final_size);
             metadata_ok(
                 &ctx,
                 CommitFileResponseProto {
-                    committed_size: req.final_size,
+                    committed_size,
                     ..CommitFileResponseProto::default()
                 },
             )
@@ -1410,7 +1530,12 @@ mod tests {
             req: beryl_proto::metadata::SyncWriteRequestProto,
         ) -> ClientResult<ValidatedMetadataResponse<SyncWriteResponseProto>> {
             self.record_sync_write(&ctx, &req);
-            let synced_size = req.target_size;
+            let (synced_size, content_revision) = self
+                .sync_responses
+                .lock()
+                .expect("sync responses")
+                .pop_front()
+                .unwrap_or((req.target_size, Some(1)));
             if let Some(write_handle) = req.write_handle.as_ref() {
                 self.next_offsets
                     .lock()
@@ -1421,7 +1546,7 @@ mod tests {
                 &ctx,
                 SyncWriteResponseProto {
                     synced_size,
-                    content_revision: Some(1),
+                    content_revision,
                     ..SyncWriteResponseProto::default()
                 },
             )

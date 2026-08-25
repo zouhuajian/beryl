@@ -211,6 +211,19 @@ pub(crate) fn side_effect_response_body_mismatch(operation: &str, detail: impl s
     ClientError::UnknownOutcome(format!("{operation} response body mismatch after OK header: {detail}"))
 }
 
+/// Converts a fallible read-buffer reservation failure without introducing a
+/// new public error contract.
+pub(crate) fn read_buffer_reservation_failed(
+    operation: &'static str,
+    requested_bytes: usize,
+    error: impl std::fmt::Display,
+) -> ClientError {
+    ClientError::Common(CommonError::new(
+        CommonErrorKind::Internal,
+        format!("{operation} failed to reserve {requested_bytes} read buffer bytes: {error}"),
+    ))
+}
+
 pub(crate) fn invalid_response(operation: &'static str, reason: impl Into<String>) -> ClientError {
     ClientError::InvalidResponse {
         operation,

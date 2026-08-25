@@ -9,11 +9,11 @@ use beryl_common::header::{HeaderIdentity, HEADER_WORKER_DATA_ERROR_DETAIL, WORK
 use beryl_proto::worker::write_block_request_proto::Payload;
 use beryl_types::chunk::ByteRange;
 use beryl_types::{BlockShape, GroupName, WorkerEndpointInfo};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use prost::Message;
 
 use super::WorkerWriteTarget;
-use crate::error::{ClientError, ClientResult};
+use crate::error::{read_buffer_reservation_failed, ClientError, ClientResult};
 use crate::planner::PlannedBlockRead;
 use crate::rpc_error::{invalid_header_action, validate_data_header_or_action};
 use crate::runtime::AttemptContext;
@@ -109,7 +109,11 @@ pub(super) async fn read_block_stream_to_bytes(
     stream: &mut tonic::codec::Streaming<beryl_proto::worker::ReadBlockChunkProto>,
     block_read: &PlannedBlockRead,
 ) -> ClientResult<Bytes> {
-    let mut output = BytesMut::with_capacity(block_read.len as usize);
+    let expected_len = block_read.len as usize;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(expected_len)
+        .map_err(|error| read_buffer_reservation_failed("ReadBlock", expected_len, error))?;
     while let Some(chunk) = stream
         .message()
         .await
@@ -122,7 +126,7 @@ pub(super) async fn read_block_stream_to_bytes(
 
 /// Appends one nonempty read chunk without exceeding the planned range.
 pub(super) fn append_read_block_chunk(
-    output: &mut BytesMut,
+    output: &mut Vec<u8>,
     block_read: &PlannedBlockRead,
     chunk: beryl_proto::worker::ReadBlockChunkProto,
 ) -> ClientResult<()> {
@@ -141,7 +145,7 @@ pub(super) fn append_read_block_chunk(
 }
 
 /// Accepts normal read completion only after the exact planned byte count.
-pub(super) fn finish_read_block_output(output: BytesMut, block_read: &PlannedBlockRead) -> ClientResult<Bytes> {
+pub(super) fn finish_read_block_output(output: Vec<u8>, block_read: &PlannedBlockRead) -> ClientResult<Bytes> {
     if output.len() != block_read.len as usize {
         return Err(ClientError::Worker(format!(
             "worker read ended after {} bytes, expected {}",
@@ -149,7 +153,7 @@ pub(super) fn finish_read_block_output(output: BytesMut, block_read: &PlannedBlo
             block_read.len
         )));
     }
-    Ok(output.freeze())
+    Ok(Bytes::from(output))
 }
 
 pub(super) fn parse_worker_control_header(

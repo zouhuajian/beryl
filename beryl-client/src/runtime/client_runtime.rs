@@ -43,6 +43,7 @@ impl ClientRuntime {
         data_plane: WorkerDataPlane,
         metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
+        config.read.validate()?;
         let identity = ClientIdentity::generate(config.client_name.clone())?;
         let executor = MetadataExecutor::new(identity, gateway, metadata_targets, &config, Arc::clone(&metrics))?;
         Ok(Self {

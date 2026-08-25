@@ -7,7 +7,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures::stream;
 use tokio::sync::watch;
 
@@ -25,7 +25,7 @@ use super::{
 };
 use crate::cache::CacheInvalidationReason;
 use crate::config::ClientConfig;
-use crate::error::{ClientError, ClientResult};
+use crate::error::{read_buffer_reservation_failed, ClientError, ClientResult};
 use crate::metrics::{ClientMetrics, NoopClientMetrics};
 use crate::planner::{block_location_unavailable_error, PlannedBlockRead};
 use crate::runtime::{classify_error, is_worker_capacity_before_side_effect_rejection, AttemptContext, ErrorClass};
@@ -460,8 +460,15 @@ impl WorkerDataPlane {
         group_name: GroupName,
         block_reads: &[PlannedBlockRead],
     ) -> ClientResult<Bytes> {
-        let total_len = block_reads.iter().map(|block_read| block_read.len as usize).sum();
-        let mut output = BytesMut::with_capacity(total_len);
+        let total_len = block_reads.iter().try_fold(0usize, |total, block_read| {
+            total
+                .checked_add(block_read.len as usize)
+                .ok_or_else(|| ClientError::InvalidLayout("planned read length overflow".to_string()))
+        })?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(total_len)
+            .map_err(|error| read_buffer_reservation_failed("read_at", total_len, error))?;
         for block_read in block_reads {
             if block_read.block_stamp == 0 {
                 return Err(ClientError::InvalidLayout(
@@ -490,7 +497,7 @@ impl WorkerDataPlane {
             }
             output.extend_from_slice(&result.bytes);
         }
-        Ok(output.freeze())
+        Ok(Bytes::from(output))
     }
 
     /// Opens one metadata-authorized block RPC and waits for its staging Ack.
@@ -850,8 +857,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_transport_and_structured_location_failures_try_the_next_worker() {
-        for failure in [ReadFailure::Transport, ReadFailure::StructuredLocation] {
+    async fn read_failover_preserves_single_replica_results_and_fails_closed_on_corruption() {
+        let cases = [
+            (ReadFailure::Transport, true),
+            (ReadFailure::StructuredLocation, true),
+            (ReadFailure::PartialTransport, true),
+            (ReadFailure::EmptyChunk, false),
+        ];
+        for (failure, may_fail_over) in cases {
             let first_state = Arc::new(MockWorkerState::new(failure, WriteBehavior::Success));
             let second_state = Arc::new(MockWorkerState::new(ReadFailure::None, WriteBehavior::Success));
             let (first, first_shutdown) = start_mock_worker(Arc::clone(&first_state), 1).await;
@@ -859,56 +872,23 @@ mod tests {
 
             let result = grpc_client()
                 .read_block_range(attempt("ReadBlock"), group_name(), &planned_read(vec![first, second]))
-                .await
-                .expect("second Worker satisfies read");
-
-            assert_eq!(result.bytes, Bytes::from_static(b"data"));
+                .await;
+            if may_fail_over {
+                assert_eq!(result.expect("second Worker satisfies read").bytes, b"data"[..]);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ClientError::Worker(message)) if message.contains("empty chunk")
+                ));
+            }
             assert_eq!(first_state.read_calls.load(Ordering::SeqCst), 1);
-            assert_eq!(second_state.read_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                second_state.read_calls.load(Ordering::SeqCst),
+                usize::from(may_fail_over)
+            );
             let _ = first_shutdown.send(());
             let _ = second_shutdown.send(());
         }
-    }
-
-    #[tokio::test]
-    async fn partial_read_is_discarded_before_failover() {
-        let first_state = Arc::new(MockWorkerState::new(
-            ReadFailure::PartialTransport,
-            WriteBehavior::Success,
-        ));
-        let second_state = Arc::new(MockWorkerState::new(ReadFailure::None, WriteBehavior::Success));
-        let (first, first_shutdown) = start_mock_worker(Arc::clone(&first_state), 1).await;
-        let (second, second_shutdown) = start_mock_worker(Arc::clone(&second_state), 2).await;
-
-        let result = grpc_client()
-            .read_block_range(attempt("ReadBlock"), group_name(), &planned_read(vec![first, second]))
-            .await
-            .expect("second Worker replaces partial stream");
-
-        assert_eq!(result.bytes, Bytes::from_static(b"data"));
-        assert_eq!(first_state.read_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(second_state.read_calls.load(Ordering::SeqCst), 1);
-        let _ = first_shutdown.send(());
-        let _ = second_shutdown.send(());
-    }
-
-    #[tokio::test]
-    async fn read_protocol_corruption_does_not_fail_over() {
-        let first_state = Arc::new(MockWorkerState::new(ReadFailure::EmptyChunk, WriteBehavior::Success));
-        let second_state = Arc::new(MockWorkerState::new(ReadFailure::None, WriteBehavior::Success));
-        let (first, first_shutdown) = start_mock_worker(Arc::clone(&first_state), 1).await;
-        let (second, second_shutdown) = start_mock_worker(Arc::clone(&second_state), 2).await;
-
-        let error = grpc_client()
-            .read_block_range(attempt("ReadBlock"), group_name(), &planned_read(vec![first, second]))
-            .await
-            .expect_err("empty chunk fails closed");
-
-        assert!(matches!(error, ClientError::Worker(message) if message.contains("empty chunk")));
-        assert_eq!(first_state.read_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(second_state.read_calls.load(Ordering::SeqCst), 0);
-        let _ = first_shutdown.send(());
-        let _ = second_shutdown.send(());
     }
 
     #[tokio::test]

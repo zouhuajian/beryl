@@ -9,11 +9,13 @@ use std::sync::Arc;
 
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
 use beryl_types::InodeId;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use tokio::sync::Mutex;
 
 use crate::data::BlockWrite;
-use crate::error::{invalid_response, ClientError, ClientResult};
+use crate::error::{
+    invalid_response, read_buffer_reservation_failed, side_effect_response_body_mismatch, ClientError, ClientResult,
+};
 use crate::metrics::ClientMetric;
 use crate::planner;
 use crate::runtime::{
@@ -21,8 +23,6 @@ use crate::runtime::{
     refresh_hint_from_error, ClientRuntime, ErrorClass, OperationContext, OperationDeadline,
 };
 use crate::session::write_session::WriteSession;
-
-const MAX_CONVENIENCE_READ_CHUNK: u32 = 8 * 1024 * 1024;
 
 /// A reader for an immutable file snapshot opened through the filesystem client.
 #[derive(Clone)]
@@ -47,13 +47,14 @@ impl FileReader {
         self.handle.size_hint()
     }
 
-    /// Reads a range from the opened file snapshot.
+    /// Reads a configured bounded range from the opened file snapshot.
     pub async fn read_at(&self, offset: u64, len: u32) -> ClientResult<Bytes> {
         self.read_at_with_deadline(offset, len, self.runtime.executor.operation_deadline())
             .await
     }
 
     async fn read_at_with_deadline(&self, offset: u64, len: u32, deadline: OperationDeadline) -> ClientResult<Bytes> {
+        validate_read_request_size(len, self.runtime.config.read.max_request_bytes)?;
         let Some(requested_range) = planner::requested_range(offset, len, self.handle.size_hint())? else {
             return Ok(Bytes::new());
         };
@@ -138,25 +139,30 @@ impl FileReader {
         unreachable!("read attempt loop always returns on the final attempt")
     }
 
-    /// Reads the entire opened file snapshot into one buffer.
+    /// Reads the entire opened file snapshot when it fits the configured
+    /// owned-buffer limit.
     pub async fn read_all(&self) -> ClientResult<Bytes> {
         let size = self.handle.size_hint();
         if size == 0 {
             return Ok(Bytes::new());
         }
+        validate_read_all_size(size, self.runtime.config.read.max_buffered_bytes)?;
         let capacity = usize::try_from(size)
             .map_err(|_| ClientError::InvalidArgument("file is too large to read into one buffer".to_string()))?;
-        let mut output = BytesMut::with_capacity(capacity);
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(capacity)
+            .map_err(|error| read_buffer_reservation_failed("read_all", capacity, error))?;
         let mut offset = 0u64;
         let deadline = self.runtime.executor.operation_deadline();
         while offset < size {
-            let len = (size - offset).min(u64::from(MAX_CONVENIENCE_READ_CHUNK)) as u32;
+            let len = (size - offset).min(u64::from(self.runtime.config.read.max_request_bytes)) as u32;
             let bytes = self.read_at_with_deadline(offset, len, deadline.clone()).await?;
             ensure_exact_read(offset, len, &bytes)?;
             output.extend_from_slice(&bytes);
             offset += u64::from(len);
         }
-        Ok(output.freeze())
+        Ok(Bytes::from(output))
     }
 
     /// Reads exactly `len` bytes from `offset`, failing if the file snapshot ends first.
@@ -379,7 +385,14 @@ impl FileWriter {
         }
         match self.runtime.executor.commit_file(plan).await {
             Ok(response) => {
-                validate_commit_file_size(response.committed_size, final_size)?;
+                if let Err(error) = validate_commit_file_size(response.committed_size, final_size) {
+                    session.mark_commit_unknown();
+                    self.runtime.record_metric(
+                        ClientMetric::UnknownOutcome,
+                        metric_labels("CommitFile", "metadata").with_outcome("unknown"),
+                    );
+                    return Err(error);
+                }
                 session.mark_closed();
                 Ok(())
             }
@@ -464,10 +477,17 @@ impl FileWriter {
             .await
         {
             Ok(response) => {
-                validate_sync_write_size(response.synced_size, target_size)?;
-                let content_revision = response.content_revision.ok_or_else(|| {
-                    ClientError::Metadata("SyncWriteResponseProto.content_revision missing".to_string())
-                })?;
+                let content_revision = match validate_sync_write_response(&response, target_size) {
+                    Ok(content_revision) => content_revision,
+                    Err(error) => {
+                        session.mark_unknown_outcome();
+                        self.runtime.record_metric(
+                            ClientMetric::UnknownOutcome,
+                            metric_labels("SyncWrite", "metadata").with_outcome("unknown"),
+                        );
+                        return Err(error);
+                    }
+                };
                 session.update_published_state(content_revision, target_size);
                 self.handle.store_write_cursor(session.cursor());
                 Ok(())
@@ -523,12 +543,14 @@ impl fmt::Debug for FileWriter {
     }
 }
 
+/// Accepts a successful commit body only when it proves the exact frozen
+/// publication intent.
 fn validate_commit_file_size(committed_size: u64, final_size: u64) -> ClientResult<()> {
-    if committed_size < final_size {
-        return Err(invalid_response(
+    if committed_size != final_size {
+        return Err(side_effect_response_body_mismatch(
             "CommitFile",
             format!(
-                "committed_size {} is smaller than final_size {}",
+                "committed_size {} does not equal final_size {}",
                 committed_size, final_size
             ),
         ));
@@ -536,15 +558,42 @@ fn validate_commit_file_size(committed_size: u64, final_size: u64) -> ClientResu
     Ok(())
 }
 
-fn validate_sync_write_size(synced_size: u64, target_size: u64) -> ClientResult<()> {
-    if synced_size < target_size {
-        return Err(invalid_response(
+/// Validates the complete state needed to advance a writer after SyncWrite.
+fn validate_sync_write_response(
+    response: &beryl_proto::metadata::SyncWriteResponseProto,
+    target_size: u64,
+) -> ClientResult<u64> {
+    if response.synced_size != target_size {
+        return Err(side_effect_response_body_mismatch(
             "SyncWrite",
             format!(
-                "synced_size {} is smaller than target_size {}",
-                synced_size, target_size
+                "synced_size {} does not equal target_size {}",
+                response.synced_size, target_size
             ),
         ));
+    }
+    response
+        .content_revision
+        .ok_or_else(|| side_effect_response_body_mismatch("SyncWrite", "content_revision missing"))
+}
+
+/// Rejects a positioned read before planning or RPC when its declared result
+/// could exceed the configured owned-buffer limit.
+fn validate_read_request_size(requested_bytes: u32, max_bytes: u32) -> ClientResult<()> {
+    if requested_bytes > max_bytes {
+        return Err(ClientError::InvalidArgument(format!(
+            "read request size {requested_bytes} exceeds configured maximum {max_bytes}"
+        )));
+    }
+    Ok(())
+}
+
+/// Rejects a whole-file convenience read before allocation or RPC.
+fn validate_read_all_size(file_size: u64, max_bytes: u64) -> ClientResult<()> {
+    if file_size > max_bytes {
+        return Err(ClientError::InvalidArgument(format!(
+            "file size {file_size} exceeds configured read_all maximum {max_bytes}"
+        )));
     }
     Ok(())
 }
