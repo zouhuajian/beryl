@@ -11,9 +11,9 @@ use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
 use beryl_types::{GroupName, GroupStateWatermark};
 use parking_lot::RwLock;
 
-use crate::cache::StateIdCache;
 use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
+use crate::metadata::MetadataAuthorityUpdate;
 use crate::rpc_error::RefreshHint;
 use crate::runtime::context::{AttemptContext, OperationContext};
 
@@ -28,6 +28,8 @@ pub(crate) struct MetadataGroupTargets {
     pub(crate) endpoints: Vec<String>,
 }
 
+/// Routing and freshness caches protected by one lock so one response update
+/// cannot become partially visible to a concurrent request.
 #[derive(Debug)]
 struct MetadataTargetState {
     groups: Vec<MetadataGroupTargets>,
@@ -38,6 +40,7 @@ struct MetadataTargetState {
     mount_epoch_cache_order: VecDeque<String>,
     route_epoch_cache: HashMap<String, u64>,
     route_epoch_cache_order: VecDeque<String>,
+    watermarks: HashMap<GroupName, GroupStateWatermark>,
 }
 
 impl MetadataTargetState {
@@ -81,11 +84,11 @@ impl MetadataTargetState {
     }
 }
 
-/// Owns metadata target selection and correctness cache updates after refresh signals.
+/// Owns metadata target selection and monotonic correctness cache updates from
+/// successful response authority and structured refresh signals.
 #[derive(Clone, Debug)]
 pub(crate) struct MetadataTargets {
     state: Arc<RwLock<MetadataTargetState>>,
-    watermarks: StateIdCache,
 }
 
 impl MetadataTargets {
@@ -112,8 +115,8 @@ impl MetadataTargets {
                 mount_epoch_cache_order: VecDeque::new(),
                 route_epoch_cache: HashMap::new(),
                 route_epoch_cache_order: VecDeque::new(),
+                watermarks: HashMap::new(),
             })),
-            watermarks: StateIdCache::new(300),
         })
     }
 
@@ -247,6 +250,42 @@ impl MetadataTargets {
         Ok(())
     }
 
+    /// Atomically applies one validated successful response without allowing
+    /// concurrent or late responses to move any authority value backwards.
+    pub(crate) fn apply_authority_update(
+        &self,
+        operation: &OperationContext,
+        update: MetadataAuthorityUpdate,
+    ) -> ClientResult<()> {
+        if update
+            .state
+            .iter()
+            .any(|watermark| watermark.group_name != update.group_name)
+        {
+            return Err(ClientError::Metadata(
+                "metadata authority update contains a watermark for another group".to_string(),
+            ));
+        }
+        let operation_path = operation.original_target_path();
+        if operation_path.is_none() && (update.mount_epoch.is_some() || update.route_epoch.is_some()) {
+            return Err(ClientError::Metadata(
+                "metadata authority epochs require an operation path".to_string(),
+            ));
+        }
+
+        let mut state = self.state.write();
+        for watermark in update.state {
+            update_watermark_if_ahead(&mut state.watermarks, watermark);
+        }
+        if let Some(mount_epoch) = update.mount_epoch {
+            state.record_mount_epoch_hint(operation_path, None, mount_epoch);
+        }
+        if let Some(route_epoch) = update.route_epoch {
+            state.record_route_epoch_hint(operation_path, None, route_epoch);
+        }
+        Ok(())
+    }
+
     /// Add cached freshness hints to an attempt context without inventing defaults.
     pub(crate) fn enrich_attempt_context(
         &self,
@@ -265,23 +304,16 @@ impl MetadataTargets {
         ctx
     }
 
-    /// Record an msync state watermark.
-    pub(crate) fn record_state_watermark(
-        &self,
-        watermark: beryl_proto::common::GroupStateWatermarkProto,
-    ) -> ClientResult<()> {
-        let watermark = GroupStateWatermark::try_from(watermark)
-            .map_err(|err| ClientError::Metadata(format!("invalid state watermark: {err}")))?;
-        self.watermarks.update_if_ahead(watermark);
-        Ok(())
-    }
-
     /// Return cached watermark as proto for a group.
     pub(crate) fn state_watermark_proto(
         &self,
         group_name: &GroupName,
     ) -> Option<beryl_proto::common::GroupStateWatermarkProto> {
-        self.watermarks.get(group_name).map(|watermark| (&watermark).into())
+        self.state
+            .read()
+            .watermarks
+            .get(group_name)
+            .map(beryl_proto::common::GroupStateWatermarkProto::from)
     }
 }
 
@@ -293,10 +325,33 @@ fn record_epoch_hint(
     epoch: u64,
 ) {
     if let Some(path) = operation_path {
-        insert_bounded(cache, order, path.to_string(), epoch);
+        insert_bounded_epoch(cache, order, path.to_string(), epoch);
     }
     if let Some(prefix) = mount_prefix {
-        insert_bounded(cache, order, prefix.to_string(), epoch);
+        insert_bounded_epoch(cache, order, prefix.to_string(), epoch);
+    }
+}
+
+/// Inserts one path-scoped epoch while preserving the highest observed value.
+fn insert_bounded_epoch(cache: &mut HashMap<String, u64>, order: &mut VecDeque<String>, key: String, epoch: u64) {
+    if let Some(existing) = cache.get_mut(&key) {
+        *existing = (*existing).max(epoch);
+        return;
+    }
+    insert_bounded(cache, order, key, epoch);
+}
+
+/// Advances one group watermark and ignores equal or older observations.
+fn update_watermark_if_ahead(
+    watermarks: &mut HashMap<GroupName, GroupStateWatermark>,
+    new_watermark: GroupStateWatermark,
+) {
+    match watermarks.get_mut(&new_watermark.group_name) {
+        Some(existing) if new_watermark.state_id > existing.state_id => *existing = new_watermark,
+        None => {
+            watermarks.insert(new_watermark.group_name.clone(), new_watermark);
+        }
+        Some(_) => {}
     }
 }
 
@@ -435,44 +490,63 @@ mod tests {
     }
 
     #[test]
-    fn mount_epoch_hint_enriches_later_attempts() {
+    fn authority_updates_and_refresh_hints_never_regress() {
         let manager = manager();
         let op = path_operation();
 
         manager
-            .record_refresh(
+            .apply_authority_update(
                 &op,
-                ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
-                &RefreshHint {
+                MetadataAuthorityUpdate {
+                    group_name: group_name("root"),
+                    state: vec![GroupStateWatermark::try_from(watermark_proto("root", 10)).unwrap()],
                     mount_epoch: Some(31),
+                    route_epoch: Some(41),
+                },
+            )
+            .expect("new authority update");
+        for (kind, hint) in [
+            (
+                MetadataErrorKind::MountEpochMismatch,
+                RefreshHint {
+                    mount_epoch: Some(30),
                     mount_prefix: Some("/alpha".to_string()),
                     ..RefreshHint::default()
                 },
-            )
-            .expect("refresh recorded");
-
-        let enriched = manager.enrich_attempt_context(&op, metadata_attempt(&op));
-        let header = enriched.metadata_header().expect("metadata header");
-
-        assert_eq!(header.mount_epoch, Some(31));
-    }
-
-    #[test]
-    fn stale_state_watermark_keeps_highest_state_id() {
-        let manager = manager();
-
-        manager
-            .record_state_watermark(watermark_proto("root", 10))
-            .expect("watermark");
-        manager
-            .record_state_watermark(watermark_proto("root", 8))
-            .expect("older watermark");
-        assert_eq!(
+            ),
+            (
+                MetadataErrorKind::RouteEpochMismatch,
+                RefreshHint {
+                    route_epoch: Some(40),
+                    mount_prefix: Some("/alpha".to_string()),
+                    ..RefreshHint::default()
+                },
+            ),
+        ] {
             manager
-                .state_watermark_proto(&group_name("root"))
-                .and_then(|watermark| watermark.state_id.map(|state_id| state_id.index)),
-            Some(10)
-        );
+                .record_refresh(&op, ErrorKind::Metadata(kind), &hint)
+                .expect("older refresh hint");
+        }
+        manager
+            .apply_authority_update(
+                &op,
+                MetadataAuthorityUpdate {
+                    group_name: group_name("root"),
+                    state: vec![GroupStateWatermark::try_from(watermark_proto("root", 8)).unwrap()],
+                    mount_epoch: Some(29),
+                    route_epoch: Some(39),
+                },
+            )
+            .expect("older authority update");
+
+        let header = manager
+            .enrich_attempt_context(&op, metadata_attempt(&op))
+            .with_state(manager.state_watermark_proto(&group_name("root")).into_iter().collect())
+            .metadata_header()
+            .expect("metadata header");
+        assert_eq!(header.mount_epoch, Some(31));
+        assert_eq!(header.route_epoch, Some(41));
+        assert_eq!(header.state[0].state_id.as_ref().map(|state| state.index), Some(10));
     }
 
     fn watermark_proto(group_name: &str, index: u64) -> GroupStateWatermarkProto {

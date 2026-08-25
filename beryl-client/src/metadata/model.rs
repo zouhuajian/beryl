@@ -4,7 +4,44 @@
 //! Client-domain metadata result types.
 
 use crate::error::{ClientError, ClientResult};
-use beryl_types::{FileBlockLocation, GroupName, InodeId, WriteTarget};
+use beryl_types::{FileBlockLocation, GroupName, GroupStateWatermark, InodeId, WriteTarget};
+
+/// Server-authorized metadata state learned from one validated successful response.
+///
+/// Every watermark is scoped to `group_name`. Epochs are scoped later to the
+/// operation path because the response header does not carry a mount prefix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MetadataAuthorityUpdate {
+    /// Metadata group that authorized this response.
+    pub(crate) group_name: GroupName,
+    /// Applied state-machine watermarks authorized by the group leader.
+    pub(crate) state: Vec<GroupStateWatermark>,
+    /// Current mount epoch for the operation path, when supplied.
+    pub(crate) mount_epoch: Option<u64>,
+    /// Current route epoch for the operation path, when supplied.
+    pub(crate) route_epoch: Option<u64>,
+}
+
+/// Couples a response body with the authority state validated from its header.
+///
+/// The executor must apply `authority` before exposing `body` to upper layers.
+#[derive(Clone, Debug)]
+pub(crate) struct ValidatedMetadataResponse<T> {
+    authority: MetadataAuthorityUpdate,
+    body: T,
+}
+
+impl<T> ValidatedMetadataResponse<T> {
+    /// Creates a response whose header identity and success scope are validated.
+    pub(crate) fn new(authority: MetadataAuthorityUpdate, body: T) -> Self {
+        Self { authority, body }
+    }
+
+    /// Separates the cache update from the body at the executor boundary.
+    pub(crate) fn into_parts(self) -> (MetadataAuthorityUpdate, T) {
+        (self.authority, self.body)
+    }
+}
 
 /// Validated read layout returned by metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]

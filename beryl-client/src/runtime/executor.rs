@@ -17,7 +17,7 @@ use crate::api::path::NamespacePathBuf;
 use crate::api::{CreateOptions, DeleteOptions, DirectoryEntry, DirectoryListing, FileStatus, ListOptions};
 use crate::config::{ClientConfig, RetryConfig};
 use crate::error::{invalid_response, ClientError, ClientResult};
-use crate::metadata::{AddBlockResult, MetadataGateway, ReadLayout};
+use crate::metadata::{AddBlockResult, MetadataGateway, ReadLayout, ValidatedMetadataResponse};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
 use crate::rpc_error::ClientAction;
 use crate::runtime::classify::{classify_error, ErrorClass};
@@ -459,7 +459,7 @@ impl MetadataExecutor {
     where
         Req: Clone,
         F: FnMut(Arc<dyn MetadataGateway>, AttemptContext, Req) -> Fut,
-        Fut: Future<Output = ClientResult<T>>,
+        Fut: Future<Output = ClientResult<ValidatedMetadataResponse<T>>>,
     {
         let operation_name = operation.operation_name();
         let (result, saw_transport_ambiguity) = self.execute_metadata_attempts(operation, request, call).await;
@@ -490,7 +490,7 @@ impl MetadataExecutor {
     where
         Req: Clone,
         F: FnMut(Arc<dyn MetadataGateway>, AttemptContext, Req) -> Fut,
-        Fut: Future<Output = ClientResult<T>>,
+        Fut: Future<Output = ClientResult<ValidatedMetadataResponse<T>>>,
     {
         let operation_name = operation.operation_name();
         self.execute_mutation_metadata(operation, request, move |gateway, ctx, req| {
@@ -518,11 +518,13 @@ impl MetadataExecutor {
     where
         Req: Clone,
         F: FnMut(Arc<dyn MetadataGateway>, AttemptContext, Req) -> Fut,
-        Fut: Future<Output = ClientResult<T>>,
+        Fut: Future<Output = ClientResult<ValidatedMetadataResponse<T>>>,
     {
         self.execute_metadata_attempts(operation, request, call).await.0
     }
 
+    /// Runs bounded metadata attempts and applies every validated successful
+    /// authority update before returning the corresponding body.
     async fn execute_metadata_attempts<Req, T, F, Fut>(
         &self,
         operation: OperationContext,
@@ -532,7 +534,7 @@ impl MetadataExecutor {
     where
         Req: Clone,
         F: FnMut(Arc<dyn MetadataGateway>, AttemptContext, Req) -> Fut,
-        Fut: Future<Output = ClientResult<T>>,
+        Fut: Future<Output = ClientResult<ValidatedMetadataResponse<T>>>,
     {
         let mut target_group = match self.metadata_targets.group_for_operation(&operation) {
             Ok(group) => group,
@@ -557,8 +559,15 @@ impl MetadataExecutor {
             let result = self
                 .metadata_rpc_with_deadline(&operation, call(Arc::clone(&self.gateway), ctx, request.clone()))
                 .await;
-            let Err(err) = result else {
-                return (result, saw_transport_ambiguity);
+            let err = match result {
+                Ok(response) => {
+                    let (authority, body) = response.into_parts();
+                    if let Err(err) = self.metadata_targets.apply_authority_update(&operation, authority) {
+                        return (Err(err), saw_transport_ambiguity);
+                    }
+                    return (Ok(body), saw_transport_ambiguity);
+                }
+                Err(err) => err,
             };
             let class = classify_error(&err);
             saw_transport_ambiguity |= class == ErrorClass::RetryableTransport;
@@ -640,14 +649,15 @@ impl MetadataExecutor {
             parent.deadline().clone(),
         )?;
         let ctx = AttemptContext::for_metadata(&operation, target_group, 0)?.with_metadata_endpoint(endpoint);
-        let watermark = self
+        let response = self
             .metadata_rpc_with_deadline(
                 &operation,
                 self.gateway
                     .msync(ctx, beryl_proto::metadata::MsyncRequestProto { header: None }),
             )
             .await?;
-        self.metadata_targets.record_state_watermark(watermark)
+        let (authority, _) = response.into_parts();
+        self.metadata_targets.apply_authority_update(&operation, authority)
     }
 
     async fn metadata_rpc_with_deadline<T, Fut>(&self, operation: &OperationContext, future: Fut) -> ClientResult<T>

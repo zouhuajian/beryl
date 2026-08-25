@@ -230,7 +230,9 @@ mod tests {
         WorkerWriteTarget,
     };
     use crate::error::{ClientError, ClientResult};
-    use crate::metadata::{AddBlockResult, MetadataGateway, ReadLayout};
+    use crate::metadata::{
+        AddBlockResult, MetadataAuthorityUpdate, MetadataGateway, ReadLayout, ValidatedMetadataResponse,
+    };
     use crate::planner::PlannedBlockRead;
     use crate::rpc_error::{ClientAction, RefreshHint};
     use crate::runtime::{classify_error, AttemptContext, ErrorClass, MetadataTargets};
@@ -248,8 +250,8 @@ mod tests {
     use beryl_proto::worker::write_block_request_proto::Payload;
     use beryl_types::lease::FencingToken;
     use beryl_types::{
-        BlockId, BlockIndex, ClientId, FileBlockLocation, GroupName, InodeId, WorkerEndpointInfo, WorkerId,
-        WorkerNetProtocol, WriteTarget,
+        BlockId, BlockIndex, ClientId, FileBlockLocation, GroupName, GroupStateWatermark, InodeId, RaftLogId,
+        WorkerEndpointInfo, WorkerId, WorkerNetProtocol, WriteTarget,
     };
     use bytes::Bytes;
     use std::collections::{HashMap, VecDeque};
@@ -387,6 +389,35 @@ mod tests {
         assert_eq!(calls[0].call_id, calls[2].call_id);
         assert_ne!(calls[0].call_id, calls[1].call_id);
         assert!(calls.iter().all(|call| call.deadline_ms == calls[0].deadline_ms));
+        let headers = gateway.get_status_headers();
+        assert!(headers[0].state.is_empty());
+        assert_eq!(headers[1].state[0].state_id.as_ref().map(|state| state.index), Some(1));
+    }
+
+    #[tokio::test]
+    async fn successful_metadata_authority_enriches_the_next_request() {
+        let gateway = Arc::new(MockGateway::with_get_status_authority(MetadataAuthorityUpdate {
+            group_name: group_name_from("root"),
+            state: vec![GroupStateWatermark::new(
+                group_name_from("root"),
+                RaftLogId::new(2, 1, 9),
+            )],
+            mount_epoch: Some(31),
+            route_epoch: Some(41),
+        }));
+        let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
+
+        client.stat("/alpha").await.expect("first stat");
+        client.stat("/alpha").await.expect("second stat");
+
+        let headers = gateway.get_status_headers();
+        assert_eq!(headers.len(), 2);
+        assert!(headers[0].state.is_empty());
+        assert_eq!(headers[1].mount_epoch, Some(31));
+        assert_eq!(headers[1].route_epoch, Some(41));
+        assert_eq!(headers[1].state.len(), 1);
+        assert_eq!(headers[1].state[0].group_name, "root");
+        assert_eq!(headers[1].state[0].state_id.as_ref().map(|state| state.index), Some(9));
     }
 
     #[tokio::test]
@@ -698,6 +729,24 @@ mod tests {
         GroupName::parse(raw).unwrap()
     }
 
+    /// Builds the successful response envelope used by the executor-facing mock.
+    fn metadata_response<T>(ctx: &AttemptContext, body: T) -> ValidatedMetadataResponse<T> {
+        let group_name = ctx.group_name().cloned().expect("metadata attempt group");
+        ValidatedMetadataResponse::new(
+            MetadataAuthorityUpdate {
+                group_name,
+                state: Vec::new(),
+                mount_epoch: None,
+                route_epoch: None,
+            },
+            body,
+        )
+    }
+
+    fn metadata_ok<T>(ctx: &AttemptContext, body: T) -> ClientResult<ValidatedMetadataResponse<T>> {
+        Ok(metadata_response(ctx, body))
+    }
+
     fn assert_event_order(events: &EventLog, before: &'static str, after: &'static str) {
         let events = events.lock().expect("events");
         let before_index = events
@@ -823,6 +872,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct MockGateway {
         calls: Mutex<Vec<RecordedCall>>,
+        get_status_headers: Mutex<Vec<beryl_proto::common::RequestHeaderProto>>,
+        get_status_authority: Mutex<VecDeque<MetadataAuthorityUpdate>>,
         layouts: Mutex<VecDeque<ReadLayout>>,
         create_directory_requests: Mutex<Vec<(String, bool)>>,
         next_offsets: Mutex<HashMap<u64, u64>>,
@@ -848,6 +899,10 @@ mod tests {
                 .clone()
         }
 
+        fn get_status_headers(&self) -> Vec<beryl_proto::common::RequestHeaderProto> {
+            self.get_status_headers.lock().expect("get status headers").clone()
+        }
+
         fn with_layout(layout: ReadLayout) -> Self {
             let mut layouts = VecDeque::new();
             layouts.push_back(layout);
@@ -867,6 +922,13 @@ mod tests {
         fn with_get_status_outcomes(outcomes: Vec<MetadataOutcome>) -> Self {
             Self {
                 get_status_outcomes: Mutex::new(outcomes.into()),
+                ..Self::default()
+            }
+        }
+
+        fn with_get_status_authority(authority: MetadataAuthorityUpdate) -> Self {
+            Self {
+                get_status_authority: Mutex::new(vec![authority].into()),
                 ..Self::default()
             }
         }
@@ -1051,8 +1113,12 @@ mod tests {
             &self,
             ctx: AttemptContext,
             _req: beryl_proto::metadata::GetStatusRequestProto,
-        ) -> ClientResult<GetStatusResponseProto> {
+        ) -> ClientResult<ValidatedMetadataResponse<GetStatusResponseProto>> {
             self.record("get_status", &ctx);
+            self.get_status_headers
+                .lock()
+                .expect("get status headers")
+                .push(ctx.metadata_header().expect("metadata header"));
             match self.next_get_status_outcome() {
                 MetadataOutcome::Ok => {}
                 MetadataOutcome::Transport => {
@@ -1065,9 +1131,18 @@ mod tests {
                     return Err(refresh_action_error(ErrorKind::Metadata(MetadataErrorKind::StaleState)))
                 }
             }
-            Ok(GetStatusResponseProto {
+            let body = GetStatusResponseProto {
                 attrs: Some(file_attrs_proto(10)),
                 ..GetStatusResponseProto::default()
+            };
+            let authority = self
+                .get_status_authority
+                .lock()
+                .expect("get status authority")
+                .pop_front();
+            Ok(match authority {
+                Some(authority) => ValidatedMetadataResponse::new(authority, body),
+                None => metadata_response(&ctx, body),
             })
         }
 
@@ -1075,88 +1150,98 @@ mod tests {
             &self,
             ctx: AttemptContext,
             _req: beryl_proto::metadata::ListStatusRequestProto,
-        ) -> ClientResult<ListStatusResponseProto> {
+        ) -> ClientResult<ValidatedMetadataResponse<ListStatusResponseProto>> {
             self.record("list_status", &ctx);
-            Ok(ListStatusResponseProto {
-                entries: vec![beryl_proto::metadata::DirEntryProto {
-                    name: "child".to_string(),
-                    kind: beryl_proto::metadata::InodeKindProto::InodeKindFile as i32,
-                    attrs: Some(file_attrs_proto(4)),
-                }],
-                eof: true,
-                ..ListStatusResponseProto::default()
-            })
+            metadata_ok(
+                &ctx,
+                ListStatusResponseProto {
+                    entries: vec![beryl_proto::metadata::DirEntryProto {
+                        name: "child".to_string(),
+                        kind: beryl_proto::metadata::InodeKindProto::InodeKindFile as i32,
+                        attrs: Some(file_attrs_proto(4)),
+                    }],
+                    eof: true,
+                    ..ListStatusResponseProto::default()
+                },
+            )
         }
 
         async fn create_directory(
             &self,
             ctx: AttemptContext,
             req: beryl_proto::metadata::CreateDirectoryRequestProto,
-        ) -> ClientResult<CreateDirectoryResponseProto> {
+        ) -> ClientResult<ValidatedMetadataResponse<CreateDirectoryResponseProto>> {
             self.record("create_directory", &ctx);
             self.create_directory_requests
                 .lock()
                 .expect("create directory requests")
                 .push((req.path, req.recursive));
             Self::apply_metadata_outcome(self.next_mutation_outcome(), "CreateDirectory")?;
-            Ok(CreateDirectoryResponseProto {
-                attrs: Some(file_attrs_proto(0)),
-                ..CreateDirectoryResponseProto::default()
-            })
+            metadata_ok(
+                &ctx,
+                CreateDirectoryResponseProto {
+                    attrs: Some(file_attrs_proto(0)),
+                    ..CreateDirectoryResponseProto::default()
+                },
+            )
         }
 
         async fn delete(
             &self,
             ctx: AttemptContext,
             _req: beryl_proto::metadata::DeleteRequestProto,
-        ) -> ClientResult<DeleteResponseProto> {
+        ) -> ClientResult<ValidatedMetadataResponse<DeleteResponseProto>> {
             self.record("delete", &ctx);
             Self::apply_metadata_outcome(self.next_mutation_outcome(), "Delete")?;
-            Ok(DeleteResponseProto::default())
+            metadata_ok(&ctx, DeleteResponseProto::default())
         }
 
         async fn rename(
             &self,
             ctx: AttemptContext,
             _req: beryl_proto::metadata::RenameRequestProto,
-        ) -> ClientResult<RenameResponseProto> {
+        ) -> ClientResult<ValidatedMetadataResponse<RenameResponseProto>> {
             self.record("rename", &ctx);
             Self::apply_metadata_outcome(self.next_mutation_outcome(), "Rename")?;
-            Ok(RenameResponseProto::default())
+            metadata_ok(&ctx, RenameResponseProto::default())
         }
 
         async fn open_file(
             &self,
             ctx: AttemptContext,
             _req: beryl_proto::metadata::OpenFileRequestProto,
-        ) -> ClientResult<OpenFileResponseProto> {
+        ) -> ClientResult<ValidatedMetadataResponse<OpenFileResponseProto>> {
             self.record("open_file", &ctx);
-            Ok(OpenFileResponseProto {
-                inode_id: 202,
-                file_size: 10,
-                content_revision: Some(3),
-                ..OpenFileResponseProto::default()
-            })
+            metadata_ok(
+                &ctx,
+                OpenFileResponseProto {
+                    inode_id: 202,
+                    file_size: 10,
+                    content_revision: Some(3),
+                    ..OpenFileResponseProto::default()
+                },
+            )
         }
 
         async fn read_layout(
             &self,
             ctx: AttemptContext,
             req: beryl_proto::metadata::GetBlockLocationsRequestProto,
-        ) -> ClientResult<ReadLayout> {
+        ) -> ClientResult<ValidatedMetadataResponse<ReadLayout>> {
             self.record_read_layout(&ctx, &req);
             let layouts = self.layouts.lock().expect("layouts");
-            Ok(layouts
+            let body = layouts
                 .front()
                 .cloned()
-                .unwrap_or_else(|| layout_response("root", 202, Some(3), 10, Vec::new())))
+                .unwrap_or_else(|| layout_response("root", 202, Some(3), 10, Vec::new()));
+            metadata_ok(&ctx, body)
         }
 
         async fn create_file(
             &self,
             ctx: AttemptContext,
             req: beryl_proto::metadata::CreateFileRequestProto,
-        ) -> ClientResult<CreateFileResponseProto> {
+        ) -> ClientResult<ValidatedMetadataResponse<CreateFileResponseProto>> {
             self.record_create_file(&ctx, &req);
             Self::apply_metadata_outcome(self.next_mutation_outcome(), "CreateFile")?;
             self.next_offsets.lock().expect("offsets").insert(1, 0);
@@ -1169,18 +1254,21 @@ mod tests {
             if let Some(layout) = response_layout {
                 self.write_layouts.lock().expect("write layouts").insert(302, layout);
             }
-            Ok(CreateFileResponseProto {
-                inode_id: 302,
-                layout: response_layout.map(layout_proto),
-                ..CreateFileResponseProto::default()
-            })
+            metadata_ok(
+                &ctx,
+                CreateFileResponseProto {
+                    inode_id: 302,
+                    layout: response_layout.map(layout_proto),
+                    ..CreateFileResponseProto::default()
+                },
+            )
         }
 
         async fn open_write(
             &self,
             ctx: AttemptContext,
             req: beryl_proto::metadata::OpenWriteRequestProto,
-        ) -> ClientResult<OpenWriteResponseProto> {
+        ) -> ClientResult<ValidatedMetadataResponse<OpenWriteResponseProto>> {
             self.record("open_write", &ctx);
             match self.next_open_write_outcome() {
                 MetadataOutcome::Ok => {}
@@ -1211,21 +1299,24 @@ mod tests {
                 .lock()
                 .expect("write layouts")
                 .insert(inode_id, layout);
-            Ok(OpenWriteResponseProto {
-                write_handle: Some(write_handle_proto(inode_id)),
-                base_size,
-                expires_at_ms: u64::MAX / 2,
-                layout: Some(layout_proto(layout)),
-                content_revision: 0,
-                ..OpenWriteResponseProto::default()
-            })
+            metadata_ok(
+                &ctx,
+                OpenWriteResponseProto {
+                    write_handle: Some(write_handle_proto(inode_id)),
+                    base_size,
+                    expires_at_ms: u64::MAX / 2,
+                    layout: Some(layout_proto(layout)),
+                    content_revision: 0,
+                    ..OpenWriteResponseProto::default()
+                },
+            )
         }
 
         async fn add_block(
             &self,
             ctx: AttemptContext,
             req: beryl_proto::metadata::AddBlockRequestProto,
-        ) -> ClientResult<AddBlockResult> {
+        ) -> ClientResult<ValidatedMetadataResponse<AddBlockResult>> {
             self.record_add_block(&ctx, &req);
             match self.next_add_block_outcome() {
                 AddBlockOutcome::Ok => {}
@@ -1263,52 +1354,61 @@ mod tests {
                 index
             };
             let inode_id = inode_id_from_write_handle(write_handle);
-            let header = ctx.metadata_header().expect("metadata header");
-            Ok(AddBlockResult {
-                group_name: group_name_from(&header.group_name),
-                target: write_target_with_layout(inode_id, block_index, offset, layout),
-            })
+            let group_name = ctx.group_name().cloned().expect("metadata attempt group");
+            metadata_ok(
+                &ctx,
+                AddBlockResult {
+                    group_name,
+                    target: write_target_with_layout(inode_id, block_index, offset, layout),
+                },
+            )
         }
 
         async fn commit_file(
             &self,
             ctx: AttemptContext,
             req: beryl_proto::metadata::CommitFileRequestProto,
-        ) -> ClientResult<beryl_proto::metadata::CommitFileResponseProto> {
+        ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::CommitFileResponseProto>> {
             self.record_commit_file(&ctx, &req);
-            Ok(CommitFileResponseProto {
-                committed_size: req.final_size,
-                ..CommitFileResponseProto::default()
-            })
+            metadata_ok(
+                &ctx,
+                CommitFileResponseProto {
+                    committed_size: req.final_size,
+                    ..CommitFileResponseProto::default()
+                },
+            )
         }
 
         async fn abort_file_write(
             &self,
             ctx: AttemptContext,
             _req: beryl_proto::metadata::AbortFileWriteRequestProto,
-        ) -> ClientResult<beryl_proto::metadata::AbortFileWriteResponseProto> {
+        ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::AbortFileWriteResponseProto>> {
             self.record_event("abort_file_write");
             self.record("abort_file_write", &ctx);
-            Ok(AbortFileWriteResponseProto::default())
+            metadata_ok(&ctx, AbortFileWriteResponseProto::default())
         }
 
         async fn renew_lease(
             &self,
             ctx: AttemptContext,
             _req: beryl_proto::metadata::RenewLeaseRequestProto,
-        ) -> ClientResult<beryl_proto::metadata::RenewLeaseResponseProto> {
+        ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::RenewLeaseResponseProto>> {
             self.record("renew_lease", &ctx);
-            Ok(RenewLeaseResponseProto {
-                expires_at_ms: u64::MAX / 2,
-                ..RenewLeaseResponseProto::default()
-            })
+            metadata_ok(
+                &ctx,
+                RenewLeaseResponseProto {
+                    expires_at_ms: u64::MAX / 2,
+                    ..RenewLeaseResponseProto::default()
+                },
+            )
         }
 
         async fn sync_write(
             &self,
             ctx: AttemptContext,
             req: beryl_proto::metadata::SyncWriteRequestProto,
-        ) -> ClientResult<SyncWriteResponseProto> {
+        ) -> ClientResult<ValidatedMetadataResponse<SyncWriteResponseProto>> {
             self.record_sync_write(&ctx, &req);
             let synced_size = req.target_size;
             if let Some(write_handle) = req.write_handle.as_ref() {
@@ -1317,28 +1417,40 @@ mod tests {
                     .expect("offsets")
                     .insert(write_handle.inode_id, synced_size);
             }
-            Ok(SyncWriteResponseProto {
-                synced_size,
-                content_revision: Some(1),
-                ..SyncWriteResponseProto::default()
-            })
+            metadata_ok(
+                &ctx,
+                SyncWriteResponseProto {
+                    synced_size,
+                    content_revision: Some(1),
+                    ..SyncWriteResponseProto::default()
+                },
+            )
         }
 
         async fn msync(
             &self,
             ctx: AttemptContext,
             _req: beryl_proto::metadata::MsyncRequestProto,
-        ) -> ClientResult<beryl_proto::common::GroupStateWatermarkProto> {
-            let group_name = ctx.metadata_header().expect("metadata header").group_name;
+        ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::common::GroupStateWatermarkProto>> {
+            let group_name = ctx.group_name().cloned().expect("metadata attempt group");
             self.record("msync", &ctx);
-            Ok(beryl_proto::common::GroupStateWatermarkProto {
-                group_name,
+            let body = beryl_proto::common::GroupStateWatermarkProto {
+                group_name: group_name.to_string(),
                 state_id: Some(beryl_proto::common::RaftLogIdProto {
                     term: 1,
                     leader_node_id: 1,
                     index: 1,
                 }),
-            })
+            };
+            Ok(ValidatedMetadataResponse::new(
+                MetadataAuthorityUpdate {
+                    group_name,
+                    state: vec![GroupStateWatermark::try_from(body.clone()).expect("msync watermark")],
+                    mount_epoch: None,
+                    route_epoch: None,
+                },
+                body,
+            ))
         }
     }
 

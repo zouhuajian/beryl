@@ -235,7 +235,6 @@ dependencies = [
  "beryl-proto",
  "beryl-types",
  "bytes",
- "dashmap",
  "futures",
  "metrics",
  "parking_lot",

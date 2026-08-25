@@ -30,7 +30,6 @@ serde_yaml = { workspace = true }
 # Utilities
 bytes = { workspace = true }
 parking_lot = { workspace = true }
-dashmap = { workspace = true }
 uuid = { workspace = true }
 
 # Logging

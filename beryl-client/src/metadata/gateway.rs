@@ -4,9 +4,10 @@
 //! MetadataGateway trait and tonic implementation.
 
 use async_trait::async_trait;
-use beryl_common::header::{HeaderIdentity, ResponseHeader};
+use beryl_common::error::rpc::{RecoveryAction, RefreshHint as RpcRefreshHint};
+use beryl_common::header::{ClientInfo, ResponseHeader};
 use beryl_proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
-use beryl_types::GroupName;
+use beryl_types::{GroupName, GroupStateWatermark};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +15,7 @@ use tonic::transport as tonic_net;
 
 use crate::config::ClientConfig;
 use crate::error::{side_effect_response_body_mismatch, ClientError, ClientResult};
-use crate::metadata::model::{AddBlockResult, ReadLayout};
+use crate::metadata::model::{AddBlockResult, MetadataAuthorityUpdate, ReadLayout, ValidatedMetadataResponse};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
 use crate::rpc_error::{invalid_header_action, validate_header_or_action};
 use crate::runtime::AttemptContext;
@@ -27,105 +28,106 @@ pub(crate) trait MetadataGateway: Send + Sync {
         &self,
         ctx: AttemptContext,
         req: beryl_proto::metadata::GetStatusRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::GetStatusResponseProto>;
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::GetStatusResponseProto>>;
 
     /// List directory status.
     async fn list_status(
         &self,
         ctx: AttemptContext,
         req: beryl_proto::metadata::ListStatusRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::ListStatusResponseProto>;
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::ListStatusResponseProto>>;
 
     /// Create a directory.
     async fn create_directory(
         &self,
         ctx: AttemptContext,
         req: beryl_proto::metadata::CreateDirectoryRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::CreateDirectoryResponseProto>;
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::CreateDirectoryResponseProto>>;
 
     /// Delete a namespace entry.
     async fn delete(
         &self,
         ctx: AttemptContext,
         req: beryl_proto::metadata::DeleteRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::DeleteResponseProto>;
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::DeleteResponseProto>>;
 
     /// Rename a namespace entry.
     async fn rename(
         &self,
         ctx: AttemptContext,
         req: beryl_proto::metadata::RenameRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::RenameResponseProto>;
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::RenameResponseProto>>;
 
     /// Open a file for read planning.
     async fn open_file(
         &self,
         ctx: AttemptContext,
         req: beryl_proto::metadata::OpenFileRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::OpenFileResponseProto>;
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::OpenFileResponseProto>>;
 
     /// Get the file data layout for a public read.
     async fn read_layout(
         &self,
         ctx: AttemptContext,
         req: beryl_proto::metadata::GetBlockLocationsRequestProto,
-    ) -> ClientResult<ReadLayout>;
+    ) -> ClientResult<ValidatedMetadataResponse<ReadLayout>>;
 
     /// Apply the durable CreateFile namespace mutation.
     async fn create_file(
         &self,
         ctx: AttemptContext,
         req: beryl_proto::metadata::CreateFileRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::CreateFileResponseProto>;
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::CreateFileResponseProto>>;
 
     /// Open a leader-local write session.
     async fn open_write(
         &self,
         ctx: AttemptContext,
         req: beryl_proto::metadata::OpenWriteRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::OpenWriteResponseProto>;
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::OpenWriteResponseProto>>;
 
     /// Allocate a worker write target for a write session.
     async fn add_block(
         &self,
         ctx: AttemptContext,
         req: beryl_proto::metadata::AddBlockRequestProto,
-    ) -> ClientResult<AddBlockResult>;
+    ) -> ClientResult<ValidatedMetadataResponse<AddBlockResult>>;
 
     /// Commit a write session after worker data commit succeeds.
     async fn commit_file(
         &self,
         ctx: AttemptContext,
         req: beryl_proto::metadata::CommitFileRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::CommitFileResponseProto>;
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::CommitFileResponseProto>>;
 
     /// Abort a write session best effort.
     async fn abort_file_write(
         &self,
         ctx: AttemptContext,
         req: beryl_proto::metadata::AbortFileWriteRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::AbortFileWriteResponseProto>;
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::AbortFileWriteResponseProto>>;
 
     /// Renew an active write session lease.
     async fn renew_lease(
         &self,
         ctx: AttemptContext,
         req: beryl_proto::metadata::RenewLeaseRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::RenewLeaseResponseProto>;
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::RenewLeaseResponseProto>>;
 
     /// Apply a write-session visibility or durability barrier.
     async fn sync_write(
         &self,
         ctx: AttemptContext,
         req: beryl_proto::metadata::SyncWriteRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::SyncWriteResponseProto>;
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::SyncWriteResponseProto>>;
 
-    /// Synchronize metadata state freshness.
+    /// Synchronize metadata freshness and include the returned watermark in
+    /// the validated authority update.
     async fn msync(
         &self,
         ctx: AttemptContext,
         req: beryl_proto::metadata::MsyncRequestProto,
-    ) -> ClientResult<beryl_proto::common::GroupStateWatermarkProto>;
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::common::GroupStateWatermarkProto>>;
 }
 
 /// Tonic-backed metadata gateway.
@@ -272,7 +274,7 @@ impl MetadataGateway for GrpcMetadataGateway {
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::GetStatusRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::GetStatusResponseProto> {
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::GetStatusResponseProto>> {
         req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "read")
@@ -281,15 +283,14 @@ impl MetadataGateway for GrpcMetadataGateway {
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        Ok(response)
+        validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
     async fn list_status(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::ListStatusRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::ListStatusResponseProto> {
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::ListStatusResponseProto>> {
         req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "read")
@@ -298,15 +299,14 @@ impl MetadataGateway for GrpcMetadataGateway {
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        Ok(response)
+        validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
     async fn delete(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::DeleteRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::DeleteResponseProto> {
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::DeleteResponseProto>> {
         req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
@@ -315,15 +315,14 @@ impl MetadataGateway for GrpcMetadataGateway {
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        Ok(response)
+        validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
     async fn create_directory(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::CreateDirectoryRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::CreateDirectoryResponseProto> {
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::CreateDirectoryResponseProto>> {
         req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
@@ -332,15 +331,14 @@ impl MetadataGateway for GrpcMetadataGateway {
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        Ok(response)
+        validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
     async fn rename(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::RenameRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::RenameResponseProto> {
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::RenameResponseProto>> {
         req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
@@ -349,15 +347,14 @@ impl MetadataGateway for GrpcMetadataGateway {
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        Ok(response)
+        validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
     async fn open_file(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::OpenFileRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::OpenFileResponseProto> {
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::OpenFileResponseProto>> {
         req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "read")
@@ -366,15 +363,14 @@ impl MetadataGateway for GrpcMetadataGateway {
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        Ok(response)
+        validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
     async fn read_layout(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::GetBlockLocationsRequestProto,
-    ) -> ClientResult<ReadLayout> {
+    ) -> ClientResult<ValidatedMetadataResponse<ReadLayout>> {
         req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "read")
@@ -383,15 +379,16 @@ impl MetadataGateway for GrpcMetadataGateway {
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        let group_name = parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        ReadLayout::from_get_block_locations_response(group_name, response)
+        let authority = parse_metadata_response_header(&ctx, response.header.as_ref())?;
+        let body = ReadLayout::from_get_block_locations_response(authority.group_name.clone(), response)?;
+        Ok(ValidatedMetadataResponse::new(authority, body))
     }
 
     async fn create_file(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::CreateFileRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::CreateFileResponseProto> {
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::CreateFileResponseProto>> {
         req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
@@ -400,15 +397,14 @@ impl MetadataGateway for GrpcMetadataGateway {
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        Ok(response)
+        validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
     async fn open_write(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::OpenWriteRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::OpenWriteResponseProto> {
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::OpenWriteResponseProto>> {
         req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
@@ -417,15 +413,14 @@ impl MetadataGateway for GrpcMetadataGateway {
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        Ok(response)
+        validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
     async fn add_block(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::AddBlockRequestProto,
-    ) -> ClientResult<AddBlockResult> {
+    ) -> ClientResult<ValidatedMetadataResponse<AddBlockResult>> {
         req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
@@ -434,21 +429,25 @@ impl MetadataGateway for GrpcMetadataGateway {
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        let group_name = parse_metadata_response_header(&ctx, response.header.as_ref())?;
+        let authority = parse_metadata_response_header(&ctx, response.header.as_ref())?;
         let target = response
             .target
             .ok_or_else(|| side_effect_response_body_mismatch("AddBlock", "missing target"))?;
         let target = target
             .try_into()
             .map_err(|err| side_effect_response_body_mismatch("AddBlock", err))?;
-        Ok(AddBlockResult { group_name, target })
+        let body = AddBlockResult {
+            group_name: authority.group_name.clone(),
+            target,
+        };
+        Ok(ValidatedMetadataResponse::new(authority, body))
     }
 
     async fn commit_file(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::CommitFileRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::CommitFileResponseProto> {
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::CommitFileResponseProto>> {
         req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
@@ -457,15 +456,14 @@ impl MetadataGateway for GrpcMetadataGateway {
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        Ok(response)
+        validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
     async fn abort_file_write(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::AbortFileWriteRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::AbortFileWriteResponseProto> {
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::AbortFileWriteResponseProto>> {
         req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
@@ -474,15 +472,14 @@ impl MetadataGateway for GrpcMetadataGateway {
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        Ok(response)
+        validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
     async fn renew_lease(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::RenewLeaseRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::RenewLeaseResponseProto> {
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::RenewLeaseResponseProto>> {
         req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
@@ -491,15 +488,14 @@ impl MetadataGateway for GrpcMetadataGateway {
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        Ok(response)
+        validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
     async fn sync_write(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::SyncWriteRequestProto,
-    ) -> ClientResult<beryl_proto::metadata::SyncWriteResponseProto> {
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::SyncWriteResponseProto>> {
         req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
@@ -508,15 +504,14 @@ impl MetadataGateway for GrpcMetadataGateway {
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        Ok(response)
+        validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
     async fn msync(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::MsyncRequestProto,
-    ) -> ClientResult<beryl_proto::common::GroupStateWatermarkProto> {
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::common::GroupStateWatermarkProto>> {
         req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "refresh")
@@ -525,10 +520,7 @@ impl MetadataGateway for GrpcMetadataGateway {
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        response
-            .state
-            .ok_or_else(|| ClientError::Metadata("MsyncResponseProto missing state".to_string()))
+        validated_msync_response(&ctx, response)
     }
 }
 
@@ -536,60 +528,161 @@ fn build_metadata_header(ctx: &AttemptContext) -> ClientResult<beryl_proto::comm
     ctx.metadata_header()
 }
 
+/// Validates one successful response header and keeps its authority update
+/// coupled to the body until the metadata executor applies it.
+fn validated_metadata_response<T>(
+    ctx: &AttemptContext,
+    header: Option<beryl_proto::common::ResponseHeaderProto>,
+    body: T,
+) -> ClientResult<ValidatedMetadataResponse<T>> {
+    let authority = parse_metadata_response_header(ctx, header.as_ref())?;
+    Ok(ValidatedMetadataResponse::new(authority, body))
+}
+
+/// Binds the watermark returned by Msync to the validated response group and
+/// folds it into the authority update applied by the executor.
+fn validated_msync_response(
+    ctx: &AttemptContext,
+    response: beryl_proto::metadata::MsyncResponseProto,
+) -> ClientResult<ValidatedMetadataResponse<beryl_proto::common::GroupStateWatermarkProto>> {
+    let mut authority = parse_metadata_response_header(ctx, response.header.as_ref())?;
+    let body = response
+        .state
+        .ok_or_else(|| ClientError::from(invalid_header_action("metadata Msync response missing state")))?;
+    let watermark = GroupStateWatermark::try_from(body.clone()).map_err(|err| {
+        ClientError::from(invalid_header_action(format!(
+            "metadata Msync response invalid state watermark: {err}"
+        )))
+    })?;
+    if watermark.group_name != authority.group_name {
+        return Err(ClientError::from(invalid_header_action(format!(
+            "metadata Msync response state group_name mismatch: expected {}, got {}",
+            authority.group_name, watermark.group_name
+        ))));
+    }
+    authority.state.push(watermark);
+    Ok(ValidatedMetadataResponse::new(authority, body))
+}
+
+/// Validates correlation before interpreting a structured error, and requires
+/// successful responses to carry authority for the exact attempted group.
 fn parse_metadata_response_header(
     ctx: &AttemptContext,
     header: Option<&beryl_proto::common::ResponseHeaderProto>,
-) -> ClientResult<GroupName> {
+) -> ClientResult<MetadataAuthorityUpdate> {
     let Some(header) = header else {
         return Err(ClientError::from(invalid_header_action(
             "metadata OK response missing ResponseHeader",
         )));
     };
+    let client = header
+        .client
+        .clone()
+        .ok_or_else(|| ClientError::from(invalid_header_action("metadata response missing client identity")))?
+        .try_into()
+        .map_err(|err| {
+            ClientError::from(invalid_header_action(format!(
+                "metadata response invalid client identity: {err}"
+            )))
+        })?;
+    validate_metadata_response_client(ctx, &client)?;
     let header = ResponseHeader::try_from(header.clone()).map_err(|err| {
         ClientError::from(invalid_header_action(format!(
             "metadata OK response invalid ResponseHeader: {err}"
         )))
     })?;
-    let identity = HeaderIdentity {
-        call_id: header.client.call_id,
-        client_id: header.client.client_id,
-        group_name: header.group_name.clone(),
-    };
-    let group_name = identity.group_name.clone().ok_or_else(|| {
+
+    if header.rpc_error.is_some() {
+        validate_metadata_error_scope(&header)?;
+        return match validate_header_or_action(&header) {
+            Err(action) => Err(ClientError::from(action)),
+            Ok(()) => Err(ClientError::from(invalid_header_action(
+                "metadata response declared rpc_error without a recovery action",
+            ))),
+        };
+    }
+
+    let group_name = header.group_name.clone().ok_or_else(|| {
         ClientError::from(invalid_header_action(
             "metadata OK response invalid ResponseHeader: group_name missing",
         ))
     })?;
-    validate_metadata_response_identity(ctx, &identity)?;
-    validate_header_or_action(&header).map_err(ClientError::from)?;
-    Ok(group_name)
-}
-
-fn validate_metadata_response_identity(ctx: &AttemptContext, identity: &HeaderIdentity) -> ClientResult<()> {
-    let request_identity = ctx.header_identity();
-    if identity.matches_request(&request_identity) {
-        return Ok(());
-    }
-    if let (Some(request_group_name), Some(response_group_name)) =
-        (request_identity.group_name.as_ref(), identity.group_name.as_ref())
-    {
-        if response_group_name != request_group_name {
-            return Err(ClientError::from(invalid_header_action(format!(
-                "metadata OK response invalid ResponseHeader: group_name mismatch: expected {}, got {}",
-                request_group_name, response_group_name
-            ))));
-        }
-    }
-    if identity.client_id != request_identity.client_id {
+    let request_group_name = ctx.group_name().ok_or_else(|| {
+        ClientError::from(invalid_header_action(
+            "metadata attempt missing group_name during response validation",
+        ))
+    })?;
+    if &group_name != request_group_name {
         return Err(ClientError::from(invalid_header_action(format!(
-            "metadata OK response invalid ResponseHeader: client_id mismatch: expected {}, got {}",
-            request_identity.client_id, identity.client_id
+            "metadata OK response invalid ResponseHeader: group_name mismatch: expected {}, got {}",
+            request_group_name, group_name
         ))));
     }
-    if identity.call_id != request_identity.call_id {
+    if let Some(watermark) = header.state.iter().find(|watermark| watermark.group_name != group_name) {
+        return Err(ClientError::from(invalid_header_action(format!(
+            "metadata OK response invalid ResponseHeader: state group_name mismatch: expected {}, got {}",
+            group_name, watermark.group_name
+        ))));
+    }
+
+    Ok(MetadataAuthorityUpdate {
+        group_name,
+        state: header.state,
+        mount_epoch: header.mount_epoch,
+        route_epoch: header.route_epoch,
+    })
+}
+
+/// Validates the immutable request/response correlation fields independently
+/// from group recovery hints carried by an error response.
+fn validate_metadata_response_client(ctx: &AttemptContext, client: &ClientInfo) -> ClientResult<()> {
+    let request_identity = ctx.header_identity();
+    if client.client_id != request_identity.client_id {
+        return Err(ClientError::from(invalid_header_action(format!(
+            "metadata OK response invalid ResponseHeader: client_id mismatch: expected {}, got {}",
+            request_identity.client_id, client.client_id
+        ))));
+    }
+    if client.call_id != request_identity.call_id {
         return Err(ClientError::from(invalid_header_action(
             "metadata OK response invalid ResponseHeader: call_id mismatch",
         )));
+    }
+    Ok(())
+}
+
+/// Rejects malformed or contradictory group hints before existing recovery
+/// classification consumes them. Retry and terminal errors may omit a group.
+fn validate_metadata_error_scope(header: &ResponseHeader) -> ClientResult<()> {
+    let Some(rpc_error) = header.rpc_error.as_ref() else {
+        return Ok(());
+    };
+    let hint = match &rpc_error.recovery {
+        RecoveryAction::RefreshMetadata { hint } | RecoveryAction::ReopenWriteSession { hint } => Some(hint),
+        RecoveryAction::Fail
+        | RecoveryAction::Retry { .. }
+        | RecoveryAction::RegisterWorker
+        | RecoveryAction::SendFullBlockReport => None,
+    };
+    let Some(RpcRefreshHint {
+        group_name: Some(raw_group_name),
+        ..
+    }) = hint
+    else {
+        return Ok(());
+    };
+    let hinted_group = GroupName::parse(raw_group_name).map_err(|err| {
+        ClientError::from(invalid_header_action(format!(
+            "metadata error response invalid recovery group_name: {err}"
+        )))
+    })?;
+    if let Some(header_group) = header.group_name.as_ref() {
+        if header_group != &hinted_group {
+            return Err(ClientError::from(invalid_header_action(format!(
+                "metadata error response group_name conflicts with recovery hint: header={}, hint={}",
+                header_group, hinted_group
+            ))));
+        }
     }
     Ok(())
 }
@@ -619,8 +712,9 @@ fn tonic_request<T>(ctx: &AttemptContext, message: T) -> tonic::Request<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{OperationContext, OperationDeadline};
-    use beryl_types::ClientId;
+    use crate::runtime::{classify_error, ErrorClass, OperationContext, OperationDeadline};
+    use beryl_common::error::rpc::{ErrorKind, InternalErrorKind, MetadataErrorKind, RpcErrorDetail};
+    use beryl_types::{CallId, ClientId};
     use std::sync::Mutex;
 
     #[derive(Debug, Default)]
@@ -662,6 +756,108 @@ mod tests {
         assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
     }
 
+    #[test]
+    fn successful_responses_return_complete_authority_update() {
+        let ctx = metadata_attempt("root", None);
+        let mut header = success_header(&ctx);
+        header.state.push(watermark("root", 9));
+        header.mount_epoch = Some(31);
+        header.route_epoch = Some(41);
+
+        let update = parse_metadata_response_header(&ctx, Some(&header)).expect("valid response header");
+
+        assert_eq!(update.group_name, GroupName::parse("root").unwrap());
+        assert_eq!(update.state[0].state_id.index, 9);
+        assert_eq!(update.mount_epoch, Some(31));
+        assert_eq!(update.route_epoch, Some(41));
+
+        let response = beryl_proto::metadata::MsyncResponseProto {
+            header: Some(success_header(&ctx)),
+            state: Some(watermark("root", 10)),
+        };
+        let (update, body) = validated_msync_response(&ctx, response)
+            .expect("valid Msync response")
+            .into_parts();
+        assert_eq!(update.state[0].state_id.index, 10);
+        assert_eq!(body.group_name, "root");
+    }
+
+    #[test]
+    fn successful_responses_reject_missing_or_mismatched_authority_group() {
+        let ctx = metadata_attempt("root", None);
+        let mut missing_group = success_header(&ctx);
+        missing_group.group_name.clear();
+        let mut wrong_group = success_header(&ctx);
+        wrong_group.group_name = "other".to_string();
+        let mut wrong_state_group = success_header(&ctx);
+        wrong_state_group.state.push(watermark("other", 9));
+
+        for header in [missing_group, wrong_group, wrong_state_group] {
+            let error = parse_metadata_response_header(&ctx, Some(&header)).expect_err("invalid authority group");
+            assert_eq!(classify_error(&error), ErrorClass::InvalidHeader);
+        }
+
+        for state in [
+            watermark("other", 9),
+            beryl_proto::common::GroupStateWatermarkProto {
+                group_name: "root".to_string(),
+                state_id: None,
+            },
+        ] {
+            let error = validated_msync_response(
+                &ctx,
+                beryl_proto::metadata::MsyncResponseProto {
+                    header: Some(success_header(&ctx)),
+                    state: Some(state),
+                },
+            )
+            .expect_err("invalid Msync authority");
+            assert_eq!(classify_error(&error), ErrorClass::InvalidHeader);
+        }
+    }
+
+    #[test]
+    fn structured_errors_allow_missing_group_but_not_identity_mismatch() {
+        let ctx = metadata_attempt("root", None);
+        let header = error_header_without_group(
+            &ctx,
+            RpcErrorDetail::retry(
+                ErrorKind::Internal(InternalErrorKind::NodeUnavailable),
+                Some(10),
+                "metadata not ready",
+            ),
+        );
+        let error = parse_metadata_response_header(&ctx, Some(&header)).expect_err("structured retry");
+        assert_eq!(classify_error(&error), ErrorClass::ServerRetry);
+
+        let not_leader = error_header_without_group(
+            &ctx,
+            RpcErrorDetail::refresh_metadata(
+                ErrorKind::Metadata(MetadataErrorKind::NotLeader),
+                RpcRefreshHint {
+                    group_name: Some("root".to_string()),
+                    leader_endpoint: Some("http://127.0.0.1:18081".to_string()),
+                    ..RpcRefreshHint::default()
+                },
+                "not leader",
+            ),
+        );
+        let error = parse_metadata_response_header(&ctx, Some(&not_leader)).expect_err("structured refresh");
+        assert_eq!(
+            classify_error(&error),
+            ErrorClass::RefreshMetadata(ErrorKind::Metadata(MetadataErrorKind::NotLeader))
+        );
+
+        let mut wrong_call = header.clone();
+        wrong_call.client.as_mut().expect("client").call_id = CallId::new().to_string();
+        let mut wrong_client = header;
+        wrong_client.client.as_mut().expect("client").client_id = Some(ClientId::new(8).into());
+        for header in [wrong_call, wrong_client] {
+            let error = parse_metadata_response_header(&ctx, Some(&header)).expect_err("identity mismatch");
+            assert_eq!(classify_error(&error), ErrorClass::InvalidHeader);
+        }
+    }
+
     fn metadata_attempt(group_name: &str, endpoint: Option<&str>) -> AttemptContext {
         let operation = OperationContext::new_named(
             ClientId::new(7),
@@ -676,6 +872,41 @@ mod tests {
             ctx.with_metadata_endpoint(endpoint.to_string())
         } else {
             ctx
+        }
+    }
+
+    fn success_header(ctx: &AttemptContext) -> beryl_proto::common::ResponseHeaderProto {
+        let request = ctx.metadata_header().expect("request header");
+        beryl_proto::common::ResponseHeaderProto {
+            client: request.client,
+            group_name: request.group_name,
+            ..Default::default()
+        }
+    }
+
+    fn error_header_without_group(
+        ctx: &AttemptContext,
+        error: RpcErrorDetail,
+    ) -> beryl_proto::common::ResponseHeaderProto {
+        let client = ctx
+            .metadata_header()
+            .expect("request header")
+            .client
+            .expect("request client")
+            .try_into()
+            .expect("domain client");
+        let header = ResponseHeader::from_rpc_error(client, error);
+        (&header).into()
+    }
+
+    fn watermark(group_name: &str, index: u64) -> beryl_proto::common::GroupStateWatermarkProto {
+        beryl_proto::common::GroupStateWatermarkProto {
+            group_name: group_name.to_string(),
+            state_id: Some(beryl_proto::common::RaftLogIdProto {
+                term: 1,
+                leader_node_id: 1,
+                index,
+            }),
         }
     }
 }
