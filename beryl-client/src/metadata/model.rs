@@ -24,7 +24,7 @@ pub(crate) struct MetadataAuthorityUpdate {
 
 /// Couples a response body with the authority state validated from its header.
 ///
-/// The executor must apply `authority` before exposing `body` to upper layers.
+/// The Metadata client must apply `authority` before exposing `body` upstream.
 #[derive(Clone, Debug)]
 pub(crate) struct ValidatedMetadataResponse<T> {
     authority: MetadataAuthorityUpdate,
@@ -37,9 +37,50 @@ impl<T> ValidatedMetadataResponse<T> {
         Self { authority, body }
     }
 
-    /// Separates the cache update from the body at the executor boundary.
+    /// Separates the authority update from the body at the client boundary.
     pub(crate) fn into_parts(self) -> (MetadataAuthorityUpdate, T) {
         (self.authority, self.body)
+    }
+}
+
+/// Immutable file identity and visible revision captured by `OpenFile`.
+#[derive(Clone, Debug)]
+pub(crate) struct ReadSnapshot {
+    path: String,
+    inode_id: InodeId,
+    content_revision: u64,
+    file_size: u64,
+}
+
+impl ReadSnapshot {
+    /// Creates a validated snapshot from Metadata's open-file response.
+    pub(crate) fn new(path: String, inode_id: InodeId, content_revision: u64, file_size: u64) -> Self {
+        Self {
+            path,
+            inode_id,
+            content_revision,
+            file_size,
+        }
+    }
+
+    /// Returns the path used to open this snapshot.
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Returns the immutable inode identity used for layout requests.
+    pub(crate) fn inode_id(&self) -> InodeId {
+        self.inode_id
+    }
+
+    /// Returns the visible content revision fenced by this snapshot.
+    pub(crate) fn content_revision(&self) -> u64 {
+        self.content_revision
+    }
+
+    /// Returns the file size observed by `OpenFile`.
+    pub(crate) fn size_hint(&self) -> u64 {
+        self.file_size
     }
 }
 

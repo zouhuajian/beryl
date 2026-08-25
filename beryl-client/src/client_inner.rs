@@ -1,55 +1,75 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Shared client runtime state used by filesystem facade and open handles.
+//! Shared client ownership and cross-plane orchestration.
 
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::ClientConfig;
-use crate::data::{BlockWrite, WorkerDataPlane};
 use crate::error::side_effect_response_body_mismatch;
 use crate::error::{ClientError, ClientResult};
-use crate::metadata::MetadataGateway;
+use crate::metadata::{GrpcMetadataTransport, MetadataClient, MetadataTransport};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
 use crate::rpc_error::{ClientAction, RefreshHint};
 use crate::runtime::{
-    classify_error, is_definite_worker_capacity_rejection, AttemptContext, ClientIdentity, ErrorClass,
-    MetadataExecutor, MetadataTargets, OperationContext, OperationDeadline,
+    classify_error, is_definite_worker_capacity_rejection, AttemptContext, ClientIdentity, ErrorClass, MetadataTargets,
+    OperationContext, OperationDeadline,
 };
 use crate::session::write_session::{ReadyBlock, WriteSession};
+use crate::worker::{BlockWrite, WorkerClient};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
 use bytes::Bytes;
 
-/// Shared concrete runtime state for the filesystem facade and open file handles.
-pub(crate) struct ClientRuntime {
+/// Shared owner for client configuration, Metadata orchestration, Worker IO,
+/// and metrics used by the filesystem facade and open handles.
+pub(crate) struct ClientInner {
     /// Immutable client configuration used by metadata and data-plane attempts.
     pub(crate) config: ClientConfig,
-    /// Metadata RPC executor with bounded retry, refresh, and deadline handling.
-    pub(crate) executor: MetadataExecutor,
-    /// Worker data-plane adapter used after metadata returns validated targets.
-    pub(crate) data_plane: WorkerDataPlane,
+    /// Metadata client with bounded retry, refresh, and deadline handling.
+    pub(crate) metadata: MetadataClient,
+    /// Worker client used only after Metadata returns validated targets.
+    pub(crate) worker: WorkerClient,
     /// Metrics sink shared by facade and open handles.
     pub(crate) metrics: Arc<dyn ClientMetrics>,
 }
 
-impl ClientRuntime {
-    /// Builds the shared runtime from injected metadata, worker, and metrics dependencies.
-    pub(crate) fn new(
+impl ClientInner {
+    /// Builds the production owner and both concrete transports from validated
+    /// client configuration.
+    pub(crate) fn from_config(config: ClientConfig, metrics: Arc<dyn ClientMetrics>) -> ClientResult<Self> {
+        let metadata_targets = MetadataTargets::from_config(&config)?;
+        let metadata_transport = Arc::new(GrpcMetadataTransport::new_lazy_with_config(
+            &config,
+            Arc::clone(&metrics),
+        )?);
+        let worker = WorkerClient::from_config(&config, Arc::clone(&metrics));
+        Self::from_parts(config, metadata_transport, metadata_targets, worker, metrics)
+    }
+
+    /// Establishes exactly one owner for identity, authority state, Worker
+    /// orchestration, configuration, and metrics.
+    fn from_parts(
         config: ClientConfig,
-        gateway: Arc<dyn MetadataGateway>,
+        metadata_transport: Arc<dyn MetadataTransport>,
         metadata_targets: MetadataTargets,
-        data_plane: WorkerDataPlane,
+        worker: WorkerClient,
         metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
         config.read.validate()?;
         let identity = ClientIdentity::generate(config.client_name.clone())?;
-        let executor = MetadataExecutor::new(identity, gateway, metadata_targets, &config, Arc::clone(&metrics))?;
+        let metadata = MetadataClient::new(
+            identity,
+            metadata_transport,
+            metadata_targets,
+            &config,
+            Arc::clone(&metrics),
+        )?;
         Ok(Self {
             config,
-            executor,
-            data_plane,
+            metadata,
+            worker,
             metrics,
         })
     }
@@ -63,7 +83,7 @@ impl ClientRuntime {
         deadline: OperationDeadline,
     ) -> ClientResult<BlockWrite> {
         let add_block = match self
-            .executor
+            .metadata
             .add_block(
                 session.path(),
                 session.write_handle(),
@@ -91,8 +111,8 @@ impl ClientRuntime {
             return Err(side_effect_response_body_mismatch("AddBlock", err));
         }
         let operation = worker_write_context(
-            self.executor.client_id(),
-            self.executor.client_name(),
+            self.metadata.client_id(),
+            self.metadata.client_name(),
             "WriteBlock",
             session.path(),
             deadline,
@@ -103,7 +123,7 @@ impl ClientRuntime {
             match self
                 .worker_rpc_with_timeout(
                     &operation,
-                    self.data_plane.open_write_block(
+                    self.worker.open_write_block(
                         ctx,
                         add_block.group_name.clone(),
                         add_block.target.clone(),

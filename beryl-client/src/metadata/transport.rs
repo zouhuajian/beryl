@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! MetadataGateway trait and tonic implementation.
+//! Metadata transport boundary and tonic implementation.
 
 use async_trait::async_trait;
 use beryl_common::error::rpc::{RecoveryAction, RefreshHint as RpcRefreshHint};
@@ -22,7 +22,7 @@ use crate::runtime::AttemptContext;
 
 /// Client-owned metadata control-plane adapter.
 #[async_trait]
-pub(crate) trait MetadataGateway: Send + Sync {
+pub(crate) trait MetadataTransport: Send + Sync {
     /// Get file or directory status.
     async fn get_status(
         &self,
@@ -130,17 +130,17 @@ pub(crate) trait MetadataGateway: Send + Sync {
     ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::common::GroupStateWatermarkProto>>;
 }
 
-/// Tonic-backed metadata gateway.
+/// Tonic-backed Metadata transport for one selected-endpoint attempt.
 #[derive(Clone, Debug)]
-pub(crate) struct GrpcMetadataGateway {
+pub(crate) struct GrpcMetadataTransport {
     channels: Arc<parking_lot::RwLock<HashMap<MetadataChannelKey, tonic_net::Channel>>>,
     channel_pool_enabled: bool,
     max_channels_per_group: usize,
     metrics: Arc<dyn ClientMetrics>,
 }
 
-impl GrpcMetadataGateway {
-    /// Create a lazily connecting metadata gateway from client config.
+impl GrpcMetadataTransport {
+    /// Create a lazily connecting Metadata transport from client config.
     pub(crate) fn new_lazy_with_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> ClientResult<Self> {
         Self::new_lazy_with_pool_options(
             config.connections.metadata_enabled,
@@ -269,7 +269,7 @@ fn evict_metadata_channel_if_needed(
 }
 
 #[async_trait]
-impl MetadataGateway for GrpcMetadataGateway {
+impl MetadataTransport for GrpcMetadataTransport {
     async fn get_status(
         &self,
         ctx: AttemptContext,
@@ -529,7 +529,7 @@ fn build_metadata_header(ctx: &AttemptContext) -> ClientResult<beryl_proto::comm
 }
 
 /// Validates one successful response header and keeps its authority update
-/// coupled to the body until the metadata executor applies it.
+/// coupled to the body until the Metadata client applies it.
 fn validated_metadata_response<T>(
     ctx: &AttemptContext,
     header: Option<beryl_proto::common::ResponseHeaderProto>,
@@ -540,7 +540,7 @@ fn validated_metadata_response<T>(
 }
 
 /// Binds the watermark returned by Msync to the validated response group and
-/// folds it into the authority update applied by the executor.
+/// folds it into the authority update applied by the Metadata client.
 fn validated_msync_response(
     ctx: &AttemptContext,
     response: beryl_proto::metadata::MsyncResponseProto,
@@ -737,22 +737,22 @@ mod tests {
     #[tokio::test]
     async fn concurrent_metadata_channel_requests_same_key_reuse_inserted_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let gateway =
-            Arc::new(GrpcMetadataGateway::new_lazy_with_pool_options(true, 8, metrics.clone()).expect("gateway"));
+        let transport =
+            Arc::new(GrpcMetadataTransport::new_lazy_with_pool_options(true, 8, metrics.clone()).expect("transport"));
         let ctx = metadata_attempt("root", Some("127.0.0.1:18080"));
 
         let mut tasks = Vec::with_capacity(8);
         for _ in 0..8 {
-            let gateway = Arc::clone(&gateway);
+            let transport = Arc::clone(&transport);
             let ctx = ctx.clone();
-            tasks.push(tokio::spawn(async move { gateway.client(&ctx, "read").await }));
+            tasks.push(tokio::spawn(async move { transport.client(&ctx, "read").await }));
         }
 
         for task in tasks {
             let _client = task.await.expect("task").expect("metadata client");
         }
         let events = metrics.events();
-        assert_eq!(gateway.channels.read().len(), 1);
+        assert_eq!(transport.channels.read().len(), 1);
         assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
     }
 
