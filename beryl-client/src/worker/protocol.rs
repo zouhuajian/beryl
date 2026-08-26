@@ -15,7 +15,7 @@ use prost::Message;
 use super::WorkerWriteTarget;
 use crate::error::{read_buffer_reservation_failed, ClientError, ClientResult};
 use crate::planner::PlannedBlockRead;
-use crate::rpc_error::{invalid_header_action, validate_data_header_or_action};
+use crate::rpc_error::{invalid_header_error, validate_data_header};
 use crate::runtime::AttemptContext;
 
 pub(super) fn build_read_block_request(
@@ -25,7 +25,7 @@ pub(super) fn build_read_block_request(
     worker: &WorkerEndpointInfo,
 ) -> ClientResult<beryl_proto::worker::ReadBlockRequestProto> {
     if block_read.block_stamp == 0 {
-        return Err(ClientError::InvalidLayout(
+        return Err(ClientError::invalid_layout(
             "planned block read has zero block_stamp".to_string(),
         ));
     }
@@ -36,7 +36,7 @@ pub(super) fn build_read_block_request(
         block_read.effective_len,
     )
     .map_err(|error| {
-        ClientError::InvalidLayout(format!("planned block read has invalid expected block shape: {error}"))
+        ClientError::invalid_layout(format!("planned block read has invalid expected block shape: {error}"))
     })?;
     Ok(beryl_proto::worker::ReadBlockRequestProto {
         header: Some(attempt.data_header()),
@@ -87,12 +87,12 @@ pub(super) fn build_write_block_command(
 /// Builds one ordered data payload without sequence or offset fields.
 pub(super) fn build_write_block_data(data: Bytes) -> ClientResult<beryl_proto::worker::WriteBlockRequestProto> {
     if data.is_empty() {
-        return Err(ClientError::InvalidArgument(
+        return Err(ClientError::invalid_argument(
             "WriteBlock data payload must be nonempty".to_string(),
         ));
     }
     if data.len() > beryl_proto::MAX_WORKER_DATA_FRAME_SIZE as usize {
-        return Err(ClientError::InvalidArgument(format!(
+        return Err(ClientError::invalid_argument(format!(
             "WriteBlock data exceeds maximum frame size: actual={}, maximum={}",
             data.len(),
             beryl_proto::MAX_WORKER_DATA_FRAME_SIZE
@@ -131,14 +131,20 @@ pub(super) fn append_read_block_chunk(
     chunk: beryl_proto::worker::ReadBlockChunkProto,
 ) -> ClientResult<()> {
     if chunk.data.is_empty() {
-        return Err(ClientError::Worker("worker read returned an empty chunk".to_string()));
+        return Err(ClientError::invalid_response(
+            "ReadBlock",
+            "worker read returned an empty chunk",
+        ));
     }
     let remaining = block_read.len as usize - output.len();
     if chunk.data.len() > remaining {
-        return Err(ClientError::Worker(format!(
-            "worker read chunk exceeded requested block read: remaining {remaining}, got {}",
-            chunk.data.len()
-        )));
+        return Err(ClientError::invalid_response(
+            "ReadBlock",
+            format!(
+                "worker read chunk exceeded requested block read: remaining {remaining}, got {}",
+                chunk.data.len()
+            ),
+        ));
     }
     output.extend_from_slice(&chunk.data);
     Ok(())
@@ -147,11 +153,14 @@ pub(super) fn append_read_block_chunk(
 /// Accepts normal read completion only after the exact planned byte count.
 pub(super) fn finish_read_block_output(output: Vec<u8>, block_read: &PlannedBlockRead) -> ClientResult<Bytes> {
     if output.len() != block_read.len as usize {
-        return Err(ClientError::Worker(format!(
-            "worker read ended after {} bytes, expected {}",
-            output.len(),
-            block_read.len
-        )));
+        return Err(ClientError::invalid_response(
+            "ReadBlock",
+            format!(
+                "worker read ended after {} bytes, expected {}",
+                output.len(),
+                block_read.len
+            ),
+        ));
     }
     Ok(Bytes::from(output))
 }
@@ -187,7 +196,7 @@ pub(super) fn parse_worker_control_header(
             "worker response invalid DataResponseHeader: call_id mismatch",
         ));
     }
-    validate_data_header_or_action(Some(header)).map_err(ClientError::from)
+    validate_data_header(Some(header))
 }
 
 /// Restores a structured Worker error from a marked gRPC status.
@@ -228,7 +237,7 @@ pub(super) fn has_structured_worker_error(status: &tonic::Status) -> bool {
 }
 
 pub(super) fn invalid_worker_header(message: impl Into<String>) -> ClientError {
-    ClientError::from(invalid_header_action(message))
+    invalid_header_error(message)
 }
 
 pub(super) fn is_transient_worker_transport_status(status: &tonic::Status) -> bool {
@@ -252,7 +261,7 @@ pub(super) fn default_frame_size(len: u32) -> u32 {
 
 fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> {
     if target.target.block_id.inode_id.as_raw() == 0 {
-        return Err(ClientError::InvalidLayout(
+        return Err(ClientError::invalid_layout(
             "write target block_id inode_id must be non-zero".to_string(),
         ));
     }
@@ -262,14 +271,14 @@ fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> 
         target.target.chunk_size,
         target.target.block_size,
     )
-    .map_err(|error| ClientError::InvalidLayout(format!("write target has invalid shape: {error}")))?;
+    .map_err(|error| ClientError::invalid_layout(format!("write target has invalid shape: {error}")))?;
     if target.target.worker_endpoints.is_empty() {
-        return Err(ClientError::InvalidLayout(
+        return Err(ClientError::invalid_layout(
             "write target has no worker endpoints".to_string(),
         ));
     }
     if target.target.block_stamp == 0 {
-        return Err(ClientError::InvalidLayout(
+        return Err(ClientError::invalid_layout(
             "write target block_stamp must be non-zero".to_string(),
         ));
     }

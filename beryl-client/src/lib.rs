@@ -40,5 +40,5 @@ pub use api::{CreateOptions, FileReader, FileWriter, FsClient};
 pub use api::{DeleteOptions, ListOptions};
 pub use config::ClientConfig;
 pub use config::{ConnectionConfig, ReadConfig, RetryConfig, WriteLeaseConfig};
-pub use error::{ClientActionError, ClientError, ClientResult};
+pub use error::{ClientError, ClientErrorKind, ClientResult};
 pub use metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics, NoopClientMetrics};

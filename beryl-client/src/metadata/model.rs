@@ -106,7 +106,7 @@ impl ReadLayout {
         response: beryl_proto::metadata::GetBlockLocationsResponseProto,
     ) -> ClientResult<Self> {
         if response.inode_id == 0 {
-            return Err(ClientError::InvalidLayout(
+            return Err(ClientError::invalid_layout(
                 "GetBlockLocationsResponseProto.inode_id must be non-zero".to_string(),
             ));
         }
@@ -116,7 +116,7 @@ impl ReadLayout {
             .into_iter()
             .map(FileBlockLocation::try_from)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(ClientError::InvalidLayout)?;
+            .map_err(ClientError::invalid_layout)?;
         Ok(Self {
             group_name,
             inode_id,

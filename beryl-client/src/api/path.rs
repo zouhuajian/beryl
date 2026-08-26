@@ -12,7 +12,7 @@ impl NamespacePathBuf {
     pub(crate) fn parse(raw: impl Into<String>) -> ClientResult<Self> {
         let raw = raw.into();
         if raw.is_empty() {
-            Err(ClientError::InvalidArgument("path must not be empty".to_string()))
+            Err(ClientError::invalid_argument("path must not be empty".to_string()))
         } else {
             Ok(Self(raw))
         }

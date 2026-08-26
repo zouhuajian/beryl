@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 
 use crate::error::{ClientError, ClientResult};
 use crate::planner::PlannedBlockRead;
-use crate::runtime::AttemptContext;
+use crate::runtime::{AttemptContext, OperationContext};
 
 /// Internal boundary that isolates Worker RPC transport from client runtime
 /// and provides a narrow seam for orchestration tests.
@@ -166,6 +166,7 @@ pub(crate) enum BlockWriteInput {
 /// Dropping this value aborts the response task. The transport request stream
 /// treats a dropped sender as pending cancellation, never as a successful EOF.
 pub(crate) struct BlockWrite {
+    operation: OperationContext,
     target: WriteTarget,
     written_len: u64,
     requests: Option<mpsc::Sender<BlockWriteInput>>,
@@ -177,6 +178,7 @@ pub(crate) struct BlockWrite {
 impl BlockWrite {
     /// Takes ownership of an acknowledged RPC and its exact metadata target.
     pub(crate) fn new(
+        operation: OperationContext,
         target: WriteTarget,
         requests: mpsc::Sender<BlockWriteInput>,
         cancellation: watch::Sender<bool>,
@@ -184,6 +186,7 @@ impl BlockWrite {
         completion: JoinHandle<ClientResult<()>>,
     ) -> Self {
         Self {
+            operation,
             target,
             written_len: 0,
             requests: Some(requests),
@@ -201,22 +204,27 @@ impl BlockWrite {
     /// Updates the deadline only if the previous lease is still locally live.
     /// A renewal observed after the old expiry cannot revive this block RPC.
     pub(crate) fn update_lease_expiry(&self, expires_at_ms: u64) -> ClientResult<()> {
-        self.lease.renew(expires_at_ms)
+        self.lease
+            .renew(expires_at_ms)
+            .map_err(|error| error.with_operation_context(&self.operation))
     }
 
     /// Fails promptly when the response task has already observed a terminal
     /// Worker result while the caller was between public write operations.
     pub(crate) async fn check_open(&mut self) -> ClientResult<()> {
-        self.lease.ensure_live()?;
+        self.lease
+            .ensure_live()
+            .map_err(|error| error.with_operation_context(&self.operation))?;
         if !self.completion.as_ref().is_some_and(JoinHandle::is_finished) {
             return Ok(());
         }
         let result = self.await_completion().await?;
         match result {
-            Ok(()) => Err(ClientError::UnknownOutcome(
+            Ok(()) => Err(ClientError::unknown_outcome(
                 "worker WriteBlock ended before the client finished its request stream".to_string(),
-            )),
-            Err(error) => Err(error),
+            )
+            .with_operation_context(&self.operation)),
+            Err(error) => Err(error.with_operation_context(&self.operation)),
         }
     }
 
@@ -225,9 +233,9 @@ impl BlockWrite {
     pub(crate) async fn write(&mut self, data: Bytes) -> ClientResult<()> {
         self.check_open().await?;
         let len = u64::try_from(data.len())
-            .map_err(|_| ClientError::InvalidArgument("WriteBlock data length does not fit in u64".to_string()))?;
+            .map_err(|_| ClientError::invalid_argument("WriteBlock data length does not fit in u64".to_string()))?;
         if len > self.remaining() {
-            return Err(ClientError::InvalidArgument(format!(
+            return Err(ClientError::invalid_argument(format!(
                 "WriteBlock data exceeds remaining block capacity: actual={len}, remaining={}",
                 self.remaining()
             )));
@@ -237,7 +245,7 @@ impl BlockWrite {
         self.written_len = self
             .written_len
             .checked_add(len)
-            .ok_or_else(|| ClientError::InvalidArgument("WriteBlock cursor overflow".to_string()))?;
+            .ok_or_else(|| ClientError::invalid_argument("WriteBlock cursor overflow".to_string()))?;
         Ok(())
     }
 
@@ -251,7 +259,7 @@ impl BlockWrite {
         self.cancellation.take();
         match result {
             Ok(()) => Ok((self.target.clone(), self.written_len)),
-            Err(error) => Err(error),
+            Err(error) => Err(error.with_operation_context(&self.operation)),
         }
     }
 
@@ -278,10 +286,12 @@ impl BlockWrite {
             let sender = self
                 .requests
                 .as_ref()
-                .ok_or_else(|| ClientError::Worker("WriteBlock request stream is closed".to_string()))?;
+                .ok_or_else(|| ClientError::worker("WriteBlock request stream is closed".to_string()))?;
             let mut lease_updates = self.lease.subscribe();
             loop {
-                self.lease.ensure_live()?;
+                self.lease
+                    .ensure_live()
+                    .map_err(|error| error.with_operation_context(&self.operation))?;
                 let expires_at_ms = self.lease.expires_at_ms();
                 let lease_expiry = tokio::time::sleep(duration_until_unix_ms(expires_at_ms));
                 tokio::pin!(lease_expiry);
@@ -289,13 +299,16 @@ impl BlockWrite {
                     biased;
                     changed = lease_updates.changed() => {
                         if changed.is_err() {
-                            return Err(ClientError::UnknownOutcome(
+                            return Err(ClientError::unknown_outcome(
                                 "worker WriteBlock lost its lease owner before request send".to_string(),
-                            ));
+                            )
+                            .with_operation_context(&self.operation));
                         }
                     }
                     _ = &mut lease_expiry => {
-                        self.lease.ensure_live()?;
+                        self.lease
+                            .ensure_live()
+                            .map_err(|error| error.with_operation_context(&self.operation))?;
                     }
                     permit = sender.reserve() => {
                         break match permit {
@@ -313,10 +326,11 @@ impl BlockWrite {
             return Ok(());
         }
         match self.await_completion().await? {
-            Ok(()) => Err(ClientError::UnknownOutcome(
+            Ok(()) => Err(ClientError::unknown_outcome(
                 "worker WriteBlock request stream closed before finish".to_string(),
-            )),
-            Err(error) => Err(error),
+            )
+            .with_operation_context(&self.operation)),
+            Err(error) => Err(error.with_operation_context(&self.operation)),
         }
     }
 
@@ -324,11 +338,12 @@ impl BlockWrite {
         let completion = self
             .completion
             .take()
-            .ok_or_else(|| ClientError::Worker("WriteBlock completion task is missing".to_string()))?;
+            .ok_or_else(|| ClientError::worker("WriteBlock completion task is missing".to_string()))?;
         completion.await.map_err(|error| {
-            ClientError::UnknownOutcome(format!(
+            ClientError::unknown_outcome(format!(
                 "worker WriteBlock completion task failed after acknowledgement: {error}"
             ))
+            .with_operation_context(&self.operation)
         })
     }
 }
@@ -352,7 +367,7 @@ pub(super) fn duration_until_unix_ms(expires_at_ms: u64) -> Duration {
 }
 
 pub(super) fn write_lease_expired_error() -> ClientError {
-    ClientError::UnknownOutcome("worker WriteBlock write lease expired after acknowledgement".to_string())
+    ClientError::session_expired_unknown("worker WriteBlock write lease expired after acknowledgement")
 }
 
 pub(super) fn unix_now_ms() -> u64 {

@@ -199,14 +199,14 @@ mod tests {
     use super::super::options::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_REPLICATION};
     use super::*;
     use crate::config::{ClientConfig, MetadataGroupConfig, ReadConfig};
-    use crate::error::{ClientError, ClientResult};
+    use crate::error::{ClientError, ClientErrorKind, ClientResult, RefreshHint};
     use crate::metadata::{
         AddBlockResult, MetadataAuthorityUpdate, MetadataClient, MetadataTransport, ReadLayout, ReadSnapshot,
         ValidatedMetadataResponse,
     };
+    use crate::metrics::{ClientMetric, ClientMetricEvent};
     use crate::planner::PlannedBlockRead;
-    use crate::rpc_error::{ClientAction, RefreshHint};
-    use crate::runtime::{classify_error, AttemptContext, ClientIdentity, ErrorClass, MetadataTargets};
+    use crate::runtime::{retry_decision, AttemptContext, ClientIdentity, MetadataTargets, RetryDecision, RetrySafety};
     use crate::session::write_session::WriteSession;
     use crate::worker::{
         BlockWrite, BlockWriteInput, BlockWriteLease, WorkerClient, WorkerReadResult, WorkerTransport,
@@ -216,7 +216,10 @@ mod tests {
     use beryl_common::error::rpc::{
         ErrorKind, InternalErrorKind, MetadataErrorKind, RefreshHint as RpcRefreshHint, RpcErrorDetail, WorkerErrorKind,
     };
-    use beryl_common::header::{HEADER_WORKER_DATA_REJECTION, WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT};
+    use beryl_common::header::{
+        HEADER_PRE_HANDLER_REJECTION, HEADER_WORKER_DATA_REJECTION, PRE_HANDLER_REJECTION_RPC_CONCURRENCY,
+        WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT,
+    };
     use beryl_proto::metadata::{
         AbortFileWriteResponseProto, CommitFileResponseProto, CreateDirectoryResponseProto, CreateFileResponseProto,
         DeleteResponseProto, GetStatusResponseProto, ListStatusResponseProto, OpenFileResponseProto,
@@ -228,6 +231,15 @@ mod tests {
         BlockId, BlockIndex, ClientId, FileBlockLocation, GroupName, GroupStateWatermark, InodeId, RaftLogId,
         WorkerEndpointInfo, WorkerId, WorkerNetProtocol, WriteTarget,
     };
+
+    fn assert_client_error(error: &ClientError, kind: ClientErrorKind, outcome_unknown: bool, message_fragment: &str) {
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.is_outcome_unknown(), outcome_unknown);
+        assert!(
+            error.message().contains(message_fragment),
+            "unexpected error: {error:?}"
+        );
+    }
     use bytes::Bytes;
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
@@ -239,19 +251,39 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn metadata_retry_reuses_call_id_across_transport_and_server_retry() {
         let metadata_transport = Arc::new(MockMetadataTransport::with_get_status_outcomes(vec![
+            MetadataOutcome::CapacityRejected,
             MetadataOutcome::Transport,
             MetadataOutcome::ServerRetry,
             MetadataOutcome::Ok,
         ]));
-        let client = fs_client_with_metadata_transport(test_config_with_retries("root", 3), metadata_transport.clone())
-            .expect("client");
+        let metrics = Arc::new(RecordingMetrics::default());
+        let client = fs_client_with_worker_transport_and_metrics(
+            test_config_with_retries("root", 4),
+            metadata_transport.clone(),
+            Arc::new(MockDataClient::default()),
+            metrics.clone(),
+        )
+        .expect("client");
 
-        client.stat("/alpha").await.expect("third primary attempt succeeds");
+        client.stat("/alpha").await.expect("fourth primary attempt succeeds");
 
         let calls = metadata_transport.calls();
-        assert_eq!(methods(&calls), vec!["get_status", "get_status", "get_status"]);
+        assert_eq!(
+            methods(&calls),
+            vec!["get_status", "get_status", "get_status", "get_status"]
+        );
         assert!(calls.iter().all(|call| call.call_id == calls[0].call_id));
         assert!(calls.iter().all(|call| call.deadline_ms == calls[0].deadline_ms));
+        let retry_labels: Vec<_> = metrics
+            .events()
+            .into_iter()
+            .filter(|event| event.metric() == ClientMetric::RetryAttempt)
+            .map(|event| event.labels().error_class().expect("retry error class"))
+            .collect();
+        assert_eq!(
+            retry_labels,
+            vec!["server_retry", "retryable_transport", "server_retry"]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -269,7 +301,7 @@ mod tests {
             .await
             .expect_err("read transport attempts exhausted");
 
-        assert_eq!(classify_error(&err), ErrorClass::RetryableTransport);
+        assert_client_error(&err, ClientErrorKind::Unavailable, false, "transport status");
         let calls = metadata_transport.calls();
         assert_eq!(methods(&calls), vec!["get_status", "get_status", "get_status"]);
         assert!(calls.iter().all(|call| call.call_id == calls[0].call_id));
@@ -289,7 +321,7 @@ mod tests {
             .await
             .expect_err("OpenWrite transport ambiguity must fail closed");
 
-        assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("OpenWrite")));
+        assert_client_error(&err, ClientErrorKind::Unavailable, true, "OpenWrite");
         assert_eq!(methods(&metadata_transport.calls()), vec!["open_write"]);
     }
 
@@ -324,10 +356,35 @@ mod tests {
                 other => panic!("unexpected operation {other}"),
             };
 
-            assert!(
-                matches!(err, ClientError::UnknownOutcome(_)),
-                "unexpected error for {operation}: {err:?}"
-            );
+            assert!(err.is_outcome_unknown(), "unexpected error for {operation}: {err:?}");
+            assert_eq!(methods(&metadata_transport.calls()), vec![operation]);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_retryable_mutation_transport_statuses_remain_unknown_without_replay() {
+        for (operation, recursive) in [("delete", false), ("create_directory", true)] {
+            let metadata_transport = Arc::new(MockMetadataTransport::with_mutation_outcomes(vec![
+                MetadataOutcome::Internal,
+                MetadataOutcome::Ok,
+            ]));
+            let client =
+                fs_client_with_metadata_transport(test_config_with_retries("root", 3), metadata_transport.clone())
+                    .expect("client");
+
+            let error = if recursive {
+                client
+                    .mkdirs("/alpha/beta", true)
+                    .await
+                    .expect_err("replayable mutation must not retry a non-retryable transport status")
+            } else {
+                client
+                    .delete("/alpha", DeleteOptions::default())
+                    .await
+                    .expect_err("non-replayable mutation transport result must be unknown")
+            };
+
+            assert_client_error(&error, ClientErrorKind::Internal, true, "transport ambiguity");
             assert_eq!(methods(&metadata_transport.calls()), vec![operation]);
         }
     }
@@ -441,12 +498,7 @@ mod tests {
             let config = test_config_with_read_bounds("root", max_request_bytes, max_buffered_bytes);
             let error = FsClient::try_new(config).expect_err("zero read bound must be rejected");
 
-            assert!(matches!(
-                error,
-                ClientError::Common(common)
-                    if common.kind == beryl_common::CommonErrorKind::InvalidArgument
-                        && common.message.contains(key)
-            ));
+            assert_client_error(&error, ClientErrorKind::InvalidArgument, false, key);
         }
 
         let metadata_transport = Arc::new(MockMetadataTransport::with_layout(layout_response(
@@ -465,10 +517,11 @@ mod tests {
         .expect("client");
 
         let reader = read_reader(&client, 8);
-        assert!(matches!(
-            reader.read_exact_at(8, 1).await,
-            Err(ClientError::InvalidArgument(message)) if message.contains("read_exact_at")
-        ));
+        let error = reader
+            .read_exact_at(8, 1)
+            .await
+            .expect_err("read_exact_at must reject EOF");
+        assert_client_error(&error, ClientErrorKind::InvalidArgument, false, "read_exact_at");
         assert_eq!(
             reader.read_all().await.expect("boundary-sized read_all"),
             b"abcdefgh"[..]
@@ -479,20 +532,31 @@ mod tests {
         let metadata_calls = metadata_transport.calls().len();
         let worker_calls = *worker.calls.lock().expect("worker calls");
         let oversized_reader = read_reader(&client, 9);
-        assert!(matches!(
-            oversized_reader.read_all().await,
-            Err(ClientError::InvalidArgument(message)) if message.contains("read_all maximum")
-        ));
-        assert!(matches!(
-            reader.read_at(0, 4).await,
-            Err(ClientError::InvalidArgument(message)) if message.contains("configured maximum")
-        ));
+        let error = oversized_reader.read_all().await.expect_err("read_all bound");
+        assert_client_error(&error, ClientErrorKind::InvalidArgument, false, "read_all maximum");
+        let error = reader.read_at(0, 4).await.expect_err("read request bound");
+        assert_client_error(&error, ClientErrorKind::InvalidArgument, false, "configured maximum");
         assert_eq!(metadata_transport.calls().len(), metadata_calls);
         assert_eq!(*worker.calls.lock().expect("worker calls"), worker_calls);
     }
 
     #[tokio::test]
     async fn publication_body_mismatch_preserves_only_safe_recovery_paths() {
+        let create_metadata_transport = Arc::new(MockMetadataTransport::with_create_response_layout(None));
+        let create_client =
+            fs_client_with_metadata_transport(test_config("root"), create_metadata_transport.clone()).expect("client");
+        let error = create_client
+            .create("/invalid-create", CreateOptions::create())
+            .await
+            .expect_err("malformed mutation success must be ambiguous");
+        assert_client_error(&error, ClientErrorKind::InvalidResponse, true, "layout missing");
+        let create_calls = create_metadata_transport.calls();
+        assert_eq!(methods(&create_calls), vec!["create_file"]);
+        assert_eq!(
+            error.call_id().expect("CreateFile call ID").to_string(),
+            create_calls[0].call_id
+        );
+
         let commit_metadata_transport = Arc::new(MockMetadataTransport::with_commit_response_sizes(vec![1, 0]));
         let commit_client =
             fs_client_with_metadata_transport(test_config("root"), commit_metadata_transport.clone()).expect("client");
@@ -501,10 +565,17 @@ mod tests {
             .await
             .expect("writer");
 
-        assert!(matches!(
-            commit_writer.close().await,
-            Err(ClientError::UnknownOutcome(message)) if message.contains("committed_size")
-        ));
+        let error = commit_writer.close().await.expect_err("invalid commit response");
+        assert_client_error(&error, ClientErrorKind::InvalidResponse, true, "committed_size");
+        let first_commit_call = commit_metadata_transport
+            .calls()
+            .into_iter()
+            .find(|call| call.method == "commit_file")
+            .expect("first CommitFile call");
+        assert_eq!(
+            error.call_id().expect("CommitFile call ID").to_string(),
+            first_commit_call.call_id
+        );
         commit_writer.close().await.expect("frozen CommitFile retry");
         let commit_calls: Vec<_> = commit_metadata_transport
             .calls()
@@ -517,22 +588,149 @@ mod tests {
 
         for response in [(1, Some(1)), (0, None)] {
             let sync_metadata_transport = Arc::new(MockMetadataTransport::with_sync_responses(vec![response]));
-            let sync_client =
-                fs_client_with_metadata_transport(test_config("root"), sync_metadata_transport).expect("client");
+            let sync_client = fs_client_with_metadata_transport(test_config("root"), sync_metadata_transport.clone())
+                .expect("client");
             let mut sync_writer = sync_client
                 .create("/sync", CreateOptions::create())
                 .await
                 .expect("writer");
 
-            assert!(matches!(
-                sync_writer.sync_write_visibility().await,
-                Err(ClientError::UnknownOutcome(_))
-            ));
-            assert!(matches!(
-                sync_writer.write_all(Bytes::from_static(b"x")).await,
-                Err(ClientError::StaleHandle { reason }) if reason.contains("unknown outcome")
-            ));
+            let error = sync_writer
+                .sync_write_visibility()
+                .await
+                .expect_err("invalid sync response");
+            assert_client_error(&error, ClientErrorKind::InvalidResponse, true, "response body mismatch");
+            let sync_call = sync_metadata_transport
+                .calls()
+                .into_iter()
+                .find(|call| call.method == "sync_write")
+                .expect("SyncWrite call");
+            assert_eq!(
+                error.call_id().expect("SyncWrite call ID").to_string(),
+                sync_call.call_id
+            );
+            let error = sync_writer
+                .write_all(Bytes::from_static(b"x"))
+                .await
+                .expect_err("unknown sync outcome blocks writes");
+            assert_client_error(&error, ClientErrorKind::StaleHandle, false, "unknown outcome");
         }
+
+        let renew_metadata_transport = Arc::new(MockMetadataTransport::with_renew_response_expiries(vec![0]));
+        let renew_client =
+            fs_client_with_metadata_transport(test_config("root"), renew_metadata_transport.clone()).expect("client");
+        let mut renew_writer = renew_client
+            .create("/renew", CreateOptions::create())
+            .await
+            .expect("writer");
+
+        let error = renew_writer
+            .renew_lease()
+            .await
+            .expect_err("invalid lease renewal response");
+        assert_client_error(&error, ClientErrorKind::InvalidResponse, true, "expires_at_ms");
+        let renew_call = renew_metadata_transport
+            .calls()
+            .into_iter()
+            .find(|call| call.method == "renew_lease")
+            .expect("RenewLease call");
+        assert_eq!(
+            error.call_id().expect("RenewLease call ID").to_string(),
+            renew_call.call_id
+        );
+        assert_client_error(
+            &renew_writer
+                .write_all(Bytes::from_static(b"x"))
+                .await
+                .expect_err("unknown renewal blocks writes"),
+            ClientErrorKind::StaleHandle,
+            false,
+            "unknown outcome",
+        );
+        assert_client_error(
+            &renew_writer
+                .sync_write_visibility()
+                .await
+                .expect_err("unknown renewal blocks sync"),
+            ClientErrorKind::StaleHandle,
+            false,
+            "unknown outcome",
+        );
+        assert_client_error(
+            &renew_writer.close().await.expect_err("unknown renewal blocks close"),
+            ClientErrorKind::StaleHandle,
+            false,
+            "unknown outcome",
+        );
+        assert_eq!(
+            methods(&renew_metadata_transport.calls()),
+            vec!["create_file", "open_write", "renew_lease"]
+        );
+
+        let add_block_events = event_log();
+        let add_block_metadata_transport = Arc::new(MockMetadataTransport {
+            add_block_outcomes: Mutex::new(vec![AddBlockOutcome::MismatchedTarget].into()),
+            ..MockMetadataTransport::default()
+        });
+        let add_block_worker = Arc::new(MockDataClient {
+            events: Some(add_block_events.clone()),
+            ..MockDataClient::default()
+        });
+        let add_block_client = fs_client_with_worker_transport(
+            test_config("root"),
+            add_block_metadata_transport.clone(),
+            worker_transport(add_block_worker),
+        )
+        .expect("client");
+        let mut add_block_writer = add_block_client
+            .create("/add-block", CreateOptions::create())
+            .await
+            .expect("writer");
+
+        let error = add_block_writer
+            .write_all(Bytes::from_static(b"x"))
+            .await
+            .expect_err("mismatched AddBlock target must fail closed");
+        assert_client_error(&error, ClientErrorKind::InvalidResponse, true, "file_offset mismatch");
+        let add_block_call = add_block_metadata_transport
+            .calls()
+            .into_iter()
+            .find(|call| call.method == "add_block")
+            .expect("AddBlock call");
+        assert_eq!(
+            error.call_id().expect("AddBlock call ID").to_string(),
+            add_block_call.call_id
+        );
+        assert!(add_block_events.lock().expect("AddBlock events").is_empty());
+        assert_client_error(
+            &add_block_writer
+                .write_all(Bytes::from_static(b"!"))
+                .await
+                .expect_err("unknown AddBlock target blocks later writes"),
+            ClientErrorKind::StaleHandle,
+            false,
+            "unknown outcome",
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_create_layout_is_rejected_before_rpc() {
+        let metadata_transport = Arc::new(MockMetadataTransport::default());
+        let client =
+            fs_client_with_metadata_transport(test_config("root"), metadata_transport.clone()).expect("client");
+
+        let error = client
+            .create("/invalid-layout", CreateOptions::create().with_block_size(0))
+            .await
+            .expect_err("invalid create layout must fail locally");
+
+        assert_client_error(
+            &error,
+            ClientErrorKind::InvalidArgument,
+            false,
+            "CreateOptions layout invalid",
+        );
+        assert!(metadata_transport.calls().is_empty());
     }
 
     #[tokio::test]
@@ -559,20 +757,20 @@ mod tests {
             .sync_write_visibility()
             .await
             .expect_err("flush failure must fail barrier");
-        assert!(matches!(err, ClientError::Worker(msg) if msg.contains("injected WriteBlock failure")));
+        assert_client_error(&err, ClientErrorKind::Io, false, "injected WriteBlock failure");
 
         let err = writer
             .write_all(Bytes::from_static(b"!"))
             .await
             .expect_err("unsafe flush failure blocks writes");
-        assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("invalid")));
+        assert_client_error(&err, ClientErrorKind::StaleHandle, false, "invalid");
         let err = writer
             .sync_write_durability()
             .await
             .expect_err("unsafe flush failure blocks durability sync");
-        assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("invalid")));
+        assert_client_error(&err, ClientErrorKind::StaleHandle, false, "invalid");
         let err = writer.close().await.expect_err("unsafe flush failure blocks close");
-        assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("invalid")));
+        assert_client_error(&err, ClientErrorKind::StaleHandle, false, "invalid");
         assert_eq!(method_count(&metadata_transport.calls(), "commit_file"), 0);
     }
 
@@ -608,7 +806,10 @@ mod tests {
             .await
             .expect_err("marked capacity must stop after the configured attempts");
 
-        assert_eq!(classify_error(&error), ErrorClass::ServerRetry);
+        assert_eq!(
+            retry_decision(&error, RetrySafety::NonReplayableMutation),
+            RetryDecision::Retry
+        );
         assert_eq!(method_count(&metadata_transport.calls(), "add_block"), 1);
         assert_eq!(
             events
@@ -663,16 +864,13 @@ mod tests {
             .await
             .expect_err("lease expiry must interrupt a blocked frame send");
 
-        assert!(
-            matches!(&error, ClientError::UnknownOutcome(message) if message.contains("lease expired")),
-            "unexpected error: {error:?}"
-        );
+        assert_client_error(&error, ClientErrorKind::SessionExpired, true, "lease expired");
         assert_event_order(&events, "write_block", "cancel_write_block");
         let error = writer
             .write_all(Bytes::from_static(b"!"))
             .await
             .expect_err("expired in-flight write blocks later writes");
-        assert!(matches!(error, ClientError::StaleHandle { reason } if reason.contains("unknown outcome")));
+        assert_client_error(&error, ClientErrorKind::StaleHandle, false, "unknown outcome");
         assert_eq!(method_count(&metadata_transport.calls(), "add_block"), 1);
     }
 
@@ -769,13 +967,13 @@ mod tests {
             .write_all(Bytes::from_static(b"hello"))
             .await
             .expect_err("AddBlock unknown outcome");
-        assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("AddBlock")));
+        assert_client_error(&err, ClientErrorKind::Unavailable, true, "AddBlock");
 
         let err = writer
             .write_all(Bytes::from_static(b"!"))
             .await
             .expect_err("unknown outcome blocks writes");
-        assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("unknown outcome")));
+        assert_client_error(&err, ClientErrorKind::StaleHandle, false, "unknown outcome");
         let calls = metadata_transport.calls();
         let add_calls: Vec<_> = calls.iter().filter(|call| call.method == "add_block").collect();
         assert_eq!(add_calls.len(), 3);
@@ -809,7 +1007,8 @@ mod tests {
             .await
             .expect_err("a later terminal response cannot resolve the earlier mutation attempt");
 
-        assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("AddBlock")));
+        assert!(err.is_outcome_unknown());
+        assert_eq!(err.operation(), Some("AddBlock"));
         assert_eq!(method_count(&metadata_transport.calls(), "add_block"), 2);
     }
 
@@ -904,10 +1103,19 @@ mod tests {
         metadata_transport: Arc<dyn MetadataTransport>,
         worker_transport: Arc<dyn WorkerTransport>,
     ) -> ClientResult<FsClient> {
+        let metrics: Arc<dyn ClientMetrics> = Arc::new(crate::metrics::NoopClientMetrics);
+        fs_client_with_worker_transport_and_metrics(config, metadata_transport, worker_transport, metrics)
+    }
+
+    fn fs_client_with_worker_transport_and_metrics(
+        config: ClientConfig,
+        metadata_transport: Arc<dyn MetadataTransport>,
+        worker_transport: Arc<dyn WorkerTransport>,
+        metrics: Arc<dyn ClientMetrics>,
+    ) -> ClientResult<FsClient> {
         let metadata_targets = MetadataTargets::from_config(&config)?;
         config.read.validate()?;
         let identity = ClientIdentity::generate(config.client_name.clone())?;
-        let metrics: Arc<dyn ClientMetrics> = Arc::new(crate::metrics::NoopClientMetrics);
         let metadata = MetadataClient::new(
             identity,
             metadata_transport,
@@ -924,6 +1132,23 @@ mod tests {
                 metrics,
             }),
         })
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingMetrics {
+        events: Mutex<Vec<ClientMetricEvent>>,
+    }
+
+    impl RecordingMetrics {
+        fn events(&self) -> Vec<ClientMetricEvent> {
+            self.events.lock().expect("metric events").clone()
+        }
+    }
+
+    impl ClientMetrics for RecordingMetrics {
+        fn record(&self, event: ClientMetricEvent) {
+            self.events.lock().expect("metric events").push(event);
+        }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1004,6 +1229,7 @@ mod tests {
         mutation_outcomes: Mutex<VecDeque<MetadataOutcome>>,
         commit_response_sizes: Mutex<VecDeque<u64>>,
         sync_responses: Mutex<VecDeque<(u64, Option<u64>)>>,
+        renew_response_expiries: Mutex<VecDeque<u64>>,
         events: Option<EventLog>,
     }
 
@@ -1081,6 +1307,13 @@ mod tests {
             }
         }
 
+        fn with_renew_response_expiries(expiries: Vec<u64>) -> Self {
+            Self {
+                renew_response_expiries: Mutex::new(expiries.into()),
+                ..Self::default()
+            }
+        }
+
         fn next_get_status_outcome(&self) -> MetadataOutcome {
             self.get_status_outcomes
                 .lock()
@@ -1119,6 +1352,10 @@ mod tests {
                 MetadataOutcome::Transport => Err(ClientError::from(tonic::Status::unavailable(format!(
                     "injected {operation} transport ambiguity"
                 )))),
+                MetadataOutcome::Internal => Err(ClientError::from(tonic::Status::internal(format!(
+                    "injected {operation} transport ambiguity"
+                )))),
+                MetadataOutcome::CapacityRejected => Err(pre_handler_rejection_error()),
                 MetadataOutcome::ServerRetry => Err(server_retry_error()),
                 MetadataOutcome::StaleState => {
                     Err(refresh_action_error(ErrorKind::Metadata(MetadataErrorKind::StaleState)))
@@ -1216,6 +1453,12 @@ mod tests {
                         "injected metadata transport ambiguity",
                     )))
                 }
+                MetadataOutcome::Internal => {
+                    return Err(ClientError::from(tonic::Status::internal(
+                        "injected metadata transport ambiguity",
+                    )))
+                }
+                MetadataOutcome::CapacityRejected => return Err(pre_handler_rejection_error()),
                 MetadataOutcome::ServerRetry => return Err(server_retry_error()),
                 MetadataOutcome::StaleState => {
                     return Err(refresh_action_error(ErrorKind::Metadata(MetadataErrorKind::StaleState)))
@@ -1367,6 +1610,12 @@ mod tests {
                         "injected OpenWrite transport ambiguity",
                     )))
                 }
+                MetadataOutcome::Internal => {
+                    return Err(ClientError::from(tonic::Status::internal(
+                        "injected OpenWrite transport ambiguity",
+                    )))
+                }
+                MetadataOutcome::CapacityRejected => return Err(pre_handler_rejection_error()),
                 MetadataOutcome::ServerRetry => return Err(server_retry_error()),
                 MetadataOutcome::StaleState => {
                     return Err(refresh_action_error(ErrorKind::Metadata(MetadataErrorKind::StaleState)))
@@ -1408,15 +1657,17 @@ mod tests {
             req: beryl_proto::metadata::AddBlockRequestProto,
         ) -> ClientResult<ValidatedMetadataResponse<AddBlockResult>> {
             self.record_add_block(&ctx, &req);
-            match self.next_add_block_outcome() {
+            let outcome = self.next_add_block_outcome();
+            match outcome {
                 AddBlockOutcome::Ok => {}
+                AddBlockOutcome::MismatchedTarget => {}
                 AddBlockOutcome::TransportUnknown => {
                     return Err(ClientError::from(tonic::Status::unavailable(
                         "injected AddBlock transport uncertainty",
                     )))
                 }
                 AddBlockOutcome::TerminalFailure => {
-                    return Err(ClientError::InvalidArgument(
+                    return Err(ClientError::invalid_argument(
                         "injected AddBlock terminal failure".to_string(),
                     ))
                 }
@@ -1445,13 +1696,11 @@ mod tests {
             };
             let inode_id = inode_id_from_write_handle(write_handle);
             let group_name = ctx.group_name().cloned().expect("metadata attempt group");
-            metadata_ok(
-                &ctx,
-                AddBlockResult {
-                    group_name,
-                    target: write_target_with_layout(inode_id, block_index, offset, layout),
-                },
-            )
+            let mut target = write_target_with_layout(inode_id, block_index, offset, layout);
+            if matches!(outcome, AddBlockOutcome::MismatchedTarget) {
+                target.file_offset = target.file_offset.saturating_add(1);
+            }
+            metadata_ok(&ctx, AddBlockResult { group_name, target })
         }
 
         async fn commit_file(
@@ -1491,10 +1740,16 @@ mod tests {
             _req: beryl_proto::metadata::RenewLeaseRequestProto,
         ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::RenewLeaseResponseProto>> {
             self.record("renew_lease", &ctx);
+            let expires_at_ms = self
+                .renew_response_expiries
+                .lock()
+                .expect("renew response expiries")
+                .pop_front()
+                .unwrap_or(u64::MAX / 2);
             metadata_ok(
                 &ctx,
                 RenewLeaseResponseProto {
-                    expires_at_ms: u64::MAX / 2,
+                    expires_at_ms,
                     ..RenewLeaseResponseProto::default()
                 },
             )
@@ -1558,6 +1813,7 @@ mod tests {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum AddBlockOutcome {
         Ok,
+        MismatchedTarget,
         TransportUnknown,
         TerminalFailure,
     }
@@ -1566,6 +1822,8 @@ mod tests {
     enum MetadataOutcome {
         Ok,
         Transport,
+        Internal,
+        CapacityRejected,
         ServerRetry,
         StaleState,
     }
@@ -1654,7 +1912,7 @@ mod tests {
 
         async fn open_write_block(
             &self,
-            _ctx: AttemptContext,
+            ctx: AttemptContext,
             target: WorkerWriteTarget,
             lease_expires_at_ms: u64,
         ) -> ClientResult<BlockWrite> {
@@ -1688,7 +1946,7 @@ mod tests {
                     if matches!(outcome, WorkerWriteOutcome::HoldCancellation) {
                         std::future::pending::<()>().await;
                     }
-                    return Err(ClientError::Worker("mock WriteBlock cancelled".to_string()));
+                    return Err(ClientError::worker("mock WriteBlock cancelled".to_string()));
                 }
                 loop {
                     tokio::select! {
@@ -1697,13 +1955,13 @@ mod tests {
                             if let Some(events) = &events {
                                 events.lock().expect("events").push("cancel_write_block");
                             }
-                            return Err(ClientError::Worker("mock WriteBlock cancelled".to_string()));
+                            return Err(ClientError::worker("mock WriteBlock cancelled".to_string()));
                         }
                         request = request_stream.recv() => match request {
                             Some(BlockWriteInput::Data(request)) => match request.payload {
                                 Some(Payload::Data(_)) => {}
                                 _ => {
-                                    return Err(ClientError::Worker(
+                                    return Err(ClientError::worker(
                                         "mock WriteBlock received a non-data frame after acknowledgement".to_string(),
                                     ));
                                 }
@@ -1714,11 +1972,12 @@ mod tests {
                     }
                 }
                 if matches!(outcome, WorkerWriteOutcome::WorkerError) {
-                    return Err(ClientError::Worker("injected WriteBlock failure".to_string()));
+                    return Err(ClientError::worker("injected WriteBlock failure".to_string()));
                 }
                 Ok(())
             });
             Ok(BlockWrite::new(
+                ctx.operation_context().clone(),
                 target.target,
                 requests,
                 transport_cancellation,
@@ -1782,7 +2041,7 @@ mod tests {
     fn write_session_for_tests(path: &str, base_size: u64, expires_at_ms: u64) -> ClientResult<WriteSession> {
         let inode_id = InodeId::new(302);
         let layout = beryl_types::FileLayout::try_from(layout_proto(default_layout()))
-            .map_err(|err| ClientError::InvalidLayout(err.to_string()))?;
+            .map_err(|err| ClientError::invalid_layout(err.to_string()))?;
         WriteSession::new(
             path.to_string(),
             layout,
@@ -1849,13 +2108,13 @@ mod tests {
             },
             "worker requested refresh",
         );
-        ClientError::from(ClientAction::Refresh {
-            hint: Box::new(RefreshHint {
+        ClientError::from_remote(
+            rpc_error,
+            RefreshHint {
                 worker_resolve_required: true,
                 ..RefreshHint::default()
-            }),
-            rpc_error: Box::new(rpc_error),
-        })
+            },
+        )
     }
 
     fn server_retry_error() -> ClientError {
@@ -1864,9 +2123,19 @@ mod tests {
             Some(1),
             "server requested retry",
         );
-        ClientError::from(ClientAction::Retry {
-            retry_after_ms_hint: Some(1),
-            rpc_error: Box::new(rpc_error),
-        })
+        ClientError::from_remote(rpc_error, RefreshHint::default())
+    }
+
+    fn pre_handler_rejection_error() -> ClientError {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        metadata.insert(
+            HEADER_PRE_HANDLER_REJECTION,
+            tonic::metadata::MetadataValue::from_static(PRE_HANDLER_REJECTION_RPC_CONCURRENCY),
+        );
+        ClientError::from(tonic::Status::with_metadata(
+            tonic::Code::ResourceExhausted,
+            "injected Metadata RPC capacity exhaustion",
+            metadata,
+        ))
     }
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use beryl_client::{ClientError, CreateOptions, FileStatus};
+use beryl_client::{ClientError, ClientErrorKind, CreateOptions, FileStatus};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction};
 use beryl_common::header::RequestHeader;
 use beryl_e2e::{data::deterministic_bytes, TestCluster, TestResult};
@@ -685,37 +685,18 @@ fn assert_metadata_ok(header: Option<ResponseHeaderProto>) {
 }
 
 fn assert_stale_writer_error(err: &ClientError) {
-    match err {
-        ClientError::Action(action) => {
-            assert!(matches!(
-                action.kind(),
-                Some(
-                    ErrorKind::Metadata(MetadataErrorKind::SessionInvalid)
-                        | ErrorKind::Metadata(MetadataErrorKind::SessionExpired)
-                        | ErrorKind::Metadata(MetadataErrorKind::Fencing)
-                        | ErrorKind::Metadata(MetadataErrorKind::EpochMismatch)
-                )
-            ));
-            assert!(matches!(
-                action.recovery(),
-                Some(RecoveryAction::ReopenWriteSession { .. })
-            ));
-        }
-        ClientError::StaleHandle { reason } => {
-            assert!(
-                reason.contains("invalid") || reason.contains("expired") || reason.contains("unknown"),
-                "unexpected stale handle reason: {reason}"
-            );
-        }
-        other => panic!("expected stale writer error, got {other:?}"),
-    }
+    assert!(
+        matches!(
+            err.kind(),
+            ClientErrorKind::SessionInvalid
+                | ClientErrorKind::SessionExpired
+                | ClientErrorKind::Fenced
+                | ClientErrorKind::StaleHandle
+        ),
+        "expected stale writer error, got {err:?}"
+    );
 }
 
 fn assert_not_found(err: &ClientError) {
-    if let ClientError::Action(action) = err {
-        if matches!(action.kind(), Some(ErrorKind::Metadata(MetadataErrorKind::NotFound))) {
-            return;
-        }
-    }
-    panic!("expected not found error, got {err:?}");
+    assert_eq!(err.kind(), ClientErrorKind::NotFound, "unexpected error: {err:?}");
 }

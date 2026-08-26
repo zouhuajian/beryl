@@ -46,7 +46,7 @@ impl WorkerClient {
         let total_len = block_reads.iter().try_fold(0usize, |total, block_read| {
             total
                 .checked_add(block_read.len as usize)
-                .ok_or_else(|| ClientError::InvalidLayout("planned read length overflow".to_string()))
+                .ok_or_else(|| ClientError::invalid_layout("planned read length overflow".to_string()))
         })?;
         let mut output = Vec::new();
         output
@@ -54,16 +54,16 @@ impl WorkerClient {
             .map_err(|error| read_buffer_reservation_failed("read_at", total_len, error))?;
         for block_read in block_reads {
             if block_read.block_stamp == 0 {
-                return Err(ClientError::InvalidLayout(
+                return Err(ClientError::invalid_layout(
                     "planned block read has zero block_stamp".to_string(),
                 ));
             }
             let expected_end = block_read
                 .file_offset
                 .checked_add(u64::from(block_read.len))
-                .ok_or_else(|| ClientError::InvalidLayout("planned block read end overflow".to_string()))?;
+                .ok_or_else(|| ClientError::invalid_layout("planned block read end overflow".to_string()))?;
             if expected_end != block_read.end_file_offset {
-                return Err(ClientError::InvalidLayout(
+                return Err(ClientError::invalid_layout(
                     "planned block read coverage is inconsistent".to_string(),
                 ));
             }
@@ -72,11 +72,14 @@ impl WorkerClient {
                 .read_block_range(attempt.clone(), group_name.clone(), block_read)
                 .await?;
             if result.bytes.len() != block_read.len as usize {
-                return Err(ClientError::Worker(format!(
-                    "worker read returned {} bytes for {} byte block range",
-                    result.bytes.len(),
-                    block_read.len
-                )));
+                return Err(ClientError::invalid_response(
+                    "ReadBlock",
+                    format!(
+                        "worker read returned {} bytes for {} byte block range",
+                        result.bytes.len(),
+                        block_read.len
+                    ),
+                ));
             }
             output.extend_from_slice(&result.bytes);
         }

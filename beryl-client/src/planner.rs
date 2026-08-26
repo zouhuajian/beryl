@@ -5,7 +5,7 @@
 
 use beryl_common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind};
 
-use crate::error::{ClientError, ClientResult};
+use crate::error::{ClientError, ClientResult, RefreshHint as ClientRefreshHint};
 use crate::metadata::ReadLayout;
 use beryl_types::{BlockId, BlockShape, FileBlockLocation, GroupName, InodeId, WorkerEndpointInfo};
 
@@ -44,13 +44,13 @@ pub(crate) fn requested_range(offset: u64, len: u32, file_size: u64) -> ClientRe
     }
     let requested_end = offset
         .checked_add(len as u64)
-        .ok_or_else(|| ClientError::InvalidArgument("read range offset overflow".to_string()))?;
+        .ok_or_else(|| ClientError::invalid_argument("read range offset overflow".to_string()))?;
     let end = requested_end.min(file_size);
     let effective_len = end
         .checked_sub(offset)
-        .ok_or_else(|| ClientError::InvalidArgument("read range end precedes offset".to_string()))?;
+        .ok_or_else(|| ClientError::invalid_argument("read range end precedes offset".to_string()))?;
     let effective_len = u32::try_from(effective_len)
-        .map_err(|_| ClientError::InvalidArgument("read range length exceeds u32".to_string()))?;
+        .map_err(|_| ClientError::invalid_argument("read range length exceeds u32".to_string()))?;
     if effective_len == 0 {
         return Ok(None);
     }
@@ -68,15 +68,15 @@ pub(crate) fn plan_block_reads(
     let mut normalized = Vec::with_capacity(locations.len());
     for location in locations {
         if location.len == 0 {
-            return Err(ClientError::InvalidLayout("zero-length block location".to_string()));
+            return Err(ClientError::invalid_layout("zero-length block location".to_string()));
         }
         let end = location
             .file_offset
             .checked_add(location.len)
-            .ok_or_else(|| ClientError::InvalidLayout("block location range overflow".to_string()))?;
+            .ok_or_else(|| ClientError::invalid_layout("block location range overflow".to_string()))?;
         let block_id = location.block_id;
         if block_id.inode_id != expected_inode_id {
-            return Err(ClientError::InvalidLayout(format!(
+            return Err(ClientError::invalid_layout(format!(
                 "block location inode_id {} does not match handle {}",
                 block_id.inode_id.as_raw(),
                 expected_inode_id.as_raw()
@@ -84,7 +84,7 @@ pub(crate) fn plan_block_reads(
         }
         let block_stamp = location.block_stamp;
         if block_stamp == 0 {
-            return Err(ClientError::InvalidLayout(format!(
+            return Err(ClientError::invalid_layout(format!(
                 "block location {} has zero block_stamp",
                 block_id
             )));
@@ -95,7 +95,7 @@ pub(crate) fn plan_block_reads(
             location.chunk_size,
             location.effective_len,
         )
-        .map_err(|err| ClientError::InvalidLayout(format!("block location {block_id} has invalid shape: {err}")))?;
+        .map_err(|err| ClientError::invalid_layout(format!("block location {block_id} has invalid shape: {err}")))?;
         if location.workers.is_empty() {
             return Err(block_location_unavailable_error(format!(
                 "block location unavailable: metadata returned no worker candidates for block {} file_offset={} len={} block_stamp={}",
@@ -117,7 +117,7 @@ pub(crate) fn plan_block_reads(
     for (start, end, block_id, block_stamp, location) in normalized {
         if let Some(prev_end) = previous_end {
             if start < prev_end {
-                return Err(ClientError::InvalidLayout(format!(
+                return Err(ClientError::invalid_layout(format!(
                     "layout overlap at file offset {start}"
                 )));
             }
@@ -125,7 +125,7 @@ pub(crate) fn plan_block_reads(
         previous_end = Some(end);
 
         if start > cursor {
-            return Err(ClientError::InvalidLayout(format!(
+            return Err(ClientError::invalid_layout(format!(
                 "layout gap at file offset {cursor}"
             )));
         }
@@ -139,9 +139,11 @@ pub(crate) fn plan_block_reads(
             continue;
         }
         let len = u32::try_from(read_end - read_start)
-            .map_err(|_| ClientError::InvalidLayout("planned block read length exceeds u32".to_string()))?;
+            .map_err(|_| ClientError::invalid_layout("planned block read length exceeds u32".to_string()))?;
         if len == 0 {
-            return Err(ClientError::InvalidLayout("zero-length planned block read".to_string()));
+            return Err(ClientError::invalid_layout(
+                "zero-length planned block read".to_string(),
+            ));
         }
         block_reads.push(PlannedBlockRead {
             file_offset: read_start,
@@ -163,7 +165,7 @@ pub(crate) fn plan_block_reads(
     }
 
     if cursor < requested_end {
-        return Err(ClientError::InvalidLayout(format!(
+        return Err(ClientError::invalid_layout(format!(
             "layout gap at file offset {cursor}"
         )));
     }
@@ -179,33 +181,27 @@ pub(crate) fn plan_block_reads_from_layout(
     let group_name = response.group_name.clone();
     let inode_id = response.inode_id;
     if inode_id != expected_inode_id {
-        return Err(ClientError::StaleHandle {
-            reason: format!(
-                "layout inode_id {} does not match handle {}",
-                inode_id.as_raw(),
-                expected_inode_id.as_raw()
-            ),
-        });
+        return Err(ClientError::stale_handle(format!(
+            "layout inode_id {} does not match handle {}",
+            inode_id.as_raw(),
+            expected_inode_id.as_raw()
+        )));
     }
     let actual_version = content_revision_from_response(
         response.content_revision,
         "GetBlockLocationsResponseProto.content_revision",
     )?;
-    let expected_version = expected_content_revision.ok_or_else(|| ClientError::StaleHandle {
-        reason: "read handle missing content_revision".to_string(),
-    })?;
+    let expected_version =
+        expected_content_revision.ok_or_else(|| ClientError::stale_handle("read handle missing content_revision"))?;
     if actual_version != expected_version {
-        return Err(ClientError::VersionMismatch {
-            expected: expected_version,
-            actual: actual_version,
-        });
+        return Err(ClientError::version_mismatch(expected_version, actual_version));
     }
     let block_reads = plan_block_reads(expected_inode_id, requested_range, &response.locations)?;
     Ok((group_name, block_reads))
 }
 
 fn content_revision_from_response(value: Option<u64>, field: &str) -> ClientResult<u64> {
-    value.ok_or_else(|| ClientError::InvalidLayout(format!("{field} missing")))
+    value.ok_or_else(|| ClientError::invalid_layout(format!("{field} missing")))
 }
 
 pub(crate) fn block_location_unavailable_error(message: impl Into<String>) -> ClientError {
@@ -217,13 +213,13 @@ pub(crate) fn block_location_unavailable_error(message: impl Into<String>) -> Cl
         },
         message,
     );
-    ClientError::from(crate::rpc_error::ClientAction::Refresh {
-        hint: Box::new(crate::rpc_error::RefreshHint {
+    ClientError::from_remote(
+        rpc_error,
+        ClientRefreshHint {
             worker_resolve_required: true,
-            ..crate::rpc_error::RefreshHint::default()
-        }),
-        rpc_error: Box::new(rpc_error),
-    })
+            ..ClientRefreshHint::default()
+        },
+    )
 }
 
 #[cfg(test)]
