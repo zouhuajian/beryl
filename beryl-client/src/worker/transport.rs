@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures::stream;
 use tokio::sync::watch;
 
-use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
+use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, WorkerErrorKind};
 use beryl_types::GroupName;
 
 use super::channel_pool::GrpcWorkerChannelPool;
@@ -26,7 +26,7 @@ use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
 use crate::metrics::ClientMetrics;
 use crate::planner::{block_location_unavailable_error, PlannedBlockRead};
-use crate::runtime::{classify_error, is_worker_capacity_before_side_effect_rejection, AttemptContext, ErrorClass};
+use crate::runtime::{is_definite_worker_capacity_rejection, AttemptContext};
 
 /// Executes one block-local operation against Metadata-authorized Worker
 /// candidates and owns channel health plus wire validation.
@@ -97,8 +97,9 @@ impl GrpcWorkerTransport {
         worker: &beryl_types::WorkerEndpointInfo,
         status: tonic::Status,
     ) -> ClientError {
-        if is_worker_capacity_before_side_effect_rejection(&status) {
-            return ClientError::from(status);
+        let transport_error = ClientError::from(status.clone());
+        if is_definite_worker_capacity_rejection(&transport_error) {
+            return transport_error;
         }
         if has_structured_worker_error(&status) {
             let error = parse_worker_data_status(attempt, status);
@@ -108,11 +109,12 @@ impl GrpcWorkerTransport {
         if is_transient_worker_transport_status(&status) {
             channel_pool.mark_worker_unavailable(worker, CacheInvalidationReason::Unavailable);
         }
-        ClientError::UnknownOutcome(format!(
+        let message = format!(
             "worker WriteBlock outcome is unknown after transport status {}: {}",
             status.code(),
             status.message()
-        ))
+        );
+        transport_error.with_unknown_outcome(attempt.operation_context(), message)
     }
 
     /// Opens one block RPC and returns its concrete client-side owner after the
@@ -139,7 +141,7 @@ impl GrpcWorkerTransport {
         let response = tokio::select! {
             biased;
             _ = tokio::time::sleep(duration_until_unix_ms(lease_expires_at_ms)) => {
-                return Err(write_lease_expired_error());
+                return Err(write_lease_expired_error().with_operation_context(attempt.operation_context()));
             }
             response = client.write_block(tonic::Request::new(requests)) => response,
         };
@@ -150,16 +152,17 @@ impl GrpcWorkerTransport {
         let acknowledgement = tokio::select! {
             biased;
             _ = tokio::time::sleep(duration_until_unix_ms(lease_expires_at_ms)) => {
-                return Err(write_lease_expired_error());
+                return Err(write_lease_expired_error().with_operation_context(attempt.operation_context()));
             }
             acknowledgement = responses.message() => acknowledgement,
         };
         match acknowledgement {
             Ok(Some(_)) => {}
             Ok(None) => {
-                return Err(ClientError::UnknownOutcome(
+                return Err(ClientError::unknown_outcome(
                     "worker WriteBlock ended before staging acknowledgement".to_string(),
-                ));
+                )
+                .with_operation_context(attempt.operation_context()));
             }
             Err(status) => {
                 return Err(Self::map_write_status(
@@ -175,6 +178,7 @@ impl GrpcWorkerTransport {
         let cancellation = opening_cancellation.disarm();
         let channel_pool = Arc::clone(&self.channel_pool);
         let attempt = attempt.clone();
+        let operation = attempt.operation_context().clone();
         let worker = worker.clone();
         let completion = tokio::spawn(wait_for_write_completion(
             channel_pool,
@@ -185,6 +189,7 @@ impl GrpcWorkerTransport {
             cancellation.clone(),
         ));
         Ok(BlockWrite::new(
+            operation,
             target.target.clone(),
             sender,
             cancellation,
@@ -287,9 +292,10 @@ async fn wait_for_write_completion(
     loop {
         if lease.expire_if_due() {
             cancellation.send_replace(true);
-            return Err(ClientError::UnknownOutcome(
+            return Err(ClientError::unknown_outcome(
                 "worker WriteBlock was cancelled after the write lease expired".to_string(),
-            ));
+            )
+            .with_operation_context(attempt.operation_context()));
         }
         let expires_at_ms = lease.expires_at_ms();
         let lease_expiry = tokio::time::sleep(duration_until_unix_ms(expires_at_ms));
@@ -298,9 +304,10 @@ async fn wait_for_write_completion(
             biased;
             changed = lease_updates.changed() => {
                 if changed.is_err() {
-                    return Err(ClientError::UnknownOutcome(
+                    return Err(ClientError::unknown_outcome(
                         "worker WriteBlock lost its lease owner before completion".to_string(),
-                    ));
+                    )
+                    .with_operation_context(attempt.operation_context()));
                 }
             }
             _ = &mut lease_expiry => {
@@ -308,16 +315,18 @@ async fn wait_for_write_completion(
                     continue;
                 }
                 cancellation.send_replace(true);
-                return Err(ClientError::UnknownOutcome(
+                return Err(ClientError::unknown_outcome(
                     "worker WriteBlock was cancelled after the write lease expired".to_string(),
-                ));
+                )
+                .with_operation_context(attempt.operation_context()));
             }
             response = responses.message() => {
                 return match response {
                     Ok(None) => Ok(()),
-                    Ok(Some(_)) => Err(ClientError::UnknownOutcome(
+                    Ok(Some(_)) => Err(ClientError::unknown_outcome(
                         "worker WriteBlock returned more than one acknowledgement".to_string(),
-                    )),
+                    )
+                    .with_operation_context(attempt.operation_context())),
                     Err(status) => Err(GrpcWorkerTransport::map_write_status(
                         channel_pool.as_ref(),
                         &attempt,
@@ -331,9 +340,9 @@ async fn wait_for_write_completion(
 }
 
 fn is_stale_read_location_error(error: &ClientError) -> bool {
-    match error {
-        ClientError::Action(action) => match action.action() {
-            crate::rpc_error::ClientAction::Refresh { rpc_error, .. } => matches!(
+    error.remote_error().is_some_and(|rpc_error| {
+        matches!(rpc_error.recovery, RecoveryAction::RefreshMetadata { .. })
+            && matches!(
                 rpc_error.kind,
                 ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable)
                     | ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch)
@@ -342,11 +351,8 @@ fn is_stale_read_location_error(error: &ClientError) -> bool {
                     | ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch)
                     | ErrorKind::Worker(WorkerErrorKind::FullReportRequired)
                     | ErrorKind::Worker(WorkerErrorKind::NotRegistered)
-            ),
-            _ => false,
-        },
-        _ => false,
-    }
+            )
+    })
 }
 
 #[async_trait]
@@ -377,7 +383,7 @@ impl WorkerTransport for GrpcWorkerTransport {
                         last_location_error = Some(error);
                         continue;
                     }
-                    if classify_error(&error) != ErrorClass::RetryableTransport {
+                    if !error.is_retryable_transport() {
                         return Err(error);
                     }
                     self.channel_pool
@@ -393,7 +399,7 @@ impl WorkerTransport for GrpcWorkerTransport {
                     last_location_error = Some(error);
                     continue;
                 }
-                Err(error) if classify_error(&error) == ErrorClass::RetryableTransport => {
+                Err(error) if error.is_retryable_transport() => {
                     self.channel_pool
                         .mark_worker_unavailable(worker, CacheInvalidationReason::Unavailable);
                     last_transport_error = Some(error);
@@ -424,7 +430,7 @@ impl WorkerTransport for GrpcWorkerTransport {
             .worker_candidates(&target.target.worker_endpoints)
             .into_iter()
             .next()
-            .ok_or_else(|| ClientError::Worker("worker write has no candidates".to_string()))?;
+            .ok_or_else(|| ClientError::worker("worker write has no candidates".to_string()))?;
         self.open_one_block(&attempt, &target, worker, lease_expires_at_ms)
             .await
     }
@@ -459,8 +465,9 @@ mod tests {
     use tonic::{Request, Response, Status};
 
     use super::*;
+    use crate::error::ClientErrorKind;
     use crate::metrics::NoopClientMetrics;
-    use crate::runtime::{OperationContext, OperationDeadline};
+    use crate::runtime::{retry_decision, Operation, OperationContext, OperationDeadline, RetryDecision, RetrySafety};
 
     #[derive(Clone, Copy)]
     enum ReadFailure {
@@ -675,11 +682,11 @@ mod tests {
         GroupName::parse("root").expect("group name")
     }
 
-    fn attempt(operation_name: &'static str) -> AttemptContext {
+    fn attempt(operation: Operation) -> AttemptContext {
         let operation = OperationContext::new_named(
             ClientId::new(7),
             "test-client",
-            operation_name,
+            operation,
             Some("/alpha".to_string()),
             OperationDeadline::new(5_000),
         )
@@ -781,15 +788,18 @@ mod tests {
             let (second, second_shutdown) = start_mock_worker(Arc::clone(&second_state), 2).await;
 
             let result = grpc_client()
-                .read_block_range(attempt("ReadBlock"), group_name(), &planned_read(vec![first, second]))
+                .read_block_range(
+                    attempt(Operation::Read),
+                    group_name(),
+                    &planned_read(vec![first, second]),
+                )
                 .await;
             if may_fail_over {
                 assert_eq!(result.expect("second Worker satisfies read").bytes, b"data"[..]);
             } else {
-                assert!(matches!(
-                    result,
-                    Err(ClientError::Worker(message)) if message.contains("empty chunk")
-                ));
+                let error = result.expect_err("empty chunk must fail closed");
+                assert_eq!(error.kind(), ClientErrorKind::InvalidResponse);
+                assert!(error.message().contains("empty chunk"));
             }
             assert_eq!(first_state.read_calls.load(Ordering::SeqCst), 1);
             assert_eq!(
@@ -812,7 +822,11 @@ mod tests {
         let (second, second_shutdown) = start_mock_worker(Arc::clone(&second_state), 2).await;
 
         let mut block = grpc_client()
-            .open_write_block(attempt("WriteBlock"), write_target(vec![first, second]), lease_expiry())
+            .open_write_block(
+                attempt(Operation::WriteBlock),
+                write_target(vec![first, second]),
+                lease_expiry(),
+            )
             .await
             .expect("staging acknowledgement");
         let error = match block.write(Bytes::from_static(b"data")).await {
@@ -823,7 +837,8 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(matches!(error, ClientError::UnknownOutcome(message) if message.contains("WriteBlock")));
+        assert!(error.is_outcome_unknown());
+        assert!(error.message().contains("WriteBlock"));
         assert_eq!(first_state.write_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second_state.write_calls.load(Ordering::SeqCst), 0);
         let _ = first_shutdown.send(());
@@ -836,14 +851,21 @@ mod tests {
         let (worker, shutdown) = start_mock_worker(Arc::clone(&state), 1).await;
 
         let error = match grpc_client()
-            .open_write_block(attempt("WriteBlock"), write_target(vec![worker]), lease_expiry())
+            .open_write_block(
+                attempt(Operation::WriteBlock),
+                write_target(vec![worker]),
+                lease_expiry(),
+            )
             .await
         {
             Ok(_) => panic!("capacity rejection before Worker side effects must precede acknowledgement"),
             Err(error) => error,
         };
 
-        assert_eq!(classify_error(&error), ErrorClass::ServerRetry);
+        assert_eq!(
+            retry_decision(&error, RetrySafety::NonReplayableMutation),
+            RetryDecision::Retry
+        );
         assert_eq!(state.write_calls.load(Ordering::SeqCst), 1);
         let _ = shutdown.send(());
     }
@@ -855,7 +877,7 @@ mod tests {
 
         let error = match grpc_client()
             .open_write_block(
-                attempt("WriteBlock"),
+                attempt(Operation::WriteBlock),
                 write_target(vec![worker]),
                 lease_expiry_after(10),
             )
@@ -865,7 +887,8 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(matches!(error, ClientError::UnknownOutcome(message) if message.contains("lease expired")));
+        assert!(error.is_outcome_unknown());
+        assert!(error.message().contains("lease expired"));
         tokio::time::sleep(Duration::from_millis(75)).await;
         wait_for_count(&state.write_cancellations, 1).await;
         assert_eq!(state.write_calls.load(Ordering::SeqCst), 1);
@@ -881,7 +904,7 @@ mod tests {
         let client = grpc_client();
         let mut block = client
             .open_write_block(
-                attempt("WriteBlock"),
+                attempt(Operation::WriteBlock),
                 write_target(vec![worker.clone()]),
                 lease_expiry_after(200),
             )
@@ -905,7 +928,7 @@ mod tests {
 
         let mut expired = client
             .open_write_block(
-                attempt("WriteBlock"),
+                attempt(Operation::WriteBlock),
                 write_target(vec![worker]),
                 lease_expiry_after(30),
             )
@@ -916,7 +939,8 @@ mod tests {
         let error = expired
             .update_lease_expiry(lease_expiry_after(1_000))
             .expect_err("renewal observed after old expiry cannot revive the RPC");
-        assert!(matches!(error, ClientError::UnknownOutcome(message) if message.contains("lease expired")));
+        assert!(error.is_outcome_unknown());
+        assert!(error.message().contains("lease expired"));
         assert!(expired.cancel(Duration::from_secs(1)).await);
         wait_for_count(&state.write_cancellations, 1).await;
 
@@ -933,7 +957,7 @@ mod tests {
 
         let mut cancelled = client
             .open_write_block(
-                attempt("WriteBlock"),
+                attempt(Operation::WriteBlock),
                 write_target(vec![worker.clone()]),
                 lease_expiry(),
             )
@@ -946,7 +970,7 @@ mod tests {
 
         let mut dropped = client
             .open_write_block(
-                attempt("WriteBlock"),
+                attempt(Operation::WriteBlock),
                 write_target(vec![worker.clone()]),
                 lease_expiry(),
             )
@@ -959,7 +983,7 @@ mod tests {
 
         let mut expired = client
             .open_write_block(
-                attempt("WriteBlock"),
+                attempt(Operation::WriteBlock),
                 write_target(vec![worker.clone()]),
                 lease_expiry_after(30),
             )
@@ -971,12 +995,17 @@ mod tests {
             .finish()
             .await
             .expect_err("expired block cannot finish normally");
-        assert!(matches!(error, ClientError::UnknownOutcome(message) if message.contains("lease expired")));
+        assert!(error.is_outcome_unknown());
+        assert!(error.message().contains("lease expired"));
         wait_for_count(&state.write_cancellations, 3).await;
         assert_eq!(state.write_eofs.load(Ordering::SeqCst), 0);
 
         let mut finished = client
-            .open_write_block(attempt("WriteBlock"), write_target(vec![worker]), lease_expiry())
+            .open_write_block(
+                attempt(Operation::WriteBlock),
+                write_target(vec![worker]),
+                lease_expiry(),
+            )
             .await
             .expect("open normally finished block");
         finished.write(Bytes::from_static(b"d")).await.expect("final frame");

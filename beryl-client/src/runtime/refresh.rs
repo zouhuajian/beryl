@@ -12,9 +12,8 @@ use beryl_types::{GroupName, GroupStateWatermark};
 use parking_lot::RwLock;
 
 use crate::config::ClientConfig;
-use crate::error::{ClientError, ClientResult};
+use crate::error::{ClientError, ClientResult, RefreshHint};
 use crate::metadata::MetadataAuthorityUpdate;
-use crate::rpc_error::RefreshHint;
 use crate::runtime::context::{AttemptContext, OperationContext};
 
 const METADATA_TARGET_CACHE_LIMIT: usize = 300;
@@ -95,12 +94,12 @@ impl MetadataTargets {
     /// Create metadata targets from configured metadata groups.
     pub(crate) fn new(groups: Vec<MetadataGroupTargets>) -> ClientResult<Self> {
         if groups.is_empty() {
-            return Err(ClientError::InvalidArgument(
+            return Err(ClientError::invalid_argument(
                 "MetadataTargets requires at least one metadata group".to_string(),
             ));
         }
         if let Some(group) = groups.iter().find(|group| group.endpoints.is_empty()) {
-            return Err(ClientError::InvalidArgument(format!(
+            return Err(ClientError::invalid_argument(format!(
                 "MetadataTargets group {} requires at least one endpoint",
                 group.group_name
             )));
@@ -143,7 +142,7 @@ impl MetadataTargets {
             .groups
             .first()
             .map(|group| group.group_name.clone())
-            .ok_or_else(|| ClientError::Config("metadata group configuration is empty".to_string()))
+            .ok_or_else(|| ClientError::invalid_configuration("metadata group configuration is empty".to_string()))
     }
 
     /// Choose the owner group for an operation.
@@ -179,7 +178,9 @@ impl MetadataTargets {
                 let index = attempt as usize % group.endpoints.len();
                 group.endpoints[index].clone()
             })
-            .ok_or_else(|| ClientError::Config(format!("metadata group {} is not configured", group_name)))
+            .ok_or_else(|| {
+                ClientError::invalid_configuration(format!("metadata group {} is not configured", group_name))
+            })
     }
 
     /// Clear a cached leader when transport failed against that exact endpoint.
@@ -210,7 +211,7 @@ impl MetadataTargets {
             }
             ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch | MetadataErrorKind::GroupMismatch) => {
                 let Some(group_name) = hint.group_name.as_ref() else {
-                    return Err(ClientError::Metadata(
+                    return Err(ClientError::metadata(
                         "owner group mismatch refresh missing group_name hint".to_string(),
                     ));
                 };
@@ -242,7 +243,7 @@ impl MetadataTargets {
             ErrorKind::Metadata(MetadataErrorKind::StaleState)
             | ErrorKind::Worker(WorkerErrorKind::RunMismatch | WorkerErrorKind::BlockStampMismatch) => {}
             _ => {
-                return Err(ClientError::Metadata(format!(
+                return Err(ClientError::metadata(format!(
                     "unsupported metadata refresh error kind: {kind:?}"
                 )))
             }
@@ -262,13 +263,13 @@ impl MetadataTargets {
             .iter()
             .any(|watermark| watermark.group_name != update.group_name)
         {
-            return Err(ClientError::Metadata(
+            return Err(ClientError::metadata(
                 "metadata authority update contains a watermark for another group".to_string(),
             ));
         }
         let operation_path = operation.original_target_path();
         if operation_path.is_none() && (update.mount_epoch.is_some() || update.route_epoch.is_some()) {
-            return Err(ClientError::Metadata(
+            return Err(ClientError::metadata(
                 "metadata authority epochs require an operation path".to_string(),
             ));
         }
@@ -408,8 +409,7 @@ impl Default for MetadataTargets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc_error::RefreshHint;
-    use crate::runtime::{OperationContext, OperationDeadline};
+    use crate::runtime::{Operation, OperationContext, OperationDeadline};
     use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
     use beryl_proto::common::{GroupStateWatermarkProto, RaftLogIdProto};
     use beryl_types::{ClientId, GroupName};
@@ -426,7 +426,7 @@ mod tests {
         OperationContext::new_named(
             ClientId::new(7),
             "test-client",
-            "OpenFile",
+            Operation::OpenFile,
             Some("/alpha/file".to_string()),
             OperationDeadline::new(1_000),
         )

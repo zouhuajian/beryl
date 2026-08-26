@@ -15,13 +15,14 @@ use crate::api::options::DEFAULT_REPLICATION;
 use crate::api::path::NamespacePathBuf;
 use crate::api::{CreateOptions, DeleteOptions, DirectoryEntry, DirectoryListing, FileStatus, ListOptions};
 use crate::config::{ClientConfig, RetryConfig};
-use crate::error::{invalid_response, ClientError, ClientResult};
+use crate::error::{
+    invalid_response, side_effect_response_body_mismatch, ClientError, ClientErrorKind, ClientResult, RefreshHint,
+};
 use crate::metadata::{AddBlockResult, MetadataTransport, ReadLayout, ReadSnapshot, ValidatedMetadataResponse};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
-use crate::rpc_error::ClientAction;
-use crate::runtime::classify::{classify_error, ErrorClass};
-use crate::runtime::context::{AttemptContext, ClientIdentity, OperationContext, OperationDeadline};
+use crate::runtime::context::{AttemptContext, ClientIdentity, Operation, OperationContext, OperationDeadline};
 use crate::runtime::refresh::MetadataTargets;
+use crate::runtime::{retry_decision, transport_outcome_is_ambiguous, RetryDecision};
 use crate::session::write_session::{CommitFilePlan, WriteSession};
 
 const INITIAL_BACKOFF_MS: u64 = 100;
@@ -69,18 +70,18 @@ impl MetadataClient {
 
     fn operation(
         &self,
-        name: &'static str,
+        operation: Operation,
         route_path: Option<String>,
         deadline: OperationDeadline,
     ) -> ClientResult<OperationContext> {
-        OperationContext::new_with_identity(&self.identity, name, route_path, deadline)
+        OperationContext::new_with_identity(&self.identity, operation, route_path, deadline)
     }
 
     /// Returns the current status for a normalized namespace path.
     pub(crate) async fn stat(&self, path: NamespacePathBuf) -> ClientResult<FileStatus> {
         let path = path.into_string();
         let deadline = self.operation_deadline();
-        let operation = self.operation("GetStatus", Some(path.clone()), deadline)?;
+        let operation = self.operation(Operation::GetStatus, Some(path.clone()), deadline)?;
         let response = self
             .execute_metadata(
                 operation,
@@ -97,7 +98,7 @@ impl MetadataClient {
     /// Returns one bounded Metadata-owned directory page.
     pub(crate) async fn list(&self, path: NamespacePathBuf, options: ListOptions) -> ClientResult<DirectoryListing> {
         let path = path.into_string();
-        let operation = self.operation("ListStatus", Some(path.clone()), self.operation_deadline())?;
+        let operation = self.operation(Operation::ListStatus, Some(path.clone()), self.operation_deadline())?;
         let response = self
             .execute_metadata(
                 operation,
@@ -118,25 +119,24 @@ impl MetadataClient {
     /// to the existing retry contract.
     pub(crate) async fn create_directory(&self, path: NamespacePathBuf, recursive: bool) -> ClientResult<FileStatus> {
         let path = path.into_string();
-        let operation = self.operation("CreateDirectory", Some(path.clone()), self.operation_deadline())?;
+        let kind = if recursive {
+            Operation::CreateDirectoryRecursive
+        } else {
+            Operation::CreateDirectory
+        };
+        let operation = self.operation(kind, Some(path.clone()), self.operation_deadline())?;
         let request = beryl_proto::metadata::CreateDirectoryRequestProto {
             header: None,
             path: path.clone(),
             attrs: Some(default_dir_attrs()),
             recursive,
         };
-        let response = if recursive {
-            self.execute_mutation_metadata(operation, request, |transport, ctx, req| async move {
+        let response = self
+            .execute_mutation_metadata(operation.clone(), request, |transport, ctx, req| async move {
                 transport.create_directory(ctx, req).await
             })
-            .await?
-        } else {
-            self.execute_without_transport_retry(operation, request, |transport, ctx, req| async move {
-                transport.create_directory(ctx, req).await
-            })
-            .await?
-        };
-        directory_status_from_response(path, response)
+            .await?;
+        directory_status_from_response(path, response).map_err(|error| error.with_operation_context(&operation))
     }
 
     /// Encodes the explicit delete contract and submits it without transport replay.
@@ -147,8 +147,8 @@ impl MetadataClient {
     /// namespace change.
     pub(crate) async fn delete(&self, path: NamespacePathBuf, options: DeleteOptions) -> ClientResult<()> {
         let path = path.into_string();
-        let operation = self.operation("Delete", Some(path.clone()), self.operation_deadline())?;
-        self.execute_without_transport_retry(
+        let operation = self.operation(Operation::Delete, Some(path.clone()), self.operation_deadline())?;
+        self.execute_mutation_metadata(
             operation,
             beryl_proto::metadata::DeleteRequestProto {
                 header: None,
@@ -167,8 +167,8 @@ impl MetadataClient {
     pub(crate) async fn rename(&self, src: NamespacePathBuf, dst: NamespacePathBuf) -> ClientResult<()> {
         let src = src.into_string();
         let dst = dst.into_string();
-        let operation = self.operation("Rename", Some(src.clone()), self.operation_deadline())?;
-        self.execute_without_transport_retry(
+        let operation = self.operation(Operation::Rename, Some(src.clone()), self.operation_deadline())?;
+        self.execute_mutation_metadata(
             operation,
             beryl_proto::metadata::RenameRequestProto {
                 header: None,
@@ -185,7 +185,7 @@ impl MetadataClient {
     /// Opens one immutable Metadata snapshot for subsequent authorized reads.
     pub(crate) async fn open_file(&self, path: NamespacePathBuf) -> ClientResult<ReadSnapshot> {
         let path = path.into_string();
-        let operation = self.operation("OpenFile", Some(path.clone()), self.operation_deadline())?;
+        let operation = self.operation(Operation::OpenFile, Some(path.clone()), self.operation_deadline())?;
         let response = self
             .execute_metadata(
                 operation,
@@ -197,13 +197,14 @@ impl MetadataClient {
             )
             .await?;
         if response.inode_id == 0 {
-            return Err(ClientError::Metadata(
-                "OpenFileResponseProto.inode_id must be non-zero".to_string(),
+            return Err(invalid_response(
+                "OpenFile",
+                "OpenFileResponseProto.inode_id must be non-zero",
             ));
         }
         let content_revision = response
             .content_revision
-            .ok_or_else(|| ClientError::Metadata("OpenFileResponseProto.content_revision missing".to_string()))?;
+            .ok_or_else(|| invalid_response("OpenFile", "OpenFileResponseProto.content_revision missing"))?;
         Ok(ReadSnapshot::new(
             path,
             InodeId::new(response.inode_id),
@@ -219,7 +220,7 @@ impl MetadataClient {
         req: beryl_proto::metadata::GetBlockLocationsRequestProto,
         deadline: OperationDeadline,
     ) -> ClientResult<ReadLayout> {
-        let operation = self.operation("GetBlockLocations", Some(path.to_string()), deadline)?;
+        let operation = self.operation(Operation::GetBlockLocations, Some(path.to_string()), deadline)?;
         self.execute_metadata(operation, req, |transport, ctx, req| async move {
             transport.read_layout(ctx, req).await
         })
@@ -258,9 +259,10 @@ impl MetadataClient {
     ) -> ClientResult<WriteSession> {
         let path = path.into_string();
         let deadline = self.operation_deadline();
+        let create_operation = self.operation(Operation::CreateFile, Some(path.clone()), deadline.clone())?;
         let create = self
-            .execute_without_transport_retry(
-                self.operation("CreateFile", Some(path.clone()), deadline.clone())?,
+            .execute_mutation_metadata(
+                create_operation.clone(),
                 beryl_proto::metadata::CreateFileRequestProto {
                     header: None,
                     path: path.clone(),
@@ -271,17 +273,22 @@ impl MetadataClient {
             )
             .await?;
         if create.inode_id == 0 {
-            return Err(ClientError::Metadata(
-                "CreateFileResponseProto.inode_id must be non-zero".to_string(),
-            ));
+            return Err(side_effect_response_body_mismatch(
+                "CreateFile",
+                "CreateFileResponseProto.inode_id must be non-zero",
+            )
+            .with_operation_context(&create_operation));
         }
         let created_inode_id = create.inode_id;
-        let created_layout = create
-            .layout
-            .ok_or_else(|| ClientError::Metadata("CreateFileResponseProto.layout missing".to_string()))?;
-        let created_layout = FileLayout::try_from(created_layout)
-            .map_err(|err| ClientError::InvalidLayout(format!("CreateFileResponseProto.layout invalid: {err}")))?;
-        let open = self
+        let created_layout = create.layout.ok_or_else(|| {
+            side_effect_response_body_mismatch("CreateFile", "CreateFileResponseProto.layout missing")
+                .with_operation_context(&create_operation)
+        })?;
+        let created_layout = FileLayout::try_from(created_layout).map_err(|err| {
+            side_effect_response_body_mismatch("CreateFile", format!("CreateFileResponseProto.layout invalid: {err}"))
+                .with_operation_context(&create_operation)
+        })?;
+        let (open_operation, open) = self
             .open_write_request(
                 &path,
                 beryl_proto::metadata::OpenWriteModeProto::OpenWriteModeWrite,
@@ -289,21 +296,29 @@ impl MetadataClient {
             )
             .await?;
         if open.write_handle.as_ref().map(|handle| handle.inode_id) != Some(created_inode_id) {
-            return Err(ClientError::Metadata(
-                "OpenWrite returned a different inode_id than CreateFile".to_string(),
-            ));
+            return Err(side_effect_response_body_mismatch(
+                "OpenWrite",
+                "OpenWrite returned a different inode_id than CreateFile",
+            )
+            .with_operation_context(&open_operation));
         }
-        let open_layout = open
-            .layout
-            .ok_or_else(|| ClientError::Metadata("OpenWriteResponseProto.layout missing".to_string()))?;
-        let open_layout = FileLayout::try_from(open_layout)
-            .map_err(|err| ClientError::InvalidLayout(format!("OpenWriteResponseProto.layout invalid: {err}")))?;
+        let open_layout = open.layout.ok_or_else(|| {
+            side_effect_response_body_mismatch("OpenWrite", "OpenWriteResponseProto.layout missing")
+                .with_operation_context(&open_operation)
+        })?;
+        let open_layout = FileLayout::try_from(open_layout).map_err(|err| {
+            side_effect_response_body_mismatch("OpenWrite", format!("OpenWriteResponseProto.layout invalid: {err}"))
+                .with_operation_context(&open_operation)
+        })?;
         if open_layout != created_layout {
-            return Err(ClientError::Metadata(
-                "OpenWrite returned a different layout than CreateFile".to_string(),
-            ));
+            return Err(side_effect_response_body_mismatch(
+                "OpenWrite",
+                "OpenWrite returned a different layout than CreateFile",
+            )
+            .with_operation_context(&open_operation));
         }
         write_session_from_open_response(
+            &open_operation,
             path,
             beryl_proto::metadata::OpenWriteModeProto::OpenWriteModeWrite,
             open,
@@ -313,7 +328,7 @@ impl MetadataClient {
     /// Opens an append session while preserving Metadata's stored layout.
     pub(crate) async fn open_append(&self, path: NamespacePathBuf) -> ClientResult<WriteSession> {
         let path = path.into_string();
-        let open = self
+        let (operation, open) = self
             .open_write_request(
                 &path,
                 beryl_proto::metadata::OpenWriteModeProto::OpenWriteModeAppend,
@@ -321,64 +336,68 @@ impl MetadataClient {
             )
             .await?;
         write_session_from_open_response(
+            &operation,
             path,
             beryl_proto::metadata::OpenWriteModeProto::OpenWriteModeAppend,
             open,
         )
     }
 
+    /// Retains the exact operation identity so all successful-body validation
+    /// failures remain attributable to the side-effecting RPC.
     async fn open_write_request(
         &self,
         path: &str,
         mode: beryl_proto::metadata::OpenWriteModeProto,
         deadline: OperationDeadline,
-    ) -> ClientResult<beryl_proto::metadata::OpenWriteResponseProto> {
-        self.execute_mutation_metadata(
-            self.operation("OpenWrite", Some(path.to_string()), deadline)?,
-            beryl_proto::metadata::OpenWriteRequestProto {
-                header: None,
-                path: path.to_string(),
-                mode: mode as i32,
-            },
-            |transport, ctx, req| async move {
-                match transport.open_write(ctx, req).await {
-                    Err(err) if matches!(classify_error(&err), ErrorClass::RetryableTransport) => {
-                        Err(ClientError::UnknownOutcome(format!(
-                            "OpenWrite outcome is unknown after transport ambiguity: {err}"
-                        )))
-                    }
-                    result => result,
-                }
-            },
-        )
-        .await
+    ) -> ClientResult<(OperationContext, beryl_proto::metadata::OpenWriteResponseProto)> {
+        let operation = self.operation(Operation::OpenWrite, Some(path.to_string()), deadline)?;
+        let response = self
+            .execute_mutation_metadata(
+                operation.clone(),
+                beryl_proto::metadata::OpenWriteRequestProto {
+                    header: None,
+                    path: path.to_string(),
+                    mode: mode as i32,
+                },
+                |transport, ctx, req| async move { transport.open_write(ctx, req).await },
+            )
+            .await?;
+        Ok((operation, response))
     }
 
-    /// Allocates the next Metadata-authorized block for an active write session.
+    /// Allocates the next Metadata-authorized block and retains its operation
+    /// identity for cross-plane target validation.
     pub(crate) async fn add_block(
         &self,
         path: &str,
         write_handle: beryl_proto::metadata::WriteHandleProto,
         previous_block_id: Option<BlockId>,
         deadline: OperationDeadline,
-    ) -> ClientResult<AddBlockResult> {
-        self.execute_mutation_metadata(
-            self.operation("AddBlock", Some(path.to_string()), deadline)?,
-            beryl_proto::metadata::AddBlockRequestProto {
-                header: None,
-                write_handle: Some(write_handle),
-                previous_block_id: previous_block_id.map(Into::into),
-            },
-            |transport, ctx, req| async move { transport.add_block(ctx, req).await },
-        )
-        .await
+    ) -> ClientResult<(OperationContext, AddBlockResult)> {
+        let operation = self.operation(Operation::AddBlock, Some(path.to_string()), deadline)?;
+        let result = self
+            .execute_mutation_metadata(
+                operation.clone(),
+                beryl_proto::metadata::AddBlockRequestProto {
+                    header: None,
+                    write_handle: Some(write_handle),
+                    previous_block_id: previous_block_id.map(Into::into),
+                },
+                |transport, ctx, req| async move { transport.add_block(ctx, req).await },
+            )
+            .await?;
+        Ok((operation, result))
     }
 
-    /// Replays only the frozen commit plan owned by the write session.
+    /// Replays only the frozen commit plan and validates its publication size
+    /// under the same operation identity.
     pub(crate) async fn commit_file(
         &self,
         plan: CommitFilePlan,
     ) -> ClientResult<beryl_proto::metadata::CommitFileResponseProto> {
+        let operation = plan.operation.clone();
+        let final_size = plan.final_size;
         let req = beryl_proto::metadata::CommitFileRequestProto {
             header: None,
             write_handle: Some(plan.write_handle),
@@ -388,10 +407,22 @@ impl MetadataClient {
             write_mode: plan.write_mode as i32,
             expected_file_size: plan.expected_file_size,
         };
-        self.execute_mutation_metadata(plan.operation, req, |transport, ctx, req| async move {
-            transport.commit_file(ctx, req).await
-        })
-        .await
+        let response = self
+            .execute_mutation_metadata(operation.clone(), req, |transport, ctx, req| async move {
+                transport.commit_file(ctx, req).await
+            })
+            .await?;
+        if response.committed_size != final_size {
+            return Err(side_effect_response_body_mismatch(
+                "CommitFile",
+                format!(
+                    "committed_size {} does not equal final_size {final_size}",
+                    response.committed_size
+                ),
+            )
+            .with_operation_context(&operation));
+        }
+        Ok(response)
     }
 
     /// Aborts one exact write handle under its frozen operation identity.
@@ -411,32 +442,42 @@ impl MetadataClient {
         .await
     }
 
-    /// Renews one active write lease and returns the validated response body.
+    /// Renews one active write lease and returns its validated nonzero expiry.
     pub(crate) async fn renew_lease(
         &self,
         path: &str,
         write_handle: beryl_proto::metadata::WriteHandleProto,
         deadline: OperationDeadline,
-    ) -> ClientResult<beryl_proto::metadata::RenewLeaseResponseProto> {
-        self.execute_mutation_metadata(
-            self.operation("RenewLease", Some(path.to_string()), deadline)?,
-            beryl_proto::metadata::RenewLeaseRequestProto {
-                header: None,
-                write_handle: Some(write_handle),
-            },
-            |transport, ctx, req| async move { transport.renew_lease(ctx, req).await },
-        )
-        .await
+    ) -> ClientResult<u64> {
+        let operation = self.operation(Operation::RenewLease, Some(path.to_string()), deadline)?;
+        let response = self
+            .execute_mutation_metadata(
+                operation.clone(),
+                beryl_proto::metadata::RenewLeaseRequestProto {
+                    header: None,
+                    write_handle: Some(write_handle),
+                },
+                |transport, ctx, req| async move { transport.renew_lease(ctx, req).await },
+            )
+            .await?;
+        if response.expires_at_ms == 0 {
+            return Err(
+                side_effect_response_body_mismatch("RenewLease", "expires_at_ms must be non-zero")
+                    .with_operation_context(&operation),
+            );
+        }
+        Ok(response.expires_at_ms)
     }
 
-    /// Publishes the exact committed-block prefix selected by the write session.
+    /// Publishes the exact committed-block prefix and returns the validated
+    /// content revision for the writer state transition.
     pub(crate) async fn sync_write(
         &self,
         session: &WriteSession,
         mut committed_blocks: Vec<CommittedBlock>,
         target_size: u64,
         deadline: OperationDeadline,
-    ) -> ClientResult<beryl_proto::metadata::SyncWriteResponseProto> {
+    ) -> ClientResult<u64> {
         if session.mode() == beryl_proto::metadata::OpenWriteModeProto::OpenWriteModeAppend {
             committed_blocks.retain(|block| block.file_offset >= session.base_size());
         }
@@ -449,12 +490,26 @@ impl MetadataClient {
             write_mode: session.mode() as i32,
             expected_file_size: session.base_size(),
         };
-        self.execute_mutation_metadata(
-            self.operation("SyncWrite", Some(session.path().to_string()), deadline)?,
-            req,
-            |transport, ctx, req| async move { transport.sync_write(ctx, req).await },
-        )
-        .await
+        let operation = self.operation(Operation::SyncWrite, Some(session.path().to_string()), deadline)?;
+        let response = self
+            .execute_mutation_metadata(operation.clone(), req, |transport, ctx, req| async move {
+                transport.sync_write(ctx, req).await
+            })
+            .await?;
+        if response.synced_size != target_size {
+            return Err(side_effect_response_body_mismatch(
+                "SyncWrite",
+                format!(
+                    "synced_size {} does not equal target_size {target_size}",
+                    response.synced_size
+                ),
+            )
+            .with_operation_context(&operation));
+        }
+        response.content_revision.ok_or_else(|| {
+            side_effect_response_body_mismatch("SyncWrite", "content_revision missing")
+                .with_operation_context(&operation)
+        })
     }
 
     /// Returns the stable client identity used by Worker operation contexts.
@@ -472,11 +527,13 @@ impl MetadataClient {
         &self,
         operation: &OperationContext,
         kind: ErrorKind,
-        hint: &crate::rpc_error::RefreshHint,
+        hint: &RefreshHint,
     ) -> ClientResult<()> {
         self.metadata_targets.record_refresh(operation, kind, hint)
     }
 
+    /// Executes a mutation under its typed replay policy and keeps ambiguity
+    /// sticky until a validated success proves the final outcome.
     async fn execute_mutation_metadata<Req, T, F, Fut>(
         &self,
         operation: OperationContext,
@@ -489,53 +546,35 @@ impl MetadataClient {
         Fut: Future<Output = ClientResult<ValidatedMetadataResponse<T>>>,
     {
         let operation_name = operation.operation_name();
+        let operation_context = operation.clone();
         let (result, saw_transport_ambiguity) = self.execute_metadata_attempts(operation, request, call).await;
         match result {
-            Err(err) if saw_transport_ambiguity || matches!(classify_error(&err), ErrorClass::RetryableTransport) => {
-                let unknown = ClientError::UnknownOutcome(format!(
-                    "{operation_name} outcome is unknown after transport ambiguity: {err}"
-                ));
+            Err(err) if saw_transport_ambiguity || err.is_outcome_unknown() || err.is_invalid_success_response() => {
+                let unknown = if err.is_outcome_unknown() {
+                    err.with_operation_context(&operation_context)
+                } else if saw_transport_ambiguity {
+                    let message = format!("{operation_name} outcome is unknown after transport ambiguity: {err}");
+                    err.with_unknown_outcome(&operation_context, message)
+                } else {
+                    let message = format!("{operation_name} outcome is unknown after invalid success response: {err}");
+                    err.with_unknown_outcome(&operation_context, message)
+                };
                 self.record_metric(
                     ClientMetric::UnknownOutcome,
                     ClientMetricLabels::default()
                         .with_operation(operation_name, "metadata")
-                        .with_error_class(ErrorClass::UnknownOutcome.label())
+                        .with_error_class("unknown_outcome")
                         .with_outcome("unknown"),
                 );
                 Err(unknown)
             }
-            result => result,
+            Err(err) => Err(err.with_operation_context(&operation_context)),
+            Ok(value) => Ok(value),
         }
     }
 
-    async fn execute_without_transport_retry<Req, T, F, Fut>(
-        &self,
-        operation: OperationContext,
-        request: Req,
-        mut call: F,
-    ) -> ClientResult<T>
-    where
-        Req: Clone,
-        F: FnMut(Arc<dyn MetadataTransport>, AttemptContext, Req) -> Fut,
-        Fut: Future<Output = ClientResult<ValidatedMetadataResponse<T>>>,
-    {
-        let operation_name = operation.operation_name();
-        self.execute_mutation_metadata(operation, request, move |transport, ctx, req| {
-            let future = call(transport, ctx, req);
-            async move {
-                match future.await {
-                    Err(err) if matches!(classify_error(&err), ErrorClass::RetryableTransport) => {
-                        Err(ClientError::UnknownOutcome(format!(
-                            "{operation_name} outcome is unknown after transport ambiguity: {err}"
-                        )))
-                    }
-                    result => result,
-                }
-            }
-        })
-        .await
-    }
-
+    /// Executes a read-only Metadata operation and attaches its stable identity
+    /// to any terminal failure.
     async fn execute_metadata<Req, T, F, Fut>(
         &self,
         operation: OperationContext,
@@ -547,7 +586,11 @@ impl MetadataClient {
         F: FnMut(Arc<dyn MetadataTransport>, AttemptContext, Req) -> Fut,
         Fut: Future<Output = ClientResult<ValidatedMetadataResponse<T>>>,
     {
-        self.execute_metadata_attempts(operation, request, call).await.0
+        let operation_context = operation.clone();
+        self.execute_metadata_attempts(operation, request, call)
+            .await
+            .0
+            .map_err(|error| error.with_operation_context(&operation_context))
     }
 
     /// Runs bounded metadata attempts and applies every validated successful
@@ -590,33 +633,35 @@ impl MetadataClient {
                 Ok(response) => {
                     let (authority, body) = response.into_parts();
                     if let Err(err) = self.metadata_targets.apply_authority_update(&operation, authority) {
-                        return (Err(err), saw_transport_ambiguity);
+                        return (
+                            Err(ClientError::invalid_response(
+                                operation.operation_name(),
+                                format!("invalid Metadata authority update: {err}"),
+                            )),
+                            saw_transport_ambiguity,
+                        );
                     }
                     return (Ok(body), saw_transport_ambiguity);
                 }
                 Err(err) => err,
             };
-            let class = classify_error(&err);
-            saw_transport_ambiguity |= class == ErrorClass::RetryableTransport;
-            self.record_error_metric(&operation, &class);
+            let decision = retry_decision(&err, operation.retry_safety());
+            saw_transport_ambiguity |= transport_outcome_is_ambiguous(&err, operation.retry_safety());
+            self.record_error_metric(&operation, &err);
             let has_next = attempt_index + 1 < self.retry.max_attempts();
 
-            match class {
-                ErrorClass::RetryableTransport if has_next => {
-                    self.metadata_targets.record_transport_failure(&target_group, &endpoint);
-                    self.record_retry(&operation, &class);
-                    if let Err(err) = self.sleep_with_deadline(&operation, backoff_delay(attempt_index)).await {
-                        return (Err(err), saw_transport_ambiguity);
+            match (decision, has_next) {
+                (RetryDecision::Retry, true) => {
+                    if err.is_retryable_transport() && !err.is_definitely_before_side_effect() {
+                        self.metadata_targets.record_transport_failure(&target_group, &endpoint);
                     }
-                }
-                ErrorClass::ServerRetry if has_next => {
-                    self.record_retry(&operation, &class);
+                    self.record_retry(&operation, &err);
                     let delay = server_retry_delay(&err).unwrap_or_else(|| backoff_delay(attempt_index));
                     if let Err(err) = self.sleep_with_deadline(&operation, delay).await {
                         return (Err(err), saw_transport_ambiguity);
                     }
                 }
-                ErrorClass::RefreshMetadata(kind) if has_next => {
+                (RetryDecision::RefreshMetadata(kind), true) => {
                     let hint = refresh_hint_from_error(&err);
                     if let Err(err) = self.metadata_targets.record_refresh(&operation, kind, &hint) {
                         return (Err(err), saw_transport_ambiguity);
@@ -633,29 +678,29 @@ impl MetadataClient {
                         Ok(group) => group,
                         Err(err) => return (Err(err), saw_transport_ambiguity),
                     };
-                    self.record_retry(&operation, &ErrorClass::RefreshMetadata(kind));
+                    self.record_retry(&operation, &err);
                 }
-                ErrorClass::RetryableTransport | ErrorClass::ServerRetry | ErrorClass::RefreshMetadata(_) => {
+                (RetryDecision::Retry | RetryDecision::RefreshMetadata(_), false) => {
                     self.record_metric(
                         ClientMetric::RetryExhausted,
-                        metadata_labels(&operation).with_error_class(class.label()),
+                        metadata_labels(&operation).with_error_class(err.classification_label()),
                     );
                     return (Err(err), saw_transport_ambiguity);
                 }
-                ErrorClass::UnknownOutcome => {
+                (RetryDecision::Return, _) if err.is_outcome_unknown() => {
                     self.record_metric(
                         ClientMetric::UnknownOutcome,
                         metadata_labels(&operation)
-                            .with_error_class(class.label())
+                            .with_error_class("unknown_outcome")
                             .with_outcome("unknown"),
                     );
                     return (Err(err), saw_transport_ambiguity);
                 }
-                _ => return (Err(err), saw_transport_ambiguity),
+                (RetryDecision::Return, _) => return (Err(err), saw_transport_ambiguity),
             }
         }
         (
-            Err(ClientError::Metadata(format!(
+            Err(ClientError::metadata(format!(
                 "{} exhausted attempts",
                 operation.operation_name()
             ))),
@@ -671,7 +716,7 @@ impl MetadataClient {
     ) -> ClientResult<()> {
         let endpoint = self.metadata_targets.endpoint_for_group(&target_group, attempt)?;
         let operation = self.operation(
-            "Msync",
+            Operation::Msync,
             parent.original_target_path().map(ToOwned::to_owned),
             parent.deadline().clone(),
         )?;
@@ -715,10 +760,10 @@ impl MetadataClient {
         Ok(())
     }
 
-    fn record_retry(&self, operation: &OperationContext, class: &ErrorClass) {
+    fn record_retry(&self, operation: &OperationContext, error: &ClientError) {
         self.record_metric(
             ClientMetric::RetryAttempt,
-            metadata_labels(operation).with_error_class(class.label()),
+            metadata_labels(operation).with_error_class(error.classification_label()),
         );
     }
 
@@ -726,23 +771,29 @@ impl MetadataClient {
         self.record_metric(
             ClientMetric::RpcTimeout,
             metadata_labels(operation)
-                .with_error_class(ErrorClass::RetryableTransport.label())
+                .with_error_class("retryable_transport")
                 .with_outcome("timeout"),
         );
     }
 
-    fn record_error_metric(&self, operation: &OperationContext, class: &ErrorClass) {
-        let metric = match class {
-            ErrorClass::InvalidHeader => Some(ClientMetric::InvalidHeader),
-            ErrorClass::UnknownOutcome => Some(ClientMetric::UnknownOutcome),
-            ErrorClass::Fencing => Some(ClientMetric::FencingMismatch),
-            ErrorClass::SessionInvalid => Some(ClientMetric::SessionInvalid),
-            ErrorClass::SessionExpired => Some(ClientMetric::SessionExpired),
-            ErrorClass::Unsupported => Some(ClientMetric::UnsupportedOperation),
-            _ => None,
+    fn record_error_metric(&self, operation: &OperationContext, error: &ClientError) {
+        let metric = if error.is_outcome_unknown() {
+            Some(ClientMetric::UnknownOutcome)
+        } else {
+            match error.kind() {
+                ClientErrorKind::InvalidResponse => Some(ClientMetric::InvalidHeader),
+                ClientErrorKind::Fenced => Some(ClientMetric::FencingMismatch),
+                ClientErrorKind::SessionInvalid => Some(ClientMetric::SessionInvalid),
+                ClientErrorKind::SessionExpired => Some(ClientMetric::SessionExpired),
+                ClientErrorKind::Unsupported => Some(ClientMetric::UnsupportedOperation),
+                _ => None,
+            }
         };
         if let Some(metric) = metric {
-            self.record_metric(metric, metadata_labels(operation).with_error_class(class.label()));
+            self.record_metric(
+                metric,
+                metadata_labels(operation).with_error_class(error.classification_label()),
+            );
         }
     }
 
@@ -766,27 +817,13 @@ fn metadata_labels(operation: &OperationContext) -> ClientMetricLabels {
     ClientMetricLabels::default().with_operation(operation.operation_name(), "metadata")
 }
 
-fn refresh_hint_from_error(err: &ClientError) -> crate::rpc_error::RefreshHint {
-    match err {
-        ClientError::Action(action) => match action.action() {
-            ClientAction::Refresh { hint, .. } => hint.as_ref().clone(),
-            _ => crate::rpc_error::RefreshHint::default(),
-        },
-        _ => crate::rpc_error::RefreshHint::default(),
-    }
+fn refresh_hint_from_error(err: &ClientError) -> RefreshHint {
+    err.refresh_hint().cloned().unwrap_or_default()
 }
 
 fn server_retry_delay(err: &ClientError) -> Option<Duration> {
-    let ClientError::Action(action) = err else {
-        return None;
-    };
-    let ClientAction::Retry {
-        retry_after_ms_hint, ..
-    } = action.action()
-    else {
-        return None;
-    };
-    retry_after_ms_hint.map(|delay| Duration::from_millis(delay.min(MAX_SERVER_RETRY_AFTER_MS)))
+    err.retry_after()
+        .map(|delay| delay.min(Duration::from_millis(MAX_SERVER_RETRY_AFTER_MS)))
 }
 
 fn backoff_delay(retry_index: usize) -> Duration {
@@ -835,27 +872,35 @@ fn layout_for_new_file(options: &CreateOptions) -> ClientResult<beryl_proto::com
     );
     layout
         .validate()
-        .map_err(|err| ClientError::InvalidLayout(format!("CreateOptions layout invalid: {err}")))?;
+        .map_err(|err| ClientError::invalid_argument(format!("CreateOptions layout invalid: {err}")))?;
     Ok((&layout).into())
 }
 
 /// Converts a validated open-write response into the sole client-side session
 /// state consumed by `FileWriter`.
 fn write_session_from_open_response(
+    operation: &OperationContext,
     path: String,
     mode: beryl_proto::metadata::OpenWriteModeProto,
     response: beryl_proto::metadata::OpenWriteResponseProto,
 ) -> ClientResult<WriteSession> {
-    let layout = response
-        .layout
-        .ok_or_else(|| ClientError::Metadata("OpenWriteResponseProto.layout missing".to_string()))?;
-    let layout = FileLayout::try_from(layout)
-        .map_err(|err| ClientError::InvalidLayout(format!("OpenWriteResponseProto.layout invalid: {err}")))?;
-    let write_handle = response
-        .write_handle
-        .ok_or_else(|| ClientError::Metadata("OpenWriteResponseProto.write_handle missing".to_string()))?;
+    let layout = response.layout.ok_or_else(|| {
+        side_effect_response_body_mismatch("OpenWrite", "OpenWriteResponseProto.layout missing")
+            .with_operation_context(operation)
+    })?;
+    let layout = FileLayout::try_from(layout).map_err(|err| {
+        side_effect_response_body_mismatch("OpenWrite", format!("OpenWriteResponseProto.layout invalid: {err}"))
+            .with_operation_context(operation)
+    })?;
+    let write_handle = response.write_handle.ok_or_else(|| {
+        side_effect_response_body_mismatch("OpenWrite", "OpenWriteResponseProto.write_handle missing")
+            .with_operation_context(operation)
+    })?;
     if response.expires_at_ms == 0 {
-        return Err(invalid_response("OpenWrite", "expires_at_ms must be non-zero"));
+        return Err(
+            side_effect_response_body_mismatch("OpenWrite", "expires_at_ms must be non-zero")
+                .with_operation_context(operation),
+        );
     }
     WriteSession::new(
         path,
@@ -866,6 +911,7 @@ fn write_session_from_open_response(
         response.content_revision,
         mode,
     )
+    .map_err(|error| side_effect_response_body_mismatch("OpenWrite", error).with_operation_context(operation))
 }
 
 fn file_status_from_response(
@@ -874,7 +920,7 @@ fn file_status_from_response(
 ) -> ClientResult<FileStatus> {
     let attrs = response
         .attrs
-        .ok_or_else(|| ClientError::Metadata("GetStatusResponseProto.attrs missing".to_string()))?;
+        .ok_or_else(|| invalid_response("GetStatus", "GetStatusResponseProto.attrs missing"))?;
     Ok(FileStatus::new(path, attrs.into()))
 }
 
@@ -882,9 +928,9 @@ fn directory_status_from_response(
     path: String,
     response: beryl_proto::metadata::CreateDirectoryResponseProto,
 ) -> ClientResult<FileStatus> {
-    let attrs = response
-        .attrs
-        .ok_or_else(|| ClientError::Metadata("CreateDirectoryResponseProto.attrs missing".to_string()))?;
+    let attrs = response.attrs.ok_or_else(|| {
+        side_effect_response_body_mismatch("CreateDirectory", "CreateDirectoryResponseProto.attrs missing")
+    })?;
     Ok(FileStatus::new(path, attrs.into()))
 }
 

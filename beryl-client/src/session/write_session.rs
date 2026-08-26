@@ -9,7 +9,7 @@ use beryl_proto::metadata::{OpenWriteModeProto, WriteHandleProto};
 use beryl_types::{BlockShape, CallId, ClientId, CommittedBlock, FileLayout, InodeId, WriteTarget};
 
 use crate::error::{ClientError, ClientResult};
-use crate::runtime::context::{OperationContext, OperationDeadline};
+use crate::runtime::context::{Operation, OperationContext, OperationDeadline};
 
 const LEASE_EXPIRY_SAFETY_WINDOW_MS: u64 = 1_000;
 
@@ -45,13 +45,13 @@ impl WriteSession {
     ) -> ClientResult<Self> {
         let inode_id = validate_write_handle(&write_handle)?;
         if expires_at_ms == 0 {
-            return Err(ClientError::InvalidArgument(
+            return Err(ClientError::invalid_argument(
                 "write session expires_at_ms must be non-zero".to_string(),
             ));
         }
         layout
             .validate()
-            .map_err(|err| ClientError::InvalidLayout(format!("write session layout invalid: {err}")))?;
+            .map_err(|err| ClientError::invalid_layout(format!("write session layout invalid: {err}")))?;
         Ok(Self {
             path,
             inode_id,
@@ -86,7 +86,7 @@ impl WriteSession {
         self.cursor = self
             .cursor
             .checked_add(len as u64)
-            .ok_or_else(|| ClientError::InvalidArgument("write cursor overflow".to_string()))?;
+            .ok_or_else(|| ClientError::invalid_argument("write cursor overflow".to_string()))?;
         Ok(())
     }
 
@@ -104,7 +104,7 @@ impl WriteSession {
     pub(crate) fn validate_target(&mut self, target: &WriteTarget) -> ClientResult<()> {
         self.ensure_open_for_write()?;
         if target.file_offset != self.flush_cursor {
-            return Err(ClientError::InvalidLayout(format!(
+            return Err(ClientError::invalid_layout(format!(
                 "write target file_offset mismatch: expected {}, got {}",
                 self.flush_cursor, target.file_offset
             )));
@@ -115,12 +115,12 @@ impl WriteSession {
             target.chunk_size,
             target.block_size,
         )
-        .map_err(|err| ClientError::InvalidLayout(format!("write target has invalid shape: {err}")))?;
+        .map_err(|err| ClientError::invalid_layout(format!("write target has invalid shape: {err}")))?;
         if target.block_format_id != self.layout.block_format_id
             || target.block_size != u64::from(self.layout.block_size)
             || target.chunk_size != self.layout.chunk_size
         {
-            return Err(ClientError::InvalidLayout(format!(
+            return Err(ClientError::invalid_layout(format!(
                 "write target layout does not match session layout: target=({}, {}, {}), session=({}, {}, {})",
                 target.block_format_id.as_raw(),
                 target.block_size,
@@ -132,16 +132,14 @@ impl WriteSession {
         }
         let block = target.block_id;
         if block.inode_id != self.inode_id {
-            return Err(ClientError::StaleHandle {
-                reason: format!(
-                    "write target inode_id {} does not match session inode_id {}",
-                    block.inode_id.as_raw(),
-                    self.inode_id.as_raw()
-                ),
-            });
+            return Err(ClientError::stale_handle(format!(
+                "write target inode_id {} does not match session inode_id {}",
+                block.inode_id.as_raw(),
+                self.inode_id.as_raw()
+            )));
         }
         if target.block_stamp == 0 {
-            return Err(ClientError::InvalidLayout(
+            return Err(ClientError::invalid_layout(
                 "write target block_stamp must be non-zero".to_string(),
             ));
         }
@@ -153,7 +151,7 @@ impl WriteSession {
         let final_offset = self
             .flush_cursor
             .checked_add(written_len)
-            .ok_or_else(|| ClientError::InvalidArgument("write flush cursor overflow".to_string()))?;
+            .ok_or_else(|| ClientError::invalid_argument("write flush cursor overflow".to_string()))?;
         self.ready_blocks.push(ReadyBlock { target, written_len });
         self.flush_cursor = final_offset;
         Ok(())
@@ -191,61 +189,49 @@ impl WriteSession {
             }
             WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown => {
                 let commit = self.commit.as_ref().ok_or_else(|| {
-                    ClientError::InvalidArgument("CommitFile state missing frozen identity".to_string())
+                    ClientError::invalid_argument("CommitFile state missing frozen identity".to_string())
                 })?;
                 if commit.commit_final_size != final_size || commit.commit_committed_blocks_snapshot != committed_blocks
                 {
-                    return Err(ClientError::InvalidArgument(
+                    return Err(ClientError::invalid_argument(
                         "CommitFile payload changed after commit started".to_string(),
                     ));
                 }
                 if commit.commit_write_handle != self.write_handle {
-                    return Err(ClientError::InvalidArgument(
+                    return Err(ClientError::invalid_argument(
                         "CommitFile write handle changed after commit started".to_string(),
                     ));
                 }
             }
             WriteSessionState::Closed => {
-                return Err(ClientError::StaleHandle {
-                    reason: "write handle is closed".to_string(),
-                });
+                return Err(ClientError::stale_handle("write handle is closed"));
             }
             WriteSessionState::Aborted => {
-                return Err(ClientError::StaleHandle {
-                    reason: "write handle is aborted".to_string(),
-                });
+                return Err(ClientError::stale_handle("write handle is aborted"));
             }
             WriteSessionState::UnknownOutcome => {
-                return Err(ClientError::StaleHandle {
-                    reason: "write handle has an unknown outcome".to_string(),
-                });
+                return Err(ClientError::stale_handle("write handle has an unknown outcome"));
             }
             WriteSessionState::SessionInvalid => {
-                return Err(ClientError::StaleHandle {
-                    reason: "write session is invalid".to_string(),
-                });
+                return Err(ClientError::stale_handle("write session is invalid"));
             }
             WriteSessionState::SessionExpired => {
-                return Err(ClientError::StaleHandle {
-                    reason: "write session lease expired".to_string(),
-                });
+                return Err(ClientError::stale_handle("write session lease expired"));
             }
             WriteSessionState::AbortUnknown => {
-                return Err(ClientError::StaleHandle {
-                    reason: "write handle abort outcome is unknown".to_string(),
-                });
+                return Err(ClientError::stale_handle("write handle abort outcome is unknown"));
             }
         }
 
         let commit = self
             .commit
             .as_ref()
-            .ok_or_else(|| ClientError::InvalidArgument("CommitFile state missing frozen identity".to_string()))?;
+            .ok_or_else(|| ClientError::invalid_argument("CommitFile state missing frozen identity".to_string()))?;
         let operation = OperationContext::with_call_id_named(
             client_id,
             client_name,
             commit.commit_call_id,
-            "CommitFile",
+            Operation::CommitFile,
             Some(self.path.clone()),
             deadline,
         )?;
@@ -277,10 +263,10 @@ impl WriteSession {
             }
             WriteSessionState::AbortUnknown => {
                 let abort = self.abort.as_ref().ok_or_else(|| {
-                    ClientError::InvalidArgument("AbortUnknown state missing frozen cleanup plan".to_string())
+                    ClientError::invalid_argument("AbortUnknown state missing frozen cleanup plan".to_string())
                 })?;
                 if abort.metadata_write_handle != self.write_handle {
-                    return Err(ClientError::InvalidArgument(
+                    return Err(ClientError::invalid_argument(
                         "Abort cleanup handle changed after cleanup started".to_string(),
                     ));
                 }
@@ -291,12 +277,12 @@ impl WriteSession {
         let abort = self
             .abort
             .as_ref()
-            .ok_or_else(|| ClientError::InvalidArgument("abort cleanup state missing frozen plan".to_string()))?;
+            .ok_or_else(|| ClientError::invalid_argument("abort cleanup state missing frozen plan".to_string()))?;
         let metadata_operation = OperationContext::with_call_id_named(
             client_id,
             client_name,
             abort.metadata_call_id,
-            "AbortFileWrite",
+            Operation::AbortFileWrite,
             Some(self.path.clone()),
             deadline.clone(),
         )?;
@@ -371,7 +357,7 @@ impl WriteSession {
     /// Current Metadata lease expiry used to bound an open Worker block RPC.
     pub(crate) fn expires_at_ms(&self) -> ClientResult<u64> {
         self.expires_at_ms
-            .ok_or_else(|| ClientError::InvalidArgument("write session expiry is missing".to_string()))
+            .ok_or_else(|| ClientError::invalid_argument("write session expiry is missing".to_string()))
     }
 
     /// Return whether the open session should renew before another side-effecting operation.
@@ -439,9 +425,7 @@ impl WriteSession {
         };
         if expires_at_ms <= now_ms {
             self.mark_session_expired();
-            return Err(ClientError::StaleHandle {
-                reason: "write session lease expired".to_string(),
-            });
+            return Err(ClientError::stale_handle("write session lease expired"));
         }
         Ok(expires_at_ms.saturating_sub(now_ms) <= renew_before_expiry_ms)
     }
@@ -452,43 +436,27 @@ impl WriteSession {
         };
         if expires_at_ms <= now_ms {
             self.mark_session_expired();
-            return Err(ClientError::StaleHandle {
-                reason: "write session lease expired".to_string(),
-            });
+            return Err(ClientError::stale_handle("write session lease expired"));
         }
         if expires_at_ms.saturating_sub(now_ms) <= safety_window_ms {
             self.mark_session_expired();
-            return Err(ClientError::StaleHandle {
-                reason: "write session lease is near expiry".to_string(),
-            });
+            return Err(ClientError::stale_handle("write session lease is near expiry"));
         }
         Ok(())
     }
 
     fn state_error_value(&self) -> ClientError {
         match self.state {
-            WriteSessionState::Open => ClientError::InvalidArgument("write session is open".to_string()),
-            WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown => ClientError::StaleHandle {
-                reason: "write handle has an in-progress CommitFile".to_string(),
-            },
-            WriteSessionState::Closed => ClientError::StaleHandle {
-                reason: "write handle is closed".to_string(),
-            },
-            WriteSessionState::Aborted => ClientError::StaleHandle {
-                reason: "write handle is aborted".to_string(),
-            },
-            WriteSessionState::UnknownOutcome => ClientError::StaleHandle {
-                reason: "write handle has an unknown outcome".to_string(),
-            },
-            WriteSessionState::SessionInvalid => ClientError::StaleHandle {
-                reason: "write session is invalid".to_string(),
-            },
-            WriteSessionState::SessionExpired => ClientError::StaleHandle {
-                reason: "write session lease expired".to_string(),
-            },
-            WriteSessionState::AbortUnknown => ClientError::StaleHandle {
-                reason: "write handle abort outcome is unknown".to_string(),
-            },
+            WriteSessionState::Open => ClientError::invalid_argument("write session is open".to_string()),
+            WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown => {
+                ClientError::stale_handle("write handle has an in-progress CommitFile")
+            }
+            WriteSessionState::Closed => ClientError::stale_handle("write handle is closed"),
+            WriteSessionState::Aborted => ClientError::stale_handle("write handle is aborted"),
+            WriteSessionState::UnknownOutcome => ClientError::stale_handle("write handle has an unknown outcome"),
+            WriteSessionState::SessionInvalid => ClientError::stale_handle("write session is invalid"),
+            WriteSessionState::SessionExpired => ClientError::stale_handle("write session lease expired"),
+            WriteSessionState::AbortUnknown => ClientError::stale_handle("write handle abort outcome is unknown"),
         }
     }
 }
@@ -597,12 +565,12 @@ impl AbortCleanupPlan {
 
 fn validate_write_handle(handle: &WriteHandleProto) -> ClientResult<InodeId> {
     if handle.inode_id == 0 {
-        return Err(ClientError::Metadata(
+        return Err(ClientError::metadata(
             "write handle inode_id must be non-zero".to_string(),
         ));
     }
     if handle.write_lease_epoch == 0 {
-        return Err(ClientError::Metadata(
+        return Err(ClientError::metadata(
             "write handle write_lease_epoch must be non-zero".to_string(),
         ));
     }
@@ -615,45 +583,16 @@ mod tests {
 
     use beryl_types::{BlockId, BlockIndex, ClientId, CommittedBlock, GroupName, InodeId};
 
+    use crate::error::ClientErrorKind;
     use crate::runtime::AttemptContext;
 
-    #[test]
-    fn prepare_commit_file_rejects_changed_payload_after_commit_started() {
-        let mut session = WriteSession::new(
-            "/alpha".to_string(),
-            test_layout(),
-            write_handle_proto(302),
-            0,
-            1_000,
-            0,
-            OpenWriteModeProto::OpenWriteModeWrite,
-        )
-        .expect("session");
-
-        session
-            .prepare_commit_file(
-                ClientId::new(7),
-                "test-client",
-                vec![committed_block(302, 0, 0, 5)],
-                5,
-                OperationDeadline::new(1_000),
-            )
-            .expect("first commit plan");
-        let err = session
-            .prepare_commit_file(
-                ClientId::new(7),
-                "test-client",
-                vec![committed_block(302, 0, 0, 6)],
-                6,
-                OperationDeadline::new(1_000),
-            )
-            .expect_err("changed commit payload must fail");
-
-        assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("payload changed")));
+    fn assert_error(error: &ClientError, kind: ClientErrorKind, message: &str) {
+        assert_eq!(error.kind(), kind);
+        assert!(error.message().contains(message), "unexpected error: {error:?}");
     }
 
     #[test]
-    fn prepare_commit_file_rejects_write_handle_change_after_unknown() {
+    fn frozen_commit_rejects_payload_or_handle_drift_and_reuses_call_id() {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
             test_layout(),
@@ -664,8 +603,8 @@ mod tests {
             OpenWriteModeProto::OpenWriteModeWrite,
         )
         .expect("session");
-        let blocks = vec![committed_block(302, 0, 0, 5)];
 
+        let blocks = vec![committed_block(302, 0, 0, 5)];
         let first = session
             .prepare_commit_file(
                 ClientId::new(7),
@@ -676,6 +615,17 @@ mod tests {
             )
             .expect("first commit plan");
         let first_ctx = AttemptContext::for_metadata(&first.operation, test_group_name(), 0).expect("first context");
+        let err = session
+            .prepare_commit_file(
+                ClientId::new(7),
+                "test-client",
+                vec![committed_block(302, 0, 0, 6)],
+                6,
+                OperationDeadline::new(1_000),
+            )
+            .expect_err("changed commit payload must fail");
+
+        assert_error(&err, ClientErrorKind::InvalidArgument, "payload changed");
         session.mark_commit_unknown();
 
         session.write_handle.write_lease_epoch = 2;
@@ -688,7 +638,7 @@ mod tests {
                 OperationDeadline::new(1_000),
             )
             .expect_err("changed session identity must fail");
-        assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("write handle changed")));
+        assert_error(&err, ClientErrorKind::InvalidArgument, "write handle changed");
 
         session.write_handle.write_lease_epoch = 1;
         let retry = session
@@ -731,7 +681,7 @@ mod tests {
             Ok(_) => panic!("identity drift must reject abort replay"),
             Err(err) => err,
         };
-        assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("handle changed")));
+        assert_error(&err, ClientErrorKind::InvalidArgument, "handle changed");
 
         session.write_handle.write_lease_epoch = 1;
         let retry = session
@@ -740,37 +690,6 @@ mod tests {
         let retry_ctx = AttemptContext::for_metadata(&retry.metadata_operation(), test_group_name(), 0)
             .expect("retry metadata context");
         assert_eq!(metadata_call_id(&first_ctx), metadata_call_id(&retry_ctx));
-    }
-
-    #[test]
-    fn lease_expiry_guard_marks_session_expired_and_blocks_side_effects() {
-        let mut session = WriteSession::new(
-            "/alpha".to_string(),
-            test_layout(),
-            write_handle_proto(302),
-            0,
-            1_000,
-            0,
-            OpenWriteModeProto::OpenWriteModeWrite,
-        )
-        .expect("session");
-
-        session.update_expires_at_ms(1_000);
-        let err = session
-            .ensure_operation_allowed_at_ms(WriteSessionOperation::Write, 1_001)
-            .expect_err("expired lease must block write");
-        assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("expired")));
-
-        for operation in [
-            WriteSessionOperation::Write,
-            WriteSessionOperation::Close,
-            WriteSessionOperation::Abort,
-            WriteSessionOperation::Renew,
-            WriteSessionOperation::Barrier,
-        ] {
-            let rejected = session.ensure_operation_allowed_at_ms(operation, 1_001);
-            assert!(matches!(rejected, Err(ClientError::StaleHandle { reason }) if reason.contains("expired")));
-        }
     }
 
     #[test]
@@ -793,6 +712,20 @@ mod tests {
             .ensure_operation_allowed_at_ms(WriteSessionOperation::Renew, 1)
             .expect("renew may run inside the side-effect safety window");
 
+        let mut expired = new_session(1_000);
+        for operation in [
+            WriteSessionOperation::Write,
+            WriteSessionOperation::Close,
+            WriteSessionOperation::Abort,
+            WriteSessionOperation::Renew,
+            WriteSessionOperation::Barrier,
+        ] {
+            let error = expired
+                .ensure_operation_allowed_at_ms(operation, 1_001)
+                .expect_err("expired lease must block every operation");
+            assert_error(&error, ClientErrorKind::StaleHandle, "expired");
+        }
+
         for operation in [
             WriteSessionOperation::Write,
             WriteSessionOperation::Close,
@@ -803,7 +736,7 @@ mod tests {
             let error = session
                 .ensure_operation_allowed_at_ms(operation, 1)
                 .expect_err("new side effects must stop near lease expiry");
-            assert!(matches!(error, ClientError::StaleHandle { reason } if reason.contains("near expiry")));
+            assert_error(&error, ClientErrorKind::StaleHandle, "near expiry");
         }
 
         for (state, operation) in [

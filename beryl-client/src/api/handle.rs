@@ -15,13 +15,11 @@ use crate::client_inner::{
     is_unknown_session_barrier_outcome, mark_session_after_metadata_error, metric_labels, refresh_hint_from_error,
     ClientInner,
 };
-use crate::error::{
-    invalid_response, read_buffer_reservation_failed, side_effect_response_body_mismatch, ClientError, ClientResult,
-};
+use crate::error::{read_buffer_reservation_failed, ClientError, ClientResult};
 use crate::metadata::ReadSnapshot;
 use crate::metrics::ClientMetric;
 use crate::planner;
-use crate::runtime::{classify_error, ErrorClass, OperationContext, OperationDeadline};
+use crate::runtime::{retry_decision, Operation, OperationContext, OperationDeadline, RetryDecision};
 use crate::session::write_session::WriteSession;
 use crate::worker::BlockWrite;
 
@@ -65,7 +63,7 @@ impl FileReader {
         let operation = OperationContext::new_named(
             self.inner.metadata.client_id(),
             self.inner.metadata.client_name(),
-            "Read",
+            Operation::Read,
             Some(self.snapshot.path().to_string()),
             deadline,
         )?;
@@ -94,11 +92,11 @@ impl FileReader {
             {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => {
-                    let class = classify_error(&err);
-                    self.inner.record_error_metric("Read", "worker", &class);
+                    let decision = retry_decision(&err, operation.retry_safety());
+                    self.inner.record_error_metric("Read", "worker", &err);
                     let has_next = attempt_index + 1 < self.inner.config.retry.max_attempts();
-                    match class.clone() {
-                        ErrorClass::RefreshMetadata(reason) if has_next && should_replan_after_worker_error(&err) => {
+                    match (decision, has_next) {
+                        (RetryDecision::RefreshMetadata(reason), true) if should_replan_after_worker_error(&err) => {
                             self.inner.metadata.record_data_refresh(
                                 &operation,
                                 reason,
@@ -106,30 +104,20 @@ impl FileReader {
                             )?;
                             self.inner.record_metric(
                                 ClientMetric::RetryAttempt,
-                                metric_labels("Read", "worker").with_error_class(class.label()),
+                                metric_labels("Read", "worker").with_error_class(err.classification_label()),
                             );
                         }
-                        ErrorClass::RefreshMetadata(_) => return Err(err),
-                        ErrorClass::RetryableTransport | ErrorClass::ServerRetry if has_next => {
+                        (RetryDecision::Retry, true) => {
                             self.inner.record_metric(
                                 ClientMetric::RetryAttempt,
-                                metric_labels("Read", "worker").with_error_class(class.label()),
+                                metric_labels("Read", "worker").with_error_class(err.classification_label()),
                             );
                             self.inner.sleep_before_retry(attempt_index, &operation).await?;
                         }
-                        ErrorClass::RetryableTransport | ErrorClass::ServerRetry => {
+                        (RetryDecision::Retry | RetryDecision::RefreshMetadata(_), false) => {
                             self.inner.record_metric(
                                 ClientMetric::RetryExhausted,
-                                metric_labels("Read", "worker").with_error_class(class.label()),
-                            );
-                            return Err(err);
-                        }
-                        ErrorClass::UnknownOutcome => {
-                            self.inner.record_metric(
-                                ClientMetric::UnknownOutcome,
-                                metric_labels("Read", "worker")
-                                    .with_error_class(class.label())
-                                    .with_outcome("unknown"),
+                                metric_labels("Read", "worker").with_error_class(err.classification_label()),
                             );
                             return Err(err);
                         }
@@ -150,7 +138,7 @@ impl FileReader {
         }
         validate_read_all_size(size, self.inner.config.read.max_buffered_bytes)?;
         let capacity = usize::try_from(size)
-            .map_err(|_| ClientError::InvalidArgument("file is too large to read into one buffer".to_string()))?;
+            .map_err(|_| ClientError::invalid_argument("file is too large to read into one buffer".to_string()))?;
         let mut output = Vec::new();
         output
             .try_reserve_exact(capacity)
@@ -179,7 +167,7 @@ impl FileReader {
 
 fn ensure_exact_read(offset: u64, len: u32, bytes: &Bytes) -> ClientResult<()> {
     if bytes.len() != len as usize {
-        return Err(ClientError::InvalidArgument(format!(
+        return Err(ClientError::invalid_argument(format!(
             "read_exact_at requested {} bytes at offset {} but read {} bytes",
             len,
             offset,
@@ -200,13 +188,13 @@ impl fmt::Debug for FileReader {
 
 /// Returns true when a worker read failure requires a fresh metadata layout.
 fn should_replan_after_worker_error(err: &ClientError) -> bool {
-    matches!(
-        classify_error(err),
-        ErrorClass::RefreshMetadata(
+    err.remote_error().is_some_and(|error| {
+        matches!(
+            error.kind,
             ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch)
                 | ErrorKind::Worker(WorkerErrorKind::RunMismatch | WorkerErrorKind::BlockStampMismatch)
         )
-    )
+    })
 }
 
 /// A writer for a sequential write session created through the filesystem client.
@@ -327,8 +315,7 @@ impl FileWriter {
             metric_labels("RenewLease", "metadata").with_outcome("attempt"),
         );
         match self.inner.metadata.renew_lease(&path, write_handle, deadline).await {
-            Ok(response) => {
-                let expires_at_ms = valid_write_session_expiry("RenewLease", response.expires_at_ms)?;
+            Ok(expires_at_ms) => {
                 let block_lease_update = self
                     .block_write
                     .as_ref()
@@ -347,12 +334,11 @@ impl FileWriter {
             }
             Err(err) => {
                 mark_session_after_metadata_error(session, &err);
-                let class = classify_error(&err);
-                self.inner.record_error_metric("RenewLease", "metadata", &class);
+                self.inner.record_error_metric("RenewLease", "metadata", &err);
                 self.inner.record_metric(
                     ClientMetric::LeaseRenewFailure,
                     metric_labels("RenewLease", "metadata")
-                        .with_error_class(class.label())
+                        .with_error_class(err.classification_label())
                         .with_outcome("failure"),
                 );
                 Err(err)
@@ -387,15 +373,7 @@ impl FileWriter {
             );
         }
         match self.inner.metadata.commit_file(plan).await {
-            Ok(response) => {
-                if let Err(error) = validate_commit_file_size(response.committed_size, final_size) {
-                    session.mark_commit_unknown();
-                    self.inner.record_metric(
-                        ClientMetric::UnknownOutcome,
-                        metric_labels("CommitFile", "metadata").with_outcome("unknown"),
-                    );
-                    return Err(error);
-                }
+            Ok(_) => {
                 session.mark_closed();
                 Ok(())
             }
@@ -405,15 +383,12 @@ impl FileWriter {
                     ClientMetric::UnknownOutcome,
                     metric_labels("CommitFile", "metadata").with_outcome("unknown"),
                 );
-                Err(ClientError::UnknownOutcome(format!(
-                    "CommitFile outcome is unknown for path {}: {}",
-                    path, err
-                )))
+                let message = format!("CommitFile outcome is unknown for path {path}: {err}");
+                Err(err.with_unknown_outcome_name("CommitFile", message))
             }
             Err(err) => {
                 mark_session_after_metadata_error(&mut session, &err);
-                let class = classify_error(&err);
-                self.inner.record_error_metric("CommitFile", "metadata", &class);
+                self.inner.record_error_metric("CommitFile", "metadata", &err);
                 Err(err)
             }
         }
@@ -443,7 +418,7 @@ impl FileWriter {
         {
             session.mark_abort_unknown();
             let normalized = self.inner.normalize_outcome_error("AbortFileWrite", "metadata", err);
-            let metric = if matches!(normalized, ClientError::UnknownOutcome(_)) {
+            let metric = if normalized.is_outcome_unknown() {
                 ClientMetric::AbortUnknown
             } else {
                 ClientMetric::AbortFailure
@@ -479,37 +454,23 @@ impl FileWriter {
             .sync_write(&session, committed_blocks, target_size, deadline)
             .await
         {
-            Ok(response) => {
-                let content_revision = match validate_sync_write_response(&response, target_size) {
-                    Ok(content_revision) => content_revision,
-                    Err(error) => {
-                        session.mark_unknown_outcome();
-                        self.inner.record_metric(
-                            ClientMetric::UnknownOutcome,
-                            metric_labels("SyncWrite", "metadata").with_outcome("unknown"),
-                        );
-                        return Err(error);
-                    }
-                };
+            Ok(content_revision) => {
                 session.update_published_state(content_revision, target_size);
                 self.handle.store_write_cursor(session.cursor());
                 Ok(())
             }
             Err(err) => {
-                let class = classify_error(&err);
                 if is_unknown_session_barrier_outcome(&err) {
                     session.mark_unknown_outcome();
                     self.inner.record_metric(
                         ClientMetric::UnknownOutcome,
                         metric_labels("SyncWrite", "metadata").with_outcome("unknown"),
                     );
-                    return Err(ClientError::UnknownOutcome(format!(
-                        "SyncWrite outcome is unknown for path {}: {}",
-                        path, err
-                    )));
+                    let message = format!("SyncWrite outcome is unknown for path {path}: {err}");
+                    return Err(err.with_unknown_outcome_name("SyncWrite", message));
                 }
                 mark_session_after_metadata_error(&mut session, &err);
-                self.inner.record_error_metric("SyncWrite", "metadata", &class);
+                self.inner.record_error_metric("SyncWrite", "metadata", &err);
                 Err(err)
             }
         }
@@ -546,53 +507,11 @@ impl fmt::Debug for FileWriter {
     }
 }
 
-/// Accepts a successful commit body only when it proves the exact frozen
-/// publication intent.
-fn validate_commit_file_size(committed_size: u64, final_size: u64) -> ClientResult<()> {
-    if committed_size != final_size {
-        return Err(side_effect_response_body_mismatch(
-            "CommitFile",
-            format!(
-                "committed_size {} does not equal final_size {}",
-                committed_size, final_size
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// Validates the complete state needed to advance a writer after SyncWrite.
-fn validate_sync_write_response(
-    response: &beryl_proto::metadata::SyncWriteResponseProto,
-    target_size: u64,
-) -> ClientResult<u64> {
-    if response.synced_size != target_size {
-        return Err(side_effect_response_body_mismatch(
-            "SyncWrite",
-            format!(
-                "synced_size {} does not equal target_size {}",
-                response.synced_size, target_size
-            ),
-        ));
-    }
-    response
-        .content_revision
-        .ok_or_else(|| side_effect_response_body_mismatch("SyncWrite", "content_revision missing"))
-}
-
-/// Rejects a successful lease response that cannot identify a live expiry.
-fn valid_write_session_expiry(operation: &'static str, expires_at_ms: u64) -> ClientResult<u64> {
-    if expires_at_ms == 0 {
-        return Err(invalid_response(operation, "expires_at_ms must be non-zero"));
-    }
-    Ok(expires_at_ms)
-}
-
 /// Rejects a positioned read before planning or RPC when its declared result
 /// could exceed the configured owned-buffer limit.
 fn validate_read_request_size(requested_bytes: u32, max_bytes: u32) -> ClientResult<()> {
     if requested_bytes > max_bytes {
-        return Err(ClientError::InvalidArgument(format!(
+        return Err(ClientError::invalid_argument(format!(
             "read request size {requested_bytes} exceeds configured maximum {max_bytes}"
         )));
     }
@@ -602,7 +521,7 @@ fn validate_read_request_size(requested_bytes: u32, max_bytes: u32) -> ClientRes
 /// Rejects a whole-file convenience read before allocation or RPC.
 fn validate_read_all_size(file_size: u64, max_bytes: u64) -> ClientResult<()> {
     if file_size > max_bytes {
-        return Err(ClientError::InvalidArgument(format!(
+        return Err(ClientError::invalid_argument(format!(
             "file size {file_size} exceeds configured read_all maximum {max_bytes}"
         )));
     }

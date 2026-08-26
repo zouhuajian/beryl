@@ -9,17 +9,16 @@ use std::time::Duration;
 
 use crate::config::ClientConfig;
 use crate::error::side_effect_response_body_mismatch;
-use crate::error::{ClientError, ClientResult};
+use crate::error::{ClientError, ClientErrorKind, ClientResult, RefreshHint};
 use crate::metadata::{GrpcMetadataTransport, MetadataClient, MetadataTransport};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
-use crate::rpc_error::{ClientAction, RefreshHint};
 use crate::runtime::{
-    classify_error, is_definite_worker_capacity_rejection, AttemptContext, ClientIdentity, ErrorClass, MetadataTargets,
+    is_definite_worker_capacity_rejection, AttemptContext, ClientIdentity, MetadataTargets, Operation,
     OperationContext, OperationDeadline,
 };
 use crate::session::write_session::{ReadyBlock, WriteSession};
 use crate::worker::{BlockWrite, WorkerClient};
-use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
+use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, WorkerErrorKind};
 use bytes::Bytes;
 
 /// Shared owner for client configuration, Metadata orchestration, Worker IO,
@@ -82,7 +81,7 @@ impl ClientInner {
         session: &mut WriteSession,
         deadline: OperationDeadline,
     ) -> ClientResult<BlockWrite> {
-        let add_block = match self
+        let (add_block_operation, add_block) = match self
             .metadata
             .add_block(
                 session.path(),
@@ -108,12 +107,14 @@ impl ClientInner {
                 ClientMetric::UnknownOutcome,
                 metric_labels("AddBlock", "metadata").with_outcome("unknown"),
             );
-            return Err(side_effect_response_body_mismatch("AddBlock", err));
+            return Err(
+                side_effect_response_body_mismatch("AddBlock", err).with_operation_context(&add_block_operation)
+            );
         }
         let operation = worker_write_context(
             self.metadata.client_id(),
             self.metadata.client_name(),
-            "WriteBlock",
+            Operation::WriteBlock,
             session.path(),
             deadline,
         )?;
@@ -134,18 +135,15 @@ impl ClientInner {
             {
                 Ok(block) => return Ok(block),
                 Err(err) if is_definite_worker_capacity_rejection(&err) => {
-                    let class = ErrorClass::ServerRetry;
                     let has_next = attempt_index + 1 < self.config.retry.max_attempts();
                     if !has_next {
-                        return Err(err);
+                        return Err(err.with_operation_context(&operation));
                     }
                     self.record_metric(
                         ClientMetric::RetryAttempt,
-                        metric_labels("WriteBlock", "worker").with_error_class(class.label()),
+                        metric_labels("WriteBlock", "worker").with_error_class("server_retry"),
                     );
-                    if self.sleep_before_retry(attempt_index, &operation).await.is_err() {
-                        return Err(err);
-                    }
+                    self.sleep_before_retry(attempt_index, &operation).await?;
                 }
                 Err(err) => {
                     mark_session_after_write_error(session, &err);
@@ -169,7 +167,7 @@ impl ClientInner {
         session
             .cursor()
             .checked_add(len as u64)
-            .ok_or_else(|| ClientError::InvalidArgument("write cursor overflow".to_string()))?;
+            .ok_or_else(|| ClientError::invalid_argument("write cursor overflow".to_string()))?;
         match self.worker_write_step_with_timeout(deadline, block.write(data)).await {
             Ok(()) => session.advance_cursor(len),
             Err(err) => {
@@ -251,13 +249,13 @@ impl ClientInner {
         let timeout = operation.deadline().remaining();
         if timeout.is_zero() {
             self.record_worker_timeout(operation.operation_name());
-            return Err(timeout_error("worker", operation.operation_name()));
+            return Err(timeout_error("worker", operation.operation_name()).with_operation_context(operation));
         }
         match tokio::time::timeout(timeout, future).await {
-            Ok(result) => result,
+            Ok(result) => result.map_err(|error| error.with_operation_context(operation)),
             Err(_) => {
                 self.record_worker_timeout(operation.operation_name());
-                Err(timeout_error("worker", operation.operation_name()))
+                Err(timeout_error("worker", operation.operation_name()).with_operation_context(operation))
             }
         }
     }
@@ -292,27 +290,30 @@ impl ClientInner {
         let remaining = operation.deadline().remaining();
         if remaining.is_zero() || delay >= remaining {
             self.record_worker_timeout(operation.operation_name());
-            return Err(timeout_error("worker", operation.operation_name()));
+            return Err(timeout_error("worker", operation.operation_name()).with_operation_context(operation));
         }
         tokio::time::sleep(delay).await;
         Ok(())
     }
 
-    /// Records error-class metrics for client-recognized protocol and session failures.
-    pub(crate) fn record_error_metric(&self, operation: &'static str, target_plane: &'static str, class: &ErrorClass) {
-        let metric = match class {
-            ErrorClass::InvalidHeader => Some(ClientMetric::InvalidHeader),
-            ErrorClass::UnknownOutcome => Some(ClientMetric::UnknownOutcome),
-            ErrorClass::Fencing => Some(ClientMetric::FencingMismatch),
-            ErrorClass::SessionInvalid => Some(ClientMetric::SessionInvalid),
-            ErrorClass::SessionExpired => Some(ClientMetric::SessionExpired),
-            ErrorClass::Unsupported => Some(ClientMetric::UnsupportedOperation),
-            _ => None,
+    /// Records metrics for client-recognized protocol and session failures.
+    pub(crate) fn record_error_metric(&self, operation: &'static str, target_plane: &'static str, error: &ClientError) {
+        let metric = if error.is_outcome_unknown() {
+            Some(ClientMetric::UnknownOutcome)
+        } else {
+            match error.kind() {
+                ClientErrorKind::InvalidResponse => Some(ClientMetric::InvalidHeader),
+                ClientErrorKind::Fenced => Some(ClientMetric::FencingMismatch),
+                ClientErrorKind::SessionInvalid => Some(ClientMetric::SessionInvalid),
+                ClientErrorKind::SessionExpired => Some(ClientMetric::SessionExpired),
+                ClientErrorKind::Unsupported => Some(ClientMetric::UnsupportedOperation),
+                _ => None,
+            }
         };
         if let Some(metric) = metric {
             self.record_metric(
                 metric,
-                metric_labels(operation, target_plane).with_error_class(class.label()),
+                metric_labels(operation, target_plane).with_error_class(error.classification_label()),
             );
         }
     }
@@ -324,17 +325,16 @@ impl ClientInner {
         target_plane: &'static str,
         err: ClientError,
     ) -> ClientError {
-        if matches!(err, ClientError::UnknownOutcome(_)) {
+        if err.is_outcome_unknown() {
             return err;
         }
-        let class = classify_error(&err);
-        self.record_error_metric(operation, target_plane, &class);
+        self.record_error_metric(operation, target_plane, &err);
         let normalized = map_outcome_error(operation, err);
-        if matches!(normalized, ClientError::UnknownOutcome(_)) {
+        if normalized.is_outcome_unknown() {
             self.record_metric(
                 ClientMetric::UnknownOutcome,
                 metric_labels(operation, target_plane)
-                    .with_error_class(classify_error(&normalized).label())
+                    .with_error_class("unknown_outcome")
                     .with_outcome("unknown"),
             );
         }
@@ -345,7 +345,7 @@ impl ClientInner {
         self.record_metric(
             ClientMetric::RpcTimeout,
             metric_labels(operation, "worker")
-                .with_error_class(ErrorClass::RetryableTransport.label())
+                .with_error_class("retryable_transport")
                 .with_outcome("timeout"),
         );
     }
@@ -363,28 +363,30 @@ pub(crate) fn metric_labels(operation: &'static str, target_plane: &'static str)
 
 /// Extracts a structured refresh hint from action errors when one is available.
 pub(crate) fn refresh_hint_from_error(err: &ClientError) -> RefreshHint {
-    match err {
-        ClientError::Action(action) => match action.action() {
-            ClientAction::Refresh { hint, .. } => hint.as_ref().clone(),
-            _ => RefreshHint::default(),
-        },
-        _ => RefreshHint::default(),
-    }
+    err.refresh_hint().cloned().unwrap_or_default()
 }
 
 /// Returns true when a metadata session barrier has an unknown result.
 pub(crate) fn is_unknown_session_barrier_outcome(err: &ClientError) -> bool {
-    matches!(err, ClientError::UnknownOutcome(_)) || matches!(classify_error(err), ErrorClass::RetryableTransport)
+    err.is_outcome_unknown()
 }
 
 /// Marks a write session after a metadata session-level failure.
 pub(crate) fn mark_session_after_metadata_error(session: &mut WriteSession, err: &ClientError) {
-    match classify_error(err) {
-        ErrorClass::SessionExpired => session.mark_session_expired(),
-        ErrorClass::Fencing | ErrorClass::SessionInvalid | ErrorClass::RefreshMetadata(_) => {
-            session.mark_session_invalid()
-        }
+    if err.is_outcome_unknown() {
+        session.mark_unknown_outcome();
+        return;
+    }
+    match err.kind() {
+        ClientErrorKind::SessionExpired => session.mark_session_expired(),
+        ClientErrorKind::Fenced | ClientErrorKind::SessionInvalid => session.mark_session_invalid(),
         _ => {}
+    }
+    if matches!(
+        err.remote_error().map(|error| &error.recovery),
+        Some(RecoveryAction::RefreshMetadata { .. })
+    ) {
+        session.mark_session_invalid();
     }
 }
 
@@ -399,11 +401,11 @@ fn timeout_error(target_plane: &str, operation: &str) -> ClientError {
 fn worker_write_context(
     client_id: beryl_types::ClientId,
     client_name: &str,
-    operation_name: &'static str,
+    operation: Operation,
     path: &str,
     deadline: OperationDeadline,
 ) -> ClientResult<OperationContext> {
-    OperationContext::new_named(client_id, client_name, operation_name, Some(path.to_string()), deadline)
+    OperationContext::new_named(client_id, client_name, operation, Some(path.to_string()), deadline)
 }
 
 /// Converts a durable Worker block into the Metadata committed-block shape.
@@ -429,46 +431,43 @@ fn mark_session_after_write_error(session: &mut WriteSession, err: &ClientError)
 
 /// Returns true when a failure leaves worker write side effects uncertain.
 fn has_uncertain_write_effect(err: &ClientError) -> bool {
-    matches!(err, ClientError::UnknownOutcome(_))
-        || matches!(
-            classify_error(err),
-            ErrorClass::RetryableTransport | ErrorClass::InvalidHeader
-        )
+    err.is_outcome_unknown() || err.is_retryable_transport() || err.is_invalid_success_response()
 }
 
 /// Returns true when the error invalidates or expires the write session.
 fn is_session_or_fencing_error(err: &ClientError) -> bool {
     matches!(
-        classify_error(err),
-        ErrorClass::Fencing | ErrorClass::SessionInvalid | ErrorClass::SessionExpired
+        err.kind(),
+        ClientErrorKind::Fenced | ClientErrorKind::SessionInvalid | ClientErrorKind::SessionExpired
     )
 }
 
 /// Returns true when a write-path metadata refresh cause invalidates the current session.
 fn is_write_refresh_error(err: &ClientError) -> bool {
-    matches!(
-        classify_error(err),
-        ErrorClass::RefreshMetadata(
-            ErrorKind::Metadata(
-                MetadataErrorKind::RouteEpochMismatch
-                    | MetadataErrorKind::OwnerGroupMismatch
-                    | MetadataErrorKind::StaleState
-            ) | ErrorKind::Worker(WorkerErrorKind::RunMismatch | WorkerErrorKind::BlockStampMismatch)
-        )
-    )
+    err.remote_error().is_some_and(|error| {
+        matches!(error.recovery, RecoveryAction::RefreshMetadata { .. })
+            && matches!(
+                error.kind,
+                ErrorKind::Metadata(
+                    MetadataErrorKind::RouteEpochMismatch
+                        | MetadataErrorKind::OwnerGroupMismatch
+                        | MetadataErrorKind::StaleState
+                ) | ErrorKind::Worker(WorkerErrorKind::RunMismatch | WorkerErrorKind::BlockStampMismatch)
+            )
+    })
 }
 
 /// Normalizes uncertain transport and header failures into unknown outcomes.
-fn map_outcome_error(operation: &str, err: ClientError) -> ClientError {
-    match classify_error(&err) {
-        ErrorClass::RetryableTransport => {
-            ClientError::UnknownOutcome(format!("{operation} outcome is unknown after transport failure: {err}"))
-        }
-        ErrorClass::InvalidHeader => ClientError::UnknownOutcome(format!(
-            "{operation} outcome is unknown after malformed OK response: {err}"
-        )),
-        _ => err,
+fn map_outcome_error(operation: &'static str, err: ClientError) -> ClientError {
+    if err.is_retryable_transport() {
+        let message = format!("{operation} outcome is unknown after transport failure: {err}");
+        return err.with_unknown_outcome_name(operation, message);
     }
+    if err.is_invalid_success_response() {
+        let message = format!("{operation} outcome is unknown after malformed OK response: {err}");
+        return err.with_unknown_outcome_name(operation, message);
+    }
+    err
 }
 
 fn fixed_backoff_delay(retry_index: usize) -> Duration {

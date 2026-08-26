@@ -17,7 +17,7 @@ use crate::config::ClientConfig;
 use crate::error::{side_effect_response_body_mismatch, ClientError, ClientResult};
 use crate::metadata::model::{AddBlockResult, MetadataAuthorityUpdate, ReadLayout, ValidatedMetadataResponse};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
-use crate::rpc_error::{invalid_header_action, validate_header_or_action};
+use crate::rpc_error::{invalid_header_error, validate_header};
 use crate::runtime::AttemptContext;
 
 /// Client-owned metadata control-plane adapter.
@@ -168,12 +168,12 @@ impl GrpcMetadataTransport {
         operation: &'static str,
     ) -> ClientResult<FileSystemServiceProtoClient<tonic_net::Channel>> {
         let endpoint = ctx.metadata_endpoint().map(normalize_endpoint).ok_or_else(|| {
-            ClientError::InvalidArgument("metadata AttemptContext missing metadata_endpoint".to_string())
+            ClientError::invalid_argument("metadata AttemptContext missing metadata_endpoint".to_string())
         })?;
         let group_name = ctx
             .group_name()
             .cloned()
-            .ok_or_else(|| ClientError::InvalidArgument("metadata AttemptContext missing group_name".to_string()))?;
+            .ok_or_else(|| ClientError::invalid_argument("metadata AttemptContext missing group_name".to_string()))?;
         let key = MetadataChannelKey { group_name, endpoint };
         if !self.channel_pool_enabled {
             self.record_pool_metric(ClientMetric::MetadataChannelPoolMiss, operation, "miss");
@@ -548,17 +548,14 @@ fn validated_msync_response(
     let mut authority = parse_metadata_response_header(ctx, response.header.as_ref())?;
     let body = response
         .state
-        .ok_or_else(|| ClientError::from(invalid_header_action("metadata Msync response missing state")))?;
-    let watermark = GroupStateWatermark::try_from(body.clone()).map_err(|err| {
-        ClientError::from(invalid_header_action(format!(
-            "metadata Msync response invalid state watermark: {err}"
-        )))
-    })?;
+        .ok_or_else(|| invalid_header_error("metadata Msync response missing state"))?;
+    let watermark = GroupStateWatermark::try_from(body.clone())
+        .map_err(|err| invalid_header_error(format!("metadata Msync response invalid state watermark: {err}")))?;
     if watermark.group_name != authority.group_name {
-        return Err(ClientError::from(invalid_header_action(format!(
+        return Err(invalid_header_error(format!(
             "metadata Msync response state group_name mismatch: expected {}, got {}",
             authority.group_name, watermark.group_name
-        ))));
+        )));
     }
     authority.state.push(watermark);
     Ok(ValidatedMetadataResponse::new(authority, body))
@@ -571,58 +568,46 @@ fn parse_metadata_response_header(
     header: Option<&beryl_proto::common::ResponseHeaderProto>,
 ) -> ClientResult<MetadataAuthorityUpdate> {
     let Some(header) = header else {
-        return Err(ClientError::from(invalid_header_action(
-            "metadata OK response missing ResponseHeader",
-        )));
+        return Err(invalid_header_error("metadata OK response missing ResponseHeader"));
     };
     let client = header
         .client
         .clone()
-        .ok_or_else(|| ClientError::from(invalid_header_action("metadata response missing client identity")))?
+        .ok_or_else(|| invalid_header_error("metadata response missing client identity"))?
         .try_into()
-        .map_err(|err| {
-            ClientError::from(invalid_header_action(format!(
-                "metadata response invalid client identity: {err}"
-            )))
-        })?;
+        .map_err(|err| invalid_header_error(format!("metadata response invalid client identity: {err}")))?;
     validate_metadata_response_client(ctx, &client)?;
-    let header = ResponseHeader::try_from(header.clone()).map_err(|err| {
-        ClientError::from(invalid_header_action(format!(
-            "metadata OK response invalid ResponseHeader: {err}"
-        )))
-    })?;
+    let header = ResponseHeader::try_from(header.clone())
+        .map_err(|err| invalid_header_error(format!("metadata OK response invalid ResponseHeader: {err}")))?;
 
     if header.rpc_error.is_some() {
         validate_metadata_error_scope(&header)?;
-        return match validate_header_or_action(&header) {
-            Err(action) => Err(ClientError::from(action)),
-            Ok(()) => Err(ClientError::from(invalid_header_action(
+        return match validate_header(&header) {
+            Err(error) => Err(error),
+            Ok(()) => Err(invalid_header_error(
                 "metadata response declared rpc_error without a recovery action",
-            ))),
+            )),
         };
     }
 
-    let group_name = header.group_name.clone().ok_or_else(|| {
-        ClientError::from(invalid_header_action(
-            "metadata OK response invalid ResponseHeader: group_name missing",
-        ))
-    })?;
-    let request_group_name = ctx.group_name().ok_or_else(|| {
-        ClientError::from(invalid_header_action(
-            "metadata attempt missing group_name during response validation",
-        ))
-    })?;
+    let group_name = header
+        .group_name
+        .clone()
+        .ok_or_else(|| invalid_header_error("metadata OK response invalid ResponseHeader: group_name missing"))?;
+    let request_group_name = ctx
+        .group_name()
+        .ok_or_else(|| invalid_header_error("metadata attempt missing group_name during response validation"))?;
     if &group_name != request_group_name {
-        return Err(ClientError::from(invalid_header_action(format!(
+        return Err(invalid_header_error(format!(
             "metadata OK response invalid ResponseHeader: group_name mismatch: expected {}, got {}",
             request_group_name, group_name
-        ))));
+        )));
     }
     if let Some(watermark) = header.state.iter().find(|watermark| watermark.group_name != group_name) {
-        return Err(ClientError::from(invalid_header_action(format!(
+        return Err(invalid_header_error(format!(
             "metadata OK response invalid ResponseHeader: state group_name mismatch: expected {}, got {}",
             group_name, watermark.group_name
-        ))));
+        )));
     }
 
     Ok(MetadataAuthorityUpdate {
@@ -638,15 +623,15 @@ fn parse_metadata_response_header(
 fn validate_metadata_response_client(ctx: &AttemptContext, client: &ClientInfo) -> ClientResult<()> {
     let request_identity = ctx.header_identity();
     if client.client_id != request_identity.client_id {
-        return Err(ClientError::from(invalid_header_action(format!(
+        return Err(invalid_header_error(format!(
             "metadata OK response invalid ResponseHeader: client_id mismatch: expected {}, got {}",
             request_identity.client_id, client.client_id
-        ))));
+        )));
     }
     if client.call_id != request_identity.call_id {
-        return Err(ClientError::from(invalid_header_action(
+        return Err(invalid_header_error(
             "metadata OK response invalid ResponseHeader: call_id mismatch",
-        )));
+        ));
     }
     Ok(())
 }
@@ -671,17 +656,14 @@ fn validate_metadata_error_scope(header: &ResponseHeader) -> ClientResult<()> {
     else {
         return Ok(());
     };
-    let hinted_group = GroupName::parse(raw_group_name).map_err(|err| {
-        ClientError::from(invalid_header_action(format!(
-            "metadata error response invalid recovery group_name: {err}"
-        )))
-    })?;
+    let hinted_group = GroupName::parse(raw_group_name)
+        .map_err(|err| invalid_header_error(format!("metadata error response invalid recovery group_name: {err}")))?;
     if let Some(header_group) = header.group_name.as_ref() {
         if header_group != &hinted_group {
-            return Err(ClientError::from(invalid_header_action(format!(
+            return Err(invalid_header_error(format!(
                 "metadata error response group_name conflicts with recovery hint: header={}, hint={}",
                 header_group, hinted_group
-            ))));
+            )));
         }
     }
     Ok(())
@@ -697,7 +679,7 @@ fn normalize_endpoint(endpoint: &str) -> String {
 
 fn lazy_channel(endpoint: &str) -> ClientResult<tonic_net::Channel> {
     tonic_net::Endpoint::from_shared(endpoint.to_string())
-        .map_err(|err| ClientError::Metadata(format!("invalid metadata endpoint {endpoint}: {err}")))
+        .map_err(|err| ClientError::metadata(format!("invalid metadata endpoint {endpoint}: {err}")))
         .map(|endpoint| endpoint.connect_lazy())
 }
 
@@ -712,7 +694,8 @@ fn tonic_request<T>(ctx: &AttemptContext, message: T) -> tonic::Request<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{classify_error, ErrorClass, OperationContext, OperationDeadline};
+    use crate::error::ClientErrorKind;
+    use crate::runtime::{retry_decision, Operation, OperationContext, OperationDeadline, RetryDecision, RetrySafety};
     use beryl_common::error::rpc::{ErrorKind, InternalErrorKind, MetadataErrorKind, RpcErrorDetail};
     use beryl_types::{CallId, ClientId};
     use std::sync::Mutex;
@@ -794,7 +777,7 @@ mod tests {
 
         for header in [missing_group, wrong_group, wrong_state_group] {
             let error = parse_metadata_response_header(&ctx, Some(&header)).expect_err("invalid authority group");
-            assert_eq!(classify_error(&error), ErrorClass::InvalidHeader);
+            assert_eq!(error.kind(), ClientErrorKind::InvalidResponse);
         }
 
         for state in [
@@ -812,7 +795,7 @@ mod tests {
                 },
             )
             .expect_err("invalid Msync authority");
-            assert_eq!(classify_error(&error), ErrorClass::InvalidHeader);
+            assert_eq!(error.kind(), ClientErrorKind::InvalidResponse);
         }
     }
 
@@ -828,7 +811,7 @@ mod tests {
             ),
         );
         let error = parse_metadata_response_header(&ctx, Some(&header)).expect_err("structured retry");
-        assert_eq!(classify_error(&error), ErrorClass::ServerRetry);
+        assert_eq!(retry_decision(&error, RetrySafety::ReadOnly), RetryDecision::Retry);
 
         let not_leader = error_header_without_group(
             &ctx,
@@ -844,8 +827,8 @@ mod tests {
         );
         let error = parse_metadata_response_header(&ctx, Some(&not_leader)).expect_err("structured refresh");
         assert_eq!(
-            classify_error(&error),
-            ErrorClass::RefreshMetadata(ErrorKind::Metadata(MetadataErrorKind::NotLeader))
+            retry_decision(&error, RetrySafety::ReadOnly),
+            RetryDecision::RefreshMetadata(ErrorKind::Metadata(MetadataErrorKind::NotLeader))
         );
 
         let mut wrong_call = header.clone();
@@ -854,7 +837,7 @@ mod tests {
         wrong_client.client.as_mut().expect("client").client_id = Some(ClientId::new(8).into());
         for header in [wrong_call, wrong_client] {
             let error = parse_metadata_response_header(&ctx, Some(&header)).expect_err("identity mismatch");
-            assert_eq!(classify_error(&error), ErrorClass::InvalidHeader);
+            assert_eq!(error.kind(), ClientErrorKind::InvalidResponse);
         }
     }
 
@@ -862,7 +845,7 @@ mod tests {
         let operation = OperationContext::new_named(
             ClientId::new(7),
             "test-client",
-            "GetStatus",
+            Operation::GetStatus,
             Some("/alpha".to_string()),
             OperationDeadline::new(5_000),
         )

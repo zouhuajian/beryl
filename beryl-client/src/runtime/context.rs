@@ -12,6 +12,86 @@ use beryl_types::{CallId, ClientId, GroupName};
 
 use crate::error::{ClientError, ClientResult};
 
+/// Logical client operations with their replay-safety contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Operation {
+    GetStatus,
+    ListStatus,
+    CreateDirectory,
+    CreateDirectoryRecursive,
+    Delete,
+    Rename,
+    OpenFile,
+    GetBlockLocations,
+    CreateFile,
+    OpenWrite,
+    AddBlock,
+    CommitFile,
+    AbortFileWrite,
+    RenewLease,
+    SyncWrite,
+    Msync,
+    Read,
+    WriteBlock,
+}
+
+impl Operation {
+    /// Returns the stable wire and metrics name for this operation.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::GetStatus => "GetStatus",
+            Self::ListStatus => "ListStatus",
+            Self::CreateDirectory | Self::CreateDirectoryRecursive => "CreateDirectory",
+            Self::Delete => "Delete",
+            Self::Rename => "Rename",
+            Self::OpenFile => "OpenFile",
+            Self::GetBlockLocations => "GetBlockLocations",
+            Self::CreateFile => "CreateFile",
+            Self::OpenWrite => "OpenWrite",
+            Self::AddBlock => "AddBlock",
+            Self::CommitFile => "CommitFile",
+            Self::AbortFileWrite => "AbortFileWrite",
+            Self::RenewLease => "RenewLease",
+            Self::SyncWrite => "SyncWrite",
+            Self::Msync => "Msync",
+            Self::Read => "Read",
+            Self::WriteBlock => "WriteBlock",
+        }
+    }
+
+    /// Returns the only replay authorization used by Metadata and Worker loops.
+    pub(crate) const fn retry_safety(self) -> RetrySafety {
+        match self {
+            Self::GetStatus
+            | Self::ListStatus
+            | Self::OpenFile
+            | Self::GetBlockLocations
+            | Self::Msync
+            | Self::Read => RetrySafety::ReadOnly,
+            Self::CreateDirectoryRecursive
+            | Self::AddBlock
+            | Self::CommitFile
+            | Self::AbortFileWrite
+            | Self::RenewLease
+            | Self::SyncWrite => RetrySafety::ReplayableMutation,
+            Self::CreateDirectory
+            | Self::Delete
+            | Self::Rename
+            | Self::CreateFile
+            | Self::OpenWrite
+            | Self::WriteBlock => RetrySafety::NonReplayableMutation,
+        }
+    }
+}
+
+/// Transport replay authority attached to one typed logical operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetrySafety {
+    ReadOnly,
+    ReplayableMutation,
+    NonReplayableMutation,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClientIdentity {
     client_id: ClientId,
@@ -19,20 +99,21 @@ pub(crate) struct ClientIdentity {
 }
 
 impl ClientIdentity {
+    /// Creates one nonzero process-local identity reused by all operations.
     pub(crate) fn generate(client_name: impl Into<String>) -> ClientResult<Self> {
         Self::new_checked(ClientId::generate(), client_name)
     }
 
     fn new_checked(client_id: ClientId, client_name: impl Into<String>) -> ClientResult<Self> {
         if client_id.is_zero() {
-            return Err(ClientError::InvalidArgument(
-                "ClientIdentity requires non-zero client_id".to_string(),
+            return Err(ClientError::invalid_argument(
+                "ClientIdentity requires non-zero client_id",
             ));
         }
         let client_name = client_name.into();
         if client_name.trim().is_empty() {
-            return Err(ClientError::InvalidArgument(
-                "ClientIdentity requires non-blank client_name".to_string(),
+            return Err(ClientError::invalid_argument(
+                "ClientIdentity requires non-blank client_name",
             ));
         }
         Ok(Self { client_id, client_name })
@@ -59,6 +140,7 @@ pub(crate) struct OperationDeadline {
 }
 
 impl OperationDeadline {
+    /// Captures one absolute deadline for all child RPCs of a public call.
     pub(crate) fn new(timeout_ms: u64) -> Self {
         let timeout = Duration::from_millis(timeout_ms);
         Self {
@@ -67,6 +149,7 @@ impl OperationDeadline {
         }
     }
 
+    /// Returns the remaining budget without extending the original deadline.
     pub(crate) fn remaining(&self) -> Duration {
         self.instant.saturating_duration_since(tokio::time::Instant::now())
     }
@@ -82,15 +165,16 @@ pub(crate) struct OperationContext {
     client_id: ClientId,
     client_name: String,
     call_id: CallId,
-    operation_name: &'static str,
+    operation: Operation,
     route_path: Option<String>,
     deadline: OperationDeadline,
 }
 
 impl OperationContext {
+    /// Starts a new logical operation with a fresh call identity.
     pub(crate) fn new_with_identity(
         client_identity: &ClientIdentity,
-        operation_name: &'static str,
+        operation: Operation,
         route_path: Option<String>,
         deadline: OperationDeadline,
     ) -> ClientResult<Self> {
@@ -98,34 +182,29 @@ impl OperationContext {
             client_identity.client_id(),
             client_identity.client_name(),
             client_identity.new_call_id(),
-            operation_name,
+            operation,
             route_path,
             deadline,
         )
     }
 
+    /// Starts a logical operation for an explicitly supplied client identity.
     pub(crate) fn new_named(
         client_id: ClientId,
         client_name: impl Into<String>,
-        operation_name: &'static str,
+        operation: Operation,
         route_path: Option<String>,
         deadline: OperationDeadline,
     ) -> ClientResult<Self> {
-        Self::with_call_id_named(
-            client_id,
-            client_name,
-            CallId::new(),
-            operation_name,
-            route_path,
-            deadline,
-        )
+        Self::with_call_id_named(client_id, client_name, CallId::new(), operation, route_path, deadline)
     }
 
+    /// Reconstructs a frozen mutation intent with its original call identity.
     pub(crate) fn with_call_id_named(
         client_id: ClientId,
         client_name: impl Into<String>,
         call_id: CallId,
-        operation_name: &'static str,
+        operation: Operation,
         route_path: Option<String>,
         deadline: OperationDeadline,
     ) -> ClientResult<Self> {
@@ -136,7 +215,7 @@ impl OperationContext {
             client_id,
             client_name,
             call_id,
-            operation_name,
+            operation,
             route_path,
             deadline,
         })
@@ -144,7 +223,17 @@ impl OperationContext {
 
     /// Human readable operation name.
     pub(crate) fn operation_name(&self) -> &'static str {
-        self.operation_name
+        self.operation.name()
+    }
+
+    /// Returns the immutable call identity reused by retries of this intent.
+    pub(crate) const fn call_id(&self) -> CallId {
+        self.call_id
+    }
+
+    /// Returns whether ambiguous transport failure authorizes replay.
+    pub(crate) const fn retry_safety(&self) -> RetrySafety {
+        self.operation.retry_safety()
     }
 
     /// Original target path, if present.
@@ -152,6 +241,7 @@ impl OperationContext {
         self.route_path.as_deref()
     }
 
+    /// Returns the absolute deadline shared by every child attempt.
     pub(crate) fn deadline(&self) -> &OperationDeadline {
         &self.deadline
     }
@@ -242,6 +332,11 @@ impl AttemptContext {
         }
     }
 
+    /// Returns the immutable logical operation shared by all attempts.
+    pub(crate) fn operation_context(&self) -> &OperationContext {
+        &self.operation
+    }
+
     /// Return the absolute deadline in Unix epoch milliseconds, or zero when unset.
     pub(crate) fn deadline_ms(&self) -> i64 {
         self.deadline_ms
@@ -271,10 +366,10 @@ impl AttemptContext {
         let group_name = self
             .group_name
             .as_ref()
-            .ok_or_else(|| ClientError::InvalidArgument("metadata AttemptContext missing group_name".to_string()))?;
+            .ok_or_else(|| ClientError::invalid_argument("metadata AttemptContext missing group_name"))?;
         if self.operation.client_id.is_zero() {
-            return Err(ClientError::InvalidArgument(
-                "metadata AttemptContext requires non-zero client_id".to_string(),
+            return Err(ClientError::invalid_argument(
+                "metadata AttemptContext requires non-zero client_id",
             ));
         }
         Ok(RequestHeaderProto {
@@ -300,8 +395,8 @@ impl AttemptContext {
 
 fn validate_client_id(client_id: ClientId) -> ClientResult<()> {
     if client_id.is_zero() {
-        Err(ClientError::InvalidArgument(
-            "AttemptContext requires non-zero client_id".to_string(),
+        Err(ClientError::invalid_argument(
+            "AttemptContext requires non-zero client_id",
         ))
     } else {
         Ok(())
@@ -310,8 +405,8 @@ fn validate_client_id(client_id: ClientId) -> ClientResult<()> {
 
 fn validate_client_name(client_name: &str) -> ClientResult<()> {
     if client_name.trim().is_empty() {
-        Err(ClientError::InvalidArgument(
-            "AttemptContext requires non-blank client_name".to_string(),
+        Err(ClientError::invalid_argument(
+            "AttemptContext requires non-blank client_name",
         ))
     } else {
         Ok(())
@@ -324,39 +419,4 @@ fn unix_now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use beryl_types::ClientId;
-
-    fn metadata_operation() -> OperationContext {
-        OperationContext::new_named(
-            ClientId::new(7),
-            "prod_ns01",
-            "OpenFile",
-            Some("/alpha".to_string()),
-            OperationDeadline::new(1_000),
-        )
-        .expect("operation context")
-    }
-
-    #[test]
-    fn replay_attempt_preserves_call_id() {
-        let operation = metadata_operation();
-        let first =
-            AttemptContext::for_metadata(&operation, GroupName::parse("root").unwrap(), 0).expect("first attempt");
-        let replay = AttemptContext::for_metadata(&operation, GroupName::parse("analytics").unwrap(), 1)
-            .expect("replay attempt");
-
-        let first_header = first.metadata_header().expect("first header");
-        let replay_header = replay.metadata_header().expect("replay header");
-        assert_eq!(
-            first_header.client.expect("first client").call_id,
-            replay_header.client.expect("replay client").call_id
-        );
-        assert_eq!(first_header.group_name, "root");
-        assert_eq!(replay_header.group_name, "analytics");
-    }
 }

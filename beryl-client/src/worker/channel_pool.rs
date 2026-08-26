@@ -16,8 +16,7 @@ use crate::cache::CacheInvalidationReason;
 use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
-use crate::runtime::{classify_error, ErrorClass};
-use beryl_common::error::rpc::{ErrorKind, WorkerErrorKind};
+use beryl_common::error::rpc::{ErrorKind, RecoveryAction, WorkerErrorKind};
 
 const WORKER_ENDPOINT_COOLDOWN_CACHE_LIMIT: usize = 1_024;
 
@@ -101,7 +100,7 @@ impl GrpcWorkerChannelPool {
     ) -> ClientResult<WorkerDataServiceClient<tonic_net::Channel>> {
         let key = Self::channel_key(worker)?;
         if self.is_key_cooling_down(&key) {
-            return Err(ClientError::Worker("worker endpoint is cooling down".to_string()));
+            return Err(ClientError::worker("worker endpoint is cooling down".to_string()));
         }
         if !self.enabled {
             self.record_pool_metric(ClientMetric::WorkerChannelPoolMiss, operation, "miss");
@@ -203,7 +202,7 @@ struct WorkerChannelKey {
 
 fn normalize_endpoint(endpoint: &str) -> ClientResult<String> {
     if endpoint.is_empty() {
-        return Err(ClientError::InvalidArgument(
+        return Err(ClientError::invalid_argument(
             "worker endpoint must not be empty".to_string(),
         ));
     }
@@ -216,7 +215,7 @@ fn normalize_endpoint(endpoint: &str) -> ClientResult<String> {
 
 fn build_lazy_worker_channel(endpoint: &str) -> ClientResult<tonic_net::Channel> {
     tonic_net::Endpoint::from_shared(endpoint.to_string())
-        .map_err(|err| ClientError::Worker(format!("invalid worker endpoint {endpoint}: {err}")))
+        .map_err(|err| ClientError::worker(format!("invalid worker endpoint {endpoint}: {err}")))
         .map(|endpoint| endpoint.connect_lazy())
 }
 
@@ -258,11 +257,13 @@ fn evict_worker_cooldown_if_needed(cooldowns: &mut HashMap<WorkerChannelKey, Ins
 }
 
 fn worker_run_mismatch_invalidation_reason(err: &ClientError) -> Option<CacheInvalidationReason> {
-    match classify_error(err) {
-        ErrorClass::RefreshMetadata(ErrorKind::Worker(WorkerErrorKind::RunMismatch)) => {
-            Some(CacheInvalidationReason::WorkerRun)
-        }
-        _ => None,
+    if err.remote_error().is_some_and(|error| {
+        matches!(error.recovery, RecoveryAction::RefreshMetadata { .. })
+            && error.kind == ErrorKind::Worker(WorkerErrorKind::RunMismatch)
+    }) {
+        Some(CacheInvalidationReason::WorkerRun)
+    } else {
+        None
     }
 }
 
@@ -275,7 +276,7 @@ mod tests {
     use beryl_types::{ClientId, WorkerEndpointInfo, WorkerId};
     use std::sync::Mutex;
 
-    use crate::runtime::{AttemptContext, OperationContext, OperationDeadline};
+    use crate::runtime::{AttemptContext, Operation, OperationContext, OperationDeadline};
     use crate::worker::protocol::parse_worker_control_header;
 
     #[derive(Debug, Default)]
@@ -383,7 +384,7 @@ mod tests {
         let operation = OperationContext::new_named(
             ClientId::new(7),
             "test-client",
-            "ReadBlock",
+            Operation::Read,
             Some("/alpha".to_string()),
             OperationDeadline::new(1_000),
         )
