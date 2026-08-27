@@ -7,7 +7,7 @@ use super::command::unexpected_raft_apply_success;
 use super::{missing_resolved_target_error, validate_active_write_layout};
 use super::{
     worker_endpoint_from_parts, AdmissionFailure, Freshness, FsResult, MetadataFileSystem, PresentedWriteHandle,
-    RequestContext,
+    RequestContext, SUPPORTED_REPLICA_COUNT,
 };
 use crate::error::MetadataError;
 use crate::observe;
@@ -220,28 +220,52 @@ impl MetadataFileSystem {
         lease_epoch: u64,
         freshness: Freshness,
     ) -> FsResult<()> {
-        let session = match self.session_registry.get_session_identity(inode_id) {
-            Some(session) => session,
-            None => return self.success((), None, None),
+        let mount_id = match self.session_registry.get_session_identity(inode_id) {
+            Some(session) => {
+                if session.open_client_id != ctx.caller.client.client_id {
+                    return self.session_terminal_failure(
+                        ctx,
+                        ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                        format!("AbortFileWrite client does not own inode_id={inode_id}"),
+                        None,
+                        None,
+                    );
+                }
+                if lease_epoch != session.lease_epoch {
+                    return self.session_terminal_failure(
+                        ctx,
+                        ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                        format!(
+                            "write handle epoch mismatch for inode_id={inode_id}: expected {}, got {lease_epoch}",
+                            session.lease_epoch
+                        ),
+                        None,
+                        None,
+                    );
+                }
+                session.mount_id
+            }
+            None => {
+                // A restarted leader can authenticate the initial CreateFile owner
+                // from its durable replay record even though local session state is gone.
+                let replay = match self.storage.get_create_file_replay_for_inode(inode_id) {
+                    Ok(Some(replay))
+                        if replay.operation_id.client_id == ctx.caller.client.client_id
+                            && replay.lease_epoch == lease_epoch =>
+                    {
+                        replay
+                    }
+                    Ok(Some(_)) | Ok(None) => return self.success((), None, None),
+                    Err(error) => return self.failure_from_error(ctx, error, None, None),
+                };
+                replay.mount_id
+            }
         };
-        if session.open_client_id != ctx.caller.client.client_id {
-            return self.session_terminal_failure(
-                ctx,
-                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
-                format!("AbortFileWrite client does not own inode_id={inode_id}"),
-                None,
-                None,
-            );
-        }
 
-        let (group_name, mount_epoch) =
-            match self
-                .freshness_validator
-                .validate_mount_epoch(ctx, freshness, session.mount_id)
-            {
-                Ok(hints) => hints,
-                Err(err) => return Err(err),
-            };
+        let (group_name, mount_epoch) = match self.freshness_validator.validate_mount_epoch(ctx, freshness, mount_id) {
+            Ok(hints) => hints,
+            Err(err) => return Err(err),
+        };
         let route_epoch = match self
             .freshness_validator
             .validate_route_epoch(ctx, freshness, group_name.clone(), mount_epoch, "AbortFileWrite")
@@ -250,19 +274,6 @@ impl MetadataFileSystem {
             Ok(route_epoch) => route_epoch,
             Err(err) => return Err(err),
         };
-
-        if lease_epoch != session.lease_epoch {
-            return self.session_terminal_failure(
-                ctx,
-                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
-                format!(
-                    "write handle epoch mismatch for inode_id={inode_id}: expected {}, got {}",
-                    session.lease_epoch, lease_epoch
-                ),
-                group_name,
-                mount_epoch,
-            );
-        }
 
         let expected_inode_id = inode_id;
         let expected_ended_epoch = lease_epoch.checked_add(1);
@@ -382,6 +393,7 @@ impl MetadataFileSystem {
     pub(super) async fn open_write_inode(
         &self,
         ctx: &RequestContext,
+        normalized_path: String,
         inode_id: InodeId,
         ancestor_inode_ids: Vec<InodeId>,
         mode: WriteMode,
@@ -475,6 +487,7 @@ impl MetadataFileSystem {
         };
 
         let opening = match self.session_registry.begin_session(BeginSessionInput {
+            normalized_path,
             inode_id,
             mount_id: inode.mount_id,
             current_lease_epoch,
@@ -727,6 +740,17 @@ impl MetadataFileSystem {
         let file_offset = reservation.file_offset();
         let block_stamp = reservation.block_stamp();
         let open_client_id = reservation.open_client_id();
+        let storage_chunk_size = match layout.block_format_id.spec() {
+            Ok(spec) => spec.storage_chunk_size,
+            Err(error) => {
+                return self.failure_from_error(
+                    ctx,
+                    MetadataError::Internal(format!("active write layout has an unknown block format: {error}")),
+                    group_name,
+                    mount_epoch,
+                )
+            }
+        };
         let block_id = match self.propose_block_allocation(inode_id, lease_epoch).await {
             Ok(block_id) => block_id,
             Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
@@ -759,7 +783,7 @@ impl MetadataFileSystem {
                 .map(CallerContextFields::from_caller_context),
             existing: Vec::new(),
             exclude_workers: Vec::new(),
-            target_replicas: layout.replication,
+            target_replicas: SUPPORTED_REPLICA_COUNT,
         };
         let placement = PlacementPlanner.plan(&placement_request, &placement_views);
         if placement.status != PlacementStatus::Ok {
@@ -815,7 +839,7 @@ impl MetadataFileSystem {
                 epoch: lease_epoch,
             },
             block_stamp,
-            chunk_size: layout.chunk_size,
+            chunk_size: storage_chunk_size,
             block_format_id: layout.block_format_id,
             tier,
         };
@@ -928,6 +952,7 @@ impl MetadataFileSystem {
         let opened = self
             .open_write_inode(
                 ctx,
+                open_path.clone(),
                 inode_id,
                 resolved.ancestor_inode_ids.clone(),
                 args.mode,
@@ -1000,7 +1025,7 @@ mod tests {
             storage
                 .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id))
                 .unwrap();
-            storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+            storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();
         }
 
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name("g6"));
@@ -1018,6 +1043,7 @@ mod tests {
         filesystem
             .open_write_inode(
                 &request_context_for(first_client),
+                "/first".to_string(),
                 first_inode_id,
                 vec![first_inode_id],
                 WriteMode::Write,
@@ -1031,6 +1057,7 @@ mod tests {
         let per_client_rejection = filesystem
             .open_write_inode(
                 &request_context_for(first_client),
+                "/second".to_string(),
                 second_inode_id,
                 vec![second_inode_id],
                 WriteMode::Write,
@@ -1051,6 +1078,7 @@ mod tests {
         filesystem
             .open_write_inode(
                 &request_context_for(other_client),
+                "/second".to_string(),
                 second_inode_id,
                 vec![second_inode_id],
                 WriteMode::Write,
@@ -1064,6 +1092,7 @@ mod tests {
         let global_rejection = filesystem
             .open_write_inode(
                 &request_context_for(ClientId::new(9)),
+                "/third".to_string(),
                 third_inode_id,
                 vec![third_inode_id],
                 WriteMode::Write,
@@ -1110,13 +1139,14 @@ mod tests {
         storage.put_dentry(ROOT_INODE_ID, "old", old_parent_inode_id).unwrap();
         storage.put_dentry(ROOT_INODE_ID, "new", new_parent_inode_id).unwrap();
         storage.put_dentry(old_parent_inode_id, "file", file_inode_id).unwrap();
-        storage.put_layout(file_inode_id, FileLayout::new(64, 64, 1)).unwrap();
+        storage.put_layout(file_inode_id, FileLayout::new(64)).unwrap();
 
         let open_path = "/old/file";
         let resolved = filesystem.path_resolver.resolve_path(open_path).unwrap();
         let opened = filesystem
             .open_write_inode(
                 &request_context(),
+                open_path.to_string(),
                 file_inode_id,
                 resolved.ancestor_inode_ids.clone(),
                 WriteMode::Write,
@@ -1165,7 +1195,7 @@ mod tests {
         storage
             .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id))
             .unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();
 
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
         let mount_table = builder.mount_table();
@@ -1179,6 +1209,7 @@ mod tests {
         let success = filesystem
             .open_write_inode(
                 &request_context(),
+                "/file".to_string(),
                 inode_id,
                 vec![inode_id],
                 crate::session_registry::WriteMode::Write,
@@ -1205,6 +1236,7 @@ mod tests {
         let duplicate = filesystem
             .open_write_inode(
                 &request_context(),
+                "/file".to_string(),
                 inode_id,
                 vec![inode_id],
                 crate::session_registry::WriteMode::Write,
@@ -1233,7 +1265,7 @@ mod tests {
         storage
             .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id))
             .unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();
 
         let worker_manager = Arc::new(WorkerManager::new(60_000));
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
@@ -1247,6 +1279,7 @@ mod tests {
         let opened = filesystem
             .open_write_inode(
                 &request_context(),
+                "/file".to_string(),
                 inode_id,
                 vec![inode_id],
                 crate::session_registry::WriteMode::Write,
@@ -1307,6 +1340,7 @@ mod tests {
             .filesystem
             .open_write_inode(
                 &request_context(),
+                "/file".to_string(),
                 env.inode_id,
                 vec![env.inode_id],
                 crate::session_registry::WriteMode::Write,

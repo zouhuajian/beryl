@@ -46,7 +46,10 @@ use beryl_worker::store::dirs::StoreDirs;
 use beryl_worker::WorkerCore;
 
 const BLOCK_SIZE: u64 = 4096;
-const CHUNK_SIZE: u32 = 1024;
+
+fn chunk_size() -> u32 {
+    BlockFormatId::FULL_EFFECTIVE.spec().unwrap().storage_chunk_size
+}
 
 fn block_id() -> BlockId {
     BlockId::new(InodeId::new(7), BlockIndex::new(3))
@@ -357,7 +360,7 @@ fn publish_ready_block_for(
             block_id,
             block_size: BLOCK_SIZE,
             block_format_id: BlockFormatId::FULL_EFFECTIVE,
-            chunk_size: CHUNK_SIZE,
+            chunk_size: chunk_size(),
             checksum_kind: ChecksumKind::None,
             tier: Tier::Hdd,
         })
@@ -726,7 +729,7 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_remove() {
             block_stamp: 101,
             block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
             block_size: BLOCK_SIZE,
-            chunk_size: CHUNK_SIZE,
+            chunk_size: chunk_size(),
             effective_len: BLOCK_SIZE,
             frame_size: 1024,
         }))

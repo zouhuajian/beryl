@@ -726,7 +726,10 @@ mod tests {
             block_stamp: 77,
             block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
             block_size: 4096,
-            chunk_size: 4096,
+            chunk_size: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE
+                .spec()
+                .unwrap()
+                .storage_chunk_size,
             effective_len: 4,
             workers,
         }
@@ -743,7 +746,10 @@ mod tests {
                 worker_endpoints: workers,
                 fencing_token: FencingToken::new(block_id, ClientId::new(7), 1),
                 block_stamp: 77,
-                chunk_size: 4096,
+                chunk_size: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE
+                    .spec()
+                    .unwrap()
+                    .storage_chunk_size,
                 block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
                 tier: beryl_types::Tier::Mem,
             },

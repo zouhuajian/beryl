@@ -654,6 +654,8 @@ async fn build_filesystem_service_with_sessions(
     session_registry: Arc<crate::session_registry::SessionRegistry>,
     readiness: &Readiness,
 ) -> Result<MetadataFileSystemServiceImpl, DynError> {
+    // Revalidate public mutable configuration at the runtime construction boundary.
+    let file_create_layout = config.file_layout_defaults.layout()?;
     let filesystem = Arc::new(MetadataFileSystem::new(MetadataFileSystemDeps {
         state_store: Arc::clone(&authority.state_store),
         mount_table: Arc::clone(&authority.mount_table),
@@ -663,6 +665,7 @@ async fn build_filesystem_service_with_sessions(
         worker_manager: Some(worker_manager),
         metrics: Some(Arc::clone(&authority.metadata_metrics)),
         readiness_gate: Some(readiness.gate()),
+        file_create_layout,
     }));
     let msync = Some(MsyncHandler::new(
         Arc::clone(&authority.raft_node),
@@ -785,6 +788,7 @@ mod tests {
             worker_manager: None,
             metrics: None,
             readiness_gate: None,
+            file_create_layout: crate::config::FileLayoutDefaults::default().layout().unwrap(),
         }));
         let msync = Some(MsyncHandler::new(raft_node, group_name));
         MetadataFileSystemServiceImpl::new(filesystem, msync, crate::config::NamespaceListConfig::default())
@@ -820,6 +824,7 @@ mod tests {
             rpc_concurrency: Default::default(),
             write_session_limits: Default::default(),
             write_target_limits: Default::default(),
+            file_layout_defaults: Default::default(),
             http_port: 18081,
             storage_dir: std::path::PathBuf::from("data/metadata"),
             raft: RaftConfig::default(),

@@ -184,34 +184,63 @@ impl AppRaftStateMachine {
         Ok(result)
     }
 
-    /// Apply Create command.
+    /// Create a file, its initial write lease, and its replay record in one commit.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn apply_create(
         &self,
-        parent_inode_id: InodeId,
-        name: String,
+        operation_id: CreateFileOperationId,
+        request_deadline_ms: u64,
+        session_expires_at_ms: u64,
+        normalized_path: String,
+        mount_id: MountId,
+        expected_mount_epoch: u64,
+        mount_root_inode_id: InodeId,
+        relative_components: Vec<String>,
         mut attrs: FileAttrs,
         layout: FileLayout,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<InodeId> {
+    ) -> MetadataResult<CreateFileReplayRecord> {
+        if let Some(record) = self.storage.get_create_file_replay(operation_id)? {
+            if record.request_deadline_ms != request_deadline_ms
+                || record.normalized_path != normalized_path
+                || record.mount_id != mount_id
+                || record.expected_mount_epoch != expected_mount_epoch
+                || record.mount_root_inode_id != mount_root_inode_id
+                || record.relative_components != relative_components
+            {
+                return Err(MetadataError::InvalidArgument(
+                    "CreateFile operation identity was reused with a different request".to_string(),
+                ));
+            }
+            self.validate_create_file_replay(&record, proposed_at_ms)?;
+            self.storage.commit_applied_state(raft_state)?;
+            return Ok(record);
+        }
+        if request_deadline_ms < proposed_at_ms {
+            return Err(MetadataError::InvalidArgument(
+                "CreateFile request deadline expired before proposal".to_string(),
+            ));
+        }
+        if session_expires_at_ms <= proposed_at_ms {
+            return Err(MetadataError::Again(
+                "CreateFile write session expired before proposal".to_string(),
+            ));
+        }
+        layout
+            .validate()
+            .map_err(|error| MetadataError::InvalidArgument(format!("invalid CreateFile layout: {error}")))?;
+        let (parent_inode_id, name, parent_inode) = self.resolve_create_parent(
+            mount_id,
+            expected_mount_epoch,
+            mount_root_inode_id,
+            &relative_components,
+        )?;
         if self.storage.get_dentry(parent_inode_id, &name)?.is_some() {
             return Err(MetadataError::AlreadyExists(format!("File already exists: {name}")));
         }
 
         let prepared: MetadataResult<(InodeAllocation, Inode, Inode)> = (|| {
-            // Check parent exists and is a directory
-            let parent_inode = self
-                .storage
-                .get_inode(parent_inode_id)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Parent inode not found: {}", parent_inode_id)))?;
-            if !parent_inode.kind.is_dir() {
-                return Err(MetadataError::NotDir(format!(
-                    "Parent is not a directory: {}",
-                    parent_inode_id
-                )));
-            }
-
             // Generate inode ID
             let allocation = self.storage.prepare_inode_allocation()?;
             let inode_id = allocation.inode_id;
@@ -222,7 +251,11 @@ impl AppRaftStateMachine {
             attrs.nlink = 1;
 
             // Create the file under its single canonical inode identity.
-            let inode = Inode::new_file(inode_id, attrs, parent_inode.mount_id);
+            let mut inode = Inode::new_file(inode_id, attrs, parent_inode.mount_id);
+            let InodeData::File { lease_epoch, .. } = &mut inode.data else {
+                unreachable!("new file constructor must produce file authority")
+            };
+            *lease_epoch = Some(1);
 
             // Update parent directory mtime/ctime
             let mut parent_attrs = parent_inode.attrs.clone();
@@ -234,7 +267,22 @@ impl AppRaftStateMachine {
         })();
 
         let (allocation, inode, updated_parent) = prepared?;
-        let inode_id = inode.inode_id;
+        let record = CreateFileReplayRecord {
+            operation_id,
+            request_deadline_ms,
+            normalized_path,
+            parent_inode_id,
+            name: name.clone(),
+            inode_id: inode.inode_id,
+            mount_id,
+            expected_mount_epoch,
+            mount_root_inode_id,
+            relative_components,
+            lease_epoch: 1,
+            layout,
+            content_revision: 0,
+            expires_at_ms: session_expires_at_ms,
+        };
         self.storage.create_file_atomic(
             allocation,
             parent_inode_id,
@@ -242,9 +290,137 @@ impl AppRaftStateMachine {
             &inode,
             &updated_parent,
             layout,
+            &record,
+            proposed_at_ms,
             raft_state,
         )?;
-        Ok(inode_id)
+        Ok(record)
+    }
+
+    /// Confirm that a durable CreateFile result still names its initial writable state.
+    fn validate_create_file_replay(&self, record: &CreateFileReplayRecord, proposed_at_ms: u64) -> MetadataResult<()> {
+        if record.expires_at_ms <= proposed_at_ms {
+            return Err(MetadataError::Again(
+                "replayed CreateFile write session has expired".to_string(),
+            ));
+        }
+        let (parent_inode_id, name, _) = self.resolve_create_parent(
+            record.mount_id,
+            record.expected_mount_epoch,
+            record.mount_root_inode_id,
+            &record.relative_components,
+        )?;
+        if parent_inode_id != record.parent_inode_id || name != record.name {
+            return Err(MetadataError::Again(
+                "replayed CreateFile path authority changed".to_string(),
+            ));
+        }
+        if self.storage.get_dentry(record.parent_inode_id, &record.name)? != Some(record.inode_id) {
+            return Err(MetadataError::AlreadyExists(
+                "replayed CreateFile target no longer names its original inode".to_string(),
+            ));
+        }
+        let inode = self
+            .storage
+            .get_inode(record.inode_id)?
+            .ok_or_else(|| MetadataError::NotFound(format!("CreateFile inode not found: {}", record.inode_id)))?;
+        if inode.inode_id != record.inode_id || inode.mount_id != record.mount_id || !inode.kind.is_file() {
+            return Err(MetadataError::Internal(
+                "replayed CreateFile inode authority is corrupt".to_string(),
+            ));
+        }
+        let InodeData::File {
+            extents,
+            content_revision,
+            lease_epoch,
+            next_block_index,
+        } = &inode.data
+        else {
+            return Err(MetadataError::Internal(
+                "replayed CreateFile inode payload is not a file".to_string(),
+            ));
+        };
+        if *lease_epoch != Some(record.lease_epoch) {
+            return Err(MetadataError::LeaseFenced {
+                expected: lease_epoch.unwrap_or_default(),
+                got: record.lease_epoch,
+            });
+        }
+        if !extents.is_empty()
+            || content_revision.unwrap_or_default() != record.content_revision
+            || *next_block_index != 0
+            || inode.attrs.size != 0
+        {
+            return Err(MetadataError::AlreadyExists(
+                "replayed CreateFile result no longer owns the initial file state".to_string(),
+            ));
+        }
+        if self.storage.get_layout(record.inode_id)? != record.layout {
+            return Err(MetadataError::Internal(
+                "replayed CreateFile layout authority changed".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Revalidate the mount-relative parent path carried by CreateFile apply.
+    fn resolve_create_parent(
+        &self,
+        mount_id: MountId,
+        expected_mount_epoch: u64,
+        mount_root_inode_id: InodeId,
+        relative_components: &[String],
+    ) -> MetadataResult<(InodeId, String, Inode)> {
+        Self::validate_relative_components("CreateFile", relative_components)?;
+        let mount = self
+            .storage
+            .get_mount(mount_id)?
+            .ok_or_else(|| MetadataError::NotFound(format!("Mount not found: {mount_id:?}")))?;
+        if mount.mount_epoch != expected_mount_epoch || mount.root_inode_id != mount_root_inode_id {
+            return Err(MetadataError::Again(format!(
+                "CreateFile mount precondition changed for {mount_id:?}"
+            )));
+        }
+        let mut parent = self
+            .storage
+            .get_inode(mount_root_inode_id)?
+            .ok_or_else(|| MetadataError::NotFound(format!("Mount root inode not found: {mount_root_inode_id}")))?;
+        if parent.inode_id != mount_root_inode_id
+            || parent.mount_id != mount_id
+            || !parent.kind.is_dir()
+            || !matches!(&parent.data, InodeData::Dir)
+        {
+            return Err(MetadataError::Internal(
+                "CreateFile mount root authority is corrupt".to_string(),
+            ));
+        }
+        let (name, parent_components) = relative_components
+            .split_last()
+            .expect("validated CreateFile path has a terminal component");
+        for component in parent_components {
+            let child_inode_id = self.storage.get_dentry(parent.inode_id, component)?.ok_or_else(|| {
+                MetadataError::NotFound(format!(
+                    "Entry not found: {component} (parent inode: {})",
+                    parent.inode_id
+                ))
+            })?;
+            let child = self
+                .storage
+                .get_inode(child_inode_id)?
+                .ok_or_else(|| MetadataError::NotFound(format!("Child inode not found: {child_inode_id}")))?;
+            if child.inode_id != child_inode_id || child.mount_id != mount_id {
+                return Err(MetadataError::Internal(
+                    "CreateFile parent path authority is corrupt".to_string(),
+                ));
+            }
+            if !child.kind.is_dir() || !matches!(&child.data, InodeData::Dir) {
+                return Err(MetadataError::NotDir(format!(
+                    "Path component is not a directory: {component}"
+                )));
+            }
+            parent = child;
+        }
+        Ok((parent.inode_id, name.clone(), parent))
     }
 
     /// Revalidate one bounded mount-relative Delete command and apply its target-specific mutation.
@@ -312,7 +488,7 @@ impl AppRaftStateMachine {
         mount_root_inode_id: InodeId,
         relative_components: &[String],
     ) -> MetadataResult<(InodeId, String, Inode)> {
-        Self::validate_delete_components(relative_components)?;
+        Self::validate_relative_components("Delete", relative_components)?;
         let mounts = self.storage.list_mounts()?;
         let mount = mounts
             .iter()
@@ -432,25 +608,28 @@ impl AppRaftStateMachine {
         unreachable!("Delete components are checked as non-empty")
     }
 
-    fn validate_delete_components(relative_components: &[String]) -> MetadataResult<()> {
+    /// Enforce the fixed replicated bound for one mount-relative namespace path.
+    fn validate_relative_components(operation: &str, relative_components: &[String]) -> MetadataResult<()> {
         if relative_components.is_empty() {
-            return Err(MetadataError::InvalidArgument("Cannot delete mount root".to_string()));
+            return Err(MetadataError::InvalidArgument(format!(
+                "{operation} cannot target a mount root"
+            )));
         }
         if relative_components.len() > crate::path_resolver::MAX_PATH_COMPONENTS {
             return Err(MetadataError::InvalidArgument(format!(
-                "Delete path exceeds {} components",
+                "{operation} path exceeds {} components",
                 crate::path_resolver::MAX_PATH_COMPONENTS
             )));
         }
         for component in relative_components {
             if component.is_empty() || component.contains('/') || component.contains('\0') {
-                return Err(MetadataError::InvalidArgument(
-                    "Delete path contains an invalid component".to_string(),
-                ));
+                return Err(MetadataError::InvalidArgument(format!(
+                    "{operation} path contains an invalid component"
+                )));
             }
             if component.len() > crate::path_resolver::MAX_PATH_COMPONENT_BYTES {
                 return Err(MetadataError::InvalidArgument(format!(
-                    "Delete path component exceeds {} bytes",
+                    "{operation} path component exceeds {} bytes",
                     crate::path_resolver::MAX_PATH_COMPONENT_BYTES
                 )));
             }
@@ -918,18 +1097,37 @@ mod tests {
         }
     }
 
-    fn create_file(sm: &AppRaftStateMachine, parent_inode_id: InodeId, name: &str) -> InodeId {
-        expect_file_created(
-            sm.apply(Command::CreateFile {
-                proposed_at_ms: 1,
-                parent_inode_id,
-                name: name.to_string(),
-                attrs: FileAttrs::new(),
-                layout: FileLayout::new(4096, 4096, 1),
-            })
-            .unwrap(),
-        )
-        .0
+    fn create_file_command(
+        operation_id: CreateFileOperationId,
+        mount_root_inode_id: InodeId,
+        components: &[&str],
+    ) -> Command {
+        let relative_components: Vec<_> = components.iter().map(|component| (*component).to_string()).collect();
+        Command::CreateFile {
+            proposed_at_ms: 1,
+            operation_id,
+            request_deadline_ms: 100,
+            session_expires_at_ms: 100,
+            normalized_path: format!("/{}", components.join("/")),
+            mount_id: MountId::new(1),
+            expected_mount_epoch: 1,
+            mount_root_inode_id,
+            relative_components,
+            attrs: FileAttrs::new(),
+            layout: FileLayout::new(4096),
+        }
+    }
+
+    fn create_file(sm: &AppRaftStateMachine, mount_root_inode_id: InodeId, components: &[&str]) -> InodeId {
+        let command = create_file_command(
+            CreateFileOperationId {
+                client_id: beryl_types::ClientId::new(1),
+                call_id: beryl_types::CallId::new(),
+            },
+            mount_root_inode_id,
+            components,
+        );
+        expect_file_created(sm.apply(command).unwrap()).0
     }
 
     fn assert_delete_rejection_preserves_directory(
@@ -947,6 +1145,93 @@ mod tests {
         );
         assert!(storage.get_inode(directory_inode_id).unwrap().is_some());
         assert!(storage.get_detached_root(directory_inode_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn create_file_replays_one_durable_result_without_allocating_again() {
+        let (_dir, storage, sm, parent_inode_id) = test_state();
+        let operation_id = CreateFileOperationId {
+            client_id: beryl_types::ClientId::new(7),
+            call_id: beryl_types::CallId::new(),
+        };
+        let command = create_file_command(operation_id, parent_inode_id, &["target"]);
+
+        let first = expect_file_created(sm.apply(command.clone()).unwrap());
+        let next_inode_id = storage.get_next_inode_id().unwrap();
+        expect_apply_rejection(
+            sm.apply(Command::AcquireWriteLease {
+                proposed_at_ms: 2,
+                inode_id: first.0,
+                expected_lease_epoch: 1,
+            }),
+            ApplyRejectionKind::Again,
+        );
+
+        let mut replay_command = command;
+        let Command::CreateFile {
+            proposed_at_ms,
+            request_deadline_ms,
+            session_expires_at_ms,
+            ..
+        } = &mut replay_command
+        else {
+            unreachable!("test helper must build CreateFile")
+        };
+        *proposed_at_ms = 2;
+        *request_deadline_ms = 200;
+        *session_expires_at_ms = 200;
+        expect_apply_rejection(sm.apply(replay_command.clone()), ApplyRejectionKind::InvalidArgument);
+        let Command::CreateFile {
+            request_deadline_ms, ..
+        } = &mut replay_command
+        else {
+            unreachable!("test helper must build CreateFile")
+        };
+        *request_deadline_ms = 100;
+        let replay = expect_file_created(sm.apply(replay_command.clone()).unwrap());
+
+        assert_eq!(replay, first);
+        assert_eq!(storage.get_next_inode_id().unwrap(), next_inode_id);
+        assert_eq!(storage.get_dentry(parent_inode_id, "target").unwrap(), Some(first.0));
+        assert_eq!(
+            storage.get_create_file_replay(operation_id).unwrap().unwrap().inode_id,
+            first.0
+        );
+        assert_eq!(
+            storage
+                .get_create_file_replay_for_inode(first.0)
+                .unwrap()
+                .unwrap()
+                .operation_id,
+            operation_id
+        );
+
+        let mut mount = storage.get_mount(MountId::new(1)).unwrap().unwrap();
+        mount.mount_epoch = 2;
+        storage.put_mount(&mount).unwrap();
+        expect_apply_rejection(sm.apply(replay_command.clone()), ApplyRejectionKind::Again);
+        mount.mount_epoch = 1;
+        storage.put_mount(&mount).unwrap();
+
+        expect_apply_rejection(
+            sm.apply(create_file_command(operation_id, parent_inode_id, &["other"])),
+            ApplyRejectionKind::InvalidArgument,
+        );
+        assert_eq!(storage.get_dentry(parent_inode_id, "other").unwrap(), None);
+
+        let Command::CreateFile { proposed_at_ms, .. } = &mut replay_command else {
+            unreachable!("test helper must build CreateFile")
+        };
+        *proposed_at_ms = 100;
+        expect_apply_rejection(sm.apply(replay_command), ApplyRejectionKind::Again);
+        expect_write_lease_acquired(
+            sm.apply(Command::AcquireWriteLease {
+                proposed_at_ms: 100,
+                inode_id: first.0,
+                expected_lease_epoch: 1,
+            })
+            .unwrap(),
+        );
     }
 
     #[test]
@@ -1013,7 +1298,7 @@ mod tests {
             .unwrap(),
         )
         .0;
-        let file = create_file(&sm, directory, "file");
+        let file = create_file(&sm, parent_inode_id, &["dir", "file"]);
 
         expect_delete_applied(sm.apply(delete_command("dir", directory, None, true)).unwrap());
 
@@ -1094,18 +1379,18 @@ mod tests {
     #[test]
     fn delete_rejects_a_lease_acquired_after_preflight() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
-        let inode_id = create_file(&sm, parent_inode_id, "target");
+        let inode_id = create_file(&sm, parent_inode_id, &["target"]);
 
         expect_write_lease_acquired(
             sm.apply(Command::AcquireWriteLease {
-                proposed_at_ms: 2,
+                proposed_at_ms: 100,
                 inode_id,
-                expected_lease_epoch: 0,
+                expected_lease_epoch: 1,
             })
             .unwrap(),
         );
         expect_apply_rejection(
-            sm.apply(delete_command("target", inode_id, Some(0), false)),
+            sm.apply(delete_command("target", inode_id, Some(1), false)),
             ApplyRejectionKind::Again,
         );
 
@@ -1115,14 +1400,14 @@ mod tests {
     #[test]
     fn delete_that_linearizes_first_prevents_later_lease_acquisition() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
-        let inode_id = create_file(&sm, parent_inode_id, "target");
+        let inode_id = create_file(&sm, parent_inode_id, &["target"]);
 
-        expect_delete_applied(sm.apply(delete_command("target", inode_id, Some(0), false)).unwrap());
+        expect_delete_applied(sm.apply(delete_command("target", inode_id, Some(1), false)).unwrap());
         expect_apply_rejection(
             sm.apply(Command::AcquireWriteLease {
                 proposed_at_ms: 3,
                 inode_id,
-                expected_lease_epoch: 0,
+                expected_lease_epoch: 1,
             }),
             ApplyRejectionKind::NotFound,
         );

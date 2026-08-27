@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use beryl_client::{ClientError, ClientErrorKind, CreateOptions, FileStatus};
-use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction};
+use beryl_client::{ClientError, ClientErrorKind, FileStatus};
+use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction};
 use beryl_common::header::RequestHeader;
 use beryl_e2e::{data::deterministic_bytes, TestCluster, TestResult};
-use beryl_proto::common::{ByteRangeProto, FileLayoutProto, RequestHeaderProto, ResponseHeaderProto};
+use beryl_proto::common::{ByteRangeProto, RequestHeaderProto, ResponseHeaderProto};
 use beryl_proto::convert::rpc_error_from_proto;
 use beryl_proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
 use beryl_proto::metadata::get_block_locations_request_proto;
-use beryl_proto::metadata::FileAttrsProto;
 use beryl_proto::metadata::{
     AbortFileWriteRequestProto, AddBlockRequestProto, CommitFileRequestProto, CommittedBlockProto,
     CreateFileRequestProto, GetBlockLocationsRequestProto, OpenWriteModeProto, OpenWriteRequestProto, WriteHandleProto,
@@ -18,7 +17,7 @@ use beryl_proto::metadata::{
 use beryl_proto::worker::worker_data_service_client::WorkerDataServiceClient;
 use beryl_proto::worker::write_block_request_proto::Payload;
 use beryl_proto::worker::{DataRequestHeaderProto, WriteBlockCommandProto, WriteBlockRequestProto};
-use beryl_types::{BlockFormatId, ClientId};
+use beryl_types::ClientId;
 use bytes::Bytes;
 use tokio_stream::iter;
 use tonic::Request;
@@ -29,10 +28,8 @@ async fn committed_visible_file_survives_metadata_restart() {
     let client = cluster.client().clone();
     let path = "/restart/committed";
     let payload = Bytes::from(deterministic_bytes(1_537));
-    let create_options = CreateOptions::create().with_block_size(1024).with_chunk_size(1024);
-
     client.mkdirs("/restart", true).await.expect("create restart dir");
-    let mut writer = client.create(path, create_options).await.expect("create file");
+    let mut writer = client.create(path).await.expect("create file");
     writer.write_all(payload.clone()).await.expect("write file");
     writer.close().await.expect("close file");
     cluster
@@ -56,28 +53,90 @@ async fn restart_after_empty_create_allows_noop_close_without_publishing_bytes()
     let client = cluster.client().clone();
     client.mkdirs("/restart", true).await.expect("create restart dir");
 
-    let mut writer = client
-        .create(
-            "/restart/create-before-close",
-            CreateOptions::create().with_block_size(1024).with_chunk_size(1024),
-        )
+    let owner_client_id = 701;
+    let foreign_client_id = 702;
+    let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
         .await
-        .expect("create active writer");
+        .expect("connect metadata");
+    let create = metadata
+        .create_file(Request::new(CreateFileRequestProto {
+            header: Some(metadata_header(owner_client_id)),
+            path: "/restart/create-before-close".to_string(),
+        }))
+        .await
+        .expect("create active writer")
+        .into_inner();
+    assert_metadata_ok(create.header);
+    let close_request = CommitFileRequestProto {
+        header: Some(metadata_header(owner_client_id)),
+        write_handle: create.write_handle,
+        committed_blocks: Vec::new(),
+        final_size: 0,
+        expected_content_revision: create.content_revision,
+        write_mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
+        expected_file_size: 0,
+    };
+    let mut aborted = client
+        .create("/restart/create-before-abort")
+        .await
+        .expect("create second active writer");
 
     cluster.restart_metadata().await.expect("restart metadata");
 
-    writer
-        .close()
+    let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
         .await
-        .expect("an empty close is already satisfied by durable file state");
+        .expect("reconnect metadata");
+    let mut foreign_close = close_request.clone();
+    foreign_close.header = Some(metadata_header(foreign_client_id));
+    let foreign = metadata
+        .commit_file(Request::new(foreign_close))
+        .await
+        .expect("foreign empty close response")
+        .into_inner();
+    let foreign_error = foreign
+        .header
+        .expect("foreign close response header")
+        .error
+        .expect("foreign close must fail");
+    assert_eq!(
+        rpc_error_from_proto(&foreign_error).kind,
+        ErrorKind::Metadata(MetadataErrorKind::SessionInvalid)
+    );
+    let owner = metadata
+        .commit_file(Request::new(close_request.clone()))
+        .await
+        .expect("owner empty close")
+        .into_inner();
+    assert_metadata_ok(owner.header);
+    let replay = metadata
+        .commit_file(Request::new(close_request))
+        .await
+        .expect("replay completed empty close")
+        .into_inner();
+    assert_metadata_ok(replay.header);
+    aborted
+        .abort()
+        .await
+        .expect("abort reconstructs the initial durable owner");
     let mut reopened = client
         .append("/restart/create-before-close")
         .await
         .expect("new OpenWrite call establishes a new session after restart");
     reopened.abort().await.expect("abort reopened session");
+    let mut reopened_after_abort = client
+        .append("/restart/create-before-abort")
+        .await
+        .expect("aborted CreateFile no longer reserves write authority");
+    reopened_after_abort
+        .abort()
+        .await
+        .expect("abort reopened second session");
     assert_no_committed_bytes(&cluster, "/restart/create-before-close")
         .await
         .expect("no committed bytes");
+    assert_no_committed_bytes(&cluster, "/restart/create-before-abort")
+        .await
+        .expect("aborted file has no committed bytes");
     cluster.shutdown().await.expect("shutdown cluster");
 }
 
@@ -88,10 +147,7 @@ async fn restart_after_worker_ready_before_metadata_close_rejects_stale_writer_a
     client.mkdirs("/restart", true).await.expect("create restart dir");
 
     let mut writer = client
-        .create(
-            "/restart/worker-ready-before-close",
-            CreateOptions::create().with_block_size(1024).with_chunk_size(1024),
-        )
+        .create("/restart/worker-ready-before-close")
         .await
         .expect("create active writer");
     writer
@@ -145,12 +201,7 @@ async fn existing_visible_data_remains_readable_while_active_write_fails_closed(
     let active_path = "/restart/active-hidden";
     let visible = Bytes::from_static(b"already-visible");
     let hidden = Bytes::from_static(b"hidden-after-restart");
-    let create_options = CreateOptions::create().with_block_size(1024).with_chunk_size(1024);
-
-    let mut visible_writer = client
-        .create(visible_path, create_options)
-        .await
-        .expect("create visible file");
+    let mut visible_writer = client.create(visible_path).await.expect("create visible file");
     visible_writer
         .write_all(visible.clone())
         .await
@@ -161,10 +212,7 @@ async fn existing_visible_data_remains_readable_while_active_write_fails_closed(
         .await
         .expect("visible report convergence");
 
-    let mut active_writer = client
-        .create(active_path, create_options)
-        .await
-        .expect("create active file");
+    let mut active_writer = client.create(active_path).await.expect("create active file");
     active_writer
         .write_all(hidden)
         .await
@@ -189,7 +237,7 @@ async fn existing_visible_data_remains_readable_while_active_write_fails_closed(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn session_operations_converge_by_predecessor_and_ensure_absent() {
+async fn create_replay_survives_restart_and_session_operations_converge() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     cluster
         .client()
@@ -203,38 +251,54 @@ async fn session_operations_converge_by_predecessor_and_ensure_absent() {
     let create_request = CreateFileRequestProto {
         header: Some(metadata_header(801)),
         path: path.to_string(),
-        attrs: Some(FileAttrsProto {
-            mode: 0o644,
-            uid: 1000,
-            gid: 1000,
-            ..Default::default()
-        }),
-        layout: Some(FileLayoutProto {
-            block_size: 1024,
-            chunk_size: 1024,
-            replication: 1,
-            block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
-        }),
     };
     let create = metadata
-        .create_file(Request::new(create_request))
+        .create_file(Request::new(create_request.clone()))
         .await
         .expect("CreateFile")
         .into_inner();
     assert_metadata_ok(create.header);
 
-    let open_request = OpenWriteRequestProto {
-        header: Some(metadata_header(801)),
-        path: path.to_string(),
-        mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
-    };
-    let open = metadata
-        .open_write(Request::new(open_request))
+    cluster
+        .restart_metadata()
         .await
-        .expect("OpenWrite")
+        .expect("restart metadata after CreateFile");
+    let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
+        .await
+        .expect("reconnect metadata");
+
+    let mut wrong_deadline = create_request.clone();
+    wrong_deadline
+        .header
+        .as_mut()
+        .expect("CreateFile request header")
+        .deadline_ms += 1;
+    let mismatch = metadata
+        .create_file(Request::new(wrong_deadline))
+        .await
+        .expect("mismatched CreateFile replay response")
         .into_inner();
-    assert_metadata_ok(open.header);
-    let write_handle = open.write_handle.expect("write handle");
+    let mismatch_error = mismatch
+        .header
+        .expect("mismatched replay response header")
+        .error
+        .expect("mismatched deadline must fail");
+    assert_eq!(
+        rpc_error_from_proto(&mismatch_error).kind,
+        ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument)
+    );
+    let replay_create = metadata
+        .create_file(Request::new(create_request))
+        .await
+        .expect("replayed CreateFile")
+        .into_inner();
+    assert_metadata_ok(replay_create.header);
+    assert_eq!(replay_create.layout, create.layout);
+    assert_eq!(replay_create.write_handle, create.write_handle);
+    assert_eq!(replay_create.expires_at_ms, create.expires_at_ms);
+    assert_eq!(replay_create.content_revision, create.content_revision);
+
+    let write_handle = create.write_handle.expect("write handle");
 
     let add_header = metadata_header(801);
     let add_request = AddBlockRequestProto {
@@ -327,33 +391,12 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
         .create_file(Request::new(CreateFileRequestProto {
             header: Some(metadata_header(900)),
             path: path.to_string(),
-            attrs: Some(FileAttrsProto {
-                mode: 0o644,
-                ..Default::default()
-            }),
-            layout: Some(FileLayoutProto {
-                block_size: 1024,
-                chunk_size: 1024,
-                replication: 1,
-                block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
-            }),
         }))
         .await
         .expect("CreateFile")
         .into_inner();
     assert_metadata_ok(create.header);
-    let open = metadata
-        .open_write(Request::new(OpenWriteRequestProto {
-            header: Some(metadata_header(900)),
-            path: path.to_string(),
-            mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
-        }))
-        .await
-        .expect("OpenWrite")
-        .into_inner();
-    assert_metadata_ok(open.header);
-    let old_handle = open.write_handle.expect("write handle");
-    assert_eq!(old_handle.inode_id, create.inode_id);
+    let old_handle = create.write_handle.expect("write handle");
     let mut previous_block_id = None;
     for index in 0..12 {
         let add = metadata
@@ -518,35 +561,14 @@ async fn raw_create_worker_ready_block(
         .create_file(Request::new(CreateFileRequestProto {
             header: Some(metadata_header(401)),
             path: path.to_string(),
-            attrs: Some(FileAttrsProto {
-                mode: 0o644,
-                uid: 1000,
-                gid: 1000,
-                ..Default::default()
-            }),
-            layout: Some(FileLayoutProto {
-                block_size: 1024,
-                chunk_size: 1024,
-                replication: 1,
-                block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
-            }),
         }))
         .await?
         .into_inner();
     assert_metadata_ok(create.header);
-    let open = metadata
-        .open_write(Request::new(OpenWriteRequestProto {
-            header: Some(metadata_header(401)),
-            path: path.to_string(),
-            mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
-        }))
-        .await?
-        .into_inner();
-    assert_metadata_ok(open.header);
-    let expected_content_revision = open.content_revision;
-    let expected_file_size = open.base_size;
+    let expected_content_revision = create.content_revision;
+    let expected_file_size = 0;
     let write_mode = OpenWriteModeProto::OpenWriteModeWrite as i32;
-    let write_handle = open.write_handle.expect("write handle");
+    let write_handle = create.write_handle.expect("write handle");
 
     let add_block = metadata
         .add_block(Request::new(AddBlockRequestProto {

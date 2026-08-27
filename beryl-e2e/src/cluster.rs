@@ -11,7 +11,7 @@ use beryl_client::{ClientConfig, FsClient};
 use beryl_common::observe::ObservabilityConfig;
 use beryl_common::FlatConfig;
 use beryl_metadata::config::{
-    BlockCleanupConfig, MetadataAuthorityConfig, MetadataConfig, MetadataWriteTargetLimitsConfig,
+    BlockCleanupConfig, FileLayoutDefaults, MetadataAuthorityConfig, MetadataConfig, MetadataWriteTargetLimitsConfig,
     NamespaceDeleteConfig, RaftConfig, StartupConfig, WorkerLivenessConfig,
 };
 use beryl_metadata::lifecycle::format_metadata_storage;
@@ -662,6 +662,7 @@ beryl.metadata.http.port: {http_port}
 beryl.metadata.storage.dir: {storage_dir:?}
 beryl.metadata.write-target.max-outstanding: {write_target_max_outstanding}
 beryl.metadata.write-target.max-outstanding-per-session: {write_target_max_outstanding_per_session}
+beryl.file.block-size.default: {file_block_size_default}
 beryl.metadata.block.cleanup.enabled: {cleanup_enabled}
 beryl.metadata.block.cleanup.interval: {cleanup_scan_interval_ms}ms
 beryl.metadata.block.cleanup.grace-period: {cleanup_reclaim_grace_ms}ms
@@ -685,6 +686,7 @@ beryl.logging.level: "warn,openraft=warn"
             write_target_max_outstanding = self.metadata_config.write_target_limits.max_outstanding,
             write_target_max_outstanding_per_session =
                 self.metadata_config.write_target_limits.max_outstanding_per_session,
+            file_block_size_default = self.metadata_config.file_layout_defaults.block_size,
             cleanup_scan_interval_ms = self.metadata_config.block_cleanup.scan_interval_ms,
             cleanup_reclaim_grace_ms = self.metadata_config.block_cleanup.reclaim_grace_ms,
             cleanup_max_replicas_per_scan = self.metadata_config.block_cleanup.max_replicas_per_scan,
@@ -861,6 +863,7 @@ fn metadata_config(
         rpc_concurrency: Default::default(),
         write_session_limits: Default::default(),
         write_target_limits: Default::default(),
+        file_layout_defaults: FileLayoutDefaults::try_new(1024)?,
         http_port: rpc_addr.port().saturating_add(1),
         storage_dir,
         raft: RaftConfig::default(),

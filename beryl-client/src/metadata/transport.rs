@@ -302,22 +302,6 @@ impl MetadataTransport for GrpcMetadataTransport {
         validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
-    async fn delete(
-        &self,
-        ctx: AttemptContext,
-        mut req: beryl_proto::metadata::DeleteRequestProto,
-    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::DeleteResponseProto>> {
-        req.header = Some(build_metadata_header(&ctx)?);
-        let response = self
-            .client(&ctx, "write")
-            .await?
-            .delete(tonic_request(&ctx, req))
-            .await
-            .map_err(ClientError::from)?
-            .into_inner();
-        validated_metadata_response(&ctx, response.header.clone(), response)
-    }
-
     async fn create_directory(
         &self,
         ctx: AttemptContext,
@@ -328,6 +312,22 @@ impl MetadataTransport for GrpcMetadataTransport {
             .client(&ctx, "write")
             .await?
             .create_directory(tonic_request(&ctx, req))
+            .await
+            .map_err(ClientError::from)?
+            .into_inner();
+        validated_metadata_response(&ctx, response.header.clone(), response)
+    }
+
+    async fn delete(
+        &self,
+        ctx: AttemptContext,
+        mut req: beryl_proto::metadata::DeleteRequestProto,
+    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::DeleteResponseProto>> {
+        req.header = Some(build_metadata_header(&ctx)?);
+        let response = self
+            .client(&ctx, "write")
+            .await?
+            .delete(tonic_request(&ctx, req))
             .await
             .map_err(ClientError::from)?
             .into_inner();

@@ -33,6 +33,7 @@ pub(crate) use state_machine_store::StateMachineStorage;
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::MountEntry;
 use crate::raft::AppMetadataRaftState;
+use crate::session_registry::CreateFileOperationId;
 use crate::state::RouteEpoch;
 use crate::worker::WorkerInfo;
 use beryl_types::fs::{Inode, InodeId};
@@ -64,6 +65,12 @@ const STORAGE_IDENTITY_KEY: &[u8] = b"storage_identity";
 const RAFT_STATE_KEY: &[u8] = b"raft_state";
 pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 1;
 const NEXT_INODE_ID_KEY: &[u8] = b"next_inode_id";
+const CREATE_FILE_REPLAY_COUNT_KEY: &[u8] = b"create_file_replay_count";
+const CREATE_FILE_REPLAY_PREFIX: &[u8] = b"create_file_replay/";
+const CREATE_FILE_REPLAY_EXPIRY_PREFIX: &[u8] = b"create_file_replay_expiry/";
+const CREATE_FILE_REPLAY_INODE_PREFIX: &[u8] = b"create_file_replay_inode/";
+/// Hard bound on durable CreateFile results retained for response-loss replay.
+const MAX_CREATE_FILE_REPLAY_RECORDS: u64 = 65_536;
 
 fn durable_raft_write_options() -> WriteOptions {
     let mut options = WriteOptions::default();
@@ -155,6 +162,25 @@ impl From<WriteBatch> for AuthorityBatch {
 pub(crate) struct InodeAllocation {
     pub(crate) inode_id: InodeId,
     pub(crate) next_inode_id: InodeId,
+}
+
+/// Durable result and request identity for one replayable atomic CreateFile.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct CreateFileReplayRecord {
+    pub(crate) operation_id: CreateFileOperationId,
+    pub(crate) request_deadline_ms: u64,
+    pub(crate) normalized_path: String,
+    pub(crate) parent_inode_id: InodeId,
+    pub(crate) name: String,
+    pub(crate) inode_id: InodeId,
+    pub(crate) mount_id: MountId,
+    pub(crate) expected_mount_epoch: u64,
+    pub(crate) mount_root_inode_id: InodeId,
+    pub(crate) relative_components: Vec<String>,
+    pub(crate) lease_epoch: u64,
+    pub(crate) layout: FileLayout,
+    pub(crate) content_revision: u64,
+    pub(crate) expires_at_ms: u64,
 }
 
 /// One directory insertion in an atomic recursive mkdir mutation.
@@ -335,6 +361,62 @@ impl RocksDBStorage {
 
     fn encode_layout_key(inode_id: InodeId) -> Vec<u8> {
         format!("layout:{}", inode_id.as_raw()).into_bytes()
+    }
+
+    fn encode_create_file_operation_bytes(operation_id: CreateFileOperationId) -> [u8; 32] {
+        let mut bytes = [0; 32];
+        bytes[..16].copy_from_slice(&operation_id.client_id.as_raw().to_be_bytes());
+        bytes[16..].copy_from_slice(operation_id.call_id.as_uuid().as_bytes());
+        bytes
+    }
+
+    fn encode_create_file_replay_key(operation_id: CreateFileOperationId) -> Vec<u8> {
+        let mut key = Vec::with_capacity(CREATE_FILE_REPLAY_PREFIX.len() + 32);
+        key.extend_from_slice(CREATE_FILE_REPLAY_PREFIX);
+        key.extend_from_slice(&Self::encode_create_file_operation_bytes(operation_id));
+        key
+    }
+
+    fn decode_create_file_operation_bytes(bytes: &[u8]) -> MetadataResult<CreateFileOperationId> {
+        if bytes.len() != 32 {
+            return Err(MetadataError::Internal(
+                "invalid CreateFile operation identity length".to_string(),
+            ));
+        }
+        let client_id = beryl_types::ClientId::new(u128::from_be_bytes(
+            bytes[..16].try_into().expect("checked client identity length"),
+        ));
+        let call_id = beryl_types::CallId::from_uuid(uuid::Uuid::from_bytes(
+            bytes[16..].try_into().expect("checked call identity length"),
+        ));
+        Ok(CreateFileOperationId { client_id, call_id })
+    }
+
+    fn encode_create_file_replay_inode_key(inode_id: InodeId) -> Vec<u8> {
+        let mut key = Vec::with_capacity(CREATE_FILE_REPLAY_INODE_PREFIX.len() + 8);
+        key.extend_from_slice(CREATE_FILE_REPLAY_INODE_PREFIX);
+        key.extend_from_slice(&inode_id.to_be_bytes());
+        key
+    }
+
+    fn encode_create_file_replay_expiry_key(record: &CreateFileReplayRecord) -> Vec<u8> {
+        let mut key = Vec::with_capacity(CREATE_FILE_REPLAY_EXPIRY_PREFIX.len() + 8 + 32);
+        key.extend_from_slice(CREATE_FILE_REPLAY_EXPIRY_PREFIX);
+        key.extend_from_slice(&record.expires_at_ms.to_be_bytes());
+        key.extend_from_slice(&Self::encode_create_file_operation_bytes(record.operation_id));
+        key
+    }
+
+    fn decode_create_file_replay_expiry_key(key: &[u8]) -> MetadataResult<(u64, CreateFileOperationId)> {
+        let expected_len = CREATE_FILE_REPLAY_EXPIRY_PREFIX.len() + 8 + 32;
+        if key.len() != expected_len || !key.starts_with(CREATE_FILE_REPLAY_EXPIRY_PREFIX) {
+            return Err(MetadataError::Internal(
+                "invalid CreateFile replay expiry key".to_string(),
+            ));
+        }
+        let payload = &key[CREATE_FILE_REPLAY_EXPIRY_PREFIX.len()..];
+        let expires_at_ms = u64::from_be_bytes(payload[..8].try_into().expect("checked expiry key length"));
+        Ok((expires_at_ms, Self::decode_create_file_operation_bytes(&payload[8..])?))
     }
 
     fn cf<'a>(db: &'a DB, name: &str) -> MetadataResult<&'a ColumnFamily> {

@@ -7,7 +7,7 @@ use std::error::Error;
 use std::io;
 use std::path::PathBuf;
 
-use beryl_client::{ClientConfig, CreateOptions, DeleteOptions, FsClient};
+use beryl_client::{ClientConfig, DeleteOptions, FsClient};
 use bytes::Bytes;
 
 const DIRECTORY: &str = "/examples";
@@ -29,14 +29,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .map(|index| ((index * 31 + 17) % 251) as u8)
             .collect::<Vec<_>>(),
     );
-    let mut writer = client
-        .create(
-            FILE,
-            CreateOptions::create()
-                .with_block_size(BLOCK_SIZE)
-                .with_chunk_size(BLOCK_SIZE),
-        )
-        .await?;
+    let mut writer = client.create(FILE).await?;
     writer.write_all(payload.clone()).await?;
     writer.close().await?;
 

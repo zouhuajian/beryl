@@ -7,8 +7,7 @@ use super::filesystem::{FsFailure, FsSuccess, RequestContext};
 use crate::error::MetadataError;
 use beryl_common::error::rpc::{ErrorKind, ProtocolErrorKind, RpcErrorDetail};
 use beryl_common::header::{RequestHeader, ResponseHeader};
-use beryl_types::layout::FileLayout;
-use beryl_types::{FileBlockLocation, GroupName, GroupStateWatermark, WriteTarget, MAX_BLOCK_SIZE, MAX_CHUNK_SIZE};
+use beryl_types::{FileBlockLocation, GroupName, GroupStateWatermark, WriteTarget};
 use tracing::Span;
 
 #[allow(clippy::result_large_err)]
@@ -183,25 +182,6 @@ pub(crate) fn file_attrs_from_proto(
         ctime_ms: attrs.ctime_ms,
         nlink: attrs.nlink,
     })
-}
-
-pub(crate) fn file_layout_from_proto(
-    layout: Option<beryl_proto::common::FileLayoutProto>,
-) -> Result<FileLayout, MetadataError> {
-    let layout = layout.ok_or_else(|| MetadataError::InvalidArgument("Missing FileLayout".to_string()))?;
-    if layout.block_size > MAX_BLOCK_SIZE {
-        return Err(MetadataError::ResourceExhausted(format!(
-            "block_size {} exceeds maximum {}",
-            layout.block_size, MAX_BLOCK_SIZE
-        )));
-    }
-    if layout.chunk_size > MAX_CHUNK_SIZE {
-        return Err(MetadataError::ResourceExhausted(format!(
-            "chunk_size {} exceeds maximum {}",
-            layout.chunk_size, MAX_CHUNK_SIZE
-        )));
-    }
-    FileLayout::try_from(layout).map_err(MetadataError::InvalidArgument)
 }
 
 pub(crate) fn write_target_to_proto(target: &WriteTarget) -> beryl_proto::metadata::WriteTargetProto {

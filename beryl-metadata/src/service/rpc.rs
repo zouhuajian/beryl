@@ -12,8 +12,8 @@ use super::filesystem::{
     OpenWriteArgs, PresentedWriteHandle, RenameArgs, RenewLeaseArgs, SyncWriteArgs,
 };
 use super::wire::{
-    file_attrs_from_proto, file_attrs_to_proto, file_layout_from_proto, header_from_fs_failure, header_from_rpc_error,
-    location_to_proto, ok_header_from_fs_success, request_context_from_proto, write_target_to_proto,
+    file_attrs_from_proto, file_attrs_to_proto, header_from_fs_failure, header_from_rpc_error, location_to_proto,
+    ok_header_from_fs_success, request_context_from_proto, write_target_to_proto,
 };
 use super::MetadataFileSystem;
 use super::MsyncHandler;
@@ -489,9 +489,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 &req_ctx,
                 CreateFileArgs {
                     path: req.path,
-                    parsed_attrs: file_attrs_from_proto(req.attrs),
-                    parsed_layout: file_layout_from_proto(req.layout),
-                    parsed_mode: Ok(()),
                     freshness: Self::freshness_from_header(&req.header),
                 },
             )
@@ -502,8 +499,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 let payload = success.payload;
                 response_with_header!(
                     CreateFileResponseProto {
-                        inode_id: payload.inode_id.as_raw(),
                         layout: Some((&payload.layout).into()),
+                        write_handle: Some(WriteHandleProto {
+                            inode_id: payload.inode_id.as_raw(),
+                            write_lease_epoch: payload.lease_epoch,
+                        }),
+                        expires_at_ms: payload.expires_at_ms,
+                        content_revision: payload.content_revision,
                         ..Default::default()
                     },
                     header
@@ -853,8 +855,8 @@ mod tests {
     use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
     use beryl_proto::metadata::{
         get_block_locations_request_proto, AddBlockRequestProto, CommitFileRequestProto, CommittedBlockProto,
-        CreateFileRequestProto, GetBlockLocationsRequestProto, OpenWriteModeProto, OpenWriteRequestProto,
-        SyncWriteRequestProto, WriteHandleProto, WriteTargetProto,
+        CreateFileRequestProto, GetBlockLocationsRequestProto, OpenWriteModeProto, SyncWriteRequestProto,
+        WriteHandleProto, WriteTargetProto,
     };
     use beryl_types::fs::{FileAttrs, Inode, InodeId};
     use beryl_types::ids::{BlockId, BlockIndex, MountId, WorkerId};
@@ -1035,6 +1037,7 @@ mod tests {
             worker_manager: worker_manager.clone(),
             metrics: None,
             readiness_gate: None,
+            file_create_layout: beryl_types::FileLayout::new(128),
         }));
         let msync = Some(MsyncHandler::new(Arc::clone(&raft_node), owner_group_name));
         let service = MetadataFileSystemServiceImpl::new(filesystem, msync, NamespaceListConfig::default());
@@ -1146,18 +1149,6 @@ mod tests {
             Request::new(CreateFileRequestProto {
                 header: header(client_id),
                 path: path.to_string(),
-                attrs: Some(beryl_proto::metadata::FileAttrsProto {
-                    mode: 0o644,
-                    uid: 1000,
-                    gid: 1000,
-                    ..Default::default()
-                }),
-                layout: Some(beryl_proto::common::FileLayoutProto {
-                    block_size: 4096,
-                    chunk_size: 4096,
-                    replication: 1,
-                    block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
-                }),
             }),
         )
         .await
@@ -1165,21 +1156,9 @@ mod tests {
         .into_inner();
         assert_success_header(create.header);
 
-        let open = FileSystemServiceProto::open_write(
-            &env.service,
-            Request::new(OpenWriteRequestProto {
-                header: header(client_id),
-                path: path.to_string(),
-                mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
-        assert_success_header(open.header);
-        let expected_content_revision = open.content_revision;
+        let expected_content_revision = create.content_revision;
         let write_mode = OpenWriteModeProto::OpenWriteModeWrite as i32;
-        let write_handle = open.write_handle.expect("write handle");
+        let write_handle = create.write_handle.expect("write handle");
         let target = FileSystemServiceProto::add_block(
             &env.service,
             Request::new(AddBlockRequestProto {
@@ -1363,18 +1342,6 @@ mod tests {
             Request::new(CreateFileRequestProto {
                 header: header(client_id),
                 path: path.to_string(),
-                attrs: Some(beryl_proto::metadata::FileAttrsProto {
-                    mode: 0o644,
-                    uid: 1000,
-                    gid: 1000,
-                    ..Default::default()
-                }),
-                layout: Some(beryl_proto::common::FileLayoutProto {
-                    block_size: 128,
-                    chunk_size: 128,
-                    replication: 1,
-                    block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
-                }),
             }),
         )
         .await
@@ -1382,19 +1349,7 @@ mod tests {
         .into_inner();
         assert_success_header(create.header);
 
-        let open = FileSystemServiceProto::open_write(
-            &env.service,
-            Request::new(OpenWriteRequestProto {
-                header: header(client_id),
-                path: path.to_string(),
-                mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
-        assert_success_header(open.header);
-        let write_handle = open.write_handle.expect("write handle");
+        let write_handle = create.write_handle.expect("write handle");
 
         let first_target = FileSystemServiceProto::add_block(
             &env.service,
@@ -1441,7 +1396,7 @@ mod tests {
                 write_handle: Some(write_handle),
                 committed_blocks: vec![first, second],
                 final_size: 256,
-                expected_content_revision: open.content_revision,
+                expected_content_revision: create.content_revision,
                 write_mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
                 expected_file_size: 0,
             }),
@@ -1458,7 +1413,7 @@ mod tests {
                 write_handle: Some(write_handle),
                 committed_blocks: vec![second],
                 final_size: 256,
-                expected_content_revision: open.content_revision,
+                expected_content_revision: create.content_revision,
                 write_mode: OpenWriteModeProto::OpenWriteModeAppend as i32,
                 expected_file_size: 128,
             }),
@@ -1476,7 +1431,7 @@ mod tests {
                 write_handle: Some(write_handle),
                 committed_blocks: vec![second],
                 final_size: 256,
-                expected_content_revision: open.content_revision,
+                expected_content_revision: create.content_revision,
                 write_mode: OpenWriteModeProto::OpenWriteModeAppend as i32,
                 expected_file_size: 64,
             }),
@@ -1503,18 +1458,6 @@ mod tests {
             Request::new(CreateFileRequestProto {
                 header: header(30),
                 path: "/mnt/test/replay-file".to_string(),
-                attrs: Some(beryl_proto::metadata::FileAttrsProto {
-                    mode: 0o644,
-                    uid: 1000,
-                    gid: 1000,
-                    ..Default::default()
-                }),
-                layout: Some(beryl_proto::common::FileLayoutProto {
-                    block_size: 4096,
-                    chunk_size: 4096,
-                    replication: 1,
-                    block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
-                }),
             }),
         )
         .await
@@ -1522,23 +1465,11 @@ mod tests {
         .into_inner();
         assert_success_header(create.header);
 
-        let inode_id = create.inode_id;
+        let write_handle = create.write_handle.expect("write handle");
+        let inode_id = write_handle.inode_id;
         assert_ne!(inode_id, 0);
-        let open = FileSystemServiceProto::open_write(
-            &env.service,
-            Request::new(OpenWriteRequestProto {
-                header: header(30),
-                path: "/mnt/test/replay-file".to_string(),
-                mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
-        assert_success_header(open.header);
-        let expected_content_revision = open.content_revision;
+        let expected_content_revision = create.content_revision;
         let write_mode = OpenWriteModeProto::OpenWriteModeWrite as i32;
-        let write_handle = open.write_handle.expect("write handle");
         let file_inode_id = InodeId::new(inode_id);
         let session_inode_id = InodeId::new(write_handle.inode_id);
         assert!(env.session_registry.get_session(session_inode_id).is_some());

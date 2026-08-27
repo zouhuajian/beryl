@@ -3,6 +3,7 @@
 
 //! Metadata authority commands replicated through Raft.
 
+use crate::session_registry::CreateFileOperationId;
 use beryl_types::fs::{Extent, FileAttrs, InodeId};
 use beryl_types::ids::{MountId, WorkerId};
 use beryl_types::layout::FileLayout;
@@ -33,9 +34,8 @@ pub(crate) enum PublishMode {
 
 /// One durable metadata authority operation.
 ///
-/// RPC identity is intentionally absent. Retry behavior is defined at the RPC
-/// boundary; Raft contains only state transitions and their domain
-/// preconditions.
+/// RPC identity is absent except for atomic CreateFile, whose exact client/call
+/// identity is part of its durable response-loss replay contract.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Command {
     BootstrapNamespace {
@@ -51,8 +51,14 @@ pub(crate) enum Command {
     },
     CreateFile {
         proposed_at_ms: u64,
-        parent_inode_id: InodeId,
-        name: String,
+        operation_id: CreateFileOperationId,
+        request_deadline_ms: u64,
+        session_expires_at_ms: u64,
+        normalized_path: String,
+        mount_id: MountId,
+        expected_mount_epoch: u64,
+        mount_root_inode_id: InodeId,
+        relative_components: Vec<String>,
         attrs: FileAttrs,
         layout: FileLayout,
     },

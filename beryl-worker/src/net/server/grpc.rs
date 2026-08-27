@@ -591,7 +591,7 @@ mod tests {
                 worker_run_id: worker_run_id.to_string(),
                 block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
                 block_size: 4096,
-                chunk_size: 1024,
+                chunk_size: BlockFormatId::FULL_EFFECTIVE.spec().unwrap().storage_chunk_size,
                 block_stamp: 55,
                 tier: TierProto::TierHdd as i32,
             }))),

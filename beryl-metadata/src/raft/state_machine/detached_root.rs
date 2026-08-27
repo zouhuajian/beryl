@@ -326,7 +326,7 @@ mod tests {
             .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id))
             .unwrap();
         storage.put_dentry(parent_inode_id, name, inode_id).unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();
     }
 
     fn reclaim(

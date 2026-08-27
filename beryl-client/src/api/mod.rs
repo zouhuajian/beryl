@@ -9,8 +9,8 @@ pub(crate) mod options;
 pub(crate) mod path;
 mod status;
 
-pub use beryl_types::{BlockFormatId, FileAttrs, InodeKind};
+pub use beryl_types::{FileAttrs, InodeKind};
 pub use client::FsClient;
 pub use handle::{FileReader, FileWriter};
-pub use options::{CreateOptions, DeleteOptions, ListOptions};
+pub use options::{DeleteOptions, ListOptions};
 pub use status::{DirectoryEntry, DirectoryListing, FileStatus};

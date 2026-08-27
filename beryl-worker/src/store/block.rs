@@ -1517,7 +1517,12 @@ mod tests {
 
     fn create_default_block(store: &FullBlockFileStore, group_name: &GroupName, block_id: BlockId) {
         store
-            .create_staging_block(request(group_name, block_id, 4096, 1024))
+            .create_staging_block(request(
+                group_name,
+                block_id,
+                4096,
+                BlockFormatId::FULL_EFFECTIVE.spec().unwrap().storage_chunk_size,
+            ))
             .expect("create staging block");
     }
 
@@ -1619,7 +1624,7 @@ mod tests {
             format: BlockFormat {
                 format_id: BlockFormatId::FULL_EFFECTIVE,
                 block_size: 4096,
-                chunk_size: 1024,
+                chunk_size: BlockFormatId::FULL_EFFECTIVE.spec().unwrap().storage_chunk_size.into(),
                 checksum_kind: ChecksumKind::None,
             },
             source: BlockSource { effective_len: 3072 },

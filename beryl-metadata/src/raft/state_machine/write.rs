@@ -64,6 +64,7 @@ impl AppRaftStateMachine {
         &self,
         inode_id: InodeId,
         expected_lease_epoch: u64,
+        proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<u64> {
         let prepared: MetadataResult<(Inode, u64)> = (|| {
@@ -72,6 +73,27 @@ impl AppRaftStateMachine {
                 .get_inode(inode_id)?
                 .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {inode_id}")))?;
             Self::ensure_file_inode_authority(inode_id, &inode)?;
+            if let Some(record) = self.storage.get_create_file_replay_for_inode(inode_id)? {
+                let InodeData::File {
+                    extents,
+                    content_revision,
+                    lease_epoch,
+                    next_block_index,
+                } = &inode.data
+                else {
+                    unreachable!("file authority checked above")
+                };
+                let still_initial = extents.is_empty()
+                    && content_revision.unwrap_or_default() == record.content_revision
+                    && *lease_epoch == Some(record.lease_epoch)
+                    && *next_block_index == 0
+                    && inode.attrs.size == 0;
+                if record.expires_at_ms > proposed_at_ms && still_initial {
+                    return Err(MetadataError::Again(format!(
+                        "CreateFile replay still owns the initial write session for inode {inode_id}"
+                    )));
+                }
+            }
             let lease_epoch = match &mut inode.data {
                 InodeData::File { lease_epoch, .. } => {
                     let current = lease_epoch.unwrap_or(0);

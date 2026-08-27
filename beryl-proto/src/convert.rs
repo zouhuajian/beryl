@@ -110,11 +110,9 @@ impl TryFrom<proto_common::FileLayoutProto> for FileLayout {
     type Error = String;
 
     fn try_from(layout: proto_common::FileLayoutProto) -> Result<Self, Self::Error> {
-        let replication =
-            u8::try_from(layout.replication).map_err(|_| "FileLayoutProto.replication does not fit u8".to_string())?;
         let block_format_id = beryl_types::layout::BlockFormatId::from_raw(layout.block_format_id)
             .map_err(|err| format!("FileLayoutProto.block_format_id invalid: {err}"))?;
-        let layout = FileLayout::with_block_format(layout.block_size, layout.chunk_size, replication, block_format_id);
+        let layout = FileLayout::with_block_format(layout.block_size, block_format_id);
         layout
             .validate()
             .map_err(|err| format!("FileLayoutProto invalid: {err}"))?;
@@ -126,8 +124,6 @@ impl From<&FileLayout> for proto_common::FileLayoutProto {
     fn from(layout: &FileLayout) -> Self {
         Self {
             block_size: layout.block_size,
-            chunk_size: layout.chunk_size,
-            replication: u32::from(layout.replication),
             block_format_id: layout.block_format_id.as_raw(),
         }
     }
@@ -1157,7 +1153,10 @@ mod tests {
             worker_endpoints: Vec::new(),
             fencing_token: Some(token.into()),
             block_stamp: 55,
-            chunk_size: 1024,
+            chunk_size: beryl_types::layout::BlockFormatId::FULL_EFFECTIVE
+                .spec()
+                .unwrap()
+                .storage_chunk_size,
             block_format_id: beryl_types::layout::BlockFormatId::FULL_EFFECTIVE.as_raw(),
             block_size: 4096,
             tier: proto_common::TierProto::TierHdd as i32,
@@ -1177,7 +1176,10 @@ mod tests {
             block_stamp: Some(55),
             block_format_id: beryl_types::layout::BlockFormatId::FULL_EFFECTIVE.as_raw(),
             block_size: 4096,
-            chunk_size: 1024,
+            chunk_size: beryl_types::layout::BlockFormatId::FULL_EFFECTIVE
+                .spec()
+                .unwrap()
+                .storage_chunk_size,
             effective_len: 4096,
         };
         let decoded_empty =

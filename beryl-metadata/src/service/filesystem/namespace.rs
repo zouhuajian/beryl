@@ -8,6 +8,9 @@ use super::{validate_active_write_layout, Freshness, FsResult, MetadataFileSyste
 use crate::error::{MetadataError, MetadataResult};
 use crate::observe;
 use crate::raft::{ApplySuccess, Command};
+use crate::session_registry::{
+    BeginCreateSession, BeginCreateSessionError, BeginCreateSessionInput, CreateFileOperationId, WriteOpeningError,
+};
 use beryl_types::fs::{FileAttrs, InodeId};
 use beryl_types::layout::FileLayout;
 use std::sync::atomic::Ordering;
@@ -458,16 +461,16 @@ impl MetadataFileSystem {
 
 pub(crate) struct CreateFileArgs {
     pub(crate) path: String,
-    // Deferring wire conversion errors until after write admission preserves failure precedence.
-    pub(crate) parsed_attrs: Result<FileAttrs, MetadataError>,
-    pub(crate) parsed_layout: Result<FileLayout, MetadataError>,
-    pub(crate) parsed_mode: Result<(), MetadataError>,
     pub(crate) freshness: Freshness,
 }
 
+/// Atomic CreateFile result needed to begin client-side writes immediately.
 pub(crate) struct CreatedFileOutput {
     pub(crate) inode_id: InodeId,
+    pub(crate) lease_epoch: u64,
     pub(crate) layout: FileLayout,
+    pub(crate) expires_at_ms: u64,
+    pub(crate) content_revision: u64,
 }
 
 impl MetadataFileSystem {
@@ -488,8 +491,7 @@ impl MetadataFileSystem {
                     path = %path,
                     inode_id = payload.inode_id.as_raw(),
                     layout_block_size = payload.layout.block_size,
-                    layout_chunk_size = payload.layout.chunk_size,
-                    replication = payload.layout.replication,
+                    block_format_id = payload.layout.block_format_id.as_raw(),
                     mount_epoch = success.mount_epoch,
                     route_epoch = success.route_epoch,
                     "CreateFile committed"
@@ -515,27 +517,13 @@ impl MetadataFileSystem {
         }
         let _topology_guard = self.namespace_topology.read().await;
 
-        let CreateFileArgs {
-            path,
-            parsed_attrs,
-            parsed_layout,
-            parsed_mode,
-            freshness,
-        } = args;
-        match parsed_mode {
-            Ok(()) => {}
-            Err(err) => return self.failure_from_path_error(ctx, &path, err),
-        }
-        let attrs = match parsed_attrs {
-            Ok(attrs) => attrs,
-            Err(err) => return self.failure_from_path_error(ctx, &path, err),
-        };
-        let layout = match parsed_layout {
-            Ok(layout) => layout,
-            Err(err) => return self.failure_from_path_error(ctx, &path, err),
-        };
-        if let Err(err) = validate_active_write_layout(&layout) {
-            return self.failure_from_path_error(ctx, &path, err);
+        let CreateFileArgs { path, freshness } = args;
+        if ctx.caller.deadline.has_passed() {
+            return self.failure_from_path_error(
+                ctx,
+                &path,
+                MetadataError::InvalidArgument("CreateFile request deadline has expired".to_string()),
+            );
         }
 
         let path = match crate::path_resolver::PathResolver::normalize(&path) {
@@ -546,7 +534,7 @@ impl MetadataFileSystem {
             Ok(resolved) => resolved,
             Err(err) => return self.failure_from_path_error(ctx, &path, err),
         };
-        let (Some(parent_inode_id), Some(name)) = (resolved.parent_inode_id, resolved.name.clone()) else {
+        let (Some(parent_inode_id), Some(_)) = (resolved.parent_inode_id, resolved.name.as_ref()) else {
             return self.failure_from_resolved_path_error(
                 ctx,
                 MetadataError::InvalidArgument("Cannot operate on mount root".to_string()),
@@ -556,21 +544,42 @@ impl MetadataFileSystem {
         if let Err(failure) = self.admission.check_data_write(ctx, resolved.mount_ctx.mount_id) {
             return self.failure_from_admission(failure);
         }
+        let mut parent_ancestor_inode_ids = resolved.ancestor_inode_ids.clone();
+        if resolved.inode_id.is_some() {
+            parent_ancestor_inode_ids.pop();
+        }
+        if parent_ancestor_inode_ids.last() != Some(&parent_inode_id) {
+            return self.failure_from_error(
+                ctx,
+                MetadataError::Internal("CreateFile resolved parent chain is inconsistent".to_string()),
+                Some(resolved.mount_ctx.owner_group_name),
+                Some(resolved.mount_ctx.mount_epoch),
+            );
+        }
         let success = self
-            .create_resolved(ctx, parent_inode_id, name, attrs, layout, freshness)
+            .create_resolved(
+                ctx,
+                path,
+                resolved.relative_components,
+                parent_inode_id,
+                parent_ancestor_inode_ids,
+                freshness,
+            )
             .await?;
         Ok(success)
     }
 
+    /// Reserve a session, commit atomic file authority, and activate the exact reservation.
     async fn create_resolved(
         &self,
         request_ctx: &RequestContext,
+        normalized_path: String,
+        relative_components: Vec<String>,
         parent_inode_id: InodeId,
-        name: String,
-        attrs: FileAttrs,
-        layout: FileLayout,
+        parent_ancestor_inode_ids: Vec<InodeId>,
         freshness: Freshness,
     ) -> FsResult<CreatedFileOutput> {
+        let layout = self.file_create_layout;
         if let Err(err) = validate_active_write_layout(&layout) {
             return self.failure_from_error(request_ctx, err, None, None);
         }
@@ -580,17 +589,125 @@ impl MetadataFileSystem {
             Err(err) => return Err(err),
         };
 
+        let operation_id = CreateFileOperationId {
+            client_id: request_ctx.caller.client.client_id,
+            call_id: request_ctx.caller.client.call_id,
+        };
+        let request_deadline_ms = match u64::try_from(request_ctx.caller.deadline.as_unix_ms()) {
+            Ok(deadline) => deadline,
+            Err(_) => {
+                return self.failure_from_error(
+                    request_ctx,
+                    MetadataError::InvalidArgument("CreateFile deadline must be non-negative".to_string()),
+                    Some(ctx.group_name),
+                    Some(ctx.mount_epoch),
+                );
+            }
+        };
+        let opening = match self.session_registry.begin_create_session(BeginCreateSessionInput {
+            operation_id,
+            request_deadline_ms,
+            normalized_path: normalized_path.clone(),
+            mount_id: ctx.mount_id,
+            expected_mount_epoch: ctx.mount_epoch,
+            mount_root_inode_id: ctx.mount_root_inode_id,
+            open_client_id: request_ctx.caller.client.client_id,
+            parent_ancestor_inode_ids,
+        }) {
+            Ok(BeginCreateSession::Replay(session)) => {
+                return self.success(
+                    CreatedFileOutput {
+                        inode_id: session.inode_id,
+                        lease_epoch: session.lease_epoch,
+                        layout: session.layout,
+                        expires_at_ms: session.expires_at_ms,
+                        content_revision: session.content_revision,
+                    },
+                    Some(ctx.group_name),
+                    Some(ctx.mount_epoch),
+                );
+            }
+            Ok(BeginCreateSession::Reserved(opening)) => opening,
+            Err(BeginCreateSessionError::Pending) => {
+                return self.failure_from_error(
+                    request_ctx,
+                    MetadataError::Again("the same CreateFile operation is still pending".to_string()),
+                    Some(ctx.group_name),
+                    Some(ctx.mount_epoch),
+                );
+            }
+            Err(BeginCreateSessionError::PathBusy) => {
+                return self.failure_from_error(
+                    request_ctx,
+                    MetadataError::Again("another CreateFile operation is pending for this path".to_string()),
+                    Some(ctx.group_name),
+                    Some(ctx.mount_epoch),
+                );
+            }
+            Err(BeginCreateSessionError::IdentityMismatch) => {
+                return self.failure_from_error(
+                    request_ctx,
+                    MetadataError::InvalidArgument(
+                        "CreateFile operation identity was reused for another request".to_string(),
+                    ),
+                    Some(ctx.group_name),
+                    Some(ctx.mount_epoch),
+                );
+            }
+            Err(BeginCreateSessionError::LimitExceeded(rejection)) => {
+                return self.failure_from_error(
+                    request_ctx,
+                    MetadataError::WriteSessionLimitExceeded(format!(
+                        "{} limit {} reached",
+                        rejection.limit.label(),
+                        rejection.maximum
+                    )),
+                    Some(ctx.group_name),
+                    Some(ctx.mount_epoch),
+                );
+            }
+            Err(BeginCreateSessionError::OpeningIdExhausted) => {
+                return self.failure_from_error(
+                    request_ctx,
+                    MetadataError::ResourceExhausted("leader-local write opening identity exhausted".to_string()),
+                    Some(ctx.group_name),
+                    Some(ctx.mount_epoch),
+                );
+            }
+            Err(BeginCreateSessionError::InvalidAncestorChain) => {
+                return self.failure_from_error(
+                    request_ctx,
+                    MetadataError::Internal("validated CreateFile parent chain was rejected".to_string()),
+                    Some(ctx.group_name),
+                    Some(ctx.mount_epoch),
+                );
+            }
+        };
+        let session_expires_at_ms = opening.expires_at_ms();
+
         let result = match self
             .propose_fs_write_command(
                 Command::CreateFile {
                     proposed_at_ms: crate::raft::proposal_timestamp_ms(),
-                    parent_inode_id,
-                    name,
-                    attrs,
+                    operation_id,
+                    request_deadline_ms,
+                    session_expires_at_ms,
+                    normalized_path,
+                    mount_id: ctx.mount_id,
+                    expected_mount_epoch: ctx.mount_epoch,
+                    mount_root_inode_id: ctx.mount_root_inode_id,
+                    relative_components,
+                    attrs: FileAttrs::new(),
                     layout,
                 },
                 |success| match success {
-                    ApplySuccess::FileCreated { inode_id, layout } => Ok(CreatedFileOutput { inode_id, layout }),
+                    ApplySuccess::FileCreated {
+                        inode_id,
+                        layout,
+                        lease_epoch,
+                        expires_at_ms,
+                        content_revision,
+                    } => Ok((inode_id, layout, lease_epoch, expires_at_ms, content_revision)),
                     unexpected => Err(unexpected_raft_apply_success("CreateFile", unexpected)),
                 },
             )
@@ -602,7 +719,42 @@ impl MetadataFileSystem {
             }
         };
 
-        self.success(result, Some(ctx.group_name.clone()), Some(ctx.mount_epoch))
+        let (inode_id, layout, lease_epoch, expires_at_ms, content_revision) = result;
+        let session = match opening.activate(inode_id, lease_epoch, expires_at_ms, layout, content_revision) {
+            Ok(session) => session,
+            Err(WriteOpeningError::Expired | WriteOpeningError::NotCurrent) => {
+                return self.failure_from_error(
+                    request_ctx,
+                    MetadataError::Again(format!(
+                        "CreateFile committed but its local write opening expired for inode {inode_id}"
+                    )),
+                    Some(ctx.group_name),
+                    Some(ctx.mount_epoch),
+                );
+            }
+            Err(WriteOpeningError::LeaseEpochMismatch { expected, got }) => {
+                return self.failure_from_error(
+                    request_ctx,
+                    MetadataError::Internal(format!(
+                        "CreateFile opening epoch mismatch for inode {inode_id}: expected {expected}, got {got}"
+                    )),
+                    Some(ctx.group_name),
+                    Some(ctx.mount_epoch),
+                );
+            }
+        };
+
+        self.success(
+            CreatedFileOutput {
+                inode_id: session.inode_id,
+                lease_epoch: session.lease_epoch,
+                layout: session.layout,
+                expires_at_ms: session.expires_at_ms,
+                content_revision: session.content_revision,
+            },
+            Some(ctx.group_name),
+            Some(ctx.mount_epoch),
+        )
     }
 }
 
@@ -799,7 +951,7 @@ mod tests {
         storage.put_dentry(parent_inode_id, "root", root_inode_id).unwrap();
         storage.put_dentry(root_inode_id, "nested", nested_inode_id).unwrap();
         storage.put_dentry(nested_inode_id, "file", file_inode_id).unwrap();
-        storage.put_layout(file_inode_id, FileLayout::new(64, 64, 1)).unwrap();
+        storage.put_layout(file_inode_id, FileLayout::new(64)).unwrap();
         install_write_session_with_ancestors(
             &filesystem,
             file_inode_id,
@@ -849,7 +1001,7 @@ mod tests {
             .put_inode(&Inode::new_file(file_inode_id, FileAttrs::new(), mount_id))
             .unwrap();
         storage.put_dentry(ROOT_INODE_ID, "file", file_inode_id).unwrap();
-        storage.put_layout(file_inode_id, FileLayout::new(64, 64, 1)).unwrap();
+        storage.put_layout(file_inode_id, FileLayout::new(64)).unwrap();
 
         let open_ctx = request_context();
         let delete_ctx = request_context();
@@ -920,7 +1072,7 @@ mod tests {
         storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
         storage.put_dentry(source_inode_id, "nested", nested_inode_id).unwrap();
         storage.put_dentry(nested_inode_id, "file", file_inode_id).unwrap();
-        storage.put_layout(file_inode_id, FileLayout::new(64, 64, 1)).unwrap();
+        storage.put_layout(file_inode_id, FileLayout::new(64)).unwrap();
         install_write_session_with_ancestors(
             &filesystem,
             file_inode_id,
@@ -982,7 +1134,7 @@ mod tests {
         storage.put_dentry(parent_inode_id, "target", target_inode_id).unwrap();
         storage.put_dentry(target_inode_id, "nested", nested_inode_id).unwrap();
         storage.put_dentry(nested_inode_id, "file", file_inode_id).unwrap();
-        storage.put_layout(file_inode_id, FileLayout::new(64, 64, 1)).unwrap();
+        storage.put_layout(file_inode_id, FileLayout::new(64)).unwrap();
         install_write_session_with_ancestors(
             &filesystem,
             file_inode_id,

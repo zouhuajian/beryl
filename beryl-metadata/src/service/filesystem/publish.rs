@@ -290,7 +290,7 @@ impl MetadataFileSystem {
         intent: &CloseWriteIntent,
         expected_content_revision: u64,
         mode: PublishMode,
-    ) -> MetadataResult<Option<(InodeId, MountId, u64)>> {
+    ) -> MetadataResult<Option<(InodeId, MountId, u64, u64)>> {
         let inode = self
             .read_inode(inode_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {inode_id}")))?;
@@ -362,10 +362,10 @@ impl MetadataFileSystem {
                     && extent.len == block.len
             });
         if expected_content_revision.checked_add(1) == Some(content_revision) && state_matches {
-            return Ok(Some((inode_id, inode.mount_id, content_revision)));
+            return Ok(Some((inode_id, inode.mount_id, content_revision, stored_lease_epoch)));
         }
         if content_revision == expected_content_revision && intent.committed_blocks.is_empty() && state_matches {
-            return Ok(Some((inode_id, inode.mount_id, content_revision)));
+            return Ok(Some((inode_id, inode.mount_id, content_revision, stored_lease_epoch)));
         }
         if content_revision != expected_content_revision {
             return Err(MetadataError::Again(format!(
@@ -713,21 +713,32 @@ impl MetadataFileSystem {
     fn require_publish_deadline(
         &self,
         ctx: &RequestContext,
-        group_name: &GroupName,
+        group_name: Option<&GroupName>,
         mount_epoch: Option<u64>,
         route_epoch: Option<u64>,
     ) -> Result<(), FsFailure> {
         if !ctx.caller.deadline.has_passed() {
             return Ok(());
         }
-        Err(self.publish_ready_refresh_failure(
-            ctx,
-            ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
-            "deadline expired before file publication",
-            group_name,
-            (mount_epoch, route_epoch),
-            false,
-        ))
+        match group_name {
+            Some(group_name) => Err(self.publish_ready_refresh_failure(
+                ctx,
+                ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
+                "deadline expired before file publication",
+                group_name,
+                (mount_epoch, route_epoch),
+                false,
+            )),
+            None => Err(self
+                .failure_from_error_with_route_epoch::<()>(
+                    ctx,
+                    MetadataError::Again("deadline expired before file publication".to_string()),
+                    None,
+                    mount_epoch,
+                    route_epoch,
+                )
+                .expect_err("expired publication deadline must fail")),
+        }
     }
 
     /// Revalidate leader-local session and lease state after an asynchronous
@@ -818,7 +829,7 @@ impl MetadataFileSystem {
             Err(failure) => return Err(failure),
         };
         match self.resolve_published_state(inode_id, lease_epoch, &intent, expected_content_revision, publish_mode) {
-            Ok(Some((_inode_id, mount_id, content_revision))) => {
+            Ok(Some((_inode_id, mount_id, content_revision, _stored_lease_epoch))) => {
                 let publication = if active_session.is_some() {
                     Some(self.begin_write_publication(ctx, inode_id, lease_epoch, publish_mode, "SyncWrite")?)
                 } else {
@@ -1004,7 +1015,12 @@ impl MetadataFileSystem {
             Ok(ctx) => ctx,
             Err(failure) => return Err(failure),
         };
-        self.require_publish_deadline(ctx, &worker_lookup_group_name, Some(routed.mount_epoch), route_epoch)?;
+        self.require_publish_deadline(
+            ctx,
+            Some(&worker_lookup_group_name),
+            Some(routed.mount_epoch),
+            route_epoch,
+        )?;
 
         let command = Command::PublishFile {
             proposed_at_ms: crate::raft::proposal_timestamp_ms(),
@@ -1291,7 +1307,7 @@ impl MetadataFileSystem {
             Err(failure) => return Err(failure),
         };
         match self.resolve_published_state(inode_id, lease_epoch, &intent, expected_content_revision, publish_mode) {
-            Ok(Some((_inode_id, mount_id, content_revision))) => {
+            Ok(Some((_inode_id, mount_id, content_revision, stored_lease_epoch))) => {
                 let publication = if active_session.is_some() {
                     Some(self.begin_write_publication(ctx, inode_id, lease_epoch, publish_mode, "CommitFile")?)
                 } else {
@@ -1313,6 +1329,60 @@ impl MetadataFileSystem {
                 let (group_name, mount_epoch, route_epoch) = self
                     .completed_publish_hints(ctx, freshness, mount_id, "CommitFile")
                     .await?;
+                // A no-op close has no content mutation to prove that the initial
+                // CreateFile write right ended, so advance its durable fence explicitly.
+                if content_revision == expected_content_revision && stored_lease_epoch == lease_epoch {
+                    let proposed_at_ms = crate::raft::proposal_timestamp_ms();
+                    if active_session.is_none() {
+                        let owner_matches = match self.storage.get_create_file_replay_for_inode(inode_id) {
+                            Ok(Some(replay)) => {
+                                replay.operation_id.client_id == ctx.caller.client.client_id
+                                    && replay.inode_id == inode_id
+                                    && replay.mount_id == mount_id
+                                    && replay.lease_epoch == lease_epoch
+                                    && replay.content_revision == expected_content_revision
+                                    && replay.expires_at_ms > proposed_at_ms
+                            }
+                            Ok(None) => false,
+                            Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
+                        };
+                        if !owner_matches {
+                            return self.session_terminal_failure(
+                                ctx,
+                                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                                format!("CommitFile cannot authenticate the durable owner for inode_id={inode_id}"),
+                                group_name,
+                                mount_epoch,
+                            );
+                        }
+                    }
+                    self.require_publish_deadline(ctx, group_name.as_ref(), mount_epoch, route_epoch)?;
+                    let expected_ended_epoch = lease_epoch.checked_add(1);
+                    let expected_inode_id = inode_id;
+                    if let Err(error) = self
+                        .propose_fs_write_command(
+                            Command::EndWriteLease {
+                                proposed_at_ms,
+                                inode_id,
+                                lease_epoch,
+                            },
+                            move |success| match success {
+                                ApplySuccess::WriteLeaseEnded {
+                                    inode_id: returned_inode_id,
+                                    lease_epoch: ended_epoch,
+                                } if returned_inode_id == expected_inode_id
+                                    && Some(ended_epoch) == expected_ended_epoch =>
+                                {
+                                    Ok(())
+                                }
+                                unexpected => Err(unexpected_raft_apply_success("EndWriteLease", unexpected)),
+                            },
+                        )
+                        .await
+                    {
+                        return self.failure_from_error(ctx, error, group_name, mount_epoch);
+                    }
+                }
                 if let Some(publication) = publication {
                     if let Err(message) = publication.complete_commit() {
                         return self.failure_from_error(ctx, MetadataError::Internal(message), group_name, mount_epoch);
@@ -1467,7 +1537,12 @@ impl MetadataFileSystem {
             Ok(ctx) => ctx,
             Err(failure) => return Err(failure),
         };
-        self.require_publish_deadline(ctx, &worker_lookup_group_name, Some(routed.mount_epoch), route_epoch)?;
+        self.require_publish_deadline(
+            ctx,
+            Some(&worker_lookup_group_name),
+            Some(routed.mount_epoch),
+            route_epoch,
+        )?;
 
         let command = Command::PublishFile {
             proposed_at_ms: crate::raft::proposal_timestamp_ms(),
@@ -1528,6 +1603,7 @@ mod tests {
             .filesystem
             .open_write_inode(
                 &request_context(),
+                "/file".to_string(),
                 env.inode_id,
                 vec![env.inode_id],
                 crate::session_registry::WriteMode::Write,
@@ -1555,6 +1631,7 @@ mod tests {
             .filesystem
             .open_write_inode(
                 &request_context(),
+                "/file".to_string(),
                 env.inode_id,
                 vec![env.inode_id],
                 crate::session_registry::WriteMode::Write,
@@ -1594,6 +1671,7 @@ mod tests {
             .filesystem
             .open_write_inode(
                 &request_context(),
+                "/file".to_string(),
                 env.inode_id,
                 vec![env.inode_id],
                 crate::session_registry::WriteMode::Write,
@@ -1635,6 +1713,102 @@ mod tests {
             .expect_err("deadline expiring after the wait must still prevent publication");
         assert_eq!(stored_content_revision(&env.storage, env.inode_id), None);
         assert!(env.filesystem.write_session_for_inode(open.inode_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn noop_close_requires_a_live_owner_and_deadline_before_ending_the_lease() {
+        let env = write_flow_env(0).await;
+        let open = env
+            .filesystem
+            .open_write_inode(
+                &request_context(),
+                "/file".to_string(),
+                env.inode_id,
+                vec![env.inode_id],
+                crate::session_registry::WriteMode::Write,
+                Freshness::default(),
+            )
+            .await
+            .expect("open write")
+            .payload;
+        let mut ctx = request_context();
+        ctx.caller.deadline = Deadline::from_unix_ms(0);
+
+        env.filesystem
+            .close_write_session(
+                &ctx,
+                PresentedWriteHandle {
+                    inode_id: open.inode_id,
+                    lease_epoch: open.lease_epoch,
+                },
+                CloseWriteIntent {
+                    committed_blocks: Vec::new(),
+                    final_size: 0,
+                    expected_file_size: 0,
+                },
+                Freshness::default(),
+                open.content_revision,
+                PublishMode::ReplaceIfUnchanged,
+            )
+            .await
+            .expect_err("an expired no-op close must fail before ending the lease");
+
+        let stored_epoch = env
+            .storage
+            .get_inode(open.inode_id)
+            .unwrap()
+            .and_then(|inode| match inode.data {
+                beryl_types::fs::InodeData::File { lease_epoch, .. } => lease_epoch,
+                _ => None,
+            });
+        assert_eq!(stored_epoch, Some(open.lease_epoch));
+        assert!(env.filesystem.write_session_for_inode(open.inode_id).is_some());
+
+        let env = write_flow_env(0).await;
+        let open = env
+            .filesystem
+            .open_write_inode(
+                &request_context(),
+                "/file".to_string(),
+                env.inode_id,
+                vec![env.inode_id],
+                crate::session_registry::WriteMode::Write,
+                Freshness::default(),
+            )
+            .await
+            .expect("open write")
+            .payload;
+        env.filesystem
+            .session_registry()
+            .remove_session_if_epoch(open.inode_id, open.lease_epoch)
+            .expect("remove leader-local session");
+        env.filesystem
+            .close_write_session(
+                &request_context(),
+                PresentedWriteHandle {
+                    inode_id: open.inode_id,
+                    lease_epoch: open.lease_epoch,
+                },
+                CloseWriteIntent {
+                    committed_blocks: Vec::new(),
+                    final_size: 0,
+                    expected_file_size: 0,
+                },
+                Freshness::default(),
+                open.content_revision,
+                PublishMode::ReplaceIfUnchanged,
+            )
+            .await
+            .expect_err("sessionless OpenWrite close must not advance its durable fence");
+        let stored_epoch = env
+            .storage
+            .get_inode(open.inode_id)
+            .unwrap()
+            .and_then(|inode| match inode.data {
+                beryl_types::fs::InodeData::File { lease_epoch, .. } => lease_epoch,
+                _ => None,
+            });
+        assert_eq!(stored_epoch, Some(open.lease_epoch));
     }
 
     #[tokio::test]

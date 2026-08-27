@@ -686,8 +686,11 @@ mod tests {
     };
 
     const BLOCK_SIZE: u64 = 4096;
-    const CHUNK_SIZE: u32 = 1024;
     const BLOCK_STAMP: u64 = 55;
+
+    fn chunk_size() -> u32 {
+        BlockFormatId::FULL_EFFECTIVE.spec().unwrap().storage_chunk_size
+    }
 
     fn group_name() -> GroupName {
         GroupName::parse("root").expect("group name")
@@ -705,7 +708,7 @@ mod tests {
             block_stamp: BLOCK_STAMP,
             block_size: BLOCK_SIZE,
             block_format_id: BlockFormatId::FULL_EFFECTIVE,
-            chunk_size: CHUNK_SIZE,
+            chunk_size: chunk_size(),
             checksum_kind: ChecksumKind::None,
             tier: Tier::Hdd,
         }
@@ -858,7 +861,7 @@ mod tests {
             block_stamp: BLOCK_STAMP,
             block_format_id: BlockFormatId::FULL_EFFECTIVE,
             block_size: BLOCK_SIZE,
-            chunk_size: CHUNK_SIZE,
+            chunk_size: chunk_size(),
             effective_len: 8,
             frame_size: 512,
         }
@@ -1118,7 +1121,6 @@ mod tests {
         let (_temp, _store, core) = core_with_store();
         let mut request = write_request();
         request.block_size = 3;
-        request.chunk_size = 1;
         let mut write = core
             .begin_block_write(request, write_rpc_permit())
             .await

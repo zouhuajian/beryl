@@ -4,14 +4,14 @@
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, RpcErrorDetail};
 use beryl_common::header::RequestHeader;
 use beryl_e2e::TestCluster;
-use beryl_proto::common::{FileLayoutProto, RequestHeaderProto, ResponseHeaderProto};
+use beryl_proto::common::{RequestHeaderProto, ResponseHeaderProto};
 use beryl_proto::convert::rpc_error_from_proto;
 use beryl_proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
 use beryl_proto::metadata::{
-    AbortFileWriteRequestProto, AddBlockRequestProto, CreateFileRequestProto, FileAttrsProto, OpenWriteModeProto,
+    AbortFileWriteRequestProto, AddBlockRequestProto, CreateFileRequestProto, OpenWriteModeProto,
     OpenWriteRequestProto, WriteHandleProto, WriteTargetProto,
 };
-use beryl_types::{BlockFormatId, ClientId};
+use beryl_types::ClientId;
 use tonic::transport::Channel;
 use tonic::Request;
 
@@ -28,7 +28,7 @@ async fn low_target_limits_reject_before_raft_and_release_on_abort() {
         .await
         .expect("connect Metadata");
 
-    let first_handle = create_and_open(&mut metadata, "/target-limit-a", 701).await;
+    let first_handle = create(&mut metadata, "/target-limit-a", 701).await;
     let first_target = add_block(&mut metadata, first_handle, None, 701)
         .await
         .expect("first target");
@@ -53,11 +53,11 @@ async fn low_target_limits_reject_before_raft_and_release_on_abort() {
         "per-session rejection must not allocate a block index"
     );
 
-    let second_handle = create_and_open(&mut metadata, "/target-limit-b", 701).await;
+    let second_handle = create(&mut metadata, "/target-limit-b", 701).await;
     add_block(&mut metadata, second_handle, None, 701)
         .await
         .expect("second session target");
-    let third_handle = create_and_open(&mut metadata, "/target-limit-c", 701).await;
+    let third_handle = create(&mut metadata, "/target-limit-c", 701).await;
     let global = add_block(&mut metadata, third_handle, None, 701)
         .await
         .expect_err("global target limit must reject the third session");
@@ -83,28 +83,17 @@ async fn low_target_limits_reject_before_raft_and_release_on_abort() {
     cluster.shutdown().await.expect("shutdown cluster");
 }
 
-async fn create_and_open(
-    metadata: &mut FileSystemServiceProtoClient<Channel>,
-    path: &str,
-    client_id: u64,
-) -> WriteHandleProto {
+async fn create(metadata: &mut FileSystemServiceProtoClient<Channel>, path: &str, client_id: u64) -> WriteHandleProto {
     let create = metadata
         .create_file(Request::new(CreateFileRequestProto {
             header: Some(metadata_header(client_id)),
             path: path.to_string(),
-            attrs: Some(FileAttrsProto::default()),
-            layout: Some(FileLayoutProto {
-                block_size: 1024,
-                chunk_size: 1024,
-                replication: 1,
-                block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
-            }),
         }))
         .await
         .expect("CreateFile transport")
         .into_inner();
     assert_metadata_ok(create.header);
-    open(metadata, path, client_id).await
+    create.write_handle.expect("write handle")
 }
 
 async fn open(metadata: &mut FileSystemServiceProtoClient<Channel>, path: &str, client_id: u64) -> WriteHandleProto {

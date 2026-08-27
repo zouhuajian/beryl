@@ -4,6 +4,58 @@
 use super::*;
 
 impl RocksDBStorage {
+    /// Load the durable result for one atomic CreateFile operation identity.
+    pub(crate) fn get_create_file_replay(
+        &self,
+        operation_id: CreateFileOperationId,
+    ) -> MetadataResult<Option<CreateFileReplayRecord>> {
+        let generation = self.pin_generation()?;
+        let db = generation.db();
+        let cf = Self::cf(db, CF_META)?;
+        let key = Self::encode_create_file_replay_key(operation_id);
+        let Some(value) = db
+            .get_cf(cf, key)
+            .map_err(|error| MetadataError::Internal(format!("Failed to read CreateFile replay record: {error}")))?
+        else {
+            return Ok(None);
+        };
+        let (record, consumed): (CreateFileReplayRecord, usize) = decode_from_slice(&value, standard())
+            .map_err(|error| MetadataError::Internal(format!("Failed to decode CreateFile replay record: {error}")))?;
+        if consumed != value.len() || record.operation_id != operation_id {
+            return Err(MetadataError::Internal(
+                "CreateFile replay record identity is corrupt".to_string(),
+            ));
+        }
+        Ok(Some(record))
+    }
+
+    /// Load the replay record that temporarily reserves one newly created inode.
+    pub(crate) fn get_create_file_replay_for_inode(
+        &self,
+        inode_id: InodeId,
+    ) -> MetadataResult<Option<CreateFileReplayRecord>> {
+        let generation = self.pin_generation()?;
+        let db = generation.db();
+        let cf = Self::cf(db, CF_META)?;
+        let key = Self::encode_create_file_replay_inode_key(inode_id);
+        let Some(value) = db.get_cf(cf, key).map_err(|error| {
+            MetadataError::Internal(format!("Failed to read CreateFile inode replay index: {error}"))
+        })?
+        else {
+            return Ok(None);
+        };
+        let operation_id = Self::decode_create_file_operation_bytes(&value)?;
+        let record = self
+            .get_create_file_replay(operation_id)?
+            .ok_or_else(|| MetadataError::Internal("CreateFile inode replay index has no record".to_string()))?;
+        if record.inode_id != inode_id {
+            return Err(MetadataError::Internal(
+                "CreateFile inode replay index names another inode".to_string(),
+            ));
+        }
+        Ok(Some(record))
+    }
+
     /// Get the authoritative route epoch used for stale-route validation.
     pub fn get_route_epoch(&self) -> MetadataResult<RouteEpoch> {
         let generation = self.pin_generation()?;

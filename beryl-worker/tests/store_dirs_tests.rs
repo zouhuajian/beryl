@@ -12,7 +12,10 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 const BLOCK_SIZE: u64 = 4096;
-const CHUNK_SIZE: u32 = 1024;
+
+fn chunk_size() -> u32 {
+    BlockFormatId::FULL_EFFECTIVE.spec().unwrap().storage_chunk_size
+}
 
 fn group_name() -> GroupName {
     GroupName::parse("root").unwrap()
@@ -59,7 +62,7 @@ fn staging_req(index: u32) -> CreateStagingBlockRequest {
         block_id: block_id(index),
         block_size: BLOCK_SIZE,
         block_format_id: BlockFormatId::FULL_EFFECTIVE,
-        chunk_size: CHUNK_SIZE,
+        chunk_size: chunk_size(),
         checksum_kind: ChecksumKind::None,
         tier: Tier::Hdd,
     }
