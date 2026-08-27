@@ -69,17 +69,15 @@ impl Operation {
             | Self::Msync
             | Self::Read => RetrySafety::ReadOnly,
             Self::CreateDirectoryRecursive
+            | Self::CreateFile
             | Self::AddBlock
             | Self::CommitFile
             | Self::AbortFileWrite
             | Self::RenewLease
             | Self::SyncWrite => RetrySafety::ReplayableMutation,
-            Self::CreateDirectory
-            | Self::Delete
-            | Self::Rename
-            | Self::CreateFile
-            | Self::OpenWrite
-            | Self::WriteBlock => RetrySafety::NonReplayableMutation,
+            Self::CreateDirectory | Self::Delete | Self::Rename | Self::OpenWrite | Self::WriteBlock => {
+                RetrySafety::NonReplayableMutation
+            }
         }
     }
 }

@@ -243,6 +243,132 @@ impl RocksDBStorage {
         Ok(batch)
     }
 
+    /// Add one bounded replay record, evicting only an already expired oldest entry.
+    fn batch_put_create_file_replay(
+        db: &DB,
+        cf_meta: &ColumnFamily,
+        batch: &mut WriteBatch,
+        record: &CreateFileReplayRecord,
+        proposed_at_ms: u64,
+    ) -> MetadataResult<()> {
+        let replay_key = Self::encode_create_file_replay_key(record.operation_id);
+        let replay_inode_key = Self::encode_create_file_replay_inode_key(record.inode_id);
+        if db
+            .get_cf(cf_meta, &replay_key)
+            .map_err(|error| MetadataError::Internal(format!("Failed to check CreateFile replay identity: {error}")))?
+            .is_some()
+        {
+            return Err(MetadataError::Internal(
+                "new CreateFile mutation attempted to overwrite a replay record".to_string(),
+            ));
+        }
+        if db
+            .get_cf(cf_meta, &replay_inode_key)
+            .map_err(|error| {
+                MetadataError::Internal(format!("Failed to check CreateFile inode replay index: {error}"))
+            })?
+            .is_some()
+        {
+            return Err(MetadataError::Internal(
+                "new CreateFile mutation attempted to overwrite an inode replay index".to_string(),
+            ));
+        }
+        let mut replay_count = match db
+            .get_cf(cf_meta, CREATE_FILE_REPLAY_COUNT_KEY)
+            .map_err(|error| MetadataError::Internal(format!("Failed to read CreateFile replay count: {error}")))?
+        {
+            Some(value) => {
+                decode_from_slice::<u64, _>(&value, standard())
+                    .map_err(|error| {
+                        MetadataError::Internal(format!("Failed to decode CreateFile replay count: {error}"))
+                    })?
+                    .0
+            }
+            None => 0,
+        };
+        if replay_count > MAX_CREATE_FILE_REPLAY_RECORDS {
+            return Err(MetadataError::Internal(format!(
+                "CreateFile replay count {replay_count} exceeds its compiled bound"
+            )));
+        }
+        if replay_count == MAX_CREATE_FILE_REPLAY_RECORDS {
+            let mut iter = db.iterator_cf(
+                cf_meta,
+                rocksdb::IteratorMode::From(CREATE_FILE_REPLAY_EXPIRY_PREFIX, rocksdb::Direction::Forward),
+            );
+            let Some(item) = iter.next() else {
+                return Err(MetadataError::Internal(
+                    "CreateFile replay count has no expiry index".to_string(),
+                ));
+            };
+            let (expiry_key, _) = item.map_err(|error| {
+                MetadataError::Internal(format!("Failed to scan CreateFile replay expiry: {error}"))
+            })?;
+            if !expiry_key.starts_with(CREATE_FILE_REPLAY_EXPIRY_PREFIX) {
+                return Err(MetadataError::Internal(
+                    "CreateFile replay count has no matching expiry index".to_string(),
+                ));
+            }
+            let (expires_at_ms, expired_operation_id) = Self::decode_create_file_replay_expiry_key(&expiry_key)?;
+            if expires_at_ms > proposed_at_ms {
+                return Err(MetadataError::ResourceExhausted(format!(
+                    "CreateFile replay capacity {MAX_CREATE_FILE_REPLAY_RECORDS} is exhausted"
+                )));
+            }
+            let expired_replay_key = Self::encode_create_file_replay_key(expired_operation_id);
+            let expired_replay_value = db
+                .get_cf(cf_meta, &expired_replay_key)
+                .map_err(|error| {
+                    MetadataError::Internal(format!("Failed to verify expired CreateFile replay record: {error}"))
+                })?
+                .ok_or_else(|| MetadataError::Internal("CreateFile replay expiry index has no record".to_string()))?;
+            let (expired_record, consumed): (CreateFileReplayRecord, usize) =
+                decode_from_slice(&expired_replay_value, standard()).map_err(|error| {
+                    MetadataError::Internal(format!("Failed to decode expired CreateFile replay record: {error}"))
+                })?;
+            if consumed != expired_replay_value.len() || expired_record.operation_id != expired_operation_id {
+                return Err(MetadataError::Internal(
+                    "CreateFile replay expiry index has a corrupt record".to_string(),
+                ));
+            }
+            let expired_inode_key = Self::encode_create_file_replay_inode_key(expired_record.inode_id);
+            let indexed_operation = db
+                .get_cf(cf_meta, &expired_inode_key)
+                .map_err(|error| {
+                    MetadataError::Internal(format!("Failed to verify expired CreateFile inode index: {error}"))
+                })?
+                .ok_or_else(|| MetadataError::Internal("expired CreateFile replay has no inode index".to_string()))?;
+            if Self::decode_create_file_operation_bytes(&indexed_operation)? != expired_operation_id {
+                return Err(MetadataError::Internal(
+                    "expired CreateFile inode replay index names another operation".to_string(),
+                ));
+            }
+            batch.delete_cf(cf_meta, expiry_key);
+            batch.delete_cf(cf_meta, expired_replay_key);
+            batch.delete_cf(cf_meta, expired_inode_key);
+            replay_count -= 1;
+        }
+
+        let replay_value = encode_to_vec(record, standard())
+            .map_err(|error| MetadataError::Internal(format!("Failed to encode CreateFile replay record: {error}")))?;
+        batch.put_cf(cf_meta, replay_key, replay_value);
+        batch.put_cf(
+            cf_meta,
+            replay_inode_key,
+            Self::encode_create_file_operation_bytes(record.operation_id),
+        );
+        batch.put_cf(cf_meta, Self::encode_create_file_replay_expiry_key(record), []);
+        replay_count += 1;
+        batch.put_cf(
+            cf_meta,
+            CREATE_FILE_REPLAY_COUNT_KEY,
+            encode_to_vec(replay_count, standard()).map_err(|error| {
+                MetadataError::Internal(format!("Failed to encode CreateFile replay count: {error}"))
+            })?,
+        );
+        Ok(())
+    }
+
     /// Atomically persist create-file mutation with apply tracking.
     // Atomic storage helpers keep every column-family mutation visible at the call boundary.
     #[allow(clippy::too_many_arguments)]
@@ -254,6 +380,8 @@ impl RocksDBStorage {
         inode: &Inode,
         updated_parent: &Inode,
         layout: FileLayout,
+        replay_record: &CreateFileReplayRecord,
+        proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
         let generation = self.pin_generation()?;
@@ -262,6 +390,7 @@ impl RocksDBStorage {
         let mut batch = self.create_file_batch(parent_inode_id, name, inode, updated_parent, layout)?;
         let cf_meta = Self::cf(db, CF_META)?;
         Self::batch_put_inode_allocation(&mut batch, cf_meta, allocation)?;
+        Self::batch_put_create_file_replay(db, cf_meta, &mut batch, replay_record, proposed_at_ms)?;
         self.commit_authority_batch(batch.into(), raft_state)
     }
 
@@ -699,6 +828,153 @@ mod tests {
         }
     }
 
+    fn replay_record(operation: u128, inode_id: u64, expires_at_ms: u64) -> CreateFileReplayRecord {
+        let name = format!("file-{inode_id}");
+        CreateFileReplayRecord {
+            operation_id: CreateFileOperationId {
+                client_id: beryl_types::ClientId::new(operation),
+                call_id: beryl_types::CallId::from_uuid(uuid::Uuid::from_u128(operation)),
+            },
+            request_deadline_ms: expires_at_ms,
+            normalized_path: format!("/{name}"),
+            parent_inode_id: InodeId::new(10),
+            name: name.clone(),
+            inode_id: InodeId::new(inode_id),
+            mount_id: MountId::new(1),
+            expected_mount_epoch: 1,
+            mount_root_inode_id: InodeId::new(10),
+            relative_components: vec![name],
+            lease_epoch: 1,
+            layout: FileLayout::new(4096),
+            content_revision: 0,
+            expires_at_ms,
+        }
+    }
+
+    fn seed_full_replay_table(storage: &RocksDBStorage, record: &CreateFileReplayRecord) {
+        let generation = storage.pin_generation().unwrap();
+        let db = generation.db();
+        let cf_meta = RocksDBStorage::cf(db, CF_META).unwrap();
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            cf_meta,
+            RocksDBStorage::encode_create_file_replay_key(record.operation_id),
+            encode_to_vec(record, standard()).unwrap(),
+        );
+        batch.put_cf(
+            cf_meta,
+            RocksDBStorage::encode_create_file_replay_inode_key(record.inode_id),
+            RocksDBStorage::encode_create_file_operation_bytes(record.operation_id),
+        );
+        batch.put_cf(
+            cf_meta,
+            RocksDBStorage::encode_create_file_replay_expiry_key(record),
+            [],
+        );
+        batch.put_cf(
+            cf_meta,
+            CREATE_FILE_REPLAY_COUNT_KEY,
+            encode_to_vec(MAX_CREATE_FILE_REPLAY_RECORDS, standard()).unwrap(),
+        );
+        db.write(batch).unwrap();
+    }
+
+    fn replay_count(storage: &RocksDBStorage) -> u64 {
+        let generation = storage.pin_generation().unwrap();
+        let db = generation.db();
+        let cf_meta = RocksDBStorage::cf(db, CF_META).unwrap();
+        let value = db
+            .get_cf(cf_meta, CREATE_FILE_REPLAY_COUNT_KEY)
+            .unwrap()
+            .expect("replay count");
+        decode_from_slice(&value, standard()).unwrap().0
+    }
+
+    #[test]
+    fn create_file_replay_capacity_rejects_or_replaces_atomically_across_restart() {
+        let unexpired_dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::create_for_format(unexpired_dir.path()).unwrap();
+        let parent_inode_id = InodeId::new(10);
+        let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        storage.put_inode(&parent).unwrap();
+        storage.set_next_inode_id(InodeId::new(11)).unwrap();
+        let retained = replay_record(1, 50, 101);
+        seed_full_replay_table(&storage, &retained);
+        let rejected = replay_record(2, 11, 200);
+        let allocation = storage.prepare_inode_allocation().unwrap();
+        let error = storage
+            .create_file_atomic(
+                allocation,
+                parent_inode_id,
+                &rejected.name,
+                &Inode::new_file(allocation.inode_id, FileAttrs::new(), MountId::new(1)),
+                &parent,
+                rejected.layout,
+                &rejected,
+                100,
+                &AppMetadataRaftState::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, MetadataError::ResourceExhausted(_)));
+        assert_eq!(replay_count(&storage), MAX_CREATE_FILE_REPLAY_RECORDS);
+        assert_eq!(
+            storage.get_create_file_replay(retained.operation_id).unwrap(),
+            Some(retained)
+        );
+        assert!(storage.get_create_file_replay(rejected.operation_id).unwrap().is_none());
+        assert_eq!(storage.get_dentry(parent_inode_id, &rejected.name).unwrap(), None);
+        assert_eq!(storage.get_next_inode_id().unwrap(), Some(InodeId::new(11)));
+
+        let expired_dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::create_for_format(expired_dir.path()).unwrap();
+        let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        storage.put_inode(&parent).unwrap();
+        storage.set_next_inode_id(InodeId::new(11)).unwrap();
+        let expired = replay_record(3, 51, 100);
+        seed_full_replay_table(&storage, &expired);
+        let replacement = replay_record(4, 11, 200);
+        let allocation = storage.prepare_inode_allocation().unwrap();
+        storage
+            .create_file_atomic(
+                allocation,
+                parent_inode_id,
+                &replacement.name,
+                &Inode::new_file(allocation.inode_id, FileAttrs::new(), MountId::new(1)),
+                &parent,
+                replacement.layout,
+                &replacement,
+                100,
+                &AppMetadataRaftState::default(),
+            )
+            .unwrap();
+        drop(storage);
+
+        let storage = RocksDBStorage::open_existing_for_start(expired_dir.path()).unwrap();
+        assert_eq!(replay_count(&storage), MAX_CREATE_FILE_REPLAY_RECORDS);
+        assert!(storage.get_create_file_replay(expired.operation_id).unwrap().is_none());
+        assert!(storage
+            .get_create_file_replay_for_inode(expired.inode_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            storage.get_create_file_replay(replacement.operation_id).unwrap(),
+            Some(replacement.clone())
+        );
+        assert_eq!(
+            storage.get_create_file_replay_for_inode(replacement.inode_id).unwrap(),
+            Some(replacement.clone())
+        );
+        assert_eq!(
+            storage.get_dentry(parent_inode_id, &replacement.name).unwrap(),
+            Some(replacement.inode_id)
+        );
+        assert_eq!(
+            storage.get_layout_optional(replacement.inode_id).unwrap(),
+            Some(replacement.layout)
+        );
+        assert_eq!(storage.get_next_inode_id().unwrap(), Some(InodeId::new(12)));
+    }
+
     #[test]
     fn create_file_atomic_rejects_a_target_installed_after_allocation_preparation() {
         let temp_dir = TempDir::new().unwrap();
@@ -715,6 +991,25 @@ mod tests {
             last_applied_log_id: Some(openraft::LogId::new(openraft::LeaderId::new(9, 1), 901)),
             ..AppMetadataRaftState::default()
         };
+        let replay_record = CreateFileReplayRecord {
+            operation_id: CreateFileOperationId {
+                client_id: beryl_types::ClientId::new(1),
+                call_id: beryl_types::CallId::from_uuid(uuid::Uuid::from_u128(1)),
+            },
+            request_deadline_ms: 100,
+            normalized_path: "/file".to_string(),
+            parent_inode_id,
+            name: "file".to_string(),
+            inode_id: allocation.inode_id,
+            mount_id: MountId::new(1),
+            expected_mount_epoch: 1,
+            mount_root_inode_id: parent_inode_id,
+            relative_components: vec!["file".to_string()],
+            lease_epoch: 1,
+            layout: FileLayout::new(4096),
+            content_revision: 0,
+            expires_at_ms: 100,
+        };
 
         let error = storage
             .create_file_atomic(
@@ -723,7 +1018,9 @@ mod tests {
                 "file",
                 &Inode::new_file(allocation.inode_id, FileAttrs::new(), MountId::new(1)),
                 &parent,
-                FileLayout::new(4096, 4096, 1),
+                FileLayout::new(4096),
+                &replay_record,
+                1,
                 &rejected_applied_state,
             )
             .unwrap_err();

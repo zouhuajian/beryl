@@ -16,11 +16,12 @@ use crate::raft::response::{
     ApplyRejection, ApplySuccess, DetachedRootReclaimResult, FatalApplyError, RaftApplyResult,
 };
 use crate::raft::storage::{
-    BootstrapNamespaceState, DetachedRoot, DetachedRootReclaimEntry, DetachedRootReclaimUpdate, InodeAllocation,
-    RecursiveMkdirEntry, RenameAtomicUpdate, RenameOverwriteCleanup, RocksDBStorage,
+    BootstrapNamespaceState, CreateFileReplayRecord, DetachedRoot, DetachedRootReclaimEntry, DetachedRootReclaimUpdate,
+    InodeAllocation, RecursiveMkdirEntry, RenameAtomicUpdate, RenameOverwriteCleanup, RocksDBStorage,
 };
 use crate::raft::types::AppMetadataRaftState;
 use crate::raft::RoutingDelta;
+use crate::session_registry::CreateFileOperationId;
 use beryl_types::fs::{Extent, FileAttrs, Inode, InodeData, InodeId};
 use beryl_types::ids::{BlockId, BlockIndex, MountId, WorkerId};
 use beryl_types::layout::FileLayout;
@@ -154,13 +155,38 @@ impl AppRaftStateMachine {
             }
             Command::CreateFile {
                 proposed_at_ms,
-                parent_inode_id,
-                name,
+                operation_id,
+                request_deadline_ms,
+                session_expires_at_ms,
+                normalized_path,
+                mount_id,
+                expected_mount_epoch,
+                mount_root_inode_id,
+                relative_components,
                 attrs,
                 layout,
             } => {
-                let inode_id = self.apply_create(parent_inode_id, name, attrs, layout, proposed_at_ms, raft_state)?;
-                Ok(ApplySuccess::FileCreated { inode_id, layout })
+                let result = self.apply_create(
+                    operation_id,
+                    request_deadline_ms,
+                    session_expires_at_ms,
+                    normalized_path,
+                    mount_id,
+                    expected_mount_epoch,
+                    mount_root_inode_id,
+                    relative_components,
+                    attrs,
+                    layout,
+                    proposed_at_ms,
+                    raft_state,
+                )?;
+                Ok(ApplySuccess::FileCreated {
+                    inode_id: result.inode_id,
+                    layout: result.layout,
+                    lease_epoch: result.lease_epoch,
+                    expires_at_ms: result.expires_at_ms,
+                    content_revision: result.content_revision,
+                })
             }
             Command::Delete {
                 proposed_at_ms,
@@ -211,11 +237,12 @@ impl AppRaftStateMachine {
                 Ok(ApplySuccess::RenameApplied)
             }
             Command::AcquireWriteLease {
-                proposed_at_ms: _,
+                proposed_at_ms,
                 inode_id,
                 expected_lease_epoch,
             } => {
-                let lease_epoch = self.apply_acquire_write_lease(inode_id, expected_lease_epoch, raft_state)?;
+                let lease_epoch =
+                    self.apply_acquire_write_lease(inode_id, expected_lease_epoch, proposed_at_ms, raft_state)?;
                 Ok(ApplySuccess::WriteLeaseAcquired { inode_id, lease_epoch })
             }
             Command::AllocateBlock { inode_id, lease_epoch } => {
@@ -475,7 +502,7 @@ pub(crate) mod tests {
 
     pub(crate) fn expect_file_created(raw: ApplySuccess) -> (InodeId, FileLayout) {
         match raw {
-            ApplySuccess::FileCreated { inode_id, layout } => (inode_id, layout),
+            ApplySuccess::FileCreated { inode_id, layout, .. } => (inode_id, layout),
             other => panic!("unexpected apply response: {other:?}"),
         }
     }
@@ -573,7 +600,7 @@ pub(crate) mod tests {
         storage.put_inode(&parent).unwrap();
         storage.put_inode(&inode).unwrap();
         storage.put_dentry(parent_inode_id, name, inode_id).unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();
         inode
     }
 

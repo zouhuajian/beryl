@@ -28,7 +28,6 @@ pub use group_watermark::{GroupStateWatermark, MountEpoch};
 pub use ids::{BlockId, BlockIndex, CallId, ClientId, GroupName, GroupNameError, MountId, WorkerId};
 pub use layout::{
     BlockFormatId, BlockFormatIdError, BlockShape, BlockShapeError, FileLayout, FileLayoutError, MAX_BLOCK_SIZE,
-    MAX_CHUNK_SIZE,
 };
 pub use location::{CommittedBlock, FileBlockLocation, WriteTarget};
 pub use raft_log_id::RaftLogId;

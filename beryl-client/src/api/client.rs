@@ -9,9 +9,7 @@ use std::vec::IntoIter;
 
 use futures::{stream, StreamExt};
 
-use super::{
-    CreateOptions, DeleteOptions, DirectoryEntry, DirectoryListing, FileReader, FileStatus, FileWriter, ListOptions,
-};
+use super::{DeleteOptions, DirectoryEntry, DirectoryListing, FileReader, FileStatus, FileWriter, ListOptions};
 use crate::api::path::NamespacePathBuf;
 use crate::client_inner::ClientInner;
 use crate::config::ClientConfig;
@@ -162,13 +160,10 @@ impl FsClient {
         Ok(FileReader::new(Arc::clone(&self.inner), handle))
     }
 
-    /// Creates a file write session according to the supplied creation options.
-    ///
-    /// `CreateOptions` layout fields are create-time intent for new file
-    /// creation. Metadata validates and persists the accepted `FileLayout`.
-    pub async fn create(&self, path: &str, options: CreateOptions) -> ClientResult<FileWriter> {
+    /// Atomically creates a file and obtains its initial write session.
+    pub async fn create(&self, path: &str) -> ClientResult<FileWriter> {
         let path = NamespacePathBuf::parse(path)?;
-        let response = self.inner.metadata.create_file(path, options).await?;
+        let response = self.inner.metadata.create_file(path).await?;
         Ok(FileWriter::new(Arc::clone(&self.inner), response))
     }
 
@@ -195,8 +190,6 @@ impl fmt::Debug for FsClient {
 
 #[cfg(test)]
 mod tests {
-
-    use super::super::options::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_REPLICATION};
     use super::*;
     use crate::config::{ClientConfig, MetadataGroupConfig, ReadConfig};
     use crate::error::{ClientError, ClientErrorKind, ClientResult, RefreshHint};
@@ -326,8 +319,25 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn create_file_transport_ambiguity_replays_the_same_operation() {
+        let metadata_transport = Arc::new(MockMetadataTransport::with_mutation_outcomes(vec![
+            MetadataOutcome::Transport,
+            MetadataOutcome::Ok,
+        ]));
+        let client = fs_client_with_metadata_transport(test_config_with_retries("root", 2), metadata_transport.clone())
+            .expect("client");
+
+        client.create("/alpha").await.expect("CreateFile replay succeeds");
+
+        let calls = metadata_transport.calls();
+        assert_eq!(methods(&calls), vec!["create_file", "create_file"]);
+        assert_eq!(calls[0].call_id, calls[1].call_id);
+        assert_eq!(calls[0].deadline_ms, calls[1].deadline_ms);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn unsafe_namespace_mutations_fail_closed_without_transport_replay() {
-        for operation in ["create_file", "create_directory", "delete", "rename"] {
+        for operation in ["create_directory", "delete", "rename"] {
             let metadata_transport = Arc::new(MockMetadataTransport::with_mutation_outcomes(vec![
                 MetadataOutcome::Transport,
                 MetadataOutcome::Ok,
@@ -337,10 +347,6 @@ mod tests {
                     .expect("client");
 
             let err = match operation {
-                "create_file" => client
-                    .create("/alpha", CreateOptions::create())
-                    .await
-                    .expect_err("CreateFile ambiguity must fail closed"),
                 "create_directory" => client
                     .mkdirs("/alpha", false)
                     .await
@@ -546,7 +552,7 @@ mod tests {
         let create_client =
             fs_client_with_metadata_transport(test_config("root"), create_metadata_transport.clone()).expect("client");
         let error = create_client
-            .create("/invalid-create", CreateOptions::create())
+            .create("/invalid-create")
             .await
             .expect_err("malformed mutation success must be ambiguous");
         assert_client_error(&error, ClientErrorKind::InvalidResponse, true, "layout missing");
@@ -560,10 +566,7 @@ mod tests {
         let commit_metadata_transport = Arc::new(MockMetadataTransport::with_commit_response_sizes(vec![1, 0]));
         let commit_client =
             fs_client_with_metadata_transport(test_config("root"), commit_metadata_transport.clone()).expect("client");
-        let mut commit_writer = commit_client
-            .create("/commit", CreateOptions::create())
-            .await
-            .expect("writer");
+        let mut commit_writer = commit_client.create("/commit").await.expect("writer");
 
         let error = commit_writer.close().await.expect_err("invalid commit response");
         assert_client_error(&error, ClientErrorKind::InvalidResponse, true, "committed_size");
@@ -590,10 +593,7 @@ mod tests {
             let sync_metadata_transport = Arc::new(MockMetadataTransport::with_sync_responses(vec![response]));
             let sync_client = fs_client_with_metadata_transport(test_config("root"), sync_metadata_transport.clone())
                 .expect("client");
-            let mut sync_writer = sync_client
-                .create("/sync", CreateOptions::create())
-                .await
-                .expect("writer");
+            let mut sync_writer = sync_client.create("/sync").await.expect("writer");
 
             let error = sync_writer
                 .sync_write_visibility()
@@ -619,10 +619,7 @@ mod tests {
         let renew_metadata_transport = Arc::new(MockMetadataTransport::with_renew_response_expiries(vec![0]));
         let renew_client =
             fs_client_with_metadata_transport(test_config("root"), renew_metadata_transport.clone()).expect("client");
-        let mut renew_writer = renew_client
-            .create("/renew", CreateOptions::create())
-            .await
-            .expect("writer");
+        let mut renew_writer = renew_client.create("/renew").await.expect("writer");
 
         let error = renew_writer
             .renew_lease()
@@ -664,7 +661,7 @@ mod tests {
         );
         assert_eq!(
             methods(&renew_metadata_transport.calls()),
-            vec!["create_file", "open_write", "renew_lease"]
+            vec!["create_file", "renew_lease"]
         );
 
         let add_block_events = event_log();
@@ -682,10 +679,7 @@ mod tests {
             worker_transport(add_block_worker),
         )
         .expect("client");
-        let mut add_block_writer = add_block_client
-            .create("/add-block", CreateOptions::create())
-            .await
-            .expect("writer");
+        let mut add_block_writer = add_block_client.create("/add-block").await.expect("writer");
 
         let error = add_block_writer
             .write_all(Bytes::from_static(b"x"))
@@ -714,28 +708,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_create_layout_is_rejected_before_rpc() {
-        let metadata_transport = Arc::new(MockMetadataTransport::default());
-        let client =
-            fs_client_with_metadata_transport(test_config("root"), metadata_transport.clone()).expect("client");
-
-        let error = client
-            .create("/invalid-layout", CreateOptions::create().with_block_size(0))
-            .await
-            .expect_err("invalid create layout must fail locally");
-
-        assert_client_error(
-            &error,
-            ClientErrorKind::InvalidArgument,
-            false,
-            "CreateOptions layout invalid",
-        );
-        assert!(metadata_transport.calls().is_empty());
-    }
-
-    #[tokio::test]
     async fn writer_barrier_flush_worker_error_blocks_later_write_and_close() {
-        let layout = recorded_layout_values(8, 4);
+        let layout = recorded_layout_values(8);
         let metadata_transport = Arc::new(MockMetadataTransport::with_create_response_layout(Some(layout)));
         let worker = Arc::new(MockDataClient {
             write_outcomes: Mutex::new(vec![WorkerWriteOutcome::WorkerError].into()),
@@ -747,10 +721,7 @@ mod tests {
             worker_transport(worker),
         )
         .expect("client");
-        let mut writer = client
-            .create("/created", CreateOptions::create())
-            .await
-            .expect("writer");
+        let mut writer = client.create("/created").await.expect("writer");
 
         writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
         let err = writer
@@ -796,10 +767,7 @@ mod tests {
             worker_transport(worker),
         )
         .expect("client");
-        let mut writer = client
-            .create("/created", CreateOptions::create())
-            .await
-            .expect("writer");
+        let mut writer = client.create("/created").await.expect("writer");
 
         let error = writer
             .write_all(Bytes::from_static(b"x"))
@@ -938,7 +906,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn writer_unknown_add_block_blocks_followup_writes() {
-        let layout = recorded_layout_values(5, 5);
+        let layout = recorded_layout_values(5);
         let metadata_transport = Arc::new(MockMetadataTransport {
             create_response_layout: Mutex::new(Some(Some(layout))),
             add_block_outcomes: Mutex::new(
@@ -958,10 +926,7 @@ mod tests {
             worker_transport(worker),
         )
         .expect("client");
-        let mut writer = client
-            .create("/created", CreateOptions::create())
-            .await
-            .expect("writer");
+        let mut writer = client.create("/created").await.expect("writer");
 
         let err = writer
             .write_all(Bytes::from_static(b"hello"))
@@ -982,7 +947,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn mutation_terminal_error_after_transport_ambiguity_remains_unknown() {
-        let layout = recorded_layout_values(5, 5);
+        let layout = recorded_layout_values(5);
         let metadata_transport = Arc::new(MockMetadataTransport {
             create_response_layout: Mutex::new(Some(Some(layout))),
             add_block_outcomes: Mutex::new(
@@ -997,10 +962,7 @@ mod tests {
             worker_transport(worker),
         )
         .expect("client");
-        let mut writer = client
-            .create("/created", CreateOptions::create())
-            .await
-            .expect("writer");
+        let mut writer = client.create("/created").await.expect("writer");
 
         let err = writer
             .write_all(Bytes::from_static(b"hello"))
@@ -1163,44 +1125,28 @@ mod tests {
         final_size: Option<u64>,
         committed_block_offsets: Vec<u64>,
         committed_block_lens: Vec<u64>,
-        create_layout: Option<RecordedLayout>,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct RecordedLayout {
         block_size: u32,
-        chunk_size: u32,
-        replication: u32,
         block_format_id: u32,
     }
 
     fn default_layout() -> RecordedLayout {
-        recorded_layout_values(DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE)
+        recorded_layout_values(64 * 1024 * 1024)
     }
 
-    fn recorded_layout_values(block_size: u32, chunk_size: u32) -> RecordedLayout {
+    fn recorded_layout_values(block_size: u32) -> RecordedLayout {
         RecordedLayout {
             block_size,
-            chunk_size,
-            replication: u32::from(DEFAULT_REPLICATION),
             block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
-        }
-    }
-
-    fn recorded_layout(layout: &beryl_proto::common::FileLayoutProto) -> RecordedLayout {
-        RecordedLayout {
-            block_size: layout.block_size,
-            chunk_size: layout.chunk_size,
-            replication: layout.replication,
-            block_format_id: layout.block_format_id,
         }
     }
 
     fn layout_proto(layout: RecordedLayout) -> beryl_proto::common::FileLayoutProto {
         beryl_proto::common::FileLayoutProto {
             block_size: layout.block_size,
-            chunk_size: layout.chunk_size,
-            replication: layout.replication,
             block_format_id: layout.block_format_id,
         }
     }
@@ -1380,7 +1326,6 @@ mod tests {
                 final_size: None,
                 committed_block_offsets: Vec::new(),
                 committed_block_lens: Vec::new(),
-                create_layout: None,
             }
         }
 
@@ -1388,10 +1333,8 @@ mod tests {
             self.calls.lock().expect("calls").push(call);
         }
 
-        fn record_create_file(&self, ctx: &AttemptContext, req: &beryl_proto::metadata::CreateFileRequestProto) {
-            let mut call = Self::recorded_call("create_file", ctx);
-            call.create_layout = req.layout.as_ref().map(recorded_layout);
-            self.push_call(call);
+        fn record_create_file(&self, ctx: &AttemptContext) {
+            self.record("create_file", ctx);
         }
 
         fn record_read_layout(&self, ctx: &AttemptContext, req: &beryl_proto::metadata::GetBlockLocationsRequestProto) {
@@ -1573,25 +1516,26 @@ mod tests {
         async fn create_file(
             &self,
             ctx: AttemptContext,
-            req: beryl_proto::metadata::CreateFileRequestProto,
+            _req: beryl_proto::metadata::CreateFileRequestProto,
         ) -> ClientResult<ValidatedMetadataResponse<CreateFileResponseProto>> {
-            self.record_create_file(&ctx, &req);
+            self.record_create_file(&ctx);
             Self::apply_metadata_outcome(self.next_mutation_outcome(), "CreateFile")?;
-            self.next_offsets.lock().expect("offsets").insert(1, 0);
-            let requested_layout = req.layout.as_ref().map(recorded_layout).unwrap_or_else(default_layout);
+            self.next_offsets.lock().expect("offsets").insert(302, 0);
             let response_layout = self
                 .create_response_layout
                 .lock()
                 .expect("create response layout")
-                .unwrap_or(Some(requested_layout));
+                .unwrap_or(Some(default_layout()));
             if let Some(layout) = response_layout {
                 self.write_layouts.lock().expect("write layouts").insert(302, layout);
             }
             metadata_ok(
                 &ctx,
                 CreateFileResponseProto {
-                    inode_id: 302,
                     layout: response_layout.map(layout_proto),
+                    write_handle: Some(write_handle_proto(302)),
+                    expires_at_ms: u64::MAX / 2,
+                    content_revision: 0,
                     ..CreateFileResponseProto::default()
                 },
             )
@@ -2067,7 +2011,11 @@ mod tests {
             worker_endpoints: vec![worker_endpoint()],
             fencing_token: FencingToken::new(block_id, ClientId::new(7), 1),
             block_stamp: 1,
-            chunk_size: layout.chunk_size,
+            chunk_size: beryl_types::BlockFormatId::from_raw(layout.block_format_id)
+                .expect("known test block format")
+                .spec()
+                .expect("test block format must have a specification")
+                .storage_chunk_size,
             block_format_id: beryl_types::BlockFormatId::from_raw(layout.block_format_id)
                 .expect("known test block format"),
             tier: beryl_types::Tier::Hdd,
@@ -2093,8 +2041,8 @@ mod tests {
             workers: vec![worker_endpoint()],
             block_stamp: u64::from(block_index) + 1,
             block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
-            block_size: DEFAULT_BLOCK_SIZE as u64,
-            chunk_size: DEFAULT_CHUNK_SIZE,
+            block_size: 64 * 1024 * 1024,
+            chunk_size: 4 * 1024 * 1024,
             effective_len: len,
         }
     }

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use beryl_client::CreateOptions;
 use beryl_common::error::rpc::{ErrorKind, RecoveryAction, WorkerErrorKind};
 use beryl_common::header::{RequestHeader, HEADER_WORKER_DATA_ERROR_DETAIL, WORKER_DATA_ERROR_DETAIL_V1};
 use beryl_e2e::{data::deterministic_bytes, TestCluster, TestResult};
@@ -22,7 +21,7 @@ async fn read_locations_before_full_report_convergence_are_unavailable_then_reco
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let client = cluster.client().clone();
     let path = "/worker-restart/pre-convergence";
-    let payload = write_closed_file(&mut cluster, path, 1_537, 1024)
+    let payload = write_closed_file(&mut cluster, path, 1_537)
         .await
         .expect("write committed file");
 
@@ -49,7 +48,7 @@ async fn read_locations_before_full_report_convergence_are_unavailable_then_reco
 async fn stale_old_worker_run_is_rejected_after_restart() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let path = "/worker-restart/stale-run";
-    let payload = write_closed_file(&mut cluster, path, 1_537, 1024)
+    let payload = write_closed_file(&mut cluster, path, 1_537)
         .await
         .expect("write committed file");
     let before_locations = metadata_locations(&cluster, path, payload.len() as u32)
@@ -82,7 +81,7 @@ async fn multi_block_file_is_readable_after_worker_restart_full_report_convergen
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let client = cluster.client().clone();
     let path = "/worker-restart/multi-block";
-    let payload = write_closed_file(&mut cluster, path, 5_123, 1024)
+    let payload = write_closed_file(&mut cluster, path, 5_123)
         .await
         .expect("write multi-block file");
     let before_locations = metadata_locations(&cluster, path, payload.len() as u32)
@@ -113,27 +112,14 @@ async fn multi_block_file_is_readable_after_worker_restart_full_report_convergen
     cluster.shutdown().await.expect("shutdown cluster");
 }
 
-async fn write_closed_file(
-    cluster: &mut TestCluster,
-    path: &str,
-    payload_len: usize,
-    block_size: u32,
-) -> TestResult<Bytes> {
+async fn write_closed_file(cluster: &mut TestCluster, path: &str, payload_len: usize) -> TestResult<Bytes> {
     cluster
         .client()
         .mkdirs("/worker-restart", true)
         .await
         .expect("create worker restart dir");
     let payload = Bytes::from(deterministic_bytes(payload_len));
-    let mut writer = cluster
-        .client()
-        .create(
-            path,
-            CreateOptions::create()
-                .with_block_size(block_size)
-                .with_chunk_size(block_size),
-        )
-        .await?;
+    let mut writer = cluster.client().create(path).await?;
     writer.write_all(payload.clone()).await?;
     writer.close().await?;
     cluster.converge_block_reports().await?;

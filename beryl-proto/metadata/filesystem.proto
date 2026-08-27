@@ -236,15 +236,16 @@ message GetBlockLocationsResponseProto {
 message CreateFileRequestProto {
   common.RequestHeaderProto header = 1;
   string path = 2;
-  FileAttrsProto attrs = 3;
-  common.FileLayoutProto layout = 4;
 }
 
 message CreateFileResponseProto {
   common.ResponseHeaderProto header = 1;
-  uint64 inode_id = 2;
-  // Metadata-stored FileLayout accepted by the durable namespace mutation.
-  common.FileLayoutProto layout = 3;
+  // Metadata-stored FileLayout selected by the durable namespace mutation.
+  common.FileLayoutProto layout = 2;
+  WriteHandleProto write_handle = 3;
+  uint64 expires_at_ms = 4;
+  // Durable content revision used as the first publish CAS precondition.
+  uint64 content_revision = 5;
 }
 
 enum OpenWriteModeProto {

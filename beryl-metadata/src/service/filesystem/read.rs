@@ -6,7 +6,7 @@
 use super::refresh_metadata_fs_failure;
 use super::{
     missing_resolved_target_error, worker_endpoint_from_parts, FileRange, Freshness, FsFailure, FsResult, FsSuccess,
-    MetadataFileSystem, RequestContext, StaleStateStatus,
+    MetadataFileSystem, RequestContext, StaleStateStatus, SUPPORTED_REPLICA_COUNT,
 };
 use crate::error::MetadataError;
 use crate::observe;
@@ -675,6 +675,18 @@ impl MetadataFileSystem {
                     )
                 }
             };
+            let storage_chunk_size = match layout.block_format_id.spec() {
+                Ok(spec) => spec.storage_chunk_size,
+                Err(error) => {
+                    return self.failure_from_error_with_route_epoch(
+                        &req.ctx,
+                        MetadataError::Internal(format!("persisted file layout has an unknown block format: {error}")),
+                        group_name,
+                        mount_epoch,
+                        route_epoch,
+                    )
+                }
+            };
             for extent in &extents {
                 if extent.block_id.inode_id != inode_id {
                     return self.failure_from_error_with_route_epoch(
@@ -811,7 +823,7 @@ impl MetadataFileSystem {
                             caller: caller.clone(),
                             existing: reported.clone(),
                             exclude_workers: Vec::new(),
-                            target_replicas: layout.replication,
+                            target_replicas: SUPPORTED_REPLICA_COUNT,
                         },
                         &usable_views,
                     );
@@ -857,7 +869,7 @@ impl MetadataFileSystem {
                     workers,
                     block_format_id: layout.block_format_id,
                     block_size: u64::from(layout.block_size),
-                    chunk_size: layout.chunk_size,
+                    chunk_size: storage_chunk_size,
                     effective_len,
                 });
             }
@@ -914,7 +926,7 @@ mod tests {
             next_block_index: 1,
         };
         storage.put_inode(&inode).unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();
     }
 
     #[tokio::test]
@@ -933,9 +945,7 @@ mod tests {
                 &Inode::new_file(stored_inode_id, FileAttrs::new(), mount_id),
             )
             .unwrap();
-        storage
-            .put_layout(storage_key_inode_id, FileLayout::new(4096, 4096, 1))
-            .unwrap();
+        storage.put_layout(storage_key_inode_id, FileLayout::new(4096)).unwrap();
 
         let failure = filesystem
             .get_file_layout_resolved(GetFileLayoutInput {
@@ -1094,6 +1104,7 @@ mod tests {
             .filesystem
             .open_write_inode(
                 &request_context(),
+                "/file".to_string(),
                 env.inode_id,
                 vec![env.inode_id],
                 crate::session_registry::WriteMode::Write,

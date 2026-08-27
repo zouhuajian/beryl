@@ -763,6 +763,7 @@ mod tests {
         let client_id = ClientId::new(1);
         let opening = registry
             .begin_session(BeginSessionInput {
+                normalized_path: "/file".to_string(),
                 inode_id,
                 mount_id: MountId::new(1),
                 current_lease_epoch: Some(0),
@@ -770,7 +771,7 @@ mod tests {
                 content_revision: 0,
                 mode: WriteMode::Write,
                 open_client_id: client_id,
-                layout: FileLayout::new(64, 64, 1),
+                layout: FileLayout::new(64),
                 ancestor_inode_ids: vec![inode_id],
             })
             .expect("session capacity");
@@ -1002,7 +1003,7 @@ mod tests {
             block_stamp: Some(published.block_stamp),
         });
         storage
-            .publish_file_atomic(&inode, FileLayout::new(64, 64, 1), &AppMetadataRaftState::default())
+            .publish_file_atomic(&inode, FileLayout::new(64), &AppMetadataRaftState::default())
             .unwrap();
         sessions.remove_session_if_epoch(published.block_id.inode_id, 1);
 
@@ -1114,11 +1115,7 @@ mod tests {
             block_stamp: Some(became_visible.block_stamp),
         });
         storage
-            .publish_file_atomic(
-                &visible_inode,
-                FileLayout::new(64, 64, 1),
-                &AppMetadataRaftState::default(),
-            )
+            .publish_file_atomic(&visible_inode, FileLayout::new(64), &AppMetadataRaftState::default())
             .unwrap();
         sessions.remove_session_if_epoch(became_visible.block_id.inode_id, 1);
 

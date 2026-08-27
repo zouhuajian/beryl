@@ -30,8 +30,14 @@ pub(crate) enum ApplySuccess {
     MountUpserted(crate::mount::MountEntry),
     /// Requested directory path exists with these persisted attributes.
     DirectoryEnsured { inode_id: InodeId, attrs: FileAttrs },
-    /// File inode and its authoritative layout were created atomically.
-    FileCreated { inode_id: InodeId, layout: FileLayout },
+    /// File inode, initial write lease, and replay record committed atomically.
+    FileCreated {
+        inode_id: InodeId,
+        layout: FileLayout,
+        lease_epoch: u64,
+        expires_at_ms: u64,
+        content_revision: u64,
+    },
     /// The exact namespace delete mutation committed.
     DeleteApplied,
     /// The exact namespace rename mutation committed.

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use beryl_client::{ClientResult, CreateOptions, DeleteOptions, InodeKind, ListOptions};
+use beryl_client::{ClientResult, DeleteOptions, InodeKind, ListOptions};
 use beryl_e2e::{data::deterministic_bytes, TestCluster};
 use bytes::Bytes;
 use futures::TryStreamExt;
@@ -20,12 +20,7 @@ async fn local_client_crud_roundtrip() {
     let first = Bytes::from(deterministic_bytes(1_337));
     let suffix = Bytes::from_static(b"-beryl-append-suffix");
     let expected = [first.as_ref(), suffix.as_ref()].concat();
-    let create_options = CreateOptions::create().with_block_size(1024).with_chunk_size(1024);
-
-    let mut writer = client
-        .create(path, create_options)
-        .await
-        .expect("create through metadata");
+    let mut writer = client.create(path).await.expect("create through metadata");
     writer.write_all(first.clone()).await.expect("write through worker");
     writer.close().await.expect("close through metadata");
 
@@ -166,13 +161,7 @@ async fn local_client_crud_roundtrip() {
     assert_not_found(reader_opened_before_rename.read_all().await, "reader for deleted inode");
 
     let replacement = Bytes::from_static(b"replacement-file");
-    let mut replacement_writer = client
-        .create(
-            renamed_path,
-            CreateOptions::create().with_block_size(1024).with_chunk_size(1024),
-        )
-        .await
-        .expect("recreate deleted path");
+    let mut replacement_writer = client.create(renamed_path).await.expect("recreate deleted path");
     replacement_writer
         .write_all(replacement.clone())
         .await
@@ -218,13 +207,7 @@ async fn visibility_sync_then_continue_write_roundtrip() {
     let first = Bytes::from(vec![b'a'; 317]);
     let second = Bytes::from(vec![b'b'; 1024]);
 
-    let mut writer = client
-        .create(
-            path,
-            CreateOptions::create().with_block_size(1024).with_chunk_size(1024),
-        )
-        .await
-        .expect("create through metadata");
+    let mut writer = client.create(path).await.expect("create through metadata");
     writer.write_all(first.clone()).await.expect("write first block");
     writer
         .sync_write_visibility()
@@ -264,13 +247,7 @@ async fn write_more_than_ten_blocks_roundtrip() {
     let client = cluster.client();
     let path = "/many-blocks";
     let payload = Bytes::from(deterministic_bytes(12 * 1024 + 17));
-    let mut writer = client
-        .create(
-            path,
-            CreateOptions::create().with_block_size(1024).with_chunk_size(1024),
-        )
-        .await
-        .expect("create file");
+    let mut writer = client.create(path).await.expect("create file");
 
     for offset in (0..payload.len()).step_by(127) {
         let end = (offset + 127).min(payload.len());

@@ -11,9 +11,8 @@ use std::time::Duration;
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
 use beryl_types::{BlockId, CommittedBlock, FileLayout, InodeId};
 
-use crate::api::options::DEFAULT_REPLICATION;
 use crate::api::path::NamespacePathBuf;
-use crate::api::{CreateOptions, DeleteOptions, DirectoryEntry, DirectoryListing, FileStatus, ListOptions};
+use crate::api::{DeleteOptions, DirectoryEntry, DirectoryListing, FileStatus, ListOptions};
 use crate::config::{ClientConfig, RetryConfig};
 use crate::error::{
     invalid_response, side_effect_response_body_mismatch, ClientError, ClientErrorKind, ClientResult, RefreshHint,
@@ -250,79 +249,51 @@ impl MetadataClient {
         .await
     }
 
-    /// Preserves the existing two-step CreateFile then OpenWrite behavior and
-    /// returns the validated write session without constructing an API handle.
-    pub(crate) async fn create_file(
-        &self,
-        path: NamespacePathBuf,
-        options: CreateOptions,
-    ) -> ClientResult<WriteSession> {
+    /// Atomically creates a file and validates Metadata's initial write session.
+    pub(crate) async fn create_file(&self, path: NamespacePathBuf) -> ClientResult<WriteSession> {
         let path = path.into_string();
-        let deadline = self.operation_deadline();
-        let create_operation = self.operation(Operation::CreateFile, Some(path.clone()), deadline.clone())?;
+        let create_operation = self.operation(Operation::CreateFile, Some(path.clone()), self.operation_deadline())?;
         let create = self
             .execute_mutation_metadata(
                 create_operation.clone(),
                 beryl_proto::metadata::CreateFileRequestProto {
                     header: None,
                     path: path.clone(),
-                    attrs: Some(default_file_attrs()),
-                    layout: Some(layout_for_new_file(&options)?),
                 },
                 |transport, ctx, req| async move { transport.create_file(ctx, req).await },
             )
             .await?;
-        if create.inode_id == 0 {
-            return Err(side_effect_response_body_mismatch(
-                "CreateFile",
-                "CreateFileResponseProto.inode_id must be non-zero",
-            )
-            .with_operation_context(&create_operation));
-        }
-        let created_inode_id = create.inode_id;
-        let created_layout = create.layout.ok_or_else(|| {
+        let layout = create.layout.ok_or_else(|| {
             side_effect_response_body_mismatch("CreateFile", "CreateFileResponseProto.layout missing")
                 .with_operation_context(&create_operation)
         })?;
-        let created_layout = FileLayout::try_from(created_layout).map_err(|err| {
+        let layout = FileLayout::try_from(layout).map_err(|err| {
             side_effect_response_body_mismatch("CreateFile", format!("CreateFileResponseProto.layout invalid: {err}"))
                 .with_operation_context(&create_operation)
         })?;
-        let (open_operation, open) = self
-            .open_write_request(
-                &path,
-                beryl_proto::metadata::OpenWriteModeProto::OpenWriteModeWrite,
-                deadline,
-            )
-            .await?;
-        if open.write_handle.as_ref().map(|handle| handle.inode_id) != Some(created_inode_id) {
-            return Err(side_effect_response_body_mismatch(
-                "OpenWrite",
-                "OpenWrite returned a different inode_id than CreateFile",
-            )
-            .with_operation_context(&open_operation));
-        }
-        let open_layout = open.layout.ok_or_else(|| {
-            side_effect_response_body_mismatch("OpenWrite", "OpenWriteResponseProto.layout missing")
-                .with_operation_context(&open_operation)
+        let write_handle = create.write_handle.ok_or_else(|| {
+            side_effect_response_body_mismatch("CreateFile", "CreateFileResponseProto.write_handle missing")
+                .with_operation_context(&create_operation)
         })?;
-        let open_layout = FileLayout::try_from(open_layout).map_err(|err| {
-            side_effect_response_body_mismatch("OpenWrite", format!("OpenWriteResponseProto.layout invalid: {err}"))
-                .with_operation_context(&open_operation)
-        })?;
-        if open_layout != created_layout {
+        if create.expires_at_ms == 0 {
             return Err(side_effect_response_body_mismatch(
-                "OpenWrite",
-                "OpenWrite returned a different layout than CreateFile",
+                "CreateFile",
+                "CreateFileResponseProto.expires_at_ms must be non-zero",
             )
-            .with_operation_context(&open_operation));
+            .with_operation_context(&create_operation));
         }
-        write_session_from_open_response(
-            &open_operation,
+        WriteSession::new(
             path,
+            layout,
+            write_handle,
+            0,
+            create.expires_at_ms,
+            create.content_revision,
             beryl_proto::metadata::OpenWriteModeProto::OpenWriteModeWrite,
-            open,
         )
+        .map_err(|error| {
+            side_effect_response_body_mismatch("CreateFile", error).with_operation_context(&create_operation)
+        })
     }
 
     /// Opens an append session while preserving Metadata's stored layout.
@@ -837,19 +808,6 @@ fn timeout_error(target_plane: &str, operation: &str) -> ClientError {
     )))
 }
 
-fn default_file_attrs() -> beryl_proto::metadata::FileAttrsProto {
-    beryl_proto::metadata::FileAttrsProto {
-        mode: 0o644,
-        uid: 0,
-        gid: 0,
-        size: 0,
-        atime_ms: 0,
-        mtime_ms: 0,
-        ctime_ms: 0,
-        nlink: 1,
-    }
-}
-
 fn default_dir_attrs() -> beryl_proto::metadata::FileAttrsProto {
     beryl_proto::metadata::FileAttrsProto {
         mode: 0o755,
@@ -861,19 +819,6 @@ fn default_dir_attrs() -> beryl_proto::metadata::FileAttrsProto {
         ctime_ms: 0,
         nlink: 2,
     }
-}
-
-fn layout_for_new_file(options: &CreateOptions) -> ClientResult<beryl_proto::common::FileLayoutProto> {
-    let layout = FileLayout::with_block_format(
-        options.block_size,
-        options.chunk_size,
-        DEFAULT_REPLICATION,
-        options.block_format_id,
-    );
-    layout
-        .validate()
-        .map_err(|err| ClientError::invalid_argument(format!("CreateOptions layout invalid: {err}")))?;
-    Ok((&layout).into())
 }
 
 /// Converts a validated open-write response into the sole client-side session

@@ -3,7 +3,6 @@
 
 #![cfg(unix)]
 
-use beryl_client::CreateOptions;
 use beryl_e2e::{data::deterministic_bytes, TestCluster};
 use bytes::Bytes;
 use std::ffi::CString;
@@ -131,13 +130,7 @@ async fn metadata_signals_exit_cleanly_and_preserve_visible_data() {
         .mkdirs("/process-shutdown", true)
         .await
         .expect("create directory");
-    let mut writer = client
-        .create(
-            "/process-shutdown/visible",
-            CreateOptions::create().with_block_size(1_024).with_chunk_size(1_024),
-        )
-        .await
-        .expect("create file");
+    let mut writer = client.create("/process-shutdown/visible").await.expect("create file");
     writer.write_all(payload.clone()).await.expect("write file");
     writer.close().await.expect("commit file");
     cluster

@@ -33,6 +33,9 @@ pub(super) use publish::{CommitFileArgs, SyncWriteArgs};
 pub(super) use read::{BlockLocationsTarget, GetBlockLocationsArgs, GetStatusArgs, ListStatusArgs, OpenFileArgs};
 pub(super) use write::{AbortFileWriteArgs, AddBlockArgs, OpenWriteArgs, RenewLeaseArgs};
 
+/// The supported runtime authorizes exactly one worker for each block.
+const SUPPORTED_REPLICA_COUNT: u8 = 1;
+
 #[derive(Clone, Debug)]
 pub(crate) struct RequestContext {
     pub(crate) caller: RequestHeader,
@@ -172,6 +175,8 @@ pub(crate) struct MetadataFileSystemDeps {
     pub(crate) worker_manager: Option<Arc<WorkerManager>>,
     pub(crate) metrics: Option<Arc<MetadataMetrics>>,
     pub(crate) readiness_gate: Option<Arc<RootReadinessGate>>,
+    /// Validated server-owned layout used by atomic CreateFile.
+    pub(crate) file_create_layout: beryl_types::FileLayout,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -198,6 +203,7 @@ pub(crate) struct MetadataFileSystem {
     metrics: Option<Arc<MetadataMetrics>>,
     session_registry: Arc<SessionRegistry>,
     worker_manager: Option<Arc<WorkerManager>>,
+    file_create_layout: beryl_types::FileLayout,
 }
 
 impl MetadataFileSystem {
@@ -221,6 +227,7 @@ impl MetadataFileSystem {
             metrics: deps.metrics,
             session_registry: deps.session_registry,
             worker_manager: deps.worker_manager,
+            file_create_layout: deps.file_create_layout,
         }
     }
 
@@ -401,12 +408,9 @@ impl MetadataFileSystem {
 }
 
 fn validate_active_write_layout(layout: &beryl_types::layout::FileLayout) -> Result<(), MetadataError> {
-    if layout.replication != 1 {
-        return Err(MetadataError::InvalidArgument(
-            "multi-replica write is not supported yet; replication must be 1".to_string(),
-        ));
-    }
-    Ok(())
+    layout
+        .validate()
+        .map_err(|error| MetadataError::InvalidArgument(format!("invalid file layout: {error}")))
 }
 
 #[cfg(test)]
@@ -558,6 +562,7 @@ mod tests {
                 worker_manager: self.worker_manager,
                 metrics: None,
                 readiness_gate: None,
+                file_create_layout: crate::config::FileLayoutDefaults::default().layout().unwrap(),
             });
 
             TestFilesystem {
@@ -844,13 +849,17 @@ mod tests {
                 epoch: lease_epoch,
             },
             block_stamp: 1,
-            chunk_size: 64,
+            chunk_size: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE
+                .spec()
+                .unwrap()
+                .storage_chunk_size,
             block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
             tier: beryl_types::Tier::Hdd,
         };
         let session_registry = filesystem.session_registry();
         let opening = session_registry
             .begin_session(crate::session_registry::BeginSessionInput {
+                normalized_path: "/file".to_string(),
                 inode_id,
                 mount_id,
                 current_lease_epoch: Some(0),
@@ -858,7 +867,7 @@ mod tests {
                 content_revision: 0,
                 mode: crate::session_registry::WriteMode::Write,
                 open_client_id: writer,
-                layout: FileLayout::new(64, 64, 1),
+                layout: FileLayout::new(64),
                 ancestor_inode_ids,
             })
             .expect("session capacity");
@@ -968,7 +977,7 @@ mod tests {
         let mut attrs = FileAttrs::new();
         attrs.size = base_size;
         storage.put_inode(&Inode::new_file(inode_id, attrs, mount_id)).unwrap();
-        storage.put_layout(inode_id, FileLayout::new(64, 64, 1)).unwrap();
+        storage.put_layout(inode_id, FileLayout::new(64)).unwrap();
 
         WriteFlowEnv {
             _dir: dir,

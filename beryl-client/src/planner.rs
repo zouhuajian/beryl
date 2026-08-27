@@ -272,7 +272,10 @@ mod tests {
             block_stamp,
             block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
             block_size: 4096,
-            chunk_size: 1024,
+            chunk_size: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE
+                .spec()
+                .unwrap()
+                .storage_chunk_size,
             effective_len: len,
         }
     }

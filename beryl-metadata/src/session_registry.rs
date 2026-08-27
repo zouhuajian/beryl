@@ -10,8 +10,9 @@
 use crate::observe;
 use beryl_types::fs::InodeId;
 use beryl_types::ids::MountId;
-use beryl_types::{BlockId, BlockShape, ClientId, FileLayout, WriteTarget};
+use beryl_types::{BlockId, BlockShape, CallId, ClientId, FileLayout, WriteTarget};
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -61,6 +62,8 @@ pub struct WriteSession {
     pending_add_block: Option<PendingAddBlock>,
     /// Exact local publication currently freezing the issued-target sequence.
     active_publication: Option<WritePublicationId>,
+    /// Immutable identity and response retained for exact CreateFile replay.
+    create_replay: Option<ActiveCreateReplay>,
 }
 
 /// Small active-session snapshot used before AddBlock reserves target state.
@@ -74,6 +77,8 @@ pub(crate) struct WriteSessionIdentity {
 /// Validated inputs needed before one `OpenWrite` crosses its Raft proposal.
 #[derive(Clone)]
 pub(crate) struct BeginSessionInput {
+    /// Normalized path used to exclude an unbound CreateFile opening.
+    pub normalized_path: String,
     pub mount_id: MountId,
     pub inode_id: InodeId,
     pub current_lease_epoch: Option<u64>,
@@ -85,14 +90,60 @@ pub(crate) struct BeginSessionInput {
     pub ancestor_inode_ids: Vec<InodeId>,
 }
 
+/// Stable identity of one replayable atomic CreateFile operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct CreateFileOperationId {
+    pub(crate) client_id: ClientId,
+    pub(crate) call_id: CallId,
+}
+
+/// Inputs reserved before an atomic CreateFile may cross the Raft boundary.
+pub(crate) struct BeginCreateSessionInput {
+    pub(crate) operation_id: CreateFileOperationId,
+    pub(crate) request_deadline_ms: u64,
+    pub(crate) normalized_path: String,
+    pub(crate) mount_id: MountId,
+    pub(crate) expected_mount_epoch: u64,
+    pub(crate) mount_root_inode_id: InodeId,
+    pub(crate) open_client_id: ClientId,
+    /// Mount-root-to-parent chain captured while namespace topology is stable.
+    pub(crate) parent_ancestor_inode_ids: Vec<InodeId>,
+}
+
 /// Process-local identity for one exact `OpenWrite` attempt.
 ///
 /// The durable fencing epoch can be proposed by more than one attempt before
 /// either proposal applies. This identity prevents a cancelled stale attempt
 /// from removing a replacement `Opening` entry that has the same candidate
 /// epoch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct WriteOpeningId(u64);
+
+/// Leader-local capacity reserved before CreateFile has a durable inode ID.
+#[derive(Clone, Debug)]
+struct CreateOpeningSession {
+    opening_id: WriteOpeningId,
+    operation_id: CreateFileOperationId,
+    request_deadline_ms: u64,
+    normalized_path: String,
+    mount_id: MountId,
+    expected_mount_epoch: u64,
+    mount_root_inode_id: InodeId,
+    open_client_id: ClientId,
+    expires_at_ms: u64,
+    parent_ancestor_inode_ids: Vec<InodeId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveCreateReplay {
+    operation_id: CreateFileOperationId,
+    request_deadline_ms: u64,
+    normalized_path: String,
+    mount_id: MountId,
+    expected_mount_epoch: u64,
+    mount_root_inode_id: InodeId,
+    response: CreateSessionReplay,
+}
 
 /// Process-local identity for one exact SyncWrite or CommitFile attempt.
 ///
@@ -123,7 +174,7 @@ enum WriteSessionEntry {
     /// `OpenWrite` owns capacity and inode exclusion while Raft fencing is pending.
     Opening(OpeningSession),
     /// The durable epoch was acquired and the session may continue write operations.
-    Active(WriteSession),
+    Active(Box<WriteSession>),
 }
 
 impl WriteSessionEntry {
@@ -397,6 +448,51 @@ pub(crate) struct WriteOpening<'a> {
     armed: bool,
 }
 
+/// Exact unbound CreateFile reservation held across its Raft proposal.
+#[must_use = "dropping the opening releases its leader-local create session"]
+pub(crate) struct CreateOpening<'a> {
+    registry: &'a SessionRegistry,
+    operation_id: CreateFileOperationId,
+    opening_id: WriteOpeningId,
+    expires_at_ms: u64,
+    armed: bool,
+}
+
+/// Outcome of reserving leader-local ownership for atomic CreateFile.
+pub(crate) enum BeginCreateSession<'a> {
+    /// The same operation already owns a non-expired active session.
+    Replay(CreateSessionReplay),
+    /// New capacity is reserved until Raft creates or replays the file.
+    Reserved(CreateOpening<'a>),
+}
+
+/// Minimal active-session state returned by a leader-local CreateFile replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CreateSessionReplay {
+    pub(crate) inode_id: InodeId,
+    pub(crate) lease_epoch: u64,
+    pub(crate) layout: FileLayout,
+    pub(crate) expires_at_ms: u64,
+    pub(crate) content_revision: u64,
+}
+
+/// Exact reason an atomic CreateFile session cannot be reserved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BeginCreateSessionError {
+    /// The same operation is already waiting for its Raft result.
+    Pending,
+    /// The same operation identity was reused for another request authority.
+    IdentityMismatch,
+    /// Another CreateFile operation is still reserving the same path.
+    PathBusy,
+    /// Admission capacity was exhausted before any durable mutation.
+    LimitExceeded(WriteSessionLimitExceeded),
+    /// The process-local opening identity cannot advance without reuse.
+    OpeningIdExhausted,
+    /// The captured namespace parent path is empty, cyclic, or too deep.
+    InvalidAncestorChain,
+}
+
 impl WriteOpening<'_> {
     /// Return the exact epoch that the matching Raft command must acquire.
     pub(crate) fn proposed_lease_epoch(&self) -> u64 {
@@ -409,6 +505,38 @@ impl WriteOpening<'_> {
             self.registry
                 .activate_opening(self.inode_id, self.opening_id, returned_lease_epoch, current_time_ms());
         if result.is_ok() || matches!(&result, Err(WriteOpeningError::NotCurrent | WriteOpeningError::Expired)) {
+            self.armed = false;
+        }
+        result
+    }
+}
+
+impl CreateOpening<'_> {
+    /// Return the fixed write-session expiry replicated with this create.
+    pub(crate) fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
+    }
+
+    /// Bind the durable CreateFile result and activate its write session atomically.
+    pub(crate) fn activate(
+        mut self,
+        inode_id: InodeId,
+        lease_epoch: u64,
+        expires_at_ms: u64,
+        layout: FileLayout,
+        content_revision: u64,
+    ) -> Result<WriteSession, WriteOpeningError> {
+        let result = self.registry.activate_create_opening(
+            self.operation_id,
+            self.opening_id,
+            inode_id,
+            lease_epoch,
+            expires_at_ms,
+            layout,
+            content_revision,
+            current_time_ms(),
+        );
+        if result.is_ok() {
             self.armed = false;
         }
         result
@@ -458,6 +586,16 @@ pub(crate) enum WriteSessionError {
 struct SessionRegistryState {
     /// At most one opening or active session exists for one inode.
     entries: HashMap<InodeId, WriteSessionEntry>,
+    /// Create openings that own capacity before an inode identity exists.
+    create_openings: HashMap<CreateFileOperationId, CreateOpeningSession>,
+    /// Exact path exclusion held until an unbound create is activated or cancelled.
+    create_openings_by_path: HashMap<(MountId, String), CreateFileOperationId>,
+    /// Reverse identity used by the bounded expiry index.
+    create_opening_operations: HashMap<WriteOpeningId, CreateFileOperationId>,
+    /// Create openings ordered by expiry without requiring an inode identity.
+    create_openings_by_expiry: BTreeSet<(u64, WriteOpeningId)>,
+    /// Active CreateFile operations mapped to their bound inode sessions.
+    active_create_operations: HashMap<CreateFileOperationId, InodeId>,
     /// Number of primary entries still waiting for durable fencing.
     opening_sessions: usize,
     /// Opening plus active sessions attributed to each client ID.
@@ -480,6 +618,11 @@ impl Default for SessionRegistryState {
     fn default() -> Self {
         Self {
             entries: HashMap::new(),
+            create_openings: HashMap::new(),
+            create_openings_by_path: HashMap::new(),
+            create_opening_operations: HashMap::new(),
+            create_openings_by_expiry: BTreeSet::new(),
+            active_create_operations: HashMap::new(),
             opening_sessions: 0,
             occupied_sessions_by_client: HashMap::new(),
             ancestor_activity: HashMap::new(),
@@ -540,6 +683,124 @@ impl SessionRegistry {
         self.begin_session_at(input, current_time_ms())
     }
 
+    /// Reserve CreateFile session capacity before the operation enters Raft.
+    ///
+    /// A retry of an already active operation returns the same leader-local
+    /// session. A concurrent retry of a pending operation is rejected without
+    /// submitting a duplicate proposal.
+    pub(crate) fn begin_create_session(
+        &self,
+        input: BeginCreateSessionInput,
+    ) -> Result<BeginCreateSession<'_>, BeginCreateSessionError> {
+        self.begin_create_session_at(input, current_time_ms())
+    }
+
+    fn begin_create_session_at(
+        &self,
+        input: BeginCreateSessionInput,
+        now_ms: u64,
+    ) -> Result<BeginCreateSession<'_>, BeginCreateSessionError> {
+        if input.operation_id.client_id != input.open_client_id {
+            return Err(BeginCreateSessionError::IdentityMismatch);
+        }
+        Self::validate_parent_ancestor_chain(&input.parent_ancestor_inode_ids)
+            .map_err(|_| BeginCreateSessionError::InvalidAncestorChain)?;
+
+        let mut state = self.state.write();
+        Self::retire_expired_create_opening_for_operation(&mut state, input.operation_id, now_ms);
+        Self::retire_expired_entries(&mut state, now_ms);
+        if let Some(inode_id) = state.active_create_operations.get(&input.operation_id).copied() {
+            let session = match state.entries.get(&inode_id) {
+                Some(WriteSessionEntry::Active(session))
+                    if session.create_replay.as_ref().map(|replay| replay.operation_id) == Some(input.operation_id) =>
+                {
+                    session
+                }
+                _ => panic!("active CreateFile operation index must identify its exact session"),
+            };
+            let replay = session
+                .create_replay
+                .as_ref()
+                .expect("active CreateFile operation must retain its replay identity");
+            if replay.request_deadline_ms != input.request_deadline_ms
+                || replay.normalized_path != input.normalized_path
+                || replay.mount_id != input.mount_id
+                || replay.expected_mount_epoch != input.expected_mount_epoch
+                || replay.mount_root_inode_id != input.mount_root_inode_id
+            {
+                return Err(BeginCreateSessionError::IdentityMismatch);
+            }
+            return Ok(BeginCreateSession::Replay(replay.response));
+        }
+        if let Some(opening) = state.create_openings.get(&input.operation_id) {
+            return if opening.request_deadline_ms == input.request_deadline_ms
+                && opening.normalized_path == input.normalized_path
+                && opening.mount_id == input.mount_id
+                && opening.expected_mount_epoch == input.expected_mount_epoch
+                && opening.mount_root_inode_id == input.mount_root_inode_id
+            {
+                Err(BeginCreateSessionError::Pending)
+            } else {
+                Err(BeginCreateSessionError::IdentityMismatch)
+            };
+        }
+        if state
+            .create_openings_by_path
+            .contains_key(&(input.mount_id, input.normalized_path.clone()))
+        {
+            return Err(BeginCreateSessionError::PathBusy);
+        }
+        if state.entries.len() + state.create_openings.len() >= self.max_sessions {
+            observe::record_write_session_rejected(WriteSessionLimit::Global.label());
+            return Err(BeginCreateSessionError::LimitExceeded(WriteSessionLimitExceeded {
+                limit: WriteSessionLimit::Global,
+                maximum: self.max_sessions,
+            }));
+        }
+        let client_occupied = state
+            .occupied_sessions_by_client
+            .get(&input.open_client_id)
+            .copied()
+            .unwrap_or_default();
+        if client_occupied >= self.max_sessions_per_client {
+            observe::record_write_session_rejected(WriteSessionLimit::PerClient.label());
+            return Err(BeginCreateSessionError::LimitExceeded(WriteSessionLimitExceeded {
+                limit: WriteSessionLimit::PerClient,
+                maximum: self.max_sessions_per_client,
+            }));
+        }
+
+        let opening_id = WriteOpeningId(state.next_opening_id);
+        state.next_opening_id = state
+            .next_opening_id
+            .checked_add(1)
+            .ok_or(BeginCreateSessionError::OpeningIdExhausted)?;
+        let operation_id = input.operation_id;
+        let expires_at_ms = now_ms.saturating_add(self.session_ttl_ms);
+        Self::insert_create_opening(
+            &mut state,
+            CreateOpeningSession {
+                opening_id,
+                operation_id,
+                request_deadline_ms: input.request_deadline_ms,
+                normalized_path: input.normalized_path,
+                mount_id: input.mount_id,
+                expected_mount_epoch: input.expected_mount_epoch,
+                mount_root_inode_id: input.mount_root_inode_id,
+                open_client_id: input.open_client_id,
+                expires_at_ms,
+                parent_ancestor_inode_ids: input.parent_ancestor_inode_ids,
+            },
+        );
+        Ok(BeginCreateSession::Reserved(CreateOpening {
+            registry: self,
+            operation_id,
+            opening_id,
+            expires_at_ms,
+            armed: true,
+        }))
+    }
+
     fn begin_session_at(&self, input: BeginSessionInput, now_ms: u64) -> Result<WriteOpening<'_>, BeginSessionError> {
         Self::validate_ancestor_chain(input.inode_id, &input.ancestor_inode_ids)
             .map_err(|_| BeginSessionError::InvalidAncestorChain)?;
@@ -547,10 +808,14 @@ impl SessionRegistry {
         let mut state = self.state.write();
         Self::retire_expired_entry_for_inode(&mut state, input.inode_id, now_ms);
         Self::retire_expired_entries(&mut state, now_ms);
-        if state.entries.contains_key(&input.inode_id) {
+        if state.entries.contains_key(&input.inode_id)
+            || state
+                .create_openings_by_path
+                .contains_key(&(input.mount_id, input.normalized_path.clone()))
+        {
             return Err(BeginSessionError::Busy);
         }
-        if state.entries.len() >= self.max_sessions {
+        if state.entries.len() + state.create_openings.len() >= self.max_sessions {
             observe::record_write_session_rejected(WriteSessionLimit::Global.label());
             return Err(BeginSessionError::LimitExceeded(WriteSessionLimitExceeded {
                 limit: WriteSessionLimit::Global,
@@ -646,10 +911,11 @@ impl SessionRegistry {
             issued_steps: HashMap::new(),
             pending_add_block: None,
             active_publication: None,
+            create_replay: None,
         };
         let previous = state
             .entries
-            .insert(inode_id, WriteSessionEntry::Active(session.clone()));
+            .insert(inode_id, WriteSessionEntry::Active(Box::new(session.clone())));
         assert!(
             matches!(previous, Some(WriteSessionEntry::Opening(current)) if current.opening_id == opening_id),
             "validated write opening must remain current under the registry lock"
@@ -659,6 +925,74 @@ impl SessionRegistry {
             .checked_sub(1)
             .expect("activated write session must own one opening count");
         Self::record_session_gauges(&state);
+        Ok(session)
+    }
+
+    /// Convert one exact unbound CreateFile reservation into an active inode session.
+    #[allow(clippy::too_many_arguments)]
+    fn activate_create_opening(
+        &self,
+        operation_id: CreateFileOperationId,
+        opening_id: WriteOpeningId,
+        inode_id: InodeId,
+        lease_epoch: u64,
+        expires_at_ms: u64,
+        layout: FileLayout,
+        content_revision: u64,
+        now_ms: u64,
+    ) -> Result<WriteSession, WriteOpeningError> {
+        let mut state = self.state.write();
+        let opening = match state.create_openings.get(&operation_id) {
+            Some(opening) if opening.opening_id == opening_id => opening.clone(),
+            _ => return Err(WriteOpeningError::NotCurrent),
+        };
+        if opening.expires_at_ms <= now_ms || expires_at_ms <= now_ms {
+            Self::remove_create_opening(&mut state, operation_id);
+            observe::record_write_session_expired();
+            return Err(WriteOpeningError::Expired);
+        }
+        if lease_epoch == 0 || state.entries.contains_key(&inode_id) {
+            return Err(WriteOpeningError::NotCurrent);
+        }
+        let mut ancestor_inode_ids = opening.parent_ancestor_inode_ids.clone();
+        ancestor_inode_ids.push(inode_id);
+        Self::validate_ancestor_chain(inode_id, &ancestor_inode_ids).map_err(|_| WriteOpeningError::NotCurrent)?;
+
+        let removed = Self::remove_create_opening(&mut state, operation_id)
+            .expect("validated CreateFile opening must remain current under the registry lock");
+        let response = CreateSessionReplay {
+            inode_id,
+            lease_epoch,
+            layout,
+            expires_at_ms,
+            content_revision,
+        };
+        let session = WriteSession {
+            inode_id,
+            mount_id: removed.mount_id,
+            lease_epoch,
+            base_size: 0,
+            content_revision,
+            mode: WriteMode::Write,
+            open_client_id: removed.open_client_id,
+            layout,
+            expires_at_ms,
+            ancestor_inode_ids,
+            issued_targets: Vec::new(),
+            issued_steps: HashMap::new(),
+            pending_add_block: None,
+            active_publication: None,
+            create_replay: Some(ActiveCreateReplay {
+                operation_id,
+                request_deadline_ms: removed.request_deadline_ms,
+                normalized_path: removed.normalized_path,
+                mount_id: removed.mount_id,
+                expected_mount_epoch: removed.expected_mount_epoch,
+                mount_root_inode_id: removed.mount_root_inode_id,
+                response,
+            }),
+        };
+        Self::insert_entry(&mut state, WriteSessionEntry::Active(Box::new(session.clone())));
         Ok(session)
     }
 
@@ -916,7 +1250,7 @@ impl SessionRegistry {
         Self::retire_expired_entry_for_inode(&mut state, inode_id, now_ms);
         Self::retire_expired_entries(&mut state, now_ms);
         match state.entries.get(&inode_id) {
-            Some(WriteSessionEntry::Active(session)) => Some(session.clone()),
+            Some(WriteSessionEntry::Active(session)) => Some((**session).clone()),
             Some(WriteSessionEntry::Opening(_)) | None => None,
         }
     }
@@ -945,7 +1279,7 @@ impl SessionRegistry {
             Some(WriteSessionEntry::Opening(_) | WriteSessionEntry::Active(_)) | None => return None,
         }
         match Self::remove_entry(&mut state, inode_id) {
-            Some(WriteSessionEntry::Active(session)) => Some(session),
+            Some(WriteSessionEntry::Active(session)) => Some(*session),
             Some(WriteSessionEntry::Opening(_)) | None => {
                 unreachable!("validated active session must remain current under the registry lock")
             }
@@ -1095,6 +1429,24 @@ impl SessionRegistry {
         Ok(())
     }
 
+    /// Validate the bounded mount-root-to-parent path held before inode creation.
+    fn validate_parent_ancestor_chain(ancestor_inode_ids: &[InodeId]) -> Result<(), String> {
+        if ancestor_inode_ids.is_empty() {
+            return Err("create session parent ancestor chain cannot be empty".to_string());
+        }
+        if ancestor_inode_ids.len() > crate::path_resolver::MAX_PATH_COMPONENTS {
+            return Err("create session parent ancestor chain exceeds the path depth limit".to_string());
+        }
+        let mut unique_inode_ids = HashSet::with_capacity(ancestor_inode_ids.len());
+        if ancestor_inode_ids
+            .iter()
+            .any(|ancestor_inode_id| !unique_inode_ids.insert(*ancestor_inode_id))
+        {
+            return Err("create session parent ancestor chain contains a cycle".to_string());
+        }
+        Ok(())
+    }
+
     /// Revalidate that this exact publication still owns a non-expired session.
     fn revalidate_publication(
         &self,
@@ -1224,6 +1576,17 @@ impl SessionRegistry {
         }
     }
 
+    /// Remove only the matching unbound CreateFile opening.
+    fn cancel_create_opening(&self, operation_id: CreateFileOperationId, opening_id: WriteOpeningId) {
+        let mut state = self.state.write();
+        if matches!(
+            state.create_openings.get(&operation_id),
+            Some(opening) if opening.opening_id == opening_id
+        ) {
+            Self::remove_create_opening(&mut state, operation_id);
+        }
+    }
+
     /// Release only the matching pending AddBlock step after failure or cancellation.
     fn cancel_write_target(&self, inode_id: InodeId, lease_epoch: u64, pending: &PendingAddBlock) {
         let mut state = self.state.write();
@@ -1285,8 +1648,83 @@ impl SessionRegistry {
             state.opening_sessions += 1;
         }
         *state.occupied_sessions_by_client.entry(client_id).or_default() += 1;
+        if let WriteSessionEntry::Active(session) = &entry {
+            if let Some(operation_id) = session.create_replay.as_ref().map(|replay| replay.operation_id) {
+                assert!(state.active_create_operations.insert(operation_id, inode_id).is_none());
+            }
+        }
         assert!(state.entries.insert(inode_id, entry).is_none());
         Self::record_session_gauges(state);
+    }
+
+    /// Insert an unbound CreateFile opening and all of its shared capacity indexes.
+    fn insert_create_opening(state: &mut SessionRegistryState, opening: CreateOpeningSession) {
+        assert!(state
+            .create_openings_by_path
+            .insert(
+                (opening.mount_id, opening.normalized_path.clone()),
+                opening.operation_id,
+            )
+            .is_none());
+        for ancestor_inode_id in &opening.parent_ancestor_inode_ids {
+            let activity = state
+                .ancestor_activity
+                .entry(*ancestor_inode_id)
+                .or_insert(AncestorWriteActivity {
+                    sessions_by_expiry: BTreeMap::new(),
+                });
+            *activity.sessions_by_expiry.entry(opening.expires_at_ms).or_default() += 1;
+        }
+        assert!(state
+            .create_openings_by_expiry
+            .insert((opening.expires_at_ms, opening.opening_id)));
+        assert!(state
+            .create_opening_operations
+            .insert(opening.opening_id, opening.operation_id)
+            .is_none());
+        *state
+            .occupied_sessions_by_client
+            .entry(opening.open_client_id)
+            .or_default() += 1;
+        assert!(state.create_openings.insert(opening.operation_id, opening).is_none());
+        Self::record_session_gauges(state);
+    }
+
+    /// Remove one unbound CreateFile opening and every derived index.
+    fn remove_create_opening(
+        state: &mut SessionRegistryState,
+        operation_id: CreateFileOperationId,
+    ) -> Option<CreateOpeningSession> {
+        let opening = state.create_openings.remove(&operation_id)?;
+        assert_eq!(
+            state
+                .create_openings_by_path
+                .remove(&(opening.mount_id, opening.normalized_path.clone())),
+            Some(operation_id)
+        );
+        assert!(state
+            .create_openings_by_expiry
+            .remove(&(opening.expires_at_ms, opening.opening_id)));
+        assert_eq!(
+            state.create_opening_operations.remove(&opening.opening_id),
+            Some(operation_id)
+        );
+        for ancestor_inode_id in &opening.parent_ancestor_inode_ids {
+            let remove_entry = {
+                let activity = state
+                    .ancestor_activity
+                    .get_mut(ancestor_inode_id)
+                    .expect("create opening ancestor index must exist");
+                Self::decrement_expiry_count(&mut activity.sessions_by_expiry, opening.expires_at_ms);
+                activity.sessions_by_expiry.is_empty()
+            };
+            if remove_entry {
+                state.ancestor_activity.remove(ancestor_inode_id);
+            }
+        }
+        Self::decrement_client_occupancy(state, opening.open_client_id);
+        Self::record_session_gauges(state);
+        Some(opening)
     }
 
     /// Remove one primary entry and every derived index under the state lock.
@@ -1310,6 +1748,11 @@ impl SessionRegistry {
             "write session entry must own one client capacity slot"
         );
         let entry = state.entries.remove(&inode_id)?;
+        if let WriteSessionEntry::Active(session) = &entry {
+            if let Some(operation_id) = session.create_replay.as_ref().map(|replay| replay.operation_id) {
+                assert_eq!(state.active_create_operations.remove(&operation_id), Some(inode_id));
+            }
+        }
         if entry.is_opening() {
             state.opening_sessions = state
                 .opening_sessions
@@ -1374,19 +1817,57 @@ impl SessionRegistry {
     fn retire_expired_entries(state: &mut SessionRegistryState, now_ms: u64) -> usize {
         let mut retired = 0;
         while retired < MAX_EXPIRED_SESSION_RETIREMENTS_PER_CALL {
-            let Some(&(expires_at_ms, inode_id)) = state.entries_by_expiry.first() else {
-                break;
+            let session_expiry = state.entries_by_expiry.first().copied();
+            let create_expiry = state.create_openings_by_expiry.first().copied();
+            let next_is_create = match (session_expiry, create_expiry) {
+                (None, None) => break,
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
+                (Some((session_ms, _)), Some((create_ms, _))) => create_ms < session_ms,
+            };
+            let expires_at_ms = if next_is_create {
+                create_expiry.expect("selected CreateFile expiry").0
+            } else {
+                session_expiry.expect("selected write-session expiry").0
             };
             if expires_at_ms > now_ms {
                 break;
             }
-            if Self::remove_entry(state, inode_id).is_none() {
-                state.entries_by_expiry.remove(&(expires_at_ms, inode_id));
+            if next_is_create {
+                let (_, opening_id) = create_expiry.expect("selected CreateFile expiry");
+                let operation_id = state
+                    .create_opening_operations
+                    .get(&opening_id)
+                    .copied()
+                    .expect("CreateFile expiry must identify an operation");
+                assert!(Self::remove_create_opening(state, operation_id).is_some());
+            } else {
+                let (_, inode_id) = session_expiry.expect("selected write-session expiry");
+                if Self::remove_entry(state, inode_id).is_none() {
+                    state.entries_by_expiry.remove(&(expires_at_ms, inode_id));
+                }
             }
             observe::record_write_session_expired();
             retired += 1;
         }
         retired
+    }
+
+    /// Retire one exact pending CreateFile operation after its lease deadline.
+    fn retire_expired_create_opening_for_operation(
+        state: &mut SessionRegistryState,
+        operation_id: CreateFileOperationId,
+        now_ms: u64,
+    ) -> bool {
+        let is_expired = state
+            .create_openings
+            .get(&operation_id)
+            .is_some_and(|opening| opening.expires_at_ms <= now_ms);
+        if is_expired && Self::remove_create_opening(state, operation_id).is_some() {
+            observe::record_write_session_expired();
+            return true;
+        }
+        false
     }
 
     /// Retire one requested inode even when it lies beyond the sweep budget.
@@ -1424,12 +1905,13 @@ impl SessionRegistry {
     }
 
     fn record_session_gauges(state: &SessionRegistryState) {
+        let opening_sessions = state.opening_sessions + state.create_openings.len();
         let active_sessions = state
             .entries
             .len()
             .checked_sub(state.opening_sessions)
             .expect("opening session count cannot exceed primary entries");
-        observe::set_write_sessions(state.opening_sessions, active_sessions);
+        observe::set_write_sessions(opening_sessions, active_sessions);
     }
 
     /// Publish issued occupancy as total outstanding capacity minus pending reservations.
@@ -1446,6 +1928,15 @@ impl Drop for WriteOpening<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.registry.cancel_opening(self.inode_id, self.opening_id);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for CreateOpening<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry.cancel_create_opening(self.operation_id, self.opening_id);
             self.armed = false;
         }
     }
@@ -1511,7 +2002,7 @@ mod tests {
                 epoch: 7,
             },
             block_stamp: 1,
-            chunk_size: 64,
+            chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.spec().unwrap().storage_chunk_size,
             block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
             tier: Tier::Hdd,
         }
@@ -1519,6 +2010,7 @@ mod tests {
 
     fn create_input(inode_id: InodeId) -> BeginSessionInput {
         BeginSessionInput {
+            normalized_path: format!("/inode-{}", inode_id.as_raw()),
             inode_id,
             mount_id: MountId::new(1),
             current_lease_epoch: Some(6),
@@ -1526,7 +2018,7 @@ mod tests {
             content_revision: 0,
             mode: WriteMode::Write,
             open_client_id: ClientId::new(1),
-            layout: FileLayout::new(64, 64, 1),
+            layout: FileLayout::new(64),
             ancestor_inode_ids: vec![inode_id],
         }
     }
@@ -1569,6 +2061,19 @@ mod tests {
         let mut input = create_input(inode_id);
         input.open_client_id = client_id;
         registry.begin_session(input)
+    }
+
+    fn begin_create_input(operation_id: CreateFileOperationId) -> BeginCreateSessionInput {
+        BeginCreateSessionInput {
+            operation_id,
+            request_deadline_ms: 100,
+            normalized_path: "/created".to_string(),
+            mount_id: MountId::new(1),
+            expected_mount_epoch: 1,
+            mount_root_inode_id: InodeId::new(1),
+            open_client_id: operation_id.client_id,
+            parent_ancestor_inode_ids: vec![InodeId::new(1)],
+        }
     }
 
     fn issue_target(
@@ -1661,6 +2166,139 @@ mod tests {
         let state = registry.state.read();
         assert_eq!(state.opening_sessions, 0);
         assert!(state.occupied_sessions_by_client.is_empty());
+    }
+
+    #[test]
+    fn create_opening_reserves_capacity_and_replays_after_activation() {
+        let registry = SessionRegistry::new(2, 1, 100, 100, 60_000);
+        let now_ms = current_time_ms();
+        let operation_id = CreateFileOperationId {
+            client_id: ClientId::new(9),
+            call_id: CallId::new(),
+        };
+        let mut opening = match registry
+            .begin_create_session_at(begin_create_input(operation_id), now_ms)
+            .unwrap()
+        {
+            BeginCreateSession::Reserved(opening) => opening,
+            BeginCreateSession::Replay(_) => panic!("first CreateFile must reserve capacity"),
+        };
+        let expires_at_ms = opening.expires_at_ms;
+        let mut wrong_deadline = begin_create_input(operation_id);
+        wrong_deadline.request_deadline_ms += 1;
+        assert!(matches!(
+            registry.begin_create_session_at(wrong_deadline, now_ms + 1),
+            Err(BeginCreateSessionError::IdentityMismatch)
+        ));
+        let other_operation = CreateFileOperationId {
+            client_id: ClientId::new(8),
+            call_id: CallId::new(),
+        };
+        assert!(matches!(
+            registry.begin_create_session_at(begin_create_input(other_operation), now_ms + 1),
+            Err(BeginCreateSessionError::PathBusy)
+        ));
+        let mut competing = create_input(InodeId::new(2));
+        competing.open_client_id = ClientId::new(9);
+        competing.normalized_path = "/created".to_string();
+        assert!(matches!(
+            registry.begin_session_at(competing.clone(), now_ms + 1),
+            Err(BeginSessionError::Busy)
+        ));
+        competing.normalized_path = "/other".to_string();
+        assert!(matches!(
+            registry.begin_session_at(competing, now_ms + 1),
+            Err(BeginSessionError::LimitExceeded(_))
+        ));
+
+        let session = registry
+            .activate_create_opening(
+                opening.operation_id,
+                opening.opening_id,
+                InodeId::new(2),
+                1,
+                expires_at_ms,
+                FileLayout::new(64),
+                0,
+                now_ms + 1,
+            )
+            .unwrap();
+        opening.armed = false;
+        assert_eq!(session.inode_id, InodeId::new(2));
+
+        registry
+            .begin_publication(session.inode_id, session.lease_epoch)
+            .unwrap()
+            .complete_sync(1, 0)
+            .unwrap();
+        let renewed_expires_at_ms = registry
+            .renew_session_at(
+                session.inode_id,
+                session.lease_epoch,
+                session.open_client_id,
+                now_ms + 10,
+            )
+            .unwrap();
+        assert!(renewed_expires_at_ms >= expires_at_ms);
+
+        let mut wrong_mount = begin_create_input(operation_id);
+        wrong_mount.mount_id = MountId::new(2);
+        assert!(matches!(
+            registry.begin_create_session_at(wrong_mount, now_ms + 10),
+            Err(BeginCreateSessionError::IdentityMismatch)
+        ));
+        let mut wrong_mount_epoch = begin_create_input(operation_id);
+        wrong_mount_epoch.expected_mount_epoch = 2;
+        assert!(matches!(
+            registry.begin_create_session_at(wrong_mount_epoch, now_ms + 10),
+            Err(BeginCreateSessionError::IdentityMismatch)
+        ));
+        let mut wrong_deadline = begin_create_input(operation_id);
+        wrong_deadline.request_deadline_ms += 1;
+        assert!(matches!(
+            registry.begin_create_session_at(wrong_deadline, now_ms + 10),
+            Err(BeginCreateSessionError::IdentityMismatch)
+        ));
+        let replay = registry
+            .begin_create_session_at(begin_create_input(operation_id), now_ms + 10)
+            .unwrap();
+        let BeginCreateSession::Replay(current) = replay else {
+            panic!("active CreateFile must replay its session")
+        };
+        assert_eq!(current.inode_id, session.inode_id);
+        assert_eq!(current.lease_epoch, session.lease_epoch);
+        assert_eq!(current.expires_at_ms, expires_at_ms);
+        assert_eq!(current.content_revision, 0);
+        assert_eq!(registry.get_session(session.inode_id).unwrap().content_revision, 1);
+    }
+
+    #[test]
+    fn failed_create_activation_releases_capacity_and_path_exclusion() {
+        let registry = SessionRegistry::new(2, 2, 100, 100, 60_000);
+        let operation_id = CreateFileOperationId {
+            client_id: ClientId::new(9),
+            call_id: CallId::new(),
+        };
+        let opening = match registry.begin_create_session(begin_create_input(operation_id)).unwrap() {
+            BeginCreateSession::Reserved(opening) => opening,
+            BeginCreateSession::Replay(_) => panic!("first CreateFile must reserve capacity"),
+        };
+        let expires_at_ms = opening.expires_at_ms();
+        let inode_id = InodeId::new(2);
+        install_session(&registry, create_input(inode_id)).unwrap();
+
+        assert!(matches!(
+            opening.activate(inode_id, 1, expires_at_ms, FileLayout::new(64), 0),
+            Err(WriteOpeningError::NotCurrent)
+        ));
+        assert!(registry.state.read().create_openings.is_empty());
+        assert!(registry.state.read().create_openings_by_path.is_empty());
+
+        registry.remove_session_if_epoch(inode_id, 7).unwrap();
+        assert!(matches!(
+            registry.begin_create_session(begin_create_input(operation_id)),
+            Ok(BeginCreateSession::Reserved(_))
+        ));
     }
 
     #[test]

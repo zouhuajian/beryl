@@ -1711,7 +1711,7 @@ mod tests {
                     epoch: 1,
                 },
                 block_stamp,
-                chunk_size: 64,
+                chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.spec().unwrap().storage_chunk_size,
                 block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
                 tier: Tier::Hdd,
             },

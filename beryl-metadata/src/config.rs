@@ -13,7 +13,7 @@ use beryl_common::error::{CommonError, CommonErrorKind};
 use beryl_common::grpc_server::MAX_GRPC_CONCURRENT_REQUESTS;
 use beryl_common::observe::config::{LogConfig, ResourceConfig};
 use beryl_common::observe::ObservabilityConfig;
-use beryl_types::{GroupName, MAX_FILE_EXTENTS};
+use beryl_types::{FileLayout, GroupName, MAX_FILE_EXTENTS};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
@@ -28,6 +28,7 @@ const WRITE_SESSION_MAX_ACTIVE: &str = "beryl.metadata.write-session.max-active"
 const WRITE_SESSION_MAX_ACTIVE_PER_CLIENT: &str = "beryl.metadata.write-session.max-active-per-client";
 const WRITE_TARGET_MAX_OUTSTANDING: &str = "beryl.metadata.write-target.max-outstanding";
 const WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION: &str = "beryl.metadata.write-target.max-outstanding-per-session";
+const FILE_BLOCK_SIZE_DEFAULT: &str = "beryl.file.block-size.default";
 const HTTP_PORT: &str = "beryl.metadata.http.port";
 const STORAGE_DIR: &str = "beryl.metadata.storage.dir";
 const LIST_DEFAULT_PAGE_SIZE: &str = "beryl.metadata.namespace.list.default-page-size";
@@ -76,6 +77,8 @@ pub struct MetadataConfig {
     pub write_session_limits: MetadataWriteSessionLimitsConfig,
     /// Leader-local pending plus issued write-target capacity limits.
     pub write_target_limits: MetadataWriteTargetLimitsConfig,
+    /// Server-owned defaults materialized into every newly created file layout.
+    pub file_layout_defaults: FileLayoutDefaults,
     /// Process-owned HTTP port for metrics, health, and future APIs.
     pub http_port: u16,
     /// Local directory for authoritative Metadata state.
@@ -132,6 +135,34 @@ pub struct MetadataWriteTargetLimitsConfig {
     pub max_outstanding: usize,
     /// Maximum targets retained by one active write session.
     pub max_outstanding_per_session: usize,
+}
+
+/// Defaults materialized into the immutable layout of newly created files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileLayoutDefaults {
+    /// Logical capacity of each newly allocated block.
+    pub block_size: u32,
+}
+
+impl FileLayoutDefaults {
+    /// Validate and construct the server-owned defaults for new files.
+    pub fn try_new(block_size: u32) -> Result<Self, CommonError> {
+        let config = Self { block_size };
+        config.layout()?;
+        Ok(config)
+    }
+
+    /// Materialize the fully validated layout persisted by Metadata.
+    pub fn layout(self) -> Result<FileLayout, CommonError> {
+        let layout = FileLayout::new(self.block_size);
+        layout.validate().map_err(|error| {
+            CommonError::new(
+                CommonErrorKind::InvalidArgument,
+                format!("invalid default file layout: {error}"),
+            )
+        })?;
+        Ok(layout)
+    }
 }
 
 impl MetadataConfig {
@@ -283,6 +314,14 @@ impl Default for MetadataWriteTargetLimitsConfig {
     }
 }
 
+impl Default for FileLayoutDefaults {
+    fn default() -> Self {
+        Self {
+            block_size: 64 * 1024 * 1024,
+        }
+    }
+}
+
 impl NamespaceListConfig {
     pub fn try_new(default_page_size: u32, max_page_size: u32) -> Result<Self, CommonError> {
         if default_page_size == 0 {
@@ -342,6 +381,7 @@ impl Default for MetadataConfig {
             rpc_concurrency: MetadataRpcConcurrencyConfig::default(),
             write_session_limits: MetadataWriteSessionLimitsConfig::default(),
             write_target_limits: MetadataWriteTargetLimitsConfig::default(),
+            file_layout_defaults: FileLayoutDefaults::default(),
             http_port: 18081,
             storage_dir: PathBuf::from("data/metadata"),
             raft: RaftConfig::default(),
@@ -428,6 +468,9 @@ impl MetadataConfig {
             )?,
         };
         validate_write_target_limits(&write_target_limits)?;
+        let file_layout_defaults = FileLayoutDefaults::default();
+        let file_layout_defaults =
+            FileLayoutDefaults::try_new(flat.bytes_u32_or(FILE_BLOCK_SIZE_DEFAULT, file_layout_defaults.block_size)?)?;
         let storage_dir = PathBuf::from(flat.string_or(STORAGE_DIR, defaults.storage_dir.to_str().unwrap())?);
         let observability = ObservabilityConfig::from_flat(flat)?;
 
@@ -516,6 +559,7 @@ impl MetadataConfig {
             rpc_concurrency,
             write_session_limits,
             write_target_limits,
+            file_layout_defaults,
             http_port,
             storage_dir,
             raft: RaftConfig::default(),
@@ -699,6 +743,10 @@ mod tests {
             WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION,
             i64::try_from(MAX_FILE_EXTENTS + 1).unwrap(),
         );
+        assert!(MetadataConfig::from_flat(flat).is_err());
+
+        let mut flat = base_flat();
+        flat.set(FILE_BLOCK_SIZE_DEFAULT, "0");
         assert!(MetadataConfig::from_flat(flat).is_err());
     }
 }

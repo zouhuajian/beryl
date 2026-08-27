@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use beryl_client::{ClientResult, CreateOptions, DeleteOptions};
+use beryl_client::{ClientResult, DeleteOptions};
 use beryl_e2e::{data::deterministic_bytes, TestCluster};
 use bytes::Bytes;
 
@@ -112,13 +112,7 @@ async fn recursive_delete_stays_hidden_and_reclaims_after_metadata_restart() {
 }
 
 async fn write_file(client: &beryl_client::FsClient, path: &str, payload: Bytes) {
-    let mut writer = client
-        .create(
-            path,
-            CreateOptions::create().with_block_size(1024).with_chunk_size(1024),
-        )
-        .await
-        .expect("create cleanup test file");
+    let mut writer = client.create(path).await.expect("create cleanup test file");
     writer.write_all(payload).await.expect("write cleanup test file");
     writer.close().await.expect("publish cleanup test file");
 }

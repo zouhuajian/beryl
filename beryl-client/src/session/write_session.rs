@@ -116,9 +116,15 @@ impl WriteSession {
             target.block_size,
         )
         .map_err(|err| ClientError::invalid_layout(format!("write target has invalid shape: {err}")))?;
+        let storage_chunk_size = self
+            .layout
+            .block_format_id
+            .spec()
+            .map_err(|err| ClientError::invalid_layout(format!("session block format is invalid: {err}")))?
+            .storage_chunk_size;
         if target.block_format_id != self.layout.block_format_id
             || target.block_size != u64::from(self.layout.block_size)
-            || target.chunk_size != self.layout.chunk_size
+            || target.chunk_size != storage_chunk_size
         {
             return Err(ClientError::invalid_layout(format!(
                 "write target layout does not match session layout: target=({}, {}, {}), session=({}, {}, {})",
@@ -127,7 +133,7 @@ impl WriteSession {
                 target.chunk_size,
                 self.layout.block_format_id.as_raw(),
                 self.layout.block_size,
-                self.layout.chunk_size
+                storage_chunk_size
             )));
         }
         let block = target.block_id;
@@ -754,7 +760,7 @@ mod tests {
     }
 
     fn test_layout() -> FileLayout {
-        FileLayout::new(1024, 1024, 1)
+        FileLayout::new(1024)
     }
 
     fn write_handle_proto(inode_id: u64) -> WriteHandleProto {
