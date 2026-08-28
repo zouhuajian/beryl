@@ -156,8 +156,8 @@ impl FsClient {
     /// public read-open options until they carry real behavior.
     pub async fn open(&self, path: &str) -> ClientResult<FileReader> {
         let path = NamespacePathBuf::parse(path)?;
-        let handle = self.inner.metadata.open_file(path).await?;
-        Ok(FileReader::new(Arc::clone(&self.inner), handle))
+        let file = self.inner.metadata.open_file(path).await?;
+        Ok(FileReader::new(Arc::clone(&self.inner), file))
     }
 
     /// Atomically creates a file and obtains its initial write session.
@@ -194,7 +194,7 @@ mod tests {
     use crate::config::{ClientConfig, MetadataGroupConfig, ReadConfig};
     use crate::error::{ClientError, ClientErrorKind, ClientResult, RefreshHint};
     use crate::metadata::{
-        AddBlockResult, MetadataAuthorityUpdate, MetadataClient, MetadataTransport, ReadLayout, ReadSnapshot,
+        AddBlockResult, MetadataAuthorityUpdate, MetadataClient, MetadataTransport, OpenedFile, ReadLayout,
         ValidatedMetadataResponse,
     };
     use crate::metrics::{ClientMetric, ClientMetricEvent};
@@ -202,8 +202,7 @@ mod tests {
     use crate::runtime::{retry_decision, AttemptContext, ClientIdentity, MetadataTargets, RetryDecision, RetrySafety};
     use crate::session::write_session::WriteSession;
     use crate::worker::{
-        BlockWrite, BlockWriteInput, BlockWriteLease, WorkerClient, WorkerReadResult, WorkerTransport,
-        WorkerWriteTarget,
+        BlockWrite, BlockWriteInput, BlockWriteLease, WorkerClient, WorkerTransport, WorkerWriteTarget,
     };
     use async_trait::async_trait;
     use beryl_common::error::rpc::{
@@ -469,44 +468,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reader_replans_after_worker_refresh() {
-        let metadata_transport = Arc::new(MockMetadataTransport::with_layout(layout_response(
-            "root",
-            202,
-            Some(3),
-            16,
-            vec![location(202, 0, 0, 16)],
-        )));
-        let worker = Arc::new(MockDataClient::with_refresh_once(
-            b"abcdefghijklmnop",
-            ErrorKind::Worker(WorkerErrorKind::RunMismatch),
-        ));
-        let client = fs_client_with_worker_transport(
-            test_config("root"),
-            metadata_transport.clone(),
-            worker_transport(worker),
-        )
-        .expect("client");
-        let reader = read_reader(&client, 16);
-
-        let bytes = reader.read_at(1, 3).await.expect("read succeeds after refresh");
-
-        assert_eq!(bytes, Bytes::from_static(b"bcd"));
-        assert_eq!(method_count(&metadata_transport.calls(), "read_layout"), 2);
-    }
-
-    #[tokio::test]
-    async fn reader_enforces_validated_exact_and_bounded_reads_before_rpc() {
-        for (max_request_bytes, max_buffered_bytes, key) in [
-            (0, 1, "beryl.client.read.max-request-bytes"),
-            (1, 0, "beryl.client.read.max-buffered-bytes"),
-        ] {
-            let config = test_config_with_read_bounds("root", max_request_bytes, max_buffered_bytes);
-            let error = FsClient::try_new(config).expect_err("zero read bound must be rejected");
-
-            assert_client_error(&error, ClientErrorKind::InvalidArgument, false, key);
-        }
-
+    async fn reader_replans_preserves_position_and_enforces_core_bounds() {
         let metadata_transport = Arc::new(MockMetadataTransport::with_layout(layout_response(
             "root",
             202,
@@ -514,7 +476,10 @@ mod tests {
             8,
             vec![location(202, 0, 0, 8)],
         )));
-        let worker = Arc::new(MockDataClient::from_file(b"abcdefgh"));
+        let worker = Arc::new(MockDataClient::with_refresh_once(
+            b"abcdefgh",
+            ErrorKind::Worker(WorkerErrorKind::RunMismatch),
+        ));
         let client = fs_client_with_worker_transport(
             test_config_with_read_bounds("root", 3, 8),
             metadata_transport.clone(),
@@ -522,26 +487,45 @@ mod tests {
         )
         .expect("client");
 
-        let reader = read_reader(&client, 8);
+        let mut reader = read_reader(&client, 8);
+        let mut sequential = [0u8; 4];
+        assert_eq!(reader.read(&mut sequential).await.expect("bounded sequential read"), 3);
+        assert_eq!(&sequential[..3], b"abc");
+        assert_eq!(reader.position(), 3);
+        let replan_calls = metadata_transport.calls();
+        assert_eq!(method_count(&replan_calls, "read_layout"), 2);
+        assert_eq!(replan_calls[0].call_id, replan_calls[1].call_id);
+        assert_eq!(replan_calls[0].deadline_ms, replan_calls[1].deadline_ms);
+
+        let mut positioned = [0u8; 3];
+        assert_eq!(reader.read_at(4, &mut positioned).await.expect("positioned read"), 3);
+        assert_eq!(positioned, *b"efg");
+        assert_eq!(reader.position(), 3);
+
+        let calls_before_eof = metadata_transport.calls().len();
+        let worker_calls_before_eof = *worker.calls.lock().expect("worker calls");
+        let mut beyond_eof = [0u8; 1];
         let error = reader
-            .read_exact_at(8, 1)
+            .read_exact_at(8, &mut beyond_eof)
             .await
             .expect_err("read_exact_at must reject EOF");
-        assert_client_error(&error, ClientErrorKind::InvalidArgument, false, "read_exact_at");
-        assert_eq!(
-            reader.read_all().await.expect("boundary-sized read_all"),
-            b"abcdefgh"[..]
+        assert_client_error(
+            &error,
+            ClientErrorKind::UnexpectedEof,
+            false,
+            "exceeds opened file length",
         );
-        assert_eq!(method_count(&metadata_transport.calls(), "read_layout"), 3);
-        assert_eq!(*worker.calls.lock().expect("worker calls"), 3);
+        assert_eq!(metadata_transport.calls().len(), calls_before_eof);
+        assert_eq!(*worker.calls.lock().expect("worker calls"), worker_calls_before_eof);
+
+        assert_eq!(reader.read_to_end().await.expect("remaining read"), b"defgh"[..]);
+        assert_eq!(reader.position(), 8);
 
         let metadata_calls = metadata_transport.calls().len();
         let worker_calls = *worker.calls.lock().expect("worker calls");
-        let oversized_reader = read_reader(&client, 9);
-        let error = oversized_reader.read_all().await.expect_err("read_all bound");
-        assert_client_error(&error, ClientErrorKind::InvalidArgument, false, "read_all maximum");
-        let error = reader.read_at(0, 4).await.expect_err("read request bound");
-        assert_client_error(&error, ClientErrorKind::InvalidArgument, false, "configured maximum");
+        let mut oversized_reader = read_reader(&client, 9);
+        let error = oversized_reader.read_to_end().await.expect_err("read_to_end bound");
+        assert_client_error(&error, ClientErrorKind::InvalidArgument, false, "read_to_end maximum");
         assert_eq!(metadata_transport.calls().len(), metadata_calls);
         assert_eq!(*worker.calls.lock().expect("worker calls"), worker_calls);
     }
@@ -1836,7 +1820,8 @@ mod tests {
             _ctx: AttemptContext,
             _group_name: GroupName,
             block_read: &PlannedBlockRead,
-        ) -> ClientResult<WorkerReadResult> {
+            output: &mut [u8],
+        ) -> ClientResult<()> {
             let call_number = {
                 let mut calls = self.calls.lock().expect("calls");
                 *calls += 1;
@@ -1849,9 +1834,18 @@ mod tests {
             }
             let start = block_read.file_offset as usize;
             let end = start + block_read.len as usize;
-            Ok(WorkerReadResult {
-                bytes: self.file.slice(start..end),
-            })
+            let bytes = self
+                .file
+                .get(start..end)
+                .ok_or_else(|| ClientError::invalid_response("ReadBlock", "mock read exceeds configured file"))?;
+            if bytes.len() != output.len() {
+                return Err(ClientError::invalid_response(
+                    "ReadBlock",
+                    "mock output length does not match planned range",
+                ));
+            }
+            output.copy_from_slice(bytes);
+            Ok(())
         }
 
         async fn open_write_block(
@@ -1938,7 +1932,7 @@ mod tests {
     fn read_reader(client: &FsClient, file_size: u64) -> FileReader {
         FileReader::new(
             Arc::clone(&client.inner),
-            ReadSnapshot::new("/alpha".to_string(), InodeId::new(202), 3, file_size),
+            OpenedFile::new("/alpha".to_string(), InodeId::new(202), 3, file_size),
         )
     }
 

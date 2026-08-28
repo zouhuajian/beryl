@@ -37,12 +37,17 @@ async fn committed_visible_file_survives_metadata_restart() {
         .await
         .expect("pre-restart report convergence");
 
-    let before = client.open(path).await.expect("open before restart").read_all().await;
+    let before = client
+        .open(path)
+        .await
+        .expect("open before restart")
+        .read_to_end()
+        .await;
     assert_eq!(before.expect("read before restart"), payload);
 
     cluster.restart_metadata().await.expect("restart metadata");
 
-    let after = client.open(path).await.expect("open after restart").read_all().await;
+    let after = client.open(path).await.expect("open after restart").read_to_end().await;
     assert_eq!(after.expect("read after restart"), payload);
     cluster.shutdown().await.expect("shutdown cluster");
 }
@@ -224,7 +229,7 @@ async fn existing_visible_data_remains_readable_while_active_write_fails_closed(
         .open(visible_path)
         .await
         .expect("open visible after restart")
-        .read_all()
+        .read_to_end()
         .await
         .expect("read visible after restart");
     assert_eq!(visible_after, visible);
@@ -492,7 +497,7 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
         .open(path)
         .await
         .expect("open restarted write")
-        .read_all()
+        .read_to_end()
         .await
         .expect("read restarted write");
     assert_eq!(read.as_ref(), payload.as_slice());

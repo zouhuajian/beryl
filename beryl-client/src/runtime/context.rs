@@ -22,7 +22,6 @@ pub(crate) enum Operation {
     Delete,
     Rename,
     OpenFile,
-    GetBlockLocations,
     CreateFile,
     OpenWrite,
     AddBlock,
@@ -45,7 +44,6 @@ impl Operation {
             Self::Delete => "Delete",
             Self::Rename => "Rename",
             Self::OpenFile => "OpenFile",
-            Self::GetBlockLocations => "GetBlockLocations",
             Self::CreateFile => "CreateFile",
             Self::OpenWrite => "OpenWrite",
             Self::AddBlock => "AddBlock",
@@ -62,12 +60,7 @@ impl Operation {
     /// Returns the only replay authorization used by Metadata and Worker loops.
     pub(crate) const fn retry_safety(self) -> RetrySafety {
         match self {
-            Self::GetStatus
-            | Self::ListStatus
-            | Self::OpenFile
-            | Self::GetBlockLocations
-            | Self::Msync
-            | Self::Read => RetrySafety::ReadOnly,
+            Self::GetStatus | Self::ListStatus | Self::OpenFile | Self::Msync | Self::Read => RetrySafety::ReadOnly,
             Self::CreateDirectoryRecursive
             | Self::CreateFile
             | Self::AddBlock

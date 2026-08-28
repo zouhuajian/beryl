@@ -10,9 +10,9 @@ use std::path::Path;
 
 pub const DEFAULT_CLIENT_NAME: &str = "default-client";
 pub const DEFAULT_OPERATION_TIMEOUT_MS: u64 = 30_000;
-/// Default maximum result size for one positioned owned-buffer read.
+/// Default maximum byte count for one bounded Worker read step.
 pub const DEFAULT_READ_MAX_REQUEST_BYTES: u32 = 8 * 1024 * 1024;
-/// Default maximum file size accepted by the whole-file convenience read.
+/// Default maximum remaining length accepted by `FileReader::read_to_end`.
 pub const DEFAULT_READ_MAX_BUFFERED_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_WRITE_LEASE_RENEW_BEFORE_EXPIRY_MS: u64 = 30_000;
 pub const DEFAULT_WORKER_ENDPOINT_COOLDOWN_MS: u64 = 1_000;
@@ -29,7 +29,7 @@ pub struct ClientConfig {
     pub client_name: String,
     /// Retry configuration.
     pub retry: RetryConfig,
-    /// Bounds for public APIs that return owned read buffers.
+    /// Bounds for client read steps and owned read-to-end buffers.
     pub read: ReadConfig,
     /// Client-side write lease renewal policy.
     pub write_lease: WriteLeaseConfig,
@@ -72,17 +72,17 @@ pub struct RetryConfig {
     pub operation_timeout_ms: u64,
 }
 
-/// Memory bounds for the current owned-buffer read APIs.
+/// Bounds for read RPC steps and caller-requested owned buffering.
 #[derive(Clone, Debug)]
 pub struct ReadConfig {
-    /// Maximum byte count accepted by one `read_at` or `read_exact_at` call.
+    /// Maximum byte count sent through one bounded Worker read step.
     pub max_request_bytes: u32,
-    /// Maximum file size accepted by `read_all`.
+    /// Maximum remaining byte count accepted by `FileReader::read_to_end`.
     pub max_buffered_bytes: u64,
 }
 
 impl ReadConfig {
-    /// Ensures both owned-buffer limits admit nonempty reads.
+    /// Ensures both read bounds admit nonempty reads.
     pub(crate) fn validate(&self) -> Result<(), CommonError> {
         if self.max_request_bytes == 0 {
             return Err(invalid_config(READ_MAX_REQUEST_BYTES_KEY, "must be greater than zero"));

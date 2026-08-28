@@ -17,7 +17,7 @@ use crate::config::{ClientConfig, RetryConfig};
 use crate::error::{
     invalid_response, side_effect_response_body_mismatch, ClientError, ClientErrorKind, ClientResult, RefreshHint,
 };
-use crate::metadata::{AddBlockResult, MetadataTransport, ReadLayout, ReadSnapshot, ValidatedMetadataResponse};
+use crate::metadata::{AddBlockResult, MetadataTransport, OpenedFile, ReadLayout, ValidatedMetadataResponse};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
 use crate::runtime::context::{AttemptContext, ClientIdentity, Operation, OperationContext, OperationDeadline};
 use crate::runtime::refresh::MetadataTargets;
@@ -181,8 +181,8 @@ impl MetadataClient {
         .map(|_| ())
     }
 
-    /// Opens one immutable Metadata snapshot for subsequent authorized reads.
-    pub(crate) async fn open_file(&self, path: NamespacePathBuf) -> ClientResult<ReadSnapshot> {
+    /// Opens one immutable Metadata file version for subsequent authorized reads.
+    pub(crate) async fn open_file(&self, path: NamespacePathBuf) -> ClientResult<OpenedFile> {
         let path = path.into_string();
         let operation = self.operation(Operation::OpenFile, Some(path.clone()), self.operation_deadline())?;
         let response = self
@@ -204,7 +204,7 @@ impl MetadataClient {
         let content_revision = response
             .content_revision
             .ok_or_else(|| invalid_response("OpenFile", "OpenFileResponseProto.content_revision missing"))?;
-        Ok(ReadSnapshot::new(
+        Ok(OpenedFile::new(
             path,
             InodeId::new(response.inode_id),
             content_revision,
@@ -212,31 +212,16 @@ impl MetadataClient {
         ))
     }
 
-    /// Reads an authoritative layout under a caller-provided absolute deadline.
-    pub(crate) async fn read_layout(
-        &self,
-        path: &str,
-        req: beryl_proto::metadata::GetBlockLocationsRequestProto,
-        deadline: OperationDeadline,
-    ) -> ClientResult<ReadLayout> {
-        let operation = self.operation(Operation::GetBlockLocations, Some(path.to_string()), deadline)?;
-        self.execute_metadata(operation, req, |transport, ctx, req| async move {
-            transport.read_layout(ctx, req).await
-        })
-        .await
-    }
-
-    /// Reads an authoritative layout fenced by exact inode identity.
+    /// Reads an authoritative layout using the bounded read step's identity.
     pub(crate) async fn read_layout_for_inode(
         &self,
-        path: &str,
+        operation: OperationContext,
         inode_id: InodeId,
         offset: u64,
         len: u32,
-        deadline: OperationDeadline,
     ) -> ClientResult<ReadLayout> {
-        self.read_layout(
-            path,
+        self.execute_metadata(
+            operation,
             beryl_proto::metadata::GetBlockLocationsRequestProto {
                 header: None,
                 target: Some(
@@ -244,7 +229,7 @@ impl MetadataClient {
                 ),
                 range: Some(beryl_proto::common::ByteRangeProto { offset, len }),
             },
-            deadline,
+            |transport, ctx, req| async move { transport.read_layout(ctx, req).await },
         )
         .await
     }

@@ -43,17 +43,17 @@ impl<T> ValidatedMetadataResponse<T> {
     }
 }
 
-/// Immutable file identity and visible revision captured by `OpenFile`.
+/// Immutable file identity, visible revision, and length captured by `OpenFile`.
 #[derive(Clone, Debug)]
-pub(crate) struct ReadSnapshot {
+pub(crate) struct OpenedFile {
     path: String,
     inode_id: InodeId,
     content_revision: u64,
     file_size: u64,
 }
 
-impl ReadSnapshot {
-    /// Creates a validated snapshot from Metadata's open-file response.
+impl OpenedFile {
+    /// Creates validated opened-file state from Metadata's response.
     pub(crate) fn new(path: String, inode_id: InodeId, content_revision: u64, file_size: u64) -> Self {
         Self {
             path,
@@ -63,7 +63,7 @@ impl ReadSnapshot {
         }
     }
 
-    /// Returns the path used to open this snapshot.
+    /// Returns the path used to open this file.
     pub(crate) fn path(&self) -> &str {
         &self.path
     }
@@ -73,13 +73,13 @@ impl ReadSnapshot {
         self.inode_id
     }
 
-    /// Returns the visible content revision fenced by this snapshot.
+    /// Returns the visible content revision fenced by this opened file.
     pub(crate) fn content_revision(&self) -> u64 {
         self.content_revision
     }
 
     /// Returns the file size observed by `OpenFile`.
-    pub(crate) fn size_hint(&self) -> u64 {
+    pub(crate) fn len(&self) -> u64 {
         self.file_size
     }
 }

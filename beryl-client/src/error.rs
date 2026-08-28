@@ -68,6 +68,8 @@ pub enum ClientErrorKind {
     Unavailable,
     /// Worker or local storage IO failed.
     Io,
+    /// An exact read reached the opened file version's end too early.
+    UnexpectedEof,
     /// Returned data is corrupt.
     CorruptData,
     /// A response violated the validated wire or domain contract.
@@ -101,6 +103,7 @@ impl ClientErrorKind {
             Self::Cancelled => "cancelled",
             Self::Unavailable => "unavailable",
             Self::Io => "io",
+            Self::UnexpectedEof => "unexpected_eof",
             Self::CorruptData => "corrupt_data",
             Self::InvalidResponse => "invalid_response",
             Self::Internal => "internal",
@@ -224,8 +227,16 @@ impl ClientError {
         Self::local(ClientErrorKind::InvalidArgument, message)
     }
 
+    pub(crate) fn unexpected_eof(message: impl Into<String>) -> Self {
+        Self::local(ClientErrorKind::UnexpectedEof, message)
+    }
+
     pub(crate) fn invalid_configuration(message: impl Into<String>) -> Self {
         Self::local(ClientErrorKind::InvalidConfiguration, message)
+    }
+
+    pub(crate) fn resource_exhausted(message: impl Into<String>) -> Self {
+        Self::local(ClientErrorKind::ResourceExhausted, message)
     }
 
     pub(crate) fn invalid_layout(message: impl Into<String>) -> Self {
@@ -406,17 +417,6 @@ pub(crate) fn side_effect_response_body_mismatch(operation: &'static str, detail
         ClientError::invalid_response(operation, format!("response body mismatch after OK header: {detail}"));
     error.outcome_unknown = true;
     error
-}
-
-pub(crate) fn read_buffer_reservation_failed(
-    operation: &'static str,
-    requested_bytes: usize,
-    error: impl fmt::Display,
-) -> ClientError {
-    ClientError::invalid_response(
-        operation,
-        format!("failed to reserve {requested_bytes} read buffer bytes: {error}"),
-    )
 }
 
 pub(crate) fn invalid_response(operation: &'static str, reason: impl Into<String>) -> ClientError {

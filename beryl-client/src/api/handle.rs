@@ -1,201 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Public reader and writer handles.
+//! Public writer handle.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
 use bytes::Bytes;
 use tokio::sync::Mutex;
 
 use crate::client_inner::{
-    is_unknown_session_barrier_outcome, mark_session_after_metadata_error, metric_labels, refresh_hint_from_error,
-    ClientInner,
+    is_unknown_session_barrier_outcome, mark_session_after_metadata_error, metric_labels, ClientInner,
 };
-use crate::error::{read_buffer_reservation_failed, ClientError, ClientResult};
-use crate::metadata::ReadSnapshot;
+use crate::error::ClientResult;
 use crate::metrics::ClientMetric;
-use crate::planner;
-use crate::runtime::{retry_decision, Operation, OperationContext, OperationDeadline, RetryDecision};
+use crate::runtime::OperationDeadline;
 use crate::session::write_session::WriteSession;
 use crate::worker::BlockWrite;
-
-/// A reader for an immutable file snapshot opened through the filesystem client.
-#[derive(Clone)]
-pub struct FileReader {
-    /// Shared client owner used to refresh metadata and access Workers.
-    inner: Arc<ClientInner>,
-    snapshot: ReadSnapshot,
-}
-
-impl FileReader {
-    /// Creates a public reader from a validated immutable Metadata snapshot.
-    pub(crate) fn new(inner: Arc<ClientInner>, snapshot: ReadSnapshot) -> Self {
-        Self { inner, snapshot }
-    }
-
-    /// Returns the namespace path used to open this file snapshot.
-    pub fn path(&self) -> &str {
-        self.snapshot.path()
-    }
-
-    /// Returns the file size observed when this reader was opened.
-    pub fn size_hint(&self) -> u64 {
-        self.snapshot.size_hint()
-    }
-
-    /// Reads a configured bounded range from the opened file snapshot.
-    pub async fn read_at(&self, offset: u64, len: u32) -> ClientResult<Bytes> {
-        self.read_at_with_deadline(offset, len, self.inner.metadata.operation_deadline())
-            .await
-    }
-
-    async fn read_at_with_deadline(&self, offset: u64, len: u32, deadline: OperationDeadline) -> ClientResult<Bytes> {
-        validate_read_request_size(len, self.inner.config.read.max_request_bytes)?;
-        let Some(requested_range) = planner::requested_range(offset, len, self.snapshot.size_hint())? else {
-            return Ok(Bytes::new());
-        };
-        let content_revision = self.snapshot.content_revision();
-        let inode_id = self.snapshot.inode_id();
-        let operation = OperationContext::new_named(
-            self.inner.metadata.client_id(),
-            self.inner.metadata.client_name(),
-            Operation::Read,
-            Some(self.snapshot.path().to_string()),
-            deadline,
-        )?;
-        for attempt_index in 0..self.inner.config.retry.max_attempts() {
-            let layout = self
-                .inner
-                .metadata
-                .read_layout_for_inode(
-                    self.snapshot.path(),
-                    inode_id,
-                    requested_range.file_offset,
-                    requested_range.len,
-                    operation.deadline().clone(),
-                )
-                .await?;
-            let (group_name, block_reads) =
-                planner::plan_block_reads_from_layout(inode_id, Some(content_revision), requested_range, &layout)?;
-            let ctx = self.inner.data_context(&operation, attempt_index as u32);
-            match self
-                .inner
-                .worker_rpc_with_timeout(
-                    &operation,
-                    self.inner.worker.read_block_ranges(ctx, group_name, &block_reads),
-                )
-                .await
-            {
-                Ok(bytes) => return Ok(bytes),
-                Err(err) => {
-                    let decision = retry_decision(&err, operation.retry_safety());
-                    self.inner.record_error_metric("Read", "worker", &err);
-                    let has_next = attempt_index + 1 < self.inner.config.retry.max_attempts();
-                    match (decision, has_next) {
-                        (RetryDecision::RefreshMetadata(reason), true) if should_replan_after_worker_error(&err) => {
-                            self.inner.metadata.record_data_refresh(
-                                &operation,
-                                reason,
-                                &refresh_hint_from_error(&err),
-                            )?;
-                            self.inner.record_metric(
-                                ClientMetric::RetryAttempt,
-                                metric_labels("Read", "worker").with_error_class(err.classification_label()),
-                            );
-                        }
-                        (RetryDecision::Retry, true) => {
-                            self.inner.record_metric(
-                                ClientMetric::RetryAttempt,
-                                metric_labels("Read", "worker").with_error_class(err.classification_label()),
-                            );
-                            self.inner.sleep_before_retry(attempt_index, &operation).await?;
-                        }
-                        (RetryDecision::Retry | RetryDecision::RefreshMetadata(_), false) => {
-                            self.inner.record_metric(
-                                ClientMetric::RetryExhausted,
-                                metric_labels("Read", "worker").with_error_class(err.classification_label()),
-                            );
-                            return Err(err);
-                        }
-                        _ => return Err(err),
-                    }
-                }
-            }
-        }
-        unreachable!("read attempt loop always returns on the final attempt")
-    }
-
-    /// Reads the entire opened file snapshot when it fits the configured
-    /// owned-buffer limit.
-    pub async fn read_all(&self) -> ClientResult<Bytes> {
-        let size = self.snapshot.size_hint();
-        if size == 0 {
-            return Ok(Bytes::new());
-        }
-        validate_read_all_size(size, self.inner.config.read.max_buffered_bytes)?;
-        let capacity = usize::try_from(size)
-            .map_err(|_| ClientError::invalid_argument("file is too large to read into one buffer".to_string()))?;
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(capacity)
-            .map_err(|error| read_buffer_reservation_failed("read_all", capacity, error))?;
-        let mut offset = 0u64;
-        let deadline = self.inner.metadata.operation_deadline();
-        while offset < size {
-            let len = (size - offset).min(u64::from(self.inner.config.read.max_request_bytes)) as u32;
-            let bytes = self.read_at_with_deadline(offset, len, deadline.clone()).await?;
-            ensure_exact_read(offset, len, &bytes)?;
-            output.extend_from_slice(&bytes);
-            offset += u64::from(len);
-        }
-        Ok(Bytes::from(output))
-    }
-
-    /// Reads exactly `len` bytes from `offset`, failing if the file snapshot ends first.
-    pub async fn read_exact_at(&self, offset: u64, len: u32) -> ClientResult<Bytes> {
-        let bytes = self
-            .read_at_with_deadline(offset, len, self.inner.metadata.operation_deadline())
-            .await?;
-        ensure_exact_read(offset, len, &bytes)?;
-        Ok(bytes)
-    }
-}
-
-fn ensure_exact_read(offset: u64, len: u32, bytes: &Bytes) -> ClientResult<()> {
-    if bytes.len() != len as usize {
-        return Err(ClientError::invalid_argument(format!(
-            "read_exact_at requested {} bytes at offset {} but read {} bytes",
-            len,
-            offset,
-            bytes.len()
-        )));
-    }
-    Ok(())
-}
-
-impl fmt::Debug for FileReader {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FileReader")
-            .field("path", &self.path())
-            .field("size_hint", &self.size_hint())
-            .finish()
-    }
-}
-
-/// Returns true when a worker read failure requires a fresh metadata layout.
-fn should_replan_after_worker_error(err: &ClientError) -> bool {
-    err.remote_error().is_some_and(|error| {
-        matches!(
-            error.kind,
-            ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch)
-                | ErrorKind::Worker(WorkerErrorKind::RunMismatch | WorkerErrorKind::BlockStampMismatch)
-        )
-    })
-}
 
 /// A writer for a sequential write session created through the filesystem client.
 pub struct FileWriter {
@@ -505,27 +327,6 @@ impl fmt::Debug for FileWriter {
             .field("cursor", &self.cursor())
             .finish()
     }
-}
-
-/// Rejects a positioned read before planning or RPC when its declared result
-/// could exceed the configured owned-buffer limit.
-fn validate_read_request_size(requested_bytes: u32, max_bytes: u32) -> ClientResult<()> {
-    if requested_bytes > max_bytes {
-        return Err(ClientError::invalid_argument(format!(
-            "read request size {requested_bytes} exceeds configured maximum {max_bytes}"
-        )));
-    }
-    Ok(())
-}
-
-/// Rejects a whole-file convenience read before allocation or RPC.
-fn validate_read_all_size(file_size: u64, max_bytes: u64) -> ClientResult<()> {
-    if file_size > max_bytes {
-        return Err(ClientError::invalid_argument(format!(
-            "file size {file_size} exceeds configured read_all maximum {max_bytes}"
-        )));
-    }
-    Ok(())
 }
 
 /// Shared mutable wrapper retained until `FileWriter` directly owns its

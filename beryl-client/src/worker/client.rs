@@ -6,16 +6,14 @@
 use std::fmt;
 use std::sync::Arc;
 
-use beryl_types::{GroupName, WriteTarget};
-use bytes::Bytes;
-
 use super::transport::GrpcWorkerTransport;
 use super::{BlockWrite, WorkerTransport, WorkerWriteTarget};
 use crate::config::ClientConfig;
-use crate::error::{read_buffer_reservation_failed, ClientError, ClientResult};
+use crate::error::{ClientError, ClientResult};
 use crate::metrics::ClientMetrics;
 use crate::planner::PlannedBlockRead;
 use crate::runtime::AttemptContext;
+use beryl_types::{GroupName, WriteTarget};
 
 /// Owns file-level Worker orchestration while delegating each block-local IO
 /// operation to a transport implementation.
@@ -35,23 +33,26 @@ impl WorkerClient {
         Self::new(Arc::new(GrpcWorkerTransport::from_config(config, metrics)))
     }
 
-    /// Reads all Metadata-planned block-local ranges in file order and rejects
-    /// any response that does not exactly cover its authorized range.
-    pub(crate) async fn read_block_ranges(
+    /// Fills a caller-owned buffer from ordered Metadata-planned block ranges.
+    pub(crate) async fn read_block_ranges_into(
         &self,
         attempt: AttemptContext,
         group_name: GroupName,
         block_reads: &[PlannedBlockRead],
-    ) -> ClientResult<Bytes> {
+        output: &mut [u8],
+    ) -> ClientResult<()> {
         let total_len = block_reads.iter().try_fold(0usize, |total, block_read| {
             total
                 .checked_add(block_read.len as usize)
                 .ok_or_else(|| ClientError::invalid_layout("planned read length overflow".to_string()))
         })?;
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(total_len)
-            .map_err(|error| read_buffer_reservation_failed("read_at", total_len, error))?;
+        if total_len != output.len() {
+            return Err(ClientError::invalid_layout(format!(
+                "planned read length {total_len} does not match output length {}",
+                output.len()
+            )));
+        }
+        let mut remaining = output;
         for block_read in block_reads {
             if block_read.block_stamp == 0 {
                 return Err(ClientError::invalid_layout(
@@ -67,23 +68,13 @@ impl WorkerClient {
                     "planned block read coverage is inconsistent".to_string(),
                 ));
             }
-            let result = self
-                .transport
-                .read_block_range(attempt.clone(), group_name.clone(), block_read)
+            let (block_output, tail) = remaining.split_at_mut(block_read.len as usize);
+            self.transport
+                .read_block_range(attempt.clone(), group_name.clone(), block_read, block_output)
                 .await?;
-            if result.bytes.len() != block_read.len as usize {
-                return Err(ClientError::invalid_response(
-                    "ReadBlock",
-                    format!(
-                        "worker read returned {} bytes for {} byte block range",
-                        result.bytes.len(),
-                        block_read.len
-                    ),
-                ));
-            }
-            output.extend_from_slice(&result.bytes);
+            remaining = tail;
         }
-        Ok(Bytes::from(output))
+        Ok(())
     }
 
     /// Opens one Metadata-authorized block RPC and returns only after the
