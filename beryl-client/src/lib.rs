@@ -12,9 +12,8 @@
 //! tracking and data-plane adapters. Metadata selects and persists the layout
 //! for new files; existing files reuse that stored `FileLayout`.
 //! Sequential reads retain only the current Metadata-authorized block plan;
-//! positioned reads never bypass Metadata authority. Writer sync APIs are
-//! [`FileWriter::sync_write_visibility`] and
-//! [`FileWriter::sync_write_durability`].
+//! positioned reads never bypass Metadata authority. [`FileWriter::sync`]
+//! publishes durable data while retaining the open write session.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

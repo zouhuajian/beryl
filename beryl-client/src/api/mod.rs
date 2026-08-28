@@ -4,15 +4,15 @@
 //! High-level API modules.
 
 pub(crate) mod client;
-pub(crate) mod handle;
 pub(crate) mod options;
 pub(crate) mod path;
 mod reader;
 mod status;
+mod writer;
 
 pub use beryl_types::{FileAttrs, InodeKind};
 pub use client::FsClient;
-pub use handle::FileWriter;
 pub use options::{DeleteOptions, ListOptions};
 pub use reader::FileReader;
 pub use status::{DirectoryEntry, DirectoryListing, FileStatus};
+pub use writer::FileWriter;

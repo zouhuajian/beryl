@@ -13,8 +13,8 @@ use crate::runtime::context::{Operation, OperationContext, OperationDeadline};
 
 const LEASE_EXPIRY_SAFETY_WINDOW_MS: u64 = 1_000;
 
-/// Open sequential write session tracked by an internal file handle field.
-#[derive(Clone, Debug)]
+/// Sole mutable lifecycle state for one open sequential writer.
+#[derive(Debug)]
 pub(crate) struct WriteSession {
     path: String,
     inode_id: InodeId,
@@ -28,6 +28,7 @@ pub(crate) struct WriteSession {
     expires_at_ms: Option<u64>,
     ready_blocks: Vec<ReadyBlock>,
     state: WriteSessionState,
+    sync: Option<SyncWriteState>,
     commit: Option<CommitFileState>,
     abort: Option<AbortCleanupState>,
 }
@@ -65,6 +66,7 @@ impl WriteSession {
             expires_at_ms: Some(expires_at_ms),
             ready_blocks: Vec::new(),
             state: WriteSessionState::Open,
+            sync: None,
             commit: None,
             abort: None,
         })
@@ -168,6 +170,79 @@ impl WriteSession {
         &self.ready_blocks
     }
 
+    /// Freezes one SyncWrite identity and payload before Metadata can observe it.
+    ///
+    /// A later call may only replay this exact plan until a validated success
+    /// returns the session to `Open`.
+    pub(crate) fn prepare_sync_write(
+        &mut self,
+        client_id: ClientId,
+        client_name: &str,
+        mut committed_blocks: Vec<CommittedBlock>,
+        target_size: u64,
+        deadline: OperationDeadline,
+    ) -> ClientResult<SyncWritePlan> {
+        if self.mode == OpenWriteModeProto::OpenWriteModeAppend {
+            committed_blocks.retain(|block| block.file_offset >= self.base_size);
+        }
+        match self.state {
+            WriteSessionState::Open => {
+                self.sync = Some(SyncWriteState {
+                    call_id: CallId::new(),
+                    write_handle: self.write_handle,
+                    committed_blocks,
+                    target_size,
+                    expected_content_revision: self.content_revision,
+                    expected_file_size: self.base_size,
+                    write_mode: self.mode,
+                });
+                self.state = WriteSessionState::SyncPending;
+            }
+            WriteSessionState::SyncPending => {
+                let sync = self.sync.as_ref().ok_or_else(|| {
+                    ClientError::invalid_argument("SyncWrite state missing frozen identity".to_string())
+                })?;
+                if sync.target_size != target_size || sync.committed_blocks != committed_blocks {
+                    return Err(ClientError::invalid_argument(
+                        "SyncWrite payload changed after sync started".to_string(),
+                    ));
+                }
+                if sync.write_handle != self.write_handle
+                    || sync.expected_content_revision != self.content_revision
+                    || sync.expected_file_size != self.base_size
+                    || sync.write_mode != self.mode
+                {
+                    return Err(ClientError::invalid_argument(
+                        "SyncWrite session state changed after sync started".to_string(),
+                    ));
+                }
+            }
+            _ => return Err(self.state_error_value()),
+        }
+
+        let sync = self
+            .sync
+            .as_ref()
+            .ok_or_else(|| ClientError::invalid_argument("SyncWrite state missing frozen identity".to_string()))?;
+        let operation = OperationContext::with_call_id_named(
+            client_id,
+            client_name,
+            sync.call_id,
+            Operation::SyncWrite,
+            Some(self.path.clone()),
+            deadline,
+        )?;
+        Ok(SyncWritePlan {
+            operation,
+            write_handle: sync.write_handle,
+            committed_blocks: sync.committed_blocks.clone(),
+            target_size: sync.target_size,
+            expected_content_revision: sync.expected_content_revision,
+            expected_file_size: sync.expected_file_size,
+            write_mode: sync.write_mode,
+        })
+    }
+
     /// Freeze and return the CommitFile operation for this write session.
     pub(crate) fn prepare_commit_file(
         &mut self,
@@ -226,6 +301,9 @@ impl WriteSession {
             }
             WriteSessionState::AbortUnknown => {
                 return Err(ClientError::stale_handle("write handle abort outcome is unknown"));
+            }
+            WriteSessionState::SyncPending => {
+                return Err(ClientError::stale_handle("write handle has an unresolved SyncWrite"));
             }
         }
 
@@ -310,22 +388,16 @@ impl WriteSession {
         self.state = WriteSessionState::Closed;
     }
 
-    /// Record the durable state returned by a successful SyncWrite.
-    pub(crate) fn update_published_state(&mut self, content_revision: u64, file_size: u64) {
+    /// Completes the frozen SyncWrite and restores normal writer operations.
+    pub(crate) fn mark_sync_completed(&mut self, content_revision: u64, file_size: u64) -> ClientResult<()> {
+        if !matches!(self.state, WriteSessionState::SyncPending) {
+            return Err(self.state_error_value());
+        }
         self.content_revision = content_revision;
         self.base_size = file_size;
-    }
-
-    pub(crate) fn content_revision(&self) -> u64 {
-        self.content_revision
-    }
-
-    pub(crate) fn base_size(&self) -> u64 {
-        self.base_size
-    }
-
-    pub(crate) fn mode(&self) -> OpenWriteModeProto {
-        self.mode
+        self.sync = None;
+        self.state = WriteSessionState::Open;
+        Ok(())
     }
 
     /// Marks the session aborted after Metadata accepts `AbortFileWrite`.
@@ -396,9 +468,9 @@ impl WriteSession {
         self.ensure_operation_allowed(WriteSessionOperation::Renew)
     }
 
-    /// Reject side-effect-free barriers after validating session state.
-    pub(crate) fn ensure_open_for_barrier(&mut self) -> ClientResult<()> {
-        self.ensure_operation_allowed(WriteSessionOperation::Barrier)
+    /// Reject sync unless it can start or safely replay a frozen plan.
+    pub(crate) fn ensure_open_for_sync(&mut self) -> ClientResult<()> {
+        self.ensure_operation_allowed(WriteSessionOperation::Sync)
     }
 
     fn ensure_operation_allowed(&mut self, operation: WriteSessionOperation) -> ClientResult<()> {
@@ -413,9 +485,10 @@ impl WriteSession {
                 WriteSessionOperation::Write
                 | WriteSessionOperation::Close
                 | WriteSessionOperation::Abort
-                | WriteSessionOperation::Barrier,
+                | WriteSessionOperation::Sync,
             ) => LEASE_EXPIRY_SAFETY_WINDOW_MS,
-            (WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown, WriteSessionOperation::Close)
+            (WriteSessionState::SyncPending, WriteSessionOperation::Sync)
+            | (WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown, WriteSessionOperation::Close)
             | (WriteSessionState::AbortUnknown, WriteSessionOperation::Abort) => return Ok(()),
             _ => return Err(self.state_error_value()),
         };
@@ -454,6 +527,7 @@ impl WriteSession {
     fn state_error_value(&self) -> ClientError {
         match self.state {
             WriteSessionState::Open => ClientError::invalid_argument("write session is open".to_string()),
+            WriteSessionState::SyncPending => ClientError::stale_handle("write handle has an unresolved SyncWrite"),
             WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown => {
                 ClientError::stale_handle("write handle has an in-progress CommitFile")
             }
@@ -489,6 +563,7 @@ impl ReadyBlock {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WriteSessionState {
     Open,
+    SyncPending,
     CommitStarted,
     CommitUnknown,
     Closed,
@@ -505,7 +580,7 @@ enum WriteSessionOperation {
     Close,
     Abort,
     Renew,
-    Barrier,
+    Sync,
 }
 
 fn unix_now_ms() -> u64 {
@@ -513,6 +588,17 @@ fn unix_now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
+}
+
+#[derive(Clone, Debug)]
+struct SyncWriteState {
+    call_id: CallId,
+    write_handle: WriteHandleProto,
+    committed_blocks: Vec<CommittedBlock>,
+    target_size: u64,
+    expected_content_revision: u64,
+    expected_file_size: u64,
+    write_mode: OpenWriteModeProto,
 }
 
 #[derive(Clone, Debug)]
@@ -536,6 +622,18 @@ impl std::fmt::Debug for AbortCleanupState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AbortCleanupState").finish_non_exhaustive()
     }
+}
+
+/// Frozen metadata SyncWrite operation and request payload.
+#[derive(Clone, Debug)]
+pub(crate) struct SyncWritePlan {
+    pub(crate) operation: OperationContext,
+    pub(crate) write_handle: WriteHandleProto,
+    pub(crate) committed_blocks: Vec<CommittedBlock>,
+    pub(crate) target_size: u64,
+    pub(crate) expected_content_revision: u64,
+    pub(crate) expected_file_size: u64,
+    pub(crate) write_mode: OpenWriteModeProto,
 }
 
 /// Frozen metadata CommitFile operation and request payload.
@@ -587,10 +685,9 @@ fn validate_write_handle(handle: &WriteHandleProto) -> ClientResult<InodeId> {
 mod tests {
     use super::*;
 
-    use beryl_types::{BlockId, BlockIndex, ClientId, CommittedBlock, GroupName, InodeId};
+    use beryl_types::{BlockId, BlockIndex, ClientId, CommittedBlock, InodeId};
 
     use crate::error::ClientErrorKind;
-    use crate::runtime::AttemptContext;
 
     fn assert_error(error: &ClientError, kind: ClientErrorKind, message: &str) {
         assert_eq!(error.kind(), kind);
@@ -598,17 +695,8 @@ mod tests {
     }
 
     #[test]
-    fn frozen_commit_rejects_payload_or_handle_drift_and_reuses_call_id() {
-        let mut session = WriteSession::new(
-            "/alpha".to_string(),
-            test_layout(),
-            write_handle_proto(302),
-            0,
-            1_000,
-            0,
-            OpenWriteModeProto::OpenWriteModeWrite,
-        )
-        .expect("session");
+    fn frozen_publication_plans_reject_drift_and_reuse_call_ids() {
+        let mut session = new_session(1_000);
 
         let blocks = vec![committed_block(302, 0, 0, 5)];
         let first = session
@@ -620,7 +708,6 @@ mod tests {
                 OperationDeadline::new(1_000),
             )
             .expect("first commit plan");
-        let first_ctx = AttemptContext::for_metadata(&first.operation, test_group_name(), 0).expect("first context");
         let err = session
             .prepare_commit_file(
                 ClientId::new(7),
@@ -656,31 +743,42 @@ mod tests {
                 OperationDeadline::new(1_000),
             )
             .expect("retry commit plan");
-        let retry_ctx = AttemptContext::for_metadata(&retry.operation, test_group_name(), 0).expect("retry context");
 
-        assert_eq!(metadata_call_id(&first_ctx), metadata_call_id(&retry_ctx));
+        assert_eq!(first.operation.call_id(), retry.operation.call_id());
         assert_eq!(retry.final_size, 5);
         assert_eq!(retry.committed_blocks, vec![committed_block(302, 0, 0, 5)]);
+
+        let mut sync_session = new_session(2_000);
+        let first_sync = sync_session
+            .prepare_sync_write(
+                ClientId::new(7),
+                "test-client",
+                vec![committed_block(302, 0, 0, 5)],
+                5,
+                OperationDeadline::new(1_000),
+            )
+            .expect("first sync plan");
+        let retry_sync = sync_session
+            .prepare_sync_write(
+                ClientId::new(7),
+                "test-client",
+                vec![committed_block(302, 0, 0, 5)],
+                5,
+                OperationDeadline::new(1_000),
+            )
+            .expect("retry after cancelled future");
+        assert_eq!(first_sync.operation.call_id(), retry_sync.operation.call_id());
+        assert_eq!(retry_sync.target_size, first_sync.target_size);
+        assert_eq!(retry_sync.committed_blocks, first_sync.committed_blocks);
     }
 
     #[test]
     fn prepare_abort_cleanup_rejects_session_identity_drift_after_unknown_without_replacing_call_id() {
-        let mut session = WriteSession::new(
-            "/alpha".to_string(),
-            test_layout(),
-            write_handle_proto(302),
-            0,
-            1_000,
-            0,
-            OpenWriteModeProto::OpenWriteModeWrite,
-        )
-        .expect("session");
+        let mut session = new_session(1_000);
 
         let first = session
             .prepare_abort_cleanup(ClientId::new(7), "test-client", OperationDeadline::new(1_000))
             .expect("first abort plan");
-        let first_ctx = AttemptContext::for_metadata(&first.metadata_operation(), test_group_name(), 0)
-            .expect("first metadata context");
 
         session.write_handle.write_lease_epoch = 2;
         let err = match session.prepare_abort_cleanup(ClientId::new(7), "test-client", OperationDeadline::new(1_000)) {
@@ -693,26 +791,14 @@ mod tests {
         let retry = session
             .prepare_abort_cleanup(ClientId::new(7), "test-client", OperationDeadline::new(1_000))
             .expect("retry abort plan");
-        let retry_ctx = AttemptContext::for_metadata(&retry.metadata_operation(), test_group_name(), 0)
-            .expect("retry metadata context");
-        assert_eq!(metadata_call_id(&first_ctx), metadata_call_id(&retry_ctx));
+        assert_eq!(
+            first.metadata_operation().call_id(),
+            retry.metadata_operation().call_id()
+        );
     }
 
     #[test]
     fn operation_gate_preserves_lease_and_retry_semantics() {
-        let new_session = |expires_at_ms| {
-            WriteSession::new(
-                "/alpha".to_string(),
-                test_layout(),
-                write_handle_proto(302),
-                0,
-                expires_at_ms,
-                0,
-                OpenWriteModeProto::OpenWriteModeWrite,
-            )
-            .expect("session")
-        };
-
         let mut renew = new_session(1_000);
         renew
             .ensure_operation_allowed_at_ms(WriteSessionOperation::Renew, 1)
@@ -724,7 +810,7 @@ mod tests {
             WriteSessionOperation::Close,
             WriteSessionOperation::Abort,
             WriteSessionOperation::Renew,
-            WriteSessionOperation::Barrier,
+            WriteSessionOperation::Sync,
         ] {
             let error = expired
                 .ensure_operation_allowed_at_ms(operation, 1_001)
@@ -736,7 +822,7 @@ mod tests {
             WriteSessionOperation::Write,
             WriteSessionOperation::Close,
             WriteSessionOperation::Abort,
-            WriteSessionOperation::Barrier,
+            WriteSessionOperation::Sync,
         ] {
             let mut session = new_session(1_000);
             let error = session
@@ -746,6 +832,7 @@ mod tests {
         }
 
         for (state, operation) in [
+            (WriteSessionState::SyncPending, WriteSessionOperation::Sync),
             (WriteSessionState::CommitStarted, WriteSessionOperation::Close),
             (WriteSessionState::CommitUnknown, WriteSessionOperation::Close),
             (WriteSessionState::AbortUnknown, WriteSessionOperation::Abort),
@@ -754,9 +841,22 @@ mod tests {
             session.state = state;
             session
                 .ensure_operation_allowed_at_ms(operation, 2)
-                .expect("frozen cleanup or commit retry must not be blocked by lease expiry");
+                .expect("frozen lifecycle retry must not be blocked by lease expiry");
             assert_eq!(session.state, state);
         }
+    }
+
+    fn new_session(expires_at_ms: u64) -> WriteSession {
+        WriteSession::new(
+            "/alpha".to_string(),
+            test_layout(),
+            write_handle_proto(302),
+            0,
+            expires_at_ms,
+            0,
+            OpenWriteModeProto::OpenWriteModeWrite,
+        )
+        .expect("session")
     }
 
     fn test_layout() -> FileLayout {
@@ -776,18 +876,5 @@ mod tests {
             file_offset,
             len,
         }
-    }
-
-    fn metadata_call_id(context: &AttemptContext) -> String {
-        context
-            .metadata_header()
-            .expect("metadata header")
-            .client
-            .expect("metadata client")
-            .call_id
-    }
-
-    fn test_group_name() -> GroupName {
-        GroupName::parse("root").unwrap()
     }
 }
