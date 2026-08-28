@@ -215,7 +215,7 @@ async fn visibility_sync_then_continue_write_roundtrip() {
     let mut writer = client.create(path).await.expect("create through metadata");
     writer.write_all(first.clone()).await.expect("write first block");
     writer
-        .sync_write_visibility()
+        .sync()
         .await
         .expect("publish first block while keeping session open");
     let visible_prefix = client

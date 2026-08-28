@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
-use beryl_types::{BlockId, CommittedBlock, FileLayout, InodeId};
+use beryl_types::{BlockId, FileLayout, InodeId};
 
 use crate::api::path::NamespacePathBuf;
 use crate::api::{DeleteOptions, DirectoryEntry, DirectoryListing, FileStatus, ListOptions};
@@ -22,7 +22,7 @@ use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, Client
 use crate::runtime::context::{AttemptContext, ClientIdentity, Operation, OperationContext, OperationDeadline};
 use crate::runtime::refresh::MetadataTargets;
 use crate::runtime::{retry_decision, transport_outcome_is_ambiguous, RetryDecision};
-use crate::session::write_session::{CommitFilePlan, WriteSession};
+use crate::session::write_session::{CommitFilePlan, SyncWritePlan, WriteSession};
 
 const INITIAL_BACKOFF_MS: u64 = 100;
 const MAX_BACKOFF_MS: u64 = 2_000;
@@ -425,28 +425,20 @@ impl MetadataClient {
         Ok(response.expires_at_ms)
     }
 
-    /// Publishes the exact committed-block prefix and returns the validated
-    /// content revision for the writer state transition.
-    pub(crate) async fn sync_write(
-        &self,
-        session: &WriteSession,
-        mut committed_blocks: Vec<CommittedBlock>,
-        target_size: u64,
-        deadline: OperationDeadline,
-    ) -> ClientResult<u64> {
-        if session.mode() == beryl_proto::metadata::OpenWriteModeProto::OpenWriteModeAppend {
-            committed_blocks.retain(|block| block.file_offset >= session.base_size());
-        }
+    /// Replays only the frozen sync plan and validates its publication size
+    /// under the same operation identity.
+    pub(crate) async fn sync_write(&self, plan: SyncWritePlan) -> ClientResult<u64> {
+        let operation = plan.operation.clone();
+        let target_size = plan.target_size;
         let req = beryl_proto::metadata::SyncWriteRequestProto {
             header: None,
-            write_handle: Some(session.write_handle()),
-            committed_blocks: committed_blocks.iter().map(Into::into).collect(),
-            target_size,
-            expected_content_revision: session.content_revision(),
-            write_mode: session.mode() as i32,
-            expected_file_size: session.base_size(),
+            write_handle: Some(plan.write_handle),
+            committed_blocks: plan.committed_blocks.iter().map(Into::into).collect(),
+            target_size: plan.target_size,
+            expected_content_revision: plan.expected_content_revision,
+            write_mode: plan.write_mode as i32,
+            expected_file_size: plan.expected_file_size,
         };
-        let operation = self.operation(Operation::SyncWrite, Some(session.path().to_string()), deadline)?;
         let response = self
             .execute_mutation_metadata(operation.clone(), req, |transport, ctx, req| async move {
                 transport.sync_write(ctx, req).await

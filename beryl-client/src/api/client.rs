@@ -326,7 +326,7 @@ mod tests {
         let client = fs_client_with_metadata_transport(test_config_with_retries("root", 2), metadata_transport.clone())
             .expect("client");
 
-        client.create("/alpha").await.expect("CreateFile replay succeeds");
+        let _writer = client.create("/alpha").await.expect("CreateFile replay succeeds");
 
         let calls = metadata_transport.calls();
         assert_eq!(methods(&calls), vec!["create_file", "create_file"]);
@@ -573,32 +573,44 @@ mod tests {
         assert_eq!(commit_calls[0].call_id, commit_calls[1].call_id);
         assert_eq!(commit_calls[0].final_size, commit_calls[1].final_size);
 
-        for response in [(1, Some(1)), (0, None)] {
-            let sync_metadata_transport = Arc::new(MockMetadataTransport::with_sync_responses(vec![response]));
-            let sync_client = fs_client_with_metadata_transport(test_config("root"), sync_metadata_transport.clone())
-                .expect("client");
-            let mut sync_writer = sync_client.create("/sync").await.expect("writer");
+        let sync_metadata_transport = Arc::new(MockMetadataTransport::with_sync_responses(vec![
+            (3, None),
+            (4, Some(1)),
+            (3, Some(1)),
+        ]));
+        let sync_client =
+            fs_client_with_metadata_transport(test_config("root"), sync_metadata_transport.clone()).expect("client");
+        let mut sync_writer = sync_client.create("/sync").await.expect("writer");
+        sync_writer.write_all(Bytes::from_static(b"abc")).await.expect("write");
 
-            let error = sync_writer
-                .sync_write_visibility()
-                .await
-                .expect_err("invalid sync response");
-            assert_client_error(&error, ClientErrorKind::InvalidResponse, true, "response body mismatch");
-            let sync_call = sync_metadata_transport
-                .calls()
-                .into_iter()
-                .find(|call| call.method == "sync_write")
-                .expect("SyncWrite call");
-            assert_eq!(
-                error.call_id().expect("SyncWrite call ID").to_string(),
-                sync_call.call_id
-            );
-            let error = sync_writer
+        for expected in ["content_revision missing", "synced_size"] {
+            let error = sync_writer.sync().await.expect_err("invalid sync response");
+            assert_client_error(&error, ClientErrorKind::InvalidResponse, true, expected);
+        }
+        assert_client_error(
+            &sync_writer
                 .write_all(Bytes::from_static(b"x"))
                 .await
-                .expect_err("unknown sync outcome blocks writes");
-            assert_client_error(&error, ClientErrorKind::StaleHandle, false, "unknown outcome");
+                .expect_err("unresolved sync blocks writes"),
+            ClientErrorKind::StaleHandle,
+            false,
+            "unresolved SyncWrite",
+        );
+        sync_writer.sync().await.expect("frozen SyncWrite retry");
+
+        let sync_calls: Vec<_> = sync_metadata_transport
+            .calls()
+            .into_iter()
+            .filter(|call| call.method == "sync_write")
+            .collect();
+        assert_eq!(sync_calls.len(), 3);
+        for calls in sync_calls.windows(2) {
+            assert_eq!(calls[0].call_id, calls[1].call_id);
+            assert_eq!(calls[0].target_size, calls[1].target_size);
+            assert_eq!(calls[0].committed_block_offsets, calls[1].committed_block_offsets);
+            assert_eq!(calls[0].committed_block_lens, calls[1].committed_block_lens);
         }
+        sync_writer.abort().await.expect("abort after resolved sync");
 
         let renew_metadata_transport = Arc::new(MockMetadataTransport::with_renew_response_expiries(vec![0]));
         let renew_client =
@@ -629,10 +641,7 @@ mod tests {
             "unknown outcome",
         );
         assert_client_error(
-            &renew_writer
-                .sync_write_visibility()
-                .await
-                .expect_err("unknown renewal blocks sync"),
+            &renew_writer.sync().await.expect_err("unknown renewal blocks sync"),
             ClientErrorKind::StaleHandle,
             false,
             "unknown outcome",
@@ -708,10 +717,7 @@ mod tests {
         let mut writer = client.create("/created").await.expect("writer");
 
         writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
-        let err = writer
-            .sync_write_visibility()
-            .await
-            .expect_err("flush failure must fail barrier");
+        let err = writer.sync().await.expect_err("flush failure must fail barrier");
         assert_client_error(&err, ClientErrorKind::Io, false, "injected WriteBlock failure");
 
         let err = writer
@@ -719,10 +725,7 @@ mod tests {
             .await
             .expect_err("unsafe flush failure blocks writes");
         assert_client_error(&err, ClientErrorKind::StaleHandle, false, "invalid");
-        let err = writer
-            .sync_write_durability()
-            .await
-            .expect_err("unsafe flush failure blocks durability sync");
+        let err = writer.sync().await.expect_err("unsafe flush failure blocks sync");
         assert_client_error(&err, ClientErrorKind::StaleHandle, false, "invalid");
         let err = writer.close().await.expect_err("unsafe flush failure blocks close");
         assert_client_error(&err, ClientErrorKind::StaleHandle, false, "invalid");
