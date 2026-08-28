@@ -32,7 +32,7 @@ async fn local_client_crud_roundtrip() {
         .open(path)
         .await
         .expect("open after close")
-        .read_all()
+        .read_to_end()
         .await
         .expect("read first bytes");
     assert_eq!(read, first);
@@ -48,7 +48,7 @@ async fn local_client_crud_roundtrip() {
         .open(path)
         .await
         .expect("open after append")
-        .read_all()
+        .read_to_end()
         .await
         .expect("read appended bytes");
     assert_eq!(read.as_ref(), expected.as_slice());
@@ -142,15 +142,16 @@ async fn local_client_crud_roundtrip() {
         .open(renamed_path)
         .await
         .expect("open renamed file")
-        .read_all()
+        .read_to_end()
         .await
         .expect("read renamed file");
     assert_eq!(renamed_read.as_ref(), expected.as_slice());
-    let moved_reader_bytes = reader_opened_before_rename
-        .read_all()
+    let mut moved_reader_bytes = vec![0u8; expected.len()];
+    reader_opened_before_rename
+        .read_exact_at(0, &mut moved_reader_bytes)
         .await
         .expect("reader opened before rename remains bound to the inode");
-    assert_eq!(moved_reader_bytes.as_ref(), expected.as_slice());
+    assert_eq!(moved_reader_bytes.as_slice(), expected.as_slice());
 
     client
         .delete(renamed_path, DeleteOptions::default())
@@ -158,7 +159,11 @@ async fn local_client_crud_roundtrip() {
         .expect("namespace delete renamed file");
     assert_not_found(client.stat(renamed_path).await, "deleted path status");
     assert_not_found(client.open(renamed_path).await, "deleted path open");
-    assert_not_found(reader_opened_before_rename.read_all().await, "reader for deleted inode");
+    let mut probe = [0u8; 1];
+    assert_not_found(
+        reader_opened_before_rename.read_at(0, &mut probe).await,
+        "reader for deleted inode",
+    );
 
     let replacement = Bytes::from_static(b"replacement-file");
     let mut replacement_writer = client.create(renamed_path).await.expect("recreate deleted path");
@@ -171,14 +176,14 @@ async fn local_client_crud_roundtrip() {
         .await
         .unwrap_or_else(|err| panic!("close replacement file: {err} ({err:?})"));
     assert_not_found(
-        reader_opened_before_rename.read_all().await,
+        reader_opened_before_rename.read_at(0, &mut probe).await,
         "old reader must not bind to recreated path",
     );
     let replacement_read = client
         .open(renamed_path)
         .await
         .expect("open replacement file")
-        .read_all()
+        .read_to_end()
         .await
         .expect("read replacement file");
     assert_eq!(replacement_read, replacement);
@@ -217,7 +222,7 @@ async fn visibility_sync_then_continue_write_roundtrip() {
         .open(path)
         .await
         .expect("open immediately after visibility sync")
-        .read_all()
+        .read_to_end()
         .await
         .expect("read published prefix while writer remains open");
     assert_eq!(visible_prefix, first);
@@ -232,7 +237,7 @@ async fn visibility_sync_then_continue_write_roundtrip() {
         .open(path)
         .await
         .expect("open after close")
-        .read_all()
+        .read_to_end()
         .await
         .expect("read both publication revisions");
     let expected = [first.as_ref(), second.as_ref()].concat();
@@ -258,14 +263,17 @@ async fn write_more_than_ten_blocks_roundtrip() {
     }
     writer.close().await.expect("close file");
 
-    let actual = client
-        .open(path)
-        .await
-        .expect("open file")
-        .read_all()
-        .await
-        .expect("read file");
-    assert_eq!(actual, payload);
+    let mut reader = client.open(path).await.expect("open file");
+    let mut actual = Vec::with_capacity(payload.len());
+    let mut buffer = [0u8; 127];
+    loop {
+        let read = reader.read(&mut buffer).await.expect("read bounded step");
+        if read == 0 {
+            break;
+        }
+        actual.extend_from_slice(&buffer[..read]);
+    }
+    assert_eq!(actual.as_slice(), payload.as_ref());
     cluster.shutdown().await.expect("local cluster shutdown");
 }
 

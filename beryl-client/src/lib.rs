@@ -4,16 +4,15 @@
 //! Beryl filesystem client.
 //!
 //! The public facade is centered on [`FsClient`], [`FileReader`],
-//! [`FileWriter`], delete/list options, and small namespace snapshot
-//! types.
+//! [`FileWriter`], delete/list options, and small namespace value types.
 //! Metadata-facing operations are executed through the internal metadata
 //! client and transport, with bounded retry, structured refresh, and
-//! invalid response-header handling. Public reads return one complete buffer
-//! through internal data-plane adapters; public writes use internal write-state
+//! invalid response-header handling. Public reads fill caller-owned buffers
+//! through bounded data-plane steps; public writes use internal write-state
 //! tracking and data-plane adapters. Metadata selects and persists the layout
 //! for new files; existing files reuse that stored `FileLayout`.
-//! Public reads fetch metadata-authoritative layout per read, without a read
-//! layout cache or metadata-less direct worker access. Writer sync APIs are
+//! Sequential reads retain only the current Metadata-authorized block plan;
+//! positioned reads never bypass Metadata authority. Writer sync APIs are
 //! [`FileWriter::sync_write_visibility`] and
 //! [`FileWriter::sync_write_durability`].
 

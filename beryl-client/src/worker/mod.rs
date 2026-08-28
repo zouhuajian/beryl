@@ -35,7 +35,8 @@ pub(crate) trait WorkerTransport: Send + Sync {
         attempt: AttemptContext,
         group_name: GroupName,
         block_read: &PlannedBlockRead,
-    ) -> ClientResult<WorkerReadResult>;
+        output: &mut [u8],
+    ) -> ClientResult<()>;
 
     /// Opens one metadata-authorized block write and returns only after the
     /// Worker acknowledges staging ownership.
@@ -54,12 +55,6 @@ pub(crate) struct WorkerWriteTarget {
     pub(crate) group_name: GroupName,
     /// Metadata AddBlock target.
     pub(crate) target: WriteTarget,
-}
-
-/// Exact bytes returned for one metadata-planned block-local range.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct WorkerReadResult {
-    pub(crate) bytes: Bytes,
 }
 
 /// Renewable deadline shared by one `BlockWrite` and its response task.

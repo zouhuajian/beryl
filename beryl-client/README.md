@@ -21,10 +21,12 @@
 
 The Rust native API is the client interface used today. It supports core operations such as status, non-recursive list, mkdirs, namespace delete, rename, open, create, append, read, write, sync, close, and abort.
 
-Owned-buffer reads are explicitly bounded. `read_at` and `read_exact_at` use
-`beryl.client.read.max-request-bytes`; `read_all` uses
-`beryl.client.read.max-buffered-bytes` and splits accepted files into bounded
-requests.
+Reads fill caller-owned buffers through Worker requests bounded by
+`beryl.client.read.max-request-bytes`. `FileReader::read` advances a sequential
+position, while `read_at` and `read_exact_at` leave it unchanged.
+`FileReader::read_to_end` is additionally bounded by
+`beryl.client.read.max-buffered-bytes` and commits its position only after the
+complete remaining file succeeds.
 
 `ListOptions::recursive` is part of the Rust API shape, but recursive listing is not supported by the current metadata service. Requests with that flag are rejected instead of silently falling back to non-recursive listing.
 

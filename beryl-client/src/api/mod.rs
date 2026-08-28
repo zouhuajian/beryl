@@ -7,10 +7,12 @@ pub(crate) mod client;
 pub(crate) mod handle;
 pub(crate) mod options;
 pub(crate) mod path;
+mod reader;
 mod status;
 
 pub use beryl_types::{FileAttrs, InodeKind};
 pub use client::FsClient;
-pub use handle::{FileReader, FileWriter};
+pub use handle::FileWriter;
 pub use options::{DeleteOptions, ListOptions};
+pub use reader::FileReader;
 pub use status::{DirectoryEntry, DirectoryListing, FileStatus};

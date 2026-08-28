@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .into());
     }
 
-    let actual = client.open(FILE).await?.read_all().await?;
+    let actual = client.open(FILE).await?.read_to_end().await?;
     if actual != payload {
         return Err(io::Error::other("read content mismatch").into());
     }

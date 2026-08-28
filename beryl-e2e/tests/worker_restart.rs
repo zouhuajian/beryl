@@ -38,7 +38,7 @@ async fn read_locations_before_full_report_convergence_are_unavailable_then_reco
         .open(path)
         .await
         .expect("open after convergence")
-        .read_all()
+        .read_to_end()
         .await;
     assert_eq!(after.expect("read after convergence"), payload);
     cluster.shutdown().await.expect("shutdown cluster");
@@ -107,7 +107,7 @@ async fn multi_block_file_is_readable_after_worker_restart_full_report_convergen
     assert_eq!(after_locations.len(), before_locations.len());
     assert_locations_use_only_run(&after_locations, new_run);
     assert_locations_do_not_use_run(&after_locations, old_run);
-    let after = client.open(path).await.expect("open after restart").read_all().await;
+    let after = client.open(path).await.expect("open after restart").read_to_end().await;
     assert_eq!(after.expect("read multi-block after restart"), payload);
     cluster.shutdown().await.expect("shutdown cluster");
 }

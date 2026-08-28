@@ -174,7 +174,8 @@ pub(crate) fn plan_block_reads(
 
 pub(crate) fn plan_block_reads_from_layout(
     expected_inode_id: InodeId,
-    expected_content_revision: Option<u64>,
+    expected_content_revision: u64,
+    expected_file_size: u64,
     requested_range: RequestedReadRange,
     response: &ReadLayout,
 ) -> ClientResult<(GroupName, Vec<PlannedBlockRead>)> {
@@ -191,10 +192,14 @@ pub(crate) fn plan_block_reads_from_layout(
         response.content_revision,
         "GetBlockLocationsResponseProto.content_revision",
     )?;
-    let expected_version =
-        expected_content_revision.ok_or_else(|| ClientError::stale_handle("read handle missing content_revision"))?;
-    if actual_version != expected_version {
-        return Err(ClientError::version_mismatch(expected_version, actual_version));
+    if actual_version != expected_content_revision {
+        return Err(ClientError::version_mismatch(expected_content_revision, actual_version));
+    }
+    if response.file_size != expected_file_size {
+        return Err(ClientError::stale_handle(format!(
+            "layout file size {} does not match opened length {}",
+            response.file_size, expected_file_size
+        )));
     }
     let block_reads = plan_block_reads(expected_inode_id, requested_range, &response.locations)?;
     Ok((group_name, block_reads))
@@ -255,6 +260,20 @@ mod tests {
                 format!("{err}").contains(expected),
                 "case {case} should mention {expected:?}, got {err}"
             );
+        }
+
+        let range = requested_range(0, 4, 4).expect("range").expect("nonempty range");
+        for (revision, file_size, expected) in [(Some(2), 4, "version mismatch"), (Some(1), 5, "opened length")] {
+            let layout = ReadLayout {
+                group_name: GroupName::parse("root").expect("group name"),
+                inode_id: InodeId::new(10),
+                file_size,
+                content_revision: revision,
+                locations: vec![location(10, 0, 0, 4, 101)],
+            };
+            let err = plan_block_reads_from_layout(InodeId::new(10), 1, 4, range, &layout)
+                .expect_err("opened-file authority mismatch must fail");
+            assert!(err.message().contains(expected), "expected {expected:?}, got {err}");
         }
     }
 

@@ -15,11 +15,11 @@ use beryl_types::GroupName;
 use super::channel_pool::GrpcWorkerChannelPool;
 use super::protocol::{
     build_read_block_request, build_tonic_request, build_write_block_command, has_structured_worker_error,
-    is_transient_worker_transport_status, parse_worker_data_status, read_block_stream_to_bytes,
+    is_transient_worker_transport_status, parse_worker_data_status, read_block_stream_into,
 };
 use super::{
-    duration_until_unix_ms, write_lease_expired_error, BlockWrite, BlockWriteInput, BlockWriteLease, WorkerReadResult,
-    WorkerTransport, WorkerWriteTarget,
+    duration_until_unix_ms, write_lease_expired_error, BlockWrite, BlockWriteInput, BlockWriteLease, WorkerTransport,
+    WorkerWriteTarget,
 };
 use crate::cache::CacheInvalidationReason;
 use crate::config::ClientConfig;
@@ -362,7 +362,8 @@ impl WorkerTransport for GrpcWorkerTransport {
         attempt: AttemptContext,
         group_name: GroupName,
         block_read: &PlannedBlockRead,
-    ) -> ClientResult<WorkerReadResult> {
+        output: &mut [u8],
+    ) -> ClientResult<()> {
         if block_read.workers.is_empty() {
             return Err(block_location_unavailable_error(format!(
                 "block location unavailable: no worker candidates for block {} file_offset={} len={} block_stamp={}",
@@ -392,8 +393,8 @@ impl WorkerTransport for GrpcWorkerTransport {
                     continue;
                 }
             };
-            let bytes = match read_block_stream_to_bytes(&attempt, &mut responses, block_read).await {
-                Ok(bytes) => bytes,
+            match read_block_stream_into(&attempt, &mut responses, block_read, output).await {
+                Ok(()) => {}
                 Err(error) if is_stale_read_location_error(&error) => {
                     self.channel_pool.invalidate_on_worker_run_mismatch(worker, &error);
                     last_location_error = Some(error);
@@ -406,8 +407,8 @@ impl WorkerTransport for GrpcWorkerTransport {
                     continue;
                 }
                 Err(error) => return Err(error),
-            };
-            return Ok(WorkerReadResult { bytes });
+            }
+            return Ok(());
         }
         if let Some(error) = last_transport_error {
             return Err(error);
@@ -476,6 +477,8 @@ mod tests {
         StructuredLocation,
         PartialTransport,
         EmptyChunk,
+        ShortRead,
+        OversizedRead,
     }
 
     #[derive(Clone, Copy)]
@@ -535,6 +538,16 @@ mod tests {
                 ])))),
                 ReadFailure::EmptyChunk => Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
                     ReadBlockChunkProto { data: Bytes::new() },
+                )])))),
+                ReadFailure::ShortRead => Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
+                    ReadBlockChunkProto {
+                        data: Bytes::from_static(b"da"),
+                    },
+                )])))),
+                ReadFailure::OversizedRead => Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
+                    ReadBlockChunkProto {
+                        data: Bytes::from_static(b"datax"),
+                    },
                 )])))),
                 ReadFailure::None => Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
                     ReadBlockChunkProto {
@@ -786,6 +799,8 @@ mod tests {
             (ReadFailure::StructuredLocation, true),
             (ReadFailure::PartialTransport, true),
             (ReadFailure::EmptyChunk, false),
+            (ReadFailure::ShortRead, false),
+            (ReadFailure::OversizedRead, false),
         ];
         for (failure, may_fail_over) in cases {
             let first_state = Arc::new(MockWorkerState::new(failure, WriteBehavior::Success));
@@ -793,19 +808,21 @@ mod tests {
             let (first, first_shutdown) = start_mock_worker(Arc::clone(&first_state), 1).await;
             let (second, second_shutdown) = start_mock_worker(Arc::clone(&second_state), 2).await;
 
+            let mut output = [0u8; 4];
             let result = grpc_client()
                 .read_block_range(
                     attempt(Operation::Read),
                     group_name(),
                     &planned_read(vec![first, second]),
+                    &mut output,
                 )
                 .await;
             if may_fail_over {
-                assert_eq!(result.expect("second Worker satisfies read").bytes, b"data"[..]);
+                result.expect("second Worker satisfies read");
+                assert_eq!(output, *b"data");
             } else {
-                let error = result.expect_err("empty chunk must fail closed");
+                let error = result.expect_err("invalid exact range must fail closed");
                 assert_eq!(error.kind(), ClientErrorKind::InvalidResponse);
-                assert!(error.message().contains("empty chunk"));
             }
             assert_eq!(first_state.read_calls.load(Ordering::SeqCst), 1);
             assert_eq!(
