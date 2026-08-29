@@ -15,7 +15,7 @@ async fn metadata_cleanup_commands_remove_only_deleted_file_blocks() {
         .await
         .expect("start full metadata runtime with maintenance");
     let client: beryl_client::FsClient = cluster.client().clone();
-    client.mkdirs("/cleanup", true).await.expect("create cleanup directory");
+    client.mkdirs("/cleanup").await.expect("create cleanup directory");
 
     let first = Bytes::from(deterministic_bytes(513));
     let second = Bytes::from(deterministic_bytes(777));
@@ -30,7 +30,7 @@ async fn metadata_cleanup_commands_remove_only_deleted_file_blocks() {
     assert_eq!(cluster.physical_block_count().expect("physical block count"), 2);
 
     client
-        .delete("/cleanup/first", DeleteOptions::default())
+        .delete("/cleanup/first")
         .await
         .expect("delete first namespace entry");
     cluster
@@ -49,7 +49,7 @@ async fn metadata_cleanup_commands_remove_only_deleted_file_blocks() {
     assert_eq!(remaining, second);
 
     client
-        .delete("/cleanup", DeleteOptions { recursive: true })
+        .delete_with_options("/cleanup", DeleteOptions { recursive: true })
         .await
         .expect("recursively delete remaining namespace");
     cluster
@@ -72,7 +72,7 @@ async fn recursive_delete_stays_hidden_and_reclaims_after_metadata_restart() {
         .expect("start full metadata runtime with maintenance");
     let client: beryl_client::FsClient = cluster.client().clone();
     client
-        .mkdirs("/restart-delete", true)
+        .mkdirs("/restart-delete")
         .await
         .expect("create recursive-delete root");
     write_file(&client, "/restart-delete/file", Bytes::from(deterministic_bytes(913))).await;
@@ -84,11 +84,11 @@ async fn recursive_delete_stays_hidden_and_reclaims_after_metadata_restart() {
     assert_eq!(cluster.physical_block_count().expect("physical block count"), 1);
 
     client
-        .delete("/restart-delete", DeleteOptions { recursive: true })
+        .delete_with_options("/restart-delete", DeleteOptions { recursive: true })
         .await
         .expect("atomically detach recursive-delete root");
     assert_not_found(
-        client.stat("/restart-delete").await,
+        client.get_status("/restart-delete").await,
         "detached path before metadata restart",
     );
 
@@ -97,7 +97,7 @@ async fn recursive_delete_stays_hidden_and_reclaims_after_metadata_restart() {
         .await
         .expect("restart full metadata runtime after detach");
     assert_not_found(
-        client.stat("/restart-delete").await,
+        client.get_status("/restart-delete").await,
         "detached path after metadata restart",
     );
     cluster

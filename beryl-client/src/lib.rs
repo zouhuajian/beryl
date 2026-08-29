@@ -4,7 +4,7 @@
 //! Beryl filesystem client.
 //!
 //! The public facade is centered on [`FsClient`], [`FileReader`],
-//! [`FileWriter`], delete/list options, and small namespace value types.
+//! [`FileWriter`], namespace operation options, and small namespace value types.
 //! Metadata-facing operations are executed through the internal metadata
 //! client and transport, with bounded retry, structured refresh, and
 //! invalid response-header handling. Public reads fill caller-owned buffers
@@ -33,8 +33,8 @@ pub(crate) mod metadata;
 mod worker;
 
 // Re-export commonly used types
-pub use api::{DeleteOptions, ListOptions};
-pub use api::{DirectoryEntry, DirectoryListing, FileAttrs, FileStatus, InodeKind};
+pub use api::{DeleteOptions, ListStatusOptions, MkdirOptions};
+pub use api::{FileAttrs, FileStatus, InodeKind, ListStatusIterator};
 pub use api::{FileReader, FileWriter, FsClient};
 pub use config::ClientConfig;
 pub use config::{ConnectionConfig, ReadConfig, RetryConfig, WriteLeaseConfig};

@@ -28,7 +28,7 @@ async fn committed_visible_file_survives_metadata_restart() {
     let client = cluster.client().clone();
     let path = "/restart/committed";
     let payload = Bytes::from(deterministic_bytes(1_537));
-    client.mkdirs("/restart", true).await.expect("create restart dir");
+    client.mkdirs("/restart").await.expect("create restart dir");
     let mut writer = client.create(path).await.expect("create file");
     writer.write_all(payload.clone()).await.expect("write file");
     writer.close().await.expect("close file");
@@ -56,7 +56,7 @@ async fn committed_visible_file_survives_metadata_restart() {
 async fn restart_after_empty_create_allows_noop_close_without_publishing_bytes() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let client = cluster.client().clone();
-    client.mkdirs("/restart", true).await.expect("create restart dir");
+    client.mkdirs("/restart").await.expect("create restart dir");
 
     let owner_client_id = 701;
     let foreign_client_id = 702;
@@ -149,7 +149,7 @@ async fn restart_after_empty_create_allows_noop_close_without_publishing_bytes()
 async fn restart_after_worker_ready_before_metadata_close_rejects_stale_writer_and_hides_data() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let client = cluster.client().clone();
-    client.mkdirs("/restart", true).await.expect("create restart dir");
+    client.mkdirs("/restart").await.expect("create restart dir");
 
     let mut writer = client
         .create("/restart/worker-ready-before-close")
@@ -200,7 +200,7 @@ async fn restart_after_worker_ready_before_metadata_commit_hides_unpublished_blo
 async fn existing_visible_data_remains_readable_while_active_write_fails_closed() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let client = cluster.client().clone();
-    client.mkdirs("/restart", true).await.expect("create restart dir");
+    client.mkdirs("/restart").await.expect("create restart dir");
 
     let visible_path = "/restart/existing-visible";
     let active_path = "/restart/active-hidden";
@@ -244,11 +244,7 @@ async fn existing_visible_data_remains_readable_while_active_write_fails_closed(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_replay_survives_restart_and_session_operations_converge() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
-    cluster
-        .client()
-        .mkdirs("/restart", true)
-        .await
-        .expect("create restart dir");
+    cluster.client().mkdirs("/restart").await.expect("create restart dir");
     let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
         .await
         .expect("connect metadata");
@@ -383,11 +379,7 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
         .start_metadata_process(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
         .await
         .expect("start metadata child process");
-    cluster
-        .client()
-        .mkdirs("/restart", true)
-        .await
-        .expect("create restart dir");
+    cluster.client().mkdirs("/restart").await.expect("create restart dir");
     let path = "/restart/many-blocks";
     let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
         .await
@@ -559,7 +551,7 @@ async fn raw_create_worker_ready_block(
     payload: &[u8],
 ) -> TestResult<RawWorkerReadyWrite> {
     let client = cluster.client();
-    client.mkdirs("/restart", true).await.expect("create restart dir");
+    client.mkdirs("/restart").await.expect("create restart dir");
 
     let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint()).await?;
     let create = metadata
@@ -666,7 +658,7 @@ async fn write_worker_target(target: &WriteTargetProto, payload: &[u8]) -> TestR
 }
 
 async fn assert_no_committed_bytes(cluster: &TestCluster, path: &str) -> TestResult<()> {
-    match cluster.client().stat(path).await {
+    match cluster.client().get_status(path).await {
         Ok(FileStatus { attrs, .. }) => {
             assert_eq!(attrs.size, 0, "{path} must not publish incomplete bytes");
         }

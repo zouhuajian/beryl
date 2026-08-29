@@ -126,10 +126,7 @@ async fn metadata_signals_exit_cleanly_and_preserve_visible_data() {
         .expect("start full Metadata process");
     let client = cluster.client().clone();
     let payload = Bytes::from(deterministic_bytes(1_537));
-    client
-        .mkdirs("/process-shutdown", true)
-        .await
-        .expect("create directory");
+    client.mkdirs("/process-shutdown").await.expect("create directory");
     let mut writer = client.create("/process-shutdown/visible").await.expect("create file");
     writer.write_all(payload.clone()).await.expect("write file");
     writer.close().await.expect("commit file");

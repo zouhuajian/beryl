@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use beryl_client::{ClientResult, DeleteOptions, InodeKind, ListOptions};
+use beryl_client::{ClientResult, InodeKind, ListStatusOptions, MkdirOptions};
 use beryl_e2e::{data::deterministic_bytes, TestCluster};
 use bytes::Bytes;
-use futures::TryStreamExt;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_client_crud_roundtrip() {
@@ -14,8 +13,9 @@ async fn local_client_crud_roundtrip() {
     let path = "/e2e/file";
     let renamed_path = "/e2e/file.renamed";
 
-    let created_dir = client.mkdirs(dir, true).await.expect("mkdirs through metadata");
+    let created_dir = client.mkdirs(dir).await.expect("mkdirs through metadata");
     assert_eq!(created_dir.path(), dir);
+    assert_eq!(created_dir.kind, InodeKind::Dir);
 
     let first = Bytes::from(deterministic_bytes(1_337));
     let suffix = Bytes::from_static(b"-beryl-append-suffix");
@@ -24,8 +24,9 @@ async fn local_client_crud_roundtrip() {
     writer.write_all(first.clone()).await.expect("write through worker");
     writer.close().await.expect("close through metadata");
 
-    let status = client.stat(path).await.expect("status after close");
+    let status = client.get_status(path).await.expect("status after close");
     assert_eq!(status.path(), path);
+    assert_eq!(status.kind, InodeKind::File);
     assert_eq!(status.attrs.size, first.len() as u64);
 
     let read = client
@@ -54,87 +55,39 @@ async fn local_client_crud_roundtrip() {
     assert_eq!(read.as_ref(), expected.as_slice());
 
     let subdir = "/e2e/subdir";
-    client.mkdirs(subdir, false).await.expect("create second listing entry");
-
-    let listing = client
-        .list(dir, ListOptions::default())
-        .await
-        .expect("non-recursive list");
-    let file_entry = listing
-        .entries
-        .iter()
-        .find(|entry| entry.name == "file")
-        .expect("list includes file");
-    assert_eq!(file_entry.kind, Some(InodeKind::File));
-    assert_eq!(
-        file_entry.attrs.as_ref().map(|attrs| attrs.size),
-        Some(expected.len() as u64)
-    );
-
-    let first_page = client
-        .list(
-            dir,
-            ListOptions {
-                limit: Some(1),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("first bounded listing page");
-    assert_eq!(first_page.entries.len(), 1);
-    assert!(!first_page.eof);
-    let second_page = client
-        .list(
-            dir,
-            ListOptions {
-                cursor: first_page.next_cursor.clone(),
-                limit: Some(1),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("second bounded listing page");
-    assert_eq!(second_page.entries.len(), 1);
-    assert!(second_page.eof);
-    assert!(second_page.next_cursor.is_none());
-    let mut paged_names = first_page
-        .entries
-        .into_iter()
-        .chain(second_page.entries)
-        .map(|entry| entry.name)
-        .collect::<Vec<_>>();
-    paged_names.sort();
-    assert_eq!(paged_names, vec!["file", "subdir"]);
-
-    let mut streamed_names = client
-        .list_stream(
-            dir,
-            ListOptions {
-                limit: Some(1),
-                ..Default::default()
-            },
-        )
-        .expect("create automatic listing stream")
-        .map_ok(|entry| entry.name)
-        .try_collect::<Vec<_>>()
-        .await
-        .expect("automatically paginate directory listing");
-    streamed_names.sort();
-    assert_eq!(streamed_names, vec!["file", "subdir"]);
-
     client
-        .delete(subdir, DeleteOptions::default())
+        .mkdirs_with_options(subdir, MkdirOptions { create_parent: false })
         .await
-        .expect("delete empty listing subdirectory");
+        .expect("create second listing entry");
+
+    let mut statuses = client
+        .list_status_with_options(dir, ListStatusOptions { page_size: Some(1) })
+        .await
+        .expect("start bounded directory listing");
+    assert_eq!(statuses.path(), dir);
+    let mut listed = Vec::new();
+    while let Some(status) = statuses.next().await.expect("fetch next directory status") {
+        listed.push(status);
+    }
+    listed.sort_by(|left, right| left.path().cmp(right.path()));
+    assert_eq!(
+        listed.iter().map(|status| status.path()).collect::<Vec<_>>(),
+        [path, subdir]
+    );
+    assert_eq!(listed[0].kind, InodeKind::File);
+    assert_eq!(listed[0].attrs.size, expected.len() as u64);
+    assert_eq!(listed[1].kind, InodeKind::Dir);
+
+    client.delete(subdir).await.expect("delete empty listing subdirectory");
 
     let reader_opened_before_rename = client.open(path).await.expect("open reader before rename");
     client
         .rename(path, renamed_path)
         .await
         .expect("rename through metadata");
-    assert_not_found(client.stat(path).await, "old path after rename");
+    assert_not_found(client.get_status(path).await, "old path after rename");
 
-    let renamed_status = client.stat(renamed_path).await.expect("status after rename");
+    let renamed_status = client.get_status(renamed_path).await.expect("status after rename");
     assert_eq!(renamed_status.path(), renamed_path);
     assert_eq!(renamed_status.attrs.size, expected.len() as u64);
 
@@ -154,10 +107,10 @@ async fn local_client_crud_roundtrip() {
     assert_eq!(moved_reader_bytes.as_slice(), expected.as_slice());
 
     client
-        .delete(renamed_path, DeleteOptions::default())
+        .delete(renamed_path)
         .await
         .expect("namespace delete renamed file");
-    assert_not_found(client.stat(renamed_path).await, "deleted path status");
+    assert_not_found(client.get_status(renamed_path).await, "deleted path status");
     assert_not_found(client.open(renamed_path).await, "deleted path open");
     let mut probe = [0u8; 1];
     assert_not_found(
@@ -187,19 +140,10 @@ async fn local_client_crud_roundtrip() {
         .await
         .expect("read replacement file");
     assert_eq!(replacement_read, replacement);
-    client
-        .delete(renamed_path, DeleteOptions::default())
-        .await
-        .expect("delete replacement file");
+    client.delete(renamed_path).await.expect("delete replacement file");
 
-    let listing = client
-        .list(dir, ListOptions::default())
-        .await
-        .expect("list after delete");
-    assert!(
-        !listing.entries.iter().any(|entry| entry.name == "file.renamed"),
-        "non-recursive list must not include deleted namespace entry"
-    );
+    let mut statuses = client.list_status(dir).await.expect("list after delete");
+    assert!(statuses.next().await.expect("read empty listing").is_none());
 
     cluster.shutdown().await.expect("local cluster shutdown");
 }

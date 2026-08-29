@@ -7,7 +7,7 @@ use std::error::Error;
 use std::io;
 use std::path::PathBuf;
 
-use beryl_client::{ClientConfig, DeleteOptions, FsClient};
+use beryl_client::{ClientConfig, FsClient};
 use bytes::Bytes;
 
 const DIRECTORY: &str = "/examples";
@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .unwrap_or_else(|| PathBuf::from("conf/client.yaml"));
     let client = FsClient::try_new(ClientConfig::load(config_path)?)?;
 
-    client.mkdirs(DIRECTORY, true).await?;
+    client.mkdirs(DIRECTORY).await?;
 
     let payload = Bytes::from(
         (0..2 * BLOCK_SIZE as usize + 17)
@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     writer.write_all(payload.clone()).await?;
     writer.close().await?;
 
-    let status = client.stat(FILE).await?;
+    let status = client.get_status(FILE).await?;
     if status.attrs.size != payload.len() as u64 {
         return Err(io::Error::other(format!(
             "stat size mismatch: expected {}, got {}",
@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         return Err(io::Error::other("read content mismatch").into());
     }
 
-    client.delete(FILE, DeleteOptions::default()).await?;
+    client.delete(FILE).await?;
     println!("Rust Client CRUD roundtrip succeeded: {FILE}");
     Ok(())
 }

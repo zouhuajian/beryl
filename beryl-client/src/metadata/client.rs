@@ -9,15 +9,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
-use beryl_types::{BlockId, FileLayout, InodeId};
+use beryl_types::{BlockId, FileLayout, InodeId, InodeKind};
 
 use crate::api::path::NamespacePathBuf;
-use crate::api::{DeleteOptions, DirectoryEntry, DirectoryListing, FileStatus, ListOptions};
+use crate::api::{DeleteOptions, FileStatus};
 use crate::config::{ClientConfig, RetryConfig};
 use crate::error::{
     invalid_response, side_effect_response_body_mismatch, ClientError, ClientErrorKind, ClientResult, RefreshHint,
 };
-use crate::metadata::{AddBlockResult, MetadataTransport, OpenedFile, ReadLayout, ValidatedMetadataResponse};
+use crate::metadata::{
+    AddBlockResult, ListStatusPage, MetadataTransport, OpenedFile, ReadLayout, ValidatedMetadataResponse,
+};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
 use crate::runtime::context::{AttemptContext, ClientIdentity, Operation, OperationContext, OperationDeadline};
 use crate::runtime::refresh::MetadataTargets;
@@ -77,7 +79,7 @@ impl MetadataClient {
     }
 
     /// Returns the current status for a normalized namespace path.
-    pub(crate) async fn stat(&self, path: NamespacePathBuf) -> ClientResult<FileStatus> {
+    pub(crate) async fn get_status(&self, path: NamespacePathBuf) -> ClientResult<FileStatus> {
         let path = path.into_string();
         let deadline = self.operation_deadline();
         let operation = self.operation(Operation::GetStatus, Some(path.clone()), deadline)?;
@@ -95,7 +97,12 @@ impl MetadataClient {
     }
 
     /// Returns one bounded Metadata-owned directory page.
-    pub(crate) async fn list(&self, path: NamespacePathBuf, options: ListOptions) -> ClientResult<DirectoryListing> {
+    pub(crate) async fn list_status_page(
+        &self,
+        path: NamespacePathBuf,
+        cursor: Option<Vec<u8>>,
+        page_size: Option<u32>,
+    ) -> ClientResult<ListStatusPage> {
         let path = path.into_string();
         let operation = self.operation(Operation::ListStatus, Some(path.clone()), self.operation_deadline())?;
         let response = self
@@ -104,21 +111,20 @@ impl MetadataClient {
                 beryl_proto::metadata::ListStatusRequestProto {
                     header: None,
                     path: path.clone(),
-                    recursive: options.recursive,
-                    cursor: options.cursor.unwrap_or_default(),
-                    limit: options.limit.unwrap_or(0),
+                    cursor: cursor.unwrap_or_default(),
+                    limit: page_size.unwrap_or(0),
                 },
                 |transport, ctx, req| async move { transport.list_status(ctx, req).await },
             )
             .await?;
-        directory_listing_from_response(path, response)
+        list_status_page_from_response(path, response)
     }
 
     /// Creates one directory or ensures the recursive directory chain according
     /// to the existing retry contract.
-    pub(crate) async fn create_directory(&self, path: NamespacePathBuf, recursive: bool) -> ClientResult<FileStatus> {
+    pub(crate) async fn mkdirs(&self, path: NamespacePathBuf, create_parent: bool) -> ClientResult<FileStatus> {
         let path = path.into_string();
-        let kind = if recursive {
+        let kind = if create_parent {
             Operation::CreateDirectoryRecursive
         } else {
             Operation::CreateDirectory
@@ -128,7 +134,7 @@ impl MetadataClient {
             header: None,
             path: path.clone(),
             attrs: Some(default_dir_attrs()),
-            recursive,
+            recursive: create_parent,
         };
         let response = self
             .execute_mutation_metadata(operation.clone(), request, |transport, ctx, req| async move {
@@ -843,7 +849,8 @@ fn file_status_from_response(
     let attrs = response
         .attrs
         .ok_or_else(|| invalid_response("GetStatus", "GetStatusResponseProto.attrs missing"))?;
-    Ok(FileStatus::new(path, attrs.into()))
+    let kind = inode_kind_from_wire("GetStatus", response.kind)?;
+    Ok(FileStatus::new(path, kind, attrs.into()))
 }
 
 fn directory_status_from_response(
@@ -853,19 +860,22 @@ fn directory_status_from_response(
     let attrs = response.attrs.ok_or_else(|| {
         side_effect_response_body_mismatch("CreateDirectory", "CreateDirectoryResponseProto.attrs missing")
     })?;
-    Ok(FileStatus::new(path, attrs.into()))
+    Ok(FileStatus::new(path, InodeKind::Dir, attrs.into()))
 }
 
 /// Converts a successful wire page while enforcing its cursor/EOF invariant.
-fn directory_listing_from_response(
+fn list_status_page_from_response(
     path: String,
     response: beryl_proto::metadata::ListStatusResponseProto,
-) -> ClientResult<DirectoryListing> {
+) -> ClientResult<ListStatusPage> {
     if response.eof != response.next_cursor.is_empty() {
         return Err(invalid_response(
             "ListStatus",
             "eof must be true exactly when next_cursor is empty",
         ));
+    }
+    if !response.eof && response.entries.is_empty() {
+        return Err(invalid_response("ListStatus", "non-EOF page must contain entries"));
     }
     let next_cursor = if response.next_cursor.is_empty() {
         None
@@ -876,11 +886,36 @@ fn directory_listing_from_response(
         .entries
         .into_iter()
         .map(|entry| {
-            let kind = beryl_proto::metadata::InodeKindProto::try_from(entry.kind)
-                .ok()
-                .and_then(|kind| kind.try_into().ok());
-            DirectoryEntry::new(entry.name, kind, entry.attrs.map(Into::into))
+            if entry.name.is_empty() || entry.name.contains('/') {
+                return Err(invalid_response(
+                    "ListStatus",
+                    format!("invalid direct-child name: {:?}", entry.name),
+                ));
+            }
+            let kind = inode_kind_from_wire("ListStatus", entry.kind)?;
+            let attrs = entry
+                .attrs
+                .ok_or_else(|| invalid_response("ListStatus", "DirEntryProto.attrs missing"))?;
+            let parent = path.trim_end_matches('/');
+            let child_path = if parent.is_empty() {
+                format!("/{}", entry.name)
+            } else {
+                format!("{parent}/{}", entry.name)
+            };
+            Ok(FileStatus::new(child_path, kind, attrs.into()))
         })
-        .collect();
-    Ok(DirectoryListing::new(path, entries, next_cursor, response.eof))
+        .collect::<ClientResult<Vec<_>>>()?;
+    Ok(ListStatusPage {
+        entries,
+        next_cursor,
+        eof: response.eof,
+    })
+}
+
+/// Rejects unknown and UNSPECIFIED wire values before they enter the public status model.
+fn inode_kind_from_wire(operation: &'static str, raw: i32) -> ClientResult<InodeKind> {
+    let wire = beryl_proto::metadata::InodeKindProto::try_from(raw)
+        .map_err(|_| invalid_response(operation, format!("unknown inode kind: {raw}")))?;
+    wire.try_into()
+        .map_err(|error| invalid_response(operation, format!("invalid inode kind: {error}")))
 }

@@ -63,9 +63,9 @@ message FileAttrsProto {
 message DirEntryProto {
   /// Entry name (UTF-8).
   string name = 1;
-  /// Inode kind (for quick filtering).
+  /// Required inode kind for the child status.
   InodeKindProto kind = 2;
-  /// Optional attributes (for optimization, to avoid extra Lookup calls).
+  /// Required attributes for the child status returned by ListStatus.
   optional FileAttrsProto attrs = 3;
 }
 
@@ -129,21 +129,23 @@ message GetStatusRequestProto {
 
 message GetStatusResponseProto {
   common.ResponseHeaderProto header = 1;
+  // Required user-visible attributes for a successful response.
   FileAttrsProto attrs = 2;
+  // Required namespace kind. UNSPECIFIED is not a successful domain value.
+  InodeKindProto kind = 3;
 }
 
 message ListStatusRequestProto {
   common.RequestHeaderProto header = 1;
   string path = 2;
-  bool recursive = 3;
   // Opaque seek key returned as next_cursor by a preceding page for this same
   // directory. The server retains no iterator or snapshot between requests;
   // entries inserted at or before the cursor may be omitted, while entries
   // inserted after it may appear in later pages.
-  bytes cursor = 4;
+  bytes cursor = 3;
   // Maximum entries in this page. Zero selects the Metadata server default;
   // a non-zero value above the server maximum is rejected.
-  uint32 limit = 5;
+  uint32 limit = 4;
 }
 
 message ListStatusResponseProto {

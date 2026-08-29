@@ -3,6 +3,7 @@
 
 //! Client-domain metadata result types.
 
+use crate::api::FileStatus;
 use crate::error::{ClientError, ClientResult};
 use beryl_types::{FileBlockLocation, GroupName, GroupStateWatermark, InodeId, WriteTarget};
 
@@ -29,6 +30,17 @@ pub(crate) struct MetadataAuthorityUpdate {
 pub(crate) struct ValidatedMetadataResponse<T> {
     authority: MetadataAuthorityUpdate,
     body: T,
+}
+
+/// One validated bounded directory page used by the public async iterator.
+#[derive(Clone, Debug)]
+pub(crate) struct ListStatusPage {
+    /// Fully qualified child statuses returned by Metadata.
+    pub(crate) entries: Vec<FileStatus>,
+    /// Opaque continuation cursor, present exactly when `eof` is false.
+    pub(crate) next_cursor: Option<Vec<u8>>,
+    /// Whether this page reached the current end of the directory scan.
+    pub(crate) eof: bool,
 }
 
 impl<T> ValidatedMetadataResponse<T> {

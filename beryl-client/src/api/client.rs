@@ -5,15 +5,12 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::vec::IntoIter;
 
-use futures::{stream, StreamExt};
-
-use super::{DeleteOptions, DirectoryEntry, DirectoryListing, FileReader, FileStatus, FileWriter, ListOptions};
+use super::{DeleteOptions, FileReader, FileStatus, FileWriter, ListStatusIterator, ListStatusOptions, MkdirOptions};
 use crate::api::path::NamespacePathBuf;
 use crate::client_inner::ClientInner;
 use crate::config::ClientConfig;
-use crate::error::{invalid_response, ClientResult};
+use crate::error::{ClientError, ClientResult};
 use crate::metrics::{ClientMetrics, NoopClientMetrics};
 
 /// Public filesystem-facing client facade.
@@ -21,15 +18,6 @@ use crate::metrics::{ClientMetrics, NoopClientMetrics};
 pub struct FsClient {
     /// Shared client owner reused by this facade and the handles it opens.
     pub(crate) inner: Arc<ClientInner>,
-}
-
-/// Owned state for a lazily paginated public directory-entry stream.
-struct DirectoryListStreamState {
-    client: FsClient,
-    path: NamespacePathBuf,
-    options: ListOptions,
-    buffered_entries: IntoIter<DirectoryEntry>,
-    eof: bool,
 }
 
 impl FsClient {
@@ -56,94 +44,84 @@ impl FsClient {
         &self.inner.config
     }
 
-    /// Return file or directory status through the metadata client.
-    pub async fn stat(&self, path: &str) -> ClientResult<FileStatus> {
+    /// Returns Metadata-authorized status for a file or directory.
+    pub async fn get_status(&self, path: &str) -> ClientResult<FileStatus> {
         let path = NamespacePathBuf::parse(path)?;
-        self.inner.metadata.stat(path).await
+        self.inner.metadata.get_status(path).await
     }
 
-    /// Lists one bounded directory page using explicit pagination options.
+    /// Lists the direct children of a directory using server-default paging.
     ///
-    /// Continue with [`DirectoryListing::next_cursor`] until
-    /// [`DirectoryListing::eof`] is true. The server retains no iterator or
-    /// snapshot between calls, so pages are weakly consistent: entries inserted
-    /// at or before the cursor may be omitted, while later insertions may appear.
-    /// A cursor is valid only for the same directory path.
-    pub async fn list(&self, path: &str, options: ListOptions) -> ClientResult<DirectoryListing> {
-        let path = NamespacePathBuf::parse(path)?;
-        self.inner.metadata.list(path, options).await
+    /// The first bounded page is fetched before this method returns, so path
+    /// errors are reported immediately rather than during iteration.
+    pub async fn list_status(&self, path: &str) -> ClientResult<ListStatusIterator> {
+        self.list_status_with_options(path, ListStatusOptions::default()).await
     }
 
-    /// Lazily lists directory entries across bounded unary RPC pages.
+    /// Lists the direct children of a directory with explicit page sizing.
     ///
-    /// The returned stream fetches the next page only after buffered entries
-    /// from the current page have been consumed. Dropping it cancels further
-    /// pagination. `options.cursor` may resume from an earlier page, and
-    /// `options.limit` applies independently to every request.
-    ///
-    /// Pagination remains weakly consistent because Metadata retains no
-    /// iterator or snapshot between requests. Use [`Self::list`] when callers
-    /// need explicit page boundaries or access to continuation cursors.
-    pub fn list_stream(
+    /// Metadata retains no server-side iterator or snapshot between pages.
+    /// Entries changed concurrently with iteration are therefore observed with
+    /// weak consistency. Each page is bounded by `options.page_size`.
+    pub async fn list_status_with_options(
         &self,
         path: &str,
-        options: ListOptions,
-    ) -> ClientResult<impl futures::Stream<Item = ClientResult<DirectoryEntry>> + Send + Unpin + 'static> {
-        let state = DirectoryListStreamState {
-            client: self.clone(),
-            path: NamespacePathBuf::parse(path)?,
+        options: ListStatusOptions,
+    ) -> ClientResult<ListStatusIterator> {
+        if options.page_size == Some(0) {
+            return Err(ClientError::invalid_argument(
+                "list_status page_size must be greater than zero".to_string(),
+            ));
+        }
+        let path = NamespacePathBuf::parse(path)?;
+        let first_page = self
+            .inner
+            .metadata
+            .list_status_page(path.clone(), None, options.page_size)
+            .await?;
+        Ok(ListStatusIterator::new(
+            Arc::clone(&self.inner),
+            path,
             options,
-            buffered_entries: Vec::new().into_iter(),
-            eof: false,
-        };
-        Ok(stream::try_unfold(state, |mut state| async move {
-            loop {
-                if let Some(entry) = state.buffered_entries.next() {
-                    return Ok(Some((entry, state)));
-                }
-                if state.eof {
-                    return Ok(None);
-                }
-
-                let previous_cursor = state.options.cursor.clone();
-                let page = state
-                    .client
-                    .inner
-                    .metadata
-                    .list(state.path.clone(), state.options.clone())
-                    .await?;
-                if !page.eof && page.next_cursor == previous_cursor {
-                    return Err(invalid_response(
-                        "ListStatus",
-                        "non-EOF page did not advance next_cursor",
-                    ));
-                }
-
-                state.eof = page.eof;
-                state.options.cursor = page.next_cursor;
-                state.buffered_entries = page.entries.into_iter();
-            }
-        })
-        .boxed())
+            first_page,
+        ))
     }
 
-    /// Create a directory through the metadata client.
-    /// When `recursive` is true, missing parent directories are created.
-    pub async fn mkdirs(&self, path: &str, recursive: bool) -> ClientResult<FileStatus> {
+    /// Ensures a directory exists, creating any missing parent directories.
+    pub async fn mkdirs(&self, path: &str) -> ClientResult<FileStatus> {
+        self.mkdirs_with_options(path, MkdirOptions::default()).await
+    }
+
+    /// Creates a directory using explicit parent-creation behavior.
+    ///
+    /// Disabling parent creation is a single namespace mutation. An ambiguous
+    /// transport outcome is reported as unknown instead of being replayed.
+    pub async fn mkdirs_with_options(&self, path: &str, options: MkdirOptions) -> ClientResult<FileStatus> {
         let path = NamespacePathBuf::parse(path)?;
-        self.inner.metadata.create_directory(path, recursive).await
+        self.inner.metadata.mkdirs(path, options.create_parent).await
     }
 
     /// Delete a file, symlink, or directory through the metadata client.
     ///
     /// Namespace visibility changes atomically at metadata. Physical block
     /// reclamation follows the configured metadata grace period asynchronously.
-    pub async fn delete(&self, path: &str, options: DeleteOptions) -> ClientResult<()> {
+    pub async fn delete(&self, path: &str) -> ClientResult<()> {
+        self.delete_with_options(path, DeleteOptions::default()).await
+    }
+
+    /// Deletes a namespace entry using explicit recursive behavior.
+    ///
+    /// The recursive operation remains one Metadata-authorized namespace
+    /// mutation; this client does not discover or delete descendants itself.
+    /// Ambiguous transport outcomes are reported as unknown and are not replayed.
+    pub async fn delete_with_options(&self, path: &str, options: DeleteOptions) -> ClientResult<()> {
         let path = NamespacePathBuf::parse(path)?;
         self.inner.metadata.delete(path, options).await
     }
 
-    /// Rename a namespace entry through the metadata client.
+    /// Renames a namespace entry through Metadata.
+    ///
+    /// Ambiguous transport outcomes are reported as unknown and are not replayed.
     pub async fn rename(&self, src: &str, dst: &str) -> ClientResult<()> {
         let src = NamespacePathBuf::parse(src)?;
         let dst = NamespacePathBuf::parse(dst)?;
@@ -220,8 +198,8 @@ mod tests {
     use beryl_proto::worker::write_block_request_proto::Payload;
     use beryl_types::lease::FencingToken;
     use beryl_types::{
-        BlockId, BlockIndex, ClientId, FileBlockLocation, GroupName, GroupStateWatermark, InodeId, RaftLogId,
-        WorkerEndpointInfo, WorkerId, WorkerNetProtocol, WriteTarget,
+        BlockId, BlockIndex, ClientId, FileBlockLocation, GroupName, GroupStateWatermark, InodeId, InodeKind,
+        RaftLogId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol, WriteTarget,
     };
 
     fn assert_client_error(error: &ClientError, kind: ClientErrorKind, outcome_unknown: bool, message_fragment: &str) {
@@ -257,7 +235,10 @@ mod tests {
         )
         .expect("client");
 
-        client.stat("/alpha").await.expect("fourth primary attempt succeeds");
+        client
+            .get_status("/alpha")
+            .await
+            .expect("fourth primary attempt succeeds");
 
         let calls = metadata_transport.calls();
         assert_eq!(
@@ -289,7 +270,7 @@ mod tests {
             .expect("client");
 
         let err = client
-            .stat("/alpha")
+            .get_status("/alpha")
             .await
             .expect_err("read transport attempts exhausted");
 
@@ -297,6 +278,38 @@ mod tests {
         let calls = metadata_transport.calls();
         assert_eq!(methods(&calls), vec!["get_status", "get_status", "get_status"]);
         assert!(calls.iter().all(|call| call.call_id == calls[0].call_id));
+    }
+
+    #[tokio::test]
+    async fn list_status_validates_page_size_and_fetches_the_first_page() {
+        let metadata_transport = Arc::new(MockMetadataTransport::default());
+        let client =
+            fs_client_with_metadata_transport(test_config("root"), metadata_transport.clone()).expect("client");
+
+        let error = match client
+            .list_status_with_options("/alpha", ListStatusOptions { page_size: Some(0) })
+            .await
+        {
+            Ok(_) => panic!("zero page size must fail before Metadata"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ClientErrorKind::InvalidArgument);
+        assert!(metadata_transport.calls().is_empty());
+
+        let mut statuses = client
+            .list_status_with_options("/alpha", ListStatusOptions { page_size: Some(1) })
+            .await
+            .expect("first page");
+        assert_eq!(methods(&metadata_transport.calls()), vec!["list_status"]);
+        let status = statuses
+            .next()
+            .await
+            .expect("consume first page")
+            .expect("child status");
+        assert_eq!(status.path(), "/alpha/child");
+        assert_eq!(status.kind, InodeKind::File);
+        assert!(statuses.next().await.expect("finish listing").is_none());
+        assert_eq!(methods(&metadata_transport.calls()), vec!["list_status"]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -347,11 +360,11 @@ mod tests {
 
             let err = match operation {
                 "create_directory" => client
-                    .mkdirs("/alpha", false)
+                    .mkdirs_with_options("/alpha", MkdirOptions { create_parent: false })
                     .await
                     .expect_err("non-recursive CreateDirectory ambiguity must fail closed"),
                 "delete" => client
-                    .delete("/alpha", DeleteOptions::default())
+                    .delete("/alpha")
                     .await
                     .expect_err("Delete ambiguity must fail closed"),
                 "rename" => client
@@ -379,12 +392,12 @@ mod tests {
 
             let error = if recursive {
                 client
-                    .mkdirs("/alpha/beta", true)
+                    .mkdirs("/alpha/beta")
                     .await
                     .expect_err("replayable mutation must not retry a non-retryable transport status")
             } else {
                 client
-                    .delete("/alpha", DeleteOptions::default())
+                    .delete("/alpha")
                     .await
                     .expect_err("non-replayable mutation transport result must be unknown")
             };
@@ -395,7 +408,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn recursive_create_directory_retries_as_an_ensure_operation() {
+    async fn mkdirs_retries_as_an_ensure_operation() {
         let metadata_transport = Arc::new(MockMetadataTransport::with_mutation_outcomes(vec![
             MetadataOutcome::Transport,
             MetadataOutcome::Ok,
@@ -404,7 +417,7 @@ mod tests {
             .expect("client");
 
         client
-            .mkdirs("/alpha/beta", true)
+            .mkdirs("/alpha/beta")
             .await
             .expect("recursive CreateDirectory converges after retry");
 
@@ -426,7 +439,10 @@ mod tests {
         let client = fs_client_with_metadata_transport(test_config_with_retries("root", 2), metadata_transport.clone())
             .expect("client");
 
-        client.stat("/alpha").await.expect("retry after one Msync succeeds");
+        client
+            .get_status("/alpha")
+            .await
+            .expect("retry after one Msync succeeds");
 
         let calls = metadata_transport.calls();
         assert_eq!(methods(&calls), vec!["get_status", "msync", "get_status"]);
@@ -454,8 +470,8 @@ mod tests {
         let client =
             fs_client_with_metadata_transport(test_config("root"), metadata_transport.clone()).expect("client");
 
-        client.stat("/alpha").await.expect("first stat");
-        client.stat("/alpha").await.expect("second stat");
+        client.get_status("/alpha").await.expect("first status");
+        client.get_status("/alpha").await.expect("second status");
 
         let headers = metadata_transport.get_status_headers();
         assert_eq!(headers.len(), 2);
@@ -1396,6 +1412,7 @@ mod tests {
             }
             let body = GetStatusResponseProto {
                 attrs: Some(file_attrs_proto(10)),
+                kind: beryl_proto::metadata::InodeKindProto::InodeKindFile as i32,
                 ..GetStatusResponseProto::default()
             };
             let authority = self

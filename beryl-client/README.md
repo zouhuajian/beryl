@@ -8,18 +8,18 @@
 
 - Uses metadata RPCs for namespace, layout, visibility, and write-session authority.
 - Uses worker RPCs for data reads and writes after metadata issues the required context.
-- Presents Rust API types for files, readers, writers, options, statuses, and listings.
+- Presents Rust API types for files, readers, writers, namespace options, statuses, and listing iteration.
 
 ## Main Responsibilities
 
-- `FsClient`, file readers/writers, operation options, and status/listing types.
+- `FsClient`, file readers/writers, operation options, `FileStatus`, and `ListStatusIterator`.
 - Metadata RPC orchestration and metadata response validation.
 - Worker RPC orchestration for metadata-authorized read, write, commit, sync, and abort.
 - Client identity, call IDs, retry, refresh, replay, endpoint cache, and write-session state.
 
 ## Current Active Use
 
-The Rust native API is the client interface used today. It supports core operations such as status, non-recursive list, mkdirs, namespace delete, rename, open, create, append, read, write, sync, close, and abort.
+The Rust native API is the client interface used today. Its namespace surface follows common distributed-filesystem naming: `get_status`, `list_status`, `mkdirs`, `delete`, and `rename`. Methods with operation options use a `_with_options` suffix.
 
 Reads fill caller-owned buffers through Worker requests bounded by
 `beryl.client.read.max-request-bytes`. `FileReader::read` advances a sequential
@@ -28,9 +28,9 @@ position, while `read_at` and `read_exact_at` leave it unchanged.
 `beryl.client.read.max-buffered-bytes` and commits its position only after the
 complete remaining file succeeds.
 
-`ListOptions::recursive` is part of the Rust API shape, but recursive listing is not supported by the current metadata service. Requests with that flag are rejected instead of silently falling back to non-recursive listing.
+`FsClient::list_status` returns a `ListStatusIterator`. The client fetches one bounded page before returning it, then fetches later pages only as `next` consumes buffered statuses. Listing is non-recursive and weakly consistent across pages because Metadata retains no server-side snapshot.
 
-`FsClient::delete` requires `DeleteOptions`, which currently controls recursive namespace deletion. Physical reclamation remains asynchronous and uses the Metadata cleanup grace period.
+`FsClient::delete` is non-recursive by default. `delete_with_options` accepts `DeleteOptions` for recursive namespace deletion. Physical reclamation remains asynchronous and uses the Metadata cleanup grace period.
 
 ## Runnable CRUD Example
 
@@ -45,7 +45,7 @@ cargo run --locked -p beryl-client --example crud -- conf/client.yaml
 
 The optional positional argument is the client configuration path and defaults
 to `conf/client.yaml`. The example creates `/examples/rust-client-crud.bin`,
-writes deterministic data spanning multiple blocks, checks stat and read
+writes deterministic data spanning multiple blocks, checks status and read
 results, then deletes the file. It exits nonzero on any failure or mismatch.
 
 This example intentionally demonstrates only the public Client API. Starting,
