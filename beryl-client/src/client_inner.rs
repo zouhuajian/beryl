@@ -11,7 +11,7 @@ use crate::config::ClientConfig;
 use crate::error::side_effect_response_body_mismatch;
 use crate::error::{ClientError, ClientErrorKind, ClientResult, RefreshHint};
 use crate::metadata::{GrpcMetadataTransport, MetadataClient, MetadataTransport};
-use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
+use crate::metrics::{self, ClientMetric, ClientMetricLabels};
 use crate::runtime::{
     is_definite_worker_capacity_rejection, AttemptContext, ClientIdentity, MetadataTargets, Operation,
     OperationContext, OperationDeadline,
@@ -21,8 +21,8 @@ use crate::worker::{BlockWrite, WorkerClient};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, WorkerErrorKind};
 use bytes::Bytes;
 
-/// Shared owner for client configuration, Metadata orchestration, Worker IO,
-/// and metrics used by the filesystem facade and open handles.
+/// Shared owner for client configuration, Metadata orchestration, and Worker IO
+/// used by the filesystem facade and open handles.
 pub(crate) struct ClientInner {
     /// Immutable client configuration used by metadata and data-plane attempts.
     pub(crate) config: ClientConfig,
@@ -30,46 +30,34 @@ pub(crate) struct ClientInner {
     pub(crate) metadata: MetadataClient,
     /// Worker client used only after Metadata returns validated targets.
     pub(crate) worker: WorkerClient,
-    /// Metrics sink shared by facade and open handles.
-    pub(crate) metrics: Arc<dyn ClientMetrics>,
 }
 
 impl ClientInner {
     /// Builds the production owner and both concrete transports from validated
     /// client configuration.
-    pub(crate) fn from_config(config: ClientConfig, metrics: Arc<dyn ClientMetrics>) -> ClientResult<Self> {
+    pub(crate) fn from_config(config: ClientConfig) -> ClientResult<Self> {
+        config.validate()?;
         let metadata_targets = MetadataTargets::from_config(&config)?;
-        let metadata_transport = Arc::new(GrpcMetadataTransport::new_lazy_with_config(
-            &config,
-            Arc::clone(&metrics),
-        )?);
-        let worker = WorkerClient::from_config(&config, Arc::clone(&metrics));
-        Self::from_parts(config, metadata_transport, metadata_targets, worker, metrics)
+        let metadata_transport = Arc::new(GrpcMetadataTransport::new_lazy_with_config(&config)?);
+        let worker = WorkerClient::from_config(&config);
+        Self::from_parts(config, metadata_transport, metadata_targets, worker)
     }
 
     /// Establishes exactly one owner for identity, authority state, Worker
-    /// orchestration, configuration, and metrics.
+    /// orchestration, and immutable configuration.
     fn from_parts(
         config: ClientConfig,
         metadata_transport: Arc<dyn MetadataTransport>,
         metadata_targets: MetadataTargets,
         worker: WorkerClient,
-        metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
-        config.read.validate()?;
-        let identity = ClientIdentity::generate(config.client_name.clone())?;
-        let metadata = MetadataClient::new(
-            identity,
-            metadata_transport,
-            metadata_targets,
-            &config,
-            Arc::clone(&metrics),
-        )?;
+        config.validate()?;
+        let identity = ClientIdentity::generate(config.client_name().to_string())?;
+        let metadata = MetadataClient::new(identity, metadata_transport, metadata_targets, &config)?;
         Ok(Self {
             config,
             metadata,
             worker,
-            metrics,
         })
     }
 
@@ -119,7 +107,7 @@ impl ClientInner {
             deadline,
         )?;
         let lease_expires_at_ms = session.expires_at_ms()?;
-        for attempt_index in 0..self.config.retry.max_attempts() {
+        for attempt_index in 0..self.config.max_attempts() {
             let ctx = self.data_context(&operation, attempt_index as u32);
             match self
                 .worker_rpc_with_timeout(
@@ -135,7 +123,7 @@ impl ClientInner {
             {
                 Ok(block) => return Ok(block),
                 Err(err) if is_definite_worker_capacity_rejection(&err) => {
-                    let has_next = attempt_index + 1 < self.config.retry.max_attempts();
+                    let has_next = attempt_index + 1 < self.config.max_attempts();
                     if !has_next {
                         return Err(err.with_operation_context(&operation));
                     }
@@ -350,9 +338,9 @@ impl ClientInner {
         );
     }
 
-    /// Emits one metric event through the configured metrics sink.
+    /// Emits one low-cardinality counter through the process-wide recorder.
     pub(crate) fn record_metric(&self, metric: ClientMetric, labels: ClientMetricLabels) {
-        self.metrics.record(ClientMetricEvent::new(metric, labels));
+        metrics::record(metric, labels);
     }
 }
 

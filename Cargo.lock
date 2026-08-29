@@ -229,7 +229,6 @@ dependencies = [
 name = "beryl-client"
 version = "0.1.0-alpha.1"
 dependencies = [
- "anyhow",
  "async-trait",
  "beryl-common",
  "beryl-proto",
@@ -239,14 +238,9 @@ dependencies = [
  "metrics",
  "parking_lot",
  "prost",
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror 2.0.17",
  "tokio",
  "tokio-stream",
  "tonic",
- "tracing",
  "uuid",
 ]
 

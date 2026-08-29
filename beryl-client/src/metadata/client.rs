@@ -13,14 +13,14 @@ use beryl_types::{BlockId, FileLayout, InodeId, InodeKind};
 
 use crate::api::path::NamespacePathBuf;
 use crate::api::{DeleteOptions, FileStatus};
-use crate::config::{ClientConfig, RetryConfig};
+use crate::config::ClientConfig;
 use crate::error::{
     invalid_response, side_effect_response_body_mismatch, ClientError, ClientErrorKind, ClientResult, RefreshHint,
 };
 use crate::metadata::{
     AddBlockResult, ListStatusPage, MetadataTransport, OpenedFile, ReadLayout, ValidatedMetadataResponse,
 };
-use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
+use crate::metrics::{self, ClientMetric, ClientMetricLabels};
 use crate::runtime::context::{AttemptContext, ClientIdentity, Operation, OperationContext, OperationDeadline};
 use crate::runtime::refresh::MetadataTargets;
 use crate::runtime::{retry_decision, transport_outcome_is_ambiguous, RetryDecision};
@@ -41,9 +41,8 @@ pub(crate) struct MetadataClient {
     /// Client-side route and monotonic authority state learned from Metadata.
     metadata_targets: MetadataTargets,
     /// Bounded retry and absolute operation-timeout configuration.
-    retry: RetryConfig,
-    /// Shared metrics sink for Metadata attempts and authority refreshes.
-    metrics: Arc<dyn ClientMetrics>,
+    max_attempts: usize,
+    operation_timeout_ms: u64,
 }
 
 impl MetadataClient {
@@ -53,20 +52,19 @@ impl MetadataClient {
         transport: Arc<dyn MetadataTransport>,
         metadata_targets: MetadataTargets,
         config: &ClientConfig,
-        metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
         Ok(Self {
             identity,
             transport,
             metadata_targets,
-            retry: config.retry.clone(),
-            metrics,
+            max_attempts: config.max_attempts(),
+            operation_timeout_ms: config.operation_timeout_ms(),
         })
     }
 
     /// Starts one absolute deadline shared by all work in a public operation.
     pub(crate) fn operation_deadline(&self) -> OperationDeadline {
-        OperationDeadline::new(self.retry.operation_timeout_ms)
+        OperationDeadline::new(self.operation_timeout_ms)
     }
 
     fn operation(
@@ -565,7 +563,7 @@ impl MetadataClient {
             Err(err) => return (Err(err), false),
         };
         let mut saw_transport_ambiguity = false;
-        for attempt_index in 0..self.retry.max_attempts() {
+        for attempt_index in 0..self.max_attempts {
             let attempt = attempt_index as u32;
             let endpoint = match self.metadata_targets.endpoint_for_group(&target_group, attempt) {
                 Ok(endpoint) => endpoint,
@@ -602,7 +600,7 @@ impl MetadataClient {
             let decision = retry_decision(&err, operation.retry_safety());
             saw_transport_ambiguity |= transport_outcome_is_ambiguous(&err, operation.retry_safety());
             self.record_error_metric(&operation, &err);
-            let has_next = attempt_index + 1 < self.retry.max_attempts();
+            let has_next = attempt_index + 1 < self.max_attempts;
 
             match (decision, has_next) {
                 (RetryDecision::Retry, true) => {
@@ -752,7 +750,7 @@ impl MetadataClient {
     }
 
     fn record_metric(&self, metric: ClientMetric, labels: ClientMetricLabels) {
-        self.metrics.record(ClientMetricEvent::new(metric, labels));
+        metrics::record(metric, labels);
     }
 }
 
@@ -762,7 +760,8 @@ impl fmt::Debug for MetadataClient {
             .field("client_id", &self.identity.client_id())
             .field("client_name", &self.identity.client_name())
             .field("metadata_targets", &self.metadata_targets)
-            .field("retry", &self.retry)
+            .field("max_attempts", &self.max_attempts)
+            .field("operation_timeout_ms", &self.operation_timeout_ms)
             .finish_non_exhaustive()
     }
 }

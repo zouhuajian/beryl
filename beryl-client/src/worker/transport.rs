@@ -24,7 +24,6 @@ use super::{
 use crate::cache::CacheInvalidationReason;
 use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
-use crate::metrics::ClientMetrics;
 use crate::planner::{block_location_unavailable_error, PlannedBlockRead};
 use crate::runtime::{is_definite_worker_capacity_rejection, AttemptContext};
 
@@ -58,9 +57,9 @@ impl Drop for OpeningWriteCancellation {
 
 impl GrpcWorkerTransport {
     /// Builds the production Worker transport and its bounded channel pool.
-    pub(super) fn from_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> Self {
+    pub(super) fn from_config(config: &ClientConfig) -> Self {
         Self {
-            channel_pool: Arc::new(GrpcWorkerChannelPool::from_config(config, metrics)),
+            channel_pool: Arc::new(GrpcWorkerChannelPool::from_config(config)),
         }
     }
 
@@ -467,7 +466,6 @@ mod tests {
 
     use super::*;
     use crate::error::ClientErrorKind;
-    use crate::metrics::NoopClientMetrics;
     use crate::runtime::{retry_decision, Operation, OperationContext, OperationDeadline, RetryDecision, RetrySafety};
 
     #[derive(Clone, Copy)]
@@ -670,12 +668,12 @@ mod tests {
     }
 
     fn grpc_client() -> GrpcWorkerTransport {
-        let mut config = ClientConfig::default();
-        config.connections.worker_enabled = true;
-        config.connections.worker_max_per_worker = 8;
-        GrpcWorkerTransport {
-            channel_pool: Arc::new(GrpcWorkerChannelPool::from_config(&config, Arc::new(NoopClientMetrics))),
-        }
+        let config = ClientConfig::builder()
+            .worker_connection_reuse(true)
+            .worker_connection_limit(8)
+            .build()
+            .expect("config");
+        GrpcWorkerTransport::from_config(&config)
     }
 
     fn worker_endpoint(endpoint: &str, worker_id: u64) -> WorkerEndpointInfo {

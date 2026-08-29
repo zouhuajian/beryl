@@ -119,17 +119,14 @@ impl MetadataTargets {
         })
     }
 
-    /// Build metadata targets from client config.
+    /// Builds the single supported root route from sealed client configuration.
     pub(crate) fn from_config(config: &ClientConfig) -> ClientResult<Self> {
-        let groups = config
-            .metadata_groups
-            .iter()
-            .map(|group| MetadataGroupTargets {
-                group_name: group.group_name.clone(),
-                endpoints: group.endpoints.clone(),
-            })
-            .collect();
-        Self::new(groups)
+        let root = GroupName::parse("root")
+            .map_err(|error| ClientError::invalid_configuration(format!("invalid built-in root group: {error}")))?;
+        Self::new(vec![MetadataGroupTargets {
+            group_name: root,
+            endpoints: config.metadata_endpoints().to_vec(),
+        }])
     }
 
     /// Choose the owner group for a path, using owner cache before bootstrap config.

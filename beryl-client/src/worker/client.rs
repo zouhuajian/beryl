@@ -10,7 +10,6 @@ use super::transport::GrpcWorkerTransport;
 use super::{BlockWrite, WorkerTransport, WorkerWriteTarget};
 use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
-use crate::metrics::ClientMetrics;
 use crate::planner::PlannedBlockRead;
 use crate::runtime::AttemptContext;
 use beryl_types::{GroupName, WriteTarget};
@@ -29,8 +28,8 @@ impl WorkerClient {
     }
 
     /// Builds the production Worker client and its gRPC transport.
-    pub(crate) fn from_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> Self {
-        Self::new(Arc::new(GrpcWorkerTransport::from_config(config, metrics)))
+    pub(crate) fn from_config(config: &ClientConfig) -> Self {
+        Self::new(Arc::new(GrpcWorkerTransport::from_config(config)))
     }
 
     /// Fills a caller-owned buffer from ordered Metadata-planned block ranges.

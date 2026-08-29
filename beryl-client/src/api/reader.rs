@@ -122,7 +122,7 @@ impl FileReader {
         let deadline = self.inner.metadata.operation_deadline();
         let mut filled = 0usize;
         while filled < dst.len() {
-            let step_len = (dst.len() - filled).min(self.inner.config.read.max_request_bytes as usize);
+            let step_len = (dst.len() - filled).min(self.inner.config.max_read_step_bytes() as usize);
             let step_offset = offset + filled as u64;
             let range = RequestedReadRange {
                 file_offset: step_offset,
@@ -144,10 +144,10 @@ impl FileReader {
         if remaining == 0 {
             return Ok(Bytes::new());
         }
-        if remaining > self.inner.config.read.max_buffered_bytes {
+        if remaining > self.inner.config.read_to_end_limit() {
             return Err(ClientError::invalid_argument(format!(
                 "remaining file length {remaining} exceeds configured read_to_end maximum {}",
-                self.inner.config.read.max_buffered_bytes
+                self.inner.config.read_to_end_limit()
             )));
         }
         let capacity = usize::try_from(remaining)
@@ -189,7 +189,7 @@ impl FileReader {
 
     /// Returns the EOF-truncated range for one bounded public read step.
     fn bounded_range(&self, offset: u64, output_len: usize) -> ClientResult<Option<RequestedReadRange>> {
-        let step_len = output_len.min(self.inner.config.read.max_request_bytes as usize);
+        let step_len = output_len.min(self.inner.config.max_read_step_bytes() as usize);
         let step_len =
             u32::try_from(step_len).map_err(|_| ClientError::invalid_argument("bounded read length exceeds u32"))?;
         planner::requested_range(offset, step_len, self.len())
@@ -208,7 +208,7 @@ impl FileReader {
         };
         let operation = self.read_operation(deadline)?;
 
-        for attempt_index in 0..self.inner.config.retry.max_attempts() {
+        for attempt_index in 0..self.inner.config.max_attempts() {
             if !current_block.as_ref().is_some_and(|plan| plan.contains(offset)) {
                 let layout = self
                     .inner
@@ -266,7 +266,7 @@ impl FileReader {
     ) -> ClientResult<()> {
         let operation = self.read_operation(deadline)?;
         let mut layout = None;
-        for attempt_index in 0..self.inner.config.retry.max_attempts() {
+        for attempt_index in 0..self.inner.config.max_attempts() {
             if layout.is_none() {
                 layout = Some(
                     self.inner
@@ -316,7 +316,7 @@ impl FileReader {
     ) -> ClientResult<RetryDecision> {
         let decision = retry_decision(error, operation.retry_safety());
         self.inner.record_error_metric("Read", "worker", error);
-        let has_next = attempt_index + 1 < self.inner.config.retry.max_attempts();
+        let has_next = attempt_index + 1 < self.inner.config.max_attempts();
         match (decision, has_next) {
             (RetryDecision::RefreshMetadata(reason), true) if should_replan_after_worker_error(error) => {
                 self.inner

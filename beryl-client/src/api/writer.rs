@@ -145,8 +145,8 @@ impl FileWriter {
     }
 
     async fn renew_lease_if_needed(&mut self, deadline: OperationDeadline) -> ClientResult<()> {
-        let config = &self.inner.config.write_lease;
-        if !config.auto_renew || !self.session.should_renew_lease(config.renew_before_expiry_ms)? {
+        let config = &self.inner.config;
+        if !config.automatic_lease_renewal() || !self.session.should_renew_lease(config.lease_renewal_threshold_ms())? {
             return Ok(());
         }
         self.renew_lease_locked(deadline).await

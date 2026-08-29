@@ -17,6 +17,32 @@
 - Worker RPC orchestration for metadata-authorized read, write, commit, sync, and abort.
 - Client identity, call IDs, retry, refresh, replay, endpoint cache, and write-session state.
 
+## Client Construction
+
+`ClientConfig` is immutable after construction. Load the installed dotted-key
+YAML with `ClientConfig::load`, or use `ClientConfig::builder` for embedded
+callers and tests. Both paths apply the same defaults and validation. Creating
+the runtime client revalidates the sealed value and therefore returns a
+`ClientResult`:
+
+```rust
+use std::time::Duration;
+
+use beryl_client::{ClientConfig, FsClient};
+
+let config = ClientConfig::builder()
+    .client_name("example-client")
+    .metadata_endpoints(["127.0.0.1:18080"])
+    .operation_timeout(Duration::from_secs(30))
+    .build()?;
+let client = FsClient::new(config)?;
+# Ok::<(), beryl_client::ClientError>(())
+```
+
+The public crate surface exposes the filesystem API, sealed configuration and
+builder, and stable client error types. Transport, routing, metrics plumbing,
+and configuration parsing details remain crate-internal.
+
 ## Current Active Use
 
 The Rust native API is the client interface used today. Its namespace surface follows common distributed-filesystem naming: `get_status`, `list_status`, `mkdirs`, `delete`, and `rename`. Methods with operation options use a `_with_options` suffix.
