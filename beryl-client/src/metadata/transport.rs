@@ -16,7 +16,7 @@ use tonic::transport as tonic_net;
 use crate::config::ClientConfig;
 use crate::error::{side_effect_response_body_mismatch, ClientError, ClientResult};
 use crate::metadata::model::{AddBlockResult, MetadataAuthorityUpdate, ReadLayout, ValidatedMetadataResponse};
-use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
+use crate::metrics::{self, ClientMetric, ClientMetricLabels};
 use crate::rpc_error::{invalid_header_error, validate_header};
 use crate::runtime::AttemptContext;
 
@@ -136,29 +136,19 @@ pub(crate) struct GrpcMetadataTransport {
     channels: Arc<parking_lot::RwLock<HashMap<MetadataChannelKey, tonic_net::Channel>>>,
     channel_pool_enabled: bool,
     max_channels_per_group: usize,
-    metrics: Arc<dyn ClientMetrics>,
 }
 
 impl GrpcMetadataTransport {
-    /// Create a lazily connecting Metadata transport from client config.
-    pub(crate) fn new_lazy_with_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> ClientResult<Self> {
-        Self::new_lazy_with_pool_options(
-            config.connections.metadata_enabled,
-            config.connections.metadata_max_per_group,
-            metrics,
-        )
+    /// Creates a lazily connecting Metadata transport from sealed client configuration.
+    pub(crate) fn new_lazy_with_config(config: &ClientConfig) -> ClientResult<Self> {
+        Self::new_lazy_with_pool_options(config.metadata_connection_reuse(), config.metadata_connection_limit())
     }
 
-    fn new_lazy_with_pool_options(
-        channel_pool_enabled: bool,
-        max_channels_per_group: usize,
-        metrics: Arc<dyn ClientMetrics>,
-    ) -> ClientResult<Self> {
+    fn new_lazy_with_pool_options(channel_pool_enabled: bool, max_channels_per_group: usize) -> ClientResult<Self> {
         Ok(Self {
             channels: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             channel_pool_enabled,
             max_channels_per_group: max_channels_per_group.max(1),
-            metrics,
         })
     }
 
@@ -226,14 +216,14 @@ impl GrpcMetadataTransport {
     }
 
     fn record_pool_metric(&self, metric: ClientMetric, operation: &'static str, outcome: &'static str) {
-        self.metrics.record(ClientMetricEvent::new(
+        metrics::record(
             metric,
             ClientMetricLabels::default()
                 .with_cache("channel_pool")
                 .with_target_plane("metadata")
                 .with_operation_name(operation)
                 .with_outcome(outcome),
-        ));
+        );
     }
 }
 
@@ -698,30 +688,9 @@ mod tests {
     use crate::runtime::{retry_decision, Operation, OperationContext, OperationDeadline, RetryDecision, RetrySafety};
     use beryl_common::error::rpc::{ErrorKind, InternalErrorKind, MetadataErrorKind, RpcErrorDetail};
     use beryl_types::{CallId, ClientId};
-    use std::sync::Mutex;
-
-    #[derive(Debug, Default)]
-    struct RecordingMetrics {
-        events: Mutex<Vec<ClientMetricEvent>>,
-    }
-
-    impl ClientMetrics for RecordingMetrics {
-        fn record(&self, event: ClientMetricEvent) {
-            self.events.lock().expect("events").push(event);
-        }
-    }
-
-    impl RecordingMetrics {
-        fn events(&self) -> Vec<ClientMetricEvent> {
-            self.events.lock().expect("events").clone()
-        }
-    }
-
     #[tokio::test]
     async fn concurrent_metadata_channel_requests_same_key_reuse_inserted_channel() {
-        let metrics = Arc::new(RecordingMetrics::default());
-        let transport =
-            Arc::new(GrpcMetadataTransport::new_lazy_with_pool_options(true, 8, metrics.clone()).expect("transport"));
+        let transport = Arc::new(GrpcMetadataTransport::new_lazy_with_pool_options(true, 8).expect("transport"));
         let ctx = metadata_attempt("root", Some("127.0.0.1:18080"));
 
         let mut tasks = Vec::with_capacity(8);
@@ -734,9 +703,7 @@ mod tests {
         for task in tasks {
             let _client = task.await.expect("task").expect("metadata client");
         }
-        let events = metrics.events();
         assert_eq!(transport.channels.read().len(), 1);
-        assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
     }
 
     #[test]

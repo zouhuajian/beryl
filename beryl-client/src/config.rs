@@ -1,279 +1,539 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Client configuration loading and validation.
+//! Immutable client configuration, loading, and validation.
+
+use std::path::Path;
+use std::time::Duration;
 
 use beryl_common::config::load_from_yaml_file;
-use beryl_common::{CommonError, FlatConfig};
-use beryl_types::GroupName;
-use std::path::Path;
+use beryl_common::{CommonError, CommonErrorKind, FlatConfig};
 
-pub const DEFAULT_CLIENT_NAME: &str = "default-client";
-pub const DEFAULT_OPERATION_TIMEOUT_MS: u64 = 30_000;
-/// Default maximum byte count for one bounded Worker read step.
-pub const DEFAULT_READ_MAX_REQUEST_BYTES: u32 = 8 * 1024 * 1024;
-/// Default maximum remaining length accepted by `FileReader::read_to_end`.
-pub const DEFAULT_READ_MAX_BUFFERED_BYTES: u64 = 64 * 1024 * 1024;
-pub const DEFAULT_WRITE_LEASE_RENEW_BEFORE_EXPIRY_MS: u64 = 30_000;
-pub const DEFAULT_WORKER_ENDPOINT_COOLDOWN_MS: u64 = 1_000;
+use crate::error::{ClientError, ClientResult};
 
-const READ_MAX_REQUEST_BYTES_KEY: &str = "beryl.client.read.max-request-bytes";
-const READ_MAX_BUFFERED_BYTES_KEY: &str = "beryl.client.read.max-buffered-bytes";
+const DEFAULT_CLIENT_NAME: &str = "default-client";
+const DEFAULT_METADATA_ENDPOINT: &str = "127.0.0.1:18080";
+const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_MAX_ATTEMPTS: usize = 3;
+const DEFAULT_MAX_READ_STEP_BYTES: u32 = 8 * 1024 * 1024;
+const DEFAULT_READ_TO_END_LIMIT: u64 = 64 * 1024 * 1024;
+const DEFAULT_LEASE_RENEWAL_THRESHOLD: Duration = Duration::from_secs(30);
+const DEFAULT_METADATA_CONNECTION_LIMIT: usize = 1;
+const DEFAULT_WORKER_CONNECTION_LIMIT: usize = 1;
+pub(crate) const DEFAULT_WORKER_ENDPOINT_COOLDOWN: Duration = Duration::from_secs(1);
 
-/// Client-specific configuration.
-#[derive(Clone, Debug)]
-pub struct ClientConfig {
-    /// Underlying flat configuration.
-    pub inner: FlatConfig,
-    /// Low-cardinality display identity carried in request headers.
-    pub client_name: String,
-    /// Retry configuration.
-    pub retry: RetryConfig,
-    /// Bounds for client read steps and owned read-to-end buffers.
-    pub read: ReadConfig,
-    /// Client-side write lease renewal policy.
-    pub write_lease: WriteLeaseConfig,
-    /// Metadata and Worker connection reuse configuration.
-    pub connections: ConnectionConfig,
-    /// Bootstrap endpoints for the single supported metadata group.
-    pub metadata_groups: Vec<MetadataGroupConfig>,
-}
+const CLIENT_NAME_KEY: &str = "beryl.client.name";
+const METADATA_ADDRESSES_KEY: &str = "beryl.client.metadata.addresses";
+const OPERATION_TIMEOUT_KEY: &str = "beryl.client.request.timeout";
+const MAX_ATTEMPTS_KEY: &str = "beryl.client.request.max-attempts";
+const MAX_READ_STEP_BYTES_KEY: &str = "beryl.client.read.max-request-bytes";
+const READ_TO_END_LIMIT_KEY: &str = "beryl.client.read.max-buffered-bytes";
+const AUTOMATIC_LEASE_RENEWAL_KEY: &str = "beryl.client.write-lease.auto-renew";
+const LEASE_RENEWAL_THRESHOLD_KEY: &str = "beryl.client.write-lease.renew-before-expiry";
+const METADATA_CONNECTION_REUSE_KEY: &str = "beryl.client.metadata.connections.enabled";
+const METADATA_CONNECTION_LIMIT_KEY: &str = "beryl.client.metadata.connections.max";
+const WORKER_CONNECTION_REUSE_KEY: &str = "beryl.client.worker.connections.enabled";
+const WORKER_CONNECTION_LIMIT_KEY: &str = "beryl.client.worker.connections.max-per-worker";
+const WORKER_ENDPOINT_COOLDOWN_KEY: &str = "beryl.client.worker.connections.failure-cooldown";
 
-/// Metadata group bootstrap endpoints.
+/// Immutable configuration for one native Beryl filesystem client.
+///
+/// YAML loading and programmatic construction both produce this same typed
+/// value. Fields remain private so callers cannot bypass validation after
+/// construction.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MetadataGroupConfig {
-    /// Stable metadata group name.
-    pub group_name: GroupName,
-    /// Metadata endpoints configured for the group.
-    pub endpoints: Vec<String>,
-}
-
-/// Metadata and Worker connection reuse configuration.
-#[derive(Clone, Debug)]
-pub struct ConnectionConfig {
-    /// Enable Metadata connection reuse.
-    pub metadata_enabled: bool,
-    /// Maximum cached Metadata connections per group.
-    pub metadata_max_per_group: usize,
-    /// Enable Worker connection reuse.
-    pub worker_enabled: bool,
-    /// Maximum cached worker channels per worker identity.
-    pub worker_max_per_worker: usize,
-    /// Cooldown duration after transient worker endpoint failures.
-    pub worker_failure_cooldown_ms: u64,
-}
-
-/// Retry configuration.
-#[derive(Clone, Debug)]
-pub struct RetryConfig {
-    /// Maximum attempts for one primary RPC, including the first.
-    pub max_attempts: usize,
-    /// Total public-operation timeout in milliseconds.
-    pub operation_timeout_ms: u64,
-}
-
-/// Bounds for read RPC steps and caller-requested owned buffering.
-#[derive(Clone, Debug)]
-pub struct ReadConfig {
-    /// Maximum byte count sent through one bounded Worker read step.
-    pub max_request_bytes: u32,
-    /// Maximum remaining byte count accepted by `FileReader::read_to_end`.
-    pub max_buffered_bytes: u64,
-}
-
-impl ReadConfig {
-    /// Ensures both read bounds admit nonempty reads.
-    pub(crate) fn validate(&self) -> Result<(), CommonError> {
-        if self.max_request_bytes == 0 {
-            return Err(invalid_config(READ_MAX_REQUEST_BYTES_KEY, "must be greater than zero"));
-        }
-        if self.max_buffered_bytes == 0 {
-            return Err(invalid_config(READ_MAX_BUFFERED_BYTES_KEY, "must be greater than zero"));
-        }
-        Ok(())
-    }
-}
-
-/// Write lease renewal configuration.
-#[derive(Clone, Debug)]
-pub struct WriteLeaseConfig {
-    /// Renew write leases automatically before side-effecting writer operations.
-    pub auto_renew: bool,
-    /// Renew when the current metadata lease expires within this many milliseconds.
-    pub renew_before_expiry_ms: u64,
-}
-
-impl RetryConfig {
-    /// Return the total primary RPC attempt cap, including the first attempt.
-    pub fn max_attempts(&self) -> usize {
-        self.max_attempts
-    }
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_attempts: 3,
-            operation_timeout_ms: DEFAULT_OPERATION_TIMEOUT_MS,
-        }
-    }
-}
-
-impl Default for ReadConfig {
-    fn default() -> Self {
-        Self {
-            max_request_bytes: DEFAULT_READ_MAX_REQUEST_BYTES,
-            max_buffered_bytes: DEFAULT_READ_MAX_BUFFERED_BYTES,
-        }
-    }
-}
-
-impl Default for WriteLeaseConfig {
-    fn default() -> Self {
-        Self {
-            auto_renew: true,
-            renew_before_expiry_ms: DEFAULT_WRITE_LEASE_RENEW_BEFORE_EXPIRY_MS,
-        }
-    }
-}
-
-impl Default for ConnectionConfig {
-    fn default() -> Self {
-        Self {
-            metadata_enabled: true,
-            metadata_max_per_group: 1,
-            worker_enabled: true,
-            worker_max_per_worker: 1,
-            worker_failure_cooldown_ms: DEFAULT_WORKER_ENDPOINT_COOLDOWN_MS,
-        }
-    }
-}
-
-impl Default for ClientConfig {
-    fn default() -> Self {
-        let flat = FlatConfig::new();
-        Self::from_flat(flat).unwrap()
-    }
+pub struct ClientConfig {
+    client_name: String,
+    metadata_endpoints: Vec<String>,
+    operation_timeout: Duration,
+    max_attempts: usize,
+    max_read_step_bytes: u32,
+    read_to_end_limit: u64,
+    automatic_lease_renewal: bool,
+    lease_renewal_threshold: Duration,
+    metadata_connection_reuse: bool,
+    metadata_connection_limit: usize,
+    worker_connection_reuse: bool,
+    worker_connection_limit: usize,
+    worker_endpoint_cooldown: Duration,
 }
 
 impl ClientConfig {
-    /// Load client configuration from a file.
-    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, CommonError> {
-        Self::from_flat(load_from_yaml_file(path)?)
+    /// Starts a programmatic configuration using the documented client defaults.
+    pub fn builder() -> ClientConfigBuilder {
+        ClientConfigBuilder {
+            config: Self::defaults(),
+        }
     }
 
-    /// Create from FlatConfig.
-    pub fn from_flat(flat: FlatConfig) -> Result<Self, CommonError> {
-        let client_name = client_name_from_flat(&flat)?;
-
-        let retry = retry_config_from_flat(&flat)?;
-        let read = read_config_from_flat(&flat)?;
-        let write_lease = write_lease_config_from_flat(&flat)?;
-        let connections = connection_config_from_flat(&flat)?;
-        let metadata_groups = parse_metadata_endpoints(&flat)?;
-
-        Ok(Self {
-            inner: flat,
-            client_name,
-            retry,
-            read,
-            write_lease,
-            connections,
-            metadata_groups,
-        })
+    /// Loads dotted-key YAML and converts it into validated typed configuration.
+    ///
+    /// Unknown top-level keys are ignored. Known keys use the same type, range,
+    /// endpoint, and duration validation as [`ClientConfigBuilder::build`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientErrorKind::Io`](crate::ClientErrorKind::Io) when the file
+    /// cannot be read, or [`ClientErrorKind::InvalidConfiguration`](crate::ClientErrorKind::InvalidConfiguration)
+    /// when YAML or a known configuration value is invalid.
+    pub fn load<P: AsRef<Path>>(path: P) -> ClientResult<Self> {
+        let flat = load_from_yaml_file(path).map_err(config_load_error)?;
+        Self::from_flat(&flat)
     }
 
-    /// Get the underlying flat configuration.
-    pub fn as_flat(&self) -> &FlatConfig {
-        &self.inner
-    }
-
-    /// Return the low-cardinality display identity used in request headers.
+    /// Returns the low-cardinality display identity carried in request headers.
     pub fn client_name(&self) -> &str {
         &self.client_name
     }
-}
 
-fn client_name_from_flat(flat: &FlatConfig) -> Result<String, CommonError> {
-    const KEY: &str = "beryl.client.name";
-    let name = flat.string_or(KEY, DEFAULT_CLIENT_NAME)?;
-    if name.trim().is_empty() {
-        return Err(invalid_config(KEY, "must not be blank"));
+    /// Returns bootstrap endpoints for the single supported root Metadata route.
+    pub fn metadata_endpoints(&self) -> &[String] {
+        &self.metadata_endpoints
     }
-    Ok(name)
+
+    /// Returns the absolute timeout budget for one public client operation.
+    pub fn operation_timeout(&self) -> Duration {
+        self.operation_timeout
+    }
+
+    /// Returns the maximum number of primary RPC attempts, including the first.
+    pub fn max_attempts(&self) -> usize {
+        self.max_attempts
+    }
+
+    /// Returns the maximum byte count for one bounded Worker read step.
+    pub fn max_read_step_bytes(&self) -> u32 {
+        self.max_read_step_bytes
+    }
+
+    /// Returns the maximum owned allocation accepted by `FileReader::read_to_end`.
+    pub fn read_to_end_limit(&self) -> u64 {
+        self.read_to_end_limit
+    }
+
+    /// Returns whether writer operations automatically renew a near-expiry lease.
+    pub fn automatic_lease_renewal(&self) -> bool {
+        self.automatic_lease_renewal
+    }
+
+    /// Returns how close to lease expiry automatic renewal begins.
+    pub fn lease_renewal_threshold(&self) -> Duration {
+        self.lease_renewal_threshold
+    }
+
+    pub(crate) fn metadata_connection_reuse(&self) -> bool {
+        self.metadata_connection_reuse
+    }
+
+    pub(crate) fn metadata_connection_limit(&self) -> usize {
+        self.metadata_connection_limit
+    }
+
+    pub(crate) fn worker_connection_reuse(&self) -> bool {
+        self.worker_connection_reuse
+    }
+
+    pub(crate) fn worker_connection_limit(&self) -> usize {
+        self.worker_connection_limit
+    }
+
+    pub(crate) fn worker_endpoint_cooldown(&self) -> Duration {
+        self.worker_endpoint_cooldown
+    }
+
+    pub(crate) fn operation_timeout_ms(&self) -> u64 {
+        duration_millis(self.operation_timeout)
+    }
+
+    pub(crate) fn lease_renewal_threshold_ms(&self) -> u64 {
+        duration_millis(self.lease_renewal_threshold)
+    }
+
+    /// Revalidates every correctness and resource bound at runtime construction.
+    pub(crate) fn validate(&self) -> ClientResult<()> {
+        if self.client_name.trim().is_empty() {
+            return Err(invalid_config(CLIENT_NAME_KEY, "must not be blank"));
+        }
+        if self.metadata_endpoints.is_empty() {
+            return Err(invalid_config(
+                METADATA_ADDRESSES_KEY,
+                "must contain at least one endpoint for the root route",
+            ));
+        }
+        for endpoint in &self.metadata_endpoints {
+            validate_metadata_endpoint(endpoint)?;
+        }
+        validate_millisecond_duration(OPERATION_TIMEOUT_KEY, self.operation_timeout)?;
+        if tokio::time::Instant::now()
+            .checked_add(self.operation_timeout)
+            .is_none()
+        {
+            return Err(invalid_config(
+                OPERATION_TIMEOUT_KEY,
+                "is too large for the monotonic clock",
+            ));
+        }
+        validate_positive(MAX_ATTEMPTS_KEY, self.max_attempts)?;
+        validate_positive(MAX_READ_STEP_BYTES_KEY, self.max_read_step_bytes)?;
+        validate_positive(READ_TO_END_LIMIT_KEY, self.read_to_end_limit)?;
+        validate_millisecond_duration(LEASE_RENEWAL_THRESHOLD_KEY, self.lease_renewal_threshold)?;
+        validate_positive(METADATA_CONNECTION_LIMIT_KEY, self.metadata_connection_limit)?;
+        validate_positive(WORKER_CONNECTION_LIMIT_KEY, self.worker_connection_limit)?;
+        validate_nonzero_duration(WORKER_ENDPOINT_COOLDOWN_KEY, self.worker_endpoint_cooldown)?;
+        if std::time::Instant::now()
+            .checked_add(self.worker_endpoint_cooldown)
+            .is_none()
+        {
+            return Err(invalid_config(
+                WORKER_ENDPOINT_COOLDOWN_KEY,
+                "is too large for the monotonic clock",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Converts transient flat configuration into the same sealed value used by
+    /// the public builder. Unknown keys deliberately remain ignored.
+    fn from_flat(flat: &FlatConfig) -> ClientResult<Self> {
+        let defaults = Self::defaults();
+        let metadata_endpoints = if flat.contains_key(METADATA_ADDRESSES_KEY) {
+            flat.get_string_list(METADATA_ADDRESSES_KEY)
+                .ok_or_else(|| invalid_config(METADATA_ADDRESSES_KEY, "must be a list of endpoints"))?
+        } else {
+            defaults.metadata_endpoints
+        };
+        let config = Self {
+            client_name: flat
+                .string_or(CLIENT_NAME_KEY, &defaults.client_name)
+                .map_err(config_value_error)?,
+            metadata_endpoints,
+            operation_timeout: Duration::from_millis(
+                flat.duration_ms_or(OPERATION_TIMEOUT_KEY, duration_millis(defaults.operation_timeout))
+                    .map_err(config_value_error)?,
+            ),
+            max_attempts: flat
+                .positive_usize_or(MAX_ATTEMPTS_KEY, defaults.max_attempts)
+                .map_err(config_value_error)?,
+            max_read_step_bytes: flat
+                .bytes_u32_or(MAX_READ_STEP_BYTES_KEY, defaults.max_read_step_bytes)
+                .map_err(config_value_error)?,
+            read_to_end_limit: flat
+                .bytes_u64_or(READ_TO_END_LIMIT_KEY, defaults.read_to_end_limit)
+                .map_err(config_value_error)?,
+            automatic_lease_renewal: flat
+                .bool_or(AUTOMATIC_LEASE_RENEWAL_KEY, defaults.automatic_lease_renewal)
+                .map_err(config_value_error)?,
+            lease_renewal_threshold: Duration::from_millis(
+                flat.duration_ms_or(
+                    LEASE_RENEWAL_THRESHOLD_KEY,
+                    duration_millis(defaults.lease_renewal_threshold),
+                )
+                .map_err(config_value_error)?,
+            ),
+            metadata_connection_reuse: flat
+                .bool_or(METADATA_CONNECTION_REUSE_KEY, defaults.metadata_connection_reuse)
+                .map_err(config_value_error)?,
+            metadata_connection_limit: flat
+                .positive_usize_or(METADATA_CONNECTION_LIMIT_KEY, defaults.metadata_connection_limit)
+                .map_err(config_value_error)?,
+            worker_connection_reuse: flat
+                .bool_or(WORKER_CONNECTION_REUSE_KEY, defaults.worker_connection_reuse)
+                .map_err(config_value_error)?,
+            worker_connection_limit: flat
+                .positive_usize_or(WORKER_CONNECTION_LIMIT_KEY, defaults.worker_connection_limit)
+                .map_err(config_value_error)?,
+            worker_endpoint_cooldown: Duration::from_millis(
+                flat.duration_ms_or(
+                    WORKER_ENDPOINT_COOLDOWN_KEY,
+                    duration_millis(defaults.worker_endpoint_cooldown),
+                )
+                .map_err(config_value_error)?,
+            ),
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn defaults() -> Self {
+        Self {
+            client_name: DEFAULT_CLIENT_NAME.to_string(),
+            metadata_endpoints: vec![DEFAULT_METADATA_ENDPOINT.to_string()],
+            operation_timeout: DEFAULT_OPERATION_TIMEOUT,
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            max_read_step_bytes: DEFAULT_MAX_READ_STEP_BYTES,
+            read_to_end_limit: DEFAULT_READ_TO_END_LIMIT,
+            automatic_lease_renewal: true,
+            lease_renewal_threshold: DEFAULT_LEASE_RENEWAL_THRESHOLD,
+            metadata_connection_reuse: true,
+            metadata_connection_limit: DEFAULT_METADATA_CONNECTION_LIMIT,
+            worker_connection_reuse: true,
+            worker_connection_limit: DEFAULT_WORKER_CONNECTION_LIMIT,
+            worker_endpoint_cooldown: DEFAULT_WORKER_ENDPOINT_COOLDOWN,
+        }
+    }
 }
 
-fn connection_config_from_flat(flat: &FlatConfig) -> Result<ConnectionConfig, CommonError> {
-    let defaults = ConnectionConfig::default();
-    let config = ConnectionConfig {
-        metadata_enabled: flat.bool_or("beryl.client.metadata.connections.enabled", defaults.metadata_enabled)?,
-        metadata_max_per_group: flat
-            .positive_usize_or("beryl.client.metadata.connections.max", defaults.metadata_max_per_group)?,
-        worker_enabled: flat.bool_or("beryl.client.worker.connections.enabled", defaults.worker_enabled)?,
-        worker_max_per_worker: flat.positive_usize_or(
-            "beryl.client.worker.connections.max-per-worker",
-            defaults.worker_max_per_worker,
-        )?,
-        worker_failure_cooldown_ms: flat.duration_ms_or(
-            "beryl.client.worker.connections.failure-cooldown",
-            defaults.worker_failure_cooldown_ms,
-        )?,
-    };
-    Ok(config)
+/// Programmatic constructor for a validated [`ClientConfig`].
+///
+/// The builder owns the only mutable configuration state. `build` validates
+/// the complete value and returns an immutable configuration.
+#[derive(Clone, Debug)]
+pub struct ClientConfigBuilder {
+    config: ClientConfig,
 }
 
-fn parse_metadata_endpoints(flat: &FlatConfig) -> Result<Vec<MetadataGroupConfig>, CommonError> {
-    const KEY: &str = "beryl.client.metadata.addresses";
-    let endpoints = if flat.contains_key(KEY) {
-        flat.get_string_list(KEY)
-            .ok_or_else(|| invalid_config(KEY, "must be a list of addresses"))?
+impl ClientConfigBuilder {
+    /// Sets the low-cardinality display identity carried in request headers.
+    pub fn client_name(mut self, client_name: impl Into<String>) -> Self {
+        self.config.client_name = client_name.into();
+        self
+    }
+
+    /// Replaces bootstrap endpoints for the single supported root Metadata route.
+    pub fn metadata_endpoints<I, S>(mut self, endpoints: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.config.metadata_endpoints = endpoints.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Sets the absolute timeout budget for one public client operation.
+    pub fn operation_timeout(mut self, timeout: Duration) -> Self {
+        self.config.operation_timeout = timeout;
+        self
+    }
+
+    /// Sets the primary RPC attempt cap, including the first attempt.
+    pub fn max_attempts(mut self, max_attempts: usize) -> Self {
+        self.config.max_attempts = max_attempts;
+        self
+    }
+
+    /// Sets the maximum byte count for one bounded Worker read step.
+    pub fn max_read_step_bytes(mut self, max_bytes: u32) -> Self {
+        self.config.max_read_step_bytes = max_bytes;
+        self
+    }
+
+    /// Sets the maximum owned allocation accepted by `FileReader::read_to_end`.
+    pub fn read_to_end_limit(mut self, max_bytes: u64) -> Self {
+        self.config.read_to_end_limit = max_bytes;
+        self
+    }
+
+    /// Enables or disables automatic renewal before writer side effects.
+    pub fn automatic_lease_renewal(mut self, enabled: bool) -> Self {
+        self.config.automatic_lease_renewal = enabled;
+        self
+    }
+
+    /// Sets how close to lease expiry automatic renewal begins.
+    pub fn lease_renewal_threshold(mut self, threshold: Duration) -> Self {
+        self.config.lease_renewal_threshold = threshold;
+        self
+    }
+
+    /// Enables or disables Metadata channel reuse.
+    pub fn metadata_connection_reuse(mut self, enabled: bool) -> Self {
+        self.config.metadata_connection_reuse = enabled;
+        self
+    }
+
+    /// Sets the maximum cached Metadata channels for the root route.
+    pub fn metadata_connection_limit(mut self, limit: usize) -> Self {
+        self.config.metadata_connection_limit = limit;
+        self
+    }
+
+    /// Enables or disables Worker channel reuse.
+    pub fn worker_connection_reuse(mut self, enabled: bool) -> Self {
+        self.config.worker_connection_reuse = enabled;
+        self
+    }
+
+    /// Sets the maximum cached channel identities per Worker.
+    pub fn worker_connection_limit(mut self, limit: usize) -> Self {
+        self.config.worker_connection_limit = limit;
+        self
+    }
+
+    /// Sets the cooldown after a transient Worker endpoint failure.
+    pub fn worker_endpoint_cooldown(mut self, cooldown: Duration) -> Self {
+        self.config.worker_endpoint_cooldown = cooldown;
+        self
+    }
+
+    /// Validates and seals the complete configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientErrorKind::InvalidConfiguration`](crate::ClientErrorKind::InvalidConfiguration)
+    /// for a blank client name, missing or invalid Metadata endpoints, zero
+    /// resource bounds, non-millisecond operation or lease durations, or a
+    /// duration that the runtime clock cannot represent safely.
+    pub fn build(self) -> ClientResult<ClientConfig> {
+        self.config.validate()?;
+        Ok(self.config)
+    }
+}
+
+/// Normalizes and validates one Metadata endpoint without opening a connection.
+pub(crate) fn normalize_metadata_endpoint(endpoint: &str) -> ClientResult<String> {
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        return Err(invalid_config(
+            METADATA_ADDRESSES_KEY,
+            "must not contain blank endpoints",
+        ));
+    }
+    if endpoint != trimmed {
+        return Err(invalid_config(
+            METADATA_ADDRESSES_KEY,
+            "must not contain surrounding whitespace",
+        ));
+    }
+    let endpoint = trimmed;
+    let normalized = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
     } else {
-        vec!["127.0.0.1:18080".to_string()]
+        format!("http://{endpoint}")
     };
-    if endpoints.is_empty() || endpoints.iter().any(|endpoint| endpoint.trim().is_empty()) {
-        return Err(invalid_config(KEY, "must contain at least one non-empty address"));
+    tonic::transport::Endpoint::from_shared(normalized.clone()).map_err(|error| {
+        invalid_config(
+            METADATA_ADDRESSES_KEY,
+            format!("contains invalid endpoint {endpoint}: {error}"),
+        )
+    })?;
+    Ok(normalized)
+}
+
+fn validate_metadata_endpoint(endpoint: &str) -> ClientResult<()> {
+    normalize_metadata_endpoint(endpoint).map(|_| ())
+}
+
+fn validate_positive(key: &'static str, value: impl PartialEq + Default) -> ClientResult<()> {
+    if value == Default::default() {
+        return Err(invalid_config(key, "must be greater than zero"));
     }
-    Ok(vec![MetadataGroupConfig {
-        group_name: GroupName::parse("root").expect("the supported metadata group is valid"),
-        endpoints,
-    }])
+    Ok(())
 }
 
-fn retry_config_from_flat(flat: &FlatConfig) -> Result<RetryConfig, CommonError> {
-    let defaults = RetryConfig::default();
-    let max_attempts = flat.positive_usize_or("beryl.client.request.max-attempts", defaults.max_attempts)?;
-    let operation_timeout_ms = flat.duration_ms_or("beryl.client.request.timeout", defaults.operation_timeout_ms)?;
-    Ok(RetryConfig {
-        max_attempts,
-        operation_timeout_ms,
-    })
+fn validate_nonzero_duration(key: &'static str, value: Duration) -> ClientResult<()> {
+    if value < Duration::from_millis(1) {
+        return Err(invalid_config(key, "must be at least 1ms"));
+    }
+    Ok(())
 }
 
-fn read_config_from_flat(flat: &FlatConfig) -> Result<ReadConfig, CommonError> {
-    let defaults = ReadConfig::default();
-    let config = ReadConfig {
-        max_request_bytes: flat.bytes_u32_or(READ_MAX_REQUEST_BYTES_KEY, defaults.max_request_bytes)?,
-        max_buffered_bytes: flat.bytes_u64_or(READ_MAX_BUFFERED_BYTES_KEY, defaults.max_buffered_bytes)?,
-    };
-    config.validate()?;
-    Ok(config)
+fn validate_millisecond_duration(key: &'static str, value: Duration) -> ClientResult<()> {
+    validate_nonzero_duration(key, value)?;
+    let millis = u64::try_from(value.as_millis()).map_err(|_| invalid_config(key, "is too large"))?;
+    if Duration::from_millis(millis) != value {
+        return Err(invalid_config(key, "must use whole milliseconds"));
+    }
+    Ok(())
 }
 
-fn write_lease_config_from_flat(flat: &FlatConfig) -> Result<WriteLeaseConfig, CommonError> {
-    let defaults = WriteLeaseConfig::default();
-    let config = WriteLeaseConfig {
-        auto_renew: flat.bool_or("beryl.client.write-lease.auto-renew", defaults.auto_renew)?,
-        renew_before_expiry_ms: flat.duration_ms_or(
-            "beryl.client.write-lease.renew-before-expiry",
-            defaults.renew_before_expiry_ms,
-        )?,
-    };
-    Ok(config)
+fn duration_millis(value: Duration) -> u64 {
+    u64::try_from(value.as_millis()).expect("validated client duration fits u64 milliseconds")
 }
 
-fn invalid_config(key: &'static str, detail: impl Into<String>) -> CommonError {
-    CommonError::new(
-        beryl_common::CommonErrorKind::InvalidArgument,
-        format!("{key} {}", detail.into()),
-    )
+fn config_load_error(error: CommonError) -> ClientError {
+    if error.kind == CommonErrorKind::Io {
+        error.into()
+    } else {
+        config_value_error(error)
+    }
+}
+
+fn config_value_error(error: CommonError) -> ClientError {
+    ClientError::invalid_configuration(error.to_string())
+}
+
+fn invalid_config(key: &'static str, detail: impl Into<String>) -> ClientError {
+    ClientError::invalid_configuration(format!("{key} {}", detail.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client_inner::ClientInner;
+
+    #[test]
+    fn builder_and_flat_loading_share_values_and_ignore_unknown_keys() {
+        let mut flat = FlatConfig::new();
+        flat.set(CLIENT_NAME_KEY, "configured-client");
+        flat.set(METADATA_ADDRESSES_KEY, vec!["metadata.internal:18080".to_string()]);
+        flat.set(OPERATION_TIMEOUT_KEY, "12s");
+        flat.set(MAX_ATTEMPTS_KEY, 5i64);
+        flat.set(MAX_READ_STEP_BYTES_KEY, "4MiB");
+        flat.set(READ_TO_END_LIMIT_KEY, "32MiB");
+        flat.set(AUTOMATIC_LEASE_RENEWAL_KEY, false);
+        flat.set(LEASE_RENEWAL_THRESHOLD_KEY, "8s");
+        flat.set(METADATA_CONNECTION_REUSE_KEY, false);
+        flat.set(METADATA_CONNECTION_LIMIT_KEY, 2i64);
+        flat.set(WORKER_CONNECTION_REUSE_KEY, false);
+        flat.set(WORKER_CONNECTION_LIMIT_KEY, 3i64);
+        flat.set(WORKER_ENDPOINT_COOLDOWN_KEY, "4s");
+        flat.set("beryl.future.option", "ignored");
+
+        let from_flat = ClientConfig::from_flat(&flat).expect("flat config");
+        let from_builder = ClientConfig::builder()
+            .client_name("configured-client")
+            .metadata_endpoints(["metadata.internal:18080"])
+            .operation_timeout(Duration::from_secs(12))
+            .max_attempts(5)
+            .max_read_step_bytes(4 * 1024 * 1024)
+            .read_to_end_limit(32 * 1024 * 1024)
+            .automatic_lease_renewal(false)
+            .lease_renewal_threshold(Duration::from_secs(8))
+            .metadata_connection_reuse(false)
+            .metadata_connection_limit(2)
+            .worker_connection_reuse(false)
+            .worker_connection_limit(3)
+            .worker_endpoint_cooldown(Duration::from_secs(4))
+            .build()
+            .expect("builder config");
+
+        assert_eq!(from_flat, from_builder);
+    }
+
+    #[test]
+    fn builder_rejects_invalid_identity_endpoints_and_resource_bounds() {
+        let invalid = [
+            ClientConfig::builder().client_name(" ").build(),
+            ClientConfig::builder().metadata_endpoints(Vec::<String>::new()).build(),
+            ClientConfig::builder()
+                .metadata_endpoints([" metadata.internal:18080"])
+                .build(),
+            ClientConfig::builder().metadata_endpoints(["http://["]).build(),
+            ClientConfig::builder().operation_timeout(Duration::ZERO).build(),
+            ClientConfig::builder().max_attempts(0).build(),
+            ClientConfig::builder().max_read_step_bytes(0).build(),
+            ClientConfig::builder().read_to_end_limit(0).build(),
+            ClientConfig::builder().lease_renewal_threshold(Duration::ZERO).build(),
+            ClientConfig::builder().metadata_connection_limit(0).build(),
+            ClientConfig::builder().worker_connection_limit(0).build(),
+            ClientConfig::builder().worker_endpoint_cooldown(Duration::ZERO).build(),
+        ];
+
+        assert!(invalid
+            .into_iter()
+            .all(|result| { result.is_err_and(|error| error.kind() == crate::ClientErrorKind::InvalidConfiguration) }));
+    }
+
+    #[test]
+    fn runtime_construction_revalidates_typed_configuration() {
+        let mut config = ClientConfig::builder().build().expect("config");
+        config.max_read_step_bytes = 0;
+
+        let error = match ClientInner::from_config(config) {
+            Ok(_) => panic!("runtime construction must reject invalid configuration"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), crate::ClientErrorKind::InvalidConfiguration);
+    }
 }

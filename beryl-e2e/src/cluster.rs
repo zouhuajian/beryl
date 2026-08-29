@@ -939,13 +939,14 @@ fn worker_config(
 }
 
 fn client_for(metadata_addr: SocketAddr, group_name: GroupName) -> TestResult<FsClient> {
-    let mut flat = FlatConfig::new();
     assert_eq!(group_name.as_str(), "root");
-    flat.set("beryl.client.name", "local-crud-e2e");
-    flat.set("beryl.client.metadata.addresses", vec![metadata_addr.to_string()]);
-    flat.set("beryl.client.request.max-attempts", 3i64);
-    flat.set("beryl.client.request.timeout", "2s");
-    Ok(FsClient::try_new(ClientConfig::from_flat(flat)?)?)
+    let config = ClientConfig::builder()
+        .client_name("local-crud-e2e")
+        .metadata_endpoints([metadata_addr.to_string()])
+        .max_attempts(3)
+        .operation_timeout(Duration::from_secs(2))
+        .build()?;
+    Ok(FsClient::new(config)?)
 }
 
 fn observability_config() -> Result<ObservabilityConfig, beryl_common::CommonError> {

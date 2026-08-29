@@ -4,7 +4,6 @@
 //! gRPC channel ownership and endpoint failure tracking for Worker transport.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use beryl_proto::worker::worker_data_service_client::WorkerDataServiceClient;
@@ -15,11 +14,12 @@ use tonic::transport as tonic_net;
 use crate::cache::CacheInvalidationReason;
 use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
-use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
+use crate::metrics::{self, ClientMetric, ClientMetricLabels};
 use beryl_common::error::rpc::{ErrorKind, RecoveryAction, WorkerErrorKind};
 
 const WORKER_ENDPOINT_COOLDOWN_CACHE_LIMIT: usize = 1_024;
 
+/// Owns bounded Worker channels and transient endpoint cooldown state.
 #[derive(Debug)]
 pub(super) struct GrpcWorkerChannelPool {
     channels: RwLock<HashMap<WorkerChannelKey, tonic_net::Channel>>,
@@ -27,35 +27,30 @@ pub(super) struct GrpcWorkerChannelPool {
     enabled: bool,
     max_cached_keys_per_worker: usize,
     endpoint_cooldown: Duration,
-    metrics: Arc<dyn ClientMetrics>,
 }
 
 impl GrpcWorkerChannelPool {
-    pub(super) fn new_with_cooldown_ms(
-        enabled: bool,
-        max_cached_keys_per_worker: usize,
-        endpoint_cooldown_ms: u64,
-        metrics: Arc<dyn ClientMetrics>,
-    ) -> Self {
+    /// Creates a bounded Worker channel pool with explicit reuse and cooldown policy.
+    pub(super) fn new(enabled: bool, max_cached_keys_per_worker: usize, endpoint_cooldown: Duration) -> Self {
         Self {
             channels: RwLock::new(HashMap::new()),
             cooldowns: RwLock::new(HashMap::new()),
             enabled,
             max_cached_keys_per_worker: max_cached_keys_per_worker.max(1),
-            endpoint_cooldown: Duration::from_millis(endpoint_cooldown_ms),
-            metrics,
+            endpoint_cooldown,
         }
     }
 
-    pub(super) fn from_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> Self {
-        Self::new_with_cooldown_ms(
-            config.connections.worker_enabled,
-            config.connections.worker_max_per_worker,
-            config.connections.worker_failure_cooldown_ms,
-            metrics,
+    /// Creates the production pool from sealed client configuration.
+    pub(super) fn from_config(config: &ClientConfig) -> Self {
+        Self::new(
+            config.worker_connection_reuse(),
+            config.worker_connection_limit(),
+            config.worker_endpoint_cooldown(),
         )
     }
 
+    /// Returns whether the exact Metadata-authorized Worker identity is cooling down.
     pub(super) fn is_worker_cooling_down(&self, worker: &WorkerEndpointInfo) -> bool {
         let Ok(key) = Self::channel_key(worker) else {
             return false;
@@ -63,6 +58,7 @@ impl GrpcWorkerChannelPool {
         self.is_key_cooling_down(&key)
     }
 
+    /// Invalidates one exact channel and starts its bounded failure cooldown.
     pub(super) fn mark_worker_unavailable(&self, worker: &WorkerEndpointInfo, reason: CacheInvalidationReason) {
         let Ok(key) = Self::channel_key(worker) else {
             return;
@@ -70,13 +66,17 @@ impl GrpcWorkerChannelPool {
         self.invalidate_key(&key, reason);
         if !self.endpoint_cooldown.is_zero() {
             let now = Instant::now();
+            let Some(cooldown_until) = now.checked_add(self.endpoint_cooldown) else {
+                return;
+            };
             let mut cooldowns = self.cooldowns.write();
             prune_expired_cooldowns(&mut cooldowns, now);
             evict_worker_cooldown_if_needed(&mut cooldowns, &key);
-            cooldowns.insert(key, now + self.endpoint_cooldown);
+            cooldowns.insert(key, cooldown_until);
         }
     }
 
+    /// Clears cooldown state after a validated success from the same Worker identity.
     pub(super) fn clear_worker_cooldown(&self, worker: &WorkerEndpointInfo) {
         if let Ok(key) = Self::channel_key(worker) {
             self.cooldowns.write().remove(&key);
@@ -93,6 +93,7 @@ impl GrpcWorkerChannelPool {
         cooldowns.get(key).is_some_and(|until| *until > now)
     }
 
+    /// Returns a bounded lazy Worker client unless the exact endpoint is cooling down.
     pub(super) fn worker_data_service_client(
         &self,
         worker: &WorkerEndpointInfo,
@@ -114,6 +115,7 @@ impl GrpcWorkerChannelPool {
         Ok(configure_worker_data_client(channel))
     }
 
+    /// Invalidates the cached channel for one exact Worker identity.
     pub(super) fn invalidate_worker_channel(&self, worker: &WorkerEndpointInfo, reason: CacheInvalidationReason) {
         if let Ok(key) = Self::channel_key(worker) {
             self.invalidate_key(&key, reason);
@@ -174,14 +176,14 @@ impl GrpcWorkerChannelPool {
     }
 
     fn record_pool_metric(&self, metric: ClientMetric, operation: &'static str, outcome: &'static str) {
-        self.metrics.record(ClientMetricEvent::new(
+        metrics::record(
             metric,
             ClientMetricLabels::default()
                 .with_cache("channel_pool")
                 .with_target_plane("worker")
                 .with_operation_name(operation)
                 .with_outcome(outcome),
-        ));
+        );
     }
 }
 
@@ -274,46 +276,23 @@ mod tests {
     use beryl_common::error::rpc::{ErrorKind, RefreshHint as RpcRefreshHint, RpcErrorDetail, WorkerErrorKind};
     use beryl_proto::convert::rpc_error_to_proto;
     use beryl_types::{ClientId, WorkerEndpointInfo, WorkerId};
-    use std::sync::Mutex;
+    use std::sync::Arc;
 
     use crate::runtime::{AttemptContext, Operation, OperationContext, OperationDeadline};
     use crate::worker::protocol::parse_worker_control_header;
 
-    #[derive(Debug, Default)]
-    struct RecordingMetrics {
-        events: Mutex<Vec<ClientMetricEvent>>,
-    }
-
-    impl ClientMetrics for RecordingMetrics {
-        fn record(&self, event: ClientMetricEvent) {
-            self.events.lock().expect("events").push(event);
-        }
-    }
-
-    impl RecordingMetrics {
-        fn events(&self) -> Vec<ClientMetricEvent> {
-            self.events.lock().expect("events").clone()
-        }
-    }
-
-    fn test_pool(
-        enabled: bool,
-        max_cached_keys_per_worker: usize,
-        metrics: Arc<dyn ClientMetrics>,
-    ) -> GrpcWorkerChannelPool {
-        GrpcWorkerChannelPool::new_with_cooldown_ms(
+    fn test_pool(enabled: bool, max_cached_keys_per_worker: usize) -> GrpcWorkerChannelPool {
+        GrpcWorkerChannelPool::new(
             enabled,
             max_cached_keys_per_worker,
-            crate::config::DEFAULT_WORKER_ENDPOINT_COOLDOWN_MS,
-            metrics,
+            crate::config::DEFAULT_WORKER_ENDPOINT_COOLDOWN,
         )
     }
 
     #[tokio::test]
     async fn concurrent_worker_channel_requests_same_key_reuse_inserted_channel() {
         let task_count = 8;
-        let metrics = Arc::new(RecordingMetrics::default());
-        let pool = Arc::new(test_pool(true, 8, metrics.clone()));
+        let pool = Arc::new(test_pool(true, 8));
         let worker = worker_endpoint();
 
         let mut tasks = Vec::with_capacity(task_count);
@@ -329,21 +308,12 @@ mod tests {
             let _client = task.await.expect("task").expect("worker client");
         }
         assert_eq!(pool.channels.read().len(), 1);
-        let events = metrics.events();
-        let miss_count = count_metric(&events, ClientMetric::WorkerChannelPoolMiss);
-        assert!(
-            (1..=task_count).contains(&miss_count),
-            "miss count {miss_count} outside expected race-visible bounds: {events:?}"
-        );
-        assert_eq!(count_metric(&events, ClientMetric::ChannelBuildError), 0);
-        assert_safe_metric_labels(&events);
     }
 
     // connect_lazy touches Hyper's Tokio executor even though acquisition is synchronous.
     #[tokio::test]
     async fn worker_run_mismatch_invalidates_target_channel() {
-        let metrics = Arc::new(RecordingMetrics::default());
-        let pool = test_pool(true, 1, metrics.clone());
+        let pool = test_pool(true, 1);
         let worker = worker_endpoint();
         let attempt = data_attempt_context();
 
@@ -366,7 +336,6 @@ mod tests {
         pool.invalidate_on_worker_run_mismatch(&worker, &err);
 
         assert_eq!(pool.channels.read().len(), 0);
-        assert_metric(&metrics.events(), ClientMetric::CachePreciseInvalidation);
     }
 
     fn worker_endpoint() -> WorkerEndpointInfo {
@@ -400,23 +369,5 @@ mod tests {
             client: Some(attempt.client_info()),
             error: Some(rpc_error_to_proto(&rpc_error)),
         }
-    }
-
-    fn assert_metric(events: &[ClientMetricEvent], metric: ClientMetric) {
-        assert!(
-            events.iter().any(|event| event.metric == metric),
-            "missing metric {metric:?}: {events:?}"
-        );
-    }
-
-    fn assert_safe_metric_labels(events: &[ClientMetricEvent]) {
-        assert!(
-            events.iter().all(|event| event.labels.has_only_safe_values()),
-            "unsafe metric labels: {events:?}"
-        );
-    }
-
-    fn count_metric(events: &[ClientMetricEvent], metric: ClientMetric) -> usize {
-        events.iter().filter(|event| event.metric == metric).count()
     }
 }

@@ -134,8 +134,11 @@ impl OperationDeadline {
     /// Captures one absolute deadline for all child RPCs of a public call.
     pub(crate) fn new(timeout_ms: u64) -> Self {
         let timeout = Duration::from_millis(timeout_ms);
+        let now = tokio::time::Instant::now();
         Self {
-            instant: tokio::time::Instant::now() + timeout,
+            // Sealed configuration rejects this overflow. Internal callers
+            // still fail closed with an already-expired deadline.
+            instant: now.checked_add(timeout).unwrap_or(now),
             unix_ms: unix_now_ms().saturating_add(timeout_ms.min(i64::MAX as u64) as i64),
         }
     }

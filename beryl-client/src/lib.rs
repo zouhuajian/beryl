@@ -36,7 +36,5 @@ mod worker;
 pub use api::{DeleteOptions, ListStatusOptions, MkdirOptions};
 pub use api::{FileAttrs, FileStatus, InodeKind, ListStatusIterator};
 pub use api::{FileReader, FileWriter, FsClient};
-pub use config::ClientConfig;
-pub use config::{ConnectionConfig, ReadConfig, RetryConfig, WriteLeaseConfig};
+pub use config::{ClientConfig, ClientConfigBuilder};
 pub use error::{ClientError, ClientErrorKind, ClientResult};
-pub use metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics, NoopClientMetrics};

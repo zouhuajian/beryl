@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("conf/client.yaml"));
-    let client = FsClient::try_new(ClientConfig::load(config_path)?)?;
+    let client = FsClient::new(ClientConfig::load(config_path)?)?;
 
     client.mkdirs(DIRECTORY).await?;
 

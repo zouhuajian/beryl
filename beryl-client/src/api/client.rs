@@ -11,7 +11,6 @@ use crate::api::path::NamespacePathBuf;
 use crate::client_inner::ClientInner;
 use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
-use crate::metrics::{ClientMetrics, NoopClientMetrics};
 
 /// Public filesystem-facing client facade.
 #[derive(Clone)]
@@ -21,25 +20,21 @@ pub struct FsClient {
 }
 
 impl FsClient {
-    /// Create a new filesystem client facade.
-    pub fn new(config: ClientConfig) -> Self {
-        Self::try_new(config).expect("valid client configuration")
-    }
-
-    /// Create a new filesystem client facade and return configuration errors.
-    pub fn try_new(config: ClientConfig) -> ClientResult<Self> {
-        let metrics: Arc<dyn ClientMetrics> = Arc::new(NoopClientMetrics);
-        Self::try_new_with_metrics(config, metrics)
-    }
-
-    /// Create a new filesystem client facade with an injected metrics recorder.
-    pub fn try_new_with_metrics(config: ClientConfig, metrics: Arc<dyn ClientMetrics>) -> ClientResult<Self> {
+    /// Creates a filesystem client after revalidating the sealed configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientErrorKind::InvalidConfiguration`](crate::ClientErrorKind::InvalidConfiguration)
+    /// if any sealed value violates the runtime configuration invariants. It
+    /// also returns an error if the client identity, root Metadata route, or
+    /// transport ownership cannot be constructed.
+    pub fn new(config: ClientConfig) -> ClientResult<Self> {
         Ok(Self {
-            inner: Arc::new(ClientInner::from_config(config, metrics)?),
+            inner: Arc::new(ClientInner::from_config(config)?),
         })
     }
 
-    /// Return the client configuration.
+    /// Returns the immutable configuration used by this client.
     pub fn config(&self) -> &ClientConfig {
         &self.inner.config
     }
@@ -169,13 +164,12 @@ impl fmt::Debug for FsClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ClientConfig, MetadataGroupConfig, ReadConfig};
+    use crate::config::{ClientConfig, ClientConfigBuilder};
     use crate::error::{ClientError, ClientErrorKind, ClientResult, RefreshHint};
     use crate::metadata::{
         AddBlockResult, MetadataAuthorityUpdate, MetadataClient, MetadataTransport, OpenedFile, ReadLayout,
         ValidatedMetadataResponse,
     };
-    use crate::metrics::{ClientMetric, ClientMetricEvent};
     use crate::planner::PlannedBlockRead;
     use crate::runtime::{retry_decision, AttemptContext, ClientIdentity, MetadataTargets, RetryDecision, RetrySafety};
     use crate::session::write_session::WriteSession;
@@ -226,12 +220,10 @@ mod tests {
             MetadataOutcome::ServerRetry,
             MetadataOutcome::Ok,
         ]));
-        let metrics = Arc::new(RecordingMetrics::default());
-        let client = fs_client_with_worker_transport_and_metrics(
+        let client = fs_client_with_worker_transport(
             test_config_with_retries("root", 4),
             metadata_transport.clone(),
             Arc::new(MockDataClient::default()),
-            metrics.clone(),
         )
         .expect("client");
 
@@ -247,16 +239,6 @@ mod tests {
         );
         assert!(calls.iter().all(|call| call.call_id == calls[0].call_id));
         assert!(calls.iter().all(|call| call.deadline_ms == calls[0].deadline_ms));
-        let retry_labels: Vec<_> = metrics
-            .events()
-            .into_iter()
-            .filter(|event| event.metric() == ClientMetric::RetryAttempt)
-            .map(|event| event.labels().error_class().expect("retry error class"))
-            .collect();
-        assert_eq!(
-            retry_labels,
-            vec!["server_retry", "retryable_transport", "server_retry"]
-        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -801,9 +783,11 @@ mod tests {
     async fn writer_auto_renews_near_expiry_before_write() {
         let metadata_transport = Arc::new(MockMetadataTransport::default());
         let worker = Arc::new(MockDataClient::default());
-        let mut config = test_config("root");
-        config.write_lease.auto_renew = true;
-        config.write_lease.renew_before_expiry_ms = 120_000;
+        let config = test_config_builder("root")
+            .automatic_lease_renewal(true)
+            .lease_renewal_threshold(Duration::from_secs(120))
+            .build()
+            .expect("config");
         let client = fs_client_with_worker_transport(config, metadata_transport.clone(), worker_transport(worker))
             .expect("client");
         let handle = write_session_for_tests("/created", 0, unix_now_ms() + 60_000).expect("write handle");
@@ -823,8 +807,10 @@ mod tests {
             events: Some(events.clone()),
             ..MockDataClient::default()
         });
-        let mut config = test_config("root");
-        config.write_lease.auto_renew = false;
+        let config = test_config_builder("root")
+            .automatic_lease_renewal(false)
+            .build()
+            .expect("config");
         let client = fs_client_with_worker_transport(config, metadata_transport.clone(), worker_transport(worker))
             .expect("client");
         let handle = write_session_for_tests("/created", 0, unix_now_ms() + 1_200).expect("write handle");
@@ -854,9 +840,11 @@ mod tests {
             events: Some(write_events.clone()),
             ..MockDataClient::default()
         });
-        let mut write_config = test_config("root");
-        write_config.retry.operation_timeout_ms = 50;
-        write_config.write_lease.auto_renew = false;
+        let write_config = test_config_builder("root")
+            .operation_timeout(Duration::from_millis(50))
+            .automatic_lease_renewal(false)
+            .build()
+            .expect("write config");
         let write_client = fs_client_with_worker_transport(
             write_config,
             write_metadata_transport.clone(),
@@ -882,9 +870,11 @@ mod tests {
             events: Some(abort_events.clone()),
             ..MockDataClient::default()
         });
-        let mut abort_config = test_config("root");
-        abort_config.retry.operation_timeout_ms = 50;
-        abort_config.write_lease.auto_renew = false;
+        let abort_config = test_config_builder("root")
+            .operation_timeout(Duration::from_millis(50))
+            .automatic_lease_renewal(false)
+            .build()
+            .expect("abort config");
         let abort_client = fs_client_with_worker_transport(
             abort_config,
             abort_metadata_transport.clone(),
@@ -1028,32 +1018,27 @@ mod tests {
     }
 
     fn test_config(group_name: &str) -> ClientConfig {
-        ClientConfig {
-            metadata_groups: vec![metadata_group_config(group_name)],
-            ..ClientConfig::default()
-        }
+        test_config_builder(group_name).build().expect("test config")
     }
 
-    fn metadata_group_config(group_name: &str) -> MetadataGroupConfig {
-        MetadataGroupConfig {
-            group_name: group_name_from(group_name),
-            endpoints: vec!["http://127.0.0.1:18080".to_string()],
-        }
+    fn test_config_builder(group_name: &str) -> ClientConfigBuilder {
+        assert_eq!(group_name, "root");
+        ClientConfig::builder().metadata_endpoints(["http://127.0.0.1:18080"])
     }
 
     fn test_config_with_retries(group_name: &str, max_attempts: usize) -> ClientConfig {
-        let mut config = test_config(group_name);
-        config.retry.max_attempts = max_attempts.max(1);
-        config
+        test_config_builder(group_name)
+            .max_attempts(max_attempts.max(1))
+            .build()
+            .expect("test config")
     }
 
     fn test_config_with_read_bounds(group_name: &str, max_request_bytes: u32, max_buffered_bytes: u64) -> ClientConfig {
-        let mut config = test_config(group_name);
-        config.read = ReadConfig {
-            max_request_bytes,
-            max_buffered_bytes,
-        };
-        config
+        test_config_builder(group_name)
+            .max_read_step_bytes(max_request_bytes)
+            .read_to_end_limit(max_buffered_bytes)
+            .build()
+            .expect("test config")
     }
 
     fn fs_client_with_metadata_transport(
@@ -1068,52 +1053,18 @@ mod tests {
         metadata_transport: Arc<dyn MetadataTransport>,
         worker_transport: Arc<dyn WorkerTransport>,
     ) -> ClientResult<FsClient> {
-        let metrics: Arc<dyn ClientMetrics> = Arc::new(crate::metrics::NoopClientMetrics);
-        fs_client_with_worker_transport_and_metrics(config, metadata_transport, worker_transport, metrics)
-    }
-
-    fn fs_client_with_worker_transport_and_metrics(
-        config: ClientConfig,
-        metadata_transport: Arc<dyn MetadataTransport>,
-        worker_transport: Arc<dyn WorkerTransport>,
-        metrics: Arc<dyn ClientMetrics>,
-    ) -> ClientResult<FsClient> {
         let metadata_targets = MetadataTargets::from_config(&config)?;
-        config.read.validate()?;
-        let identity = ClientIdentity::generate(config.client_name.clone())?;
-        let metadata = MetadataClient::new(
-            identity,
-            metadata_transport,
-            metadata_targets,
-            &config,
-            Arc::clone(&metrics),
-        )?;
+        config.validate()?;
+        let identity = ClientIdentity::generate(config.client_name().to_string())?;
+        let metadata = MetadataClient::new(identity, metadata_transport, metadata_targets, &config)?;
         let worker = WorkerClient::new(worker_transport);
         Ok(FsClient {
             inner: Arc::new(ClientInner {
                 config,
                 metadata,
                 worker,
-                metrics,
             }),
         })
-    }
-
-    #[derive(Debug, Default)]
-    struct RecordingMetrics {
-        events: Mutex<Vec<ClientMetricEvent>>,
-    }
-
-    impl RecordingMetrics {
-        fn events(&self) -> Vec<ClientMetricEvent> {
-            self.events.lock().expect("metric events").clone()
-        }
-    }
-
-    impl ClientMetrics for RecordingMetrics {
-        fn record(&self, event: ClientMetricEvent) {
-            self.events.lock().expect("metric events").push(event);
-        }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]

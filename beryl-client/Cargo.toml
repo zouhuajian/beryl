@@ -18,22 +18,10 @@ tokio = { workspace = true, features = ["full"] }
 futures = { workspace = true }
 async-trait = { workspace = true }
 
-# Error handling
-anyhow = { workspace = true }
-thiserror = { workspace = true }
-
-# Serialization
-serde = { workspace = true }
-serde_json = { workspace = true }
-serde_yaml = { workspace = true }
-
 # Utilities
 bytes = { workspace = true }
 parking_lot = { workspace = true }
 uuid = { workspace = true }
-
-# Logging
-tracing = { workspace = true }
 
 # Metrics
 metrics = { workspace = true }
