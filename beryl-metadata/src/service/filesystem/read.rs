@@ -29,6 +29,7 @@ pub(super) struct GetAttrInput {
 
 #[derive(Clone, Debug)]
 pub(super) struct GetAttrOutput {
+    pub(super) kind: InodeKind,
     pub(super) attrs: FileAttrs,
 }
 
@@ -42,11 +43,12 @@ struct ReadDirInput {
     freshness: Freshness,
 }
 
+/// One direct child joined with its authoritative inode status.
 #[derive(Clone, Debug)]
 pub(crate) struct ReadDirEntry {
     pub(crate) name: String,
-    pub(crate) kind: Option<InodeKind>,
-    pub(crate) attrs: Option<FileAttrs>,
+    pub(crate) kind: InodeKind,
+    pub(crate) attrs: FileAttrs,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -81,14 +83,15 @@ pub(crate) struct GetStatusArgs {
     pub(crate) freshness: Freshness,
 }
 
+/// Required namespace status returned after inode authority validation.
 pub(crate) struct GetStatusOutput {
+    pub(crate) kind: InodeKind,
     pub(crate) attrs: FileAttrs,
 }
 
 /// Validated filesystem arguments for one public directory-listing page.
 pub(crate) struct ListStatusArgs {
     pub(crate) path: String,
-    pub(crate) recursive: bool,
     pub(crate) cursor_key: Option<Vec<u8>>,
     /// Positive server-resolved page size; wire defaults and caps are already applied.
     pub(crate) max_entries: usize,
@@ -155,6 +158,7 @@ impl MetadataFileSystem {
         .await
         .map(|success| FsSuccess {
             payload: GetStatusOutput {
+                kind: success.payload.kind,
                 attrs: success.payload.attrs,
             },
             group_name: success.group_name,
@@ -180,14 +184,6 @@ impl MetadataFileSystem {
                 Some(&resolved.mount_ctx),
             );
         };
-        if args.recursive {
-            return self.failure_from_resolved_path_error(
-                ctx,
-                MetadataError::NotSupported("Recursive listing not yet implemented".to_string()),
-                Some(&resolved.mount_ctx),
-            );
-        }
-
         self.read_dir_resolved(ReadDirInput {
             ctx: ctx.clone(),
             parent_inode_id: inode_id,
@@ -506,12 +502,27 @@ impl MetadataFileSystem {
                 }
                 Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
             };
+            if inode.inode_id != req.inode_id || inode.kind != inode.data.kind() {
+                return self.failure_from_error(
+                    &req.ctx,
+                    MetadataError::Internal(format!(
+                        "inode authority is corrupt for GetStatus: key={}, value_id={}, kind={:?}, payload={:?}",
+                        req.inode_id,
+                        inode.inode_id,
+                        inode.kind,
+                        inode.data.kind()
+                    )),
+                    None,
+                    None,
+                );
+            }
 
             let (group_name, mount_epoch, route_epoch) = self
                 .validate_read_freshness_for_mount(&req.ctx, req.freshness, inode.mount_id, "GetStatus")
                 .await?;
             self.success_with_route_epoch(
                 GetAttrOutput {
+                    kind: inode.kind,
                     attrs: inode.attrs.clone(),
                 },
                 group_name,
@@ -540,6 +551,20 @@ impl MetadataFileSystem {
                 }
                 Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
             };
+            if parent_inode.inode_id != req.parent_inode_id || parent_inode.kind != parent_inode.data.kind() {
+                return self.failure_from_error(
+                    &req.ctx,
+                    MetadataError::Internal(format!(
+                        "inode authority is corrupt for ListStatus: key={}, value_id={}, kind={:?}, payload={:?}",
+                        req.parent_inode_id,
+                        parent_inode.inode_id,
+                        parent_inode.kind,
+                        parent_inode.data.kind()
+                    )),
+                    None,
+                    None,
+                );
+            }
             if !parent_inode.kind.is_dir() {
                 return self.failure_from_error(
                     &req.ctx,
@@ -589,10 +614,24 @@ impl MetadataFileSystem {
                         );
                     }
                 };
+                if child_inode.inode_id != child_inode_id || child_inode.kind != child_inode.data.kind() {
+                    return self.failure_from_error_with_route_epoch(
+                        &req.ctx,
+                        MetadataError::Internal(format!(
+                            "child inode authority is corrupt for ListStatus: key={child_inode_id}, value_id={}, kind={:?}, payload={:?}",
+                            child_inode.inode_id,
+                            child_inode.kind,
+                            child_inode.data.kind()
+                        )),
+                        group_name,
+                        mount_epoch,
+                        route_epoch,
+                    );
+                }
                 dir_entries.push(ReadDirEntry {
                     name,
-                    kind: Some(child_inode.kind),
-                    attrs: Some(child_inode.attrs.clone()),
+                    kind: child_inode.kind,
+                    attrs: child_inode.attrs.clone(),
                 });
             }
 

@@ -3,6 +3,19 @@
 
 //! Public filesystem operation options.
 
+/// Options for creating a directory hierarchy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MkdirOptions {
+    /// Whether missing parent directories should be created.
+    pub create_parent: bool,
+}
+
+impl Default for MkdirOptions {
+    fn default() -> Self {
+        Self { create_parent: true }
+    }
+}
+
 /// Options for deleting a namespace entry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DeleteOptions {
@@ -10,19 +23,13 @@ pub struct DeleteOptions {
     pub recursive: bool,
 }
 
-/// Options for listing a directory through [`FsClient::list`](crate::FsClient::list).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ListOptions {
-    /// Whether the listing should recursively include descendants.
-    pub recursive: bool,
-
-    /// Opaque seek cursor returned by a previous page for the same directory.
-    /// It does not identify a server-side iterator or snapshot.
-    pub cursor: Option<Vec<u8>>,
-
-    /// Maximum entries in one page. `None` selects the Metadata server default.
+/// Options for listing a directory through [`FsClient::list_status`](crate::FsClient::list_status).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListStatusOptions {
+    /// Maximum entries fetched by each Metadata request.
+    /// `None` selects the Metadata server default.
     ///
     /// A value above the server maximum is rejected instead of being silently
-    /// truncated.
-    pub limit: Option<u32>,
+    /// truncated, and zero is rejected by the client.
+    pub page_size: Option<u32>,
 }

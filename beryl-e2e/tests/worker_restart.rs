@@ -115,7 +115,7 @@ async fn multi_block_file_is_readable_after_worker_restart_full_report_convergen
 async fn write_closed_file(cluster: &mut TestCluster, path: &str, payload_len: usize) -> TestResult<Bytes> {
     cluster
         .client()
-        .mkdirs("/worker-restart", true)
+        .mkdirs("/worker-restart")
         .await
         .expect("create worker restart dir");
     let payload = Bytes::from(deterministic_bytes(payload_len));

@@ -205,6 +205,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             Ok(success) => response_with_header!(
                 GetStatusResponseProto {
                     attrs: Some(file_attrs_to_proto(&success.payload.attrs)),
+                    kind: InodeKindProto::from(success.payload.kind) as i32,
                     ..Default::default()
                 },
                 ok_header_from_fs_success(&req_ctx, &success)
@@ -235,7 +236,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 &req_ctx,
                 ListStatusArgs {
                     path: req.path,
-                    recursive: req.recursive,
                     cursor_key: (!req.cursor.is_empty()).then_some(req.cursor),
                     max_entries,
                     freshness: Self::freshness_from_header(&req.header),
@@ -251,13 +251,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     .into_iter()
                     .map(|entry| DirEntryProto {
                         name: entry.name,
-                        kind: match entry.kind {
-                            Some(beryl_types::fs::InodeKind::File) => InodeKindProto::InodeKindFile as i32,
-                            Some(beryl_types::fs::InodeKind::Dir) => InodeKindProto::InodeKindDir as i32,
-                            Some(beryl_types::fs::InodeKind::Symlink) => InodeKindProto::InodeKindSymlink as i32,
-                            None => InodeKindProto::InodeKindUnspecified as i32,
-                        },
-                        attrs: entry.attrs.as_ref().map(file_attrs_to_proto),
+                        kind: InodeKindProto::from(entry.kind) as i32,
+                        attrs: Some(file_attrs_to_proto(&entry.attrs)),
                     })
                     .collect();
                 response_with_header!(
