@@ -54,10 +54,10 @@ pub struct TestCluster {
     worker_manager: Arc<WorkerManager>,
     registrar: MetadataRegistrar,
     registration_state: Arc<beryl_worker::control::RegistrationSet>,
-    block_report: Arc<MetadataBlockReportLoop>,
+    block_report: Option<Arc<MetadataBlockReportLoop>>,
     background_block_report: Option<tokio::task::JoinHandle<()>>,
-    heartbeat: MetadataHeartbeatLoop,
-    block_store: Arc<StoreDirs>,
+    heartbeat: Option<MetadataHeartbeatLoop>,
+    block_store: Option<Arc<StoreDirs>>,
     worker_cleanup: Option<BlockCleanupRuntime>,
     metadata_server: MetadataServiceInstance,
     metadata_process: Option<MetadataProcessInstance>,
@@ -159,10 +159,10 @@ impl TestCluster {
             worker_manager,
             registrar: worker.registrar,
             registration_state: worker.registration_state,
-            block_report: worker.block_report,
+            block_report: Some(worker.block_report),
             background_block_report: None,
-            heartbeat: worker.heartbeat,
-            block_store: worker.block_store,
+            heartbeat: Some(worker.heartbeat),
+            block_store: Some(worker.block_store),
             worker_cleanup: worker.cleanup,
             metadata_server,
             metadata_process: None,
@@ -179,13 +179,27 @@ impl TestCluster {
         &self.client
     }
 
+    fn block_report(&self) -> &Arc<MetadataBlockReportLoop> {
+        self.block_report
+            .as_ref()
+            .expect("primary Worker block reporter is running")
+    }
+
+    fn block_store(&self) -> &Arc<StoreDirs> {
+        self.block_store.as_ref().expect("primary Worker store is running")
+    }
+
+    fn heartbeat(&self) -> &MetadataHeartbeatLoop {
+        self.heartbeat.as_ref().expect("primary Worker heartbeat is running")
+    }
+
     /// Start a bounded E2E reporter so write RPCs exercise the asynchronous
     /// Worker-to-Metadata report path without manual convergence.
     pub fn start_background_block_reports(&mut self) {
         if self.background_block_report.is_some() {
             return;
         }
-        let mut block_reports = vec![Arc::clone(&self.block_report)];
+        let mut block_reports = vec![Arc::clone(self.block_report())];
         block_reports.extend(
             self.additional_workers
                 .iter()
@@ -224,7 +238,7 @@ impl TestCluster {
     }
 
     pub fn ready_block_count(&self) -> TestResult<usize> {
-        let primary = self.block_store.scan_group_blocks(&self.group_name)?.len();
+        let primary = self.block_store().scan_group_blocks(&self.group_name)?.len();
         self.additional_workers.iter().try_fold(primary, |count, worker| {
             Ok(count + worker.block_store.scan_group_blocks(&self.group_name)?.len())
         })
@@ -232,7 +246,7 @@ impl TestCluster {
 
     /// Returns blocks whose local reclamation has fully updated store accounting.
     pub fn physical_block_count(&self) -> TestResult<usize> {
-        let primary = store_report_block_count(&self.block_store)?;
+        let primary = store_report_block_count(self.block_store())?;
         self.additional_workers.iter().try_fold(primary, |count, worker| {
             Ok(count + store_report_block_count(&worker.block_store)?)
         })
@@ -321,6 +335,9 @@ impl TestCluster {
                 .shutdown_until(tokio::time::Instant::now() + TEST_SHUTDOWN_TIMEOUT)
                 .await?;
         }
+        self.heartbeat.take();
+        self.block_report.take();
+        self.block_store.take();
         let listener = TcpListener::bind(self.worker_addr).await?;
         let worker = start_worker_instance(&self.worker_config, listener)?;
         let worker_id = worker.worker_id;
@@ -328,9 +345,9 @@ impl TestCluster {
         self.worker_id = worker_id;
         self.registrar = worker.registrar;
         self.registration_state = worker.registration_state;
-        self.block_report = worker.block_report;
-        self.heartbeat = worker.heartbeat;
-        self.block_store = worker.block_store;
+        self.block_report = Some(worker.block_report);
+        self.heartbeat = Some(worker.heartbeat);
+        self.block_store = Some(worker.block_store);
         self.worker_cleanup = worker.cleanup;
         self.worker_server = worker.worker_server;
 
@@ -342,7 +359,7 @@ impl TestCluster {
             worker_id,
         )
         .await?;
-        readiness::send_heartbeat(&self.heartbeat, &self.block_store).await?;
+        readiness::send_heartbeat(self.heartbeat(), self.block_store()).await?;
         readiness::wait_for_worker_heartbeat(
             &self.registration_state,
             &self.worker_manager,
@@ -461,7 +478,7 @@ impl TestCluster {
             self.worker_id,
         )
         .await?;
-        readiness::send_heartbeat(&self.heartbeat, &self.block_store).await?;
+        readiness::send_heartbeat(self.heartbeat(), self.block_store()).await?;
         readiness::wait_for_worker_heartbeat(
             &self.registration_state,
             &self.worker_manager,
@@ -496,7 +513,7 @@ impl TestCluster {
         self.stop_background_block_reports().await;
         let result = async {
             if self.metadata_process.is_some() {
-                send_full_block_report_to_external_metadata(&self.heartbeat, &self.block_report, &self.block_store)
+                send_full_block_report_to_external_metadata(self.heartbeat(), self.block_report(), self.block_store())
                     .await?;
                 for worker in &self.additional_workers {
                     send_full_block_report_to_external_metadata(
@@ -510,9 +527,9 @@ impl TestCluster {
             }
 
             readiness::converge_block_reports(
-                &self.heartbeat,
-                &self.block_report,
-                &self.block_store,
+                self.heartbeat(),
+                self.block_report(),
+                self.block_store(),
                 &self.registration_state,
                 &self.worker_manager,
                 &self.group_name,
@@ -550,13 +567,13 @@ impl TestCluster {
         let external_metadata = self.metadata_process.is_some();
         readiness::ReadinessCheck::startup("block cleanup convergence")
             .wait_for_async(|| async {
-                if readiness::send_heartbeat(&self.heartbeat, &self.block_store)
+                if readiness::send_heartbeat(self.heartbeat(), self.block_store())
                     .await
                     .is_err()
                 {
                     return false;
                 }
-                let Ok(_round) = self.block_report.send_delta_once().await else {
+                let Ok(_round) = self.block_report().send_delta_once().await else {
                     return false;
                 };
                 for worker in &self.additional_workers {
@@ -577,9 +594,13 @@ impl TestCluster {
                     return true;
                 }
 
-                if send_full_block_report_to_external_metadata(&self.heartbeat, &self.block_report, &self.block_store)
-                    .await
-                    .is_err()
+                if send_full_block_report_to_external_metadata(
+                    self.heartbeat(),
+                    self.block_report(),
+                    self.block_store(),
+                )
+                .await
+                .is_err()
                 {
                     return false;
                 }
@@ -618,6 +639,9 @@ impl TestCluster {
                 .shutdown_until(tokio::time::Instant::now() + TEST_SHUTDOWN_TIMEOUT)
                 .await?;
         }
+        self.heartbeat.take();
+        self.block_report.take();
+        self.block_store.take();
         if let Some(process) = self.metadata_process.take() {
             process.kill().await?;
         } else {
@@ -630,9 +654,9 @@ impl TestCluster {
         register_worker_with_external_metadata(
             &self.registrar,
             &self.registration_state,
-            &self.heartbeat,
-            &self.block_report,
-            &self.block_store,
+            self.heartbeat(),
+            self.block_report(),
+            self.block_store(),
             &self.group_name,
         )
         .await?;
@@ -928,7 +952,7 @@ fn worker_config(
             retry_max_backoff_ms: 100,
         },
         heartbeat_interval_ms: 1_000,
-        block_report_interval_ms: 1_000,
+        block_report_delta_flush_interval_ms: 1_000,
         block_report_batch_size: 1_000,
         block_cleanup: WorkerBlockCleanupConfig::default(),
         shutdown_timeout_ms: 30_000,

@@ -1045,7 +1045,7 @@ mod tests {
                     &group_name_value,
                     worker_id,
                     1,
-                    report_block_with_stamp_and_state(block_id, 41, BlockReportBlockState::Partial),
+                    report_block_with_stamp_and_state(block_id, 41, BlockReportBlockState::Corrupt),
                 ),
                 Case::StampMismatch => publish_report_locations_with_stamp(
                     &worker_manager,

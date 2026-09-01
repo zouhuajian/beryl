@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::WorkerError;
 use crate::observe;
+use crate::report::BlockReportChangeTracker;
 use crate::runtime::block::{BlockManager, ReadPin, ReclaimingBlock};
 use crate::runtime::write::{BlockWriteIoGuard, BlockWriteKey, BlockWriteRegistration, BlockWriteRegistry};
 use crate::runtime::DataRpcPermit;
@@ -468,6 +469,17 @@ impl WorkerCore {
         self.block_manager.reclaiming_blocks(group_name)
     }
 
+    /// Returns the reportable deleting state for one exact block.
+    pub(crate) fn reclaiming_block(&self, group_name: &GroupName, block_id: BlockId) -> Option<ReclaimingBlock> {
+        self.block_manager.reclaiming_block(group_name, block_id)
+    }
+
+    /// Returns retained runtime lifecycle changes for incremental reporting.
+    pub(crate) fn block_report_changes(&self) -> &BlockReportChangeTracker {
+        self.block_manager.block_report_changes()
+    }
+
+    /// Waits for a coalesced runtime block-report wake-up.
     pub(crate) async fn wait_for_block_report_change(&self) {
         self.block_manager.wait_for_block_report_change().await;
     }

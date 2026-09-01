@@ -84,7 +84,7 @@ impl From<i32> for HealthStatus {
 }
 
 /// Block locations keyed by metadata group and block identity.
-pub type BlockLocations = HashMap<BlockLocationKey, Vec<WorkerRegistrationKey>>;
+pub type BlockLocations = HashMap<BlockLocationKey, BTreeSet<WorkerRegistrationKey>>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BlockLocationKey {
@@ -185,10 +185,10 @@ struct HeartbeatRejectionState {
     reason: HeartbeatRejectionReason,
 }
 
+/// Metadata's accepted worker-local lifecycle state for one block version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockReportBlockState {
     Ready,
-    Partial,
     Corrupt,
     Deleting,
 }
@@ -206,51 +206,56 @@ pub struct BlockReportBlock {
     pub effective_len: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BlockReportDeltaOp {
-    AddUpdate,
-    Remove,
-}
-
+/// Latest reportable state for one block in an ordered Delta batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BlockReportDeltaEntry {
-    pub op: BlockReportDeltaOp,
-    pub block: BlockReportBlock,
+pub enum BlockReportChange {
+    Upsert(BlockReportBlock),
+    Remove(BlockId),
 }
 
+/// Observable index changes and acknowledgement state from one accepted batch.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BlockReportApplyResult {
     pub added_blocks: Vec<BlockId>,
     pub removed_blocks: Vec<BlockId>,
-    pub next_delta_seq: u64,
-    pub baseline_established: bool,
-    pub baseline_replaced: bool,
+    pub next_batch_seq: u64,
+    pub baseline_published: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum BlockReportState {
-    #[default]
-    Empty,
-    Receiving,
-    Ready,
-}
-
-#[derive(Clone, Debug, Default)]
-struct WorkerBlockReportRuntime {
-    /// WorkerRunId is live-only. A new worker run must publish a new full
-    /// baseline before delta reports are accepted.
-    worker_run_id: Option<WorkerRunId>,
-    state: BlockReportState,
-    /// Monotonic within one worker run and one group.
-    report_seq: u64,
-    next_batch_seq: u64,
-    full_report_had_baseline: bool,
-    staging_blocks: HashMap<BlockId, BlockReportBlock>,
-    published_blocks: HashMap<BlockId, BlockReportBlock>,
-    /// Ordered Ready block identities used for bounded cleanup pagination.
+/// Metadata-visible baseline accepted from one exact Worker process run.
+#[derive(Clone, Debug)]
+struct ActiveBlockReport {
+    baseline_seq: u64,
+    blocks: HashMap<BlockId, BlockReportBlock>,
+    /// Ordered Ready identities used by cleanup pagination and index removal.
     ready_blocks: BTreeSet<BlockId>,
-    /// Next delta sequence expected for the current published full baseline.
-    delta_seq: u64,
+    next_delta_batch_seq: u64,
+}
+
+/// Incomplete Full report that is never visible through location lookups.
+#[derive(Clone, Debug)]
+struct StagingFullBlockReport {
+    baseline_seq: u64,
+    next_batch_seq: u64,
+    blocks: HashMap<BlockId, BlockReportBlock>,
+}
+
+/// Full/Delta soft state for one registered Worker run.
+#[derive(Clone, Debug)]
+struct WorkerBlockReportRuntime {
+    worker_run_id: WorkerRunId,
+    /// Greatest Full baseline ever started for this run. Unlike `active`, this
+    /// survives continuity loss so a delayed Full cannot republish stale data.
+    baseline_high_watermark: Option<u64>,
+    active: Option<ActiveBlockReport>,
+    staging: Option<StagingFullBlockReport>,
+}
+
+/// Atomically couples published reports with their derived reverse index.
+#[derive(Debug, Default)]
+struct BlockReportObservationState {
+    reports: BTreeMap<WorkerRegistrationKey, WorkerBlockReportRuntime>,
+    locations: BlockLocations,
 }
 
 /// Result of checking whether one publication batch has readable worker evidence.
@@ -307,11 +312,55 @@ pub(crate) enum PublishReadyConflict {
     },
 }
 
-fn ready_block_ids<'a>(blocks: impl Iterator<Item = &'a BlockReportBlock>) -> HashSet<BlockId> {
+fn ready_block_ids<'a>(blocks: impl Iterator<Item = &'a BlockReportBlock>) -> BTreeSet<BlockId> {
     blocks
         .filter(|block| block.block_state == BlockReportBlockState::Ready)
         .map(|block| block.block_id)
         .collect()
+}
+
+/// Adds only the supplied Ready identities to the reverse location index.
+fn add_worker_ready_locations(
+    locations: &mut BlockLocations,
+    key: &WorkerRegistrationKey,
+    block_ids: impl Iterator<Item = BlockId>,
+) {
+    for block_id in block_ids {
+        locations
+            .entry(BlockLocationKey::new(&key.group_name, block_id))
+            .or_default()
+            .insert(key.clone());
+    }
+}
+
+/// Removes only the supplied Ready identities without scanning global locations.
+fn remove_worker_ready_locations(
+    locations: &mut BlockLocations,
+    key: &WorkerRegistrationKey,
+    block_ids: impl Iterator<Item = BlockId>,
+) {
+    for block_id in block_ids {
+        let location_key = BlockLocationKey::new(&key.group_name, block_id);
+        let remove_entry = locations.get_mut(&location_key).is_some_and(|workers| {
+            workers.remove(key);
+            workers.is_empty()
+        });
+        if remove_entry {
+            locations.remove(&location_key);
+        }
+    }
+}
+
+/// Removes one Worker report and every index entry derived from its active baseline.
+fn remove_worker_report(
+    observations: &mut BlockReportObservationState,
+    key: &WorkerRegistrationKey,
+) -> Option<WorkerBlockReportRuntime> {
+    let report = observations.reports.remove(key)?;
+    if let Some(active) = &report.active {
+        remove_worker_ready_locations(&mut observations.locations, key, active.ready_blocks.iter().copied());
+    }
+    Some(report)
 }
 
 fn validate_same_run_descriptor(
@@ -353,14 +402,12 @@ pub struct WorkerManager {
     descriptors: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerDescriptor>>>,
     /// Accepted worker process runs for this metadata process, learned through Raft apply.
     registrations: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerRegistrationState>>>,
-    /// Worker runtime (soft-state, memory-only, updated via fanout heartbeat).
+    /// Worker runtime (soft-state, memory-only, updated by heartbeat).
     runtime: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerRuntime>>>,
     /// Last heartbeat rejection state per worker, used only to suppress repeated unchanged warn logs.
     heartbeat_rejections: Arc<RwLock<HashMap<WorkerRegistrationKey, HeartbeatRejectionState>>>,
-    /// Block presence keyed by (group_name, block_id), memory-only.
-    locations: Arc<RwLock<BlockLocations>>,
-    /// Full/delta report runtime in stable group/worker pagination order.
-    block_reports: Arc<RwLock<BTreeMap<WorkerRegistrationKey, WorkerBlockReportRuntime>>>,
+    /// Worker reports and their derived location index, published atomically.
+    block_report_observations: Arc<RwLock<BlockReportObservationState>>,
     /// Coalesced revision for publication-relevant worker observations.
     ///
     /// Ready evidence is leader-local and reconstructable. The revision only
@@ -378,8 +425,7 @@ impl WorkerManager {
             registrations: Arc::new(RwLock::new(HashMap::new())),
             runtime: Arc::new(RwLock::new(HashMap::new())),
             heartbeat_rejections: Arc::new(RwLock::new(HashMap::new())),
-            locations: Arc::new(RwLock::new(HashMap::new())),
-            block_reports: Arc::new(RwLock::new(BTreeMap::new())),
+            block_report_observations: Arc::new(RwLock::new(BlockReportObservationState::default())),
             publication_observation,
             heartbeat_timeout_ms,
         }
@@ -402,14 +448,14 @@ impl WorkerManager {
     /// Drops live registration and reconstructable report state on metadata restart.
     pub fn reset_worker_soft_state(&self) {
         let mut registrations = self.registrations.write();
-        let mut block_reports = self.block_reports.write();
+        let mut observations = self.block_report_observations.write();
         registrations.clear();
-        block_reports.clear();
-        drop(block_reports);
+        observations.reports.clear();
+        observations.locations.clear();
+        drop(observations);
         drop(registrations);
         self.runtime.write().clear();
         self.heartbeat_rejections.write().clear();
-        self.locations.write().clear();
         self.notify_publication_observation_changed();
     }
 
@@ -435,16 +481,13 @@ impl WorkerManager {
         let mut registrations = self.registrations.write();
         let mut runtime = self.runtime.write();
         let mut heartbeat_rejections = self.heartbeat_rejections.write();
-        let mut locations = self.locations.write();
-        // Keep report state last to match readers that hold runtime or location
-        // guards while reading reports, preventing lock-order inversion.
-        let mut block_reports = self.block_reports.write();
+        let mut observations = self.block_report_observations.write();
         descriptors.clear();
         registrations.clear();
-        block_reports.clear();
+        observations.reports.clear();
+        observations.locations.clear();
         runtime.clear();
         heartbeat_rejections.clear();
-        locations.clear();
         for worker in workers {
             let descriptor = WorkerDescriptor {
                 group_name: worker.group_name,
@@ -458,8 +501,7 @@ impl WorkerManager {
                 descriptor,
             );
         }
-        drop(block_reports);
-        drop(locations);
+        drop(observations);
         drop(heartbeat_rejections);
         drop(runtime);
         drop(registrations);
@@ -583,7 +625,7 @@ impl WorkerManager {
         self.upsert_descriptor(descriptor)?;
 
         let mut registrations = self.registrations.write();
-        let mut block_reports = self.block_reports.write();
+        let mut observations = self.block_report_observations.write();
         let same_registered_run = registrations
             .get(&key)
             .map(|registration| registration.worker_run_id.matches(worker_run_id))
@@ -600,30 +642,30 @@ impl WorkerManager {
             },
         );
         if !same_registered_run {
-            block_reports.remove(&key);
+            remove_worker_report(&mut observations, &key);
         }
-        drop(block_reports);
+        drop(observations);
         drop(registrations);
         self.heartbeat_rejections.write().remove(&key);
         if !same_registered_run {
             self.runtime.write().remove(&key);
-            self.remove_location_index_for_worker(&key);
         }
         self.notify_publication_observation_changed();
         Ok(())
     }
 
-    /// Receive one full-report batch.
+    /// Stages one ordered Full batch and atomically publishes the final baseline.
     ///
-    /// `batch_seq == 0` starts a staged report for `report_seq`. Staged blocks
-    /// are not visible until `final_batch` publishes the full baseline.
+    /// Starting a newer baseline first invalidates the previous report and its
+    /// locations because Full is currently a recovery operation, not a periodic
+    /// refresh. Replayed batches never reset already accepted staging state.
     #[allow(clippy::too_many_arguments)]
     pub fn receive_full_block_report(
         &self,
         group_name: &GroupName,
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
-        report_seq: u64,
+        baseline_seq: u64,
         batch_seq: u64,
         final_batch: bool,
         blocks: Vec<BlockReportBlock>,
@@ -642,106 +684,165 @@ impl WorkerManager {
                 worker_id.as_raw()
             )));
         }
-        let mut reports = self.block_reports.write();
-        let report = reports.entry(key.clone()).or_default();
-        if batch_seq == 0 {
-            let full_report_had_baseline = report.state == BlockReportState::Ready;
-            if report
-                .worker_run_id
-                .is_some_and(|report_worker_run_id| report_worker_run_id.matches(worker_run_id))
-                && report.report_seq > report_seq
-            {
-                return Err(MetadataError::FullReportRequired(format!(
-                    "full report required: stale report_seq {} for group_name={}, worker_id={}, current {}",
-                    report_seq,
-                    group_name,
-                    worker_id.as_raw(),
-                    report.report_seq
-                )));
-            }
-            report.worker_run_id = Some(worker_run_id);
-            report.state = BlockReportState::Receiving;
-            report.report_seq = report_seq;
-            report.next_batch_seq = 0;
-            report.full_report_had_baseline = full_report_had_baseline;
-            report.staging_blocks.clear();
-        }
-
-        if report.state != BlockReportState::Receiving
-            || !report
-                .worker_run_id
-                .is_some_and(|report_worker_run_id| report_worker_run_id.matches(worker_run_id))
-            || report.report_seq != report_seq
-            || report.next_batch_seq != batch_seq
-        {
-            return Err(MetadataError::FullReportRequired(format!(
-                "full report required: expected batch_seq {} for group_name={}, worker_id={}",
-                report.next_batch_seq,
+        let mut observations = self.block_report_observations.write();
+        let BlockReportObservationState { reports, locations } = &mut *observations;
+        let report = reports.entry(key.clone()).or_insert_with(|| WorkerBlockReportRuntime {
+            worker_run_id,
+            baseline_high_watermark: None,
+            active: None,
+            staging: None,
+        });
+        if !report.worker_run_id.matches(worker_run_id) {
+            return Err(MetadataError::StaleState(format!(
+                "worker_run_id mismatch for group_name={}, worker_id={}",
                 group_name,
                 worker_id.as_raw()
             )));
         }
 
-        for block in blocks {
-            report.staging_blocks.insert(block.block_id, block);
-        }
-        report.next_batch_seq = batch_seq.saturating_add(1);
-
-        if !final_batch {
-            let next_delta_seq = report.delta_seq;
+        if report
+            .active
+            .as_ref()
+            .is_some_and(|active| active.baseline_seq == baseline_seq)
+        {
             return Ok(BlockReportApplyResult {
-                next_delta_seq,
+                baseline_published: true,
                 ..BlockReportApplyResult::default()
             });
         }
 
-        let old_published_blocks = report.published_blocks.clone();
-        let old_ready = ready_block_ids(old_published_blocks.values());
-        let published_blocks = std::mem::take(&mut report.staging_blocks);
-        let baseline_established = !report.full_report_had_baseline;
-        let baseline_replaced = report.full_report_had_baseline && old_published_blocks != published_blocks;
-        let new_ready = ready_block_ids(published_blocks.values());
-        report.published_blocks = published_blocks;
-        report.ready_blocks = report
-            .published_blocks
-            .values()
-            .filter(|block| block.block_state == BlockReportBlockState::Ready)
-            .map(|block| block.block_id)
-            .collect();
-        report.state = BlockReportState::Ready;
-        report.delta_seq = 0;
-        let next_delta_seq = report.delta_seq;
-        let published_for_index = report.published_blocks.clone();
-        drop(reports);
-        drop(registrations);
+        let continuing_staging = report
+            .staging
+            .as_ref()
+            .is_some_and(|staging| staging.baseline_seq == baseline_seq);
+        if !continuing_staging
+            && report
+                .baseline_high_watermark
+                .is_some_and(|high_watermark| baseline_seq <= high_watermark)
+        {
+            return Err(MetadataError::FullReportRequired(format!(
+                "full report required: stale baseline_seq {} for group_name={}, worker_id={}, high watermark {}",
+                baseline_seq,
+                group_name,
+                worker_id.as_raw(),
+                report
+                    .baseline_high_watermark
+                    .expect("checked block report baseline high watermark")
+            )));
+        }
 
-        self.rebuild_location_index_for_worker(key, &published_for_index);
+        let starting_new_baseline = !continuing_staging;
+        let mut removed_blocks = Vec::new();
+        if starting_new_baseline {
+            if batch_seq != 0 {
+                return Err(MetadataError::FullReportRequired(format!(
+                    "full report required from batch_seq 0 for group_name={}, worker_id={}",
+                    group_name,
+                    worker_id.as_raw()
+                )));
+            }
+            if let Some(active) = report.active.take() {
+                removed_blocks = active.ready_blocks.iter().copied().collect();
+                remove_worker_ready_locations(locations, &key, active.ready_blocks.iter().copied());
+            }
+            report.staging = Some(StagingFullBlockReport {
+                baseline_seq,
+                next_batch_seq: 0,
+                blocks: HashMap::new(),
+            });
+            report.baseline_high_watermark = Some(baseline_seq);
+        }
+
+        let staging = report.staging.as_mut().expect("full staging must exist");
+        if batch_seq < staging.next_batch_seq {
+            return Ok(BlockReportApplyResult {
+                removed_blocks,
+                next_batch_seq: staging.next_batch_seq,
+                ..BlockReportApplyResult::default()
+            });
+        }
+        if batch_seq > staging.next_batch_seq {
+            let expected_batch_seq = staging.next_batch_seq;
+            report.staging = None;
+            return Err(MetadataError::FullReportRequired(format!(
+                "full report required after batch gap: expected {}, got {} for group_name={}, worker_id={}",
+                expected_batch_seq,
+                batch_seq,
+                group_name,
+                worker_id.as_raw()
+            )));
+        }
+
+        let mut batch_ids = HashSet::with_capacity(blocks.len());
+        for block in &blocks {
+            if !batch_ids.insert(block.block_id) || staging.blocks.contains_key(&block.block_id) {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "full block report contains duplicate block_id {}",
+                    block.block_id
+                )));
+            }
+        }
+        for block in blocks {
+            staging.blocks.insert(block.block_id, block);
+        }
+        staging.next_batch_seq = batch_seq
+            .checked_add(1)
+            .ok_or_else(|| MetadataError::InvalidArgument("full block report batch_seq overflow".to_string()))?;
+
+        if !final_batch {
+            let next_batch_seq = staging.next_batch_seq;
+            drop(observations);
+            drop(registrations);
+            if !removed_blocks.is_empty() {
+                self.notify_publication_observation_changed();
+            }
+            return Ok(BlockReportApplyResult {
+                removed_blocks,
+                next_batch_seq,
+                ..BlockReportApplyResult::default()
+            });
+        }
+
+        let staging = report.staging.take().expect("full staging must exist");
+        let ready_blocks = ready_block_ids(staging.blocks.values());
+        add_worker_ready_locations(locations, &key, ready_blocks.iter().copied());
+        report.active = Some(ActiveBlockReport {
+            baseline_seq,
+            blocks: staging.blocks,
+            ready_blocks: ready_blocks.clone(),
+            next_delta_batch_seq: 0,
+        });
+        drop(observations);
+        drop(registrations);
         self.notify_publication_observation_changed();
         tracing::debug!(
             group_name = %group_name,
             worker_id = worker_id.as_raw(),
             worker_run_id = %worker_run_id,
-            report_seq,
+            baseline_seq,
             "Worker full block report converged"
         );
         Ok(BlockReportApplyResult {
-            added_blocks: new_ready.difference(&old_ready).copied().collect(),
-            removed_blocks: old_ready.difference(&new_ready).copied().collect(),
-            next_delta_seq,
-            baseline_established,
-            baseline_replaced,
+            added_blocks: ready_blocks.into_iter().collect(),
+            removed_blocks,
+            baseline_published: true,
+            ..BlockReportApplyResult::default()
         })
     }
 
-    /// Apply one ordered delta-report batch to the current published baseline.
+    /// Applies one ordered Delta batch and its location changes atomically.
+    ///
+    /// A sequence gap invalidates the affected Worker baseline before requiring
+    /// Full recovery. Older batches are idempotent retries because the Worker
+    /// retains one immutable in-flight request until Metadata acknowledges it.
     pub fn apply_delta_block_report(
         &self,
         group_name: &GroupName,
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
-        report_seq: u64,
-        delta_seq: u64,
-        deltas: Vec<BlockReportDeltaEntry>,
+        baseline_seq: u64,
+        batch_seq: u64,
+        changes: Vec<BlockReportChange>,
     ) -> MetadataResult<BlockReportApplyResult> {
         self.validate_report_source(group_name, worker_id, worker_run_id)?;
         let key = WorkerRegistrationKey::new(group_name, worker_id);
@@ -757,7 +858,8 @@ impl WorkerManager {
                 worker_id.as_raw()
             )));
         }
-        let mut reports = self.block_reports.write();
+        let mut observations = self.block_report_observations.write();
+        let BlockReportObservationState { reports, locations } = &mut *observations;
         let report = reports.get_mut(&key).ok_or_else(|| {
             MetadataError::FullReportRequired(format!(
                 "full report required before delta for group_name={}, worker_id={}",
@@ -765,73 +867,121 @@ impl WorkerManager {
                 worker_id.as_raw()
             ))
         })?;
-        if report.state != BlockReportState::Ready
-            || !report
-                .worker_run_id
-                .is_some_and(|report_worker_run_id| report_worker_run_id.matches(worker_run_id))
-            || report.report_seq != report_seq
-        {
+        if !report.worker_run_id.matches(worker_run_id) {
+            return Err(MetadataError::StaleState(format!(
+                "worker_run_id mismatch for group_name={}, worker_id={}",
+                group_name,
+                worker_id.as_raw()
+            )));
+        }
+        let Some(current_baseline_seq) = report.active.as_ref().map(|active| active.baseline_seq) else {
             return Err(MetadataError::FullReportRequired(format!(
                 "full report required for current baseline: group_name={}, worker_id={}",
                 group_name,
                 worker_id.as_raw()
             )));
-        }
-
-        let delta_count = u64::try_from(deltas.len()).unwrap_or(u64::MAX);
-        if delta_seq < report.delta_seq {
-            let old_delta_end = delta_seq.saturating_add(delta_count);
-            if old_delta_end <= report.delta_seq {
-                return Ok(BlockReportApplyResult {
-                    next_delta_seq: report.delta_seq,
-                    ..BlockReportApplyResult::default()
-                });
+        };
+        if current_baseline_seq != baseline_seq {
+            if baseline_seq > current_baseline_seq {
+                let active = report.active.take().expect("active block report must exist");
+                remove_worker_ready_locations(locations, &key, active.ready_blocks.iter().copied());
+                drop(observations);
+                drop(registrations);
+                self.notify_publication_observation_changed();
             }
             return Err(MetadataError::FullReportRequired(format!(
-                "full report required after overlapping old delta: expected delta_seq {}, got {}",
-                report.delta_seq, delta_seq
+                "full report required for baseline_seq {}: group_name={}, worker_id={}, current {}",
+                baseline_seq,
+                group_name,
+                worker_id.as_raw(),
+                current_baseline_seq
             )));
         }
-        if delta_seq > report.delta_seq {
+        let active = report.active.as_mut().expect("active block report must exist");
+        if batch_seq < active.next_delta_batch_seq {
+            return Ok(BlockReportApplyResult {
+                next_batch_seq: active.next_delta_batch_seq,
+                ..BlockReportApplyResult::default()
+            });
+        }
+        if batch_seq > active.next_delta_batch_seq {
+            let active = report.active.take().expect("active block report must exist");
+            remove_worker_ready_locations(locations, &key, active.ready_blocks.iter().copied());
+            drop(observations);
+            drop(registrations);
+            self.notify_publication_observation_changed();
             return Err(MetadataError::FullReportRequired(format!(
-                "full report required after delta gap: expected delta_seq {}, got {}",
-                report.delta_seq, delta_seq
+                "full report required after delta gap: expected batch_seq {}, got {}",
+                active.next_delta_batch_seq, batch_seq
             )));
         }
+        let Some(next_batch_seq) = batch_seq.checked_add(1) else {
+            let active = report.active.take().expect("active block report must exist");
+            remove_worker_ready_locations(locations, &key, active.ready_blocks.iter().copied());
+            drop(observations);
+            drop(registrations);
+            self.notify_publication_observation_changed();
+            return Err(MetadataError::FullReportRequired(
+                "full report required after delta batch sequence overflow".to_string(),
+            ));
+        };
 
-        let old_ready = ready_block_ids(report.published_blocks.values());
-        for delta in deltas {
-            let block_id = delta.block.block_id;
-            match delta.op {
-                BlockReportDeltaOp::AddUpdate => {
-                    if delta.block.block_state == BlockReportBlockState::Ready {
-                        report.ready_blocks.insert(block_id);
-                    } else {
-                        report.ready_blocks.remove(&block_id);
-                    }
-                    report.published_blocks.insert(block_id, delta.block);
-                }
-                BlockReportDeltaOp::Remove => {
-                    report.ready_blocks.remove(&block_id);
-                    report.published_blocks.remove(&block_id);
-                }
+        let mut changed_ids = HashSet::with_capacity(changes.len());
+        for change in &changes {
+            let block_id = match change {
+                BlockReportChange::Upsert(block) => block.block_id,
+                BlockReportChange::Remove(block_id) => *block_id,
+            };
+            if !changed_ids.insert(block_id) {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "delta block report contains duplicate block_id {block_id}"
+                )));
             }
         }
-        report.delta_seq = report.delta_seq.saturating_add(delta_count);
-        let new_ready = ready_block_ids(report.published_blocks.values());
-        let next_delta_seq = report.delta_seq;
-        let published_for_index = report.published_blocks.clone();
-        drop(reports);
+
+        let mut added_blocks = Vec::new();
+        let mut removed_blocks = Vec::new();
+        for change in changes {
+            let block_id = match &change {
+                BlockReportChange::Upsert(block) => block.block_id,
+                BlockReportChange::Remove(block_id) => *block_id,
+            };
+            let was_ready = active.ready_blocks.contains(&block_id);
+            match change {
+                BlockReportChange::Upsert(block) => {
+                    active.blocks.insert(block_id, block);
+                }
+                BlockReportChange::Remove(block_id) => {
+                    active.blocks.remove(&block_id);
+                }
+            }
+            let is_ready = active
+                .blocks
+                .get(&block_id)
+                .is_some_and(|block| block.block_state == BlockReportBlockState::Ready);
+            match (was_ready, is_ready) {
+                (false, true) => {
+                    active.ready_blocks.insert(block_id);
+                    add_worker_ready_locations(locations, &key, std::iter::once(block_id));
+                    added_blocks.push(block_id);
+                }
+                (true, false) => {
+                    active.ready_blocks.remove(&block_id);
+                    remove_worker_ready_locations(locations, &key, std::iter::once(block_id));
+                    removed_blocks.push(block_id);
+                }
+                _ => {}
+            }
+        }
+        active.next_delta_batch_seq = next_batch_seq;
+        drop(observations);
         drop(registrations);
-
-        self.rebuild_location_index_for_worker(key, &published_for_index);
         self.notify_publication_observation_changed();
         Ok(BlockReportApplyResult {
-            added_blocks: new_ready.difference(&old_ready).copied().collect(),
-            removed_blocks: old_ready.difference(&new_ready).copied().collect(),
-            next_delta_seq,
-            baseline_established: false,
-            baseline_replaced: false,
+            added_blocks,
+            removed_blocks,
+            next_batch_seq,
+            ..BlockReportApplyResult::default()
         })
     }
 
@@ -864,37 +1014,6 @@ impl WorkerManager {
             )));
         }
         Ok(())
-    }
-
-    fn rebuild_location_index_for_worker(
-        &self,
-        key: WorkerRegistrationKey,
-        published_blocks: &HashMap<BlockId, BlockReportBlock>,
-    ) {
-        let mut locations = self.locations.write();
-        for workers in locations.values_mut() {
-            workers.retain(|worker_key| worker_key != &key);
-        }
-        locations.retain(|_, workers| !workers.is_empty());
-        for block in published_blocks
-            .values()
-            .filter(|block| block.block_state == BlockReportBlockState::Ready)
-        {
-            let workers = locations
-                .entry(BlockLocationKey::new(&key.group_name, block.block_id))
-                .or_default();
-            if !workers.contains(&key) {
-                workers.push(key.clone());
-            }
-        }
-    }
-
-    fn remove_location_index_for_worker(&self, key: &WorkerRegistrationKey) {
-        let mut locations = self.locations.write();
-        for workers in locations.values_mut() {
-            workers.retain(|worker_key| worker_key != key);
-        }
-        locations.retain(|_, workers| !workers.is_empty());
     }
 
     pub fn mark_heartbeat_need_register_if_changed(
@@ -1069,33 +1188,21 @@ impl WorkerManager {
         let mut affected_blocks = HashSet::new();
 
         let mut registrations = self.registrations.write();
-        let mut block_reports = self.block_reports.write();
+        let mut observations = self.block_report_observations.write();
         let registration_removed = registrations.remove(&key).is_some();
-        let removed_report = block_reports.remove(&key);
+        let removed_report = remove_worker_report(&mut observations, &key);
         if registration_removed || removed_report.is_some() {
             removed = true;
         }
-        drop(block_reports);
+        if let Some(report) = &removed_report {
+            if let Some(active) = &report.active {
+                affected_blocks.extend(active.ready_blocks.iter().copied());
+            }
+        }
+        drop(observations);
         drop(registrations);
         if self.runtime.write().remove(&key).is_some() {
             removed = true;
-        }
-
-        if let Some(report) = removed_report {
-            affected_blocks.extend(ready_block_ids(report.published_blocks.values()));
-        }
-
-        {
-            let mut locations = self.locations.write();
-            for (location_key, workers) in locations.iter_mut() {
-                let before = workers.len();
-                workers.retain(|worker_key| worker_key != &key);
-                if workers.len() != before {
-                    removed = true;
-                    affected_blocks.insert(location_key.block_id);
-                }
-            }
-            locations.retain(|_, workers| !workers.is_empty());
         }
 
         let mut affected_blocks: Vec<_> = affected_blocks.into_iter().collect();
@@ -1191,11 +1298,12 @@ impl WorkerManager {
 
     /// Get block locations for one metadata group (only live workers in that group).
     pub fn get_block_locations(&self, group_name: &GroupName, block_id: BlockId) -> Vec<WorkerId> {
-        let locations = self.locations.read();
         let live_workers = self.list_live_workers_in_group(group_name);
         let live_set: std::collections::HashSet<WorkerId> = live_workers.into_iter().collect();
+        let observations = self.block_report_observations.read();
 
-        locations
+        observations
+            .locations
             .get(&BlockLocationKey::new(group_name, block_id))
             .map(|workers| {
                 workers
@@ -1209,9 +1317,8 @@ impl WorkerManager {
 
     /// Return ready block-report locations with the report's worker run id.
     pub fn reported_block_locations(&self, group_name: &GroupName, block_id: BlockId) -> Vec<ReportedBlockLocation> {
-        let locations = self.locations.read();
-        let reports = self.block_reports.read();
-        let Some(worker_keys) = locations.get(&BlockLocationKey::new(group_name, block_id)) else {
+        let observations = self.block_report_observations.read();
+        let Some(worker_keys) = observations.locations.get(&BlockLocationKey::new(group_name, block_id)) else {
             return Vec::new();
         };
 
@@ -1220,16 +1327,14 @@ impl WorkerManager {
             if &key.group_name != group_name {
                 continue;
             }
-            let Some(report) = reports.get(key) else {
+            let Some(report) = observations.reports.get(key) else {
                 continue;
             };
-            if report.state != BlockReportState::Ready {
-                continue;
-            }
-            let Some(worker_run_id) = report.worker_run_id else {
+            let worker_run_id = report.worker_run_id;
+            let Some(active) = &report.active else {
                 continue;
             };
-            let Some(block) = report.published_blocks.get(&block_id) else {
+            let Some(block) = active.blocks.get(&block_id) else {
                 continue;
             };
             if block.block_state != BlockReportBlockState::Ready {
@@ -1253,9 +1358,9 @@ impl WorkerManager {
     /// captures an inclusive block end when it first enters each worker, so
     /// appends cannot indefinitely delay progress to the next worker.
     pub(crate) fn ready_replica_scan_end(&self, group_name: &GroupName) -> Option<WorkerId> {
-        let reports = self.block_reports.read();
+        let observations = self.block_report_observations.read();
         let end_key = WorkerRegistrationKey::new(group_name, WorkerId::new(u64::MAX));
-        let (worker_key, _) = reports.range(..=end_key).next_back()?;
+        let (worker_key, _) = observations.reports.range(..=end_key).next_back()?;
         if &worker_key.group_name != group_name {
             return None;
         }
@@ -1298,7 +1403,8 @@ impl WorkerManager {
         }
 
         let registrations = self.registrations.read();
-        let reports = self.block_reports.read();
+        let observations = self.block_report_observations.read();
+        let reports = &observations.reports;
         let start_worker_id = cursor
             .map(|cursor| cursor.worker_id)
             .unwrap_or_else(|| WorkerId::new(0));
@@ -1322,11 +1428,9 @@ impl WorkerManager {
             let current_run = registrations
                 .get(worker_key)
                 .map(|registration| registration.worker_run_id);
-            if report.state != BlockReportState::Ready
-                || report_run_id.is_none()
-                || !current_run
-                    .is_some_and(|run_id| report_run_id.is_some_and(|report_run_id| run_id.matches(report_run_id)))
-                || report.ready_blocks.is_empty()
+            let active = report.active.as_ref();
+            if !current_run.is_some_and(|run_id| run_id.matches(report_run_id))
+                || active.is_none_or(|active| active.ready_blocks.is_empty())
             {
                 visited += 1;
                 if is_end_worker {
@@ -1348,18 +1452,18 @@ impl WorkerManager {
                 }
                 continue;
             }
-            let report_run_id = report_run_id.expect("Ready report run checked above");
+            let active = active.expect("active report checked above");
 
             let worker_cursor = cursor.filter(|cursor| cursor.worker_id == worker_key.worker_id);
             let after_block = worker_cursor.and_then(|cursor| cursor.block_id);
             let worker_end_block_id = worker_cursor
                 .and_then(|cursor| cursor.worker_end_block_id)
-                .or_else(|| report.ready_blocks.last().copied())
+                .or_else(|| active.ready_blocks.last().copied())
                 .expect("non-empty Ready report has a last block");
             let lower_bound = after_block.map(Excluded).unwrap_or(Unbounded);
             let replicas_before_worker = replicas.len();
-            for block_id in report.ready_blocks.range((lower_bound, Included(worker_end_block_id))) {
-                let Some(block) = report.published_blocks.get(block_id) else {
+            for block_id in active.ready_blocks.range((lower_bound, Included(worker_end_block_id))) {
+                let Some(block) = active.blocks.get(block_id) else {
                     return Err(MetadataError::Internal(format!(
                         "Ready block index is missing report state for group_name={}, worker_id={}, block_id={}",
                         group_name,
@@ -1447,7 +1551,7 @@ impl WorkerManager {
     pub(crate) fn is_current_ready_replica(&self, replica: &ReplicaKey) -> bool {
         let worker_key = WorkerRegistrationKey::new(&replica.group_name, replica.worker_id);
         let registrations = self.registrations.read();
-        let reports = self.block_reports.read();
+        let observations = self.block_report_observations.read();
 
         let Some(registration) = registrations.get(&worker_key) else {
             return false;
@@ -1456,18 +1560,17 @@ impl WorkerManager {
             return false;
         }
 
-        let Some(report) = reports.get(&worker_key) else {
+        let Some(report) = observations.reports.get(&worker_key) else {
             return false;
         };
-        if report.state != BlockReportState::Ready
-            || !report
-                .worker_run_id
-                .is_some_and(|report_run_id| report_run_id.matches(replica.worker_run_id))
-        {
+        if !report.worker_run_id.matches(replica.worker_run_id) {
             return false;
         }
+        let Some(active) = &report.active else {
+            return false;
+        };
 
-        report.published_blocks.get(&replica.block_id).is_some_and(|block| {
+        active.blocks.get(&replica.block_id).is_some_and(|block| {
             block.block_state == BlockReportBlockState::Ready && block.block_stamp == replica.block_stamp
         })
     }
@@ -1492,7 +1595,7 @@ impl WorkerManager {
         let descriptors = self.descriptors.read();
         let registrations = self.registrations.read();
         let runtime = self.runtime.read();
-        let reports = self.block_reports.read();
+        let observations = self.block_report_observations.read();
         let now = Instant::now();
         let timeout = self.heartbeat_timeout();
 
@@ -1550,17 +1653,16 @@ impl WorkerManager {
                     continue;
                 }
 
-                let Some(report) = reports.get(&key) else {
+                let Some(report) = observations.reports.get(&key) else {
                     continue;
                 };
-                if report.state != BlockReportState::Ready
-                    || !report
-                        .worker_run_id
-                        .is_some_and(|report_run_id| report_run_id.matches(endpoint.worker_run_id))
-                {
+                if !report.worker_run_id.matches(endpoint.worker_run_id) {
                     continue;
                 }
-                let Some(block) = report.published_blocks.get(&target.block_id) else {
+                let Some(active) = &report.active else {
+                    continue;
+                };
+                let Some(block) = active.blocks.get(&target.block_id) else {
                     continue;
                 };
                 if block.block_stamp != target.block_stamp {
@@ -1586,7 +1688,6 @@ impl WorkerManager {
                         ready = true;
                         break;
                     }
-                    BlockReportBlockState::Partial => {}
                     BlockReportBlockState::Corrupt | BlockReportBlockState::Deleting => {
                         conflict = Some(PublishReadyConflict::UnreadableBlock {
                             block_id: target.block_id,
@@ -1616,8 +1717,8 @@ mod tests {
     //! Tests for worker manager and registration.
 
     use super::{
-        BlockReportBlock, BlockReportBlockState, BlockReportDeltaEntry, BlockReportDeltaOp, PublishReadyConflict,
-        PublishReadyStatus, PublishReadyTarget, WorkerManager, WorkerRegistrationKey,
+        BlockReportBlock, BlockReportBlockState, BlockReportChange, PublishReadyConflict, PublishReadyStatus,
+        PublishReadyTarget, WorkerManager, WorkerRegistrationKey,
     };
     use crate::error::MetadataError;
     use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
@@ -1648,6 +1749,14 @@ mod tests {
             block_state: BlockReportBlockState::Ready,
             effective_len: 64,
         }
+    }
+
+    fn upsert(index: u32) -> BlockReportChange {
+        BlockReportChange::Upsert(report_block(index))
+    }
+
+    fn remove(index: u32) -> BlockReportChange {
+        BlockReportChange::Remove(report_block(index).block_id)
     }
 
     fn record_heartbeat(
@@ -1906,7 +2015,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_full_report_seq_cannot_roll_back_published_view() {
+    fn full_batches_publish_atomically_and_stale_baselines_cannot_roll_back() {
         let manager = WorkerManager::new(60_000);
         let group_name_value = group_name("g25");
         let worker_id = WorkerId::new(9);
@@ -1916,21 +2025,65 @@ mod tests {
         manager
             .receive_full_block_report(&group_name_value, worker_id, run_id, 7, 0, true, vec![report_block(0)])
             .unwrap();
+        let second_worker = WorkerId::new(8);
+        let second_run: WorkerRunId = "550e8400-e29b-41d4-a716-446655440101".parse().unwrap();
+        register_live_report_worker(&manager, &group_name_value, second_worker, second_run);
+        manager
+            .receive_full_block_report(
+                &group_name_value,
+                second_worker,
+                second_run,
+                1,
+                0,
+                true,
+                vec![report_block(0)],
+            )
+            .unwrap();
         assert_eq!(
             manager.get_block_locations(&group_name_value, report_block(0).block_id),
+            vec![second_worker, worker_id]
+        );
+
+        let first_batch = manager
+            .receive_full_block_report(&group_name_value, worker_id, run_id, 8, 0, false, vec![report_block(1)])
+            .unwrap();
+        assert_eq!(first_batch.next_batch_seq, 1);
+        assert!(!first_batch.baseline_published);
+        assert_eq!(
+            manager.get_block_locations(&group_name_value, report_block(0).block_id),
+            vec![second_worker]
+        );
+        assert!(manager
+            .get_block_locations(&group_name_value, report_block(1).block_id)
+            .is_empty());
+
+        let replay = manager
+            .receive_full_block_report(&group_name_value, worker_id, run_id, 8, 0, false, vec![report_block(1)])
+            .unwrap();
+        assert_eq!(replay.next_batch_seq, 1);
+        let published = manager
+            .receive_full_block_report(&group_name_value, worker_id, run_id, 8, 1, true, vec![report_block(2)])
+            .unwrap();
+        assert!(published.baseline_published);
+        assert_eq!(
+            manager.get_block_locations(&group_name_value, report_block(1).block_id),
+            vec![worker_id]
+        );
+        assert_eq!(
+            manager.get_block_locations(&group_name_value, report_block(2).block_id),
             vec![worker_id]
         );
 
         let stale = manager
-            .receive_full_block_report(&group_name_value, worker_id, run_id, 6, 0, true, vec![report_block(1)])
-            .expect_err("stale report_seq must not reset the published baseline");
+            .receive_full_block_report(&group_name_value, worker_id, run_id, 7, 0, true, vec![report_block(3)])
+            .expect_err("stale baseline_seq must not reset the published baseline");
         assert!(stale.to_string().contains("full report required"));
         assert_eq!(
-            manager.get_block_locations(&group_name_value, report_block(0).block_id),
+            manager.get_block_locations(&group_name_value, report_block(1).block_id),
             vec![worker_id]
         );
         assert!(manager
-            .get_block_locations(&group_name_value, report_block(1).block_id)
+            .get_block_locations(&group_name_value, report_block(3).block_id)
             .is_empty());
     }
 
@@ -1943,17 +2096,7 @@ mod tests {
         register_live_report_worker(&manager, &group_name_value, worker_id, run_id);
 
         let before_full = manager
-            .apply_delta_block_report(
-                &group_name_value,
-                worker_id,
-                run_id,
-                1,
-                0,
-                vec![BlockReportDeltaEntry {
-                    op: BlockReportDeltaOp::AddUpdate,
-                    block: report_block(0),
-                }],
-            )
+            .apply_delta_block_report(&group_name_value, worker_id, run_id, 1, 0, vec![upsert(0)])
             .expect_err("delta before full report must fail");
         assert!(before_full.to_string().contains("full report required"));
 
@@ -1962,17 +2105,7 @@ mod tests {
             .unwrap();
 
         manager
-            .apply_delta_block_report(
-                &group_name_value,
-                worker_id,
-                run_id,
-                7,
-                0,
-                vec![BlockReportDeltaEntry {
-                    op: BlockReportDeltaOp::AddUpdate,
-                    block: report_block(1),
-                }],
-            )
+            .apply_delta_block_report(&group_name_value, worker_id, run_id, 7, 0, vec![upsert(1)])
             .unwrap();
         assert_eq!(
             manager.get_block_locations(&group_name_value, report_block(1).block_id),
@@ -1980,48 +2113,54 @@ mod tests {
         );
 
         manager
-            .apply_delta_block_report(
-                &group_name_value,
-                worker_id,
-                run_id,
-                7,
-                0,
-                vec![BlockReportDeltaEntry {
-                    op: BlockReportDeltaOp::AddUpdate,
-                    block: report_block(1),
-                }],
-            )
+            .apply_delta_block_report(&group_name_value, worker_id, run_id, 7, 0, vec![upsert(1)])
             .unwrap();
 
-        let gap = manager
-            .apply_delta_block_report(
-                &group_name_value,
-                worker_id,
-                run_id,
-                7,
-                3,
-                vec![BlockReportDeltaEntry {
-                    op: BlockReportDeltaOp::Remove,
-                    block: report_block(1),
-                }],
-            )
-            .expect_err("delta gap must require full report");
-        assert!(gap.to_string().contains("full report required"));
+        let newer_baseline = manager
+            .apply_delta_block_report(&group_name_value, worker_id, run_id, 8, 1, vec![remove(1)])
+            .expect_err("a newer unrecognized baseline must require Full recovery");
+        assert!(newer_baseline.to_string().contains("full report required"));
+        assert!(manager
+            .get_block_locations(&group_name_value, report_block(0).block_id)
+            .is_empty());
+        assert!(manager
+            .get_block_locations(&group_name_value, report_block(1).block_id)
+            .is_empty());
+        manager
+            .receive_full_block_report(&group_name_value, worker_id, run_id, 7, 0, true, vec![report_block(2)])
+            .expect_err("an invalidated baseline must remain below the Full high watermark");
+        assert!(manager
+            .get_block_locations(&group_name_value, report_block(2).block_id)
+            .is_empty());
 
-        let epoch_mismatch = manager
-            .apply_delta_block_report(
+        manager
+            .receive_full_block_report(
                 &group_name_value,
                 worker_id,
                 run_id,
-                8,
-                1,
-                vec![BlockReportDeltaEntry {
-                    op: BlockReportDeltaOp::Remove,
-                    block: report_block(1),
-                }],
+                9,
+                0,
+                true,
+                vec![report_block(0), report_block(1)],
             )
-            .expect_err("report_seq mismatch must require full report");
-        assert!(epoch_mismatch.to_string().contains("full report required"));
+            .unwrap();
+        let gap = manager
+            .apply_delta_block_report(&group_name_value, worker_id, run_id, 9, 3, vec![remove(1)])
+            .expect_err("delta gap must require Full recovery");
+        assert!(gap.to_string().contains("full report required"));
+        assert!(manager
+            .get_block_locations(&group_name_value, report_block(0).block_id)
+            .is_empty());
+        manager
+            .receive_full_block_report(&group_name_value, worker_id, run_id, 9, 0, true, vec![report_block(2)])
+            .expect_err("a gapped baseline must not be republished by a delayed Full");
+        manager
+            .receive_full_block_report(&group_name_value, worker_id, run_id, 10, 0, true, vec![report_block(2)])
+            .expect("a strictly newer Full must recover continuity");
+        assert_eq!(
+            manager.get_block_locations(&group_name_value, report_block(2).block_id),
+            vec![worker_id]
+        );
     }
 
     #[test]
@@ -2092,17 +2231,7 @@ mod tests {
 
         record_heartbeat(&manager, &group_name_value, worker_id, second_run_id, 1, 900).unwrap();
         let delta = manager
-            .apply_delta_block_report(
-                &group_name_value,
-                worker_id,
-                second_run_id,
-                1,
-                0,
-                vec![BlockReportDeltaEntry {
-                    op: BlockReportDeltaOp::AddUpdate,
-                    block: report_block(1),
-                }],
-            )
+            .apply_delta_block_report(&group_name_value, worker_id, second_run_id, 1, 0, vec![upsert(1)])
             .expect_err("replacement must require a new full report baseline");
         assert!(matches!(delta, MetadataError::FullReportRequired(_)));
     }

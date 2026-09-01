@@ -28,7 +28,7 @@ beryl.worker.metadata.retry.max-backoff: 5s
 beryl.worker.heartbeat.interval: 1s
 
 # -------------------- Block reports --------------------
-beryl.worker.block.report.interval: 1s
+beryl.worker.block.report.delta-flush-interval: 1s
 beryl.worker.block.report.batch-size: 1000
 
 # -------------------- Block cleanup --------------------

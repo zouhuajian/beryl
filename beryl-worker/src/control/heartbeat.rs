@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Worker-to-metadata heartbeat fanout.
+//! Worker-to-metadata heartbeat reporting.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -65,7 +65,7 @@ pub struct MetadataHeartbeatLoop {
     config: WorkerRegistrationConfig,
     descriptor: RegistrationDescriptor,
     state: Arc<RegistrationSet>,
-    endpoints: Vec<Endpoint>,
+    endpoint: Endpoint,
     control_identity: ControlIdentity,
     heartbeat_seq: Mutex<HashMap<(GroupName, WorkerRunId), u64>>,
     cleanup: BlockCleanupExecutor,
@@ -101,18 +101,13 @@ impl MetadataHeartbeatLoop {
         config
             .validate()
             .map_err(|err| HeartbeatError::InvalidConfig(err.message))?;
-        let mut endpoints = Vec::with_capacity(config.endpoints.len());
-        for endpoint in &config.endpoints {
-            endpoints.push(
-                Endpoint::from_shared(endpoint.clone())
-                    .map_err(|err| HeartbeatError::InvalidConfig(format!("beryl.worker.metadata.addresses: {err}")))?,
-            );
-        }
+        let endpoint = Endpoint::from_shared(config.endpoints[0].clone())
+            .map_err(|err| HeartbeatError::InvalidConfig(format!("beryl.worker.metadata.addresses: {err}")))?;
         Ok(Self {
             config,
             descriptor,
             state,
-            endpoints,
+            endpoint,
             control_identity: ControlIdentity::new_local(),
             heartbeat_seq: Mutex::new(HashMap::new()),
             cleanup,
@@ -164,62 +159,48 @@ impl MetadataHeartbeatLoop {
         let op = self.control_identity.new_op();
         let request = self.build_request(&registration, &op, seq, &snapshot);
         let mut round = HeartbeatRound {
-            attempted_peers: self.endpoints.len(),
+            attempted_peers: 1,
             ..HeartbeatRound::default()
         };
-        let mut last_error = None;
-
-        for endpoint in &self.endpoints {
-            let started = Instant::now();
-            match self.send_to_peer(endpoint.clone(), request.clone()).await {
-                Ok(HeartbeatPeerOutcome::Accepted {
-                    liveness_timeout,
-                    cleanup_commands,
-                }) => {
-                    let duration = started.elapsed().as_secs_f64();
-                    observe::record_metadata_rpc("heartbeat", "ok", "none", duration);
-                    observe::record_heartbeat_sent("ok", "none");
-                    round.accepted_peers += 1;
-                    self.state
-                        .record_heartbeat_success(&registration.group_name, liveness_timeout);
-                    self.cleanup.enqueue(&registration, cleanup_commands);
-                }
-                Ok(HeartbeatPeerOutcome::NeedRegister) => {
-                    observe::record_metadata_rpc(
-                        "heartbeat",
-                        "error",
-                        "need_register",
-                        started.elapsed().as_secs_f64(),
-                    );
-                    round.needs_register = true;
-                    self.state.mark_needs_register(&registration.group_name);
-                }
-                Ok(HeartbeatPeerOutcome::WorkerRunMismatch) => {
-                    observe::record_metadata_rpc(
-                        "heartbeat",
-                        "error",
-                        "worker_run_mismatch",
-                        started.elapsed().as_secs_f64(),
-                    );
-                    round.worker_run_mismatch = true;
-                    self.state.mark_needs_register(&registration.group_name);
-                }
-                Err(error) => {
-                    observe::record_metadata_rpc(
-                        "heartbeat",
-                        "error",
-                        heartbeat_error_kind(&error),
-                        started.elapsed().as_secs_f64(),
-                    );
-                    debug!(%error, "Worker heartbeat peer attempt failed");
-                    last_error = Some(error);
-                }
+        let started = Instant::now();
+        match self.send_to_peer(self.endpoint.clone(), request).await {
+            Ok(HeartbeatPeerOutcome::Accepted {
+                liveness_timeout,
+                cleanup_commands,
+            }) => {
+                let duration = started.elapsed().as_secs_f64();
+                observe::record_metadata_rpc("heartbeat", "ok", "none", duration);
+                observe::record_heartbeat_sent("ok", "none");
+                round.accepted_peers = 1;
+                self.state
+                    .record_heartbeat_success(&registration.group_name, liveness_timeout);
+                self.cleanup.enqueue(&registration, cleanup_commands);
             }
-        }
-
-        if round.accepted_peers == 0 && !round.needs_register && !round.worker_run_mismatch && round.attempted_peers > 0
-        {
-            return Err(last_error.unwrap_or_else(|| HeartbeatError::Retryable("no heartbeat peer accepted".into())));
+            Ok(HeartbeatPeerOutcome::NeedRegister) => {
+                observe::record_metadata_rpc("heartbeat", "error", "need_register", started.elapsed().as_secs_f64());
+                round.needs_register = true;
+                self.state.mark_needs_register(&registration.group_name);
+            }
+            Ok(HeartbeatPeerOutcome::WorkerRunMismatch) => {
+                observe::record_metadata_rpc(
+                    "heartbeat",
+                    "error",
+                    "worker_run_mismatch",
+                    started.elapsed().as_secs_f64(),
+                );
+                round.worker_run_mismatch = true;
+                self.state.mark_needs_register(&registration.group_name);
+            }
+            Err(error) => {
+                observe::record_metadata_rpc(
+                    "heartbeat",
+                    "error",
+                    heartbeat_error_kind(&error),
+                    started.elapsed().as_secs_f64(),
+                );
+                debug!(%error, "Worker heartbeat endpoint attempt failed");
+                return Err(error);
+            }
         }
 
         Ok(round)

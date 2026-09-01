@@ -247,7 +247,7 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
             return Err(error).context("Failed to create worker metadata heartbeat loop");
         }
     };
-    let block_report = match MetadataBlockReportLoop::with_options_and_interval(
+    let block_report = match MetadataBlockReportLoop::with_options_and_delta_flush_interval(
         config.metadata.clone(),
         block_report_descriptor,
         Arc::clone(&registration_state),
@@ -257,7 +257,7 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
             full_max_blocks_per_batch: config.block_report_batch_size,
             delta_max_entries_per_batch: config.block_report_batch_size,
         },
-        Duration::from_millis(config.block_report_interval_ms),
+        Duration::from_millis(config.block_report_delta_flush_interval_ms),
     ) {
         Ok(block_report) => block_report,
         Err(error) => {

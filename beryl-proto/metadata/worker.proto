@@ -99,49 +99,46 @@ message BlockCleanupCommandProto {
 // Worker → Metadata RPC: Block Reporting
 // ============================================================================
 
-/// Block state reported by one worker-local block entry.
-enum BlockReportBlockStateProto {
-  BLOCK_REPORT_BLOCK_STATE_UNSPECIFIED = 0;
-  BLOCK_REPORT_BLOCK_STATE_READY = 1;
-  BLOCK_REPORT_BLOCK_STATE_PARTIAL = 2;
-  BLOCK_REPORT_BLOCK_STATE_CORRUPT = 3;
-  BLOCK_REPORT_BLOCK_STATE_DELETING = 4;
+/// Worker-observed state of one local block.
+enum ReportedBlockStateProto {
+  REPORTED_BLOCK_STATE_UNSPECIFIED = 0;
+  REPORTED_BLOCK_STATE_READY = 1;
+  REPORTED_BLOCK_STATE_CORRUPT = 2;
+  REPORTED_BLOCK_STATE_DELETING = 3;
 }
 
-/// Block-level location entry. Chunk bitmaps and range routing are out of scope.
-message BlockReportBlockProto {
+/// Current worker-local state for one block. Chunk bitmaps and range routing are out of scope.
+message ReportedBlockProto {
   common.BlockIdProto block_id = 1;
   uint64 block_stamp = 2;
-  BlockReportBlockStateProto block_state = 3;
+  ReportedBlockStateProto state = 3;
   // Worker-persisted valid length for this exact local block version.
   // Ready entries must carry a non-zero value; Deleting entries may use zero.
   uint64 effective_len = 4;
 }
 
-/// Delta operation type for the current published full-report baseline.
-enum BlockReportDeltaOpProto {
-  BLOCK_REPORT_DELTA_OP_UNSPECIFIED = 0;
-  BLOCK_REPORT_DELTA_OP_ADD_UPDATE = 1;
-  BLOCK_REPORT_DELTA_OP_REMOVE = 2;
-}
-
-message BlockReportDeltaProto {
-  BlockReportDeltaOpProto op = 1;
-  BlockReportBlockProto block = 2;
+/// One block entry in a Delta Block Report.
+/// Present carries the current local state; absent means no reportable local record remains.
+message DeltaBlockReportEntryProto {
+  oneof block {
+    ReportedBlockProto present = 1;
+    common.BlockIdProto absent = 2;
+  }
 }
 
 message FullBlockReportBatchProto {
-  /// Sequence number within the current report_seq.
+  /// Sequence number within the current baseline_seq.
   uint64 batch_seq = 1;
-  /// True when this is the final batch of the current report_seq.
+  /// True when this is the final batch of the current baseline_seq.
   bool final_batch = 2;
-  repeated BlockReportBlockProto blocks = 3;
+  repeated ReportedBlockProto blocks = 3;
 }
 
-message DeltaBlockReportProto {
-  /// First delta sequence represented by this request.
-  uint64 delta_seq = 1;
-  repeated BlockReportDeltaProto deltas = 2;
+/// One ordered Delta batch for a published Full Report baseline.
+message DeltaBlockReportBatchProto {
+  /// Ordered batch sequence scoped to the current baseline_seq.
+  uint64 batch_seq = 1;
+  repeated DeltaBlockReportEntryProto entries = 2;
 }
 
 message BlockReportRequestProto {
@@ -150,20 +147,33 @@ message BlockReportRequestProto {
   uint64 worker_id = 2;
   /// Current live worker process-run identity.
   string worker_run_id = 3;
-  /// Monotonic within one worker run and one group.
-  uint64 report_seq = 4;
-  oneof report {
-    FullBlockReportBatchProto full = 5;
-    DeltaBlockReportProto delta = 6;
+  /// Monotonic full-report baseline sequence within one worker run and group.
+  uint64 baseline_seq = 4;
+  oneof batch {
+    FullBlockReportBatchProto full_report = 5;
+    DeltaBlockReportBatchProto delta_report = 6;
   }
 }
 
+/// Batch kind confirmed by a successful BlockReport response.
+enum BlockReportKindProto {
+  BLOCK_REPORT_KIND_UNSPECIFIED = 0;
+  BLOCK_REPORT_KIND_FULL = 1;
+  BLOCK_REPORT_KIND_DELTA = 2;
+}
+
+/// Cumulative Metadata progress after processing one report batch.
 message BlockReportResponseProto {
   common.ResponseHeaderProto header = 1;
-  /// Accepted report_seq for this response.
-  uint64 report_seq = 2;
-  /// Next delta sequence expected by metadata for the current published baseline.
-  uint64 next_delta_seq = 3;
+  /// Must match the request batch; errors may leave this unspecified.
+  BlockReportKindProto report_kind = 2;
+  uint64 baseline_seq = 3;
+  /// Next batch expected while Full staging is incomplete or after an accepted Delta.
+  /// Zero when the Full baseline is already published and no next Full batch is expected.
+  uint64 next_batch_seq = 4;
+  /// False only while a Full Report baseline remains incomplete.
+  /// Successful Delta responses must always return true.
+  bool baseline_published = 5;
 }
 
 // ============================================================================
