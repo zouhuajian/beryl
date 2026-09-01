@@ -69,6 +69,21 @@ fn staging_req(index: u32) -> CreateStagingBlockRequest {
 }
 
 #[test]
+fn store_directory_has_one_process_owner() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("hdd0");
+    let first = StoreDirs::open(store_dirs(vec![dir_config(path.clone(), 32 * 1024)]), 0, 30_000).unwrap();
+
+    assert!(matches!(
+        StoreDirs::open(store_dirs(vec![dir_config(path.clone(), 32 * 1024)]), 0, 30_000),
+        Err(WorkerError::Unavailable(_))
+    ));
+    drop(first);
+    StoreDirs::open(store_dirs(vec![dir_config(path, 32 * 1024)]), 0, 30_000)
+        .expect("dropping the owner must release the directory lock");
+}
+
+#[test]
 fn reclaim_fails_closed_on_staging_artifact_in_any_store_dir() {
     let temp = TempDir::new().unwrap();
     let hdd0 = temp.path().join("hdd0");

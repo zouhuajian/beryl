@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::CString;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -13,12 +13,12 @@ use std::time::{Duration, Instant};
 
 use beryl_types::{BlockId, GroupName, Tier, TierFree};
 use bytes::Bytes;
-use tokio::sync::Notify;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::StoreDirConfig;
 use crate::error::WorkerError;
+use crate::report::BlockReportChangeTracker;
 use crate::store::block::{
     BlockMetaPayload, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
     PublishReadyRequest, ReclaimBlockRequest, ReclaimBlockResult, ReclaimBlockState, StoreResult,
@@ -50,16 +50,20 @@ pub struct StoreReport {
     pub dirs: Vec<StoreDirReport>,
 }
 
-/// Aggregates local block stores and signals changes to their reportable view.
+/// Owns configured store directories and retains reportable lifecycle changes.
 ///
-/// `block_report_changed` is a coalescing wake-up signal, not an event log.
-/// Block reporting must rescan the stores after every wake-up.
+/// Every directory is locked for this value's lifetime. A second Beryl Worker
+/// therefore cannot mutate the same store behind the in-process Delta tracker.
+/// Direct filesystem mutation by external tools remains unsupported because it
+/// bypasses both local lifecycle validation and block-report continuity.
 #[derive(Debug)]
 pub struct StoreDirs {
     inner: Mutex<StoreDirsState>,
+    /// Open descriptors retain exclusive advisory locks until shutdown.
+    _ownership_locks: Vec<File>,
     reserve_bytes: u64,
     check_interval: Duration,
-    block_report_changed: Notify,
+    block_report_changes: BlockReportChangeTracker,
 }
 
 #[derive(Debug)]
@@ -105,8 +109,11 @@ impl StoreDirs {
         }
 
         let mut dirs = Vec::with_capacity(configs.len());
+        let mut ownership_locks = Vec::with_capacity(configs.len());
         for (id, config) in configs {
             init_store_path(&config.path)?;
+            let ownership_lock = acquire_store_ownership_lock(&config.path)?;
+            probe_store_path(&config.path)?;
             let (fs_total_bytes, fs_free_bytes) = fs_stats(&config.path)?;
             let mount_key = mount_key(&config.path)?;
             let store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(config.path.clone()));
@@ -137,6 +144,7 @@ impl StoreDirs {
                 pending_blocks: HashMap::new(),
                 writable: true,
             });
+            ownership_locks.push(ownership_lock);
         }
 
         Ok(Self {
@@ -144,9 +152,10 @@ impl StoreDirs {
                 dirs,
                 round_robin: HashMap::new(),
             }),
+            _ownership_locks: ownership_locks,
             reserve_bytes: reserve_space_bytes,
             check_interval: Duration::from_millis(check_interval_ms),
-            block_report_changed: Notify::new(),
+            block_report_changes: BlockReportChangeTracker::default(),
         })
     }
 
@@ -178,13 +187,14 @@ impl StoreDirs {
         Ok(blocks)
     }
 
-    /// Waits until a successful local publication or deletion may change a
-    /// block report.
-    ///
-    /// Multiple changes may share one notification because the consumer derives
-    /// the authoritative state by scanning the stores.
+    /// Returns the retained change source used by the block report loop.
+    pub(crate) fn block_report_changes(&self) -> &BlockReportChangeTracker {
+        &self.block_report_changes
+    }
+
+    /// Waits until a successful local publication or deletion changes a report.
     pub(crate) async fn wait_for_block_report_change(&self) {
-        self.block_report_changed.notified().await;
+        self.block_report_changes.wait().await;
     }
 
     fn refresh_due(&self, inner: &mut StoreDirsState) -> StoreResult<()> {
@@ -419,6 +429,7 @@ impl LocalBlockStore for StoreDirs {
             )));
         };
         let meta = store.publish_ready(req)?;
+        self.block_report_changes.record(&group_name, block_id);
         let mut inner = self.inner.lock().expect("store dir state poisoned");
         if !release_pending_locked(&mut inner.dirs[dir_index], &group_name, block_id)? {
             return Err(WorkerError::Corrupt(format!(
@@ -430,8 +441,6 @@ impl LocalBlockStore for StoreDirs {
             .used_bytes
             .saturating_add(meta.source.effective_len);
         inner.dirs[dir_index].block_count = inner.dirs[dir_index].block_count.saturating_add(1);
-        drop(inner);
-        self.block_report_changed.notify_one();
         Ok(meta)
     }
 
@@ -468,12 +477,11 @@ impl LocalBlockStore for StoreDirs {
         };
         let result = store.reclaim_block(req)?;
         if let ReclaimBlockResult::Deleted { effective_len } = result {
+            self.block_report_changes.record(&req.group_name, req.block_id);
             let mut inner = self.inner.lock().expect("store dir state poisoned");
             release_pending_locked(&mut inner.dirs[dir_index], &req.group_name, req.block_id)?;
             inner.dirs[dir_index].used_bytes = inner.dirs[dir_index].used_bytes.saturating_sub(effective_len);
             inner.dirs[dir_index].block_count = inner.dirs[dir_index].block_count.saturating_sub(1);
-            drop(inner);
-            self.block_report_changed.notify_one();
         }
         Ok(result)
     }
@@ -614,7 +622,25 @@ fn init_store_path(path: &Path) -> StoreResult<()> {
             path.display()
         )));
     }
-    probe_store_path(path)
+    Ok(())
+}
+
+/// Acquires the process-lifetime ownership fence for one configured store.
+fn acquire_store_ownership_lock(path: &Path) -> StoreResult<File> {
+    let lock_path = path.join(".beryl-worker.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
+        WorkerError::Unavailable(format!(
+            "worker store directory {} is already owned by another process: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(file)
 }
 
 fn probe_store_path(path: &Path) -> StoreResult<()> {

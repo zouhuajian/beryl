@@ -14,6 +14,7 @@ use tokio::sync::Notify;
 
 use crate::data::core::{ReadBlockRequest, WorkerCoreResult};
 use crate::error::WorkerError;
+use crate::report::BlockReportChangeTracker;
 use crate::store::block::{BlockState, LocalBlockStore};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -36,13 +37,13 @@ enum BlockAccessState {
 
 /// Coordinates reader pins and destructive block lifecycle transitions.
 ///
-/// `changed` wakes lifecycle waiters. `block_report_changed` is emitted only
-/// after final reclaim state is cleared so reporting can observe removal.
+/// `changed` wakes lifecycle waiters. `block_report_changes` retains the exact
+/// identities whose reportable state changed before any notification is lost.
 #[derive(Debug, Default)]
 struct BlockAccessRegistry {
     states: Mutex<HashMap<BlockAccessKey, BlockAccessState>>,
     changed: Notify,
-    block_report_changed: Notify,
+    block_report_changes: BlockReportChangeTracker,
 }
 
 /// Exact block version currently excluded from new readers for reclamation.
@@ -201,6 +202,7 @@ impl BlockAccessRegistry {
                 }
             }
         }
+        self.block_report_changes.record(&key.group_name, key.block_id);
 
         let permit = ReclaimPermit {
             registry: Arc::clone(self),
@@ -267,7 +269,7 @@ impl BlockAccessRegistry {
         }
         drop(states);
         self.changed.notify_waiters();
-        self.block_report_changed.notify_one();
+        self.block_report_changes.record(&key.group_name, key.block_id);
     }
 
     /// Snapshots exact versions currently fenced from new readers for reporting.
@@ -289,9 +291,29 @@ impl BlockAccessRegistry {
         blocks
     }
 
-    /// Waits until completed reclamation may change the reportable block view.
+    /// Returns the exact reclaim fence for one block, if present.
+    fn reclaiming_block(&self, group_name: &GroupName, block_id: BlockId) -> Option<ReclaimingBlock> {
+        let states = self.states.lock().expect("block access state poisoned");
+        match states.get(&BlockAccessKey {
+            group_name: group_name.clone(),
+            block_id,
+        }) {
+            Some(BlockAccessState::Reclaiming { block_stamp, .. }) => Some(ReclaimingBlock {
+                block_id,
+                block_stamp: *block_stamp,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Returns the retained reclaim-lifecycle change source.
+    fn block_report_changes(&self) -> &BlockReportChangeTracker {
+        &self.block_report_changes
+    }
+
+    /// Waits until a reclaim lifecycle transition changes the reportable view.
     async fn wait_for_block_report_change(&self) {
-        self.block_report_changed.notified().await;
+        self.block_report_changes.wait().await;
     }
 }
 
@@ -320,7 +342,7 @@ impl BlockManager {
             access: Arc::new(BlockAccessRegistry {
                 states: Mutex::new(HashMap::new()),
                 changed: Notify::new(),
-                block_report_changed: Notify::new(),
+                block_report_changes: BlockReportChangeTracker::default(),
             }),
         }
     }
@@ -364,7 +386,17 @@ impl BlockManager {
         self.access.reclaiming_blocks(group_name)
     }
 
-    /// Waits for a completed reclaim lifecycle transition.
+    /// Returns the reportable deleting state for one exact block.
+    pub(crate) fn reclaiming_block(&self, group_name: &GroupName, block_id: BlockId) -> Option<ReclaimingBlock> {
+        self.access.reclaiming_block(group_name, block_id)
+    }
+
+    /// Returns the retained reclaim-lifecycle change source.
+    pub(crate) fn block_report_changes(&self) -> &BlockReportChangeTracker {
+        self.access.block_report_changes()
+    }
+
+    /// Waits for a reclaim lifecycle transition.
     pub(crate) async fn wait_for_block_report_change(&self) {
         self.access.wait_for_block_report_change().await;
     }

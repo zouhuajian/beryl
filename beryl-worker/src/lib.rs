@@ -9,6 +9,7 @@ pub mod data;
 pub mod error;
 pub mod net;
 pub mod observe;
+pub(crate) mod report;
 pub mod runtime;
 pub mod store;
 

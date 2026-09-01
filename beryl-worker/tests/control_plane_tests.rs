@@ -6,16 +6,16 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use beryl_common::error::rpc::{ErrorKind, RpcErrorDetail, WorkerErrorKind};
+use beryl_common::error::rpc::RpcErrorDetail;
 use beryl_proto::common::ResponseHeaderProto;
 use beryl_proto::convert::rpc_error_to_proto;
 use beryl_proto::metadata::metadata_worker_service_proto_server::{
     MetadataWorkerServiceProto, MetadataWorkerServiceProtoServer,
 };
 use beryl_proto::metadata::{
-    block_report_request_proto, BlockCleanupCommandProto, BlockReportBlockStateProto, BlockReportDeltaOpProto,
+    block_report_request_proto, delta_block_report_entry_proto, BlockCleanupCommandProto, BlockReportKindProto,
     BlockReportRequestProto, BlockReportResponseProto, HeartbeatRequestProto, HeartbeatResponseProto,
-    RegisterWorkerRequestProto, RegisterWorkerResponseProto,
+    RegisterWorkerRequestProto, RegisterWorkerResponseProto, ReportedBlockStateProto,
 };
 use beryl_proto::worker::worker_data_service_server::WorkerDataService;
 use beryl_proto::worker::ReadBlockRequestProto;
@@ -33,8 +33,8 @@ use tonic::{Request, Response, Status};
 
 use beryl_worker::config::{StoreDirConfig, WorkerConfig, WorkerRegistrationConfig};
 use beryl_worker::control::{
-    BlockCleanupOptions, BlockCleanupRuntime, HeartbeatSnapshot, MetadataBlockReportLoop, MetadataHeartbeatLoop,
-    Registration, RegistrationDescriptor, RegistrationSet,
+    BlockCleanupOptions, BlockCleanupRuntime, BlockReportOptions, HeartbeatSnapshot, MetadataBlockReportLoop,
+    MetadataHeartbeatLoop, Registration, RegistrationDescriptor, RegistrationSet,
 };
 use beryl_worker::net::protocol::WorkerNetProtocol;
 use beryl_worker::net::server::grpc::WorkerDataServiceImpl;
@@ -80,8 +80,22 @@ enum MockHeartbeatReply {
 #[derive(Clone)]
 enum MockBlockReportReply {
     Ok,
-    HeaderError(RpcErrorDetail),
+    Response {
+        report_kind: i32,
+        baseline_seq: u64,
+        next_batch_seq: u64,
+        baseline_published: bool,
+    },
+    AppliedThenStatus(Status),
     Status(Status),
+}
+
+#[derive(Default)]
+struct MockFullReportState {
+    worker_run_id: Option<String>,
+    baseline_seq: Option<u64>,
+    next_batch_seq: u64,
+    baseline_published: bool,
 }
 
 #[derive(Default)]
@@ -92,6 +106,7 @@ struct MockMetadataState {
     requests: Mutex<Vec<RegisterWorkerRequestProto>>,
     heartbeat_requests: Mutex<Vec<HeartbeatRequestProto>>,
     block_report_requests: Mutex<Vec<BlockReportRequestProto>>,
+    full_report: Mutex<MockFullReportState>,
 }
 
 #[derive(Clone)]
@@ -181,17 +196,74 @@ impl MetadataWorkerServiceProto for MockMetadataWorkerService {
             .unwrap_or(MockBlockReportReply::Ok);
 
         match reply {
-            MockBlockReportReply::Ok => Ok(Response::new(BlockReportResponseProto {
+            MockBlockReportReply::Ok => {
+                let (report_kind, next_batch_seq, baseline_published) = apply_block_report(&self.state, &request);
+                Ok(Response::new(BlockReportResponseProto {
+                    header: Some(response_header_from_block_report_request(&request, None)),
+                    report_kind: report_kind as i32,
+                    baseline_seq: request.baseline_seq,
+                    next_batch_seq,
+                    baseline_published,
+                }))
+            }
+            MockBlockReportReply::Response {
+                report_kind,
+                baseline_seq,
+                next_batch_seq,
+                baseline_published,
+            } => Ok(Response::new(BlockReportResponseProto {
                 header: Some(response_header_from_block_report_request(&request, None)),
-                report_seq: request.report_seq,
-                next_delta_seq: 0,
+                report_kind,
+                baseline_seq,
+                next_batch_seq,
+                baseline_published,
             })),
-            MockBlockReportReply::HeaderError(error) => Ok(Response::new(BlockReportResponseProto {
-                header: Some(response_header_from_block_report_request(&request, Some(error))),
-                report_seq: request.report_seq,
-                next_delta_seq: 0,
-            })),
+            MockBlockReportReply::AppliedThenStatus(status) => {
+                apply_block_report(&self.state, &request);
+                Err(status)
+            }
             MockBlockReportReply::Status(status) => Err(status),
+        }
+    }
+}
+
+fn apply_block_report(
+    state: &MockMetadataState,
+    request: &BlockReportRequestProto,
+) -> (BlockReportKindProto, u64, bool) {
+    match request.batch.as_ref().expect("mock block report kind") {
+        block_report_request_proto::Batch::FullReport(full) => {
+            let mut accepted = state.full_report.lock().unwrap();
+            if accepted.worker_run_id.as_deref() != Some(request.worker_run_id.as_str())
+                || accepted.baseline_seq != Some(request.baseline_seq)
+            {
+                assert_eq!(full.batch_seq, 0, "a new mock Full baseline must start at batch zero");
+                *accepted = MockFullReportState {
+                    worker_run_id: Some(request.worker_run_id.clone()),
+                    baseline_seq: Some(request.baseline_seq),
+                    next_batch_seq: 0,
+                    baseline_published: false,
+                };
+            }
+            if !accepted.baseline_published {
+                if full.batch_seq == accepted.next_batch_seq {
+                    accepted.next_batch_seq += 1;
+                    accepted.baseline_published = full.final_batch;
+                } else {
+                    assert!(
+                        full.batch_seq < accepted.next_batch_seq,
+                        "mock Full report received a batch gap"
+                    );
+                }
+            }
+            (
+                BlockReportKindProto::BlockReportKindFull,
+                accepted.next_batch_seq,
+                accepted.baseline_published,
+            )
+        }
+        block_report_request_proto::Batch::DeltaReport(delta) => {
+            (BlockReportKindProto::BlockReportKindDelta, delta.batch_seq + 1, true)
         }
     }
 }
@@ -264,6 +336,7 @@ async fn start_mock_metadata(
         requests: Mutex::new(Vec::new()),
         heartbeat_requests: Mutex::new(Vec::new()),
         block_report_requests: Mutex::new(Vec::new()),
+        full_report: Mutex::new(MockFullReportState::default()),
     });
     let service = MockMetadataWorkerService {
         state: Arc::clone(&state),
@@ -303,6 +376,19 @@ fn test_registration_config(endpoint: String) -> WorkerRegistrationConfig {
         retry_initial_backoff_ms: 1,
         retry_max_backoff_ms: 1,
     }
+}
+
+#[test]
+fn worker_metadata_config_requires_one_leader_endpoint() {
+    let mut config = WorkerRegistrationConfig::default();
+    config.endpoints.clear();
+    assert!(config.validate().is_err());
+
+    config.endpoints = vec![
+        "http://127.0.0.1:18080".to_string(),
+        "http://127.0.0.1:18081".to_string(),
+    ];
+    assert!(config.validate().is_err());
 }
 
 fn test_worker_run_id() -> WorkerRunId {
@@ -391,25 +477,27 @@ async fn wait_for_block_report_requests(mock: &MockMetadataState, expected: usiz
     .unwrap_or_else(|_| panic!("timed out waiting for {expected} block report requests"));
 }
 
-async fn wait_for_block_report_delta(
-    mock: &MockMetadataState,
-    expected_op: BlockReportDeltaOpProto,
-    expected_block_id: BlockId,
-    timeout: Duration,
-) {
+fn assert_same_report_retry(first: &BlockReportRequestProto, retry: &BlockReportRequestProto) {
+    let mut first = first.clone();
+    let mut retry = retry.clone();
+    first.header.as_mut().expect("request header").deadline_ms = 0;
+    retry.header.as_mut().expect("request header").deadline_ms = 0;
+    assert_eq!(first, retry, "retry may refresh only the RPC deadline");
+}
+
+async fn wait_for_block_report_absent(mock: &MockMetadataState, expected_block_id: BlockId, timeout: Duration) {
     tokio::time::timeout(timeout, async {
         loop {
             let found = mock.block_report_requests.lock().unwrap().iter().any(|request| {
-                let Some(block_report_request_proto::Report::Delta(delta)) = request.report.as_ref() else {
+                let Some(block_report_request_proto::Batch::DeltaReport(delta)) = request.batch.as_ref() else {
                     return false;
                 };
-                delta.deltas.iter().any(|entry| {
-                    entry.op() == expected_op
-                        && entry
-                            .block
-                            .as_ref()
-                            .and_then(|block| block.block_id)
-                            .is_some_and(|block_id| BlockId::try_from(block_id) == Ok(expected_block_id))
+                delta.entries.iter().any(|entry| {
+                    matches!(
+                        entry.block.as_ref(),
+                        Some(delta_block_report_entry_proto::Block::Absent(block_id))
+                            if BlockId::try_from(*block_id) == Ok(expected_block_id)
+                    )
                 })
             });
             if found {
@@ -419,7 +507,7 @@ async fn wait_for_block_report_delta(
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("timed out waiting for {expected_op:?} delta for {expected_block_id}"));
+    .unwrap_or_else(|_| panic!("timed out waiting for absent Delta entry for {expected_block_id}"));
 }
 
 #[cfg(unix)]
@@ -537,7 +625,7 @@ beryl.worker.metadata.request-timeout: 1s
 beryl.worker.metadata.retry.initial-backoff: 10ms
 beryl.worker.metadata.retry.max-backoff: 100ms
 beryl.worker.heartbeat.interval: 20ms
-beryl.worker.block.report.interval: 20ms
+beryl.worker.block.report.delta-flush-interval: 20ms
 beryl.worker.block.report.batch-size: 100
 beryl.worker.block.cleanup.queue-capacity: 16
 beryl.worker.block.cleanup.concurrency: 2
@@ -579,7 +667,7 @@ async fn wait_for_full_report_count(mock: &MockMetadataState, block_id: BlockId,
                 .unwrap()
                 .iter()
                 .filter(|request| {
-                    let Some(block_report_request_proto::Report::Full(full)) = request.report.as_ref() else {
+                    let Some(block_report_request_proto::Batch::FullReport(full)) = request.batch.as_ref() else {
                         return false;
                     };
                     full.blocks.iter().any(|block| {
@@ -660,7 +748,7 @@ async fn worker_signals_exit_cleanly_and_restart_reports_current_blocks() {
 }
 
 #[tokio::test]
-async fn heartbeat_cleanup_command_reports_deleting_then_delta_remove() {
+async fn heartbeat_cleanup_command_reports_deleting_then_delta_absent() {
     let worker_run_id = test_worker_run_id();
     let (endpoint, mock, shutdown) = start_mock_metadata(Vec::new()).await;
     *mock.heartbeat_replies.lock().unwrap() = VecDeque::from([MockHeartbeatReply::OkWithCleanup {
@@ -746,11 +834,7 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_remove() {
         loop {
             let round = reporter.send_delta_once().await.expect("send Deleting delta");
             if round.accepted_peers > 0
-                && latest_delta_has(
-                    &mock,
-                    BlockReportDeltaOpProto::BlockReportDeltaOpAddUpdate,
-                    BlockReportBlockStateProto::BlockReportBlockStateDeleting,
-                )
+                && latest_delta_has_present_state(&mock, ReportedBlockStateProto::ReportedBlockStateDeleting)
             {
                 break;
             }
@@ -780,47 +864,53 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_remove() {
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let round = reporter.send_delta_once().await.expect("send REMOVE delta");
-            if round.accepted_peers > 0
-                && latest_delta_has(
-                    &mock,
-                    BlockReportDeltaOpProto::BlockReportDeltaOpRemove,
-                    BlockReportBlockStateProto::BlockReportBlockStateDeleting,
-                )
-            {
+            let round = reporter.send_delta_once().await.expect("send absent Delta entry");
+            if round.accepted_peers > 0 && latest_delta_has_absent(&mock, block_id()) {
                 break;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("cleanup must publish REMOVE after physical deletion completes");
+    .expect("cleanup must publish an absent entry after physical deletion completes");
     shutdown.send(()).ok();
 }
 
-fn latest_delta_has(
-    mock: &MockMetadataState,
-    expected_op: BlockReportDeltaOpProto,
-    expected_state: BlockReportBlockStateProto,
-) -> bool {
+fn latest_delta_has_present_state(mock: &MockMetadataState, expected_state: ReportedBlockStateProto) -> bool {
     let requests = mock.block_report_requests.lock().unwrap();
     let Some(request) = requests.last() else {
         return false;
     };
-    let Some(block_report_request_proto::Report::Delta(delta)) = request.report.as_ref() else {
+    let Some(block_report_request_proto::Batch::DeltaReport(delta)) = request.batch.as_ref() else {
         return false;
     };
-    delta.deltas.iter().any(|entry| {
-        entry.op() == expected_op
-            && entry
-                .block
-                .as_ref()
-                .is_some_and(|block| block.block_state() == expected_state)
+    delta.entries.iter().any(|entry| {
+        matches!(
+            entry.block.as_ref(),
+            Some(delta_block_report_entry_proto::Block::Present(block)) if block.state() == expected_state
+        )
+    })
+}
+
+fn latest_delta_has_absent(mock: &MockMetadataState, expected_block_id: BlockId) -> bool {
+    let requests = mock.block_report_requests.lock().unwrap();
+    let Some(request) = requests.last() else {
+        return false;
+    };
+    let Some(block_report_request_proto::Batch::DeltaReport(delta)) = request.batch.as_ref() else {
+        return false;
+    };
+    delta.entries.iter().any(|entry| {
+        matches!(
+            entry.block.as_ref(),
+            Some(delta_block_report_entry_proto::Block::Absent(block_id))
+                if BlockId::try_from(*block_id) == Ok(expected_block_id)
+        )
     })
 }
 
 #[tokio::test]
-async fn block_report_loop_sends_coalesced_ready_and_remove_deltas_on_store_changes() {
+async fn block_report_loop_sends_coalesced_present_and_absent_entries_on_store_changes() {
     let worker_run_id = test_worker_run_id();
     let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(Vec::new()).await;
     let state = Arc::new(RegistrationSet::new());
@@ -836,12 +926,14 @@ async fn block_report_loop_sends_coalesced_ready_and_remove_deltas_on_store_chan
     let first = BlockId::new(InodeId::new(7), BlockIndex::new(0));
     let second = BlockId::new(InodeId::new(7), BlockIndex::new(1));
     let core = test_worker_core(Arc::clone(&store));
-    let reporter = MetadataBlockReportLoop::new(
+    let reporter = MetadataBlockReportLoop::with_options_and_delta_flush_interval(
         test_registration_config(endpoint),
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
         Arc::clone(&store),
         Arc::clone(&core),
+        BlockReportOptions::default(),
+        Duration::from_millis(20),
     )
     .expect("block reporter");
     let reporter_handle = reporter.spawn();
@@ -854,23 +946,23 @@ async fn block_report_loop_sends_coalesced_ready_and_remove_deltas_on_store_chan
     {
         let requests = mock.block_report_requests.lock().unwrap();
         assert!(matches!(
-            requests[0].report.as_ref(),
-            Some(block_report_request_proto::Report::Full(_))
+            requests[0].batch.as_ref(),
+            Some(block_report_request_proto::Batch::FullReport(_))
         ));
-        let Some(block_report_request_proto::Report::Delta(delta)) = requests[1].report.as_ref() else {
+        let Some(block_report_request_proto::Batch::DeltaReport(delta)) = requests[1].batch.as_ref() else {
             panic!("expected event-driven delta report");
         };
-        assert_eq!(delta.deltas.len(), 2);
-        assert!(delta
-            .deltas
-            .iter()
-            .all(|entry| entry.op() == BlockReportDeltaOpProto::BlockReportDeltaOpAddUpdate));
+        assert_eq!(delta.entries.len(), 2);
+        assert!(delta.entries.iter().all(|entry| matches!(
+            entry.block.as_ref(),
+            Some(delta_block_report_entry_proto::Block::Present(_))
+        )));
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
         mock.block_report_requests.lock().unwrap().len(),
         2,
-        "rapid Ready changes should be coalesced before the periodic tick"
+        "an accepted baseline must not trigger periodic Full reports across later flush ticks"
     );
 
     assert_eq!(
@@ -885,40 +977,22 @@ async fn block_report_loop_sends_coalesced_ready_and_remove_deltas_on_store_chan
             effective_len: BLOCK_SIZE
         }
     );
-    wait_for_block_report_delta(
-        &mock,
-        BlockReportDeltaOpProto::BlockReportDeltaOpRemove,
-        first,
-        Duration::from_millis(500),
-    )
-    .await;
-    {
-        let requests = mock.block_report_requests.lock().unwrap();
-        assert!(requests.iter().any(|request| {
-            let Some(block_report_request_proto::Report::Delta(delta)) = request.report.as_ref() else {
-                return false;
-            };
-            delta.deltas.iter().any(|entry| {
-                entry.op() == BlockReportDeltaOpProto::BlockReportDeltaOpRemove
-                    && entry
-                        .block
-                        .as_ref()
-                        .and_then(|block| block.block_id)
-                        .is_some_and(|block_id| BlockId::try_from(block_id) == Ok(first))
-            })
-        }));
-    }
+    wait_for_block_report_absent(&mock, first, Duration::from_millis(500)).await;
 
     reporter_handle.abort();
     shutdown.send(()).ok();
 }
 
 #[tokio::test]
-async fn event_driven_delta_failure_is_retried_by_periodic_reporting() {
+async fn result_unknown_retries_immutable_batches_and_preserves_newer_changes() {
     let worker_run_id = test_worker_run_id();
     let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(vec![
         MockBlockReportReply::Ok,
+        MockBlockReportReply::AppliedThenStatus(Status::unavailable("full acknowledgement lost")),
+        MockBlockReportReply::Ok,
+        MockBlockReportReply::Ok,
         MockBlockReportReply::Status(Status::unavailable("delta unavailable")),
+        MockBlockReportReply::Ok,
         MockBlockReportReply::Ok,
     ])
     .await;
@@ -932,105 +1006,182 @@ async fn event_driven_delta_failure_is_retried_by_periodic_reporting() {
     state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
     let temp = TempDir::new().expect("tempdir");
     let store = report_store(&temp);
-    let reporter = MetadataBlockReportLoop::new(
+    let first = BlockId::new(InodeId::new(7), BlockIndex::new(0));
+    let second = BlockId::new(InodeId::new(7), BlockIndex::new(1));
+    let third = BlockId::new(InodeId::new(7), BlockIndex::new(2));
+    let fourth = BlockId::new(InodeId::new(7), BlockIndex::new(3));
+    publish_ready_block_for(store.as_ref(), group_name(), first, payload(), 101);
+    publish_ready_block_for(store.as_ref(), group_name(), second, payload(), 102);
+    publish_ready_block_for(store.as_ref(), group_name(), third, payload(), 103);
+    let reporter = MetadataBlockReportLoop::with_options(
         test_registration_config(endpoint),
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
         Arc::clone(&store),
         test_worker_core(Arc::clone(&store)),
+        BlockReportOptions {
+            full_max_blocks_per_batch: 1,
+            delta_max_entries_per_batch: 1,
+        },
     )
     .expect("block reporter");
-    let reporter_handle = reporter.spawn();
-    wait_for_block_report_requests(&mock, 1, Duration::from_millis(500)).await;
 
-    publish_ready_block_for(store.as_ref(), group_name(), block_id(), payload(), 101);
-    wait_for_block_report_requests(&mock, 2, Duration::from_millis(500)).await;
-    wait_for_block_report_requests(&mock, 3, Duration::from_millis(1_500)).await;
+    reporter
+        .send_full_once()
+        .await
+        .expect_err("second Full batch result is unknown");
+    publish_ready_block_for(store.as_ref(), group_name(), fourth, payload(), 104);
+    assert_eq!(reporter.send_full_once().await.unwrap().accepted_peers, 1);
+    reporter
+        .send_delta_once()
+        .await
+        .expect_err("first Delta result is unknown");
+    assert!(matches!(
+        store.reclaim_block(&ReclaimBlockRequest {
+            group_name: group_name(),
+            block_id: fourth,
+            expected_block_stamp: 104,
+        }),
+        Ok(beryl_worker::ReclaimBlockResult::Deleted { .. })
+    ));
+    assert_eq!(reporter.send_delta_once().await.unwrap().accepted_peers, 1);
+    assert_eq!(reporter.send_delta_once().await.unwrap().accepted_peers, 1);
 
     {
         let requests = mock.block_report_requests.lock().unwrap();
+        assert_eq!(requests.len(), 7);
+        assert_same_report_retry(&requests[0], &requests[2]);
+        let Some(block_report_request_proto::Batch::FullReport(full)) = requests[0].batch.as_ref() else {
+            panic!("expected Full request");
+        };
+        assert_eq!(full.batch_seq, 0);
+        assert_eq!(full.blocks.len(), 1);
+        assert_eq!(full.blocks[0].block_id.map(BlockId::try_from), Some(Ok(first)));
+        let Some(block_report_request_proto::Batch::FullReport(full)) = requests[1].batch.as_ref() else {
+            panic!("expected second Full batch");
+        };
+        assert_eq!(full.batch_seq, 1);
+        assert_eq!(full.blocks[0].block_id.map(BlockId::try_from), Some(Ok(second)));
+        let Some(block_report_request_proto::Batch::FullReport(full)) = requests[3].batch.as_ref() else {
+            panic!("expected recovery to continue from Metadata's acknowledged cursor");
+        };
+        assert_eq!(full.batch_seq, 2);
+        assert_eq!(full.blocks[0].block_id.map(BlockId::try_from), Some(Ok(third)));
+        assert_same_report_retry(&requests[4], &requests[5]);
+        let Some(block_report_request_proto::Batch::DeltaReport(delta)) = requests[4].batch.as_ref() else {
+            panic!("expected Delta request");
+        };
+        assert!(delta.entries.iter().any(|entry| {
+            matches!(
+                entry.block.as_ref(),
+                Some(delta_block_report_entry_proto::Block::Present(block))
+                    if block.block_id.map(BlockId::try_from) == Some(Ok(fourth))
+            )
+        }));
+        let Some(block_report_request_proto::Batch::DeltaReport(delta)) = requests[6].batch.as_ref() else {
+            panic!("expected retained newer Delta request");
+        };
         assert!(matches!(
-            requests[1].report.as_ref(),
-            Some(block_report_request_proto::Report::Delta(_))
-        ));
-        assert!(matches!(
-            requests[2].report.as_ref(),
-            Some(block_report_request_proto::Report::Delta(_))
+            delta.entries[0].block.as_ref(),
+            Some(delta_block_report_entry_proto::Block::Absent(block_id))
+                if BlockId::try_from(*block_id) == Ok(fourth)
         ));
     }
 
-    reporter_handle.abort();
     shutdown.send(()).ok();
 }
 
 #[tokio::test]
-async fn re_registration_rebuilds_full_report_after_block_report_registration_errors() {
-    for error in [
-        RpcErrorDetail::register_worker(ErrorKind::Worker(WorkerErrorKind::NotRegistered), "register worker"),
-        RpcErrorDetail::register_worker(ErrorKind::Worker(WorkerErrorKind::RunMismatch), "worker run mismatch"),
-    ] {
-        let worker_run_id = test_worker_run_id();
-        let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(vec![
-            MockBlockReportReply::Ok,
-            MockBlockReportReply::HeaderError(error),
-            MockBlockReportReply::Ok,
-        ])
-        .await;
-        let state = Arc::new(RegistrationSet::new());
-        let registration = Registration {
-            group_name: group_name(),
-            worker_id: WorkerId::new(42),
-            worker_run_id,
-            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
-        };
-        state.record_registered(registration.clone());
-        state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
-        let temp = TempDir::new().expect("tempdir");
-        let store = report_store(&temp);
-        let reporter = MetadataBlockReportLoop::new(
-            test_registration_config(endpoint),
-            test_registration_descriptor(worker_run_id),
-            Arc::clone(&state),
-            Arc::clone(&store),
-            test_worker_core(Arc::clone(&store)),
-        )
-        .expect("block reporter");
-        let reporter_handle = reporter.spawn();
-        wait_for_block_report_requests(&mock, 1, Duration::from_millis(500)).await;
-
-        publish_ready_block_for(store.as_ref(), group_name(), block_id(), payload(), 101);
-        wait_for_block_report_requests(&mock, 2, Duration::from_millis(500)).await;
-        tokio::time::timeout(Duration::from_millis(500), async {
-            while state.registration(&group_name()).is_some() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("block report registration error should clear the registration");
-
-        state.record_registered(registration);
-        state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
-        wait_for_block_report_requests(&mock, 3, Duration::from_millis(1_500)).await;
-
-        {
-            let requests = mock.block_report_requests.lock().unwrap();
-            assert!(matches!(
-                requests[0].report.as_ref(),
-                Some(block_report_request_proto::Report::Full(_))
-            ));
-            assert!(matches!(
-                requests[1].report.as_ref(),
-                Some(block_report_request_proto::Report::Delta(_))
-            ));
-            assert!(matches!(
-                requests[2].report.as_ref(),
-                Some(block_report_request_proto::Report::Full(_))
-            ));
-        }
-
-        reporter_handle.abort();
-        shutdown.send(()).ok();
+async fn block_report_rejects_responses_that_do_not_confirm_the_request() {
+    let full_kind = BlockReportKindProto::BlockReportKindFull as i32;
+    let delta_kind = BlockReportKindProto::BlockReportKindDelta as i32;
+    let response = |report_kind, baseline_seq, next_batch_seq, baseline_published| MockBlockReportReply::Response {
+        report_kind,
+        baseline_seq,
+        next_batch_seq,
+        baseline_published,
+    };
+    let invalid_full_responses = [
+        (response(i32::MAX, 1, 1, false), "unknown report_kind"),
+        (response(delta_kind, 1, 1, true), "requested report kind"),
+        (response(full_kind, 2, 1, false), "baseline_seq"),
+        (response(full_kind, 1, 0, false), "expected next_batch_seq>=1"),
+        (response(full_kind, 1, 3, false), "invalid next_batch_seq 3"),
+    ];
+    let mut replies = invalid_full_responses
+        .iter()
+        .map(|(reply, _)| reply.clone())
+        .collect::<Vec<_>>();
+    replies.extend([
+        MockBlockReportReply::Ok,
+        MockBlockReportReply::Ok,
+        response(delta_kind, 1, 1, false),
+    ]);
+    let worker_run_id = test_worker_run_id();
+    let (endpoint, _mock, shutdown) = start_mock_metadata_with_block_reports(replies).await;
+    let state = Arc::new(RegistrationSet::new());
+    state.record_registered(Registration {
+        group_name: group_name(),
+        worker_id: WorkerId::new(42),
+        worker_run_id,
+        advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+    });
+    state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
+    let temp = TempDir::new().expect("tempdir");
+    let store = report_store(&temp);
+    for (block_index, block_stamp) in [(0, 101), (1, 102)] {
+        publish_ready_block_for(
+            store.as_ref(),
+            group_name(),
+            BlockId::new(InodeId::new(7), BlockIndex::new(block_index)),
+            payload(),
+            block_stamp,
+        );
     }
+    let reporter = MetadataBlockReportLoop::with_options(
+        test_registration_config(endpoint),
+        test_registration_descriptor(worker_run_id),
+        Arc::clone(&state),
+        Arc::clone(&store),
+        test_worker_core(Arc::clone(&store)),
+        BlockReportOptions {
+            full_max_blocks_per_batch: 1,
+            delta_max_entries_per_batch: 1,
+        },
+    )
+    .expect("block reporter");
+
+    for (_, expected_message) in invalid_full_responses {
+        let error = reporter
+            .send_full_once()
+            .await
+            .expect_err("invalid Full acknowledgement must fail closed");
+        assert!(
+            matches!(&error, beryl_worker::control::BlockReportError::Fatal(_)),
+            "invalid Full acknowledgement must be fatal: {error}"
+        );
+        assert!(
+            error.to_string().contains(expected_message),
+            "unexpected Full acknowledgement error: {error}"
+        );
+    }
+
+    assert_eq!(reporter.send_full_once().await.unwrap().accepted_peers, 1);
+    publish_ready_block_for(
+        store.as_ref(),
+        group_name(),
+        BlockId::new(InodeId::new(7), BlockIndex::new(2)),
+        payload(),
+        103,
+    );
+    let error = reporter
+        .send_delta_once()
+        .await
+        .expect_err("Delta acknowledgement without a published baseline must fail closed");
+    assert!(matches!(&error, beryl_worker::control::BlockReportError::Fatal(_)));
+    assert!(error.to_string().contains("published Delta baseline"));
+
+    shutdown.send(()).ok();
 }
 
 #[tokio::test]
@@ -1085,7 +1236,7 @@ async fn startup_marker_recovery_precedes_first_full_block_report() {
     assert_eq!(round.accepted_peers, 1);
     let requests = mock.block_report_requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
-    let block_report_request_proto::Report::Full(full) = requests[0].report.as_ref().expect("full report") else {
+    let block_report_request_proto::Batch::FullReport(full) = requests[0].batch.as_ref().expect("full report") else {
         panic!("expected full block report");
     };
     assert!(full.blocks.is_empty(), "recovered block must not reappear as Ready");

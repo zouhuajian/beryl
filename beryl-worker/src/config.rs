@@ -38,7 +38,7 @@ const METADATA_REQUEST_TIMEOUT: &str = "beryl.worker.metadata.request-timeout";
 const METADATA_RETRY_INITIAL_BACKOFF: &str = "beryl.worker.metadata.retry.initial-backoff";
 const METADATA_RETRY_MAX_BACKOFF: &str = "beryl.worker.metadata.retry.max-backoff";
 const HEARTBEAT_INTERVAL: &str = "beryl.worker.heartbeat.interval";
-const BLOCK_REPORT_INTERVAL: &str = "beryl.worker.block.report.interval";
+const BLOCK_REPORT_DELTA_FLUSH_INTERVAL: &str = "beryl.worker.block.report.delta-flush-interval";
 const BLOCK_REPORT_BATCH_SIZE: &str = "beryl.worker.block.report.batch-size";
 const BLOCK_CLEANUP_QUEUE_CAPACITY: &str = "beryl.worker.block.cleanup.queue-capacity";
 const BLOCK_CLEANUP_CONCURRENCY: &str = "beryl.worker.block.cleanup.concurrency";
@@ -51,7 +51,10 @@ const SHUTDOWN_TIMEOUT: &str = "beryl.worker.shutdown.timeout";
 pub struct WorkerRegistrationConfig {
     /// Internal identity for the one supported metadata group.
     pub group_name: GroupName,
-    /// Tonic endpoint URIs derived from configured `host:port` addresses.
+    /// The single Metadata leader endpoint supported by the current runtime.
+    ///
+    /// This remains a vector only because the YAML key is a string list; validation
+    /// rejects zero or multiple values before any control-plane task starts.
     pub endpoints: Vec<String>,
     /// Timeout shared by registration, heartbeat, and block report RPCs.
     pub request_timeout_ms: u64,
@@ -145,7 +148,8 @@ pub struct WorkerConfig {
     pub net: WorkerNetConfig,
     pub metadata: WorkerRegistrationConfig,
     pub heartbeat_interval_ms: u64,
-    pub block_report_interval_ms: u64,
+    /// Maximum delay before retrying or flushing retained Delta changes.
+    pub block_report_delta_flush_interval_ms: u64,
     pub block_report_batch_size: usize,
     pub block_cleanup: WorkerBlockCleanupConfig,
     /// Graceful RPC/background drain interval before remaining work is cancelled.
@@ -190,7 +194,7 @@ impl Default for WorkerConfig {
             ),
             metadata: WorkerRegistrationConfig::default(),
             heartbeat_interval_ms: 1_000,
-            block_report_interval_ms: 1_000,
+            block_report_delta_flush_interval_ms: 1_000,
             block_report_batch_size: 1_000,
             block_cleanup: WorkerBlockCleanupConfig::default(),
             shutdown_timeout_ms: 30_000,
@@ -235,7 +239,10 @@ impl WorkerConfig {
         let store = parse_store_config(flat, &defaults.store)?;
         let metadata = parse_metadata_config(flat, &defaults.metadata)?;
         let heartbeat_interval_ms = flat.duration_ms_or(HEARTBEAT_INTERVAL, defaults.heartbeat_interval_ms)?;
-        let block_report_interval_ms = flat.duration_ms_or(BLOCK_REPORT_INTERVAL, defaults.block_report_interval_ms)?;
+        let block_report_delta_flush_interval_ms = flat.duration_ms_or(
+            BLOCK_REPORT_DELTA_FLUSH_INTERVAL,
+            defaults.block_report_delta_flush_interval_ms,
+        )?;
         let block_report_batch_size =
             flat.positive_usize_or(BLOCK_REPORT_BATCH_SIZE, defaults.block_report_batch_size)?;
         let shutdown_timeout_ms = flat.duration_ms_or(SHUTDOWN_TIMEOUT, defaults.shutdown_timeout_ms)?;
@@ -280,7 +287,7 @@ impl WorkerConfig {
             ),
             metadata,
             heartbeat_interval_ms,
-            block_report_interval_ms,
+            block_report_delta_flush_interval_ms,
             block_report_batch_size,
             block_cleanup,
             shutdown_timeout_ms,
@@ -495,8 +502,13 @@ fn validate_store_config(config: &WorkerConfig) -> Result<(), CommonError> {
 
 impl WorkerRegistrationConfig {
     pub fn validate(&self) -> Result<(), CommonError> {
-        if self.endpoints.is_empty() {
-            return Err(invalid_config(METADATA_ADDRESSES, "must not be empty"));
+        // TODO: Support Metadata fanout only after worker-run registration and
+        // peer-scoped report recovery are completed end to end.
+        if self.endpoints.len() != 1 {
+            return Err(invalid_config(
+                METADATA_ADDRESSES,
+                "must contain exactly one Metadata leader address",
+            ));
         }
         for endpoint in &self.endpoints {
             Endpoint::from_shared(endpoint.clone())

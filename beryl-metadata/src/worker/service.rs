@@ -4,8 +4,8 @@
 //! MetadataWorkerService implementation.
 
 use super::manager::{
-    worker_net_protocol_label, BlockReportBlock, BlockReportBlockState, BlockReportDeltaEntry, BlockReportDeltaOp,
-    WorkerManager, WORKER_NET_PROTOCOL_GRPC,
+    worker_net_protocol_label, BlockReportBlock, BlockReportBlockState, BlockReportChange, WorkerManager,
+    WORKER_NET_PROTOCOL_GRPC,
 };
 use crate::error::{to_rpc_error, MetadataError, MetadataResult};
 use crate::maintenance::BlockCleanupCoordinator;
@@ -258,23 +258,27 @@ impl MetadataWorkerServiceImpl {
         )
     }
 
-    fn proto_to_report_block(block: BlockReportBlockProto) -> MetadataResult<BlockReportBlock> {
+    fn proto_to_report_block(block: ReportedBlockProto) -> MetadataResult<BlockReportBlock> {
         let block_id_proto = block
             .block_id
             .ok_or_else(|| MetadataError::InvalidArgument("block report entry missing block_id".to_string()))?;
         let block_id = BlockId::try_from(block_id_proto)
             .unwrap_or_else(|error| panic!("validated BlockIdProto must be valid: {error}"));
-        let block_state = match block.block_state() {
-            BlockReportBlockStateProto::BlockReportBlockStateReady => BlockReportBlockState::Ready,
-            BlockReportBlockStateProto::BlockReportBlockStatePartial => BlockReportBlockState::Partial,
-            BlockReportBlockStateProto::BlockReportBlockStateCorrupt => BlockReportBlockState::Corrupt,
-            BlockReportBlockStateProto::BlockReportBlockStateDeleting => BlockReportBlockState::Deleting,
-            BlockReportBlockStateProto::BlockReportBlockStateUnspecified => {
+        let block_state = match block.state() {
+            ReportedBlockStateProto::ReportedBlockStateReady => BlockReportBlockState::Ready,
+            ReportedBlockStateProto::ReportedBlockStateCorrupt => BlockReportBlockState::Corrupt,
+            ReportedBlockStateProto::ReportedBlockStateDeleting => BlockReportBlockState::Deleting,
+            ReportedBlockStateProto::ReportedBlockStateUnspecified => {
                 return Err(MetadataError::InvalidArgument(
-                    "block report entry block_state must be specified".to_string(),
+                    "block report entry state must be specified".to_string(),
                 ));
             }
         };
+        if block.block_stamp == 0 {
+            return Err(MetadataError::InvalidArgument(
+                "block report entry block_stamp must be non-zero".to_string(),
+            ));
+        }
         if block_state == BlockReportBlockState::Ready && block.effective_len == 0 {
             return Err(MetadataError::InvalidArgument(
                 "Ready block report entry effective_len must be greater than zero".to_string(),
@@ -288,23 +292,18 @@ impl MetadataWorkerServiceImpl {
         })
     }
 
-    fn proto_to_delta(delta: BlockReportDeltaProto) -> MetadataResult<BlockReportDeltaEntry> {
-        let block = delta
-            .block
-            .ok_or_else(|| MetadataError::InvalidArgument("block report delta missing block".to_string()))?;
-        let op = match delta.op() {
-            BlockReportDeltaOpProto::BlockReportDeltaOpAddUpdate => BlockReportDeltaOp::AddUpdate,
-            BlockReportDeltaOpProto::BlockReportDeltaOpRemove => BlockReportDeltaOp::Remove,
-            BlockReportDeltaOpProto::BlockReportDeltaOpUnspecified => {
-                return Err(MetadataError::InvalidArgument(
-                    "block report delta op must be specified".to_string(),
-                ));
+    fn proto_to_delta_entry(entry: DeltaBlockReportEntryProto) -> MetadataResult<BlockReportChange> {
+        match entry.block {
+            Some(delta_block_report_entry_proto::Block::Present(block)) => {
+                Self::proto_to_report_block(block).map(BlockReportChange::Upsert)
             }
-        };
-        Ok(BlockReportDeltaEntry {
-            op,
-            block: Self::proto_to_report_block(block)?,
-        })
+            Some(delta_block_report_entry_proto::Block::Absent(block_id)) => BlockId::try_from(block_id)
+                .map(BlockReportChange::Remove)
+                .map_err(|error| MetadataError::InvalidArgument(format!("invalid absent block_id: {error}"))),
+            None => Err(MetadataError::InvalidArgument(
+                "delta block report entry block must be specified".to_string(),
+            )),
+        }
     }
 
     fn record_worker_rpc_outcome<T>(
@@ -364,9 +363,9 @@ fn tonic_status_error_kind(status: &Status) -> &'static str {
 }
 
 fn block_report_kind(req: &BlockReportRequestProto) -> &'static str {
-    match &req.report {
-        Some(block_report_request_proto::Report::Full(_)) => "full",
-        Some(block_report_request_proto::Report::Delta(_)) => "delta",
+    match &req.batch {
+        Some(block_report_request_proto::Batch::FullReport(_)) => "full",
+        Some(block_report_request_proto::Batch::DeltaReport(_)) => "delta",
         None => "unknown",
     }
 }
@@ -939,17 +938,24 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     return self.invalid_request_response(&req.header, block_report_response_with_header, error)
                 }
             };
-            let report_seq = req.report_seq;
-            let Some(report) = req.report else {
+            let baseline_seq = req.baseline_seq;
+            if baseline_seq == 0 {
                 return self.invalid_request_response(
                     &req.header,
                     block_report_response_with_header,
-                    "block report body is required",
+                    "block report baseline_seq must be non-zero",
+                );
+            }
+            let Some(batch) = req.batch else {
+                return self.invalid_request_response(
+                    &req.header,
+                    block_report_response_with_header,
+                    "block report batch is required",
                 );
             };
 
-            let (result, report_kind, batch_seq, delta_seq, final_batch) = match report {
-                block_report_request_proto::Report::Full(full) => {
+            let (report_kind, report_kind_proto, batch_seq, final_batch, apply_result) = match batch {
+                block_report_request_proto::Batch::FullReport(full) => {
                     let batch_seq = full.batch_seq;
                     let final_batch = full.final_batch;
                     if full.blocks.len() > MAX_REPORT_ENTRIES {
@@ -976,102 +982,47 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                             }
                         }
                     }
-                    let result = match self.worker_manager.receive_full_block_report(
+                    let result = self.worker_manager.receive_full_block_report(
                         &group_name,
                         worker_id,
                         worker_run_id,
-                        report_seq,
+                        baseline_seq,
                         full.batch_seq,
                         full.final_batch,
                         blocks,
-                    ) {
-                        Ok(result) => result,
-                        Err(MetadataError::NotFound(message)) => {
-                            warn!(
-                                target: "metadata.worker",
-                                op = "BlockReport",
-                                result = "rejected",
-                                error_code = "need_register",
-                                report_kind = "full",
-                                group_name = %group_name,
-                                worker_id = worker_id.as_raw(),
-                                worker_run_id = %worker_run_id,
-                                report_seq,
-                                batch_seq,
-                                final_batch,
-                                "Block report rejected"
-                            );
-                            return self.need_register_response(
-                                &req.header,
-                                block_report_response_with_header,
-                                message,
-                            );
-                        }
-                        Err(MetadataError::StaleState(message)) => {
-                            warn!(
-                                target: "metadata.worker",
-                                op = "BlockReport",
-                                result = "rejected",
-                                error_code = "worker_run_mismatch",
-                                report_kind = "full",
-                                group_name = %group_name,
-                                worker_id = worker_id.as_raw(),
-                                worker_run_id = %worker_run_id,
-                                report_seq,
-                                batch_seq,
-                                final_batch,
-                                "Block report rejected"
-                            );
-                            return self.worker_run_mismatch_response(
-                                &req.header,
-                                block_report_response_with_header,
-                                message,
-                            );
-                        }
-                        Err(MetadataError::FullReportRequired(message)) => {
-                            warn!(
-                                target: "metadata.worker",
-                                op = "BlockReport",
-                                result = "rejected",
-                                error_code = "full_report_required",
-                                report_kind = "full",
-                                group_name = %group_name,
-                                worker_id = worker_id.as_raw(),
-                                worker_run_id = %worker_run_id,
-                                report_seq,
-                                batch_seq,
-                                final_batch,
-                                "Block report rejected"
-                            );
-                            return self.full_report_required_response(
-                                &req.header,
-                                block_report_response_with_header,
-                                message,
-                            );
-                        }
-                        Err(error) => {
-                            return self.metadata_error_response(&req.header, block_report_response_with_header, error)
-                        }
-                    };
-                    (result, "full", Some(batch_seq), None, Some(final_batch))
+                    );
+                    (
+                        "full",
+                        BlockReportKindProto::BlockReportKindFull,
+                        batch_seq,
+                        Some(final_batch),
+                        result,
+                    )
                 }
-                block_report_request_proto::Report::Delta(delta) => {
-                    let delta_seq = delta.delta_seq;
-                    if delta.deltas.len() > MAX_REPORT_ENTRIES {
+                block_report_request_proto::Batch::DeltaReport(delta) => {
+                    let batch_seq = delta.batch_seq;
+                    if delta.entries.is_empty() {
+                        return self.invalid_request_response(
+                            &req.header,
+                            block_report_response_with_header,
+                            "delta block report entries must be non-empty",
+                        );
+                    }
+                    if delta.entries.len() > MAX_REPORT_ENTRIES {
                         return self.metadata_error_response(
                             &req.header,
                             block_report_response_with_header,
                             MetadataError::ResourceExhausted(format!(
                                 "delta block report entry count {} exceeds maximum {}",
-                                delta.deltas.len(),
+                                delta.entries.len(),
                                 MAX_REPORT_ENTRIES
                             )),
                         );
                     }
-                    let mut deltas = Vec::with_capacity(delta.deltas.len());
-                    for delta in delta.deltas {
-                        match Self::proto_to_delta(delta) {
-                            Ok(delta) => deltas.push(delta),
+                    let mut changes = Vec::with_capacity(delta.entries.len());
+                    for entry in delta.entries {
+                        match Self::proto_to_delta_entry(entry) {
+                            Ok(change) => changes.push(change),
                             Err(error) => {
                                 return self.metadata_error_response(
                                     &req.header,
@@ -1081,80 +1032,76 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                             }
                         }
                     }
-                    let result = match self.worker_manager.apply_delta_block_report(
+                    let result = self.worker_manager.apply_delta_block_report(
                         &group_name,
                         worker_id,
                         worker_run_id,
-                        report_seq,
-                        delta_seq,
-                        deltas,
-                    ) {
-                        Ok(result) => result,
-                        Err(MetadataError::NotFound(message)) => {
-                            warn!(
-                                target: "metadata.worker",
-                                op = "BlockReport",
-                                result = "rejected",
-                                error_code = "need_register",
-                                report_kind = "delta",
-                                group_name = %group_name,
-                                worker_id = worker_id.as_raw(),
-                                worker_run_id = %worker_run_id,
-                                report_seq,
-                                delta_seq,
-                                "Block report rejected"
-                            );
-                            return self.need_register_response(
-                                &req.header,
-                                block_report_response_with_header,
-                                message,
-                            );
-                        }
-                        Err(MetadataError::StaleState(message)) => {
-                            warn!(
-                                target: "metadata.worker",
-                                op = "BlockReport",
-                                result = "rejected",
-                                error_code = "worker_run_mismatch",
-                                report_kind = "delta",
-                                group_name = %group_name,
-                                worker_id = worker_id.as_raw(),
-                                worker_run_id = %worker_run_id,
-                                report_seq,
-                                delta_seq,
-                                "Block report rejected"
-                            );
-                            return self.worker_run_mismatch_response(
-                                &req.header,
-                                block_report_response_with_header,
-                                message,
-                            );
-                        }
-                        Err(MetadataError::FullReportRequired(message)) => {
-                            warn!(
-                                target: "metadata.worker",
-                                op = "BlockReport",
-                                result = "rejected",
-                                error_code = "full_report_required",
-                                report_kind = "delta",
-                                group_name = %group_name,
-                                worker_id = worker_id.as_raw(),
-                                worker_run_id = %worker_run_id,
-                                report_seq,
-                                delta_seq,
-                                "Block report rejected"
-                            );
-                            return self.full_report_required_response(
-                                &req.header,
-                                block_report_response_with_header,
-                                message,
-                            );
-                        }
-                        Err(error) => {
-                            return self.metadata_error_response(&req.header, block_report_response_with_header, error)
-                        }
-                    };
-                    (result, "delta", None, Some(delta_seq), None)
+                        baseline_seq,
+                        batch_seq,
+                        changes,
+                    );
+                    (
+                        "delta",
+                        BlockReportKindProto::BlockReportKindDelta,
+                        batch_seq,
+                        None,
+                        result,
+                    )
+                }
+            };
+
+            let result = match apply_result {
+                Ok(result) => result,
+                Err(MetadataError::NotFound(message)) => {
+                    warn!(
+                        target: "metadata.worker",
+                        op = "BlockReport",
+                        result = "rejected",
+                        error_code = "need_register",
+                        report_kind,
+                        group_name = %group_name,
+                        worker_id = worker_id.as_raw(),
+                        worker_run_id = %worker_run_id,
+                        baseline_seq,
+                        batch_seq,
+                        "Block report rejected"
+                    );
+                    return self.need_register_response(&req.header, block_report_response_with_header, message);
+                }
+                Err(MetadataError::StaleState(message)) => {
+                    warn!(
+                        target: "metadata.worker",
+                        op = "BlockReport",
+                        result = "rejected",
+                        error_code = "worker_run_mismatch",
+                        report_kind,
+                        group_name = %group_name,
+                        worker_id = worker_id.as_raw(),
+                        worker_run_id = %worker_run_id,
+                        baseline_seq,
+                        batch_seq,
+                        "Block report rejected"
+                    );
+                    return self.worker_run_mismatch_response(&req.header, block_report_response_with_header, message);
+                }
+                Err(MetadataError::FullReportRequired(message)) => {
+                    warn!(
+                        target: "metadata.worker",
+                        op = "BlockReport",
+                        result = "rejected",
+                        error_code = "full_report_required",
+                        report_kind,
+                        group_name = %group_name,
+                        worker_id = worker_id.as_raw(),
+                        worker_run_id = %worker_run_id,
+                        baseline_seq,
+                        batch_seq,
+                        "Block report rejected"
+                    );
+                    return self.full_report_required_response(&req.header, block_report_response_with_header, message);
+                }
+                Err(error) => {
+                    return self.metadata_error_response(&req.header, block_report_response_with_header, error)
                 }
             };
 
@@ -1162,10 +1109,8 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             observe::record_worker_block_report_blocks("removed", result.removed_blocks.len());
 
             let changed_block_count = result.added_blocks.len() + result.removed_blocks.len();
-            let full_baseline_changed = matches!((batch_seq, final_batch), (Some(_), Some(true)))
-                && (result.baseline_established || result.baseline_replaced);
-            if changed_block_count > 0 || full_baseline_changed {
-                if let (Some(batch_seq), Some(final_batch)) = (batch_seq, final_batch) {
+            if changed_block_count > 0 || result.baseline_published {
+                if let Some(final_batch) = final_batch {
                     info!(
                         target: "metadata.block",
                         op = "FullBlockReport",
@@ -1177,16 +1122,16 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                         group_name = %group_name,
                         worker_id = worker_id.as_raw(),
                         worker_run_id = %worker_run_id,
-                        report_seq,
+                        baseline_seq,
                         batch_seq,
                         final_batch,
-                        next_delta_seq = result.next_delta_seq,
+                        next_batch_seq = result.next_batch_seq,
                         added_blocks = result.added_blocks.len(),
                         removed_blocks = result.removed_blocks.len(),
                         changed_block_count,
                         "Full block report processed"
                     );
-                } else if let Some(delta_seq) = delta_seq {
+                } else {
                     info!(
                         target: "metadata.block",
                         op = "DeltaBlockReport",
@@ -1198,9 +1143,9 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                         group_name = %group_name,
                         worker_id = worker_id.as_raw(),
                         worker_run_id = %worker_run_id,
-                        report_seq,
-                        delta_seq,
-                        next_delta_seq = result.next_delta_seq,
+                        baseline_seq,
+                        batch_seq,
+                        next_batch_seq = result.next_batch_seq,
                         added_blocks = result.added_blocks.len(),
                         removed_blocks = result.removed_blocks.len(),
                         changed_block_count,
@@ -1209,10 +1154,19 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 }
             }
 
+            let baseline_published = match report_kind_proto {
+                BlockReportKindProto::BlockReportKindFull => result.baseline_published,
+                BlockReportKindProto::BlockReportKindDelta => true,
+                BlockReportKindProto::BlockReportKindUnspecified => {
+                    unreachable!("validated block report batch always has a concrete kind")
+                }
+            };
             Ok(Response::new(BlockReportResponseProto {
                 header: Some(self.create_response_header_from_request(&req.header, Some(&group_name))),
-                report_seq,
-                next_delta_seq: result.next_delta_seq,
+                report_kind: report_kind_proto as i32,
+                baseline_seq,
+                next_batch_seq: result.next_batch_seq,
+                baseline_published,
             }))
         }
         .await;
@@ -1308,38 +1262,27 @@ mod tests {
         block_id.into()
     }
 
-    fn report_block_proto(block_id: BlockId) -> BlockReportBlockProto {
-        BlockReportBlockProto {
-            block_id: Some(block_proto(block_id)),
-            block_stamp: 100 + u64::from(block_id.index.as_raw()),
-            block_state: BlockReportBlockStateProto::BlockReportBlockStateReady as i32,
-            effective_len: 64,
-        }
-    }
-
-    fn delta_report_request(
+    fn absent_delta_request(
         group_name: GroupName,
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
-        report_seq: u64,
-        delta_seq: u64,
-        deltas: Vec<(BlockReportDeltaOpProto, BlockId)>,
+        baseline_seq: u64,
+        batch_seq: u64,
+        block_id: BlockId,
     ) -> BlockReportRequestProto {
         BlockReportRequestProto {
             header: Some(valid_request_header(&group_name, ClientId::new(72))),
             worker_id: worker_id.as_raw(),
             worker_run_id: worker_run_id.to_string(),
-            report_seq,
-            report: Some(block_report_request_proto::Report::Delta(DeltaBlockReportProto {
-                delta_seq,
-                deltas: deltas
-                    .into_iter()
-                    .map(|(op, block_id)| BlockReportDeltaProto {
-                        op: op as i32,
-                        block: Some(report_block_proto(block_id)),
-                    })
-                    .collect(),
-            })),
+            baseline_seq,
+            batch: Some(block_report_request_proto::Batch::DeltaReport(
+                DeltaBlockReportBatchProto {
+                    batch_seq,
+                    entries: vec![DeltaBlockReportEntryProto {
+                        block: Some(delta_block_report_entry_proto::Block::Absent(block_proto(block_id))),
+                    }],
+                },
+            )),
         }
     }
 
@@ -1480,13 +1423,13 @@ mod tests {
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
             &service,
-            Request::new(delta_report_request(
+            Request::new(absent_delta_request(
                 group_name("root"),
                 worker_id,
                 worker_run_id,
                 3,
                 0,
-                vec![(BlockReportDeltaOpProto::BlockReportDeltaOpRemove, block_id)],
+                block_id,
             )),
         )
         .await
@@ -1494,7 +1437,10 @@ mod tests {
         .into_inner();
 
         assert!(response.header.as_ref().expect("header").error.is_none());
-        assert_eq!(response.next_delta_seq, 1);
+        assert_eq!(response.report_kind(), BlockReportKindProto::BlockReportKindDelta);
+        assert_eq!(response.baseline_seq, 3);
+        assert_eq!(response.next_batch_seq, 1);
+        assert!(response.baseline_published);
         assert!(worker_manager
             .get_block_locations(&group_name("root"), block_id)
             .is_empty());
@@ -1604,7 +1550,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_accepts_liveness_without_raft_propose_for_leader_and_follower() {
-        for (worker_id, leader, report_seq) in [(WorkerId::new(12), false, 7), (WorkerId::new(13), true, 1)] {
+        for (worker_id, leader, heartbeat_seq) in [(WorkerId::new(12), false, 7), (WorkerId::new(13), true, 1)] {
             let dir = TempDir::new().unwrap();
             let raft_node = if leader {
                 leader_raft(&dir).await
@@ -1632,7 +1578,7 @@ mod tests {
                     group_name("root"),
                     worker_id,
                     test_worker_run_id(),
-                    report_seq,
+                    heartbeat_seq,
                     9090,
                 )),
             )
