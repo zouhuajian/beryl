@@ -7,7 +7,7 @@ use super::filesystem::{FsFailure, FsSuccess, RequestContext};
 use crate::error::MetadataError;
 use beryl_common::error::rpc::{ErrorKind, ProtocolErrorKind, RpcErrorDetail};
 use beryl_common::header::{RequestHeader, ResponseHeader};
-use beryl_types::{FileBlockLocation, GroupName, GroupStateWatermark, WriteTarget};
+use beryl_types::{FileBlockLocation, GroupName, GroupStateWatermark, LocatedBlock};
 use tracing::Span;
 
 #[allow(clippy::result_large_err)]
@@ -184,7 +184,7 @@ pub(crate) fn file_attrs_from_proto(
     })
 }
 
-pub(crate) fn write_target_to_proto(target: &WriteTarget) -> beryl_proto::metadata::WriteTargetProto {
+pub(crate) fn located_block_to_proto(target: &LocatedBlock) -> beryl_proto::metadata::LocatedBlockProto {
     target.into()
 }
 

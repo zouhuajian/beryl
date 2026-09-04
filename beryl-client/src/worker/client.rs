@@ -12,7 +12,7 @@ use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
 use crate::planner::PlannedBlockRead;
 use crate::runtime::AttemptContext;
-use beryl_types::{GroupName, WriteTarget};
+use beryl_types::{GroupName, LocatedBlock};
 
 /// Owns file-level Worker orchestration while delegating each block-local IO
 /// operation to a transport implementation.
@@ -82,7 +82,7 @@ impl WorkerClient {
         &self,
         attempt: AttemptContext,
         group_name: GroupName,
-        target: WriteTarget,
+        target: LocatedBlock,
         lease_expires_at_ms: u64,
     ) -> ClientResult<BlockWrite> {
         self.transport

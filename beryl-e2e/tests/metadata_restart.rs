@@ -11,9 +11,9 @@ use beryl_proto::convert::rpc_error_from_proto;
 use beryl_proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
 use beryl_proto::metadata::get_block_locations_request_proto::Target;
 use beryl_proto::metadata::{
-    AbortFileWriteRequestProto, AddBlockRequestProto, CommitFileRequestProto, CommittedBlockProto,
-    CreateFileRequestProto, GetBlockLocationsRequestProto, OpenWriteModeProto, OpenWriteRequestProto, WriteHandleProto,
-    WriteTargetProto,
+    AbortFileWriteRequestProto, AllocateBlockRequestProto, CommitFileRequestProto, CommittedBlockProto,
+    CreateFileRequestProto, GetBlockLocationsRequestProto, LocatedBlockProto, OpenWriteModeProto,
+    OpenWriteRequestProto, WriteHandleProto,
 };
 use beryl_proto::worker::worker_data_service_client::WorkerDataServiceClient;
 use beryl_proto::worker::write_block_request_proto::Payload;
@@ -303,55 +303,15 @@ async fn create_replay_survives_restart_and_session_operations_converge() {
 
     let write_handle = create.write_handle.expect("write handle");
 
-    let add_header = metadata_header(801);
-    let add_request = AddBlockRequestProto {
-        header: Some(add_header.clone()),
-        write_handle: Some(write_handle),
-        previous_block_id: None,
-    };
-    let first_add = metadata
-        .add_block(Request::new(add_request.clone()))
-        .await
-        .expect("first AddBlock")
-        .into_inner();
-    let replay_add = metadata
-        .add_block(Request::new(add_request))
-        .await
-        .expect("replayed AddBlock")
-        .into_inner();
-    assert_metadata_ok(first_add.header);
-    assert_metadata_ok(replay_add.header);
-    assert_eq!(replay_add.target, first_add.target);
-    let first_target = first_add.target.expect("first target");
-    let first_block_id = first_target.block_id.expect("first block id");
-    let second_add = metadata
-        .add_block(Request::new(AddBlockRequestProto {
-            header: Some(metadata_header(801)),
-            write_handle: Some(write_handle),
-            previous_block_id: Some(first_block_id),
-        }))
-        .await
-        .expect("second logical AddBlock")
-        .into_inner();
-    assert_metadata_ok(second_add.header);
-    let second_block_id = second_add
-        .target
-        .expect("second target")
-        .block_id
-        .expect("second block id");
-    assert_eq!(second_block_id.block_index, first_block_id.block_index + 1);
-
-    let first_step_replay = metadata
-        .add_block(Request::new(AddBlockRequestProto {
-            header: Some(add_header),
-            write_handle: Some(write_handle),
-            previous_block_id: None,
-        }))
-        .await
-        .expect("AddBlock replay response")
-        .into_inner();
-    assert_metadata_ok(first_step_replay.header);
-    assert_eq!(first_step_replay.target, Some(first_target));
+    let header = metadata_header(801);
+    let first = allocate_block(&mut metadata, write_handle, None, header.clone()).await;
+    let replay = allocate_block(&mut metadata, write_handle, None, header.clone()).await;
+    assert_eq!(replay, first);
+    let first_id = first.block_id.expect("first block id");
+    let second = allocate_block(&mut metadata, write_handle, Some(first_id), metadata_header(801)).await;
+    assert_eq!(second.block_id.unwrap().block_index, first_id.block_index + 1);
+    let historical = allocate_block(&mut metadata, write_handle, None, header).await;
+    assert_eq!(historical, first);
 
     let abort_request = AbortFileWriteRequestProto {
         header: Some(metadata_header(801)),
@@ -398,17 +358,8 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
     let old_handle = create.write_handle.expect("write handle");
     let mut previous_block_id = None;
     for index in 0..12 {
-        let add = metadata
-            .add_block(Request::new(AddBlockRequestProto {
-                header: Some(metadata_header(900)),
-                write_handle: Some(old_handle),
-                previous_block_id,
-            }))
-            .await
-            .expect("AddBlock")
-            .into_inner();
-        assert_metadata_ok(add.header);
-        let block_id = add.target.expect("write target").block_id.expect("block id");
+        let block = allocate_block(&mut metadata, old_handle, previous_block_id, metadata_header(900)).await;
+        let block_id = block.block_id.expect("block id");
         assert_eq!(block_id.inode_id, old_handle.inode_id);
         assert_eq!(block_id.block_index, index as u32);
         previous_block_id = Some(block_id);
@@ -434,17 +385,7 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
     let new_handle = reopened.write_handle.expect("new write handle");
     assert_eq!(new_handle.inode_id, old_handle.inode_id);
     let payload = deterministic_bytes(1024);
-    let next = metadata
-        .add_block(Request::new(AddBlockRequestProto {
-            header: Some(metadata_header(900)),
-            write_handle: Some(new_handle),
-            previous_block_id: None,
-        }))
-        .await
-        .expect("AddBlock after restart")
-        .into_inner();
-    assert_metadata_ok(next.header);
-    let target = next.target.expect("write target after restart");
+    let target = allocate_block(&mut metadata, new_handle, None, metadata_header(900)).await;
     let block_id = target.block_id.expect("block id after restart");
     assert_eq!(block_id.inode_id, new_handle.inode_id);
     assert_eq!(block_id.block_index, 12);
@@ -569,16 +510,7 @@ async fn raw_create_worker_ready_block(
     let write_mode = OpenWriteModeProto::OpenWriteModeWrite as i32;
     let write_handle = create.write_handle.expect("write handle");
 
-    let add_block = metadata
-        .add_block(Request::new(AddBlockRequestProto {
-            header: Some(metadata_header(401)),
-            write_handle: Some(write_handle),
-            previous_block_id: None,
-        }))
-        .await?
-        .into_inner();
-    assert_metadata_ok(add_block.header);
-    let target = add_block.target.expect("write target");
+    let target = allocate_block(&mut metadata, write_handle, None, metadata_header(401)).await;
     write_worker_target(&target, payload).await?;
     let committed_block = CommittedBlockProto {
         block_id: target.block_id,
@@ -621,7 +553,26 @@ async fn assert_stale_commit_file(cluster: &TestCluster, active: RawWorkerReadyW
     Ok(())
 }
 
-async fn write_worker_target(target: &WriteTargetProto, payload: &[u8]) -> TestResult<()> {
+async fn allocate_block(
+    metadata: &mut FileSystemServiceProtoClient<tonic::transport::Channel>,
+    write_handle: WriteHandleProto,
+    previous_block_id: Option<beryl_proto::common::BlockIdProto>,
+    header: RequestHeaderProto,
+) -> LocatedBlockProto {
+    let response = metadata
+        .allocate_block(Request::new(AllocateBlockRequestProto {
+            header: Some(header),
+            write_handle: Some(write_handle),
+            previous_block_id,
+        }))
+        .await
+        .expect("AllocateBlock transport")
+        .into_inner();
+    assert_metadata_ok(response.header);
+    response.block.expect("allocated block")
+}
+
+async fn write_worker_target(target: &LocatedBlockProto, payload: &[u8]) -> TestResult<()> {
     let worker = target
         .worker_endpoints
         .first()

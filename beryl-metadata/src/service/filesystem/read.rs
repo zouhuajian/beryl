@@ -1152,7 +1152,7 @@ mod tests {
             .await
             .expect("open write should succeed");
         let key = open.payload;
-        let target = add_block_for_key(&env.filesystem, &key).await;
+        let target = allocate_block_for_key(&env.filesystem, &key).await;
         publish_env_write_target(&env, &target, 1);
         commit_for_key(
             &env.filesystem,

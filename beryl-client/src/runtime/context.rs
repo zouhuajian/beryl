@@ -24,7 +24,7 @@ pub(crate) enum Operation {
     OpenFile,
     CreateFile,
     OpenWrite,
-    AddBlock,
+    AllocateBlock,
     CommitFile,
     AbortFileWrite,
     RenewLease,
@@ -46,7 +46,7 @@ impl Operation {
             Self::OpenFile => "OpenFile",
             Self::CreateFile => "CreateFile",
             Self::OpenWrite => "OpenWrite",
-            Self::AddBlock => "AddBlock",
+            Self::AllocateBlock => "AllocateBlock",
             Self::CommitFile => "CommitFile",
             Self::AbortFileWrite => "AbortFileWrite",
             Self::RenewLease => "RenewLease",
@@ -63,7 +63,7 @@ impl Operation {
             Self::GetStatus | Self::ListStatus | Self::OpenFile | Self::Msync | Self::Read => RetrySafety::ReadOnly,
             Self::CreateDirectoryRecursive
             | Self::CreateFile
-            | Self::AddBlock
+            | Self::AllocateBlock
             | Self::CommitFile
             | Self::AbortFileWrite
             | Self::RenewLease

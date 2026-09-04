@@ -182,7 +182,7 @@ Write-session limits are also restart-only:
 Excess `OpenWrite` calls fail before an opening can submit a Raft proposal.
 The shipped defaults are `1024` globally and `64` per client.
 
-Write-target limits are restart-only and count both AddBlock requests pending
+Write-target limits are restart-only and count both AllocateBlock requests pending
 allocation and targets already issued to active sessions:
 
 - `beryl.metadata.write-target.max-outstanding` bounds pending plus issued
@@ -192,6 +192,11 @@ allocation and targets already issued to active sessions:
 
 Existing predecessor replay does not consume another target slot. New
 limit-plus-one requests fail before `AllocateBlock` is proposed through Raft.
+`AllocateBlock` returns a `LocatedBlock` containing selected write locations and
+authorization; allocation does not create Worker data or publish file contents.
+Replay is scoped to the active session chain. `SyncWrite` retires unpublished
+suffix allocations, and Metadata restart invalidates leader-local sessions.
+Placement failure after durable allocation can leave a permanent block-index gap.
 The shipped defaults are `65536` globally and `10000` per session. The
 per-session value cannot exceed the compiled file extent maximum.
 

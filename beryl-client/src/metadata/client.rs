@@ -10,7 +10,7 @@ use crate::error::{
     invalid_response, side_effect_response_body_mismatch, ClientError, ClientErrorKind, ClientResult, RefreshHint,
 };
 use crate::metadata::{
-    AddBlockResult, ListStatusPage, MetadataTransport, OpenedFile, ReadLayout, ValidatedMetadataResponse,
+    AllocateBlockResult, ListStatusPage, MetadataTransport, OpenedFile, ReadLayout, ValidatedMetadataResponse,
 };
 use crate::metrics;
 use crate::metrics::{ClientMetric, ClientMetricLabels};
@@ -22,7 +22,7 @@ use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
 use beryl_proto::common::ByteRangeProto;
 use beryl_proto::metadata::get_block_locations_request_proto::Target;
 use beryl_proto::metadata::{
-    AbortFileWriteRequestProto, AbortFileWriteResponseProto, AddBlockRequestProto, CommitFileRequestProto,
+    AbortFileWriteRequestProto, AbortFileWriteResponseProto, AllocateBlockRequestProto, CommitFileRequestProto,
     CommitFileResponseProto, CreateDirectoryRequestProto, CreateDirectoryResponseProto, CreateFileRequestProto,
     DeleteOptionsProto, DeleteRequestProto, FileAttrsProto, FileTypeProto, GetBlockLocationsRequestProto,
     GetStatusRequestProto, GetStatusResponseProto, ListStatusRequestProto, ListStatusResponseProto, MsyncRequestProto,
@@ -332,23 +332,25 @@ impl MetadataClient {
 
     /// Allocates the next Metadata-authorized block and retains its operation
     /// identity for cross-plane target validation.
-    pub(crate) async fn add_block(
+    /// Retries keep the same handle, predecessor, call identity, and deadline;
+    /// Metadata decides whether that predecessor still has a replayable result.
+    pub(crate) async fn allocate_block(
         &self,
         path: &str,
         write_handle: WriteHandle,
         previous_block_id: Option<BlockId>,
         deadline: OperationDeadline,
-    ) -> ClientResult<(OperationContext, AddBlockResult)> {
-        let operation = self.operation(Operation::AddBlock, Some(path.to_string()), deadline)?;
+    ) -> ClientResult<(OperationContext, AllocateBlockResult)> {
+        let operation = self.operation(Operation::AllocateBlock, Some(path.to_string()), deadline)?;
         let result = self
             .execute_mutation_metadata(
                 operation.clone(),
-                AddBlockRequestProto {
+                AllocateBlockRequestProto {
                     header: None,
                     write_handle: Some(write_handle.into()),
                     previous_block_id: previous_block_id.map(Into::into),
                 },
-                |transport, ctx, req| async move { transport.add_block(ctx, req).await },
+                |transport, ctx, req| async move { transport.allocate_block(ctx, req).await },
             )
             .await?;
         Ok((operation, result))

@@ -13,6 +13,6 @@ pub(crate) mod transport;
 
 pub(crate) use client::MetadataClient;
 pub(crate) use model::{
-    AddBlockResult, ListStatusPage, MetadataAuthorityUpdate, OpenedFile, ReadLayout, ValidatedMetadataResponse,
+    AllocateBlockResult, ListStatusPage, MetadataAuthorityUpdate, OpenedFile, ReadLayout, ValidatedMetadataResponse,
 };
 pub(crate) use transport::{GrpcMetadataTransport, MetadataTransport};

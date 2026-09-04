@@ -13,10 +13,10 @@ use beryl_proto::common::{
     TierProto, WorkerEndpointInfoProto,
 };
 use beryl_proto::metadata::{
-    AbortFileWriteResponseProto, AddBlockResponseProto, CommitFileResponseProto, CreateDirectoryResponseProto,
+    AbortFileWriteResponseProto, AllocateBlockResponseProto, CommitFileResponseProto, CreateDirectoryResponseProto,
     CreateFileResponseProto, FileAttrsProto, FileBlockLocationProto, FileTypeProto, GetBlockLocationsResponseProto,
-    GetStatusResponseProto, MsyncResponseProto, OpenFileResponseProto, RenewLeaseResponseProto, SyncWriteResponseProto,
-    WriteHandleProto, WriteTargetProto,
+    GetStatusResponseProto, LocatedBlockProto, MsyncResponseProto, OpenFileResponseProto, RenewLeaseResponseProto,
+    SyncWriteResponseProto, WriteHandleProto,
 };
 use beryl_types::BlockFormatId;
 use bytes::Bytes;
@@ -268,7 +268,7 @@ async fn reader_replans_without_advancing_position_and_rejects_local_bounds_befo
 }
 
 #[tokio::test]
-async fn malformed_create_and_add_block_successes_fail_closed_before_worker_io() {
+async fn malformed_create_and_allocate_block_successes_fail_closed_before_worker_io() {
     let mut missing_layout = create_response(301, 8);
     missing_layout.layout = None;
     let mut zero_inode = create_response(301, 8);
@@ -280,9 +280,9 @@ async fn malformed_create_and_add_block_successes_fail_closed_before_worker_io()
             .into_iter()
             .map(MetadataReply::success)
             .collect(),
-        add_block: VecDeque::from([MetadataReply::success(AddBlockResponseProto {
-            target: Some(write_target(302, 0, 1, "127.0.0.1:9", 8)),
-            ..AddBlockResponseProto::default()
+        allocate_block: VecDeque::from([MetadataReply::success(AllocateBlockResponseProto {
+            block: Some(write_target(302, 0, 1, "127.0.0.1:9", 8)),
+            ..AllocateBlockResponseProto::default()
         })]),
         ..MetadataScript::default()
     });
@@ -303,20 +303,20 @@ async fn malformed_create_and_add_block_successes_fail_closed_before_worker_io()
     let add_error = writer
         .write_all(Bytes::from_static(b"x"))
         .await
-        .expect_err("mismatched AddBlock target");
+        .expect_err("mismatched AllocateBlock target");
     assert_client_error(
         &add_error,
         ClientErrorKind::InvalidResponse,
         true,
         "file_offset mismatch",
     );
-    assert_eq!(add_error.operation(), Some("AddBlock"));
+    assert_eq!(add_error.operation(), Some("AllocateBlock"));
     let stale = writer
         .write_all(Bytes::from_static(b"!"))
         .await
-        .expect_err("unknown AddBlock blocks writes");
+        .expect_err("unknown AllocateBlock blocks writes");
     assert_client_error(&stale, ClientErrorKind::StaleHandle, false, "unknown outcome");
-    assert_eq!(calls_for(&metadata.calls(), "AddBlock").len(), 1);
+    assert_eq!(calls_for(&metadata.calls(), "AllocateBlock").len(), 1);
     server.shutdown().await;
 }
 
@@ -360,9 +360,9 @@ async fn malformed_sync_response_blocks_new_writes_until_the_same_sync_resolves(
     let worker_server = worker.start().await;
     let metadata = MockMetadata::new(MetadataScript {
         create_file: VecDeque::from([MetadataReply::success(create_response(304, 8))]),
-        add_block: VecDeque::from([MetadataReply::success(AddBlockResponseProto {
-            target: Some(write_target(304, 0, 0, worker_server.endpoint(), 8)),
-            ..AddBlockResponseProto::default()
+        allocate_block: VecDeque::from([MetadataReply::success(AllocateBlockResponseProto {
+            block: Some(write_target(304, 0, 0, worker_server.endpoint(), 8)),
+            ..AllocateBlockResponseProto::default()
         })]),
         sync_write: VecDeque::from([
             MetadataReply::success(SyncWriteResponseProto {
@@ -446,9 +446,9 @@ async fn worker_failure_after_ack_invalidates_the_writer_and_prevents_commit() {
     let worker_server = worker.start().await;
     let metadata = MockMetadata::new(MetadataScript {
         create_file: VecDeque::from([MetadataReply::success(create_response(306, 8))]),
-        add_block: VecDeque::from([MetadataReply::success(AddBlockResponseProto {
-            target: Some(write_target(306, 0, 0, worker_server.endpoint(), 8)),
-            ..AddBlockResponseProto::default()
+        allocate_block: VecDeque::from([MetadataReply::success(AllocateBlockResponseProto {
+            block: Some(write_target(306, 0, 0, worker_server.endpoint(), 8)),
+            ..AllocateBlockResponseProto::default()
         })]),
         ..MetadataScript::default()
     });
@@ -474,22 +474,28 @@ async fn worker_failure_after_ack_invalidates_the_writer_and_prevents_commit() {
 }
 
 #[tokio::test]
-async fn marked_worker_capacity_is_retried_without_invalidating_the_writer() {
+async fn allocation_replay_and_worker_capacity_retries_keep_the_same_block() {
     let worker = MockWorker::new(WorkerScript {
         writes: VecDeque::from([
             WriteReply::CapacityRejected,
             WriteReply::CapacityRejected,
             WriteReply::CapacityRejected,
+            WriteReply::Success,
         ]),
         ..WorkerScript::default()
     });
     let worker_server = worker.start().await;
+    let allocated = AllocateBlockResponseProto {
+        block: Some(write_target(307, 0, 0, worker_server.endpoint(), 8)),
+        ..AllocateBlockResponseProto::default()
+    };
     let metadata = MockMetadata::new(MetadataScript {
         create_file: VecDeque::from([MetadataReply::success(create_response(307, 8))]),
-        add_block: VecDeque::from([MetadataReply::success(AddBlockResponseProto {
-            target: Some(write_target(307, 0, 0, worker_server.endpoint(), 8)),
-            ..AddBlockResponseProto::default()
-        })]),
+        allocate_block: VecDeque::from([
+            MetadataReply::status(Status::unavailable("allocation response lost")),
+            MetadataReply::success(allocated.clone()),
+            MetadataReply::success(allocated),
+        ]),
         ..MetadataScript::default()
     });
     let metadata_server = metadata.start().await;
@@ -505,8 +511,23 @@ async fn marked_worker_capacity_is_retried_without_invalidating_the_writer() {
         .write_all(Bytes::new())
         .await
         .expect("definite pre-side-effect rejection leaves writer open");
-    assert_eq!(calls_for(&metadata.calls(), "AddBlock").len(), 1);
     assert_eq!(worker.write_calls(), 3);
+    assert_eq!(worker.write_data_frames(), 0);
+    writer
+        .write_all(Bytes::from_static(b"12345678"))
+        .await
+        .expect("capacity recovered");
+    assert_eq!(writer.cursor(), 8);
+    assert_eq!(worker.write_calls(), 4);
+    assert_eq!(worker.write_completions(), 1);
+    let calls = metadata.calls();
+    let allocations = calls_for(&calls, "AllocateBlock");
+    assert_eq!(allocations.len(), 3);
+    assert_same_identity_and_deadline(&allocations[..2]);
+    for request in metadata.allocations() {
+        assert_eq!(request.write_handle, Some(write_handle(307)));
+        assert_eq!(request.previous_block_id, None);
+    }
     metadata_server.shutdown().await;
     worker_server.shutdown().await;
 }
@@ -602,10 +623,10 @@ fn write_target(
     file_offset: u64,
     worker_endpoint: &str,
     block_size: u64,
-) -> WriteTargetProto {
+) -> LocatedBlockProto {
     let block_id = BlockIdProto { inode_id, block_index };
     let format = BlockFormatId::CURRENT_FOR_NEW_FILE;
-    WriteTargetProto {
+    LocatedBlockProto {
         block_id: Some(block_id),
         file_offset,
         block_format_id: format.as_raw(),

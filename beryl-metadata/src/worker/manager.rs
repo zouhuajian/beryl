@@ -7,7 +7,7 @@ use crate::error::{MetadataError, MetadataResult};
 use crate::placement::{ReportedBlockLocation, WorkerPlacementView};
 use beryl_types::ids::{BlockId, WorkerId};
 use beryl_types::layout::BlockFormatId;
-use beryl_types::{GroupName, TierFree, WorkerNetProtocol, WorkerRunId, WriteTarget};
+use beryl_types::{GroupName, LocatedBlock, TierFree, WorkerNetProtocol, WorkerRunId};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -274,7 +274,7 @@ pub(crate) enum PublishReadyStatus {
 /// One metadata-issued target paired with the exact length requested for publication.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PublishReadyTarget {
-    pub(crate) target: WriteTarget,
+    pub(crate) target: LocatedBlock,
     pub(crate) effective_len: u64,
 }
 
@@ -1726,8 +1726,8 @@ mod tests {
     use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
     use beryl_types::lease::{FencingToken, LeaseEpoch};
     use beryl_types::{
-        BlockFormatId, ClientId, GroupName, Tier, TierFree, WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId,
-        WriteTarget,
+        BlockFormatId, ClientId, GroupName, LocatedBlock, Tier, TierFree, WorkerEndpointInfo, WorkerNetProtocol,
+        WorkerRunId,
     };
     use std::time::{Duration, Instant};
 
@@ -1806,7 +1806,7 @@ mod tests {
     ) -> PublishReadyTarget {
         PublishReadyTarget {
             effective_len: 64,
-            target: WriteTarget {
+            target: LocatedBlock {
                 block_id,
                 file_offset: 0,
                 block_size: 64,
