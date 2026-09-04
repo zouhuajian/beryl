@@ -10,6 +10,7 @@ use beryl_common::error::rpc::{
     ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind,
 };
 use beryl_types::ids::MountId;
+use beryl_types::LeaseEpoch;
 use thiserror::Error;
 
 /// Metadata service error.
@@ -77,7 +78,7 @@ pub enum MetadataError {
 
     /// Lease fenced: expected epoch >= {expected}, got {got}.
     #[error("lease fenced: expected epoch >= {expected}, got {got}")]
-    LeaseFenced { expected: u64, got: u64 },
+    LeaseFenced { expected: LeaseEpoch, got: LeaseEpoch },
 
     /// Leader changed (retryable).
     #[error("leader changed: {0}")]

@@ -3,20 +3,23 @@
 
 //! Bounded sequential and positioned file reads.
 
-use std::fmt;
-use std::sync::Arc;
-
-use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
-use bytes::Bytes;
-
 use crate::client_inner::{metric_labels, refresh_hint_from_error, ClientInner};
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::{OpenedFile, ReadLayout};
 use crate::metrics::ClientMetric;
-use crate::planner::{self, RequestedReadRange};
+use crate::planner;
+use crate::planner::{PlannedBlockRead, RequestedReadRange};
 use crate::runtime::{retry_decision, Operation, OperationContext, OperationDeadline, RetryDecision};
+use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
+use beryl_types::GroupName;
+use bytes::Bytes;
+use std::fmt::{Debug, Formatter, Result};
+use std::sync::Arc;
 
-/// Reads one immutable file version with bounded Worker requests.
+/// Reads against the inode, content generation, and length captured at open.
+///
+/// Fresh layouts must match that authority; cached block plans retain their
+/// existing lifetime. This reader does not retain historical file contents.
 pub struct FileReader {
     inner: Arc<ClientInner>,
     file: OpenedFile,
@@ -277,7 +280,7 @@ impl FileReader {
             }
             let (group_name, block_reads) = planner::plan_block_reads_from_layout(
                 self.file.inode_id(),
-                self.file.content_revision(),
+                self.file.generation(),
                 self.file.len(),
                 range,
                 layout.as_ref().expect("read layout was initialized"),
@@ -359,8 +362,8 @@ impl FileReader {
     }
 }
 
-impl fmt::Debug for FileReader {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Debug for FileReader {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         f.debug_struct("FileReader")
             .field("path", &self.path())
             .field("len", &self.len())
@@ -380,13 +383,8 @@ struct CurrentBlockPlan {
 impl CurrentBlockPlan {
     /// Validates a fresh layout and identifies the first block serving the cursor.
     fn new(file: &OpenedFile, range: RequestedReadRange, mut layout: ReadLayout) -> ClientResult<Self> {
-        let (_, reads) = planner::plan_block_reads_from_layout(
-            file.inode_id(),
-            file.content_revision(),
-            file.len(),
-            range,
-            &layout,
-        )?;
+        let (_, reads) =
+            planner::plan_block_reads_from_layout(file.inode_id(), file.generation(), file.len(), range, &layout)?;
         let first = reads
             .first()
             .ok_or_else(|| ClientError::invalid_layout("read layout produced no block plan"))?;
@@ -413,18 +411,8 @@ impl CurrentBlockPlan {
     }
 
     /// Re-plans a subrange while rechecking opened-file authority invariants.
-    fn plan(
-        &self,
-        file: &OpenedFile,
-        range: RequestedReadRange,
-    ) -> ClientResult<(beryl_types::GroupName, Vec<planner::PlannedBlockRead>)> {
-        planner::plan_block_reads_from_layout(
-            file.inode_id(),
-            file.content_revision(),
-            file.len(),
-            range,
-            &self.layout,
-        )
+    fn plan(&self, file: &OpenedFile, range: RequestedReadRange) -> ClientResult<(GroupName, Vec<PlannedBlockRead>)> {
+        planner::plan_block_reads_from_layout(file.inode_id(), file.generation(), file.len(), range, &self.layout)
     }
 }
 

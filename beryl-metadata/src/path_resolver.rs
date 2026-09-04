@@ -9,8 +9,7 @@
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::{mount_prefix_matches_path, MountEntry, MountTable};
 use crate::raft::RocksDBStorage;
-use beryl_types::fs::InodeId;
-use beryl_types::ids::MountId;
+use beryl_types::ids::{InodeId, MountId};
 use beryl_types::GroupName;
 use std::sync::Arc;
 

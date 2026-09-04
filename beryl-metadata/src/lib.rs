@@ -62,7 +62,7 @@
 //! ```compile_fail
 //! use beryl_metadata::mount::{DataIoPolicy, MountKind};
 //! use beryl_metadata::MountTable;
-//! use beryl_types::fs::InodeId;
+//! use beryl_types::ids::InodeId;
 //! use beryl_types::GroupName;
 //!
 //! let table = MountTable::new();

@@ -3,22 +3,21 @@
 
 //! Local block storage boundary.
 
-use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-
+use super::meta_codec::{
+    decode_meta_payload, decode_staging_meta_payload, encode_meta_payload, encode_staging_meta_payload,
+};
+use crate::error::WorkerError;
 use beryl_common::error::rpc::{ErrorKind, WorkerErrorKind};
 use beryl_types::ids::{BlockId, BlockIndex, InodeId};
 use beryl_types::layout::{BlockFormatId, BlockShape};
 use beryl_types::{GroupName, Tier};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-
-use super::meta_codec::{
-    decode_meta_payload, decode_staging_meta_payload, encode_meta_payload, encode_staging_meta_payload,
-};
-use crate::error::WorkerError;
+use std::collections::HashSet;
+use std::fs;
+use std::fs::{File, OpenOptions};
+use std::io::{Error, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 pub type StoreResult<T> = Result<T, WorkerError>;
 
@@ -1417,7 +1416,7 @@ fn sync_parent_dir_after_commit(parent: &Path) {
     let _ = sync_parent_dir(parent);
 }
 
-fn map_data_open_error(err: std::io::Error, message: &str) -> WorkerError {
+fn map_data_open_error(err: Error, message: &str) -> WorkerError {
     if err.kind() == std::io::ErrorKind::NotFound {
         corrupt(message)
     } else {
@@ -1425,7 +1424,7 @@ fn map_data_open_error(err: std::io::Error, message: &str) -> WorkerError {
     }
 }
 
-fn map_staging_data_open_error(err: std::io::Error, message: &str) -> WorkerError {
+fn map_staging_data_open_error(err: Error, message: &str) -> WorkerError {
     if err.kind() == std::io::ErrorKind::NotFound {
         not_found(message)
     } else {
@@ -1433,7 +1432,7 @@ fn map_staging_data_open_error(err: std::io::Error, message: &str) -> WorkerErro
     }
 }
 
-fn map_truncated_read_error(err: std::io::Error, message: &str) -> WorkerError {
+fn map_truncated_read_error(err: Error, message: &str) -> WorkerError {
     if err.kind() == std::io::ErrorKind::UnexpectedEof {
         corrupt(message)
     } else {
@@ -1455,16 +1454,16 @@ fn corrupt(message: impl Into<String>) -> WorkerError {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::{self, OpenOptions};
-    use std::io::Write;
-    use std::sync::OnceLock;
-
+    use super::*;
     use beryl_types::ids::{BlockId, BlockIndex, InodeId};
     use beryl_types::GroupName;
     use bytes::Bytes;
+    use std::fmt::Debug;
+    use std::fs;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::sync::OnceLock;
     use tempfile::TempDir;
-
-    use super::*;
 
     fn ids() -> (&'static GroupName, BlockId) {
         (
@@ -1578,7 +1577,7 @@ mod tests {
         );
     }
 
-    fn assert_corrupt<T: std::fmt::Debug>(result: Result<T, WorkerError>) {
+    fn assert_corrupt<T: Debug>(result: Result<T, WorkerError>) {
         match result.expect_err("operation should fail") {
             WorkerError::Corrupt(_) => {}
             other => panic!("expected corrupt error, got {other:?}"),

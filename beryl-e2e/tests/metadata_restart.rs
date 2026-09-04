@@ -4,11 +4,12 @@
 use beryl_client::{ClientError, ClientErrorKind, FileStatus};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction};
 use beryl_common::header::RequestHeader;
-use beryl_e2e::{data::deterministic_bytes, TestCluster, TestResult};
+use beryl_e2e::data::deterministic_bytes;
+use beryl_e2e::{TestCluster, TestResult};
 use beryl_proto::common::{ByteRangeProto, RequestHeaderProto, ResponseHeaderProto};
 use beryl_proto::convert::rpc_error_from_proto;
 use beryl_proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
-use beryl_proto::metadata::get_block_locations_request_proto;
+use beryl_proto::metadata::get_block_locations_request_proto::Target;
 use beryl_proto::metadata::{
     AbortFileWriteRequestProto, AddBlockRequestProto, CommitFileRequestProto, CommittedBlockProto,
     CreateFileRequestProto, GetBlockLocationsRequestProto, OpenWriteModeProto, OpenWriteRequestProto, WriteHandleProto,
@@ -19,6 +20,7 @@ use beryl_proto::worker::write_block_request_proto::Payload;
 use beryl_proto::worker::{DataRequestHeaderProto, WriteBlockCommandProto, WriteBlockRequestProto};
 use beryl_types::ClientId;
 use bytes::Bytes;
+use std::path::Path;
 use tokio_stream::iter;
 use tonic::Request;
 
@@ -77,7 +79,7 @@ async fn restart_after_empty_create_allows_noop_close_without_publishing_bytes()
         write_handle: create.write_handle,
         committed_blocks: Vec::new(),
         final_size: 0,
-        expected_content_revision: create.content_revision,
+        expected_generation: create.generation,
         write_mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
         expected_file_size: 0,
     };
@@ -297,7 +299,7 @@ async fn create_replay_survives_restart_and_session_operations_converge() {
     assert_eq!(replay_create.layout, create.layout);
     assert_eq!(replay_create.write_handle, create.write_handle);
     assert_eq!(replay_create.expires_at_ms, create.expires_at_ms);
-    assert_eq!(replay_create.content_revision, create.content_revision);
+    assert_eq!(replay_create.generation, create.generation);
 
     let write_handle = create.write_handle.expect("write handle");
 
@@ -376,7 +378,7 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
     cluster.start_additional_worker().await.expect("start second worker");
     assert_eq!(cluster.current_worker_run_ids().len(), 2);
     cluster
-        .start_metadata_process(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .start_metadata_process(Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
         .await
         .expect("start metadata child process");
     cluster.client().mkdirs("/restart").await.expect("create restart dir");
@@ -472,7 +474,7 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
                 len: payload.len() as u64,
             }],
             final_size: payload.len() as u64,
-            expected_content_revision: reopened.content_revision,
+            expected_generation: reopened.generation,
             write_mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
             expected_file_size: reopened.base_size,
         }))
@@ -508,7 +510,7 @@ async fn completed_commit_is_resolved_from_durable_state_after_metadata_restart(
         write_handle: Some(active.write_handle),
         committed_blocks: vec![active.committed_block],
         final_size: b"durable-publish".len() as u64,
-        expected_content_revision: active.expected_content_revision,
+        expected_generation: active.expected_generation,
         write_mode: active.write_mode,
         expected_file_size: active.expected_file_size,
     };
@@ -540,7 +542,7 @@ async fn completed_commit_is_resolved_from_durable_state_after_metadata_restart(
 struct RawWorkerReadyWrite {
     write_handle: WriteHandleProto,
     committed_block: CommittedBlockProto,
-    expected_content_revision: u64,
+    expected_generation: u64,
     expected_file_size: u64,
     write_mode: i32,
 }
@@ -562,7 +564,7 @@ async fn raw_create_worker_ready_block(
         .await?
         .into_inner();
     assert_metadata_ok(create.header);
-    let expected_content_revision = create.content_revision;
+    let expected_generation = create.generation;
     let expected_file_size = 0;
     let write_mode = OpenWriteModeProto::OpenWriteModeWrite as i32;
     let write_handle = create.write_handle.expect("write handle");
@@ -587,7 +589,7 @@ async fn raw_create_worker_ready_block(
     Ok(RawWorkerReadyWrite {
         write_handle,
         committed_block,
-        expected_content_revision,
+        expected_generation,
         expected_file_size,
         write_mode,
     })
@@ -602,7 +604,7 @@ async fn assert_stale_commit_file(cluster: &TestCluster, active: RawWorkerReadyW
             write_handle: Some(active.write_handle),
             committed_blocks: vec![active.committed_block],
             final_size,
-            expected_content_revision: active.expected_content_revision,
+            expected_generation: active.expected_generation,
             write_mode: active.write_mode,
             expected_file_size: active.expected_file_size,
         }))
@@ -672,7 +674,7 @@ async fn assert_no_metadata_locations(cluster: &TestCluster, path: &str, len: u3
     let response = metadata
         .get_block_locations(Request::new(GetBlockLocationsRequestProto {
             header: Some(metadata_header(601)),
-            target: Some(get_block_locations_request_proto::Target::Path(path.to_string())),
+            target: Some(Target::Path(path.to_string())),
             range: Some(ByteRangeProto { offset: 0, len }),
         }))
         .await?

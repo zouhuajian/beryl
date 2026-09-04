@@ -3,10 +3,9 @@
 
 //! In-process continuity tracking for incremental block reports.
 
+use beryl_types::{BlockId, GroupName, MAX_REPORT_ENTRIES};
 use std::collections::HashMap;
 use std::sync::Mutex;
-
-use beryl_types::{BlockId, GroupName, MAX_REPORT_ENTRIES};
 use tokio::sync::Notify;
 
 /// One dirty block identity paired with the revision that selected it.
@@ -123,9 +122,8 @@ impl BlockReportChangeTracker {
 
 #[cfg(test)]
 mod tests {
-    use beryl_types::ids::{BlockIndex, InodeId};
-
     use super::*;
+    use beryl_types::ids::{BlockIndex, InodeId};
 
     fn block_id(index: usize) -> BlockId {
         BlockId::new(InodeId::new(1), BlockIndex::new(u32::try_from(index).unwrap()))

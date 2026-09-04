@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use super::*;
+use super::{
+    decode_from_slice, encode_to_vec, standard, worker_key, AppMetadataRaftState, AuthorityBatch, ColumnFamily,
+    CreateFileReplayRecord, DetachedRoot, DetachedRootReclaimUpdate, FileLayout, Inode, InodeAllocation, InodeId,
+    Instant, MetadataError, MetadataResult, MountEntry, RecursiveMkdirEntry, RenameAtomicUpdate, RocksDBStorage,
+    RouteEpoch, WorkerInfo, WriteBatch, CF_DENTRIES, CF_DETACHED_ROOTS, CF_INODES, CF_META, CF_MOUNTS, CF_RAFT_STATE,
+    CF_WORKERS, CREATE_FILE_REPLAY_COUNT_KEY, CREATE_FILE_REPLAY_EXPIRY_PREFIX, DB, MAX_CREATE_FILE_REPLAY_RECORDS,
+    NEXT_INODE_ID_KEY, RAFT_STATE_KEY,
+};
+use rocksdb::{Direction, IteratorMode};
 
 impl RocksDBStorage {
     pub(super) fn commit_authority_batch(
@@ -294,7 +302,7 @@ impl RocksDBStorage {
         if replay_count == MAX_CREATE_FILE_REPLAY_RECORDS {
             let mut iter = db.iterator_cf(
                 cf_meta,
-                rocksdb::IteratorMode::From(CREATE_FILE_REPLAY_EXPIRY_PREFIX, rocksdb::Direction::Forward),
+                IteratorMode::From(CREATE_FILE_REPLAY_EXPIRY_PREFIX, Direction::Forward),
             );
             let Some(item) = iter.next() else {
                 return Err(MetadataError::Internal(
@@ -646,8 +654,12 @@ impl RocksDBStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_registry::CreateFileOperationId;
     use beryl_types::fs::FileAttrs;
+    use beryl_types::{CallId, ClientId, ContentGeneration, LeaseEpoch, MountId};
+    use openraft::{LeaderId, LogId};
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     impl RocksDBStorage {
         /// Persist the authoritative route epoch used for stale-route validation.
@@ -832,8 +844,8 @@ mod tests {
         let name = format!("file-{inode_id}");
         CreateFileReplayRecord {
             operation_id: CreateFileOperationId {
-                client_id: beryl_types::ClientId::new(operation),
-                call_id: beryl_types::CallId::from_uuid(uuid::Uuid::from_u128(operation)),
+                client_id: ClientId::new(operation),
+                call_id: CallId::from_uuid(Uuid::from_u128(operation)),
             },
             request_deadline_ms: expires_at_ms,
             normalized_path: format!("/{name}"),
@@ -844,9 +856,9 @@ mod tests {
             expected_mount_epoch: 1,
             mount_root_inode_id: InodeId::new(10),
             relative_components: vec![name],
-            lease_epoch: 1,
+            lease_epoch: LeaseEpoch::new(1),
             layout: FileLayout::new(4096),
-            content_revision: 0,
+            generation: ContentGeneration::new(0),
             expires_at_ms,
         }
     }
@@ -988,34 +1000,16 @@ mod tests {
         storage.put_inode(&existing).unwrap();
         let applied_before = storage.load_raft_state().unwrap();
         let rejected_applied_state = AppMetadataRaftState {
-            last_applied_log_id: Some(openraft::LogId::new(openraft::LeaderId::new(9, 1), 901)),
+            last_applied_log_id: Some(LogId::new(LeaderId::new(9, 1), 901)),
             ..AppMetadataRaftState::default()
         };
-        let replay_record = CreateFileReplayRecord {
-            operation_id: CreateFileOperationId {
-                client_id: beryl_types::ClientId::new(1),
-                call_id: beryl_types::CallId::from_uuid(uuid::Uuid::from_u128(1)),
-            },
-            request_deadline_ms: 100,
-            normalized_path: "/file".to_string(),
-            parent_inode_id,
-            name: "file".to_string(),
-            inode_id: allocation.inode_id,
-            mount_id: MountId::new(1),
-            expected_mount_epoch: 1,
-            mount_root_inode_id: parent_inode_id,
-            relative_components: vec!["file".to_string()],
-            lease_epoch: 1,
-            layout: FileLayout::new(4096),
-            content_revision: 0,
-            expires_at_ms: 100,
-        };
+        let replay_record = replay_record(1, allocation.inode_id.as_raw(), 100);
 
         let error = storage
             .create_file_atomic(
                 allocation,
                 parent_inode_id,
-                "file",
+                &replay_record.name,
                 &Inode::new_file(allocation.inode_id, FileAttrs::new(), MountId::new(1)),
                 &parent,
                 FileLayout::new(4096),
@@ -1028,7 +1022,7 @@ mod tests {
         assert!(error.to_string().contains("already exists"));
         assert_eq!(storage.load_raft_state().unwrap(), applied_before);
         assert_eq!(storage.get_inode(allocation.inode_id).unwrap(), Some(existing));
-        assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), None);
+        assert_eq!(storage.get_dentry(parent_inode_id, &replay_record.name).unwrap(), None);
         assert_eq!(storage.get_layout_optional(allocation.inode_id).unwrap(), None);
         assert_eq!(storage.get_next_inode_id().unwrap(), Some(allocation.inode_id));
     }

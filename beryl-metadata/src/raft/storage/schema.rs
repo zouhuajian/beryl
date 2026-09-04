@@ -3,7 +3,15 @@
 
 //! RocksDB schema, identity, and open policy.
 
-use super::*;
+use super::{
+    decode_from_slice, durable_raft_write_options, encode_to_vec, standard, Arc, ColumnFamilyDescriptor, DetachedRoot,
+    GenerationHandle, GenerationWriteGuard, InodeId, MetadataError, MetadataResult, Options, Path, PinnedGeneration,
+    RocksDBStorage, StagedGeneration, StorageIdentity, CF_DENTRIES, CF_DETACHED_ROOTS, CF_INODES, CF_META, CF_MOUNTS,
+    CF_RAFT_LOG, CF_RAFT_SNAPSHOT, CF_RAFT_STATE, CF_WORKERS, CURRENT_CFS, DB, ROCKSDB_SCHEMA_VERSION,
+    ROCKSDB_SCHEMA_VERSION_KEY, STORAGE_IDENTITY_KEY,
+};
+use rocksdb::{IteratorMode, Snapshot};
+use std::path::PathBuf;
 
 impl RocksDBStorage {
     /// Create RocksDB state for `metadata format`.
@@ -69,7 +77,7 @@ impl RocksDBStorage {
 
     pub(crate) fn with_pinned_snapshot<T>(
         &self,
-        operation: impl FnOnce(&DB, &rocksdb::Snapshot<'_>) -> MetadataResult<T>,
+        operation: impl FnOnce(&DB, &Snapshot<'_>) -> MetadataResult<T>,
     ) -> MetadataResult<T> {
         let generation = self.pin_generation()?;
         let snapshot = generation.db().snapshot();
@@ -132,7 +140,7 @@ impl RocksDBStorage {
     }
 
     /// Directory where snapshot files are materialized.
-    pub fn snapshot_dir(&self) -> std::path::PathBuf {
+    pub fn snapshot_dir(&self) -> PathBuf {
         self.generations.snapshot_dir()
     }
 }
@@ -250,8 +258,6 @@ fn can_bind_storage_identity(db: &DB) -> MetadataResult<bool> {
 }
 
 fn database_is_pristine(db: &DB, allowed_meta_keys: &[&[u8]]) -> MetadataResult<bool> {
-    use rocksdb::IteratorMode;
-
     for name in [
         CF_MOUNTS,
         CF_WORKERS,
@@ -302,8 +308,6 @@ pub(super) fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
 
 /// Validate every durable marker before a generation becomes authoritative.
 pub(super) fn validate_detached_root_records(db: &DB) -> MetadataResult<()> {
-    use rocksdb::IteratorMode;
-
     let cf = db
         .cf_handle(CF_DETACHED_ROOTS)
         .ok_or_else(|| MetadataError::Internal("Detached roots CF not found".to_string()))?;
@@ -353,6 +357,8 @@ fn missing_rocksdb_state_error(path: &Path, detail: &str) -> MetadataError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beryl_types::FileAttrs;
+    use beryl_types::{Inode, MountId};
     use tempfile::TempDir;
 
     impl RocksDBStorage {
@@ -364,7 +370,7 @@ mod tests {
 
     #[test]
     fn opening_non_current_schema_versions_requires_reformat_without_rewriting_them() {
-        for unsupported_version in [0, 2, 10, u64::MAX] {
+        for unsupported_version in [0, 1, 3, u64::MAX] {
             let dir = TempDir::new().unwrap();
             let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
             drop(storage);
@@ -428,11 +434,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
         storage
-            .put_inode(&Inode::new_dir(
-                InodeId::new(1),
-                beryl_types::FileAttrs::new(),
-                MountId::new(1),
-            ))
+            .put_inode(&Inode::new_dir(InodeId::new(1), FileAttrs::new(), MountId::new(1)))
             .unwrap();
         storage
             .with_pinned_db(|db| {

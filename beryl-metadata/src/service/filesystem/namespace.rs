@@ -4,15 +4,18 @@
 //! Durable namespace creation, rename, and delete operations.
 
 use super::command::unexpected_raft_apply_success;
-use super::{validate_active_write_layout, Freshness, FsResult, MetadataFileSystem, RequestContext};
+use super::{validate_active_write_layout, Freshness, FsResult, MetadataFileSystem, RequestContext, RoutedFsWriteCtx};
 use crate::error::{MetadataError, MetadataResult};
 use crate::observe;
+use crate::path_resolver::PathResolver;
 use crate::raft::{ApplySuccess, Command};
 use crate::session_registry::{
     BeginCreateSession, BeginCreateSessionError, BeginCreateSessionInput, CreateFileOperationId, WriteOpeningError,
 };
-use beryl_types::fs::{FileAttrs, InodeId};
+use beryl_types::fs::{FileAttrs, Inode, InodeData};
+use beryl_types::ids::InodeId;
 use beryl_types::layout::FileLayout;
+use beryl_types::{ContentGeneration, LeaseEpoch};
 use std::sync::atomic::Ordering;
 
 pub(crate) struct CreateDirectoryArgs {
@@ -57,7 +60,7 @@ impl MetadataFileSystem {
             Ok(attrs) => attrs,
             Err(err) => return self.failure_from_path_error(ctx, &path, err),
         };
-        let path = match crate::path_resolver::PathResolver::normalize(&path) {
+        let path = match PathResolver::normalize(&path) {
             Ok(path) => path,
             Err(err) => return self.failure_from_path_error(ctx, &path, err),
         };
@@ -206,11 +209,11 @@ impl MetadataFileSystem {
             return self.failure_from_admission(failure);
         }
         let _topology_guard = self.namespace_topology.write().await;
-        let src_path = match crate::path_resolver::PathResolver::normalize(&args.src_path) {
+        let src_path = match PathResolver::normalize(&args.src_path) {
             Ok(path) => path,
             Err(err) => return self.failure_from_path_error(ctx, &args.src_path, err),
         };
-        let dst_path = match crate::path_resolver::PathResolver::normalize(&args.dst_path) {
+        let dst_path = match PathResolver::normalize(&args.dst_path) {
             Ok(path) => path,
             Err(err) => return self.failure_from_path_error(ctx, &args.dst_path, err),
         };
@@ -244,7 +247,7 @@ impl MetadataFileSystem {
         let expected_dst_lease_epoch = match dst_resolved.inode_id {
             Some(dst_inode_id) => match self.read_inode(dst_inode_id) {
                 Ok(Some(inode)) => match &inode.data {
-                    beryl_types::fs::InodeData::File { lease_epoch, .. } => Some(lease_epoch.unwrap_or(0)),
+                    InodeData::File { lease_epoch, .. } => Some(lease_epoch.unwrap_or_default()),
                     _ => None,
                 },
                 Ok(None) => None,
@@ -447,7 +450,7 @@ impl MetadataFileSystem {
     fn routed_unit_result(
         &self,
         request_ctx: &RequestContext,
-        ctx: &super::RoutedFsWriteCtx,
+        ctx: &RoutedFsWriteCtx,
         result: MetadataResult<()>,
     ) -> FsResult<()> {
         match result {
@@ -467,10 +470,10 @@ pub(crate) struct CreateFileArgs {
 /// Atomic CreateFile result needed to begin client-side writes immediately.
 pub(crate) struct CreatedFileOutput {
     pub(crate) inode_id: InodeId,
-    pub(crate) lease_epoch: u64,
+    pub(crate) lease_epoch: LeaseEpoch,
     pub(crate) layout: FileLayout,
     pub(crate) expires_at_ms: u64,
-    pub(crate) content_revision: u64,
+    pub(crate) generation: ContentGeneration,
 }
 
 impl MetadataFileSystem {
@@ -526,7 +529,7 @@ impl MetadataFileSystem {
             );
         }
 
-        let path = match crate::path_resolver::PathResolver::normalize(&path) {
+        let path = match PathResolver::normalize(&path) {
             Ok(path) => path,
             Err(err) => return self.failure_from_path_error(ctx, &path, err),
         };
@@ -621,7 +624,7 @@ impl MetadataFileSystem {
                         lease_epoch: session.lease_epoch,
                         layout: session.layout,
                         expires_at_ms: session.expires_at_ms,
-                        content_revision: session.content_revision,
+                        generation: session.generation,
                     },
                     Some(ctx.group_name),
                     Some(ctx.mount_epoch),
@@ -706,8 +709,8 @@ impl MetadataFileSystem {
                         layout,
                         lease_epoch,
                         expires_at_ms,
-                        content_revision,
-                    } => Ok((inode_id, layout, lease_epoch, expires_at_ms, content_revision)),
+                        generation,
+                    } => Ok((inode_id, layout, lease_epoch, expires_at_ms, generation)),
                     unexpected => Err(unexpected_raft_apply_success("CreateFile", unexpected)),
                 },
             )
@@ -719,8 +722,8 @@ impl MetadataFileSystem {
             }
         };
 
-        let (inode_id, layout, lease_epoch, expires_at_ms, content_revision) = result;
-        let session = match opening.activate(inode_id, lease_epoch, expires_at_ms, layout, content_revision) {
+        let (inode_id, layout, lease_epoch, expires_at_ms, generation) = result;
+        let session = match opening.activate(inode_id, lease_epoch, expires_at_ms, layout, generation) {
             Ok(session) => session,
             Err(WriteOpeningError::Expired | WriteOpeningError::NotCurrent) => {
                 return self.failure_from_error(
@@ -750,7 +753,7 @@ impl MetadataFileSystem {
                 lease_epoch: session.lease_epoch,
                 layout: session.layout,
                 expires_at_ms: session.expires_at_ms,
-                content_revision: session.content_revision,
+                generation: session.generation,
             },
             Some(ctx.group_name),
             Some(ctx.mount_epoch),
@@ -778,7 +781,7 @@ impl MetadataFileSystem {
         }
         let _topology_guard = self.namespace_topology.write().await;
 
-        let path = match crate::path_resolver::PathResolver::normalize(&args.path) {
+        let path = match PathResolver::normalize(&args.path) {
             Ok(path) => path,
             Err(err) => return self.failure_from_path_error(ctx, &args.path, err),
         };
@@ -909,10 +912,10 @@ impl MetadataFileSystem {
     }
 
     /// Read the persisted file fencing epoch used by delete apply preconditions.
-    fn file_lease_epoch(inode: &beryl_types::fs::Inode) -> u64 {
+    fn file_lease_epoch(inode: &Inode) -> LeaseEpoch {
         match &inode.data {
-            beryl_types::fs::InodeData::File { lease_epoch, .. } => lease_epoch.unwrap_or(0),
-            _ => 0,
+            InodeData::File { lease_epoch, .. } => lease_epoch.unwrap_or_default(),
+            _ => LeaseEpoch::default(),
         }
     }
 }
@@ -921,6 +924,8 @@ impl MetadataFileSystem {
 mod tests {
     use super::*;
     use crate::service::filesystem::tests::*;
+    use crate::service::filesystem::OpenWriteArgs;
+    use beryl_types::WriteMode;
 
     #[tokio::test]
     async fn recursive_delete_rejects_active_writer_at_any_descendant_depth() {
@@ -1008,9 +1013,9 @@ mod tests {
         let (open_result, delete_result) = tokio::join!(
             filesystem.open_write(
                 &open_ctx,
-                crate::service::filesystem::OpenWriteArgs {
+                OpenWriteArgs {
                     path: "/file".to_string(),
-                    mode: crate::session_registry::WriteMode::Write,
+                    mode: WriteMode::Overwrite,
                     freshness: Freshness::default(),
                 },
             ),

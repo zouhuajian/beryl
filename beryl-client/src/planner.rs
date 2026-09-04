@@ -3,11 +3,12 @@
 
 //! Read planning from metadata block locations to worker block reads.
 
-use beryl_common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind};
-
 use crate::error::{ClientError, ClientResult, RefreshHint as ClientRefreshHint};
 use crate::metadata::ReadLayout;
-use beryl_types::{BlockId, BlockShape, FileBlockLocation, GroupName, InodeId, WorkerEndpointInfo};
+use beryl_common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind};
+use beryl_types::{
+    BlockFormatId, BlockId, BlockShape, ContentGeneration, FileBlockLocation, GroupName, InodeId, WorkerEndpointInfo,
+};
 
 /// File byte range requested by a reader after EOF truncation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,7 +32,7 @@ pub(crate) struct PlannedBlockRead {
     pub(crate) block_id: BlockId,
     pub(crate) block_offset: u64,
     pub(crate) block_stamp: u64,
-    pub(crate) block_format_id: beryl_types::BlockFormatId,
+    pub(crate) block_format_id: BlockFormatId,
     pub(crate) block_size: u64,
     pub(crate) chunk_size: u32,
     pub(crate) effective_len: u64,
@@ -174,7 +175,7 @@ pub(crate) fn plan_block_reads(
 
 pub(crate) fn plan_block_reads_from_layout(
     expected_inode_id: InodeId,
-    expected_content_revision: u64,
+    expected_generation: ContentGeneration,
     expected_file_size: u64,
     requested_range: RequestedReadRange,
     response: &ReadLayout,
@@ -188,12 +189,9 @@ pub(crate) fn plan_block_reads_from_layout(
             expected_inode_id.as_raw()
         )));
     }
-    let actual_version = content_revision_from_response(
-        response.content_revision,
-        "GetBlockLocationsResponseProto.content_revision",
-    )?;
-    if actual_version != expected_content_revision {
-        return Err(ClientError::version_mismatch(expected_content_revision, actual_version));
+    let generation = generation_from_response(response.generation, "GetBlockLocationsResponseProto.generation")?;
+    if generation != expected_generation {
+        return Err(ClientError::generation_mismatch(expected_generation, generation));
     }
     if response.file_size != expected_file_size {
         return Err(ClientError::stale_handle(format!(
@@ -205,7 +203,8 @@ pub(crate) fn plan_block_reads_from_layout(
     Ok((group_name, block_reads))
 }
 
-fn content_revision_from_response(value: Option<u64>, field: &str) -> ClientResult<u64> {
+/// Require Metadata visibility authority before accepting a read layout.
+fn generation_from_response(value: Option<ContentGeneration>, field: &str) -> ClientResult<ContentGeneration> {
     value.ok_or_else(|| ClientError::invalid_layout(format!("{field} missing")))
 }
 
@@ -263,15 +262,19 @@ mod tests {
         }
 
         let range = requested_range(0, 4, 4).expect("range").expect("nonempty range");
-        for (revision, file_size, expected) in [(Some(2), 4, "version mismatch"), (Some(1), 5, "opened length")] {
+        for (generation, file_size, expected) in [
+            (None, 4, "generation missing"),
+            (Some(2), 4, "generation mismatch"),
+            (Some(1), 5, "opened length"),
+        ] {
             let layout = ReadLayout {
                 group_name: GroupName::parse("root").expect("group name"),
                 inode_id: InodeId::new(10),
                 file_size,
-                content_revision: revision,
+                generation: generation.map(ContentGeneration::new),
                 locations: vec![location(10, 0, 0, 4, 101)],
             };
-            let err = plan_block_reads_from_layout(InodeId::new(10), 1, 4, range, &layout)
+            let err = plan_block_reads_from_layout(InodeId::new(10), ContentGeneration::new(1), 4, range, &layout)
                 .expect_err("opened-file authority mismatch must fail");
             assert!(err.message().contains(expected), "expected {expected:?}, got {err}");
         }
@@ -289,12 +292,9 @@ mod tests {
                 worker_run_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
             }],
             block_stamp,
-            block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
+            block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
             block_size: 4096,
-            chunk_size: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE
-                .spec()
-                .unwrap()
-                .storage_chunk_size,
+            chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.spec().unwrap().storage_chunk_size,
             effective_len: len,
         }
     }

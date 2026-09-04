@@ -3,42 +3,38 @@
 
 //! RocksDB-backed Raft state machine store (openraft `RaftStateMachine` + snapshot I/O).
 
+use super::{durable_raft_write_options, AuthorityBatch};
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::{MountEntry, MountTable, MountTableState};
 use crate::observe;
 use crate::raft::response::{ApplySuccess, RaftApplyResult};
 use crate::raft::storage::snapshot::{
-    decode_snapshot, is_node_local_meta_key, SnapshotCodecError, SnapshotIdentity, SnapshotWriter,
+    decode_snapshot, is_node_local_meta_key, snapshot_file_in_use, IncomingSnapshotToken, SnapshotCodecError,
+    SnapshotFile, SnapshotIdentity, SnapshotInstallTracker, SnapshotWriter,
 };
-use crate::raft::storage::snapshot::{snapshot_file_in_use, SnapshotFile};
-use crate::raft::storage::snapshot::{IncomingSnapshotToken, SnapshotInstallTracker};
 use crate::raft::storage::{RocksDBStorage, StorageIdentity, STATE_CFS};
 use crate::raft::types::{from_openraft_log_id, AppMetadataRaftState, MetadataNode, MetadataRaftTypeConfig};
-use crate::raft::MetadataReadView;
+use crate::raft::{AppRaftStateMachine, MetadataReadView};
 use crate::state::RouteEpoch;
-use openraft::storage::{RaftStateMachine, SnapshotSignature};
-use openraft::AnyError;
-use openraft::Entry;
-use openraft::EntryPayload;
-use openraft::LogId;
-use openraft::RaftLogId;
-use openraft::Snapshot;
-use openraft::SnapshotMeta;
-use openraft::StorageError;
-use openraft::StorageIOError;
-use openraft::StoredMembership;
+use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, SnapshotSignature};
+use openraft::{
+    AnyError, Entry, EntryPayload, LogId, OptionalSend, RaftLogId, RaftTypeConfig, Snapshot, SnapshotMeta,
+    StorageError, StorageIOError, StoredMembership,
+};
 use parking_lot::{Mutex, RwLock};
+use rocksdb::{
+    ColumnFamily, Direction, IteratorMode, ReadOptions, Snapshot as DbSnapshot, WriteBatch, WriteOptions, DB,
+};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter, Error, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::task::JoinError;
 use tracing::info;
 use uuid::Uuid;
-
-use crate::raft::AppRaftStateMachine;
-use rocksdb::{IteratorMode, ReadOptions, Snapshot as DbSnapshot, WriteBatch, WriteOptions, DB};
 
 const SNAPSHOT_BATCH_BYTES: usize = 2 * 1024 * 1024;
 const CF_META: &str = "meta";
@@ -95,8 +91,8 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
 
     async fn apply<I>(&mut self, entries: I) -> Result<Vec<RaftApplyResult>, StorageError<u64>>
     where
-        I: IntoIterator<Item = Entry<MetadataRaftTypeConfig>> + openraft::OptionalSend,
-        I::IntoIter: openraft::OptionalSend,
+        I: IntoIterator<Item = Entry<MetadataRaftTypeConfig>> + OptionalSend,
+        I::IntoIter: OptionalSend,
     {
         let entries: Vec<_> = entries.into_iter().collect();
         let mut results = Vec::new();
@@ -188,7 +184,7 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
 
     async fn begin_receiving_snapshot(
         &mut self,
-    ) -> Result<Box<<MetadataRaftTypeConfig as openraft::RaftTypeConfig>::SnapshotData>, StorageError<u64>> {
+    ) -> Result<Box<<MetadataRaftTypeConfig as RaftTypeConfig>::SnapshotData>, StorageError<u64>> {
         let tmp_path = temp_snapshot_path(&self.storage, &format!("incoming-{}", Uuid::new_v4()));
         let token = self.snapshot_install.begin().map_err(|e| StorageError::IO {
             source: StorageIOError::<u64>::write_snapshot(None, AnyError::new(&e)),
@@ -204,7 +200,7 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<u64, MetadataNode>,
-        snapshot: Box<<MetadataRaftTypeConfig as openraft::RaftTypeConfig>::SnapshotData>,
+        snapshot: Box<<MetadataRaftTypeConfig as RaftTypeConfig>::SnapshotData>,
     ) -> Result<(), StorageError<u64>> {
         let started = Instant::now();
         let snapshot_path = snapshot.path().to_path_buf();
@@ -295,7 +291,7 @@ pub(crate) struct AppSnapshotBuilder {
     _state: Arc<RwLock<AppMetadataRaftState>>,
 }
 
-impl openraft::storage::RaftSnapshotBuilder<MetadataRaftTypeConfig> for AppSnapshotBuilder {
+impl RaftSnapshotBuilder<MetadataRaftTypeConfig> for AppSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<MetadataRaftTypeConfig>, StorageError<u64>> {
         let started = Instant::now();
         let storage = Arc::clone(&self.storage);
@@ -438,9 +434,9 @@ fn write_snapshot_v2(
     db: &DB,
     snapshot: &DbSnapshot<'_>,
     identity: &SnapshotIdentity,
-    path: &std::path::Path,
+    path: &Path,
 ) -> MetadataResult<()> {
-    let file = fs::OpenOptions::new()
+    let file = OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(path)
@@ -471,7 +467,7 @@ fn install_snapshot_generation(
     read_view: &MetadataReadView,
     meta: &SnapshotMeta<u64, MetadataNode>,
     incoming_path: PathBuf,
-    mut incoming_file: std::fs::File,
+    mut incoming_file: File,
     incoming_token: Option<IncomingSnapshotToken>,
 ) -> MetadataResult<SnapshotArtifact> {
     let boundary = meta.last_log_id.ok_or_else(|| {
@@ -587,7 +583,7 @@ fn decode_into_staged(db: &DB, reader: impl Read, expected: &SnapshotIdentity) -
         batch.put_cf(cf, key, value);
         if batch.size_in_bytes() >= SNAPSHOT_BATCH_BYTES {
             db.write(std::mem::take(&mut batch)).map_err(|error| {
-                SnapshotCodecError::Io(std::io::Error::other(format!("write staged snapshot batch: {error}")))
+                SnapshotCodecError::Io(Error::other(format!("write staged snapshot batch: {error}")))
             })?;
         }
         Ok(())
@@ -694,10 +690,7 @@ fn copy_log_suffix(old_db: &DB, staged_db: &DB, boundary_index: u64) -> Metadata
     let start_key = format!("{start:020}");
     let mut expected = start;
     let mut batch = WriteBatch::default();
-    for item in old_db.iterator_cf(
-        old_cf,
-        rocksdb::IteratorMode::From(start_key.as_bytes(), rocksdb::Direction::Forward),
-    ) {
+    for item in old_db.iterator_cf(old_cf, IteratorMode::From(start_key.as_bytes(), Direction::Forward)) {
         let (key, value) = item.map_err(|error| MetadataError::Internal(format!("copy raft log suffix: {error}")))?;
         let index = std::str::from_utf8(&key)
             .map_err(|error| MetadataError::Internal(format!("invalid raft log key: {error}")))?
@@ -769,7 +762,7 @@ fn persist_snapshot_meta(db: &DB, meta: &SnapshotMeta<u64, MetadataNode>) -> Met
         .map_err(|error| MetadataError::Internal(format!("persist snapshot metadata: {error}")))
 }
 
-fn required_cf<'a>(db: &'a DB, name: &str) -> MetadataResult<&'a rocksdb::ColumnFamily> {
+fn required_cf<'a>(db: &'a DB, name: &str) -> MetadataResult<&'a ColumnFamily> {
     db.cf_handle(name)
         .ok_or_else(|| MetadataError::Internal(format!("column family {name} is missing")))
 }
@@ -781,7 +774,7 @@ fn durable_write_options() -> WriteOptions {
     options
 }
 
-fn publish_received_snapshot_file(incoming: &std::path::Path, final_path: &std::path::Path) -> MetadataResult<()> {
+fn publish_received_snapshot_file(incoming: &Path, final_path: &Path) -> MetadataResult<()> {
     if incoming == final_path {
         return sync_directory(
             final_path
@@ -810,15 +803,15 @@ fn publish_received_snapshot_file(incoming: &std::path::Path, final_path: &std::
     )
 }
 
-fn files_equal(left: &std::path::Path, right: &std::path::Path) -> MetadataResult<bool> {
+fn files_equal(left: &Path, right: &Path) -> MetadataResult<bool> {
     if fs::metadata(left).map(|meta| meta.len()).ok() != fs::metadata(right).map(|meta| meta.len()).ok() {
         return Ok(false);
     }
     let mut left = BufReader::new(
-        fs::File::open(left).map_err(|error| MetadataError::Internal(format!("open incoming snapshot: {error}")))?,
+        File::open(left).map_err(|error| MetadataError::Internal(format!("open incoming snapshot: {error}")))?,
     );
     let mut right = BufReader::new(
-        fs::File::open(right).map_err(|error| MetadataError::Internal(format!("open existing snapshot: {error}")))?,
+        File::open(right).map_err(|error| MetadataError::Internal(format!("open existing snapshot: {error}")))?,
     );
     let mut left_buffer = [0u8; 64 * 1024];
     let mut right_buffer = [0u8; 64 * 1024];
@@ -838,8 +831,8 @@ fn files_equal(left: &std::path::Path, right: &std::path::Path) -> MetadataResul
     }
 }
 
-fn sync_directory(path: &std::path::Path) -> MetadataResult<()> {
-    fs::File::open(path)
+fn sync_directory(path: &Path) -> MetadataResult<()> {
+    File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| MetadataError::Internal(format!("sync directory {}: {error}", path.display())))
 }
@@ -860,7 +853,7 @@ fn current_snapshot_path(storage: &RocksDBStorage) -> MetadataResult<Option<Path
     Ok(Some(path))
 }
 
-fn cleanup_obsolete_snapshot_files(storage: &RocksDBStorage, current: Option<&std::path::Path>) -> MetadataResult<()> {
+fn cleanup_obsolete_snapshot_files(storage: &RocksDBStorage, current: Option<&Path>) -> MetadataResult<()> {
     let directory = storage.snapshot_dir();
     for entry in fs::read_dir(&directory)
         .map_err(|error| MetadataError::Internal(format!("list snapshot directory: {error}")))?
@@ -908,13 +901,11 @@ fn snapshot_write_error(signature: Option<SnapshotSignature<u64>>, error: &Metad
 }
 
 #[allow(clippy::result_large_err)]
-fn snapshot_join_error(signature: Option<SnapshotSignature<u64>>, error: tokio::task::JoinError) -> StorageError<u64> {
+fn snapshot_join_error(signature: Option<SnapshotSignature<u64>>, error: JoinError) -> StorageError<u64> {
     StorageError::IO {
         source: StorageIOError::<u64>::write_snapshot(signature, AnyError::new(&error)),
     }
 }
-
-use super::*;
 
 impl RocksDBStorage {
     pub(crate) fn commit_applied_state(&self, raft_state: &AppMetadataRaftState) -> MetadataResult<()> {
@@ -966,12 +957,14 @@ mod tests {
     use super::*;
     use crate::mount::{DataIoPolicy, MountEntry, MountKind, MountTable};
     use crate::raft::state_machine::AppRaftStateMachine;
+    use crate::raft::storage::DetachedRoot;
     use crate::raft::{
-        ApplySuccess, Command, MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES, MAX_RECLAIM_DETACHED_ROOT_ENTRIES,
+        ApplySuccess, Command, DetachedRootReclaimResult, MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES,
+        MAX_RECLAIM_DETACHED_ROOT_ENTRIES,
     };
     use crate::state::RouteEpoch;
-    use beryl_types::fs::{FileAttrs, Inode, InodeId};
-    use beryl_types::ids::MountId;
+    use beryl_types::fs::{FileAttrs, Inode};
+    use beryl_types::ids::{InodeId, MountId};
     use beryl_types::GroupName;
     use metrics::{Counter, CounterFn, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
     use openraft::storage::RaftSnapshotBuilder;
@@ -1033,7 +1026,7 @@ mod tests {
         snapshot: Snapshot<MetadataRaftTypeConfig>,
     ) -> (
         SnapshotMeta<u64, MetadataNode>,
-        Box<<MetadataRaftTypeConfig as openraft::RaftTypeConfig>::SnapshotData>,
+        Box<<MetadataRaftTypeConfig as RaftTypeConfig>::SnapshotData>,
     ) {
         let Snapshot { meta, mut snapshot } = snapshot;
         let mut incoming = store.begin_receiving_snapshot().await.unwrap();
@@ -1139,7 +1132,7 @@ mod tests {
         let sm_a = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage_a)));
 
         storage_a.put_route_epoch(RouteEpoch::new(7)).unwrap();
-        storage_a.set_next_inode_id(beryl_types::fs::InodeId::new(77)).unwrap();
+        storage_a.set_next_inode_id(InodeId::new(77)).unwrap();
         let snapshot_mount = MountEntry {
             mount_id: MountId::new(17),
             mount_prefix: "/snapshot".to_string(),
@@ -1212,14 +1205,8 @@ mod tests {
 
         // Validate data restored.
         assert_eq!(read_view_b.route_epoch(), RouteEpoch::new(7));
-        assert_eq!(
-            storage_b.get_next_inode_id().unwrap(),
-            Some(beryl_types::fs::InodeId::new(77))
-        );
-        assert_eq!(
-            storage_b.prepare_inode_allocation().unwrap().inode_id,
-            beryl_types::fs::InodeId::new(77)
-        );
+        assert_eq!(storage_b.get_next_inode_id().unwrap(), Some(InodeId::new(77)));
+        assert_eq!(storage_b.prepare_inode_allocation().unwrap().inode_id, InodeId::new(77));
         assert_eq!(
             storage_b.get_detached_root(detached_inode_id).unwrap(),
             Some(detached_root)
@@ -1238,9 +1225,10 @@ mod tests {
             .unwrap();
         assert!(matches!(
             reclaim_responses.as_slice(),
-            [Ok(ApplySuccess::DetachedRootsReclaimed(
-                crate::raft::DetachedRootReclaimResult { completed_roots: 1, .. }
-            ))]
+            [Ok(ApplySuccess::DetachedRootsReclaimed(DetachedRootReclaimResult {
+                completed_roots: 1,
+                ..
+            }))]
         ));
         assert!(storage_b.get_detached_root(detached_inode_id).unwrap().is_none());
         assert!(storage_b.get_inode(detached_inode_id).unwrap().is_none());

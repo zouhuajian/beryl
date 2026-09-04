@@ -661,13 +661,14 @@ impl BlockCleanupCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RaftConfig;
     use crate::raft::{AppMetadataRaftState, AppRaftStateMachine};
-    use crate::session_registry::{BeginSessionInput, WriteMode};
+    use crate::session_registry::BeginSessionInput;
     use crate::worker::{BlockReportBlock, BlockReportBlockState};
     use crate::MountTable;
-    use beryl_types::fs::{Extent, FileAttrs, Inode, InodeData, InodeId};
-    use beryl_types::ids::{BlockId, BlockIndex, MountId, WorkerId};
-    use beryl_types::{ClientId, FileLayout, WorkerRunId};
+    use beryl_types::fs::{Extent, FileAttrs, Inode, InodeData};
+    use beryl_types::ids::{BlockId, BlockIndex, InodeId, MountId, WorkerId};
+    use beryl_types::{ClientId, ContentGeneration, FileLayout, LeaseEpoch, Tier, TierFree, WorkerRunId, WriteMode};
     use tempfile::TempDir;
 
     fn group_name() -> GroupName {
@@ -695,7 +696,7 @@ mod tests {
                 storage,
                 state_machine,
                 Arc::new(MountTable::new()),
-                &crate::config::RaftConfig::default(),
+                &RaftConfig::default(),
             )
             .await
             .unwrap(),
@@ -751,8 +752,8 @@ mod tests {
         let mut inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1));
         inode.data = InodeData::File {
             extents,
-            content_revision: Some(1),
-            lease_epoch: Some(1),
+            generation: Some(ContentGeneration::new(1)),
+            lease_epoch: Some(LeaseEpoch::new(1)),
             next_block_index,
         };
         storage.put_inode(&inode).unwrap();
@@ -766,16 +767,16 @@ mod tests {
                 normalized_path: "/file".to_string(),
                 inode_id,
                 mount_id: MountId::new(1),
-                current_lease_epoch: Some(0),
+                current_lease_epoch: Some(LeaseEpoch::new(0)),
                 base_size: 0,
-                content_revision: 0,
-                mode: WriteMode::Write,
+                generation: ContentGeneration::new(0),
+                mode: WriteMode::Overwrite,
                 open_client_id: client_id,
                 layout: FileLayout::new(64),
                 ancestor_inode_ids: vec![inode_id],
             })
             .expect("session capacity");
-        opening.activate(1).expect("session created");
+        opening.activate(LeaseEpoch::new(1)).expect("session created");
     }
 
     fn publish_report(manager: &WorkerManager, replicas: &[ReplicaKey]) {
@@ -807,8 +808,8 @@ mod tests {
                 report_seq,
                 &address,
                 1,
-                vec![beryl_types::TierFree {
-                    tier: beryl_types::Tier::Hdd,
+                vec![TierFree {
+                    tier: Tier::Hdd,
                     free_bytes: 900,
                 }],
             )
@@ -882,7 +883,7 @@ mod tests {
                 block_id: visible.block_id,
                 block_offset: 0,
                 len: 64,
-                content_revision: Some(1),
+                generation: Some(ContentGeneration::new(1)),
                 block_stamp: Some(1),
             }],
             1,
@@ -893,7 +894,7 @@ mod tests {
         persist_file(&storage, active.block_id.inode_id, Vec::new(), 1);
         create_session(&sessions, active.block_id.inode_id);
         assert_eq!(coordinator.classify(&active).unwrap(), CleanupDecision::Wait);
-        sessions.remove_session_if_epoch(active.block_id.inode_id, 1);
+        sessions.remove_session_if_epoch(active.block_id.inode_id, LeaseEpoch::new(1));
         assert_eq!(coordinator.classify(&active).unwrap(), CleanupDecision::Reclaimable);
 
         let unallocated = replica(14, 1, 1);
@@ -933,7 +934,7 @@ mod tests {
                 block_id: becomes_visible.block_id,
                 block_offset: 0,
                 len: 64,
-                content_revision: Some(1),
+                generation: Some(ContentGeneration::new(1)),
                 block_stamp: Some(becomes_visible.block_stamp),
             }],
             1,
@@ -999,13 +1000,13 @@ mod tests {
             block_id: published.block_id,
             block_offset: 0,
             len: 64,
-            content_revision: Some(1),
+            generation: Some(ContentGeneration::new(1)),
             block_stamp: Some(published.block_stamp),
         });
         storage
             .publish_file_atomic(&inode, FileLayout::new(64), &AppMetadataRaftState::default())
             .unwrap();
-        sessions.remove_session_if_epoch(published.block_id.inode_id, 1);
+        sessions.remove_session_if_epoch(published.block_id.inode_id, LeaseEpoch::new(1));
 
         let decision = coordinator.revalidate_reclaimable(&published).unwrap();
         assert_eq!(decision, CleanupDecision::Keep);
@@ -1111,13 +1112,13 @@ mod tests {
             block_id: became_visible.block_id,
             block_offset: 0,
             len: 64,
-            content_revision: Some(1),
+            generation: Some(ContentGeneration::new(1)),
             block_stamp: Some(became_visible.block_stamp),
         });
         storage
             .publish_file_atomic(&visible_inode, FileLayout::new(64), &AppMetadataRaftState::default())
             .unwrap();
-        sessions.remove_session_if_epoch(became_visible.block_id.inode_id, 1);
+        sessions.remove_session_if_epoch(became_visible.block_id.inode_id, LeaseEpoch::new(1));
 
         storage
             .with_pinned_db(|db| {

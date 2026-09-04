@@ -3,15 +3,6 @@
 
 //! Worker transport implementation and block-local RPC lifecycle.
 
-use std::sync::Arc;
-
-use async_trait::async_trait;
-use futures::stream;
-use tokio::sync::watch;
-
-use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, WorkerErrorKind};
-use beryl_types::GroupName;
-
 use super::channel_pool::GrpcWorkerChannelPool;
 use super::protocol::{
     build_read_block_request, build_tonic_request, build_write_block_command, has_structured_worker_error,
@@ -26,6 +17,16 @@ use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
 use crate::planner::{block_location_unavailable_error, PlannedBlockRead};
 use crate::runtime::{is_definite_worker_capacity_rejection, AttemptContext};
+use async_trait::async_trait;
+use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, WorkerErrorKind};
+use beryl_proto::worker::{WriteBlockRequestProto, WriteBlockResponseProto};
+use beryl_types::{GroupName, WorkerEndpointInfo};
+use futures::{stream, Stream};
+use std::sync::Arc;
+use tokio::sync::mpsc::Receiver;
+use tokio::sync::watch;
+use tokio::sync::watch::Sender;
+use tonic::{Request, Status, Streaming};
 
 /// Executes one block-local operation against Metadata-authorized Worker
 /// candidates and owns channel health plus wire validation.
@@ -37,12 +38,12 @@ pub(super) struct GrpcWorkerTransport {
 /// Cancels a request whose open future exits before the staging Ack can
 /// transfer request-stream ownership to `BlockWrite`.
 struct OpeningWriteCancellation {
-    signal: Option<watch::Sender<bool>>,
+    signal: Option<Sender<bool>>,
 }
 
 impl OpeningWriteCancellation {
     /// Transfers cancellation ownership to the acknowledged block RPC.
-    fn disarm(&mut self) -> watch::Sender<bool> {
+    fn disarm(&mut self) -> Sender<bool> {
         self.signal.take().expect("opening cancellation signal is present")
     }
 }
@@ -65,10 +66,7 @@ impl GrpcWorkerTransport {
 
     /// Orders candidates by observed channel health without inventing targets
     /// beyond Metadata's authorized list.
-    fn worker_candidates<'a>(
-        &self,
-        workers: &'a [beryl_types::WorkerEndpointInfo],
-    ) -> Vec<&'a beryl_types::WorkerEndpointInfo> {
+    fn worker_candidates<'a>(&self, workers: &'a [WorkerEndpointInfo]) -> Vec<&'a WorkerEndpointInfo> {
         let mut active = Vec::with_capacity(workers.len());
         let mut cooling = Vec::new();
         for worker in workers {
@@ -93,8 +91,8 @@ impl GrpcWorkerTransport {
     fn map_write_status(
         channel_pool: &GrpcWorkerChannelPool,
         attempt: &AttemptContext,
-        worker: &beryl_types::WorkerEndpointInfo,
-        status: tonic::Status,
+        worker: &WorkerEndpointInfo,
+        status: Status,
     ) -> ClientError {
         let transport_error = ClientError::from(status.clone());
         if is_definite_worker_capacity_rejection(&transport_error) {
@@ -126,7 +124,7 @@ impl GrpcWorkerTransport {
         &self,
         attempt: &AttemptContext,
         target: &WorkerWriteTarget,
-        worker: &beryl_types::WorkerEndpointInfo,
+        worker: &WorkerEndpointInfo,
         lease_expires_at_ms: u64,
     ) -> ClientResult<BlockWrite> {
         let mut client = self.channel_pool.worker_data_service_client(worker, "WriteBlock")?;
@@ -142,7 +140,7 @@ impl GrpcWorkerTransport {
             _ = tokio::time::sleep(duration_until_unix_ms(lease_expires_at_ms)) => {
                 return Err(write_lease_expired_error().with_operation_context(attempt.operation_context()));
             }
-            response = client.write_block(tonic::Request::new(requests)) => response,
+            response = client.write_block(Request::new(requests)) => response,
         };
         let mut responses = response
             .map_err(|status| Self::map_write_status(self.channel_pool.as_ref(), attempt, worker, status))?
@@ -203,8 +201,8 @@ impl GrpcWorkerTransport {
 /// The command is emitted once, `Finish` is the only normal EOF, and every
 /// abandoned or expired write emits at most one failure-cleanup frame.
 struct BlockWriteRequestState {
-    command: Option<beryl_proto::worker::WriteBlockRequestProto>,
-    inputs: tokio::sync::mpsc::Receiver<BlockWriteInput>,
+    command: Option<WriteBlockRequestProto>,
+    inputs: Receiver<BlockWriteInput>,
     cancellation: Option<watch::Receiver<bool>>,
     cancellation_sent: bool,
 }
@@ -212,10 +210,10 @@ struct BlockWriteRequestState {
 /// Emits physical command and data frames. Only explicit `Finish` becomes EOF;
 /// cancellation uses Worker's existing invalid-payload cleanup path.
 fn write_block_requests(
-    command: beryl_proto::worker::WriteBlockRequestProto,
-    receiver: tokio::sync::mpsc::Receiver<BlockWriteInput>,
+    command: WriteBlockRequestProto,
+    receiver: Receiver<BlockWriteInput>,
     cancellation: watch::Receiver<bool>,
-) -> impl futures::Stream<Item = beryl_proto::worker::WriteBlockRequestProto> {
+) -> impl Stream<Item = WriteBlockRequestProto> {
     let state = BlockWriteRequestState {
         command: Some(command),
         inputs: receiver,
@@ -229,7 +227,7 @@ fn write_block_requests(
 /// preserving the one-terminal-event request-stream invariant.
 async fn next_write_block_request(
     mut state: BlockWriteRequestState,
-) -> Option<(beryl_proto::worker::WriteBlockRequestProto, BlockWriteRequestState)> {
+) -> Option<(WriteBlockRequestProto, BlockWriteRequestState)> {
     if let Some(command) = state.command.take() {
         return Some((command, state));
     }
@@ -272,8 +270,8 @@ async fn next_write_block_request(
 
 /// Builds a terminal missing-payload request. Worker already rejects this
 /// shape through its owned failure path, which aborts staging without Ready.
-fn write_block_failure_cleanup_request() -> beryl_proto::worker::WriteBlockRequestProto {
-    beryl_proto::worker::WriteBlockRequestProto { payload: None }
+fn write_block_failure_cleanup_request() -> WriteBlockRequestProto {
+    WriteBlockRequestProto { payload: None }
 }
 
 /// Waits for the sole terminal response condition after the staging Ack.
@@ -282,10 +280,10 @@ fn write_block_failure_cleanup_request() -> beryl_proto::worker::WriteBlockReque
 async fn wait_for_write_completion(
     channel_pool: Arc<GrpcWorkerChannelPool>,
     attempt: AttemptContext,
-    worker: beryl_types::WorkerEndpointInfo,
-    mut responses: tonic::Streaming<beryl_proto::worker::WriteBlockResponseProto>,
+    worker: WorkerEndpointInfo,
+    mut responses: Streaming<WriteBlockResponseProto>,
     lease: Arc<BlockWriteLease>,
-    cancellation: watch::Sender<bool>,
+    cancellation: Sender<bool>,
 ) -> ClientResult<()> {
     let mut lease_updates = lease.subscribe();
     loop {
@@ -438,11 +436,9 @@ impl WorkerTransport for GrpcWorkerTransport {
 
 #[cfg(test)]
 mod tests {
-    use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
+    use super::*;
+    use crate::error::ClientErrorKind;
+    use crate::runtime::{retry_decision, Operation, OperationContext, OperationDeadline, RetryDecision, RetrySafety};
     use beryl_common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind};
     use beryl_common::header::{
         HEADER_WORKER_DATA_ERROR_DETAIL, HEADER_WORKER_DATA_REJECTION, WORKER_DATA_ERROR_DETAIL_V1,
@@ -450,23 +446,28 @@ mod tests {
     };
     use beryl_proto::convert::rpc_error_to_proto;
     use beryl_proto::worker::worker_data_service_server::{WorkerDataService, WorkerDataServiceServer};
+    use beryl_proto::worker::write_block_request_proto::Payload;
     use beryl_proto::worker::{
-        DataResponseHeaderProto, ReadBlockChunkProto, ReadBlockRequestProto, WriteBlockRequestProto,
-        WriteBlockResponseProto,
+        DataRequestHeaderProto, DataResponseHeaderProto, ReadBlockChunkProto, ReadBlockRequestProto,
+        WriteBlockRequestProto, WriteBlockResponseProto,
     };
     use beryl_types::lease::FencingToken;
     use beryl_types::{
-        BlockId, BlockIndex, ClientId, InodeId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol, WorkerRunId,
-        WriteTarget,
+        BlockFormatId, BlockId, BlockIndex, ClientId, InodeId, LeaseEpoch, Tier, WorkerEndpointInfo, WorkerId,
+        WorkerNetProtocol, WorkerRunId, WriteTarget,
     };
     use bytes::Bytes;
     use prost::Message;
+    use std::io::Error;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::ReceiverStream;
+    use tonic::metadata::{MetadataMap, MetadataValue};
     use tonic::transport::Server;
-    use tonic::{Request, Response, Status};
-
-    use super::*;
-    use crate::error::ClientErrorKind;
-    use crate::runtime::{retry_decision, Operation, OperationContext, OperationDeadline, RetryDecision, RetrySafety};
+    use tonic::{Code, Request, Response, Status};
 
     #[derive(Clone, Copy)]
     enum ReadFailure {
@@ -518,7 +519,7 @@ mod tests {
 
     #[tonic::async_trait]
     impl WorkerDataService for MockWorkerService {
-        type ReadBlockStream = Pin<Box<dyn futures::Stream<Item = Result<ReadBlockChunkProto, Status>> + Send>>;
+        type ReadBlockStream = Pin<Box<dyn Stream<Item = Result<ReadBlockChunkProto, Status>> + Send>>;
         async fn read_block(
             &self,
             request: Request<ReadBlockRequestProto>,
@@ -555,21 +556,21 @@ mod tests {
             }
         }
 
-        type WriteBlockStream = Pin<Box<dyn futures::Stream<Item = Result<WriteBlockResponseProto, Status>> + Send>>;
+        type WriteBlockStream = Pin<Box<dyn Stream<Item = Result<WriteBlockResponseProto, Status>> + Send>>;
 
         async fn write_block(
             &self,
-            request: Request<tonic::Streaming<WriteBlockRequestProto>>,
+            request: Request<Streaming<WriteBlockRequestProto>>,
         ) -> Result<Response<Self::WriteBlockStream>, Status> {
             self.state.write_calls.fetch_add(1, Ordering::SeqCst);
             if matches!(self.state.write_behavior, WriteBehavior::CapacityRejected) {
-                let mut metadata = tonic::metadata::MetadataMap::new();
+                let mut metadata = MetadataMap::new();
                 metadata.insert(
                     HEADER_WORKER_DATA_REJECTION,
-                    tonic::metadata::MetadataValue::from_static(WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT),
+                    MetadataValue::from_static(WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT),
                 );
                 return Err(Status::with_metadata(
-                    tonic::Code::ResourceExhausted,
+                    Code::ResourceExhausted,
                     "mock Worker write capacity exhausted",
                     metadata,
                 ));
@@ -579,10 +580,7 @@ mod tests {
                 .message()
                 .await?
                 .ok_or_else(|| Status::invalid_argument("missing command"))?;
-            if !matches!(
-                first.payload,
-                Some(beryl_proto::worker::write_block_request_proto::Payload::Command(_))
-            ) {
+            if !matches!(first.payload, Some(Payload::Command(_))) {
                 return Err(Status::invalid_argument("first payload must be command"));
             }
             let (responses, response_stream) = tokio::sync::mpsc::channel(2);
@@ -606,7 +604,7 @@ mod tests {
                                 }
                                 request = requests.message() => match request {
                                     Ok(Some(request)) => match request.payload {
-                                        Some(beryl_proto::worker::write_block_request_proto::Payload::Data(_)) => {
+                                        Some(Payload::Data(_)) => {
                                             state.write_data_frames.fetch_add(1, Ordering::SeqCst);
                                         }
                                         _ => {
@@ -636,9 +634,7 @@ mod tests {
                 }
                 WriteBehavior::CapacityRejected => unreachable!("capacity rejection returned before stream setup"),
             }
-            Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
-                response_stream,
-            ))))
+            Ok(Response::new(Box::pin(ReceiverStream::new(response_stream))))
         }
     }
 
@@ -646,13 +642,11 @@ mod tests {
         state: Arc<MockWorkerState>,
         worker_id: u64,
     ) -> (WorkerEndpointInfo, tokio::sync::oneshot::Sender<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind mock Worker");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock Worker");
         let address = listener.local_addr().expect("mock Worker address");
         let incoming = futures::stream::try_unfold(listener, |listener| async move {
             let (stream, _) = listener.accept().await?;
-            Ok::<_, std::io::Error>(Some((stream, listener)))
+            Ok::<_, Error>(Some((stream, listener)))
         });
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -735,12 +729,9 @@ mod tests {
             block_id: block_id(),
             block_offset: 0,
             block_stamp: 77,
-            block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
+            block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
             block_size: 4096,
-            chunk_size: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE
-                .spec()
-                .unwrap()
-                .storage_chunk_size,
+            chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.spec().unwrap().storage_chunk_size,
             effective_len: 4,
             workers,
         }
@@ -755,19 +746,16 @@ mod tests {
                 file_offset: 0,
                 block_size: 4096,
                 worker_endpoints: workers,
-                fencing_token: FencingToken::new(block_id, ClientId::new(7), 1),
+                fencing_token: FencingToken::new(block_id, ClientId::new(7), LeaseEpoch::new(1)),
                 block_stamp: 77,
-                chunk_size: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE
-                    .spec()
-                    .unwrap()
-                    .storage_chunk_size,
-                block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
-                tier: beryl_types::Tier::Mem,
+                chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.spec().unwrap().storage_chunk_size,
+                block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
+                tier: Tier::Mem,
             },
         }
     }
 
-    fn structured_location_status(header: Option<&beryl_proto::worker::DataRequestHeaderProto>) -> Status {
+    fn structured_location_status(header: Option<&DataRequestHeaderProto>) -> Status {
         let error = RpcErrorDetail::refresh_metadata(
             ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
             RefreshHint::default(),
@@ -777,13 +765,13 @@ mod tests {
             client: header.and_then(|header| header.client.clone()),
             error: Some(rpc_error_to_proto(&error)),
         };
-        let mut metadata = tonic::metadata::MetadataMap::new();
+        let mut metadata = MetadataMap::new();
         metadata.insert(
             HEADER_WORKER_DATA_ERROR_DETAIL,
             WORKER_DATA_ERROR_DETAIL_V1.parse().expect("error detail version"),
         );
         Status::with_details_and_metadata(
-            tonic::Code::FailedPrecondition,
+            Code::FailedPrecondition,
             error.message,
             Bytes::from(response.encode_to_vec()),
             metadata,

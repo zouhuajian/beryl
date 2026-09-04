@@ -6,9 +6,51 @@
 //! These types are the authoritative representation of filesystem metadata.
 //! They are independent of transport (gRPC/proto) and storage (RocksDB) layers.
 
-use crate::ids::MountId;
+use crate::ids::{BlockId, InodeId, MountId};
+use crate::lease::LeaseEpoch;
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::fmt::{Display, Formatter, Result};
+
+/// Write behavior selected when opening a file session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteMode {
+    /// Replace the currently visible file contents when publication succeeds.
+    Overwrite,
+    /// Append after the currently visible file contents.
+    Append,
+}
+
+/// Change counter for the currently visible content of one inode.
+///
+/// Compare generations only within the same inode. Metadata advances this value
+/// when visible content changes; zero is the initial generation. It does not
+/// identify retained historical data, a writer lease, or a physical block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ContentGeneration(u64);
+
+impl ContentGeneration {
+    /// Wraps a generation from persisted state or a protocol boundary.
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the scalar used by storage and wire encodings.
+    pub const fn as_raw(self) -> u64 {
+        self.0
+    }
+
+    /// Returns the next generation, or None on exhaustion; never wraps.
+    pub fn checked_next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
+
+impl Display for ContentGeneration {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        self.0.fmt(f)
+    }
+}
 
 /// Largest number of extents stored in one file inode by the inline layout.
 ///
@@ -17,72 +59,10 @@ use std::fmt;
 /// larger inline vector.
 pub const MAX_FILE_EXTENTS: usize = 10_000;
 
-/// Inode identifier (64-bit).
-///
-/// Inodes are the authoritative identity for filesystem objects.
-/// Each mount has a root inode, and all files/directories/symlinks have unique inodes.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-#[repr(transparent)]
-pub struct InodeId(pub u64);
-
-impl InodeId {
-    /// Creates a new InodeId from a raw value.
-    #[inline]
-    pub const fn new(v: u64) -> Self {
-        Self(v)
-    }
-
-    /// Returns the inner value.
-    #[inline]
-    pub const fn as_raw(self) -> u64 {
-        self.0
-    }
-
-    /// Encodes as fixed-width big-endian bytes (8 bytes).
-    /// Used for RocksDB key encoding.
-    #[inline]
-    pub fn to_be_bytes(self) -> [u8; 8] {
-        self.0.to_be_bytes()
-    }
-
-    /// Decodes from fixed-width big-endian bytes (8 bytes).
-    #[inline]
-    pub fn from_be_bytes(bytes: [u8; 8]) -> Self {
-        Self(u64::from_be_bytes(bytes))
-    }
-}
-
-impl fmt::Debug for InodeId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("InodeId").field(&self.0).finish()
-    }
-}
-
-impl fmt::Display for InodeId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<u64> for InodeId {
-    #[inline]
-    fn from(v: u64) -> Self {
-        Self(v)
-    }
-}
-
-impl From<InodeId> for u64 {
-    #[inline]
-    fn from(v: InodeId) -> Self {
-        v.0
-    }
-}
-
-/// Inode kind (file, directory, symlink).
+/// Payload-free namespace type tag, independent of inode storage layout.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum InodeKind {
+pub enum FileType {
     /// Regular file.
     File,
     /// Directory.
@@ -91,23 +71,23 @@ pub enum InodeKind {
     Symlink,
 }
 
-impl InodeKind {
+impl FileType {
     /// Returns true if this is a directory.
     #[inline]
     pub fn is_dir(self) -> bool {
-        matches!(self, InodeKind::Dir)
+        matches!(self, FileType::Dir)
     }
 
     /// Returns true if this is a file.
     #[inline]
     pub fn is_file(self) -> bool {
-        matches!(self, InodeKind::File)
+        matches!(self, FileType::File)
     }
 
     /// Returns true if this is a symlink.
     #[inline]
     pub fn is_symlink(self) -> bool {
-        matches!(self, InodeKind::Symlink)
+        matches!(self, FileType::Symlink)
     }
 }
 
@@ -180,14 +160,14 @@ pub struct Extent {
     /// File offset (start of this extent in the file).
     pub file_offset: u64,
     /// Block ID that contains this extent.
-    pub block_id: crate::ids::BlockId,
+    pub block_id: BlockId,
     /// Offset within the block (where this extent starts in the block).
     pub block_offset: u64,
     /// Length of this extent in bytes.
     pub len: u64,
-    /// File version for the committed file state that owns this extent.
+    /// Content generation for the committed file state that owns this extent.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content_revision: Option<u64>,
+    pub generation: Option<ContentGeneration>,
     /// Metadata-assigned block stamp for direct read validation.
     /// Readable committed extents must carry a non-zero value.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -199,7 +179,7 @@ pub struct Extent {
 #[serde(rename_all = "snake_case")]
 pub enum InodeData {
     /// File inode data.
-    /// Includes extents for the committed block map, content_revision for visible
+    /// Includes extents for the committed block map, generation for visible
     /// file state, lease_epoch for lease management, and the next durable block
     /// ordinal reserved for this file inode.
     File {
@@ -207,15 +187,15 @@ pub enum InodeData {
         /// Supports append-only write path.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         extents: Vec<Extent>,
-        /// Visible file state version.
+        /// Generation of the currently visible file contents.
         /// Advanced by authoritative metadata apply when committed content,
         /// size or read-plan state changes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        content_revision: Option<u64>,
+        generation: Option<ContentGeneration>,
         /// Lease epoch (monotonically increasing, for fencing).
         /// Persisted in inode for lease management.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        lease_epoch: Option<u64>,
+        lease_epoch: Option<LeaseEpoch>,
         /// Next block ordinal to allocate for this file.
         /// This counter is monotonic and is not derived from visible extents.
         next_block_index: u64,
@@ -233,12 +213,12 @@ pub enum InodeData {
 }
 
 impl InodeData {
-    /// Returns the InodeKind for this data.
-    pub fn kind(&self) -> InodeKind {
+    /// Returns the FileType for this data.
+    pub fn kind(&self) -> FileType {
         match self {
-            InodeData::File { .. } => InodeKind::File,
-            InodeData::Dir => InodeKind::Dir,
-            InodeData::Symlink { .. } => InodeKind::Symlink,
+            InodeData::File { .. } => FileType::File,
+            InodeData::Dir => FileType::Dir,
+            InodeData::Symlink { .. } => FileType::Symlink,
         }
     }
 }
@@ -254,7 +234,7 @@ pub struct Inode {
     /// Inode ID.
     pub inode_id: InodeId,
     /// Inode kind.
-    pub kind: InodeKind,
+    pub kind: FileType,
     /// File attributes.
     pub attrs: FileAttrs,
     /// Variant-specific data.
@@ -267,16 +247,16 @@ pub struct Inode {
 
 impl Inode {
     /// Creates a new inode with mount_id.
-    pub fn new(inode_id: InodeId, kind: InodeKind, attrs: FileAttrs, mount_id: MountId) -> Self {
+    pub fn new(inode_id: InodeId, kind: FileType, attrs: FileAttrs, mount_id: MountId) -> Self {
         let data = match kind {
-            InodeKind::File => InodeData::File {
+            FileType::File => InodeData::File {
                 extents: Vec::new(),
-                content_revision: None,
+                generation: None,
                 lease_epoch: None,
                 next_block_index: 0,
             },
-            InodeKind::Dir => InodeData::Dir,
-            InodeKind::Symlink => InodeData::Symlink { target: None },
+            FileType::Dir => InodeData::Dir,
+            FileType::Symlink => InodeData::Symlink { target: None },
         };
         Self {
             inode_id,
@@ -289,22 +269,45 @@ impl Inode {
 
     /// Creates a new file inode.
     pub fn new_file(inode_id: InodeId, attrs: FileAttrs, mount_id: MountId) -> Self {
-        Self::new(inode_id, InodeKind::File, attrs, mount_id)
+        Self::new(inode_id, FileType::File, attrs, mount_id)
     }
 
     /// Creates a new directory inode.
     pub fn new_dir(inode_id: InodeId, attrs: FileAttrs, mount_id: MountId) -> Self {
-        Self::new(inode_id, InodeKind::Dir, attrs, mount_id)
+        Self::new(inode_id, FileType::Dir, attrs, mount_id)
     }
 
     /// Creates a new symlink inode.
     pub fn new_symlink(inode_id: InodeId, attrs: FileAttrs, target: String, mount_id: MountId) -> Self {
         Self {
             inode_id,
-            kind: InodeKind::Symlink,
+            kind: FileType::Symlink,
             attrs,
             data: InodeData::Symlink { target: Some(target) },
             mount_id,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_counters_preserve_scalar_encoding_and_never_wrap() {
+        for raw in [0, 1, u64::MAX - 1, u64::MAX] {
+            let generation = ContentGeneration::new(raw);
+            let epoch = LeaseEpoch::new(raw);
+            let encoded = raw.to_string();
+            assert_eq!(serde_json::to_string(&generation).unwrap(), encoded);
+            assert_eq!(serde_json::to_string(&epoch).unwrap(), encoded);
+            assert_eq!(serde_json::from_str::<ContentGeneration>(&encoded).unwrap(), generation);
+            assert_eq!(serde_json::from_str::<LeaseEpoch>(&encoded).unwrap(), epoch);
+            assert_eq!(
+                generation.checked_next().map(ContentGeneration::as_raw),
+                raw.checked_add(1)
+            );
+            assert_eq!(epoch.checked_next().map(LeaseEpoch::as_raw), raw.checked_add(1));
         }
     }
 }

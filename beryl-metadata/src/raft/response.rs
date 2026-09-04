@@ -4,9 +4,11 @@
 //! Responses produced by committed metadata Raft commands.
 
 use crate::error::MetadataError;
-use beryl_types::fs::{FileAttrs, InodeId};
-use beryl_types::ids::{BlockId, WorkerId};
+use crate::mount::MountEntry;
+use beryl_types::fs::FileAttrs;
+use beryl_types::ids::{BlockId, InodeId, WorkerId};
 use beryl_types::layout::FileLayout;
+use beryl_types::{ContentGeneration, LeaseEpoch};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -27,29 +29,32 @@ pub(crate) type RaftApplyResult = Result<ApplySuccess, ApplyRejection>;
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum ApplySuccess {
     /// Root mount created or confirmed by namespace bootstrap.
-    MountUpserted(crate::mount::MountEntry),
+    MountUpserted(MountEntry),
     /// Requested directory path exists with these persisted attributes.
     DirectoryEnsured { inode_id: InodeId, attrs: FileAttrs },
     /// File inode, initial write lease, and replay record committed atomically.
     FileCreated {
         inode_id: InodeId,
         layout: FileLayout,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         expires_at_ms: u64,
-        content_revision: u64,
+        generation: ContentGeneration,
     },
     /// The exact namespace delete mutation committed.
     DeleteApplied,
     /// The exact namespace rename mutation committed.
     RenameApplied,
     /// Durable write-lease authority advanced to this epoch.
-    WriteLeaseAcquired { inode_id: InodeId, lease_epoch: u64 },
+    WriteLeaseAcquired { inode_id: InodeId, lease_epoch: LeaseEpoch },
     /// Durable block ordinal allocated for one active write lease.
     BlockAllocated(BlockId),
     /// Durable write-lease authority ended at this fencing epoch.
-    WriteLeaseEnded { inode_id: InodeId, lease_epoch: u64 },
-    /// File visibility committed at this content revision.
-    FilePublished { inode_id: InodeId, content_revision: u64 },
+    WriteLeaseEnded { inode_id: InodeId, lease_epoch: LeaseEpoch },
+    /// File visibility committed at this content generation.
+    FilePublished {
+        inode_id: InodeId,
+        generation: ContentGeneration,
+    },
     /// Durable worker descriptor accepted by the authority state.
     WorkerUpserted(WorkerId),
     /// Bounded progress made by one internal detached-root mutation.
@@ -83,7 +88,7 @@ pub(crate) enum ApplyRejectionKind {
     ActiveWorkerConflict,
     Again,
     ResourceExhausted,
-    LeaseFenced { expected: u64, got: u64 },
+    LeaseFenced { expected: LeaseEpoch, got: LeaseEpoch },
 }
 
 /// Recoverable application failure returned through Raft.
@@ -228,11 +233,14 @@ mod tests {
             MetadataError::ResourceExhausted(message) if message == "extent limit"
         ));
 
-        let rejection =
-            ApplyRejection::from_metadata_error(MetadataError::LeaseFenced { expected: 11, got: 9 }).unwrap();
+        let rejection = ApplyRejection::from_metadata_error(MetadataError::LeaseFenced {
+            expected: LeaseEpoch::new(11),
+            got: LeaseEpoch::new(9),
+        })
+        .unwrap();
         assert!(matches!(
             rejection.into_metadata_error(),
-            MetadataError::LeaseFenced { expected: 11, got: 9 }
+            MetadataError::LeaseFenced { expected, got } if expected == LeaseEpoch::new(11) && got == LeaseEpoch::new(9)
         ));
 
         let fatal =

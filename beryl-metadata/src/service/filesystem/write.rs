@@ -4,35 +4,36 @@
 //! Leader-local write lease, placement, and session lifecycle.
 
 use super::command::unexpected_raft_apply_success;
-use super::{missing_resolved_target_error, validate_active_write_layout};
 use super::{
-    worker_endpoint_from_parts, AdmissionFailure, Freshness, FsResult, MetadataFileSystem, PresentedWriteHandle,
-    RequestContext, SUPPORTED_REPLICA_COUNT,
+    missing_resolved_target_error, validate_active_write_layout, worker_endpoint_from_parts, AdmissionFailure,
+    Freshness, FsResult, FsSuccess, MetadataFileSystem, RequestContext, WriteHandle, SUPPORTED_REPLICA_COUNT,
 };
 use crate::error::MetadataError;
 use crate::observe;
+use crate::path_resolver::{PathResolver, ResolvedPath};
 use crate::placement::{PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus};
-use crate::raft::ApplySuccess;
+use crate::raft::{ApplySuccess, Command};
 use crate::session_registry::{
-    BeginAddBlock, BeginAddBlockError, BeginSessionError, BeginSessionInput, CompleteWriteTargetError, WriteMode,
-    WriteOpeningError, WriteSessionError, WriteTargetLimit,
+    BeginAddBlock, BeginAddBlockError, BeginSessionError, BeginSessionInput, CompleteWriteTargetError, SessionRegistry,
+    WriteOpeningError, WriteSession, WriteSessionError, WriteTargetLimit,
 };
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
 use beryl_common::header::CallerContextFields;
-use beryl_types::fs::InodeId;
-use beryl_types::ids::BlockId;
+use beryl_types::fs::InodeData;
+use beryl_types::ids::{BlockId, InodeId};
 use beryl_types::layout::FileLayout;
 use beryl_types::lease::FencingToken;
-use beryl_types::WriteTarget;
+use beryl_types::{ContentGeneration, LeaseEpoch, WriteMode, WriteTarget};
 
+/// Acquired writer authority and visible base returned to the client.
 #[derive(Clone, Debug)]
 pub(crate) struct OpenWriteOutput {
     pub(crate) inode_id: InodeId,
-    pub(crate) lease_epoch: u64,
+    pub(crate) lease_epoch: LeaseEpoch,
     pub(crate) layout: FileLayout,
     pub(crate) base_size: u64,
     pub(crate) expires_at_ms: u64,
-    pub(crate) content_revision: u64,
+    pub(crate) generation: ContentGeneration,
 }
 
 #[derive(Clone, Debug)]
@@ -46,18 +47,18 @@ pub(crate) struct RenewLeaseOutput {
 }
 
 pub(crate) struct AddBlockArgs {
-    pub(crate) handle: PresentedWriteHandle,
+    pub(crate) handle: WriteHandle,
     pub(crate) previous_block_id: Option<BlockId>,
     pub(crate) freshness: Freshness,
 }
 
 pub(crate) struct AbortFileWriteArgs {
-    pub(crate) handle: PresentedWriteHandle,
+    pub(crate) handle: WriteHandle,
     pub(crate) freshness: Freshness,
 }
 
 pub(crate) struct RenewLeaseArgs {
-    pub(crate) handle: PresentedWriteHandle,
+    pub(crate) handle: WriteHandle,
     pub(crate) freshness: Freshness,
 }
 
@@ -106,7 +107,7 @@ impl MetadataFileSystem {
                 client_id = %ctx.caller.client.client_id,
                 call_id = %ctx.caller.client.call_id,
                 handle_inode_id = handle.inode_id.as_raw(),
-                lease_epoch = handle.lease_epoch,
+                lease_epoch = handle.lease_epoch.as_raw(),
                 mount_epoch = failure.mount_epoch,
                 route_epoch = failure.route_epoch,
                 "AddBlock rejected"
@@ -132,7 +133,7 @@ impl MetadataFileSystem {
                 client_id = %ctx.caller.client.client_id,
                 call_id = %ctx.caller.client.call_id,
                 inode_id = handle.inode_id.as_raw(),
-                lease_epoch = handle.lease_epoch,
+                lease_epoch = handle.lease_epoch.as_raw(),
                 mount_epoch = success.mount_epoch,
                 route_epoch = success.route_epoch,
                 "AbortFileWrite completed"
@@ -145,7 +146,7 @@ impl MetadataFileSystem {
                 client_id = %ctx.caller.client.client_id,
                 call_id = %ctx.caller.client.call_id,
                 inode_id = handle.inode_id.as_raw(),
-                lease_epoch = handle.lease_epoch,
+                lease_epoch = handle.lease_epoch.as_raw(),
                 mount_epoch = failure.mount_epoch,
                 route_epoch = failure.route_epoch,
                 "AbortFileWrite rejected"
@@ -176,7 +177,7 @@ impl MetadataFileSystem {
                 client_id = %ctx.caller.client.client_id,
                 call_id = %ctx.caller.client.call_id,
                 inode_id = handle.inode_id.as_raw(),
-                lease_epoch = handle.lease_epoch,
+                lease_epoch = handle.lease_epoch.as_raw(),
                 mount_epoch = success.mount_epoch,
                 route_epoch = success.route_epoch,
                 "RenewLease completed"
@@ -189,7 +190,7 @@ impl MetadataFileSystem {
                 client_id = %ctx.caller.client.client_id,
                 call_id = %ctx.caller.client.call_id,
                 inode_id = handle.inode_id.as_raw(),
-                lease_epoch = handle.lease_epoch,
+                lease_epoch = handle.lease_epoch.as_raw(),
                 mount_epoch = failure.mount_epoch,
                 route_epoch = failure.route_epoch,
                 "RenewLease rejected"
@@ -217,7 +218,7 @@ impl MetadataFileSystem {
         &self,
         ctx: &RequestContext,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         freshness: Freshness,
     ) -> FsResult<()> {
         let mount_id = match self.session_registry.get_session_identity(inode_id) {
@@ -275,20 +276,19 @@ impl MetadataFileSystem {
             Err(err) => return Err(err),
         };
 
-        let expected_inode_id = inode_id;
-        let expected_ended_epoch = lease_epoch.checked_add(1);
+        let next_epoch = lease_epoch.checked_next();
         match self
             .propose_fs_write_command(
-                crate::raft::Command::EndWriteLease {
+                Command::EndWriteLease {
                     proposed_at_ms: crate::raft::proposal_timestamp_ms(),
-                    inode_id: expected_inode_id,
+                    inode_id,
                     lease_epoch,
                 },
                 move |success| match success {
                     ApplySuccess::WriteLeaseEnded {
                         inode_id: returned_inode_id,
                         lease_epoch: ended_epoch,
-                    } if returned_inode_id == expected_inode_id && Some(ended_epoch) == expected_ended_epoch => Ok(()),
+                    } if returned_inode_id == inode_id && Some(ended_epoch) == next_epoch => Ok(()),
                     unexpected => Err(unexpected_raft_apply_success("EndWriteLease", unexpected)),
                 },
             )
@@ -306,7 +306,7 @@ impl MetadataFileSystem {
         &self,
         ctx: &RequestContext,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         freshness: Freshness,
     ) -> FsResult<RenewLeaseOutput> {
         let session = match self.session_registry.get_session_identity(inode_id) {
@@ -401,9 +401,7 @@ impl MetadataFileSystem {
     ) -> FsResult<OpenWriteOutput> {
         let caller_ctx = &ctx.caller;
 
-        if let Err(message) =
-            crate::session_registry::SessionRegistry::validate_ancestor_chain(inode_id, &ancestor_inode_ids)
-        {
+        if let Err(message) = SessionRegistry::validate_ancestor_chain(inode_id, &ancestor_inode_ids) {
             return self.failure_from_error(ctx, MetadataError::Internal(message), None, None);
         }
 
@@ -464,7 +462,7 @@ impl MetadataFileSystem {
 
         let base_size = match mode {
             WriteMode::Append => inode.attrs.size,
-            WriteMode::Write => 0,
+            WriteMode::Overwrite => 0,
         };
 
         let layout = match self.read_layout(inode_id) {
@@ -476,13 +474,13 @@ impl MetadataFileSystem {
         if let Err(err) = validate_active_write_layout(&layout) {
             return self.failure_from_error(ctx, err, group_name, mount_epoch);
         }
-        let current_content_revision = match &inode.data {
-            beryl_types::fs::InodeData::File { content_revision, .. } => *content_revision,
+        let generation = match &inode.data {
+            InodeData::File { generation, .. } => *generation,
             _ => None,
         };
 
-        let current_lease_epoch = match &inode.data {
-            beryl_types::fs::InodeData::File { lease_epoch, .. } => *lease_epoch,
+        let base_epoch = match &inode.data {
+            InodeData::File { lease_epoch, .. } => *lease_epoch,
             _ => None,
         };
 
@@ -490,9 +488,9 @@ impl MetadataFileSystem {
             normalized_path,
             inode_id,
             mount_id: inode.mount_id,
-            current_lease_epoch,
+            current_lease_epoch: base_epoch,
             base_size,
-            content_revision: current_content_revision.unwrap_or(0),
+            generation: generation.unwrap_or_default(),
             mode,
             open_client_id: caller_ctx.client.client_id,
             layout,
@@ -550,10 +548,10 @@ impl MetadataFileSystem {
 
         let lease_result = self
             .propose_fs_write_command(
-                crate::raft::Command::AcquireWriteLease {
+                Command::AcquireWriteLease {
                     proposed_at_ms: crate::raft::proposal_timestamp_ms(),
                     inode_id,
-                    expected_lease_epoch: current_lease_epoch.unwrap_or(0),
+                    expected_lease_epoch: base_epoch.unwrap_or_default(),
                 },
                 move |success| match success {
                     ApplySuccess::WriteLeaseAcquired {
@@ -602,7 +600,7 @@ impl MetadataFileSystem {
         &self,
         ctx: &RequestContext,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         previous_block_id: Option<BlockId>,
         freshness: Freshness,
     ) -> FsResult<AddBlockOutput> {
@@ -867,14 +865,14 @@ impl MetadataFileSystem {
     }
 }
 
-fn open_write_output(session: &crate::session_registry::WriteSession) -> OpenWriteOutput {
+fn open_write_output(session: &WriteSession) -> OpenWriteOutput {
     OpenWriteOutput {
         inode_id: session.inode_id,
         lease_epoch: session.lease_epoch,
         layout: session.layout,
         base_size: session.base_size,
         expires_at_ms: session.expires_at_ms,
-        content_revision: session.content_revision,
+        generation: session.generation,
     }
 }
 
@@ -902,7 +900,7 @@ impl MetadataFileSystem {
                     path = %path,
                     inode_id = payload.inode_id.as_raw(),
                     inode_id = payload.inode_id.as_raw(),
-                    lease_epoch = payload.lease_epoch,
+                    lease_epoch = payload.lease_epoch.as_raw(),
                     mount_epoch = success.mount_epoch,
                     route_epoch = success.route_epoch,
                     "OpenWrite opened"
@@ -931,7 +929,7 @@ impl MetadataFileSystem {
             return self.failure_from_admission(failure);
         }
         let _topology_guard = self.namespace_topology.read().await;
-        let open_path = match crate::path_resolver::PathResolver::normalize(&args.path) {
+        let open_path = match PathResolver::normalize(&args.path) {
             Ok(path) => path,
             Err(err) => return self.failure_from_path_error(ctx, &args.path, err),
         };
@@ -972,8 +970,8 @@ impl MetadataFileSystem {
         &self,
         ctx: &RequestContext,
         open_path: &str,
-        resolved: &crate::path_resolver::ResolvedPath,
-        opened: super::FsSuccess<OpenWriteOutput>,
+        resolved: &ResolvedPath,
+        opened: FsSuccess<OpenWriteOutput>,
     ) -> FsResult<OpenWriteOutput> {
         let inode_id = opened.payload.inode_id;
         let topology_unchanged = self.path_resolver.resolve_path(open_path).is_ok_and(|current| {
@@ -1004,11 +1002,12 @@ mod tests {
     use super::*;
     use crate::raft::Command;
     use crate::service::filesystem::tests::*;
+    use beryl_common::header::RequestHeader;
     use beryl_types::ClientId;
 
     fn request_context_for(client_id: ClientId) -> RequestContext {
         RequestContext {
-            caller: beryl_common::header::RequestHeader::new(client_id),
+            caller: RequestHeader::new(client_id),
             route_epoch: None,
         }
     }
@@ -1031,7 +1030,7 @@ mod tests {
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name("g6"));
         let mount_table = builder.mount_table();
         let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
-        let session_registry = Arc::new(crate::session_registry::SessionRegistry::new(2, 1, 100, 100, 60_000));
+        let session_registry = Arc::new(SessionRegistry::new(2, 1, 100, 100, 60_000));
         let filesystem = builder
             .with_storage(Arc::clone(&storage))
             .with_raft_node(raft_node)
@@ -1046,7 +1045,7 @@ mod tests {
                 "/first".to_string(),
                 first_inode_id,
                 vec![first_inode_id],
-                WriteMode::Write,
+                WriteMode::Overwrite,
                 Freshness::default(),
             )
             .await
@@ -1060,7 +1059,7 @@ mod tests {
                 "/second".to_string(),
                 second_inode_id,
                 vec![second_inode_id],
-                WriteMode::Write,
+                WriteMode::Overwrite,
                 Freshness::default(),
             )
             .await
@@ -1081,7 +1080,7 @@ mod tests {
                 "/second".to_string(),
                 second_inode_id,
                 vec![second_inode_id],
-                WriteMode::Write,
+                WriteMode::Overwrite,
                 Freshness::default(),
             )
             .await
@@ -1095,7 +1094,7 @@ mod tests {
                 "/third".to_string(),
                 third_inode_id,
                 vec![third_inode_id],
-                WriteMode::Write,
+                WriteMode::Overwrite,
                 Freshness::default(),
             )
             .await
@@ -1149,7 +1148,7 @@ mod tests {
                 open_path.to_string(),
                 file_inode_id,
                 resolved.ancestor_inode_ids.clone(),
-                WriteMode::Write,
+                WriteMode::Overwrite,
                 Freshness::default(),
             )
             .await
@@ -1212,7 +1211,7 @@ mod tests {
                 "/file".to_string(),
                 inode_id,
                 vec![inode_id],
-                crate::session_registry::WriteMode::Write,
+                WriteMode::Overwrite,
                 Freshness::default(),
             )
             .await
@@ -1229,7 +1228,7 @@ mod tests {
             .get_inode(inode_id)
             .unwrap()
             .and_then(|inode| match inode.data {
-                beryl_types::fs::InodeData::File { lease_epoch, .. } => lease_epoch,
+                InodeData::File { lease_epoch, .. } => lease_epoch,
                 _ => None,
             })
             .expect("OpenWrite must persist the acquired lease epoch");
@@ -1239,17 +1238,14 @@ mod tests {
                 "/file".to_string(),
                 inode_id,
                 vec![inode_id],
-                crate::session_registry::WriteMode::Write,
+                WriteMode::Overwrite,
                 Freshness::default(),
             )
             .await
             .expect_err("a duplicate OpenWrite must fail closed while the lease is active");
-        assert_fail(
-            &duplicate.error,
-            beryl_common::error::rpc::ErrorKind::Metadata(MetadataErrorKind::Busy),
-        );
+        assert_fail(&duplicate.error, ErrorKind::Metadata(MetadataErrorKind::Busy));
         let epoch_after_duplicate = storage.get_inode(inode_id).unwrap().and_then(|inode| match inode.data {
-            beryl_types::fs::InodeData::File { lease_epoch, .. } => lease_epoch,
+            InodeData::File { lease_epoch, .. } => lease_epoch,
             _ => None,
         });
         assert_eq!(epoch_after_duplicate, Some(persisted_epoch));
@@ -1282,7 +1278,7 @@ mod tests {
                 "/file".to_string(),
                 inode_id,
                 vec![inode_id],
-                crate::session_registry::WriteMode::Write,
+                WriteMode::Overwrite,
                 Freshness::default(),
             )
             .await
@@ -1299,7 +1295,7 @@ mod tests {
             .await
             .expect_err("placement without a live worker must fail after durable allocation");
         let first_next_index = storage.get_inode(inode_id).unwrap().and_then(|inode| match inode.data {
-            beryl_types::fs::InodeData::File { next_block_index, .. } => Some(next_block_index),
+            InodeData::File { next_block_index, .. } => Some(next_block_index),
             _ => None,
         });
         assert_eq!(first_next_index, Some(1));
@@ -1327,7 +1323,7 @@ mod tests {
             .target;
         assert_eq!(target.block_id.index, BlockIndex::new(1));
         let second_next_index = storage.get_inode(inode_id).unwrap().and_then(|inode| match inode.data {
-            beryl_types::fs::InodeData::File { next_block_index, .. } => Some(next_block_index),
+            InodeData::File { next_block_index, .. } => Some(next_block_index),
             _ => None,
         });
         assert_eq!(second_next_index, Some(2));
@@ -1343,7 +1339,7 @@ mod tests {
                 "/file".to_string(),
                 env.inode_id,
                 vec![env.inode_id],
-                crate::session_registry::WriteMode::Write,
+                WriteMode::Overwrite,
                 Freshness::default(),
             )
             .await
@@ -1353,8 +1349,8 @@ mod tests {
             .begin_add_block(env.inode_id, opened.payload.lease_epoch, None)
             .expect("reserve first AddBlock")
         {
-            crate::session_registry::BeginAddBlock::Reserved(reservation) => reservation,
-            crate::session_registry::BeginAddBlock::Replay(_) => panic!("new AddBlock must reserve"),
+            BeginAddBlock::Reserved(reservation) => reservation,
+            BeginAddBlock::Replay(_) => panic!("new AddBlock must reserve"),
         };
         let duplicate = env
             .filesystem
@@ -1373,7 +1369,7 @@ mod tests {
             .get_inode(env.inode_id)
             .unwrap()
             .and_then(|inode| match inode.data {
-                beryl_types::fs::InodeData::File { next_block_index, .. } => Some(next_block_index),
+                InodeData::File { next_block_index, .. } => Some(next_block_index),
                 _ => None,
             });
         assert_eq!(next_block_index, Some(0));
@@ -1402,7 +1398,7 @@ mod tests {
             .get_inode(env.inode_id)
             .unwrap()
             .and_then(|inode| match inode.data {
-                beryl_types::fs::InodeData::File { next_block_index, .. } => Some(next_block_index),
+                InodeData::File { next_block_index, .. } => Some(next_block_index),
                 _ => None,
             });
         assert_eq!(next_block_index, Some(1));

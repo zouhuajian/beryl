@@ -6,44 +6,52 @@
 //! This module provides bidirectional conversion between proto messages
 //! and domain types defined in the types crate.
 
-use crate::common as proto_common;
-use crate::metadata as proto_metadata;
-use ::beryl_common::{
-    Deadline,
-    error::rpc::{
-        ErrorKind as RpcErrorKind, InternalErrorKind as RpcInternalErrorKind,
-        MetadataErrorKind as RpcMetadataErrorKind, ProtocolErrorKind as RpcProtocolErrorKind,
-        RecoveryAction as RpcRecoveryAction, RefreshHint as RpcRefreshHint, RpcErrorDetail, WorkerEndpointHint,
-        WorkerErrorKind as RpcWorkerErrorKind,
-    },
-    header::{CallerContext, ClientInfo, RequestHeader, ResponseHeader, TraceContext},
+use crate::common::error_kind_proto::Kind;
+use crate::common::recovery_action_proto::Action;
+use crate::common::{
+    BlockIdProto, ByteRangeProto, CallerContextProto, ClientIdProto, ClientInfoProto, ErrorDetailProto, ErrorKindProto,
+    FailRecoveryProto, FencingTokenProto, FileLayoutProto, GroupStateWatermarkProto, InternalErrorKindProto,
+    MetadataErrorKindProto, ProtocolErrorKindProto, RaftLogIdProto, RecoveryActionProto, RefreshHintProto,
+    RefreshMetadataRecoveryProto, RegisterWorkerRecoveryProto, ReopenWriteSessionRecoveryProto, RequestHeaderProto,
+    ResponseHeaderProto, RetryRecoveryProto, SendFullBlockReportRecoveryProto, TierProto, TraceContextProto,
+    WorkerEndpointInfoProto, WorkerErrorKindProto,
 };
+use crate::metadata::{
+    CommittedBlockProto, FileAttrsProto, FileBlockLocationProto, FileTypeProto, OpenWriteModeProto, WriteHandleProto,
+    WriteTargetProto,
+};
+use ::beryl_common::Deadline;
+use ::beryl_common::error::rpc::{
+    ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail,
+    WorkerEndpointHint, WorkerErrorKind,
+};
+use ::beryl_common::header::{CallerContext, ClientInfo, RequestHeader, ResponseHeader, TraceContext};
 use beryl_types::chunk::ByteRange;
 use beryl_types::ids::{BlockId, BlockIndex, WorkerId};
-use beryl_types::layout::{BlockShape, FileLayout};
-use beryl_types::lease::FencingToken;
+use beryl_types::layout::{BlockFormatId, BlockShape, FileLayout};
+use beryl_types::lease::{FencingToken, LeaseEpoch, WriteHandle};
 use beryl_types::{
-    CallId, ClientId, CommittedBlock, FileAttrs, FileBlockLocation, GroupName, GroupStateWatermark, InodeId, InodeKind,
-    RaftLogId, Tier, WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId, WriteTarget,
+    CallId, ClientId, CommittedBlock, FileAttrs, FileBlockLocation, FileType, GroupName, GroupStateWatermark, InodeId,
+    RaftLogId, Tier, WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId, WriteMode, WriteTarget,
 };
 
 // ============================================================================
 // ID Conversions
 // ============================================================================
 
-impl From<BlockId> for proto_common::BlockIdProto {
+impl From<BlockId> for BlockIdProto {
     fn from(id: BlockId) -> Self {
-        proto_common::BlockIdProto {
+        BlockIdProto {
             inode_id: id.inode_id.as_raw(),
             block_index: id.index.as_raw(),
         }
     }
 }
 
-impl TryFrom<proto_common::BlockIdProto> for BlockId {
+impl TryFrom<BlockIdProto> for BlockId {
     type Error = String;
 
-    fn try_from(id: proto_common::BlockIdProto) -> Result<Self, Self::Error> {
+    fn try_from(id: BlockIdProto) -> Result<Self, Self::Error> {
         if id.inode_id == 0 {
             return Err("BlockIdProto.inode_id must be non-zero".to_string());
         }
@@ -51,20 +59,20 @@ impl TryFrom<proto_common::BlockIdProto> for BlockId {
     }
 }
 
-impl From<ClientId> for proto_common::ClientIdProto {
+impl From<ClientId> for ClientIdProto {
     fn from(id: ClientId) -> Self {
         let value = id.as_raw();
-        proto_common::ClientIdProto {
+        ClientIdProto {
             high: (value >> 64) as u64,
             low: value as u64,
         }
     }
 }
 
-impl TryFrom<proto_common::ClientIdProto> for ClientId {
+impl TryFrom<ClientIdProto> for ClientId {
     type Error = String;
 
-    fn try_from(id: proto_common::ClientIdProto) -> Result<Self, Self::Error> {
+    fn try_from(id: ClientIdProto) -> Result<Self, Self::Error> {
         let value = ((id.high as u128) << 64) | (id.low as u128);
         if value == 0 {
             return Err("client_id must be non-zero".to_string());
@@ -74,7 +82,7 @@ impl TryFrom<proto_common::ClientIdProto> for ClientId {
 }
 
 /// Parse a required block id field without choosing caller error policy.
-pub fn required_block_id(proto: Option<proto_common::BlockIdProto>, field_name: &str) -> Result<BlockId, String> {
+pub fn required_block_id(proto: Option<BlockIdProto>, field_name: &str) -> Result<BlockId, String> {
     proto
         .ok_or_else(|| format!("missing {field_name}"))?
         .try_into()
@@ -82,7 +90,7 @@ pub fn required_block_id(proto: Option<proto_common::BlockIdProto>, field_name: 
 }
 
 /// Parse a required client id field without choosing caller error policy.
-pub fn required_client_id(proto: Option<proto_common::ClientIdProto>, field_name: &str) -> Result<ClientId, String> {
+pub fn required_client_id(proto: Option<ClientIdProto>, field_name: &str) -> Result<ClientId, String> {
     proto
         .ok_or_else(|| format!("missing {field_name}"))?
         .try_into()
@@ -97,20 +105,20 @@ pub fn require_call_id(value: &str, field_name: &str) -> Result<CallId, String> 
     CallId::parse(value).map_err(|err| format!("{field_name} {err}"))
 }
 
-impl From<ByteRange> for proto_common::ByteRangeProto {
+impl From<ByteRange> for ByteRangeProto {
     fn from(range: ByteRange) -> Self {
-        proto_common::ByteRangeProto {
+        ByteRangeProto {
             offset: range.offset,
             len: range.len,
         }
     }
 }
 
-impl TryFrom<proto_common::FileLayoutProto> for FileLayout {
+impl TryFrom<FileLayoutProto> for FileLayout {
     type Error = String;
 
-    fn try_from(layout: proto_common::FileLayoutProto) -> Result<Self, Self::Error> {
-        let block_format_id = beryl_types::layout::BlockFormatId::from_raw(layout.block_format_id)
+    fn try_from(layout: FileLayoutProto) -> Result<Self, Self::Error> {
+        let block_format_id = BlockFormatId::from_raw(layout.block_format_id)
             .map_err(|err| format!("FileLayoutProto.block_format_id invalid: {err}"))?;
         let layout = FileLayout::with_block_format(layout.block_size, block_format_id);
         layout
@@ -120,7 +128,7 @@ impl TryFrom<proto_common::FileLayoutProto> for FileLayout {
     }
 }
 
-impl From<&FileLayout> for proto_common::FileLayoutProto {
+impl From<&FileLayout> for FileLayoutProto {
     fn from(layout: &FileLayout) -> Self {
         Self {
             block_size: layout.block_size,
@@ -129,7 +137,7 @@ impl From<&FileLayout> for proto_common::FileLayoutProto {
     }
 }
 
-impl From<FileLayout> for proto_common::FileLayoutProto {
+impl From<FileLayout> for FileLayoutProto {
     fn from(layout: FileLayout) -> Self {
         Self::from(&layout)
     }
@@ -139,8 +147,8 @@ impl From<FileLayout> for proto_common::FileLayoutProto {
 // FS Domain Conversions
 // ============================================================================
 
-impl From<proto_metadata::FileAttrsProto> for FileAttrs {
-    fn from(attrs: proto_metadata::FileAttrsProto) -> Self {
+impl From<FileAttrsProto> for FileAttrs {
+    fn from(attrs: FileAttrsProto) -> Self {
         Self {
             mode: attrs.mode,
             uid: attrs.uid,
@@ -154,7 +162,7 @@ impl From<proto_metadata::FileAttrsProto> for FileAttrs {
     }
 }
 
-impl From<&FileAttrs> for proto_metadata::FileAttrsProto {
+impl From<&FileAttrs> for FileAttrsProto {
     fn from(attrs: &FileAttrs) -> Self {
         Self {
             mode: attrs.mode,
@@ -169,62 +177,117 @@ impl From<&FileAttrs> for proto_metadata::FileAttrsProto {
     }
 }
 
-impl From<FileAttrs> for proto_metadata::FileAttrsProto {
+impl From<FileAttrs> for FileAttrsProto {
     fn from(attrs: FileAttrs) -> Self {
         Self::from(&attrs)
     }
 }
 
-impl TryFrom<proto_metadata::InodeKindProto> for InodeKind {
+/// Reject an unspecified tag instead of guessing the namespace entry type.
+impl TryFrom<FileTypeProto> for FileType {
     type Error = String;
 
-    fn try_from(kind: proto_metadata::InodeKindProto) -> Result<Self, Self::Error> {
+    fn try_from(kind: FileTypeProto) -> Result<Self, Self::Error> {
         match kind {
-            proto_metadata::InodeKindProto::InodeKindFile => Ok(Self::File),
-            proto_metadata::InodeKindProto::InodeKindDir => Ok(Self::Dir),
-            proto_metadata::InodeKindProto::InodeKindSymlink => Ok(Self::Symlink),
-            proto_metadata::InodeKindProto::InodeKindUnspecified => {
-                Err("unspecified inode kind is not a domain value".to_string())
-            }
+            FileTypeProto::FileTypeFile => Ok(Self::File),
+            FileTypeProto::FileTypeDir => Ok(Self::Dir),
+            FileTypeProto::FileTypeSymlink => Ok(Self::Symlink),
+            FileTypeProto::FileTypeUnspecified => Err("unspecified inode kind is not a domain value".to_string()),
         }
     }
 }
 
-impl From<InodeKind> for proto_metadata::InodeKindProto {
-    fn from(kind: InodeKind) -> Self {
+/// Encode a payload-free type label without exposing the persisted inode model.
+impl From<FileType> for FileTypeProto {
+    fn from(kind: FileType) -> Self {
         match kind {
-            InodeKind::File => Self::InodeKindFile,
-            InodeKind::Dir => Self::InodeKindDir,
-            InodeKind::Symlink => Self::InodeKindSymlink,
+            FileType::File => Self::FileTypeFile,
+            FileType::Dir => Self::FileTypeDir,
+            FileType::Symlink => Self::FileTypeSymlink,
         }
     }
 }
 
-impl From<FencingToken> for proto_common::FencingTokenProto {
+/// Encodes session intent using the existing wire enum values.
+impl From<WriteMode> for OpenWriteModeProto {
+    fn from(mode: WriteMode) -> Self {
+        match mode {
+            WriteMode::Overwrite => Self::OpenWriteModeWrite,
+            WriteMode::Append => Self::OpenWriteModeAppend,
+        }
+    }
+}
+
+/// Rejects absent intent instead of choosing a write policy at the wire boundary.
+impl TryFrom<OpenWriteModeProto> for WriteMode {
+    type Error = String;
+
+    fn try_from(mode: OpenWriteModeProto) -> Result<Self, Self::Error> {
+        match mode {
+            OpenWriteModeProto::OpenWriteModeWrite => Ok(Self::Overwrite),
+            OpenWriteModeProto::OpenWriteModeAppend => Ok(Self::Append),
+            OpenWriteModeProto::OpenWriteModeUnspecified => Err("write mode is required".to_string()),
+        }
+    }
+}
+
+/// Decodes required session intent, rejecting both unspecified and unknown modes.
+pub fn parse_write_mode(value: i32) -> Result<WriteMode, String> {
+    OpenWriteModeProto::try_from(value)
+        .map_err(|_| format!("unknown write mode: {value}"))?
+        .try_into()
+}
+
+/// Encode only the file and lease identity; caller identity stays in the header.
+impl From<WriteHandle> for WriteHandleProto {
+    fn from(handle: WriteHandle) -> Self {
+        Self {
+            inode_id: handle.inode_id.as_raw(),
+            write_lease_epoch: handle.lease_epoch.as_raw(),
+        }
+    }
+}
+
+/// Check structural identity before a handle enters domain orchestration.
+impl TryFrom<WriteHandleProto> for WriteHandle {
+    type Error = String;
+
+    fn try_from(handle: WriteHandleProto) -> Result<Self, Self::Error> {
+        if handle.inode_id == 0 {
+            return Err("write_handle.inode_id must be non-zero".to_string());
+        }
+        if handle.write_lease_epoch == 0 {
+            return Err("write_handle.write_lease_epoch must be non-zero".to_string());
+        }
+        Ok(Self {
+            inode_id: InodeId::new(handle.inode_id),
+            lease_epoch: LeaseEpoch::new(handle.write_lease_epoch),
+        })
+    }
+}
+
+impl From<FencingToken> for FencingTokenProto {
     fn from(token: FencingToken) -> Self {
-        proto_common::FencingTokenProto {
+        FencingTokenProto {
             block_id: Some(token.block_id.into()),
             owner: Some(token.owner.into()),
-            epoch: token.epoch,
+            epoch: token.epoch.as_raw(),
         }
     }
 }
 
-impl TryFrom<proto_common::FencingTokenProto> for FencingToken {
+impl TryFrom<FencingTokenProto> for FencingToken {
     type Error = String;
 
-    fn try_from(token: proto_common::FencingTokenProto) -> Result<Self, Self::Error> {
+    fn try_from(token: FencingTokenProto) -> Result<Self, Self::Error> {
         let block_id = required_block_id(token.block_id, "block_id in token")?;
         let owner = required_client_id(token.owner, "owner in token")?;
-        Ok(FencingToken::new(block_id, owner, token.epoch))
+        Ok(FencingToken::new(block_id, owner, LeaseEpoch::new(token.epoch)))
     }
 }
 
 /// Parse a required fencing token field without choosing caller error policy.
-pub fn required_fencing_token(
-    proto: Option<proto_common::FencingTokenProto>,
-    field_name: &str,
-) -> Result<FencingToken, String> {
+pub fn required_fencing_token(proto: Option<FencingTokenProto>, field_name: &str) -> Result<FencingToken, String> {
     proto.ok_or_else(|| format!("missing {field_name}"))?.try_into()
 }
 
@@ -236,41 +299,41 @@ pub fn require_worker_run_id(value: &str, field_name: &str) -> Result<WorkerRunI
     WorkerRunId::parse(value).map_err(|err| format!("{field_name} invalid: {err}"))
 }
 
-impl From<Tier> for proto_common::TierProto {
+impl From<Tier> for TierProto {
     fn from(tier: Tier) -> Self {
         match tier {
-            Tier::Mem => proto_common::TierProto::TierMem,
-            Tier::Nvme => proto_common::TierProto::TierNvme,
-            Tier::Ssd => proto_common::TierProto::TierSsd,
-            Tier::Hdd => proto_common::TierProto::TierHdd,
+            Tier::Mem => TierProto::TierMem,
+            Tier::Nvme => TierProto::TierNvme,
+            Tier::Ssd => TierProto::TierSsd,
+            Tier::Hdd => TierProto::TierHdd,
         }
     }
 }
 
-impl TryFrom<proto_common::TierProto> for Tier {
+impl TryFrom<TierProto> for Tier {
     type Error = String;
 
-    fn try_from(tier: proto_common::TierProto) -> Result<Self, Self::Error> {
+    fn try_from(tier: TierProto) -> Result<Self, Self::Error> {
         match tier {
-            proto_common::TierProto::TierMem => Ok(Self::Mem),
-            proto_common::TierProto::TierNvme => Ok(Self::Nvme),
-            proto_common::TierProto::TierSsd => Ok(Self::Ssd),
-            proto_common::TierProto::TierHdd => Ok(Self::Hdd),
-            proto_common::TierProto::TierUnspecified => Err("tier must be specified".to_string()),
+            TierProto::TierMem => Ok(Self::Mem),
+            TierProto::TierNvme => Ok(Self::Nvme),
+            TierProto::TierSsd => Ok(Self::Ssd),
+            TierProto::TierHdd => Ok(Self::Hdd),
+            TierProto::TierUnspecified => Err("tier must be specified".to_string()),
         }
     }
 }
 
 pub fn parse_known_tier(value: i32) -> Result<Tier, String> {
-    proto_common::TierProto::try_from(value)
+    TierProto::try_from(value)
         .map_err(|_| format!("unknown tier value {value}"))?
         .try_into()
 }
 
-impl TryFrom<proto_common::WorkerEndpointInfoProto> for WorkerEndpointInfo {
+impl TryFrom<WorkerEndpointInfoProto> for WorkerEndpointInfo {
     type Error = String;
 
-    fn try_from(endpoint: proto_common::WorkerEndpointInfoProto) -> Result<Self, Self::Error> {
+    fn try_from(endpoint: WorkerEndpointInfoProto) -> Result<Self, Self::Error> {
         worker_endpoint_info_from_parts(
             WorkerId::new(endpoint.worker_id),
             endpoint.endpoint,
@@ -301,7 +364,7 @@ pub fn worker_endpoint_info_from_parts(
     })
 }
 
-impl From<&WorkerEndpointInfo> for proto_common::WorkerEndpointInfoProto {
+impl From<&WorkerEndpointInfo> for WorkerEndpointInfoProto {
     fn from(endpoint: &WorkerEndpointInfo) -> Self {
         Self {
             worker_id: endpoint.worker_id.as_raw(),
@@ -311,7 +374,7 @@ impl From<&WorkerEndpointInfo> for proto_common::WorkerEndpointInfoProto {
     }
 }
 
-impl From<WorkerEndpointInfo> for proto_common::WorkerEndpointInfoProto {
+impl From<WorkerEndpointInfo> for WorkerEndpointInfoProto {
     fn from(endpoint: WorkerEndpointInfo) -> Self {
         Self {
             worker_id: endpoint.worker_id.as_raw(),
@@ -321,11 +384,11 @@ impl From<WorkerEndpointInfo> for proto_common::WorkerEndpointInfoProto {
     }
 }
 
-impl TryFrom<proto_metadata::WriteTargetProto> for WriteTarget {
+impl TryFrom<WriteTargetProto> for WriteTarget {
     type Error = String;
 
-    fn try_from(target: proto_metadata::WriteTargetProto) -> Result<Self, Self::Error> {
-        let block_format_id = beryl_types::layout::BlockFormatId::from_raw(target.block_format_id)
+    fn try_from(target: WriteTargetProto) -> Result<Self, Self::Error> {
+        let block_format_id = BlockFormatId::from_raw(target.block_format_id)
             .map_err(|err| format!("WriteTargetProto.block_format_id invalid: {err}"))?;
         BlockShape::new(block_format_id, target.block_size, target.chunk_size, target.block_size)
             .map_err(|err| format!("WriteTargetProto invalid block shape: {err}"))?;
@@ -341,7 +404,7 @@ impl TryFrom<proto_metadata::WriteTargetProto> for WriteTarget {
         if fencing_token.block_id != block_id {
             return Err("WriteTargetProto.fencing_token block_id must match block_id".to_string());
         }
-        if fencing_token.owner.is_zero() || fencing_token.epoch == 0 {
+        if fencing_token.owner.is_zero() || fencing_token.epoch.as_raw() == 0 {
             return Err("WriteTargetProto.fencing_token owner and epoch must be non-zero".to_string());
         }
         let worker_endpoints = target
@@ -363,7 +426,7 @@ impl TryFrom<proto_metadata::WriteTargetProto> for WriteTarget {
     }
 }
 
-impl From<&WriteTarget> for proto_metadata::WriteTargetProto {
+impl From<&WriteTarget> for WriteTargetProto {
     fn from(target: &WriteTarget) -> Self {
         Self {
             block_id: Some(target.block_id.into()),
@@ -374,12 +437,12 @@ impl From<&WriteTarget> for proto_metadata::WriteTargetProto {
             chunk_size: target.chunk_size,
             block_format_id: target.block_format_id.as_raw(),
             block_size: target.block_size,
-            tier: proto_common::TierProto::from(target.tier) as i32,
+            tier: TierProto::from(target.tier) as i32,
         }
     }
 }
 
-impl From<WriteTarget> for proto_metadata::WriteTargetProto {
+impl From<WriteTarget> for WriteTargetProto {
     fn from(target: WriteTarget) -> Self {
         Self {
             block_id: Some(target.block_id.into()),
@@ -390,15 +453,15 @@ impl From<WriteTarget> for proto_metadata::WriteTargetProto {
             chunk_size: target.chunk_size,
             block_format_id: target.block_format_id.as_raw(),
             block_size: target.block_size,
-            tier: proto_common::TierProto::from(target.tier) as i32,
+            tier: TierProto::from(target.tier) as i32,
         }
     }
 }
 
-impl TryFrom<proto_metadata::CommittedBlockProto> for CommittedBlock {
+impl TryFrom<CommittedBlockProto> for CommittedBlock {
     type Error = String;
 
-    fn try_from(block: proto_metadata::CommittedBlockProto) -> Result<Self, Self::Error> {
+    fn try_from(block: CommittedBlockProto) -> Result<Self, Self::Error> {
         let block_id = required_block_id(block.block_id, "CommittedBlockProto.block_id")?;
         Ok(Self {
             block_id,
@@ -408,7 +471,7 @@ impl TryFrom<proto_metadata::CommittedBlockProto> for CommittedBlock {
     }
 }
 
-impl From<&CommittedBlock> for proto_metadata::CommittedBlockProto {
+impl From<&CommittedBlock> for CommittedBlockProto {
     fn from(block: &CommittedBlock) -> Self {
         Self {
             block_id: Some(block.block_id.into()),
@@ -418,7 +481,7 @@ impl From<&CommittedBlock> for proto_metadata::CommittedBlockProto {
     }
 }
 
-impl From<CommittedBlock> for proto_metadata::CommittedBlockProto {
+impl From<CommittedBlock> for CommittedBlockProto {
     fn from(block: CommittedBlock) -> Self {
         Self {
             block_id: Some(block.block_id.into()),
@@ -428,10 +491,10 @@ impl From<CommittedBlock> for proto_metadata::CommittedBlockProto {
     }
 }
 
-impl TryFrom<proto_metadata::FileBlockLocationProto> for FileBlockLocation {
+impl TryFrom<FileBlockLocationProto> for FileBlockLocation {
     type Error = String;
 
-    fn try_from(location: proto_metadata::FileBlockLocationProto) -> Result<Self, Self::Error> {
+    fn try_from(location: FileBlockLocationProto) -> Result<Self, Self::Error> {
         if location.len == 0 {
             return Err("FileBlockLocationProto.len must be non-zero".to_string());
         }
@@ -441,7 +504,7 @@ impl TryFrom<proto_metadata::FileBlockLocationProto> for FileBlockLocation {
         if block_stamp == 0 {
             return Err("FileBlockLocationProto.block_stamp must be non-zero".to_string());
         }
-        let block_format_id = beryl_types::layout::BlockFormatId::from_raw(location.block_format_id)
+        let block_format_id = BlockFormatId::from_raw(location.block_format_id)
             .map_err(|err| format!("FileBlockLocationProto.block_format_id invalid: {err}"))?;
         BlockShape::new(
             block_format_id,
@@ -470,7 +533,7 @@ impl TryFrom<proto_metadata::FileBlockLocationProto> for FileBlockLocation {
     }
 }
 
-impl From<&FileBlockLocation> for proto_metadata::FileBlockLocationProto {
+impl From<&FileBlockLocation> for FileBlockLocationProto {
     fn from(location: &FileBlockLocation) -> Self {
         Self {
             block_id: Some(location.block_id.into()),
@@ -486,7 +549,7 @@ impl From<&FileBlockLocation> for proto_metadata::FileBlockLocationProto {
     }
 }
 
-impl From<FileBlockLocation> for proto_metadata::FileBlockLocationProto {
+impl From<FileBlockLocation> for FileBlockLocationProto {
     fn from(location: FileBlockLocation) -> Self {
         Self {
             block_id: Some(location.block_id.into()),
@@ -506,9 +569,9 @@ impl From<FileBlockLocation> for proto_metadata::FileBlockLocationProto {
 // RaftLogIdProto Conversions
 // ============================================================================
 
-impl From<&RaftLogId> for proto_common::RaftLogIdProto {
+impl From<&RaftLogId> for RaftLogIdProto {
     fn from(log_id: &RaftLogId) -> Self {
-        proto_common::RaftLogIdProto {
+        RaftLogIdProto {
             term: log_id.term,
             leader_node_id: log_id.leader_node_id,
             index: log_id.index,
@@ -516,9 +579,9 @@ impl From<&RaftLogId> for proto_common::RaftLogIdProto {
     }
 }
 
-impl From<RaftLogId> for proto_common::RaftLogIdProto {
+impl From<RaftLogId> for RaftLogIdProto {
     fn from(log_id: RaftLogId) -> Self {
-        proto_common::RaftLogIdProto {
+        RaftLogIdProto {
             term: log_id.term,
             leader_node_id: log_id.leader_node_id,
             index: log_id.index,
@@ -526,16 +589,16 @@ impl From<RaftLogId> for proto_common::RaftLogIdProto {
     }
 }
 
-impl From<proto_common::RaftLogIdProto> for RaftLogId {
-    fn from(state_id: proto_common::RaftLogIdProto) -> Self {
+impl From<RaftLogIdProto> for RaftLogId {
+    fn from(state_id: RaftLogIdProto) -> Self {
         RaftLogId::new(state_id.term, state_id.leader_node_id, state_id.index)
     }
 }
 
-impl TryFrom<proto_common::GroupStateWatermarkProto> for GroupStateWatermark {
+impl TryFrom<GroupStateWatermarkProto> for GroupStateWatermark {
     type Error = String;
 
-    fn try_from(proto: proto_common::GroupStateWatermarkProto) -> Result<Self, Self::Error> {
+    fn try_from(proto: GroupStateWatermarkProto) -> Result<Self, Self::Error> {
         let group_name = GroupName::parse(&proto.group_name)
             .map_err(|err| format!("invalid group_name in GroupStateWatermarkProto: {err}"))?;
         let state_id = proto
@@ -546,9 +609,9 @@ impl TryFrom<proto_common::GroupStateWatermarkProto> for GroupStateWatermark {
     }
 }
 
-impl From<&GroupStateWatermark> for proto_common::GroupStateWatermarkProto {
+impl From<&GroupStateWatermark> for GroupStateWatermarkProto {
     fn from(watermark: &GroupStateWatermark) -> Self {
-        proto_common::GroupStateWatermarkProto {
+        GroupStateWatermarkProto {
             state_id: Some(watermark.state_id.into()),
             group_name: watermark.group_name.to_string(),
         }
@@ -563,10 +626,10 @@ impl From<&GroupStateWatermark> for proto_common::GroupStateWatermarkProto {
 // beryl_proto::common::RequestHeaderProto/ResponseHeaderProto and beryl_common::header types.
 // All conversions MUST use these implementations.
 
-impl TryFrom<proto_common::ClientInfoProto> for ClientInfo {
+impl TryFrom<ClientInfoProto> for ClientInfo {
     type Error = String;
 
-    fn try_from(proto: proto_common::ClientInfoProto) -> Result<Self, Self::Error> {
+    fn try_from(proto: ClientInfoProto) -> Result<Self, Self::Error> {
         let call_id = require_call_id(&proto.call_id, "call_id")?;
         let client_id = required_client_id(proto.client_id, "client_id")?;
         let client_name = if proto.client_name.is_empty() {
@@ -583,9 +646,9 @@ impl TryFrom<proto_common::ClientInfoProto> for ClientInfo {
     }
 }
 
-impl From<&ClientInfo> for proto_common::ClientInfoProto {
+impl From<&ClientInfo> for ClientInfoProto {
     fn from(info: &ClientInfo) -> Self {
-        proto_common::ClientInfoProto {
+        ClientInfoProto {
             call_id: info.call_id.to_string(),
             client_id: Some(info.client_id.into()),
             client_name: info.client_name.clone().unwrap_or_default(),
@@ -593,8 +656,8 @@ impl From<&ClientInfo> for proto_common::ClientInfoProto {
     }
 }
 
-impl From<proto_common::TraceContextProto> for TraceContext {
-    fn from(proto: proto_common::TraceContextProto) -> Self {
+impl From<TraceContextProto> for TraceContext {
+    fn from(proto: TraceContextProto) -> Self {
         Self {
             traceparent: proto.traceparent.filter(|value| !value.is_empty()),
             tracestate: proto.tracestate.filter(|value| !value.is_empty()),
@@ -603,7 +666,7 @@ impl From<proto_common::TraceContextProto> for TraceContext {
     }
 }
 
-impl From<&TraceContext> for proto_common::TraceContextProto {
+impl From<&TraceContext> for TraceContextProto {
     fn from(context: &TraceContext) -> Self {
         Self {
             traceparent: context.traceparent.clone(),
@@ -613,11 +676,11 @@ impl From<&TraceContext> for proto_common::TraceContextProto {
     }
 }
 
-fn optional_trace_context(proto: Option<proto_common::TraceContextProto>) -> TraceContext {
+fn optional_trace_context(proto: Option<TraceContextProto>) -> TraceContext {
     proto.map(TraceContext::from).unwrap_or_default()
 }
 
-fn proto_trace_context(context: &TraceContext) -> Option<proto_common::TraceContextProto> {
+fn proto_trace_context(context: &TraceContext) -> Option<TraceContextProto> {
     if context.traceparent.is_none() && context.tracestate.is_none() && context.baggage.is_none() {
         None
     } else {
@@ -625,10 +688,10 @@ fn proto_trace_context(context: &TraceContext) -> Option<proto_common::TraceCont
     }
 }
 
-impl TryFrom<proto_common::RequestHeaderProto> for RequestHeader {
+impl TryFrom<RequestHeaderProto> for RequestHeader {
     type Error = String;
 
-    fn try_from(proto: proto_common::RequestHeaderProto) -> Result<Self, Self::Error> {
+    fn try_from(proto: RequestHeaderProto) -> Result<Self, Self::Error> {
         let client = proto.client.ok_or_else(|| "missing client".to_string())?.try_into()?;
         let deadline = Deadline::from_unix_ms(proto.deadline_ms);
         let trace_context = optional_trace_context(proto.trace_context);
@@ -652,34 +715,27 @@ impl TryFrom<proto_common::RequestHeaderProto> for RequestHeader {
     }
 }
 
-impl From<&RequestHeader> for proto_common::RequestHeaderProto {
+impl From<&RequestHeader> for RequestHeaderProto {
     fn from(header: &RequestHeader) -> Self {
-        proto_common::RequestHeaderProto {
+        RequestHeaderProto {
             client: Some((&header.client).into()),
             trace_context: proto_trace_context(&header.trace_context),
             group_name: header.group_name.as_ref().map(ToString::to_string).unwrap_or_default(),
             mount_epoch: header.mount_epoch,
-            state: header
-                .state
-                .iter()
-                .map(proto_common::GroupStateWatermarkProto::from)
-                .collect(),
+            state: header.state.iter().map(GroupStateWatermarkProto::from).collect(),
             route_epoch: header.route_epoch,
             deadline_ms: header.deadline.as_unix_ms(),
-            caller_context: header
-                .caller_context
-                .as_ref()
-                .map(|cc| proto_common::CallerContextProto {
-                    context: cc.context.clone(),
-                }),
+            caller_context: header.caller_context.as_ref().map(|cc| CallerContextProto {
+                context: cc.context.clone(),
+            }),
         }
     }
 }
 
-impl TryFrom<proto_common::ResponseHeaderProto> for ResponseHeader {
+impl TryFrom<ResponseHeaderProto> for ResponseHeader {
     type Error = String;
 
-    fn try_from(proto: proto_common::ResponseHeaderProto) -> Result<Self, Self::Error> {
+    fn try_from(proto: ResponseHeaderProto) -> Result<Self, Self::Error> {
         let client = proto
             .client
             .clone()
@@ -706,18 +762,14 @@ impl TryFrom<proto_common::ResponseHeaderProto> for ResponseHeader {
     }
 }
 
-impl From<&ResponseHeader> for proto_common::ResponseHeaderProto {
+impl From<&ResponseHeader> for ResponseHeaderProto {
     fn from(header: &ResponseHeader) -> Self {
         let error_detail = header.rpc_error.as_ref().map(rpc_error_to_proto);
 
-        proto_common::ResponseHeaderProto {
+        ResponseHeaderProto {
             client: Some((&header.client).into()),
             error: error_detail,
-            state: header
-                .state
-                .iter()
-                .map(proto_common::GroupStateWatermarkProto::from)
-                .collect(),
+            state: header.state.iter().map(GroupStateWatermarkProto::from).collect(),
             mount_epoch: header.mount_epoch,
             route_epoch: header.route_epoch,
             group_name: header.group_name.as_ref().map(ToString::to_string).unwrap_or_default(),
@@ -729,218 +781,176 @@ impl From<&ResponseHeader> for proto_common::ResponseHeaderProto {
 // RPC error helpers (shared between control/data-plane conversions)
 // ============================================================================
 
-fn metadata_kind_proto_to_kind(kind: proto_common::MetadataErrorKindProto) -> Option<RpcMetadataErrorKind> {
+fn metadata_kind_proto_to_kind(kind: MetadataErrorKindProto) -> Option<MetadataErrorKind> {
     Some(match kind {
-        proto_common::MetadataErrorKindProto::MetadataErrorKindUnspecified => return None,
-        proto_common::MetadataErrorKindProto::MetadataErrorKindNotFound => RpcMetadataErrorKind::NotFound,
-        proto_common::MetadataErrorKindProto::MetadataErrorKindAlreadyExists => RpcMetadataErrorKind::AlreadyExists,
-        proto_common::MetadataErrorKindProto::MetadataErrorKindNotDirectory => RpcMetadataErrorKind::NotDirectory,
-        proto_common::MetadataErrorKindProto::MetadataErrorKindIsDirectory => RpcMetadataErrorKind::IsDirectory,
-        proto_common::MetadataErrorKindProto::MetadataErrorKindDirectoryNotEmpty => {
-            RpcMetadataErrorKind::DirectoryNotEmpty
-        }
-        proto_common::MetadataErrorKindProto::MetadataErrorKindCrossMountRename => {
-            RpcMetadataErrorKind::CrossMountRename
-        }
-        proto_common::MetadataErrorKindProto::MetadataErrorKindBusy => RpcMetadataErrorKind::Busy,
-        proto_common::MetadataErrorKindProto::MetadataErrorKindConflict => RpcMetadataErrorKind::Conflict,
-        proto_common::MetadataErrorKindProto::MetadataErrorKindNotLeader => RpcMetadataErrorKind::NotLeader,
-        proto_common::MetadataErrorKindProto::MetadataErrorKindStaleState => RpcMetadataErrorKind::StaleState,
-        proto_common::MetadataErrorKindProto::MetadataErrorKindMountEpochMismatch => {
-            RpcMetadataErrorKind::MountEpochMismatch
-        }
-        proto_common::MetadataErrorKindProto::MetadataErrorKindRouteEpochMismatch => {
-            RpcMetadataErrorKind::RouteEpochMismatch
-        }
-        proto_common::MetadataErrorKindProto::MetadataErrorKindOwnerGroupMismatch => {
-            RpcMetadataErrorKind::OwnerGroupMismatch
-        }
-        proto_common::MetadataErrorKindProto::MetadataErrorKindGroupMismatch => RpcMetadataErrorKind::GroupMismatch,
-        proto_common::MetadataErrorKindProto::MetadataErrorKindFencing => RpcMetadataErrorKind::Fencing,
-        proto_common::MetadataErrorKindProto::MetadataErrorKindSessionInvalid => RpcMetadataErrorKind::SessionInvalid,
-        proto_common::MetadataErrorKindProto::MetadataErrorKindSessionExpired => RpcMetadataErrorKind::SessionExpired,
-        proto_common::MetadataErrorKindProto::MetadataErrorKindEpochMismatch => RpcMetadataErrorKind::EpochMismatch,
-        proto_common::MetadataErrorKindProto::MetadataErrorKindResourceExhausted => {
-            RpcMetadataErrorKind::ResourceExhausted
-        }
+        MetadataErrorKindProto::MetadataErrorKindUnspecified => return None,
+        MetadataErrorKindProto::MetadataErrorKindNotFound => MetadataErrorKind::NotFound,
+        MetadataErrorKindProto::MetadataErrorKindAlreadyExists => MetadataErrorKind::AlreadyExists,
+        MetadataErrorKindProto::MetadataErrorKindNotDirectory => MetadataErrorKind::NotDirectory,
+        MetadataErrorKindProto::MetadataErrorKindIsDirectory => MetadataErrorKind::IsDirectory,
+        MetadataErrorKindProto::MetadataErrorKindDirectoryNotEmpty => MetadataErrorKind::DirectoryNotEmpty,
+        MetadataErrorKindProto::MetadataErrorKindCrossMountRename => MetadataErrorKind::CrossMountRename,
+        MetadataErrorKindProto::MetadataErrorKindBusy => MetadataErrorKind::Busy,
+        MetadataErrorKindProto::MetadataErrorKindConflict => MetadataErrorKind::Conflict,
+        MetadataErrorKindProto::MetadataErrorKindNotLeader => MetadataErrorKind::NotLeader,
+        MetadataErrorKindProto::MetadataErrorKindStaleState => MetadataErrorKind::StaleState,
+        MetadataErrorKindProto::MetadataErrorKindMountEpochMismatch => MetadataErrorKind::MountEpochMismatch,
+        MetadataErrorKindProto::MetadataErrorKindRouteEpochMismatch => MetadataErrorKind::RouteEpochMismatch,
+        MetadataErrorKindProto::MetadataErrorKindOwnerGroupMismatch => MetadataErrorKind::OwnerGroupMismatch,
+        MetadataErrorKindProto::MetadataErrorKindGroupMismatch => MetadataErrorKind::GroupMismatch,
+        MetadataErrorKindProto::MetadataErrorKindFencing => MetadataErrorKind::Fencing,
+        MetadataErrorKindProto::MetadataErrorKindSessionInvalid => MetadataErrorKind::SessionInvalid,
+        MetadataErrorKindProto::MetadataErrorKindSessionExpired => MetadataErrorKind::SessionExpired,
+        MetadataErrorKindProto::MetadataErrorKindEpochMismatch => MetadataErrorKind::EpochMismatch,
+        MetadataErrorKindProto::MetadataErrorKindResourceExhausted => MetadataErrorKind::ResourceExhausted,
     })
 }
 
-fn metadata_kind_to_proto(kind: RpcMetadataErrorKind) -> proto_common::MetadataErrorKindProto {
+fn metadata_kind_to_proto(kind: MetadataErrorKind) -> MetadataErrorKindProto {
     match kind {
-        RpcMetadataErrorKind::NotFound => proto_common::MetadataErrorKindProto::MetadataErrorKindNotFound,
-        RpcMetadataErrorKind::AlreadyExists => proto_common::MetadataErrorKindProto::MetadataErrorKindAlreadyExists,
-        RpcMetadataErrorKind::NotDirectory => proto_common::MetadataErrorKindProto::MetadataErrorKindNotDirectory,
-        RpcMetadataErrorKind::IsDirectory => proto_common::MetadataErrorKindProto::MetadataErrorKindIsDirectory,
-        RpcMetadataErrorKind::DirectoryNotEmpty => {
-            proto_common::MetadataErrorKindProto::MetadataErrorKindDirectoryNotEmpty
-        }
-        RpcMetadataErrorKind::CrossMountRename => {
-            proto_common::MetadataErrorKindProto::MetadataErrorKindCrossMountRename
-        }
-        RpcMetadataErrorKind::Busy => proto_common::MetadataErrorKindProto::MetadataErrorKindBusy,
-        RpcMetadataErrorKind::Conflict => proto_common::MetadataErrorKindProto::MetadataErrorKindConflict,
-        RpcMetadataErrorKind::NotLeader => proto_common::MetadataErrorKindProto::MetadataErrorKindNotLeader,
-        RpcMetadataErrorKind::StaleState => proto_common::MetadataErrorKindProto::MetadataErrorKindStaleState,
-        RpcMetadataErrorKind::MountEpochMismatch => {
-            proto_common::MetadataErrorKindProto::MetadataErrorKindMountEpochMismatch
-        }
-        RpcMetadataErrorKind::RouteEpochMismatch => {
-            proto_common::MetadataErrorKindProto::MetadataErrorKindRouteEpochMismatch
-        }
-        RpcMetadataErrorKind::OwnerGroupMismatch => {
-            proto_common::MetadataErrorKindProto::MetadataErrorKindOwnerGroupMismatch
-        }
-        RpcMetadataErrorKind::GroupMismatch => proto_common::MetadataErrorKindProto::MetadataErrorKindGroupMismatch,
-        RpcMetadataErrorKind::Fencing => proto_common::MetadataErrorKindProto::MetadataErrorKindFencing,
-        RpcMetadataErrorKind::SessionInvalid => proto_common::MetadataErrorKindProto::MetadataErrorKindSessionInvalid,
-        RpcMetadataErrorKind::SessionExpired => proto_common::MetadataErrorKindProto::MetadataErrorKindSessionExpired,
-        RpcMetadataErrorKind::EpochMismatch => proto_common::MetadataErrorKindProto::MetadataErrorKindEpochMismatch,
-        RpcMetadataErrorKind::ResourceExhausted => {
-            proto_common::MetadataErrorKindProto::MetadataErrorKindResourceExhausted
-        }
+        MetadataErrorKind::NotFound => MetadataErrorKindProto::MetadataErrorKindNotFound,
+        MetadataErrorKind::AlreadyExists => MetadataErrorKindProto::MetadataErrorKindAlreadyExists,
+        MetadataErrorKind::NotDirectory => MetadataErrorKindProto::MetadataErrorKindNotDirectory,
+        MetadataErrorKind::IsDirectory => MetadataErrorKindProto::MetadataErrorKindIsDirectory,
+        MetadataErrorKind::DirectoryNotEmpty => MetadataErrorKindProto::MetadataErrorKindDirectoryNotEmpty,
+        MetadataErrorKind::CrossMountRename => MetadataErrorKindProto::MetadataErrorKindCrossMountRename,
+        MetadataErrorKind::Busy => MetadataErrorKindProto::MetadataErrorKindBusy,
+        MetadataErrorKind::Conflict => MetadataErrorKindProto::MetadataErrorKindConflict,
+        MetadataErrorKind::NotLeader => MetadataErrorKindProto::MetadataErrorKindNotLeader,
+        MetadataErrorKind::StaleState => MetadataErrorKindProto::MetadataErrorKindStaleState,
+        MetadataErrorKind::MountEpochMismatch => MetadataErrorKindProto::MetadataErrorKindMountEpochMismatch,
+        MetadataErrorKind::RouteEpochMismatch => MetadataErrorKindProto::MetadataErrorKindRouteEpochMismatch,
+        MetadataErrorKind::OwnerGroupMismatch => MetadataErrorKindProto::MetadataErrorKindOwnerGroupMismatch,
+        MetadataErrorKind::GroupMismatch => MetadataErrorKindProto::MetadataErrorKindGroupMismatch,
+        MetadataErrorKind::Fencing => MetadataErrorKindProto::MetadataErrorKindFencing,
+        MetadataErrorKind::SessionInvalid => MetadataErrorKindProto::MetadataErrorKindSessionInvalid,
+        MetadataErrorKind::SessionExpired => MetadataErrorKindProto::MetadataErrorKindSessionExpired,
+        MetadataErrorKind::EpochMismatch => MetadataErrorKindProto::MetadataErrorKindEpochMismatch,
+        MetadataErrorKind::ResourceExhausted => MetadataErrorKindProto::MetadataErrorKindResourceExhausted,
     }
 }
 
-fn worker_kind_proto_to_kind(kind: proto_common::WorkerErrorKindProto) -> Option<RpcWorkerErrorKind> {
+fn worker_kind_proto_to_kind(kind: WorkerErrorKindProto) -> Option<WorkerErrorKind> {
     Some(match kind {
-        proto_common::WorkerErrorKindProto::WorkerErrorKindUnspecified => return None,
-        proto_common::WorkerErrorKindProto::WorkerErrorKindNotRegistered => RpcWorkerErrorKind::NotRegistered,
-        proto_common::WorkerErrorKindProto::WorkerErrorKindRunMismatch => RpcWorkerErrorKind::RunMismatch,
-        proto_common::WorkerErrorKindProto::WorkerErrorKindDescriptorMismatch => RpcWorkerErrorKind::DescriptorMismatch,
-        proto_common::WorkerErrorKindProto::WorkerErrorKindFullReportRequired => RpcWorkerErrorKind::FullReportRequired,
-        proto_common::WorkerErrorKindProto::WorkerErrorKindBlockLocationUnavailable => {
-            RpcWorkerErrorKind::BlockLocationUnavailable
-        }
-        proto_common::WorkerErrorKindProto::WorkerErrorKindBlockStampMismatch => RpcWorkerErrorKind::BlockStampMismatch,
-        proto_common::WorkerErrorKindProto::WorkerErrorKindNodeUnavailable => RpcWorkerErrorKind::NodeUnavailable,
-        proto_common::WorkerErrorKindProto::WorkerErrorKindTimeout => RpcWorkerErrorKind::Timeout,
-        proto_common::WorkerErrorKindProto::WorkerErrorKindResourceExhausted => RpcWorkerErrorKind::ResourceExhausted,
-        proto_common::WorkerErrorKindProto::WorkerErrorKindConflict => RpcWorkerErrorKind::Conflict,
-        proto_common::WorkerErrorKindProto::WorkerErrorKindCorrupt => RpcWorkerErrorKind::Corrupt,
-        proto_common::WorkerErrorKindProto::WorkerErrorKindFencing => RpcWorkerErrorKind::Fencing,
-        proto_common::WorkerErrorKindProto::WorkerErrorKindCancelled => RpcWorkerErrorKind::Cancelled,
-        proto_common::WorkerErrorKindProto::WorkerErrorKindIo => RpcWorkerErrorKind::Io,
-        proto_common::WorkerErrorKindProto::WorkerErrorKindNotFound => RpcWorkerErrorKind::NotFound,
+        WorkerErrorKindProto::WorkerErrorKindUnspecified => return None,
+        WorkerErrorKindProto::WorkerErrorKindNotRegistered => WorkerErrorKind::NotRegistered,
+        WorkerErrorKindProto::WorkerErrorKindRunMismatch => WorkerErrorKind::RunMismatch,
+        WorkerErrorKindProto::WorkerErrorKindDescriptorMismatch => WorkerErrorKind::DescriptorMismatch,
+        WorkerErrorKindProto::WorkerErrorKindFullReportRequired => WorkerErrorKind::FullReportRequired,
+        WorkerErrorKindProto::WorkerErrorKindBlockLocationUnavailable => WorkerErrorKind::BlockLocationUnavailable,
+        WorkerErrorKindProto::WorkerErrorKindBlockStampMismatch => WorkerErrorKind::BlockStampMismatch,
+        WorkerErrorKindProto::WorkerErrorKindNodeUnavailable => WorkerErrorKind::NodeUnavailable,
+        WorkerErrorKindProto::WorkerErrorKindTimeout => WorkerErrorKind::Timeout,
+        WorkerErrorKindProto::WorkerErrorKindResourceExhausted => WorkerErrorKind::ResourceExhausted,
+        WorkerErrorKindProto::WorkerErrorKindConflict => WorkerErrorKind::Conflict,
+        WorkerErrorKindProto::WorkerErrorKindCorrupt => WorkerErrorKind::Corrupt,
+        WorkerErrorKindProto::WorkerErrorKindFencing => WorkerErrorKind::Fencing,
+        WorkerErrorKindProto::WorkerErrorKindCancelled => WorkerErrorKind::Cancelled,
+        WorkerErrorKindProto::WorkerErrorKindIo => WorkerErrorKind::Io,
+        WorkerErrorKindProto::WorkerErrorKindNotFound => WorkerErrorKind::NotFound,
     })
 }
 
-fn worker_kind_to_proto(kind: RpcWorkerErrorKind) -> proto_common::WorkerErrorKindProto {
+fn worker_kind_to_proto(kind: WorkerErrorKind) -> WorkerErrorKindProto {
     match kind {
-        RpcWorkerErrorKind::NotRegistered => proto_common::WorkerErrorKindProto::WorkerErrorKindNotRegistered,
-        RpcWorkerErrorKind::RunMismatch => proto_common::WorkerErrorKindProto::WorkerErrorKindRunMismatch,
-        RpcWorkerErrorKind::DescriptorMismatch => proto_common::WorkerErrorKindProto::WorkerErrorKindDescriptorMismatch,
-        RpcWorkerErrorKind::FullReportRequired => proto_common::WorkerErrorKindProto::WorkerErrorKindFullReportRequired,
-        RpcWorkerErrorKind::BlockLocationUnavailable => {
-            proto_common::WorkerErrorKindProto::WorkerErrorKindBlockLocationUnavailable
-        }
-        RpcWorkerErrorKind::BlockStampMismatch => proto_common::WorkerErrorKindProto::WorkerErrorKindBlockStampMismatch,
-        RpcWorkerErrorKind::NodeUnavailable => proto_common::WorkerErrorKindProto::WorkerErrorKindNodeUnavailable,
-        RpcWorkerErrorKind::Timeout => proto_common::WorkerErrorKindProto::WorkerErrorKindTimeout,
-        RpcWorkerErrorKind::ResourceExhausted => proto_common::WorkerErrorKindProto::WorkerErrorKindResourceExhausted,
-        RpcWorkerErrorKind::Conflict => proto_common::WorkerErrorKindProto::WorkerErrorKindConflict,
-        RpcWorkerErrorKind::Corrupt => proto_common::WorkerErrorKindProto::WorkerErrorKindCorrupt,
-        RpcWorkerErrorKind::Fencing => proto_common::WorkerErrorKindProto::WorkerErrorKindFencing,
-        RpcWorkerErrorKind::Cancelled => proto_common::WorkerErrorKindProto::WorkerErrorKindCancelled,
-        RpcWorkerErrorKind::Io => proto_common::WorkerErrorKindProto::WorkerErrorKindIo,
-        RpcWorkerErrorKind::NotFound => proto_common::WorkerErrorKindProto::WorkerErrorKindNotFound,
+        WorkerErrorKind::NotRegistered => WorkerErrorKindProto::WorkerErrorKindNotRegistered,
+        WorkerErrorKind::RunMismatch => WorkerErrorKindProto::WorkerErrorKindRunMismatch,
+        WorkerErrorKind::DescriptorMismatch => WorkerErrorKindProto::WorkerErrorKindDescriptorMismatch,
+        WorkerErrorKind::FullReportRequired => WorkerErrorKindProto::WorkerErrorKindFullReportRequired,
+        WorkerErrorKind::BlockLocationUnavailable => WorkerErrorKindProto::WorkerErrorKindBlockLocationUnavailable,
+        WorkerErrorKind::BlockStampMismatch => WorkerErrorKindProto::WorkerErrorKindBlockStampMismatch,
+        WorkerErrorKind::NodeUnavailable => WorkerErrorKindProto::WorkerErrorKindNodeUnavailable,
+        WorkerErrorKind::Timeout => WorkerErrorKindProto::WorkerErrorKindTimeout,
+        WorkerErrorKind::ResourceExhausted => WorkerErrorKindProto::WorkerErrorKindResourceExhausted,
+        WorkerErrorKind::Conflict => WorkerErrorKindProto::WorkerErrorKindConflict,
+        WorkerErrorKind::Corrupt => WorkerErrorKindProto::WorkerErrorKindCorrupt,
+        WorkerErrorKind::Fencing => WorkerErrorKindProto::WorkerErrorKindFencing,
+        WorkerErrorKind::Cancelled => WorkerErrorKindProto::WorkerErrorKindCancelled,
+        WorkerErrorKind::Io => WorkerErrorKindProto::WorkerErrorKindIo,
+        WorkerErrorKind::NotFound => WorkerErrorKindProto::WorkerErrorKindNotFound,
     }
 }
 
-fn protocol_kind_proto_to_kind(kind: proto_common::ProtocolErrorKindProto) -> Option<RpcProtocolErrorKind> {
+fn protocol_kind_proto_to_kind(kind: ProtocolErrorKindProto) -> Option<ProtocolErrorKind> {
     Some(match kind {
-        proto_common::ProtocolErrorKindProto::ProtocolErrorKindUnspecified => return None,
-        proto_common::ProtocolErrorKindProto::ProtocolErrorKindInvalidHeader => RpcProtocolErrorKind::InvalidHeader,
-        proto_common::ProtocolErrorKindProto::ProtocolErrorKindInvalidArgument => RpcProtocolErrorKind::InvalidArgument,
-        proto_common::ProtocolErrorKindProto::ProtocolErrorKindPermissionDenied => {
-            RpcProtocolErrorKind::PermissionDenied
-        }
-        proto_common::ProtocolErrorKindProto::ProtocolErrorKindUnsupported => RpcProtocolErrorKind::Unsupported,
-        proto_common::ProtocolErrorKindProto::ProtocolErrorKindCancelled => RpcProtocolErrorKind::Cancelled,
-        proto_common::ProtocolErrorKindProto::ProtocolErrorKindCorrupt => RpcProtocolErrorKind::Corrupt,
+        ProtocolErrorKindProto::ProtocolErrorKindUnspecified => return None,
+        ProtocolErrorKindProto::ProtocolErrorKindInvalidHeader => ProtocolErrorKind::InvalidHeader,
+        ProtocolErrorKindProto::ProtocolErrorKindInvalidArgument => ProtocolErrorKind::InvalidArgument,
+        ProtocolErrorKindProto::ProtocolErrorKindPermissionDenied => ProtocolErrorKind::PermissionDenied,
+        ProtocolErrorKindProto::ProtocolErrorKindUnsupported => ProtocolErrorKind::Unsupported,
+        ProtocolErrorKindProto::ProtocolErrorKindCancelled => ProtocolErrorKind::Cancelled,
+        ProtocolErrorKindProto::ProtocolErrorKindCorrupt => ProtocolErrorKind::Corrupt,
     })
 }
 
-fn protocol_kind_to_proto(kind: RpcProtocolErrorKind) -> proto_common::ProtocolErrorKindProto {
+fn protocol_kind_to_proto(kind: ProtocolErrorKind) -> ProtocolErrorKindProto {
     match kind {
-        RpcProtocolErrorKind::InvalidHeader => proto_common::ProtocolErrorKindProto::ProtocolErrorKindInvalidHeader,
-        RpcProtocolErrorKind::InvalidArgument => proto_common::ProtocolErrorKindProto::ProtocolErrorKindInvalidArgument,
-        RpcProtocolErrorKind::PermissionDenied => {
-            proto_common::ProtocolErrorKindProto::ProtocolErrorKindPermissionDenied
-        }
-        RpcProtocolErrorKind::Unsupported => proto_common::ProtocolErrorKindProto::ProtocolErrorKindUnsupported,
-        RpcProtocolErrorKind::Cancelled => proto_common::ProtocolErrorKindProto::ProtocolErrorKindCancelled,
-        RpcProtocolErrorKind::Corrupt => proto_common::ProtocolErrorKindProto::ProtocolErrorKindCorrupt,
+        ProtocolErrorKind::InvalidHeader => ProtocolErrorKindProto::ProtocolErrorKindInvalidHeader,
+        ProtocolErrorKind::InvalidArgument => ProtocolErrorKindProto::ProtocolErrorKindInvalidArgument,
+        ProtocolErrorKind::PermissionDenied => ProtocolErrorKindProto::ProtocolErrorKindPermissionDenied,
+        ProtocolErrorKind::Unsupported => ProtocolErrorKindProto::ProtocolErrorKindUnsupported,
+        ProtocolErrorKind::Cancelled => ProtocolErrorKindProto::ProtocolErrorKindCancelled,
+        ProtocolErrorKind::Corrupt => ProtocolErrorKindProto::ProtocolErrorKindCorrupt,
     }
 }
 
-fn internal_kind_proto_to_kind(kind: proto_common::InternalErrorKindProto) -> Option<RpcInternalErrorKind> {
+fn internal_kind_proto_to_kind(kind: InternalErrorKindProto) -> Option<InternalErrorKind> {
     Some(match kind {
-        proto_common::InternalErrorKindProto::InternalErrorKindUnspecified => return None,
-        proto_common::InternalErrorKindProto::InternalErrorKindNodeUnavailable => RpcInternalErrorKind::NodeUnavailable,
-        proto_common::InternalErrorKindProto::InternalErrorKindTimeout => RpcInternalErrorKind::Timeout,
-        proto_common::InternalErrorKindProto::InternalErrorKindResourceExhausted => {
-            RpcInternalErrorKind::ResourceExhausted
-        }
-        proto_common::InternalErrorKindProto::InternalErrorKindCancelled => RpcInternalErrorKind::Cancelled,
-        proto_common::InternalErrorKindProto::InternalErrorKindCorrupt => RpcInternalErrorKind::Corrupt,
-        proto_common::InternalErrorKindProto::InternalErrorKindInternal => RpcInternalErrorKind::Internal,
+        InternalErrorKindProto::InternalErrorKindUnspecified => return None,
+        InternalErrorKindProto::InternalErrorKindNodeUnavailable => InternalErrorKind::NodeUnavailable,
+        InternalErrorKindProto::InternalErrorKindTimeout => InternalErrorKind::Timeout,
+        InternalErrorKindProto::InternalErrorKindResourceExhausted => InternalErrorKind::ResourceExhausted,
+        InternalErrorKindProto::InternalErrorKindCancelled => InternalErrorKind::Cancelled,
+        InternalErrorKindProto::InternalErrorKindCorrupt => InternalErrorKind::Corrupt,
+        InternalErrorKindProto::InternalErrorKindInternal => InternalErrorKind::Internal,
     })
 }
 
-fn internal_kind_to_proto(kind: RpcInternalErrorKind) -> proto_common::InternalErrorKindProto {
+fn internal_kind_to_proto(kind: InternalErrorKind) -> InternalErrorKindProto {
     match kind {
-        RpcInternalErrorKind::NodeUnavailable => proto_common::InternalErrorKindProto::InternalErrorKindNodeUnavailable,
-        RpcInternalErrorKind::Timeout => proto_common::InternalErrorKindProto::InternalErrorKindTimeout,
-        RpcInternalErrorKind::ResourceExhausted => {
-            proto_common::InternalErrorKindProto::InternalErrorKindResourceExhausted
-        }
-        RpcInternalErrorKind::Cancelled => proto_common::InternalErrorKindProto::InternalErrorKindCancelled,
-        RpcInternalErrorKind::Corrupt => proto_common::InternalErrorKindProto::InternalErrorKindCorrupt,
-        RpcInternalErrorKind::Internal => proto_common::InternalErrorKindProto::InternalErrorKindInternal,
+        InternalErrorKind::NodeUnavailable => InternalErrorKindProto::InternalErrorKindNodeUnavailable,
+        InternalErrorKind::Timeout => InternalErrorKindProto::InternalErrorKindTimeout,
+        InternalErrorKind::ResourceExhausted => InternalErrorKindProto::InternalErrorKindResourceExhausted,
+        InternalErrorKind::Cancelled => InternalErrorKindProto::InternalErrorKindCancelled,
+        InternalErrorKind::Corrupt => InternalErrorKindProto::InternalErrorKindCorrupt,
+        InternalErrorKind::Internal => InternalErrorKindProto::InternalErrorKindInternal,
     }
 }
 
-fn error_kind_proto_to_kind(kind: Option<&proto_common::ErrorKindProto>) -> Option<RpcErrorKind> {
+fn error_kind_proto_to_kind(kind: Option<&ErrorKindProto>) -> Option<ErrorKind> {
     match kind.and_then(|kind| kind.kind.as_ref()) {
-        Some(proto_common::error_kind_proto::Kind::Metadata(kind)) => {
-            let kind = proto_common::MetadataErrorKindProto::try_from(*kind).ok()?;
-            Some(RpcErrorKind::Metadata(metadata_kind_proto_to_kind(kind)?))
+        Some(Kind::Metadata(kind)) => {
+            let kind = MetadataErrorKindProto::try_from(*kind).ok()?;
+            Some(ErrorKind::Metadata(metadata_kind_proto_to_kind(kind)?))
         }
-        Some(proto_common::error_kind_proto::Kind::Worker(kind)) => {
-            let kind = proto_common::WorkerErrorKindProto::try_from(*kind).ok()?;
-            Some(RpcErrorKind::Worker(worker_kind_proto_to_kind(kind)?))
+        Some(Kind::Worker(kind)) => {
+            let kind = WorkerErrorKindProto::try_from(*kind).ok()?;
+            Some(ErrorKind::Worker(worker_kind_proto_to_kind(kind)?))
         }
-        Some(proto_common::error_kind_proto::Kind::Protocol(kind)) => {
-            let kind = proto_common::ProtocolErrorKindProto::try_from(*kind).ok()?;
-            Some(RpcErrorKind::Protocol(protocol_kind_proto_to_kind(kind)?))
+        Some(Kind::Protocol(kind)) => {
+            let kind = ProtocolErrorKindProto::try_from(*kind).ok()?;
+            Some(ErrorKind::Protocol(protocol_kind_proto_to_kind(kind)?))
         }
-        Some(proto_common::error_kind_proto::Kind::Internal(kind)) => {
-            let kind = proto_common::InternalErrorKindProto::try_from(*kind).ok()?;
-            Some(RpcErrorKind::Internal(internal_kind_proto_to_kind(kind)?))
+        Some(Kind::Internal(kind)) => {
+            let kind = InternalErrorKindProto::try_from(*kind).ok()?;
+            Some(ErrorKind::Internal(internal_kind_proto_to_kind(kind)?))
         }
         None => None,
     }
 }
 
-fn error_kind_to_proto(kind: RpcErrorKind) -> proto_common::ErrorKindProto {
+fn error_kind_to_proto(kind: ErrorKind) -> ErrorKindProto {
     let kind = match kind {
-        RpcErrorKind::Metadata(kind) => {
-            proto_common::error_kind_proto::Kind::Metadata(metadata_kind_to_proto(kind) as i32)
-        }
-        RpcErrorKind::Worker(kind) => proto_common::error_kind_proto::Kind::Worker(worker_kind_to_proto(kind) as i32),
-        RpcErrorKind::Protocol(kind) => {
-            proto_common::error_kind_proto::Kind::Protocol(protocol_kind_to_proto(kind) as i32)
-        }
-        RpcErrorKind::Internal(kind) => {
-            proto_common::error_kind_proto::Kind::Internal(internal_kind_to_proto(kind) as i32)
-        }
+        ErrorKind::Metadata(kind) => Kind::Metadata(metadata_kind_to_proto(kind) as i32),
+        ErrorKind::Worker(kind) => Kind::Worker(worker_kind_to_proto(kind) as i32),
+        ErrorKind::Protocol(kind) => Kind::Protocol(protocol_kind_to_proto(kind) as i32),
+        ErrorKind::Internal(kind) => Kind::Internal(internal_kind_to_proto(kind) as i32),
     };
-    proto_common::ErrorKindProto { kind: Some(kind) }
+    ErrorKindProto { kind: Some(kind) }
 }
 
-fn refresh_hint_proto_to_hint(hint: Option<&proto_common::RefreshHintProto>) -> RpcRefreshHint {
-    hint.map_or_else(RpcRefreshHint::default, |hint| RpcRefreshHint {
+fn refresh_hint_proto_to_hint(hint: Option<&RefreshHintProto>) -> RefreshHint {
+    hint.map_or_else(RefreshHint::default, |hint| RefreshHint {
         leader_endpoint: hint.leader_endpoint.clone(),
         group_name: hint.group_name.clone(),
         mount_epoch: hint.mount_epoch,
@@ -958,8 +968,8 @@ fn refresh_hint_proto_to_hint(hint: Option<&proto_common::RefreshHintProto>) -> 
     })
 }
 
-fn refresh_hint_to_proto(hint: &RpcRefreshHint) -> proto_common::RefreshHintProto {
-    proto_common::RefreshHintProto {
+fn refresh_hint_to_proto(hint: &RefreshHint) -> RefreshHintProto {
+    RefreshHintProto {
         leader_endpoint: hint.leader_endpoint.clone(),
         group_name: hint.group_name.clone(),
         mount_epoch: hint.mount_epoch,
@@ -968,7 +978,7 @@ fn refresh_hint_to_proto(hint: &RpcRefreshHint) -> proto_common::RefreshHintProt
         worker_endpoints: hint
             .worker_endpoints
             .iter()
-            .map(|endpoint| proto_common::WorkerEndpointInfoProto {
+            .map(|endpoint| WorkerEndpointInfoProto {
                 worker_id: endpoint.worker_id,
                 endpoint: endpoint.endpoint.clone(),
                 worker_run_id: String::new(),
@@ -978,58 +988,38 @@ fn refresh_hint_to_proto(hint: &RpcRefreshHint) -> proto_common::RefreshHintProt
     }
 }
 
-fn recovery_proto_to_action(recovery: Option<&proto_common::RecoveryActionProto>) -> Option<RpcRecoveryAction> {
+fn recovery_proto_to_action(recovery: Option<&RecoveryActionProto>) -> Option<RecoveryAction> {
     match recovery.and_then(|recovery| recovery.action.as_ref()) {
-        Some(proto_common::recovery_action_proto::Action::Fail(_)) => Some(RpcRecoveryAction::Fail),
-        Some(proto_common::recovery_action_proto::Action::Retry(retry)) => Some(RpcRecoveryAction::Retry {
+        Some(Action::Fail(_)) => Some(RecoveryAction::Fail),
+        Some(Action::Retry(retry)) => Some(RecoveryAction::Retry {
             after_ms: retry.after_ms,
         }),
-        Some(proto_common::recovery_action_proto::Action::RefreshMetadata(refresh)) => {
-            Some(RpcRecoveryAction::RefreshMetadata {
-                hint: refresh_hint_proto_to_hint(refresh.hint.as_ref()),
-            })
-        }
-        Some(proto_common::recovery_action_proto::Action::ReopenWriteSession(reopen)) => {
-            Some(RpcRecoveryAction::ReopenWriteSession {
-                hint: refresh_hint_proto_to_hint(reopen.hint.as_ref()),
-            })
-        }
-        Some(proto_common::recovery_action_proto::Action::RegisterWorker(_)) => Some(RpcRecoveryAction::RegisterWorker),
-        Some(proto_common::recovery_action_proto::Action::SendFullBlockReport(_)) => {
-            Some(RpcRecoveryAction::SendFullBlockReport)
-        }
+        Some(Action::RefreshMetadata(refresh)) => Some(RecoveryAction::RefreshMetadata {
+            hint: refresh_hint_proto_to_hint(refresh.hint.as_ref()),
+        }),
+        Some(Action::ReopenWriteSession(reopen)) => Some(RecoveryAction::ReopenWriteSession {
+            hint: refresh_hint_proto_to_hint(reopen.hint.as_ref()),
+        }),
+        Some(Action::RegisterWorker(_)) => Some(RecoveryAction::RegisterWorker),
+        Some(Action::SendFullBlockReport(_)) => Some(RecoveryAction::SendFullBlockReport),
         None => None,
     }
 }
 
-fn recovery_action_to_proto(action: &RpcRecoveryAction) -> proto_common::RecoveryActionProto {
+fn recovery_action_to_proto(action: &RecoveryAction) -> RecoveryActionProto {
     let action = match action {
-        RpcRecoveryAction::Fail => {
-            proto_common::recovery_action_proto::Action::Fail(proto_common::FailRecoveryProto {})
-        }
-        RpcRecoveryAction::Retry { after_ms } => {
-            proto_common::recovery_action_proto::Action::Retry(proto_common::RetryRecoveryProto { after_ms: *after_ms })
-        }
-        RpcRecoveryAction::RefreshMetadata { hint } => {
-            proto_common::recovery_action_proto::Action::RefreshMetadata(proto_common::RefreshMetadataRecoveryProto {
-                hint: Some(refresh_hint_to_proto(hint)),
-            })
-        }
-        RpcRecoveryAction::ReopenWriteSession { hint } => {
-            proto_common::recovery_action_proto::Action::ReopenWriteSession(
-                proto_common::ReopenWriteSessionRecoveryProto {
-                    hint: Some(refresh_hint_to_proto(hint)),
-                },
-            )
-        }
-        RpcRecoveryAction::RegisterWorker => {
-            proto_common::recovery_action_proto::Action::RegisterWorker(proto_common::RegisterWorkerRecoveryProto {})
-        }
-        RpcRecoveryAction::SendFullBlockReport => proto_common::recovery_action_proto::Action::SendFullBlockReport(
-            proto_common::SendFullBlockReportRecoveryProto {},
-        ),
+        RecoveryAction::Fail => Action::Fail(FailRecoveryProto {}),
+        RecoveryAction::Retry { after_ms } => Action::Retry(RetryRecoveryProto { after_ms: *after_ms }),
+        RecoveryAction::RefreshMetadata { hint } => Action::RefreshMetadata(RefreshMetadataRecoveryProto {
+            hint: Some(refresh_hint_to_proto(hint)),
+        }),
+        RecoveryAction::ReopenWriteSession { hint } => Action::ReopenWriteSession(ReopenWriteSessionRecoveryProto {
+            hint: Some(refresh_hint_to_proto(hint)),
+        }),
+        RecoveryAction::RegisterWorker => Action::RegisterWorker(RegisterWorkerRecoveryProto {}),
+        RecoveryAction::SendFullBlockReport => Action::SendFullBlockReport(SendFullBlockReportRecoveryProto {}),
     };
-    proto_common::RecoveryActionProto { action: Some(action) }
+    RecoveryActionProto { action: Some(action) }
 }
 
 /// Convert proto ErrorDetailProto into RPC error.
@@ -1037,13 +1027,13 @@ fn recovery_action_to_proto(action: &RpcRecoveryAction) -> proto_common::Recover
 /// Missing or unknown failure facts and recovery actions fail closed as an
 /// invalid header. Malformed input cannot retain a retry or refresh action
 /// supplied by the wire payload.
-pub fn rpc_error_from_proto(err_detail: &proto_common::ErrorDetailProto) -> RpcErrorDetail {
+pub fn rpc_error_from_proto(err_detail: &ErrorDetailProto) -> RpcErrorDetail {
     let (Some(kind), Some(recovery)) = (
         error_kind_proto_to_kind(err_detail.kind.as_ref()),
         recovery_proto_to_action(err_detail.recovery.as_ref()),
     ) else {
         return RpcErrorDetail::fail(
-            RpcErrorKind::Protocol(RpcProtocolErrorKind::InvalidHeader),
+            ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader),
             "malformed RPC error detail",
         );
     };
@@ -1055,8 +1045,8 @@ pub fn rpc_error_from_proto(err_detail: &proto_common::ErrorDetailProto) -> RpcE
 }
 
 /// Convert RPC error into proto ErrorDetailProto.
-pub fn rpc_error_to_proto(err: &RpcErrorDetail) -> proto_common::ErrorDetailProto {
-    proto_common::ErrorDetailProto {
+pub fn rpc_error_to_proto(err: &RpcErrorDetail) -> ErrorDetailProto {
+    ErrorDetailProto {
         kind: Some(error_kind_to_proto(err.kind)),
         recovery: Some(recovery_action_to_proto(&err.recovery)),
         message: err.message.clone(),
@@ -1066,8 +1056,57 @@ pub fn rpc_error_to_proto(err: &RpcErrorDetail) -> proto_common::ErrorDetailProt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
 
-    fn test_worker_run_id() -> beryl_types::WorkerRunId {
+    #[test]
+    fn write_domain_values_preserve_wire_identity_and_intent() {
+        for (kind, raw) in [(FileType::File, 1), (FileType::Dir, 2), (FileType::Symlink, 3)] {
+            let wire = FileTypeProto::from(kind);
+            assert_eq!(wire as i32, raw);
+            assert_eq!(FileType::try_from(wire).unwrap(), kind);
+        }
+        assert!(FileType::try_from(FileTypeProto::FileTypeUnspecified).is_err());
+        assert!(FileTypeProto::try_from(i32::MAX).is_err());
+        let bytes = [8, 42, 16, 17];
+        let handle = WriteHandle::try_from(WriteHandleProto::decode(bytes.as_slice()).unwrap()).unwrap();
+        assert_eq!(
+            handle,
+            WriteHandle {
+                inode_id: InodeId::new(42),
+                lease_epoch: LeaseEpoch::new(17)
+            }
+        );
+        assert_eq!(WriteHandleProto::from(handle).encode_to_vec(), bytes);
+        for (inode_id, write_lease_epoch) in [(0, 17), (42, 0)] {
+            assert!(
+                WriteHandle::try_from(WriteHandleProto {
+                    inode_id,
+                    write_lease_epoch
+                })
+                .is_err()
+            );
+        }
+        for (mode, wire) in [(WriteMode::Overwrite, 1), (WriteMode::Append, 2)] {
+            let encoded = OpenWriteModeProto::from(mode);
+            assert_eq!(encoded as i32, wire);
+            assert_eq!(parse_write_mode(wire).unwrap(), mode);
+        }
+        for raw in [0, -1, i32::MAX] {
+            assert!(parse_write_mode(raw).is_err());
+        }
+
+        let token = FencingToken::new(
+            BlockId::from_u64_u32(42, u32::MAX),
+            ClientId::new(9),
+            LeaseEpoch::new(17),
+        );
+        let wire = FencingTokenProto::from(token);
+        assert_eq!(wire.block_id.unwrap().block_index, u32::MAX);
+        assert_eq!(wire.epoch, 17);
+        assert_eq!(FencingToken::try_from(wire).unwrap(), token);
+    }
+
+    fn test_worker_run_id() -> WorkerRunId {
         "550e8400-e29b-41d4-a716-446655440000"
             .parse()
             .expect("valid test WorkerRunId")
@@ -1075,123 +1114,88 @@ mod tests {
 
     #[test]
     fn malformed_rpc_error_details_fail_closed_without_recovery() {
-        let retry = || proto_common::RecoveryActionProto {
-            action: Some(proto_common::recovery_action_proto::Action::Retry(
-                proto_common::RetryRecoveryProto { after_ms: Some(1) },
-            )),
+        let kind = |value| ErrorKindProto {
+            kind: Some(Kind::Metadata(value)),
         };
-        let refresh = || proto_common::RecoveryActionProto {
-            action: Some(proto_common::recovery_action_proto::Action::RefreshMetadata(
-                proto_common::RefreshMetadataRecoveryProto {
-                    hint: Some(proto_common::RefreshHintProto::default()),
-                },
-            )),
-        };
-        let valid_kind = || proto_common::ErrorKindProto {
-            kind: Some(proto_common::error_kind_proto::Kind::Metadata(
-                proto_common::MetadataErrorKindProto::MetadataErrorKindNotFound as i32,
-            )),
-        };
-        let malformed = [
-            proto_common::ErrorDetailProto {
-                kind: Some(proto_common::ErrorKindProto {
-                    kind: Some(proto_common::error_kind_proto::Kind::Metadata(i32::MAX)),
-                }),
-                recovery: Some(retry()),
-                message: "unknown kind with retry".to_string(),
-            },
-            proto_common::ErrorDetailProto {
-                kind: Some(proto_common::ErrorKindProto {
-                    kind: Some(proto_common::error_kind_proto::Kind::Metadata(
-                        proto_common::MetadataErrorKindProto::MetadataErrorKindUnspecified as i32,
-                    )),
-                }),
-                recovery: Some(retry()),
-                message: "unspecified kind with retry".to_string(),
-            },
-            proto_common::ErrorDetailProto {
-                kind: None,
-                recovery: Some(refresh()),
-                message: "missing kind with refresh".to_string(),
-            },
-            proto_common::ErrorDetailProto {
-                kind: Some(valid_kind()),
-                recovery: None,
-                message: "missing recovery".to_string(),
-            },
-            proto_common::ErrorDetailProto {
-                kind: Some(valid_kind()),
-                recovery: Some(proto_common::RecoveryActionProto { action: None }),
-                message: "missing recovery action".to_string(),
-            },
-        ];
-
-        for encoded in malformed {
+        let retry = Some(RecoveryActionProto {
+            action: Some(Action::Retry(RetryRecoveryProto { after_ms: Some(1) })),
+        });
+        let refresh = Some(RecoveryActionProto {
+            action: Some(Action::RefreshMetadata(RefreshMetadataRecoveryProto {
+                hint: Some(RefreshHintProto::default()),
+            })),
+        });
+        let valid = Some(kind(MetadataErrorKindProto::MetadataErrorKindNotFound as i32));
+        for (kind, recovery) in [
+            (Some(kind(i32::MAX)), retry.clone()),
+            (
+                Some(kind(MetadataErrorKindProto::MetadataErrorKindUnspecified as i32)),
+                retry,
+            ),
+            (None, refresh),
+            (valid, None),
+            (valid, Some(RecoveryActionProto { action: None })),
+        ] {
+            let encoded = ErrorDetailProto {
+                kind,
+                recovery,
+                message: String::new(),
+            };
             let decoded = rpc_error_from_proto(&encoded);
-            assert_eq!(
-                decoded.kind,
-                RpcErrorKind::Protocol(RpcProtocolErrorKind::InvalidHeader)
-            );
-            assert_eq!(decoded.recovery, RpcRecoveryAction::Fail);
+            assert_eq!(decoded.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
+            assert_eq!(decoded.recovery, RecoveryAction::Fail);
             assert_eq!(decoded.message, "malformed RPC error detail");
         }
     }
 
     #[test]
     fn shared_location_conversion_rejects_malformed_required_fields() {
-        let endpoint = || proto_common::WorkerEndpointInfoProto {
+        let endpoint = || WorkerEndpointInfoProto {
             worker_id: 7,
             endpoint: "127.0.0.1:19101".to_string(),
             worker_run_id: test_worker_run_id().to_string(),
         };
         let block_id = BlockId::from_u64_u32(42, 3);
-        let token = FencingToken::new(block_id, ClientId::new(9), 17);
+        let token = FencingToken::new(block_id, ClientId::new(9), LeaseEpoch::new(17));
 
-        let mut target = proto_metadata::WriteTargetProto {
+        let mut target = WriteTargetProto {
             block_id: Some(block_id.into()),
             file_offset: 128,
             worker_endpoints: Vec::new(),
             fencing_token: Some(token.into()),
             block_stamp: 55,
-            chunk_size: beryl_types::layout::BlockFormatId::FULL_EFFECTIVE
-                .spec()
-                .unwrap()
-                .storage_chunk_size,
-            block_format_id: beryl_types::layout::BlockFormatId::FULL_EFFECTIVE.as_raw(),
+            chunk_size: BlockFormatId::FULL_EFFECTIVE.spec().unwrap().storage_chunk_size,
+            block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
             block_size: 4096,
-            tier: proto_common::TierProto::TierHdd as i32,
+            tier: TierProto::TierHdd as i32,
         };
-        let err = beryl_types::WriteTarget::try_from(target.clone()).expect_err("empty target workers must fail");
+        let err = WriteTarget::try_from(target.clone()).expect_err("empty target workers must fail");
         assert!(err.contains("worker_endpoints"));
         target.worker_endpoints.push(endpoint());
         target.block_stamp = 0;
-        let err = beryl_types::WriteTarget::try_from(target).expect_err("zero target block_stamp must fail");
+        let err = WriteTarget::try_from(target).expect_err("zero target block_stamp must fail");
         assert!(err.contains("block_stamp"));
 
-        let mut location = proto_metadata::FileBlockLocationProto {
+        let mut location = FileBlockLocationProto {
             block_id: Some(block_id.into()),
             file_offset: 128,
             len: 4096,
             workers: Vec::new(),
             block_stamp: Some(55),
-            block_format_id: beryl_types::layout::BlockFormatId::FULL_EFFECTIVE.as_raw(),
+            block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
             block_size: 4096,
-            chunk_size: beryl_types::layout::BlockFormatId::FULL_EFFECTIVE
-                .spec()
-                .unwrap()
-                .storage_chunk_size,
+            chunk_size: BlockFormatId::FULL_EFFECTIVE.spec().unwrap().storage_chunk_size,
             effective_len: 4096,
         };
         let decoded_empty =
-            beryl_types::FileBlockLocation::try_from(location.clone()).expect("empty read location workers are valid");
+            FileBlockLocation::try_from(location.clone()).expect("empty read location workers are valid");
         assert!(decoded_empty.workers.is_empty());
         location.workers.push(endpoint());
         location.block_stamp = None;
-        let err =
-            beryl_types::FileBlockLocation::try_from(location.clone()).expect_err("missing block_stamp must fail");
+        let err = FileBlockLocation::try_from(location.clone()).expect_err("missing block_stamp must fail");
         assert!(err.contains("block_stamp missing"));
         location.block_stamp = Some(0);
-        let err = beryl_types::FileBlockLocation::try_from(location).expect_err("zero block_stamp must fail");
+        let err = FileBlockLocation::try_from(location).expect_err("zero block_stamp must fail");
         assert!(err.contains("block_stamp"));
     }
 }

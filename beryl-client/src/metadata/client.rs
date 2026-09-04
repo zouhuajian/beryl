@@ -3,14 +3,6 @@
 
 //! Metadata operation execution, retry, and authority-state ownership.
 
-use std::fmt;
-use std::future::Future;
-use std::sync::Arc;
-use std::time::Duration;
-
-use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
-use beryl_types::{BlockId, FileLayout, InodeId, InodeKind};
-
 use crate::api::path::NamespacePathBuf;
 use crate::api::{DeleteOptions, FileStatus};
 use crate::config::ClientConfig;
@@ -20,11 +12,31 @@ use crate::error::{
 use crate::metadata::{
     AddBlockResult, ListStatusPage, MetadataTransport, OpenedFile, ReadLayout, ValidatedMetadataResponse,
 };
-use crate::metrics::{self, ClientMetric, ClientMetricLabels};
+use crate::metrics;
+use crate::metrics::{ClientMetric, ClientMetricLabels};
 use crate::runtime::context::{AttemptContext, ClientIdentity, Operation, OperationContext, OperationDeadline};
 use crate::runtime::refresh::MetadataTargets;
 use crate::runtime::{retry_decision, transport_outcome_is_ambiguous, RetryDecision};
 use crate::session::write_session::{CommitFilePlan, SyncWritePlan, WriteSession};
+use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
+use beryl_proto::common::ByteRangeProto;
+use beryl_proto::metadata::get_block_locations_request_proto::Target;
+use beryl_proto::metadata::{
+    AbortFileWriteRequestProto, AbortFileWriteResponseProto, AddBlockRequestProto, CommitFileRequestProto,
+    CommitFileResponseProto, CreateDirectoryRequestProto, CreateDirectoryResponseProto, CreateFileRequestProto,
+    DeleteOptionsProto, DeleteRequestProto, FileAttrsProto, FileTypeProto, GetBlockLocationsRequestProto,
+    GetStatusRequestProto, GetStatusResponseProto, ListStatusRequestProto, ListStatusResponseProto, MsyncRequestProto,
+    OpenFileRequestProto, OpenWriteModeProto, OpenWriteRequestProto, OpenWriteResponseProto, RenameRequestProto,
+    RenewLeaseRequestProto, SyncWriteRequestProto,
+};
+use beryl_types::{
+    BlockId, ClientId, ContentGeneration, FileLayout, FileType, GroupName, InodeId, WriteHandle, WriteMode,
+};
+use std::fmt::{Debug, Formatter, Result};
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
+use tonic::Status;
 
 const INITIAL_BACKOFF_MS: u64 = 100;
 const MAX_BACKOFF_MS: u64 = 2_000;
@@ -84,7 +96,7 @@ impl MetadataClient {
         let response = self
             .execute_metadata(
                 operation,
-                beryl_proto::metadata::GetStatusRequestProto {
+                GetStatusRequestProto {
                     header: None,
                     path: path.clone(),
                 },
@@ -106,7 +118,7 @@ impl MetadataClient {
         let response = self
             .execute_metadata(
                 operation,
-                beryl_proto::metadata::ListStatusRequestProto {
+                ListStatusRequestProto {
                     header: None,
                     path: path.clone(),
                     cursor: cursor.unwrap_or_default(),
@@ -128,7 +140,7 @@ impl MetadataClient {
             Operation::CreateDirectory
         };
         let operation = self.operation(kind, Some(path.clone()), self.operation_deadline())?;
-        let request = beryl_proto::metadata::CreateDirectoryRequestProto {
+        let request = CreateDirectoryRequestProto {
             header: None,
             path: path.clone(),
             attrs: Some(default_dir_attrs()),
@@ -153,10 +165,10 @@ impl MetadataClient {
         let operation = self.operation(Operation::Delete, Some(path.clone()), self.operation_deadline())?;
         self.execute_mutation_metadata(
             operation,
-            beryl_proto::metadata::DeleteRequestProto {
+            DeleteRequestProto {
                 header: None,
                 path,
-                options: Some(beryl_proto::metadata::DeleteOptionsProto {
+                options: Some(DeleteOptionsProto {
                     recursive: options.recursive,
                 }),
             },
@@ -173,7 +185,7 @@ impl MetadataClient {
         let operation = self.operation(Operation::Rename, Some(src.clone()), self.operation_deadline())?;
         self.execute_mutation_metadata(
             operation,
-            beryl_proto::metadata::RenameRequestProto {
+            RenameRequestProto {
                 header: None,
                 src_path: src,
                 dst_path: dst,
@@ -185,14 +197,14 @@ impl MetadataClient {
         .map(|_| ())
     }
 
-    /// Opens one immutable Metadata file version for subsequent authorized reads.
+    /// Captures inode, content generation, and length for subsequent authorized reads.
     pub(crate) async fn open_file(&self, path: NamespacePathBuf) -> ClientResult<OpenedFile> {
         let path = path.into_string();
         let operation = self.operation(Operation::OpenFile, Some(path.clone()), self.operation_deadline())?;
         let response = self
             .execute_metadata(
                 operation,
-                beryl_proto::metadata::OpenFileRequestProto {
+                OpenFileRequestProto {
                     header: None,
                     path: path.clone(),
                 },
@@ -205,13 +217,13 @@ impl MetadataClient {
                 "OpenFileResponseProto.inode_id must be non-zero",
             ));
         }
-        let content_revision = response
-            .content_revision
-            .ok_or_else(|| invalid_response("OpenFile", "OpenFileResponseProto.content_revision missing"))?;
+        let generation = response
+            .generation
+            .ok_or_else(|| invalid_response("OpenFile", "OpenFileResponseProto.generation missing"))?;
         Ok(OpenedFile::new(
             path,
             InodeId::new(response.inode_id),
-            content_revision,
+            ContentGeneration::new(generation),
             response.file_size,
         ))
     }
@@ -226,12 +238,10 @@ impl MetadataClient {
     ) -> ClientResult<ReadLayout> {
         self.execute_metadata(
             operation,
-            beryl_proto::metadata::GetBlockLocationsRequestProto {
+            GetBlockLocationsRequestProto {
                 header: None,
-                target: Some(
-                    beryl_proto::metadata::get_block_locations_request_proto::Target::InodeId(inode_id.as_raw()),
-                ),
-                range: Some(beryl_proto::common::ByteRangeProto { offset, len }),
+                target: Some(Target::InodeId(inode_id.as_raw())),
+                range: Some(ByteRangeProto { offset, len }),
             },
             |transport, ctx, req| async move { transport.read_layout(ctx, req).await },
         )
@@ -245,7 +255,7 @@ impl MetadataClient {
         let create = self
             .execute_mutation_metadata(
                 create_operation.clone(),
-                beryl_proto::metadata::CreateFileRequestProto {
+                CreateFileRequestProto {
                     header: None,
                     path: path.clone(),
                 },
@@ -264,6 +274,9 @@ impl MetadataClient {
             side_effect_response_body_mismatch("CreateFile", "CreateFileResponseProto.write_handle missing")
                 .with_operation_context(&create_operation)
         })?;
+        let write_handle = WriteHandle::try_from(write_handle).map_err(|error| {
+            side_effect_response_body_mismatch("CreateFile", error).with_operation_context(&create_operation)
+        })?;
         if create.expires_at_ms == 0 {
             return Err(side_effect_response_body_mismatch(
                 "CreateFile",
@@ -277,8 +290,8 @@ impl MetadataClient {
             write_handle,
             0,
             create.expires_at_ms,
-            create.content_revision,
-            beryl_proto::metadata::OpenWriteModeProto::OpenWriteModeWrite,
+            ContentGeneration::new(create.generation),
+            WriteMode::Overwrite,
         )
         .map_err(|error| {
             side_effect_response_body_mismatch("CreateFile", error).with_operation_context(&create_operation)
@@ -289,18 +302,9 @@ impl MetadataClient {
     pub(crate) async fn open_append(&self, path: NamespacePathBuf) -> ClientResult<WriteSession> {
         let path = path.into_string();
         let (operation, open) = self
-            .open_write_request(
-                &path,
-                beryl_proto::metadata::OpenWriteModeProto::OpenWriteModeAppend,
-                self.operation_deadline(),
-            )
+            .open_write_request(&path, WriteMode::Append, self.operation_deadline())
             .await?;
-        write_session_from_open_response(
-            &operation,
-            path,
-            beryl_proto::metadata::OpenWriteModeProto::OpenWriteModeAppend,
-            open,
-        )
+        write_session_from_open_response(&operation, path, WriteMode::Append, open)
     }
 
     /// Retains the exact operation identity so all successful-body validation
@@ -308,17 +312,17 @@ impl MetadataClient {
     async fn open_write_request(
         &self,
         path: &str,
-        mode: beryl_proto::metadata::OpenWriteModeProto,
+        mode: WriteMode,
         deadline: OperationDeadline,
-    ) -> ClientResult<(OperationContext, beryl_proto::metadata::OpenWriteResponseProto)> {
+    ) -> ClientResult<(OperationContext, OpenWriteResponseProto)> {
         let operation = self.operation(Operation::OpenWrite, Some(path.to_string()), deadline)?;
         let response = self
             .execute_mutation_metadata(
                 operation.clone(),
-                beryl_proto::metadata::OpenWriteRequestProto {
+                OpenWriteRequestProto {
                     header: None,
                     path: path.to_string(),
-                    mode: mode as i32,
+                    mode: OpenWriteModeProto::from(mode) as i32,
                 },
                 |transport, ctx, req| async move { transport.open_write(ctx, req).await },
             )
@@ -331,7 +335,7 @@ impl MetadataClient {
     pub(crate) async fn add_block(
         &self,
         path: &str,
-        write_handle: beryl_proto::metadata::WriteHandleProto,
+        write_handle: WriteHandle,
         previous_block_id: Option<BlockId>,
         deadline: OperationDeadline,
     ) -> ClientResult<(OperationContext, AddBlockResult)> {
@@ -339,9 +343,9 @@ impl MetadataClient {
         let result = self
             .execute_mutation_metadata(
                 operation.clone(),
-                beryl_proto::metadata::AddBlockRequestProto {
+                AddBlockRequestProto {
                     header: None,
-                    write_handle: Some(write_handle),
+                    write_handle: Some(write_handle.into()),
                     previous_block_id: previous_block_id.map(Into::into),
                 },
                 |transport, ctx, req| async move { transport.add_block(ctx, req).await },
@@ -352,19 +356,16 @@ impl MetadataClient {
 
     /// Replays only the frozen commit plan and validates its publication size
     /// under the same operation identity.
-    pub(crate) async fn commit_file(
-        &self,
-        plan: CommitFilePlan,
-    ) -> ClientResult<beryl_proto::metadata::CommitFileResponseProto> {
+    pub(crate) async fn commit_file(&self, plan: CommitFilePlan) -> ClientResult<CommitFileResponseProto> {
         let operation = plan.operation.clone();
         let final_size = plan.final_size;
-        let req = beryl_proto::metadata::CommitFileRequestProto {
+        let req = CommitFileRequestProto {
             header: None,
-            write_handle: Some(plan.write_handle),
+            write_handle: Some(plan.write_handle.into()),
             committed_blocks: plan.committed_blocks.iter().map(Into::into).collect(),
             final_size: plan.final_size,
-            expected_content_revision: plan.expected_content_revision,
-            write_mode: plan.write_mode as i32,
+            expected_generation: plan.expected_generation.as_raw(),
+            write_mode: OpenWriteModeProto::from(plan.write_mode) as i32,
             expected_file_size: plan.expected_file_size,
         };
         let response = self
@@ -389,13 +390,13 @@ impl MetadataClient {
     pub(crate) async fn abort_file_write(
         &self,
         operation: OperationContext,
-        write_handle: beryl_proto::metadata::WriteHandleProto,
-    ) -> ClientResult<beryl_proto::metadata::AbortFileWriteResponseProto> {
+        write_handle: WriteHandle,
+    ) -> ClientResult<AbortFileWriteResponseProto> {
         self.execute_mutation_metadata(
             operation,
-            beryl_proto::metadata::AbortFileWriteRequestProto {
+            AbortFileWriteRequestProto {
                 header: None,
-                write_handle: Some(write_handle),
+                write_handle: Some(write_handle.into()),
             },
             |transport, ctx, req| async move { transport.abort_file_write(ctx, req).await },
         )
@@ -406,16 +407,16 @@ impl MetadataClient {
     pub(crate) async fn renew_lease(
         &self,
         path: &str,
-        write_handle: beryl_proto::metadata::WriteHandleProto,
+        write_handle: WriteHandle,
         deadline: OperationDeadline,
     ) -> ClientResult<u64> {
         let operation = self.operation(Operation::RenewLease, Some(path.to_string()), deadline)?;
         let response = self
             .execute_mutation_metadata(
                 operation.clone(),
-                beryl_proto::metadata::RenewLeaseRequestProto {
+                RenewLeaseRequestProto {
                     header: None,
-                    write_handle: Some(write_handle),
+                    write_handle: Some(write_handle.into()),
                 },
                 |transport, ctx, req| async move { transport.renew_lease(ctx, req).await },
             )
@@ -431,16 +432,16 @@ impl MetadataClient {
 
     /// Replays only the frozen sync plan and validates its publication size
     /// under the same operation identity.
-    pub(crate) async fn sync_write(&self, plan: SyncWritePlan) -> ClientResult<u64> {
+    pub(crate) async fn sync_write(&self, plan: SyncWritePlan) -> ClientResult<ContentGeneration> {
         let operation = plan.operation.clone();
         let target_size = plan.target_size;
-        let req = beryl_proto::metadata::SyncWriteRequestProto {
+        let req = SyncWriteRequestProto {
             header: None,
-            write_handle: Some(plan.write_handle),
+            write_handle: Some(plan.write_handle.into()),
             committed_blocks: plan.committed_blocks.iter().map(Into::into).collect(),
             target_size: plan.target_size,
-            expected_content_revision: plan.expected_content_revision,
-            write_mode: plan.write_mode as i32,
+            expected_generation: plan.expected_generation.as_raw(),
+            write_mode: OpenWriteModeProto::from(plan.write_mode) as i32,
             expected_file_size: plan.expected_file_size,
         };
         let response = self
@@ -458,14 +459,13 @@ impl MetadataClient {
             )
             .with_operation_context(&operation));
         }
-        response.content_revision.ok_or_else(|| {
-            side_effect_response_body_mismatch("SyncWrite", "content_revision missing")
-                .with_operation_context(&operation)
+        response.generation.map(ContentGeneration::new).ok_or_else(|| {
+            side_effect_response_body_mismatch("SyncWrite", "generation missing").with_operation_context(&operation)
         })
     }
 
     /// Returns the stable client identity used by Worker operation contexts.
-    pub(crate) fn client_id(&self) -> beryl_types::ClientId {
+    pub(crate) fn client_id(&self) -> ClientId {
         self.identity.client_id()
     }
 
@@ -663,7 +663,7 @@ impl MetadataClient {
     async fn refresh_state(
         &self,
         parent: &OperationContext,
-        target_group: beryl_types::GroupName,
+        target_group: GroupName,
         attempt: u32,
     ) -> ClientResult<()> {
         let endpoint = self.metadata_targets.endpoint_for_group(&target_group, attempt)?;
@@ -676,8 +676,7 @@ impl MetadataClient {
         let response = self
             .metadata_rpc_with_deadline(
                 &operation,
-                self.transport
-                    .msync(ctx, beryl_proto::metadata::MsyncRequestProto { header: None }),
+                self.transport.msync(ctx, MsyncRequestProto { header: None }),
             )
             .await?;
         let (authority, _) = response.into_parts();
@@ -754,8 +753,8 @@ impl MetadataClient {
     }
 }
 
-impl fmt::Debug for MetadataClient {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Debug for MetadataClient {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         f.debug_struct("MetadataClient")
             .field("client_id", &self.identity.client_id())
             .field("client_name", &self.identity.client_name())
@@ -785,13 +784,13 @@ fn backoff_delay(retry_index: usize) -> Duration {
 }
 
 fn timeout_error(target_plane: &str, operation: &str) -> ClientError {
-    ClientError::from(tonic::Status::deadline_exceeded(format!(
+    ClientError::from(Status::deadline_exceeded(format!(
         "{target_plane} {operation} exceeded the public operation deadline"
     )))
 }
 
-fn default_dir_attrs() -> beryl_proto::metadata::FileAttrsProto {
-    beryl_proto::metadata::FileAttrsProto {
+fn default_dir_attrs() -> FileAttrsProto {
+    FileAttrsProto {
         mode: 0o755,
         uid: 0,
         gid: 0,
@@ -808,8 +807,8 @@ fn default_dir_attrs() -> beryl_proto::metadata::FileAttrsProto {
 fn write_session_from_open_response(
     operation: &OperationContext,
     path: String,
-    mode: beryl_proto::metadata::OpenWriteModeProto,
-    response: beryl_proto::metadata::OpenWriteResponseProto,
+    mode: WriteMode,
+    response: OpenWriteResponseProto,
 ) -> ClientResult<WriteSession> {
     let layout = response.layout.ok_or_else(|| {
         side_effect_response_body_mismatch("OpenWrite", "OpenWriteResponseProto.layout missing")
@@ -823,6 +822,8 @@ fn write_session_from_open_response(
         side_effect_response_body_mismatch("OpenWrite", "OpenWriteResponseProto.write_handle missing")
             .with_operation_context(operation)
     })?;
+    let write_handle = WriteHandle::try_from(write_handle)
+        .map_err(|error| side_effect_response_body_mismatch("OpenWrite", error).with_operation_context(operation))?;
     if response.expires_at_ms == 0 {
         return Err(
             side_effect_response_body_mismatch("OpenWrite", "expires_at_ms must be non-zero")
@@ -835,38 +836,29 @@ fn write_session_from_open_response(
         write_handle,
         response.base_size,
         response.expires_at_ms,
-        response.content_revision,
+        ContentGeneration::new(response.generation),
         mode,
     )
     .map_err(|error| side_effect_response_body_mismatch("OpenWrite", error).with_operation_context(operation))
 }
 
-fn file_status_from_response(
-    path: String,
-    response: beryl_proto::metadata::GetStatusResponseProto,
-) -> ClientResult<FileStatus> {
+fn file_status_from_response(path: String, response: GetStatusResponseProto) -> ClientResult<FileStatus> {
     let attrs = response
         .attrs
         .ok_or_else(|| invalid_response("GetStatus", "GetStatusResponseProto.attrs missing"))?;
-    let kind = inode_kind_from_wire("GetStatus", response.kind)?;
+    let kind = file_type_from_wire("GetStatus", response.kind)?;
     Ok(FileStatus::new(path, kind, attrs.into()))
 }
 
-fn directory_status_from_response(
-    path: String,
-    response: beryl_proto::metadata::CreateDirectoryResponseProto,
-) -> ClientResult<FileStatus> {
+fn directory_status_from_response(path: String, response: CreateDirectoryResponseProto) -> ClientResult<FileStatus> {
     let attrs = response.attrs.ok_or_else(|| {
         side_effect_response_body_mismatch("CreateDirectory", "CreateDirectoryResponseProto.attrs missing")
     })?;
-    Ok(FileStatus::new(path, InodeKind::Dir, attrs.into()))
+    Ok(FileStatus::new(path, FileType::Dir, attrs.into()))
 }
 
 /// Converts a successful wire page while enforcing its cursor/EOF invariant.
-fn list_status_page_from_response(
-    path: String,
-    response: beryl_proto::metadata::ListStatusResponseProto,
-) -> ClientResult<ListStatusPage> {
+fn list_status_page_from_response(path: String, response: ListStatusResponseProto) -> ClientResult<ListStatusPage> {
     if response.eof != response.next_cursor.is_empty() {
         return Err(invalid_response(
             "ListStatus",
@@ -891,7 +883,7 @@ fn list_status_page_from_response(
                     format!("invalid direct-child name: {:?}", entry.name),
                 ));
             }
-            let kind = inode_kind_from_wire("ListStatus", entry.kind)?;
+            let kind = file_type_from_wire("ListStatus", entry.kind)?;
             let attrs = entry
                 .attrs
                 .ok_or_else(|| invalid_response("ListStatus", "DirEntryProto.attrs missing"))?;
@@ -912,9 +904,9 @@ fn list_status_page_from_response(
 }
 
 /// Rejects unknown and UNSPECIFIED wire values before they enter the public status model.
-fn inode_kind_from_wire(operation: &'static str, raw: i32) -> ClientResult<InodeKind> {
-    let wire = beryl_proto::metadata::InodeKindProto::try_from(raw)
-        .map_err(|_| invalid_response(operation, format!("unknown inode kind: {raw}")))?;
+fn file_type_from_wire(operation: &'static str, raw: i32) -> ClientResult<FileType> {
+    let wire =
+        FileTypeProto::try_from(raw).map_err(|_| invalid_response(operation, format!("unknown inode kind: {raw}")))?;
     wire.try_into()
         .map_err(|error| invalid_response(operation, format!("invalid inode kind: {error}")))
 }

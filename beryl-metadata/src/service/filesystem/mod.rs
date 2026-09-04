@@ -21,13 +21,14 @@ use crate::state::StateStore;
 use crate::worker::WorkerManager;
 use beryl_common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail};
 use beryl_common::header::RequestHeader;
-use beryl_types::fs::InodeId;
-use beryl_types::ids::WorkerId;
-use beryl_types::{GroupName, GroupStateWatermark, WorkerEndpointInfo};
-use std::sync::Arc;
-
+use beryl_types::fs::Inode;
+use beryl_types::ids::{InodeId, WorkerId};
+use beryl_types::{FileLayout, GroupName, GroupStateWatermark, WorkerEndpointInfo, WorkerRunId, WriteHandle};
 use command::RoutedFsWriteCtx;
 use guard::{AdmissionFailure, AdmissionGuard, FreshnessValidator, StaleStateStatus};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
 pub(super) use namespace::{CreateDirectoryArgs, CreateFileArgs, DeleteArgs, RenameArgs};
 pub(super) use publish::{CommitFileArgs, SyncWriteArgs};
 pub(super) use read::{BlockLocationsTarget, GetBlockLocationsArgs, GetStatusArgs, ListStatusArgs, OpenFileArgs};
@@ -131,7 +132,7 @@ fn worker_endpoint_from_parts(
     worker_id: WorkerId,
     endpoint: String,
     worker_net_protocol: i32,
-    worker_run_id: beryl_types::WorkerRunId,
+    worker_run_id: WorkerRunId,
 ) -> Result<WorkerEndpointInfo, MetadataError> {
     if worker_net_protocol != 1 {
         return Err(MetadataError::InvalidArgument(format!(
@@ -176,13 +177,7 @@ pub(crate) struct MetadataFileSystemDeps {
     pub(crate) metrics: Option<Arc<MetadataMetrics>>,
     pub(crate) readiness_gate: Option<Arc<RootReadinessGate>>,
     /// Validated server-owned layout used by atomic CreateFile.
-    pub(crate) file_create_layout: beryl_types::FileLayout,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct PresentedWriteHandle {
-    pub(crate) inode_id: InodeId,
-    pub(crate) lease_epoch: u64,
+    pub(crate) file_create_layout: FileLayout,
 }
 
 /// Metadata service state combining durable Raft authority with leader-local admission state.
@@ -194,7 +189,7 @@ pub(crate) struct MetadataFileSystem {
     /// exclusive guard. This lock is leader-local admission only: Raft apply
     /// preconditions and persisted fencing epochs provide replay-safe durable
     /// authority, while OpenWrite revalidates its path before replying.
-    namespace_topology: tokio::sync::RwLock<()>,
+    namespace_topology: RwLock<()>,
     admission: AdmissionGuard,
     mount_table: Arc<MountTable>,
     freshness_validator: FreshnessValidator,
@@ -203,7 +198,7 @@ pub(crate) struct MetadataFileSystem {
     metrics: Option<Arc<MetadataMetrics>>,
     session_registry: Arc<SessionRegistry>,
     worker_manager: Option<Arc<WorkerManager>>,
-    file_create_layout: beryl_types::FileLayout,
+    file_create_layout: FileLayout,
 }
 
 impl MetadataFileSystem {
@@ -218,7 +213,7 @@ impl MetadataFileSystem {
 
         Self {
             path_resolver,
-            namespace_topology: tokio::sync::RwLock::new(()),
+            namespace_topology: RwLock::new(()),
             admission,
             mount_table: deps.mount_table,
             freshness_validator,
@@ -394,7 +389,7 @@ impl MetadataFileSystem {
         ))
     }
 
-    fn read_inode(&self, inode_id: InodeId) -> MetadataResult<Option<beryl_types::fs::Inode>> {
+    fn read_inode(&self, inode_id: InodeId) -> MetadataResult<Option<Inode>> {
         self.storage.get_inode(inode_id)
     }
 
@@ -402,12 +397,12 @@ impl MetadataFileSystem {
         self.storage.get_dentry(parent_inode_id, name)
     }
 
-    fn read_layout(&self, inode_id: InodeId) -> MetadataResult<beryl_types::layout::FileLayout> {
+    fn read_layout(&self, inode_id: InodeId) -> MetadataResult<FileLayout> {
         self.storage.get_layout(inode_id)
     }
 }
 
-fn validate_active_write_layout(layout: &beryl_types::layout::FileLayout) -> Result<(), MetadataError> {
+fn validate_active_write_layout(layout: &FileLayout) -> Result<(), MetadataError> {
     layout
         .validate()
         .map_err(|error| MetadataError::InvalidArgument(format!("invalid file layout: {error}")))
@@ -416,43 +411,49 @@ fn validate_active_write_layout(layout: &beryl_types::layout::FileLayout) -> Res
 #[cfg(test)]
 mod tests {
     pub(super) use super::*;
+    use crate::config::FileLayoutDefaults;
     pub(super) use crate::config::RaftConfig;
     pub(super) use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
+    use crate::raft::PublishMode;
     pub(super) use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
     pub(super) use crate::service::filesystem::publish::{CloseWriteIntent, CloseWriteOutput};
     pub(super) use crate::service::filesystem::write::OpenWriteOutput;
+    use crate::session_registry::{BeginAddBlock, BeginSessionInput, WriteSession};
+    use crate::state::RouteEpoch;
     pub(super) use crate::worker::{BlockReportBlock, BlockReportBlockState, WorkerDescriptor, WorkerManager};
     pub(super) use beryl_common::error::rpc::{
         ErrorKind, InternalErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail, WorkerErrorKind,
     };
     pub(super) use beryl_common::header::RequestHeader;
+    use beryl_types::fs::InodeData;
     pub(super) use beryl_types::fs::{FileAttrs, Inode};
     pub(super) use beryl_types::ids::{BlockId, BlockIndex, ClientId, InodeId, MountId, WorkerId};
     pub(super) use beryl_types::layout::FileLayout;
     pub(super) use beryl_types::lease::FencingToken;
+    use beryl_types::{BlockFormatId, ContentGeneration, LeaseEpoch, WriteMode};
     pub(super) use beryl_types::{CommittedBlock, GroupName, Tier, TierFree, WorkerRunId, WriteTarget};
+    use std::ops::Deref;
+    use std::sync::atomic::{AtomicU64, Ordering};
     pub(super) use std::sync::Arc;
     pub(super) use std::time::Duration;
     pub(super) use tempfile::TempDir;
 
     pub(super) struct MemoryStateStore {
-        route_epoch: std::sync::atomic::AtomicU64,
+        route_epoch: AtomicU64,
     }
 
     impl MemoryStateStore {
         pub(super) fn new() -> Self {
             Self {
-                route_epoch: std::sync::atomic::AtomicU64::new(1),
+                route_epoch: AtomicU64::new(1),
             }
         }
     }
 
     #[async_trait::async_trait]
     impl StateStore for MemoryStateStore {
-        async fn get_route_epoch(&self) -> MetadataResult<crate::state::RouteEpoch> {
-            Ok(crate::state::RouteEpoch::new(
-                self.route_epoch.load(std::sync::atomic::Ordering::Acquire),
-            ))
+        async fn get_route_epoch(&self) -> MetadataResult<RouteEpoch> {
+            Ok(RouteEpoch::new(self.route_epoch.load(Ordering::Acquire)))
         }
     }
 
@@ -462,7 +463,7 @@ mod tests {
         _storage_dir: Option<TempDir>,
     }
 
-    impl std::ops::Deref for TestFilesystem {
+    impl Deref for TestFilesystem {
         type Target = MetadataFileSystem;
 
         fn deref(&self) -> &Self::Target {
@@ -471,10 +472,7 @@ mod tests {
     }
 
     impl TestFilesystem {
-        pub(super) fn write_session_for_inode(
-            &self,
-            inode_id: InodeId,
-        ) -> Option<crate::session_registry::WriteSession> {
+        pub(super) fn write_session_for_inode(&self, inode_id: InodeId) -> Option<WriteSession> {
             self.session_registry.get_session(inode_id)
         }
 
@@ -562,7 +560,7 @@ mod tests {
                 worker_manager: self.worker_manager,
                 metrics: None,
                 readiness_gate: None,
-                file_create_layout: crate::config::FileLayoutDefaults::default().layout().unwrap(),
+                file_create_layout: FileLayoutDefaults::default().layout().unwrap(),
             });
 
             TestFilesystem {
@@ -788,7 +786,7 @@ mod tests {
     pub(super) fn worker_manager_for_write_targets(group_name: &GroupName) -> Arc<WorkerManager> {
         let manager = Arc::new(WorkerManager::new(60_000));
         for raw in 1..=3 {
-            let worker_id = beryl_types::ids::WorkerId::new(raw);
+            let worker_id = WorkerId::new(raw);
             register_worker_descriptor(&manager, group_name, worker_id, format!("127.0.0.1:{}", 9000 + raw));
             record_worker_heartbeat(&manager, group_name, worker_id, 1024 * 1024);
         }
@@ -836,7 +834,7 @@ mod tests {
         ancestor_inode_ids: Vec<InodeId>,
     ) {
         let writer = ClientId::new(7);
-        let lease_epoch = 1;
+        let lease_epoch = LeaseEpoch::new(1);
         let block_id = BlockId::new(inode_id, BlockIndex::new(0));
         let target = WriteTarget {
             block_id,
@@ -849,23 +847,20 @@ mod tests {
                 epoch: lease_epoch,
             },
             block_stamp: 1,
-            chunk_size: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE
-                .spec()
-                .unwrap()
-                .storage_chunk_size,
-            block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE,
-            tier: beryl_types::Tier::Hdd,
+            chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.spec().unwrap().storage_chunk_size,
+            block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
+            tier: Tier::Hdd,
         };
         let session_registry = filesystem.session_registry();
         let opening = session_registry
-            .begin_session(crate::session_registry::BeginSessionInput {
+            .begin_session(BeginSessionInput {
                 normalized_path: "/file".to_string(),
                 inode_id,
                 mount_id,
-                current_lease_epoch: Some(0),
+                current_lease_epoch: Some(LeaseEpoch::new(0)),
                 base_size: 0,
-                content_revision: 0,
-                mode: crate::session_registry::WriteMode::Write,
+                generation: ContentGeneration::new(0),
+                mode: WriteMode::Overwrite,
                 open_client_id: writer,
                 layout: FileLayout::new(64),
                 ancestor_inode_ids,
@@ -876,8 +871,8 @@ mod tests {
             .begin_add_block(inode_id, lease_epoch, None)
             .expect("target capacity")
         {
-            crate::session_registry::BeginAddBlock::Reserved(reservation) => reservation,
-            crate::session_registry::BeginAddBlock::Replay(_) => panic!("new target must reserve capacity"),
+            BeginAddBlock::Reserved(reservation) => reservation,
+            BeginAddBlock::Replay(_) => panic!("new target must reserve capacity"),
         };
         target_reservation.complete(target).expect("target installed");
     }
@@ -918,7 +913,7 @@ mod tests {
         filesystem
             .close_write_session(
                 &request_context(),
-                PresentedWriteHandle {
+                WriteHandle {
                     inode_id: key.inode_id,
                     lease_epoch: key.lease_epoch,
                 },
@@ -928,15 +923,15 @@ mod tests {
                     expected_file_size: key.base_size,
                 },
                 Freshness::default(),
-                key.content_revision,
+                key.generation,
                 match filesystem
                     .session_registry
                     .get_session(key.inode_id)
                     .expect("active write session")
                     .mode
                 {
-                    crate::session_registry::WriteMode::Write => crate::raft::PublishMode::ReplaceIfUnchanged,
-                    crate::session_registry::WriteMode::Append => crate::raft::PublishMode::AppendIfUnchanged,
+                    WriteMode::Overwrite => PublishMode::ReplaceIfUnchanged,
+                    WriteMode::Append => PublishMode::AppendIfUnchanged,
                 },
             )
             .await
@@ -1009,10 +1004,10 @@ mod tests {
         );
     }
 
-    pub(super) fn stored_content_revision(storage: &RocksDBStorage, inode_id: InodeId) -> Option<u64> {
+    pub(super) fn stored_generation(storage: &RocksDBStorage, inode_id: InodeId) -> Option<ContentGeneration> {
         let inode = storage.get_inode(inode_id).unwrap().expect("test inode should exist");
         match inode.data {
-            beryl_types::fs::InodeData::File { content_revision, .. } => content_revision,
+            InodeData::File { generation, .. } => generation,
             other => panic!("unexpected inode data: {:?}", other),
         }
     }

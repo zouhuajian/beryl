@@ -3,13 +3,14 @@
 
 //! Client-side sequential write session state.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use beryl_proto::metadata::{OpenWriteModeProto, WriteHandleProto};
-use beryl_types::{BlockShape, CallId, ClientId, CommittedBlock, FileLayout, InodeId, WriteTarget};
-
 use crate::error::{ClientError, ClientResult};
 use crate::runtime::context::{Operation, OperationContext, OperationDeadline};
+use beryl_types::{
+    BlockId, BlockShape, CallId, ClientId, CommittedBlock, ContentGeneration, FileLayout, InodeId, WriteHandle,
+    WriteMode, WriteTarget,
+};
+use std::fmt::{Debug, Formatter, Result};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const LEASE_EXPIRY_SAFETY_WINDOW_MS: u64 = 1_000;
 
@@ -19,9 +20,9 @@ pub(crate) struct WriteSession {
     path: String,
     inode_id: InodeId,
     layout: FileLayout,
-    content_revision: u64,
-    mode: OpenWriteModeProto,
-    write_handle: WriteHandleProto,
+    generation: ContentGeneration,
+    mode: WriteMode,
+    write_handle: WriteHandle,
     base_size: u64,
     cursor: u64,
     flush_cursor: u64,
@@ -34,17 +35,18 @@ pub(crate) struct WriteSession {
 }
 
 impl WriteSession {
-    /// Create a new client-side write session from metadata open-write state.
+    /// Create a session from Metadata state whose handle passed wire validation.
+    /// Layout and expiry are checked before accepting further write operations.
     pub(crate) fn new(
         path: String,
         layout: FileLayout,
-        write_handle: WriteHandleProto,
+        write_handle: WriteHandle,
         base_size: u64,
         expires_at_ms: u64,
-        content_revision: u64,
-        mode: OpenWriteModeProto,
+        generation: ContentGeneration,
+        mode: WriteMode,
     ) -> ClientResult<Self> {
-        let inode_id = validate_write_handle(&write_handle)?;
+        let inode_id = write_handle.inode_id;
         if expires_at_ms == 0 {
             return Err(ClientError::invalid_argument(
                 "write session expires_at_ms must be non-zero".to_string(),
@@ -57,7 +59,7 @@ impl WriteSession {
             path,
             inode_id,
             layout,
-            content_revision,
+            generation,
             mode,
             write_handle,
             base_size,
@@ -93,12 +95,12 @@ impl WriteSession {
     }
 
     /// Metadata write handle.
-    pub(crate) fn write_handle(&self) -> WriteHandleProto {
+    pub(crate) fn write_handle(&self) -> WriteHandle {
         self.write_handle
     }
 
     /// Predecessor that identifies the next logical AddBlock step.
-    pub(crate) fn previous_block_id(&self) -> Option<beryl_types::BlockId> {
+    pub(crate) fn previous_block_id(&self) -> Option<BlockId> {
         self.ready_blocks.last().map(|block| block.target.block_id)
     }
 
@@ -182,7 +184,7 @@ impl WriteSession {
         target_size: u64,
         deadline: OperationDeadline,
     ) -> ClientResult<SyncWritePlan> {
-        if self.mode == OpenWriteModeProto::OpenWriteModeAppend {
+        if self.mode == WriteMode::Append {
             committed_blocks.retain(|block| block.file_offset >= self.base_size);
         }
         match self.state {
@@ -192,7 +194,7 @@ impl WriteSession {
                     write_handle: self.write_handle,
                     committed_blocks,
                     target_size,
-                    expected_content_revision: self.content_revision,
+                    expected_generation: self.generation,
                     expected_file_size: self.base_size,
                     write_mode: self.mode,
                 });
@@ -208,7 +210,7 @@ impl WriteSession {
                     ));
                 }
                 if sync.write_handle != self.write_handle
-                    || sync.expected_content_revision != self.content_revision
+                    || sync.expected_generation != self.generation
                     || sync.expected_file_size != self.base_size
                     || sync.write_mode != self.mode
                 {
@@ -237,7 +239,7 @@ impl WriteSession {
             write_handle: sync.write_handle,
             committed_blocks: sync.committed_blocks.clone(),
             target_size: sync.target_size,
-            expected_content_revision: sync.expected_content_revision,
+            expected_generation: sync.expected_generation,
             expected_file_size: sync.expected_file_size,
             write_mode: sync.write_mode,
         })
@@ -252,7 +254,7 @@ impl WriteSession {
         final_size: u64,
         deadline: OperationDeadline,
     ) -> ClientResult<CommitFilePlan> {
-        if self.mode == OpenWriteModeProto::OpenWriteModeAppend {
+        if self.mode == WriteMode::Append {
             committed_blocks.retain(|block| block.file_offset >= self.base_size);
         }
         match self.state {
@@ -262,7 +264,7 @@ impl WriteSession {
                     commit_write_handle: self.write_handle,
                     commit_final_size: final_size,
                     commit_committed_blocks_snapshot: committed_blocks,
-                    expected_content_revision: self.content_revision,
+                    expected_generation: self.generation,
                     expected_file_size: self.base_size,
                     write_mode: self.mode,
                 });
@@ -324,7 +326,7 @@ impl WriteSession {
             write_handle: commit.commit_write_handle,
             committed_blocks: commit.commit_committed_blocks_snapshot.clone(),
             final_size: commit.commit_final_size,
-            expected_content_revision: commit.expected_content_revision,
+            expected_generation: commit.expected_generation,
             expected_file_size: commit.expected_file_size,
             write_mode: commit.write_mode,
         })
@@ -389,11 +391,11 @@ impl WriteSession {
     }
 
     /// Completes the frozen SyncWrite and restores normal writer operations.
-    pub(crate) fn mark_sync_completed(&mut self, content_revision: u64, file_size: u64) -> ClientResult<()> {
+    pub(crate) fn mark_sync_completed(&mut self, generation: ContentGeneration, file_size: u64) -> ClientResult<()> {
         if !matches!(self.state, WriteSessionState::SyncPending) {
             return Err(self.state_error_value());
         }
-        self.content_revision = content_revision;
+        self.generation = generation;
         self.base_size = file_size;
         self.sync = None;
         self.state = WriteSessionState::Open;
@@ -593,33 +595,33 @@ fn unix_now_ms() -> u64 {
 #[derive(Clone, Debug)]
 struct SyncWriteState {
     call_id: CallId,
-    write_handle: WriteHandleProto,
+    write_handle: WriteHandle,
     committed_blocks: Vec<CommittedBlock>,
     target_size: u64,
-    expected_content_revision: u64,
+    expected_generation: ContentGeneration,
     expected_file_size: u64,
-    write_mode: OpenWriteModeProto,
+    write_mode: WriteMode,
 }
 
 #[derive(Clone, Debug)]
 struct CommitFileState {
     commit_call_id: CallId,
-    commit_write_handle: WriteHandleProto,
+    commit_write_handle: WriteHandle,
     commit_final_size: u64,
     commit_committed_blocks_snapshot: Vec<CommittedBlock>,
-    expected_content_revision: u64,
+    expected_generation: ContentGeneration,
     expected_file_size: u64,
-    write_mode: OpenWriteModeProto,
+    write_mode: WriteMode,
 }
 
 #[derive(Clone)]
 struct AbortCleanupState {
     metadata_call_id: CallId,
-    metadata_write_handle: WriteHandleProto,
+    metadata_write_handle: WriteHandle,
 }
 
-impl std::fmt::Debug for AbortCleanupState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for AbortCleanupState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         f.debug_struct("AbortCleanupState").finish_non_exhaustive()
     }
 }
@@ -628,31 +630,31 @@ impl std::fmt::Debug for AbortCleanupState {
 #[derive(Clone, Debug)]
 pub(crate) struct SyncWritePlan {
     pub(crate) operation: OperationContext,
-    pub(crate) write_handle: WriteHandleProto,
+    pub(crate) write_handle: WriteHandle,
     pub(crate) committed_blocks: Vec<CommittedBlock>,
     pub(crate) target_size: u64,
-    pub(crate) expected_content_revision: u64,
+    pub(crate) expected_generation: ContentGeneration,
     pub(crate) expected_file_size: u64,
-    pub(crate) write_mode: OpenWriteModeProto,
+    pub(crate) write_mode: WriteMode,
 }
 
 /// Frozen metadata CommitFile operation and request payload.
 #[derive(Clone, Debug)]
 pub(crate) struct CommitFilePlan {
     pub(crate) operation: OperationContext,
-    pub(crate) write_handle: WriteHandleProto,
+    pub(crate) write_handle: WriteHandle,
     pub(crate) committed_blocks: Vec<CommittedBlock>,
     pub(crate) final_size: u64,
-    pub(crate) expected_content_revision: u64,
+    pub(crate) expected_generation: ContentGeneration,
     pub(crate) expected_file_size: u64,
-    pub(crate) write_mode: OpenWriteModeProto,
+    pub(crate) write_mode: WriteMode,
 }
 
 /// Frozen side-effecting abort cleanup plan.
 #[derive(Clone)]
 pub(crate) struct AbortCleanupPlan {
     metadata_operation: OperationContext,
-    metadata_write_handle: WriteHandleProto,
+    metadata_write_handle: WriteHandle,
 }
 
 impl AbortCleanupPlan {
@@ -662,32 +664,16 @@ impl AbortCleanupPlan {
     }
 
     /// Metadata write handle payload frozen before cleanup starts.
-    pub(crate) fn metadata_write_handle(&self) -> WriteHandleProto {
+    pub(crate) fn metadata_write_handle(&self) -> WriteHandle {
         self.metadata_write_handle
     }
-}
-
-fn validate_write_handle(handle: &WriteHandleProto) -> ClientResult<InodeId> {
-    if handle.inode_id == 0 {
-        return Err(ClientError::metadata(
-            "write handle inode_id must be non-zero".to_string(),
-        ));
-    }
-    if handle.write_lease_epoch == 0 {
-        return Err(ClientError::metadata(
-            "write handle write_lease_epoch must be non-zero".to_string(),
-        ));
-    }
-    Ok(InodeId::new(handle.inode_id))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use beryl_types::{BlockId, BlockIndex, ClientId, CommittedBlock, InodeId};
-
     use crate::error::ClientErrorKind;
+    use beryl_types::{BlockId, BlockIndex, ClientId, CommittedBlock, InodeId, LeaseEpoch};
 
     fn assert_error(error: &ClientError, kind: ClientErrorKind, message: &str) {
         assert_eq!(error.kind(), kind);
@@ -698,75 +684,47 @@ mod tests {
     fn frozen_publication_plans_reject_drift_and_reuse_call_ids() {
         let mut session = new_session(1_000);
 
-        let blocks = vec![committed_block(302, 0, 0, 5)];
-        let first = session
-            .prepare_commit_file(
+        let prepare = |session: &mut WriteSession, len| {
+            session.prepare_commit_file(
                 ClientId::new(7),
                 "test-client",
-                blocks.clone(),
-                5,
+                vec![committed_block(302, 0, 0, len)],
+                len,
                 OperationDeadline::new(1_000),
             )
-            .expect("first commit plan");
-        let err = session
-            .prepare_commit_file(
-                ClientId::new(7),
-                "test-client",
-                vec![committed_block(302, 0, 0, 6)],
-                6,
-                OperationDeadline::new(1_000),
-            )
-            .expect_err("changed commit payload must fail");
-
+        };
+        let first = prepare(&mut session, 5).expect("first commit plan");
+        let err = prepare(&mut session, 6).expect_err("changed commit payload must fail");
         assert_error(&err, ClientErrorKind::InvalidArgument, "payload changed");
         session.mark_commit_unknown();
-
-        session.write_handle.write_lease_epoch = 2;
-        let err = session
-            .prepare_commit_file(
-                ClientId::new(7),
-                "test-client",
-                blocks.clone(),
-                5,
-                OperationDeadline::new(1_000),
-            )
-            .expect_err("changed session identity must fail");
+        session.write_handle.lease_epoch = LeaseEpoch::new(2);
+        let err = prepare(&mut session, 5).expect_err("changed session identity must fail");
         assert_error(&err, ClientErrorKind::InvalidArgument, "write handle changed");
-
-        session.write_handle.write_lease_epoch = 1;
-        let retry = session
-            .prepare_commit_file(
-                ClientId::new(7),
-                "test-client",
-                blocks,
-                5,
-                OperationDeadline::new(1_000),
-            )
-            .expect("retry commit plan");
+        session.write_handle.lease_epoch = LeaseEpoch::new(1);
+        let retry = prepare(&mut session, 5).expect("retry commit plan");
 
         assert_eq!(first.operation.call_id(), retry.operation.call_id());
+        assert_eq!(first.write_handle, retry.write_handle);
+        assert_eq!(first.expected_generation, retry.expected_generation);
         assert_eq!(retry.final_size, 5);
         assert_eq!(retry.committed_blocks, vec![committed_block(302, 0, 0, 5)]);
 
         let mut sync_session = new_session(2_000);
-        let first_sync = sync_session
-            .prepare_sync_write(
+        let prepare_sync = |session: &mut WriteSession| {
+            session.prepare_sync_write(
                 ClientId::new(7),
                 "test-client",
                 vec![committed_block(302, 0, 0, 5)],
                 5,
                 OperationDeadline::new(1_000),
             )
-            .expect("first sync plan");
-        let retry_sync = sync_session
-            .prepare_sync_write(
-                ClientId::new(7),
-                "test-client",
-                vec![committed_block(302, 0, 0, 5)],
-                5,
-                OperationDeadline::new(1_000),
-            )
-            .expect("retry after cancelled future");
+        };
+        let first_sync = prepare_sync(&mut sync_session).expect("first sync plan");
+        sync_session.generation = ContentGeneration::new(1);
+        let error = prepare_sync(&mut sync_session).expect_err("generation drift must fail");
+        assert_error(&error, ClientErrorKind::InvalidArgument, "session state changed");
+        sync_session.generation = ContentGeneration::new(0);
+        let retry_sync = prepare_sync(&mut sync_session).expect("retry after cancelled future");
         assert_eq!(first_sync.operation.call_id(), retry_sync.operation.call_id());
         assert_eq!(retry_sync.target_size, first_sync.target_size);
         assert_eq!(retry_sync.committed_blocks, first_sync.committed_blocks);
@@ -776,21 +734,17 @@ mod tests {
     fn prepare_abort_cleanup_rejects_session_identity_drift_after_unknown_without_replacing_call_id() {
         let mut session = new_session(1_000);
 
-        let first = session
-            .prepare_abort_cleanup(ClientId::new(7), "test-client", OperationDeadline::new(1_000))
-            .expect("first abort plan");
-
-        session.write_handle.write_lease_epoch = 2;
-        let err = match session.prepare_abort_cleanup(ClientId::new(7), "test-client", OperationDeadline::new(1_000)) {
-            Ok(_) => panic!("identity drift must reject abort replay"),
-            Err(err) => err,
+        let prepare = |session: &mut WriteSession| {
+            session.prepare_abort_cleanup(ClientId::new(7), "test-client", OperationDeadline::new(1_000))
         };
+        let first = prepare(&mut session).expect("first abort plan");
+        session.write_handle.lease_epoch = LeaseEpoch::new(2);
+        let err = prepare(&mut session)
+            .err()
+            .expect("identity drift must reject abort replay");
         assert_error(&err, ClientErrorKind::InvalidArgument, "handle changed");
-
-        session.write_handle.write_lease_epoch = 1;
-        let retry = session
-            .prepare_abort_cleanup(ClientId::new(7), "test-client", OperationDeadline::new(1_000))
-            .expect("retry abort plan");
+        session.write_handle.lease_epoch = LeaseEpoch::new(1);
+        let retry = prepare(&mut session).expect("retry abort plan");
         assert_eq!(
             first.metadata_operation().call_id(),
             retry.metadata_operation().call_id()
@@ -850,11 +804,11 @@ mod tests {
         WriteSession::new(
             "/alpha".to_string(),
             test_layout(),
-            write_handle_proto(302),
+            write_handle(302),
             0,
             expires_at_ms,
-            0,
-            OpenWriteModeProto::OpenWriteModeWrite,
+            ContentGeneration::new(0),
+            WriteMode::Overwrite,
         )
         .expect("session")
     }
@@ -863,10 +817,10 @@ mod tests {
         FileLayout::new(1024)
     }
 
-    fn write_handle_proto(inode_id: u64) -> WriteHandleProto {
-        WriteHandleProto {
-            inode_id,
-            write_lease_epoch: 1,
+    fn write_handle(inode_id: u64) -> WriteHandle {
+        WriteHandle {
+            inode_id: InodeId::new(inode_id),
+            lease_epoch: LeaseEpoch::new(1),
         }
     }
 

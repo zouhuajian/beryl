@@ -3,21 +3,21 @@
 
 //! Public namespace status values.
 
-use beryl_types::{FileAttrs, InodeKind};
+use beryl_types::{FileAttrs, FileType};
 
 /// Metadata-authorized status for one namespace entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileStatus {
     path: String,
     /// Namespace entry kind.
-    pub kind: InodeKind,
+    pub kind: FileType,
     /// User-visible attributes for the namespace entry.
     pub attrs: FileAttrs,
 }
 
 impl FileStatus {
     /// Creates a status from a validated namespace path and Metadata response.
-    pub(crate) fn new(path: impl Into<String>, kind: InodeKind, attrs: FileAttrs) -> Self {
+    pub(crate) fn new(path: impl Into<String>, kind: FileType, attrs: FileAttrs) -> Self {
         Self {
             path: path.into(),
             kind,

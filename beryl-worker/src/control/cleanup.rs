@@ -3,23 +3,20 @@
 
 //! Bounded execution of metadata-authorized block cleanup commands.
 
+use crate::control::{Registration, RegistrationSet};
+use crate::error::WorkerError;
+use crate::{observe, ReclaimBlockRequest, ReclaimBlockResult, WorkerCore};
+use beryl_common::error::rpc::{ErrorKind, WorkerErrorKind};
+use beryl_types::{BlockId, GroupName, WorkerId, WorkerRunId};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-use beryl_common::error::rpc::{ErrorKind, WorkerErrorKind};
-use beryl_types::{BlockId, GroupName, WorkerId, WorkerRunId};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, Semaphore};
-use tokio::task::JoinHandle;
-use tokio::task::JoinSet;
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
-
-use crate::control::{Registration, RegistrationSet};
-use crate::error::WorkerError;
-use crate::observe;
-use crate::{ReclaimBlockRequest, ReclaimBlockResult, WorkerCore};
 
 /// One exact block version received from an authenticated heartbeat response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,7 +83,7 @@ struct BlockCleanupInner {
 #[derive(Clone)]
 pub struct BlockCleanupExecutor {
     inner: Arc<BlockCleanupInner>,
-    sender: mpsc::Sender<CleanupReplicaKey>,
+    sender: Sender<CleanupReplicaKey>,
 }
 
 /// Owned task lifecycle for the Worker block cleanup executor.
@@ -133,7 +130,7 @@ impl BlockCleanupRuntime {
     /// Drains cleanup until `deadline`, then aborts and awaits the executor.
     ///
     /// Returns `true` when the process owner had to force cancellation.
-    pub async fn shutdown_until(mut self, deadline: Instant) -> Result<bool, tokio::task::JoinError> {
+    pub async fn shutdown_until(mut self, deadline: Instant) -> Result<bool, JoinError> {
         self.shutdown.cancel();
         let Some(mut task) = self.task.take() else {
             return Ok(false);
@@ -167,7 +164,7 @@ impl BlockCleanupExecutor {
         core: Arc<WorkerCore>,
         registrations: Arc<RegistrationSet>,
         options: BlockCleanupOptions,
-    ) -> Result<(Self, mpsc::Receiver<CleanupReplicaKey>), WorkerError> {
+    ) -> Result<(Self, Receiver<CleanupReplicaKey>), WorkerError> {
         validate_options(&options)?;
         let (sender, receiver) = mpsc::channel(options.max_pending);
         let inner = Arc::new(BlockCleanupInner {
@@ -233,7 +230,7 @@ impl BlockCleanupExecutor {
 /// any undeleted replica remains discoverable through a later block report.
 async fn run_executor(
     inner: Arc<BlockCleanupInner>,
-    mut receiver: mpsc::Receiver<CleanupReplicaKey>,
+    mut receiver: Receiver<CleanupReplicaKey>,
     shutdown: CancellationToken,
     force: CancellationToken,
 ) {
@@ -451,17 +448,15 @@ fn validate_options(options: &BlockCleanupOptions) -> Result<(), WorkerError> {
 
 #[cfg(test)]
 mod tests {
-    use std::ops::Deref;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use bytes::Bytes;
-
     use super::*;
     use crate::store::block::{
         BlockMetaPayload, CreateStagingBlockRequest, LocalBlockStore, PublishReadyRequest, ReclaimBlockState,
         StoreResult,
     };
     use beryl_types::{BlockIndex, InodeId};
+    use bytes::Bytes;
+    use std::ops::Deref;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone, Copy)]
     enum ReclaimBehavior {

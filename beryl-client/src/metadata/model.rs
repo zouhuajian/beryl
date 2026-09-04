@@ -5,7 +5,8 @@
 
 use crate::api::FileStatus;
 use crate::error::{ClientError, ClientResult};
-use beryl_types::{FileBlockLocation, GroupName, GroupStateWatermark, InodeId, WriteTarget};
+use beryl_proto::metadata::GetBlockLocationsResponseProto;
+use beryl_types::{ContentGeneration, FileBlockLocation, GroupName, GroupStateWatermark, InodeId, WriteTarget};
 
 /// Server-authorized metadata state learned from one validated successful response.
 ///
@@ -55,22 +56,22 @@ impl<T> ValidatedMetadataResponse<T> {
     }
 }
 
-/// Immutable file identity, visible revision, and length captured by `OpenFile`.
+/// Immutable file identity, visible generation, and length captured by `OpenFile`.
 #[derive(Clone, Debug)]
 pub(crate) struct OpenedFile {
     path: String,
     inode_id: InodeId,
-    content_revision: u64,
+    generation: ContentGeneration,
     file_size: u64,
 }
 
 impl OpenedFile {
     /// Creates validated opened-file state from Metadata's response.
-    pub(crate) fn new(path: String, inode_id: InodeId, content_revision: u64, file_size: u64) -> Self {
+    pub(crate) fn new(path: String, inode_id: InodeId, generation: ContentGeneration, file_size: u64) -> Self {
         Self {
             path,
             inode_id,
-            content_revision,
+            generation,
             file_size,
         }
     }
@@ -85,9 +86,9 @@ impl OpenedFile {
         self.inode_id
     }
 
-    /// Returns the visible content revision fenced by this opened file.
-    pub(crate) fn content_revision(&self) -> u64 {
-        self.content_revision
+    /// Returns the visible content generation fenced by this opened file.
+    pub(crate) fn generation(&self) -> ContentGeneration {
+        self.generation
     }
 
     /// Returns the file size observed by `OpenFile`.
@@ -103,10 +104,10 @@ pub(crate) struct ReadLayout {
     pub group_name: GroupName,
     /// File inode identity this layout belongs to.
     pub inode_id: InodeId,
-    /// Authoritative file size at this layout version.
+    /// Authoritative file size at this content generation.
     pub file_size: u64,
-    /// Durable visible file-state version for this read plan.
-    pub content_revision: Option<u64>,
+    /// Durable visible content generation for this read plan.
+    pub generation: Option<ContentGeneration>,
     /// Metadata-authoritative block locations for the requested range.
     pub locations: Vec<FileBlockLocation>,
 }
@@ -115,7 +116,7 @@ impl ReadLayout {
     /// Convert a metadata wire response into the client read-layout domain view.
     pub(crate) fn from_get_block_locations_response(
         group_name: GroupName,
-        response: beryl_proto::metadata::GetBlockLocationsResponseProto,
+        response: GetBlockLocationsResponseProto,
     ) -> ClientResult<Self> {
         if response.inode_id == 0 {
             return Err(ClientError::invalid_layout(
@@ -133,7 +134,7 @@ impl ReadLayout {
             group_name,
             inode_id,
             file_size: response.file_size,
-            content_revision: response.content_revision,
+            generation: response.generation.map(ContentGeneration::new),
             locations,
         })
     }

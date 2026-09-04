@@ -5,18 +5,17 @@
 
 use super::command::unexpected_raft_apply_success;
 use super::{
-    fs_failure_from_metadata_error, Freshness, FsFailure, FsResult, MetadataFileSystem, PresentedWriteHandle,
-    RequestContext,
+    fs_failure_from_metadata_error, Freshness, FsFailure, FsResult, MetadataFileSystem, RequestContext, WriteHandle,
 };
 use crate::error::{MetadataError, MetadataResult};
 use crate::observe;
 use crate::raft::{ApplySuccess, Command, PublishMode};
-use crate::session_registry::{BeginWritePublicationError, WritePublication};
+use crate::session_registry::{BeginWritePublicationError, WritePublication, WriteSession};
 use crate::worker::{PublishReadyConflict, PublishReadyStatus, PublishReadyTarget};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint, WorkerErrorKind};
-use beryl_types::fs::{Extent, InodeId};
-use beryl_types::ids::MountId;
-use beryl_types::{CommittedBlock, GroupName, MAX_FILE_EXTENTS};
+use beryl_types::fs::{Extent, InodeData};
+use beryl_types::ids::{InodeId, MountId};
+use beryl_types::{CommittedBlock, ContentGeneration, GroupName, LeaseEpoch, WriteMode, MAX_FILE_EXTENTS};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]
@@ -29,7 +28,7 @@ pub(super) struct CloseWriteIntent {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SyncWriteOutput {
     pub(crate) synced_size: u64,
-    pub(crate) content_revision: Option<u64>,
+    pub(crate) generation: Option<ContentGeneration>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -38,21 +37,21 @@ pub(crate) struct CloseWriteOutput {
 }
 
 pub(crate) struct CommitFileArgs {
-    pub(crate) handle: PresentedWriteHandle,
+    pub(crate) handle: WriteHandle,
     pub(crate) committed_blocks: Vec<CommittedBlock>,
     pub(crate) final_size: u64,
     pub(crate) freshness: Freshness,
-    pub(crate) expected_content_revision: u64,
+    pub(crate) expected_generation: ContentGeneration,
     pub(crate) expected_file_size: u64,
     pub(crate) publish_mode: PublishMode,
 }
 
 pub(crate) struct SyncWriteArgs {
-    pub(crate) handle: PresentedWriteHandle,
+    pub(crate) handle: WriteHandle,
     pub(crate) committed_blocks: Vec<CommittedBlock>,
     pub(crate) target_size: u64,
     pub(crate) freshness: Freshness,
-    pub(crate) expected_content_revision: u64,
+    pub(crate) expected_generation: ContentGeneration,
     pub(crate) expected_file_size: u64,
     pub(crate) publish_mode: PublishMode,
 }
@@ -89,7 +88,7 @@ impl MetadataFileSystem {
                     expected_file_size: args.expected_file_size,
                 },
                 args.freshness,
-                args.expected_content_revision,
+                args.expected_generation,
                 args.publish_mode,
             )
             .await;
@@ -105,7 +104,7 @@ impl MetadataFileSystem {
                 final_size = args.final_size,
                 committed_block_count,
                 committed_bytes,
-                lease_epoch = handle.lease_epoch,
+                lease_epoch = handle.lease_epoch.as_raw(),
                 mount_epoch = success.mount_epoch,
                 route_epoch = success.route_epoch,
                 "CommitFile committed"
@@ -121,7 +120,7 @@ impl MetadataFileSystem {
                 final_size = args.final_size,
                 committed_block_count,
                 committed_bytes,
-                lease_epoch = handle.lease_epoch,
+                lease_epoch = handle.lease_epoch.as_raw(),
                 mount_epoch = failure.mount_epoch,
                 route_epoch = failure.route_epoch,
                 "CommitFile rejected"
@@ -158,16 +157,16 @@ impl MetadataFileSystem {
                 expected_file_size: args.expected_file_size,
             },
             args.freshness,
-            args.expected_content_revision,
+            args.expected_generation,
             args.publish_mode,
         )
         .await
     }
 
-    fn publish_mode_for_session(session: &crate::session_registry::WriteSession) -> PublishMode {
+    fn publish_mode_for_session(session: &WriteSession) -> PublishMode {
         match session.mode {
-            crate::session_registry::WriteMode::Write => PublishMode::ReplaceIfUnchanged,
-            crate::session_registry::WriteMode::Append => PublishMode::AppendIfUnchanged,
+            WriteMode::Overwrite => PublishMode::ReplaceIfUnchanged,
+            WriteMode::Append => PublishMode::AppendIfUnchanged,
         }
     }
 
@@ -175,10 +174,10 @@ impl MetadataFileSystem {
         &self,
         ctx: &RequestContext,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         publish_mode: PublishMode,
         operation: &'static str,
-    ) -> Result<Option<crate::session_registry::WriteSession>, FsFailure> {
+    ) -> Result<Option<WriteSession>, FsFailure> {
         let Some(session) = self.session_registry.get_session(inode_id) else {
             return Ok(None);
         };
@@ -208,7 +207,7 @@ impl MetadataFileSystem {
         &'a self,
         ctx: &RequestContext,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         publish_mode: PublishMode,
         operation: &'static str,
     ) -> Result<WritePublication<'a>, FsFailure> {
@@ -280,17 +279,17 @@ impl MetadataFileSystem {
     /// Resolve an ambiguous publish from the durable file state.
     ///
     /// This is state-equivalence recovery, not historical request replay. Once
-    /// the requested postcondition is visible at the next content revision,
+    /// the requested postcondition is visible at the next content generation,
     /// preconditions such as the original publish mode are no longer
     /// distinguishable without persisting request history.
     fn resolve_published_state(
         &self,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         intent: &CloseWriteIntent,
-        expected_content_revision: u64,
+        expected_generation: ContentGeneration,
         mode: PublishMode,
-    ) -> MetadataResult<Option<(InodeId, MountId, u64, u64)>> {
+    ) -> MetadataResult<Option<(InodeId, MountId, ContentGeneration, LeaseEpoch)>> {
         let inode = self
             .read_inode(inode_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {inode_id}")))?;
@@ -300,20 +299,20 @@ impl MetadataFileSystem {
                 inode.inode_id
             )));
         }
-        let (visible_extents, content_revision, stored_lease_epoch) = match &inode.data {
-            beryl_types::fs::InodeData::File {
+        let (visible_extents, generation, stored_lease_epoch) = match &inode.data {
+            InodeData::File {
                 extents,
-                content_revision,
+                generation,
                 lease_epoch,
                 ..
-            } => (extents, content_revision.unwrap_or(0), lease_epoch.unwrap_or(0)),
+            } => (extents, generation.unwrap_or_default(), lease_epoch.unwrap_or_default()),
             _ => {
                 return Err(MetadataError::InvalidArgument(format!(
                     "Inode is not a file: {inode_id}"
                 )))
             }
         };
-        if stored_lease_epoch != lease_epoch && lease_epoch.checked_add(1) != Some(stored_lease_epoch) {
+        if stored_lease_epoch != lease_epoch && lease_epoch.checked_next() != Some(stored_lease_epoch) {
             return Err(MetadataError::LeaseFenced {
                 expected: stored_lease_epoch,
                 got: lease_epoch,
@@ -361,15 +360,15 @@ impl MetadataFileSystem {
                     && extent.block_offset == 0
                     && extent.len == block.len
             });
-        if expected_content_revision.checked_add(1) == Some(content_revision) && state_matches {
-            return Ok(Some((inode_id, inode.mount_id, content_revision, stored_lease_epoch)));
+        if expected_generation.checked_next() == Some(generation) && state_matches {
+            return Ok(Some((inode_id, inode.mount_id, generation, stored_lease_epoch)));
         }
-        if content_revision == expected_content_revision && intent.committed_blocks.is_empty() && state_matches {
-            return Ok(Some((inode_id, inode.mount_id, content_revision, stored_lease_epoch)));
+        if generation == expected_generation && intent.committed_blocks.is_empty() && state_matches {
+            return Ok(Some((inode_id, inode.mount_id, generation, stored_lease_epoch)));
         }
-        if content_revision != expected_content_revision {
+        if generation != expected_generation {
             return Err(MetadataError::Again(format!(
-                "content revision changed for inode {inode_id}: expected {expected_content_revision}, current {content_revision}"
+                "content generation changed for inode {inode_id}: expected {expected_generation}, current {generation}"
             )));
         }
         Ok(None)
@@ -396,26 +395,24 @@ impl MetadataFileSystem {
     ///
     /// A target is historical only when the durable inode already contains the
     /// exact extent and stamp. An older, uncommitted target must fail closed:
-    /// publishing it under a later revision would make Metadata and Worker
+    /// publishing it under a later generation would make Metadata and Worker
     /// disagree about the block stamp.
     fn publication_ready_targets(
         &self,
-        session: &crate::session_registry::WriteSession,
+        session: &WriteSession,
         committed_blocks: &[CommittedBlock],
-        expected_content_revision: u64,
+        expected_generation: ContentGeneration,
     ) -> MetadataResult<Vec<PublishReadyTarget>> {
-        let new_block_stamp = expected_content_revision
-            .checked_add(1)
-            .ok_or_else(|| MetadataError::InvalidArgument("content revision overflow".to_string()))?;
+        let new_block_stamp = expected_generation
+            .checked_next()
+            .ok_or_else(|| MetadataError::InvalidArgument("content generation overflow".to_string()))?;
         let inode = self
             .read_inode(session.inode_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {}", session.inode_id)))?;
-        let (visible_extents, durable_content_revision) = match &inode.data {
-            beryl_types::fs::InodeData::File {
-                extents,
-                content_revision,
-                ..
-            } => (extents, content_revision.unwrap_or(0)),
+        let (visible_extents, durable_generation) = match &inode.data {
+            InodeData::File {
+                extents, generation, ..
+            } => (extents, generation.unwrap_or_default()),
             _ => {
                 return Err(MetadataError::InvalidArgument(format!(
                     "Inode is not a file: {}",
@@ -423,9 +420,9 @@ impl MetadataFileSystem {
                 )))
             }
         };
-        if durable_content_revision != expected_content_revision {
+        if durable_generation != expected_generation {
             return Err(MetadataError::StaleState(format!(
-                "content revision changed for inode {}: expected {expected_content_revision}, current {durable_content_revision}",
+                "content generation changed for inode {}: expected {expected_generation}, current {durable_generation}",
                 session.inode_id
             )));
         }
@@ -450,9 +447,9 @@ impl MetadataFileSystem {
             if already_visible {
                 continue;
             }
-            if target.block_stamp != new_block_stamp {
+            if target.block_stamp != new_block_stamp.as_raw() {
                 return Err(MetadataError::InvalidArgument(format!(
-                    "Committed block {} was issued for block stamp {} but is not visible at content revision {expected_content_revision}",
+                    "Committed block {} was issued for block stamp {} but is not visible at content generation {expected_generation}",
                     block.block_id, target.block_stamp
                 )));
             }
@@ -750,7 +747,7 @@ impl MetadataFileSystem {
         publication: &WritePublication<'_>,
         publish_mode: PublishMode,
         operation: &'static str,
-    ) -> Result<crate::session_registry::WriteSession, FsFailure> {
+    ) -> Result<WriteSession, FsFailure> {
         let expected = publication.session();
         if let Some(failure) = self.session_write_admission_failure(ctx, expected.inode_id) {
             return Err(self
@@ -783,7 +780,7 @@ impl MetadataFileSystem {
         if current.inode_id != expected.inode_id
             || current.mount_id != expected.mount_id
             || current.base_size != expected.base_size
-            || current.content_revision != expected.content_revision
+            || current.generation != expected.generation
         {
             return Err(self
                 .session_terminal_failure::<()>(
@@ -816,10 +813,10 @@ impl MetadataFileSystem {
     async fn sync_write_session(
         &self,
         ctx: &RequestContext,
-        handle: PresentedWriteHandle,
+        handle: WriteHandle,
         intent: CloseWriteIntent,
         freshness: Freshness,
-        expected_content_revision: u64,
+        expected_generation: ContentGeneration,
         publish_mode: PublishMode,
     ) -> FsResult<SyncWriteOutput> {
         let inode_id = handle.inode_id;
@@ -828,8 +825,8 @@ impl MetadataFileSystem {
             Ok(session) => session,
             Err(failure) => return Err(failure),
         };
-        match self.resolve_published_state(inode_id, lease_epoch, &intent, expected_content_revision, publish_mode) {
-            Ok(Some((_inode_id, mount_id, content_revision, _stored_lease_epoch))) => {
+        match self.resolve_published_state(inode_id, lease_epoch, &intent, expected_generation, publish_mode) {
+            Ok(Some((_inode_id, mount_id, generation, _stored_lease_epoch))) => {
                 let publication = if active_session.is_some() {
                     Some(self.begin_write_publication(ctx, inode_id, lease_epoch, publish_mode, "SyncWrite")?)
                 } else {
@@ -837,13 +834,12 @@ impl MetadataFileSystem {
                 };
                 if publication.as_ref().is_some_and(|publication| {
                     let session = publication.session();
-                    session.content_revision != expected_content_revision
-                        && session.content_revision != content_revision
+                    session.generation != expected_generation && session.generation != generation
                 }) {
                     return self.session_terminal_failure(
                         ctx,
                         ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
-                        "SyncWrite content revision does not match the active session".to_string(),
+                        "SyncWrite content generation does not match the active session".to_string(),
                         None,
                         None,
                     );
@@ -852,14 +848,14 @@ impl MetadataFileSystem {
                     .completed_publish_hints(ctx, freshness, mount_id, "SyncWrite")
                     .await?;
                 if let Some(publication) = publication {
-                    if let Err(message) = publication.complete_sync(content_revision, intent.final_size) {
+                    if let Err(message) = publication.complete_sync(generation, intent.final_size) {
                         return self.failure_from_error(ctx, MetadataError::Internal(message), group_name, mount_epoch);
                     }
                 }
                 return self.success_with_route_epoch(
                     SyncWriteOutput {
                         synced_size: intent.final_size,
-                        content_revision: Some(content_revision),
+                        generation: Some(generation),
                     },
                     group_name,
                     mount_epoch,
@@ -885,7 +881,7 @@ impl MetadataFileSystem {
             }
         };
         let session = publication.session().clone();
-        if session.content_revision != expected_content_revision {
+        if session.generation != expected_generation {
             return self.session_terminal_failure(
                 ctx,
                 ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
@@ -969,13 +965,13 @@ impl MetadataFileSystem {
         }
         let worker_lookup_group_name =
             self.require_worker_lookup_group(ctx, group_name.clone(), mount_epoch, route_epoch, "SyncWrite")?;
-        let new_targets =
-            match self.publication_ready_targets(&session, &intent.committed_blocks, expected_content_revision) {
-                Ok(targets) => targets,
-                Err(err) => {
-                    return Err(self.invalid_publication_failure(ctx, err.to_string(), group_name, mount_epoch));
-                }
-            };
+        let new_targets = match self.publication_ready_targets(&session, &intent.committed_blocks, expected_generation)
+        {
+            Ok(targets) => targets,
+            Err(err) => {
+                return Err(self.invalid_publication_failure(ctx, err.to_string(), group_name, mount_epoch));
+            }
+        };
         self.wait_for_publish_ready(ctx, &worker_lookup_group_name, mount_epoch, route_epoch, &new_targets)
             .await?;
 
@@ -1027,28 +1023,28 @@ impl MetadataFileSystem {
             inode_id: session.inode_id,
             extents,
             target_size: intent.final_size,
-            expected_content_revision,
+            expected_generation,
             expected_file_size: intent.expected_file_size,
             lease_epoch,
             mode: publish_mode,
         };
-        let expected_inode_id = session.inode_id;
-        let content_revision = match self
+        let inode_id = session.inode_id;
+        let generation = match self
             .propose_fs_write_command(command, move |success| match success {
                 ApplySuccess::FilePublished {
                     inode_id: returned_inode_id,
-                    content_revision,
-                } if returned_inode_id == expected_inode_id => Ok(content_revision),
+                    generation,
+                } if returned_inode_id == inode_id => Ok(generation),
                 unexpected => Err(unexpected_raft_apply_success("PublishFile", unexpected)),
             })
             .await
         {
-            Ok(content_revision) => content_revision,
+            Ok(generation) => generation,
             Err(err) => {
                 return self.failure_from_error(ctx, err, Some(routed.group_name.clone()), Some(routed.mount_epoch));
             }
         };
-        if let Err(message) = publication.complete_sync(content_revision, intent.final_size) {
+        if let Err(message) = publication.complete_sync(generation, intent.final_size) {
             return self.failure_from_error(
                 ctx,
                 MetadataError::Internal(message),
@@ -1060,7 +1056,7 @@ impl MetadataFileSystem {
         self.success_with_route_epoch(
             SyncWriteOutput {
                 synced_size: intent.final_size,
-                content_revision: Some(content_revision),
+                generation: Some(generation),
             },
             Some(routed.group_name.clone()),
             Some(routed.mount_epoch),
@@ -1106,7 +1102,7 @@ impl MetadataFileSystem {
                     .read_inode(inode_id)?
                     .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {inode_id}")))?;
                 let visible_extents = match &inode.data {
-                    beryl_types::fs::InodeData::File { extents, .. } => extents,
+                    InodeData::File { extents, .. } => extents,
                     _ => {
                         return Err(MetadataError::InvalidArgument(format!(
                             "Inode is not a file: {inode_id}"
@@ -1149,10 +1145,7 @@ impl MetadataFileSystem {
     ///
     /// A newly published partial block must be the session's last issued target;
     /// otherwise the next capacity-aligned target would leave a file gap.
-    fn validate_committed_blocks(
-        intent: &CloseWriteIntent,
-        session: &crate::session_registry::WriteSession,
-    ) -> MetadataResult<Vec<Extent>> {
+    fn validate_committed_blocks(intent: &CloseWriteIntent, session: &WriteSession) -> MetadataResult<Vec<Extent>> {
         if intent.expected_file_size != session.base_size {
             return Err(MetadataError::InvalidArgument(format!(
                 "Expected file size mismatch: session={}, request={}",
@@ -1230,15 +1223,15 @@ impl MetadataFileSystem {
                 block_id: block.block_id,
                 block_offset: 0,
                 len: block.len,
-                content_revision: None,
+                generation: None,
                 block_stamp: None,
             });
         }
 
         if sorted.is_empty() {
             let expected_final_size = match session.mode {
-                crate::session_registry::WriteMode::Append => session.base_size,
-                crate::session_registry::WriteMode::Write => 0,
+                WriteMode::Append => session.base_size,
+                WriteMode::Overwrite => 0,
             };
             if intent.final_size != expected_final_size {
                 return Err(MetadataError::InvalidArgument(format!(
@@ -1250,7 +1243,7 @@ impl MetadataFileSystem {
         }
 
         match session.mode {
-            crate::session_registry::WriteMode::Append => {
+            WriteMode::Append => {
                 let mut expected_offset = session.base_size;
                 for block in &sorted {
                     if block.file_offset != expected_offset {
@@ -1268,7 +1261,7 @@ impl MetadataFileSystem {
                     )));
                 }
             }
-            crate::session_registry::WriteMode::Write => {
+            WriteMode::Overwrite => {
                 let mut expected_offset = 0;
                 for block in &sorted {
                     if block.file_offset != expected_offset {
@@ -1294,10 +1287,10 @@ impl MetadataFileSystem {
     pub(super) async fn close_write_session(
         &self,
         ctx: &RequestContext,
-        handle: PresentedWriteHandle,
+        handle: WriteHandle,
         intent: CloseWriteIntent,
         freshness: Freshness,
-        expected_content_revision: u64,
+        expected_generation: ContentGeneration,
         publish_mode: PublishMode,
     ) -> FsResult<CloseWriteOutput> {
         let inode_id = handle.inode_id;
@@ -1306,8 +1299,8 @@ impl MetadataFileSystem {
             Ok(session) => session,
             Err(failure) => return Err(failure),
         };
-        match self.resolve_published_state(inode_id, lease_epoch, &intent, expected_content_revision, publish_mode) {
-            Ok(Some((_inode_id, mount_id, content_revision, stored_lease_epoch))) => {
+        match self.resolve_published_state(inode_id, lease_epoch, &intent, expected_generation, publish_mode) {
+            Ok(Some((_inode_id, mount_id, generation, stored_lease_epoch))) => {
                 let publication = if active_session.is_some() {
                     Some(self.begin_write_publication(ctx, inode_id, lease_epoch, publish_mode, "CommitFile")?)
                 } else {
@@ -1315,13 +1308,12 @@ impl MetadataFileSystem {
                 };
                 if publication.as_ref().is_some_and(|publication| {
                     let session = publication.session();
-                    session.content_revision != expected_content_revision
-                        && session.content_revision != content_revision
+                    session.generation != expected_generation && session.generation != generation
                 }) {
                     return self.session_terminal_failure(
                         ctx,
                         ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
-                        "CommitFile content revision does not match the active session".to_string(),
+                        "CommitFile content generation does not match the active session".to_string(),
                         None,
                         None,
                     );
@@ -1331,7 +1323,7 @@ impl MetadataFileSystem {
                     .await?;
                 // A no-op close has no content mutation to prove that the initial
                 // CreateFile write right ended, so advance its durable fence explicitly.
-                if content_revision == expected_content_revision && stored_lease_epoch == lease_epoch {
+                if generation == expected_generation && stored_lease_epoch == lease_epoch {
                     let proposed_at_ms = crate::raft::proposal_timestamp_ms();
                     if active_session.is_none() {
                         let owner_matches = match self.storage.get_create_file_replay_for_inode(inode_id) {
@@ -1340,7 +1332,7 @@ impl MetadataFileSystem {
                                     && replay.inode_id == inode_id
                                     && replay.mount_id == mount_id
                                     && replay.lease_epoch == lease_epoch
-                                    && replay.content_revision == expected_content_revision
+                                    && replay.generation == expected_generation
                                     && replay.expires_at_ms > proposed_at_ms
                             }
                             Ok(None) => false,
@@ -1357,8 +1349,7 @@ impl MetadataFileSystem {
                         }
                     }
                     self.require_publish_deadline(ctx, group_name.as_ref(), mount_epoch, route_epoch)?;
-                    let expected_ended_epoch = lease_epoch.checked_add(1);
-                    let expected_inode_id = inode_id;
+                    let next_epoch = lease_epoch.checked_next();
                     if let Err(error) = self
                         .propose_fs_write_command(
                             Command::EndWriteLease {
@@ -1370,11 +1361,7 @@ impl MetadataFileSystem {
                                 ApplySuccess::WriteLeaseEnded {
                                     inode_id: returned_inode_id,
                                     lease_epoch: ended_epoch,
-                                } if returned_inode_id == expected_inode_id
-                                    && Some(ended_epoch) == expected_ended_epoch =>
-                                {
-                                    Ok(())
-                                }
+                                } if returned_inode_id == inode_id && Some(ended_epoch) == next_epoch => Ok(()),
                                 unexpected => Err(unexpected_raft_apply_success("EndWriteLease", unexpected)),
                             },
                         )
@@ -1416,7 +1403,7 @@ impl MetadataFileSystem {
             }
         };
         let session = publication.session().clone();
-        if session.content_revision != expected_content_revision {
+        if session.generation != expected_generation {
             return self.session_terminal_failure(
                 ctx,
                 ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
@@ -1480,18 +1467,13 @@ impl MetadataFileSystem {
         }
         let worker_lookup_group_name =
             self.require_worker_lookup_group(ctx, group_name.clone(), mount_epoch, route_epoch, "CommitFile")?;
-        let new_targets =
-            match self.publication_ready_targets(&session, &intent.committed_blocks, expected_content_revision) {
-                Ok(targets) => targets,
-                Err(err) => {
-                    return Err(self.invalid_publication_failure(
-                        ctx,
-                        err.to_string(),
-                        group_name.clone(),
-                        mount_epoch,
-                    ));
-                }
-            };
+        let new_targets = match self.publication_ready_targets(&session, &intent.committed_blocks, expected_generation)
+        {
+            Ok(targets) => targets,
+            Err(err) => {
+                return Err(self.invalid_publication_failure(ctx, err.to_string(), group_name.clone(), mount_epoch));
+            }
+        };
         self.wait_for_publish_ready(ctx, &worker_lookup_group_name, mount_epoch, route_epoch, &new_targets)
             .await?;
 
@@ -1549,18 +1531,18 @@ impl MetadataFileSystem {
             inode_id: session.inode_id,
             extents,
             target_size: intent.final_size,
-            expected_content_revision,
+            expected_generation,
             expected_file_size: intent.expected_file_size,
             lease_epoch,
             mode: publish_mode,
         };
-        let expected_inode_id = session.inode_id;
+        let inode_id = session.inode_id;
         match self
             .propose_fs_write_command(command, move |success| match success {
                 ApplySuccess::FilePublished {
                     inode_id: returned_inode_id,
                     ..
-                } if returned_inode_id == expected_inode_id => Ok(()),
+                } if returned_inode_id == inode_id => Ok(()),
                 unexpected => Err(unexpected_raft_apply_success("PublishFile", unexpected)),
             })
             .await
@@ -1606,7 +1588,7 @@ mod tests {
                 "/file".to_string(),
                 env.inode_id,
                 vec![env.inode_id],
-                crate::session_registry::WriteMode::Write,
+                WriteMode::Overwrite,
                 Freshness::default(),
             )
             .await
@@ -1634,7 +1616,7 @@ mod tests {
                 "/file".to_string(),
                 env.inode_id,
                 vec![env.inode_id],
-                crate::session_registry::WriteMode::Write,
+                WriteMode::Overwrite,
                 Freshness::default(),
             )
             .await
@@ -1651,7 +1633,7 @@ mod tests {
                 .is_err(),
             "publication must remain pending before the Ready report"
         );
-        assert_eq!(stored_content_revision(&env.storage, env.inode_id), None);
+        assert_eq!(stored_generation(&env.storage, env.inode_id), None);
 
         publish_env_write_target(&env, &target, 1);
         tokio::time::timeout(Duration::from_secs(2), &mut commit)
@@ -1659,8 +1641,8 @@ mod tests {
             .expect("Ready observation should wake publication")
             .expect("commit should succeed");
         assert_eq!(
-            stored_content_revision(&env.storage, env.inode_id),
-            Some(target.block_stamp)
+            stored_generation(&env.storage, env.inode_id),
+            Some(ContentGeneration::new(target.block_stamp))
         );
     }
 
@@ -1674,7 +1656,7 @@ mod tests {
                 "/file".to_string(),
                 env.inode_id,
                 vec![env.inode_id],
-                crate::session_registry::WriteMode::Write,
+                WriteMode::Overwrite,
                 Freshness::default(),
             )
             .await
@@ -1685,7 +1667,7 @@ mod tests {
         ctx.caller.deadline = Deadline::from_now(Duration::from_millis(40));
         let commit = env.filesystem.close_write_session(
             &ctx,
-            PresentedWriteHandle {
+            WriteHandle {
                 inode_id: open.inode_id,
                 lease_epoch: open.lease_epoch,
             },
@@ -1695,7 +1677,7 @@ mod tests {
                 expected_file_size: open.base_size,
             },
             Freshness::default(),
-            open.content_revision,
+            open.generation,
             PublishMode::ReplaceIfUnchanged,
         );
         tokio::pin!(commit);
@@ -1711,7 +1693,7 @@ mod tests {
         commit
             .await
             .expect_err("deadline expiring after the wait must still prevent publication");
-        assert_eq!(stored_content_revision(&env.storage, env.inode_id), None);
+        assert_eq!(stored_generation(&env.storage, env.inode_id), None);
         assert!(env.filesystem.write_session_for_inode(open.inode_id).is_some());
     }
 
@@ -1725,7 +1707,7 @@ mod tests {
                 "/file".to_string(),
                 env.inode_id,
                 vec![env.inode_id],
-                crate::session_registry::WriteMode::Write,
+                WriteMode::Overwrite,
                 Freshness::default(),
             )
             .await
@@ -1737,7 +1719,7 @@ mod tests {
         env.filesystem
             .close_write_session(
                 &ctx,
-                PresentedWriteHandle {
+                WriteHandle {
                     inode_id: open.inode_id,
                     lease_epoch: open.lease_epoch,
                 },
@@ -1747,7 +1729,7 @@ mod tests {
                     expected_file_size: 0,
                 },
                 Freshness::default(),
-                open.content_revision,
+                open.generation,
                 PublishMode::ReplaceIfUnchanged,
             )
             .await
@@ -1758,7 +1740,7 @@ mod tests {
             .get_inode(open.inode_id)
             .unwrap()
             .and_then(|inode| match inode.data {
-                beryl_types::fs::InodeData::File { lease_epoch, .. } => lease_epoch,
+                InodeData::File { lease_epoch, .. } => lease_epoch,
                 _ => None,
             });
         assert_eq!(stored_epoch, Some(open.lease_epoch));
@@ -1772,7 +1754,7 @@ mod tests {
                 "/file".to_string(),
                 env.inode_id,
                 vec![env.inode_id],
-                crate::session_registry::WriteMode::Write,
+                WriteMode::Overwrite,
                 Freshness::default(),
             )
             .await
@@ -1785,7 +1767,7 @@ mod tests {
         env.filesystem
             .close_write_session(
                 &request_context(),
-                PresentedWriteHandle {
+                WriteHandle {
                     inode_id: open.inode_id,
                     lease_epoch: open.lease_epoch,
                 },
@@ -1795,7 +1777,7 @@ mod tests {
                     expected_file_size: 0,
                 },
                 Freshness::default(),
-                open.content_revision,
+                open.generation,
                 PublishMode::ReplaceIfUnchanged,
             )
             .await
@@ -1805,7 +1787,7 @@ mod tests {
             .get_inode(open.inode_id)
             .unwrap()
             .and_then(|inode| match inode.data {
-                beryl_types::fs::InodeData::File { lease_epoch, .. } => lease_epoch,
+                InodeData::File { lease_epoch, .. } => lease_epoch,
                 _ => None,
             });
         assert_eq!(stored_epoch, Some(open.lease_epoch));
@@ -1818,13 +1800,13 @@ mod tests {
         let ctx = request_context();
         let commit = env.filesystem.close_write_session(
             &ctx,
-            PresentedWriteHandle {
+            WriteHandle {
                 inode_id: open.inode_id,
                 lease_epoch: open.lease_epoch,
             },
             target_intent(&target, open.base_size),
             Freshness::default(),
-            open.content_revision,
+            open.generation,
             PublishMode::ReplaceIfUnchanged,
         );
         tokio::pin!(commit);
@@ -1852,7 +1834,7 @@ mod tests {
             failure.error.recovery,
             RecoveryAction::ReopenWriteSession { .. }
         ));
-        assert_eq!(stored_content_revision(&env.storage, env.inode_id), None);
+        assert_eq!(stored_generation(&env.storage, env.inode_id), None);
     }
 
     #[tokio::test]
@@ -1866,13 +1848,13 @@ mod tests {
         let ctx = request_context();
         let commit = env.filesystem.close_write_session(
             &ctx,
-            PresentedWriteHandle {
+            WriteHandle {
                 inode_id: open.inode_id,
                 lease_epoch: open.lease_epoch,
             },
             target_intent(&target, open.base_size),
             Freshness::default(),
-            open.content_revision,
+            open.generation,
             PublishMode::ReplaceIfUnchanged,
         );
         tokio::pin!(commit);
@@ -1899,7 +1881,7 @@ mod tests {
             &failure.error,
             ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
         );
-        assert_eq!(stored_content_revision(&env.storage, env.inode_id), None);
+        assert_eq!(stored_generation(&env.storage, env.inode_id), None);
     }
 
     #[tokio::test]
@@ -1909,13 +1891,13 @@ mod tests {
         let ctx = request_context();
         let commit = env.filesystem.close_write_session(
             &ctx,
-            PresentedWriteHandle {
+            WriteHandle {
                 inode_id: open.inode_id,
                 lease_epoch: open.lease_epoch,
             },
             target_intent(&target, open.base_size),
             Freshness::default(),
-            open.content_revision,
+            open.generation,
             PublishMode::ReplaceIfUnchanged,
         );
         tokio::pin!(commit);
@@ -1937,6 +1919,6 @@ mod tests {
             .expect("leadership loss must wake and finish publication")
             .expect_err("a nonleader must fail closed");
         assert_refresh_metadata(&failure.error, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
-        assert_eq!(stored_content_revision(&env.storage, env.inode_id), None);
+        assert_eq!(stored_generation(&env.storage, env.inode_id), None);
     }
 }

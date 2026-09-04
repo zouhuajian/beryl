@@ -3,18 +3,6 @@
 
 //! Worker core domain types and data-plane facade.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
-use beryl_types::chunk::ByteRange;
-use beryl_types::ids::BlockId;
-use beryl_types::layout::{BlockFormatId, BlockShape, BlockShapeError};
-use beryl_types::{GroupName, Tier, WorkerRunId};
-use bytes::Bytes;
-use tokio::time::Instant as TokioInstant;
-use tokio_util::sync::CancellationToken;
-
 use crate::error::WorkerError;
 use crate::observe;
 use crate::report::BlockReportChangeTracker;
@@ -22,9 +10,19 @@ use crate::runtime::block::{BlockManager, ReadPin, ReclaimingBlock};
 use crate::runtime::write::{BlockWriteIoGuard, BlockWriteKey, BlockWriteRegistration, BlockWriteRegistry};
 use crate::runtime::DataRpcPermit;
 use crate::store::block::{
-    BlockState, ChecksumKind, CreateStagingBlockRequest, LocalBlockStore, PublishReadyRequest, ReclaimBlockRequest,
-    ReclaimBlockResult,
+    BlockMetaPayload, BlockState, ChecksumKind, CreateStagingBlockRequest, LocalBlockStore, PublishReadyRequest,
+    ReclaimBlockRequest, ReclaimBlockResult,
 };
+use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
+use beryl_types::chunk::ByteRange;
+use beryl_types::ids::BlockId;
+use beryl_types::layout::{BlockFormatId, BlockShape, BlockShapeError};
+use beryl_types::{GroupName, Tier, WorkerRunId};
+use bytes::Bytes;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
+use tokio_util::sync::CancellationToken;
 
 pub type WorkerCoreResult<T> = Result<T, WorkerError>;
 
@@ -363,7 +361,7 @@ impl WorkerCore {
     /// Runs bounded cleanup for writes whose owning RPC was cancelled or dropped.
     pub async fn run_block_write_cleanup(&self, shutdown: CancellationToken) {
         let mut interval = tokio::time::interval(WRITE_CLEANUP_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 biased;
@@ -644,10 +642,7 @@ fn reject_existing_final_block(
     }
 }
 
-fn validate_existing_block_shape(
-    req: &WriteBlockRequest,
-    meta: &crate::store::block::BlockMetaPayload,
-) -> WorkerCoreResult<()> {
+fn validate_existing_block_shape(req: &WriteBlockRequest, meta: &BlockMetaPayload) -> WorkerCoreResult<()> {
     if meta.visibility.block_stamp != req.block_stamp {
         return Err(WorkerError::RefreshMetadata {
             kind: ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
@@ -675,19 +670,6 @@ fn validate_existing_block_shape(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{mpsc, Arc, Mutex};
-    use std::time::Duration;
-
-    use beryl_common::error::rpc::{ErrorKind, WorkerErrorKind};
-    use beryl_types::chunk::ByteRange;
-    use beryl_types::ids::{BlockId, BlockIndex, InodeId};
-    use beryl_types::layout::BlockFormatId;
-    use beryl_types::{GroupName, Tier, WorkerRunId};
-    use bytes::Bytes;
-    use tempfile::TempDir;
-    use tokio::sync::Semaphore;
-
     use super::{ReadBlockRequest, WorkerCore, WriteBlockRequest};
     use crate::error::WorkerError;
     use crate::runtime::DataRpcPermit;
@@ -696,6 +678,19 @@ mod tests {
         FullBlockFileStoreConfig, LocalBlockStore, PublishReadyRequest, ReclaimBlockRequest, ReclaimBlockResult,
         ReclaimBlockState, StoreResult,
     };
+    use beryl_common::error::rpc::{ErrorKind, WorkerErrorKind};
+    use beryl_types::chunk::ByteRange;
+    use beryl_types::ids::{BlockId, BlockIndex, InodeId};
+    use beryl_types::layout::BlockFormatId;
+    use beryl_types::{GroupName, Tier, WorkerRunId};
+    use bytes::Bytes;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{Receiver, Sender};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio::sync::Semaphore;
+    use tokio::time::Instant;
 
     const BLOCK_SIZE: u64 = 4096;
     const BLOCK_STAMP: u64 = 55;
@@ -766,8 +761,8 @@ mod tests {
     struct BlockingStore {
         inner: Arc<FullBlockFileStore>,
         operation: BlockingOperation,
-        started: Mutex<Option<mpsc::Sender<()>>>,
-        release: Mutex<mpsc::Receiver<()>>,
+        started: Mutex<Option<Sender<()>>>,
+        release: Mutex<Receiver<()>>,
         abort_calls: Arc<AtomicUsize>,
     }
 
@@ -834,8 +829,8 @@ mod tests {
         _temp: TempDir,
         store: Arc<FullBlockFileStore>,
         core: Arc<WorkerCore>,
-        started: mpsc::Receiver<()>,
-        release: mpsc::Sender<()>,
+        started: Receiver<()>,
+        release: Sender<()>,
         abort_calls: Arc<AtomicUsize>,
     }
 
@@ -892,7 +887,7 @@ mod tests {
         drop(write);
         assert!(
             !core
-                .drain_block_writes_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .drain_block_writes_until(Instant::now() + Duration::from_secs(1))
                 .await
         );
 
@@ -928,7 +923,7 @@ mod tests {
         }
         assert_eq!(write_slots.available_permits(), 0);
         assert!(
-            core.drain_block_writes_until(tokio::time::Instant::now() + Duration::from_millis(50))
+            core.drain_block_writes_until(Instant::now() + Duration::from_millis(50))
                 .await,
             "cleanup must not release ownership while create IO is still running"
         );
@@ -936,7 +931,7 @@ mod tests {
         release.send(()).expect("release create");
         assert!(
             !core
-                .drain_block_writes_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .drain_block_writes_until(Instant::now() + Duration::from_secs(1))
                 .await
         );
         assert_eq!(write_slots.available_permits(), 1);
@@ -973,7 +968,7 @@ mod tests {
         publish.abort();
         assert!(publish.await.expect_err("finish write cancelled").is_cancelled());
         assert!(
-            core.drain_block_writes_until(tokio::time::Instant::now() + Duration::from_millis(50))
+            core.drain_block_writes_until(Instant::now() + Duration::from_millis(50))
                 .await,
             "cleanup must not race a detached publish"
         );
@@ -981,7 +976,7 @@ mod tests {
         release.send(()).expect("release publish");
         assert!(
             !core
-                .drain_block_writes_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .drain_block_writes_until(Instant::now() + Duration::from_secs(1))
                 .await
         );
         let meta = store.load_meta(&group_name(), block_id()).expect("ready metadata");
@@ -1014,7 +1009,7 @@ mod tests {
         assert!(cleanup.await.expect_err("cleanup waiter cancelled").is_cancelled());
 
         assert!(
-            core.drain_block_writes_until(tokio::time::Instant::now() + Duration::from_millis(50))
+            core.drain_block_writes_until(Instant::now() + Duration::from_millis(50))
                 .await,
             "a second cleanup pass must wait for the claimed abort"
         );
@@ -1028,7 +1023,7 @@ mod tests {
         release.send(()).expect("release abort");
         assert!(
             !core
-                .drain_block_writes_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .drain_block_writes_until(Instant::now() + Duration::from_secs(1))
                 .await
         );
         let reused = core
@@ -1057,7 +1052,7 @@ mod tests {
         let drain_core = Arc::clone(&core);
         let drain = tokio::spawn(async move {
             drain_core
-                .drain_block_writes_until(tokio::time::Instant::now() + Duration::from_millis(50))
+                .drain_block_writes_until(Instant::now() + Duration::from_millis(50))
                 .await
         });
         tokio::task::spawn_blocking(move || started.recv().expect("drain abort started"))
@@ -1076,7 +1071,7 @@ mod tests {
         release.send(()).expect("release drain abort");
         assert!(
             !core
-                .drain_block_writes_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .drain_block_writes_until(Instant::now() + Duration::from_secs(1))
                 .await
         );
         let reused = core
@@ -1110,7 +1105,7 @@ mod tests {
         assert_eq!(core.cleanup_block_write_batch(false).await, 0);
         assert!(
             !core
-                .drain_block_writes_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .drain_block_writes_until(Instant::now() + Duration::from_secs(1))
                 .await,
             "all claims in the panicked batch must be retryable"
         );

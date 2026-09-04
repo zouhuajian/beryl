@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use super::*;
+use super::{
+    AppMetadataRaftState, AppRaftStateMachine, BlockId, BlockIndex, Extent, FileLayout, Inode, InodeData, InodeId,
+    MetadataError, MetadataResult, PublishMode, MAX_FILE_EXTENTS,
+};
+use beryl_types::{ContentGeneration, LeaseEpoch};
+use std::collections::HashSet;
 
 impl AppRaftStateMachine {
     fn ensure_file_inode_authority(inode_id: InodeId, inode: &Inode) -> MetadataResult<()> {
@@ -16,10 +21,11 @@ impl AppRaftStateMachine {
         Ok(())
     }
 
+    /// Reserve a never-reused sequence under the current durable writer epoch.
     pub(super) fn apply_allocate_block(
         &self,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<BlockId> {
         let mut inode = self
@@ -33,10 +39,10 @@ impl AppRaftStateMachine {
                 next_block_index,
                 ..
             } => {
-                let current_lease_epoch = stored_lease_epoch.unwrap_or(0);
-                if current_lease_epoch != lease_epoch {
+                let epoch = stored_lease_epoch.unwrap_or_default();
+                if epoch != lease_epoch {
                     return Err(MetadataError::LeaseFenced {
-                        expected: current_lease_epoch,
+                        expected: epoch,
                         got: lease_epoch,
                     });
                 }
@@ -63,11 +69,11 @@ impl AppRaftStateMachine {
     pub(super) fn apply_acquire_write_lease(
         &self,
         inode_id: InodeId,
-        expected_lease_epoch: u64,
+        expected_lease_epoch: LeaseEpoch,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<u64> {
-        let prepared: MetadataResult<(Inode, u64)> = (|| {
+    ) -> MetadataResult<LeaseEpoch> {
+        let prepared: MetadataResult<(Inode, LeaseEpoch)> = (|| {
             let mut inode = self
                 .storage
                 .get_inode(inode_id)?
@@ -76,7 +82,7 @@ impl AppRaftStateMachine {
             if let Some(record) = self.storage.get_create_file_replay_for_inode(inode_id)? {
                 let InodeData::File {
                     extents,
-                    content_revision,
+                    generation,
                     lease_epoch,
                     next_block_index,
                 } = &inode.data
@@ -84,7 +90,7 @@ impl AppRaftStateMachine {
                     unreachable!("file authority checked above")
                 };
                 let still_initial = extents.is_empty()
-                    && content_revision.unwrap_or_default() == record.content_revision
+                    && generation.unwrap_or_default() == record.generation
                     && *lease_epoch == Some(record.lease_epoch)
                     && *next_block_index == 0
                     && inode.attrs.size == 0;
@@ -96,13 +102,13 @@ impl AppRaftStateMachine {
             }
             let lease_epoch = match &mut inode.data {
                 InodeData::File { lease_epoch, .. } => {
-                    let current = lease_epoch.unwrap_or(0);
+                    let current = lease_epoch.unwrap_or_default();
                     if current != expected_lease_epoch {
                         return Err(MetadataError::Again(format!(
                             "write lease epoch changed for inode {inode_id}: expected {expected_lease_epoch}, current {current}"
                         )));
                     }
-                    let next = current.checked_add(1).ok_or_else(|| {
+                    let next = current.checked_next().ok_or_else(|| {
                         MetadataError::InvalidArgument(format!("write lease epoch overflow for inode {inode_id}"))
                     })?;
                     *lease_epoch = Some(next);
@@ -126,20 +132,20 @@ impl AppRaftStateMachine {
     pub(super) fn apply_end_write_lease(
         &self,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<u64> {
-        let prepared: MetadataResult<(Option<Inode>, u64)> = (|| {
+    ) -> MetadataResult<LeaseEpoch> {
+        let prepared: MetadataResult<(Option<Inode>, LeaseEpoch)> = (|| {
             let mut inode = self
                 .storage
                 .get_inode(inode_id)?
                 .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {inode_id}")))?;
             Self::ensure_file_inode_authority(inode_id, &inode)?;
-            let next = lease_epoch.checked_add(1).ok_or_else(|| {
+            let next = lease_epoch.checked_next().ok_or_else(|| {
                 MetadataError::InvalidArgument(format!("write lease epoch overflow for inode {inode_id}"))
             })?;
             let current = match &mut inode.data {
-                InodeData::File { lease_epoch, .. } => lease_epoch.unwrap_or(0),
+                InodeData::File { lease_epoch, .. } => lease_epoch.unwrap_or_default(),
                 _ => {
                     return Err(MetadataError::InvalidArgument(format!(
                         "Inode is not a file: {inode_id}"
@@ -175,9 +181,9 @@ impl AppRaftStateMachine {
         Ok(ended_epoch)
     }
 
-    /// Publish one fenced file version or confirm an exact idempotent replay.
+    /// Publish one fenced content generation or confirm an exact idempotent replay.
     ///
-    /// The returned revision is always the durable revision visible after the
+    /// The returned generation is always the durable generation visible after the
     /// command. Both mutation and replay paths commit the supplied applied index.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn apply_publish_file(
@@ -185,14 +191,14 @@ impl AppRaftStateMachine {
         inode_id: InodeId,
         mut requested_extents: Vec<Extent>,
         target_size: u64,
-        expected_content_revision: u64,
+        expected_generation: ContentGeneration,
         expected_file_size: u64,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         mode: PublishMode,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<u64> {
-        let prepared: MetadataResult<(Inode, FileLayout, u64, bool)> = (|| {
+    ) -> MetadataResult<ContentGeneration> {
+        let prepared: MetadataResult<(Inode, FileLayout, ContentGeneration, bool)> = (|| {
             let mut inode = self
                 .storage
                 .get_inode(inode_id)?
@@ -201,10 +207,10 @@ impl AppRaftStateMachine {
             let layout = self.storage.get_layout(inode_id)?;
             requested_extents.sort_by_key(|extent| (extent.file_offset, extent.block_id.index.as_raw()));
 
-            let (existing_extents, current_content_revision, stored_lease_epoch) = match &inode.data {
+            let (existing_extents, generation, stored_lease_epoch) = match &inode.data {
                 InodeData::File {
                     extents,
-                    content_revision,
+                    generation,
                     lease_epoch,
                     ..
                 } => {
@@ -216,7 +222,11 @@ impl AppRaftStateMachine {
                             inode_id
                         )));
                     }
-                    (extents.clone(), content_revision.unwrap_or(0), lease_epoch.unwrap_or(0))
+                    (
+                        extents.clone(),
+                        generation.unwrap_or_default(),
+                        lease_epoch.unwrap_or_default(),
+                    )
                 }
                 _ => unreachable!("file inode must carry file data"),
             };
@@ -226,14 +236,14 @@ impl AppRaftStateMachine {
                     got: lease_epoch,
                 });
             }
-            if current_content_revision == expected_content_revision && inode.attrs.size != expected_file_size {
+            if generation == expected_generation && inode.attrs.size != expected_file_size {
                 return Err(MetadataError::Again(format!(
                     "file size changed for inode {inode_id}: expected {expected_file_size}, current {}",
                     inode.attrs.size
                 )));
             }
 
-            let mut seen = std::collections::HashSet::with_capacity(requested_extents.len());
+            let mut seen = HashSet::with_capacity(requested_extents.len());
             let block_capacity = u64::from(layout.block_size);
             for extent in &requested_extents {
                 if extent.len == 0 {
@@ -309,16 +319,16 @@ impl AppRaftStateMachine {
                             )
                     }
                 };
-            if expected_content_revision.checked_add(1) == Some(current_content_revision) && state_matches {
-                return Ok((inode, layout, current_content_revision, false));
+            if expected_generation.checked_next() == Some(generation) && state_matches {
+                return Ok((inode, layout, generation, false));
             }
-            if current_content_revision != expected_content_revision {
+            if generation != expected_generation {
                 return Err(MetadataError::Again(format!(
-                    "content revision changed for inode {inode_id}: expected {expected_content_revision}, current {current_content_revision}"
+                    "content generation changed for inode {inode_id}: expected {expected_generation}, current {generation}"
                 )));
             }
             if state_matches {
-                return Ok((inode, layout, current_content_revision, false));
+                return Ok((inode, layout, generation, false));
             }
 
             let mut extents_to_publish = match mode {
@@ -356,12 +366,12 @@ impl AppRaftStateMachine {
                     "final file extent count {final_extent_count} exceeds maximum {MAX_FILE_EXTENTS} for inode {inode_id}"
                 )));
             }
-            let content_revision = Self::next_content_revision(inode_id, Some(current_content_revision))?;
-            Self::stamp_extents(&mut extents_to_publish, &existing_extents, content_revision);
+            let generation = Self::next_generation(inode_id, Some(generation))?;
+            Self::stamp_extents(&mut extents_to_publish, &existing_extents, generation);
             match &mut inode.data {
                 InodeData::File {
                     extents,
-                    content_revision: stored_content_revision,
+                    generation: stored_generation,
                     ..
                 } => {
                     match mode {
@@ -369,9 +379,9 @@ impl AppRaftStateMachine {
                         PublishMode::AppendIfUnchanged => extents.extend(extents_to_publish),
                     }
                     for extent in extents.iter_mut() {
-                        extent.content_revision = Some(content_revision);
+                        extent.generation = Some(generation);
                     }
-                    *stored_content_revision = Some(content_revision);
+                    *stored_generation = Some(generation);
                 }
                 _ => unreachable!("file inode must carry file data"),
             }
@@ -379,16 +389,16 @@ impl AppRaftStateMachine {
             inode
                 .attrs
                 .update_mtime_ctime(Self::mutation_timestamp(&inode, proposed_at_ms));
-            Ok((inode, layout, content_revision, true))
+            Ok((inode, layout, generation, true))
         })();
 
-        let (inode, layout, content_revision, changed) = prepared?;
+        let (inode, layout, generation, changed) = prepared?;
         if changed {
             self.storage.publish_file_atomic(&inode, layout, raft_state)?;
         } else {
             self.storage.commit_applied_state(raft_state)?;
         }
-        Ok(content_revision)
+        Ok(generation)
     }
 }
 
@@ -397,7 +407,8 @@ mod tests {
     use super::*;
     use crate::raft::response::ApplyRejectionKind;
     use crate::raft::state_machine::tests::*;
-    use beryl_types::InodeKind;
+    use beryl_types::FileType;
+    use openraft::{LeaderId, LogId};
 
     fn expect_block_allocated(result: ApplySuccess) -> BlockId {
         match result {
@@ -414,33 +425,33 @@ mod tests {
         let sm = AppRaftStateMachine::new(Arc::clone(&storage));
         let applied_before = storage.load_raft_state().unwrap();
         let rejected_applied_state = AppMetadataRaftState {
-            last_applied_log_id: Some(openraft::LogId::new(openraft::LeaderId::new(7, 1), 703)),
+            last_applied_log_id: Some(LogId::new(LeaderId::new(7, 1), 703)),
             ..AppMetadataRaftState::default()
         };
         assert_ne!(rejected_applied_state, applied_before);
         let commands = [
             Command::AllocateBlock {
                 inode_id,
-                lease_epoch: 1,
+                lease_epoch: LeaseEpoch::new(1),
             },
             Command::AcquireWriteLease {
                 proposed_at_ms: 1,
                 inode_id,
-                expected_lease_epoch: 1,
+                expected_lease_epoch: LeaseEpoch::new(1),
             },
             Command::EndWriteLease {
                 proposed_at_ms: 1,
                 inode_id,
-                lease_epoch: 1,
+                lease_epoch: LeaseEpoch::new(1),
             },
             Command::PublishFile {
                 proposed_at_ms: 1,
                 inode_id,
                 extents: Vec::new(),
                 target_size: 0,
-                expected_content_revision: 0,
+                expected_generation: ContentGeneration::new(0),
                 expected_file_size: 0,
-                lease_epoch: 1,
+                lease_epoch: LeaseEpoch::new(1),
                 mode: PublishMode::ReplaceIfUnchanged,
             },
         ];
@@ -460,7 +471,7 @@ mod tests {
         let kind_inode_id = InodeId::new(108);
         let mut kind_mismatch =
             install_file_with_extents(&kind_storage, InodeId::new(100), "file", kind_inode_id, Vec::new(), 0);
-        kind_mismatch.kind = InodeKind::Dir;
+        kind_mismatch.kind = FileType::Dir;
         kind_storage.put_inode(&kind_mismatch).unwrap();
         assert_file_mutations_reject_corrupt_inode(kind_storage, kind_inode_id, &kind_mismatch);
 
@@ -482,7 +493,7 @@ mod tests {
         install_file_with_extents(&storage, InodeId::new(100), "file", inode_id, Vec::new(), 0);
         let allocate = || Command::AllocateBlock {
             inode_id,
-            lease_epoch: 1,
+            lease_epoch: LeaseEpoch::new(1),
         };
 
         let first = expect_block_allocated(
@@ -498,9 +509,9 @@ mod tests {
                     inode_id,
                     extents: vec![extent(first, 0, 1024)],
                     target_size: 1024,
-                    expected_content_revision: 0,
+                    expected_generation: ContentGeneration::new(0),
                     expected_file_size: 0,
-                    lease_epoch: 1,
+                    lease_epoch: LeaseEpoch::new(1),
                     mode: PublishMode::ReplaceIfUnchanged,
                 })
                 .unwrap(),
@@ -512,9 +523,9 @@ mod tests {
         assert!(matches!(
             restarted.apply(Command::AllocateBlock {
                 inode_id,
-                lease_epoch: 0,
+                lease_epoch: LeaseEpoch::new(0),
             }),
-            Err(MetadataError::LeaseFenced { expected: 1, got: 0 })
+            Err(MetadataError::LeaseFenced { expected, got }) if expected == LeaseEpoch::new(1) && got == LeaseEpoch::new(0)
         ));
 
         let inode = storage.get_inode(inode_id).unwrap().unwrap();
@@ -538,7 +549,7 @@ mod tests {
         let sm = AppRaftStateMachine::new(Arc::clone(&storage));
         let command = || Command::AllocateBlock {
             inode_id,
-            lease_epoch: 1,
+            lease_epoch: LeaseEpoch::new(1),
         };
 
         let last = expect_block_allocated(sm.apply(command()).unwrap());
@@ -566,9 +577,9 @@ mod tests {
             inode_id,
             extents: vec![extent(BlockId::new(inode_id, BlockIndex::new(0)), 0, 1024)],
             target_size: 1024,
-            expected_content_revision: 0,
+            expected_generation: ContentGeneration::new(0),
             expected_file_size: 0,
-            lease_epoch: 1,
+            lease_epoch: LeaseEpoch::new(1),
             mode: PublishMode::ReplaceIfUnchanged,
         };
 
@@ -576,7 +587,7 @@ mod tests {
             sm.apply(Command::EndWriteLease {
                 proposed_at_ms: 1,
                 inode_id,
-                lease_epoch: 1,
+                lease_epoch: LeaseEpoch::new(1),
             })
             .unwrap(),
         );
@@ -585,14 +596,17 @@ mod tests {
             sm.apply(Command::EndWriteLease {
                 proposed_at_ms: 3,
                 inode_id,
-                lease_epoch: 1,
+                lease_epoch: LeaseEpoch::new(1),
             })
             .unwrap(),
         );
         assert_eq!(replayed_end, (inode_id, 2));
         expect_apply_rejection(
             sm.apply(publish),
-            ApplyRejectionKind::LeaseFenced { expected: 2, got: 1 },
+            ApplyRejectionKind::LeaseFenced {
+                expected: LeaseEpoch::new(2),
+                got: LeaseEpoch::new(1),
+            },
         );
         assert_eq!(storage.get_inode(inode_id).unwrap().unwrap().attrs.size, 0);
     }
@@ -609,9 +623,9 @@ mod tests {
             inode_id,
             extents: vec![extent(BlockId::new(inode_id, BlockIndex::new(0)), 0, 1024)],
             target_size: 1024,
-            expected_content_revision: 0,
+            expected_generation: ContentGeneration::new(0),
             expected_file_size: 0,
-            lease_epoch: 1,
+            lease_epoch: LeaseEpoch::new(1),
             mode: PublishMode::ReplaceIfUnchanged,
         };
 
@@ -626,9 +640,9 @@ mod tests {
                 inode_id,
                 extents: Vec::new(),
                 target_size: 0,
-                expected_content_revision: 0,
+                expected_generation: ContentGeneration::new(0),
                 expected_file_size: 0,
-                lease_epoch: 1,
+                lease_epoch: LeaseEpoch::new(1),
                 mode: PublishMode::ReplaceIfUnchanged,
             }),
             ApplyRejectionKind::Again,
@@ -637,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn append_publish_requires_the_current_content_revision_and_contiguous_offset() {
+    fn append_publish_requires_the_generation_and_contiguous_offset() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage));
@@ -657,9 +671,9 @@ mod tests {
                 inode_id,
                 extents: vec![extent(BlockId::new(inode_id, BlockIndex::new(1)), 1024, 512)],
                 target_size: 1536,
-                expected_content_revision: 0,
+                expected_generation: ContentGeneration::new(0),
                 expected_file_size: 1024,
-                lease_epoch: 1,
+                lease_epoch: LeaseEpoch::new(1),
                 mode: PublishMode::AppendIfUnchanged,
             })
             .unwrap(),
@@ -672,9 +686,9 @@ mod tests {
                 inode_id,
                 extents: vec![extent(BlockId::new(inode_id, BlockIndex::new(2)), 1024, 512)],
                 target_size: 1536,
-                expected_content_revision: 0,
+                expected_generation: ContentGeneration::new(0),
                 expected_file_size: 1024,
-                lease_epoch: 1,
+                lease_epoch: LeaseEpoch::new(1),
                 mode: PublishMode::AppendIfUnchanged,
             }),
             ApplyRejectionKind::Again,
@@ -685,9 +699,9 @@ mod tests {
             inode_id,
             extents: vec![extent(BlockId::new(inode_id, BlockIndex::new(2)), 1536, 512)],
             target_size: 2048,
-            expected_content_revision: 1,
+            expected_generation: ContentGeneration::new(1),
             expected_file_size: 1536,
-            lease_epoch: 1,
+            lease_epoch: LeaseEpoch::new(1),
             mode: PublishMode::AppendIfUnchanged,
         };
         let second = expect_file_published(sm.apply(second_append.clone()).unwrap());

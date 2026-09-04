@@ -30,12 +30,12 @@ import "common/header.proto";
 // Shared external payloads
 // ============================================================================
 
-/// Inode kind (file, directory, symlink).
-enum InodeKindProto {
-  INODE_KIND_UNSPECIFIED = 0;
-  INODE_KIND_FILE = 1;
-  INODE_KIND_DIR = 2;
-  INODE_KIND_SYMLINK = 3;
+/// Payload-free namespace type tag.
+enum FileTypeProto {
+  FILE_TYPE_UNSPECIFIED = 0;
+  FILE_TYPE_FILE = 1;
+  FILE_TYPE_DIR = 2;
+  FILE_TYPE_SYMLINK = 3;
 }
 
 /// File attributes (metadata for inodes).
@@ -64,11 +64,13 @@ message DirEntryProto {
   /// Entry name (UTF-8).
   string name = 1;
   /// Required inode kind for the child status.
-  InodeKindProto kind = 2;
+  FileTypeProto kind = 2;
   /// Required attributes for the child status returned by ListStatus.
   optional FileAttrsProto attrs = 3;
 }
 
+// Identifies a file write lease. Both fields must be non-zero; Metadata checks
+// caller ownership and current authority independently of this structural value.
 message WriteHandleProto {
   uint64 inode_id = 1;
   uint64 write_lease_epoch = 2;
@@ -132,7 +134,7 @@ message GetStatusResponseProto {
   // Required user-visible attributes for a successful response.
   FileAttrsProto attrs = 2;
   // Required namespace kind. UNSPECIFIED is not a successful domain value.
-  InodeKindProto kind = 3;
+  FileTypeProto kind = 3;
 }
 
 message ListStatusRequestProto {
@@ -208,9 +210,9 @@ message OpenFileResponseProto {
   common.ResponseHeaderProto header = 1;
   uint64 inode_id = 2;
   uint64 file_size = 3;
-  // Durable visible file state version for the current committed read plan.
-  // It advances when cached OpenFile/GetBlockLocations data may be invalid.
-  optional uint64 content_revision = 4;
+  // Content change counter scoped to this inode; it does not retain history.
+  // It advances when the Metadata-visible file contents change.
+  optional uint64 generation = 4;
 }
 
 message GetBlockLocationsRequestProto {
@@ -227,8 +229,8 @@ message GetBlockLocationsResponseProto {
   uint64 inode_id = 2;
   uint64 file_size = 3;
   repeated FileBlockLocationProto locations = 4;
-  // Same revision contract as OpenFileResponseProto.content_revision.
-  optional uint64 content_revision = 5;
+  // Same generation contract as OpenFileResponseProto.generation.
+  optional uint64 generation = 5;
 }
 
 // ============================================================================
@@ -246,8 +248,8 @@ message CreateFileResponseProto {
   common.FileLayoutProto layout = 2;
   WriteHandleProto write_handle = 3;
   uint64 expires_at_ms = 4;
-  // Durable content revision used as the first publish CAS precondition.
-  uint64 content_revision = 5;
+  // Durable content generation used as the first publish CAS precondition.
+  uint64 generation = 5;
 }
 
 enum OpenWriteModeProto {
@@ -269,8 +271,8 @@ message OpenWriteResponseProto {
   uint64 expires_at_ms = 4;
   // Metadata-stored FileLayout for the existing file.
   common.FileLayoutProto layout = 5;
-  // Durable content revision used as the publish CAS precondition.
-  uint64 content_revision = 6;
+  // Durable content generation used as the publish CAS precondition.
+  uint64 generation = 6;
 }
 
 message AddBlockRequestProto {
@@ -291,7 +293,7 @@ message CommitFileRequestProto {
   WriteHandleProto write_handle = 2;
   repeated CommittedBlockProto committed_blocks = 3;
   uint64 final_size = 4;
-  uint64 expected_content_revision = 5;
+  uint64 expected_generation = 5;
   OpenWriteModeProto write_mode = 6;
   uint64 expected_file_size = 7;
 }
@@ -325,7 +327,7 @@ message SyncWriteRequestProto {
   WriteHandleProto write_handle = 2;
   repeated CommittedBlockProto committed_blocks = 3;
   uint64 target_size = 4;
-  uint64 expected_content_revision = 5;
+  uint64 expected_generation = 5;
   OpenWriteModeProto write_mode = 6;
   uint64 expected_file_size = 7;
 }
@@ -333,7 +335,7 @@ message SyncWriteRequestProto {
 message SyncWriteResponseProto {
   common.ResponseHeaderProto header = 1;
   uint64 synced_size = 2;
-  optional uint64 content_revision = 3;
+  optional uint64 generation = 3;
 }
 
 // ============================================================================

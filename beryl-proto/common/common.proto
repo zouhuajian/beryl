@@ -28,11 +28,11 @@ message ClientIdProto {
 // Common Data Structures
 // ============================================================================
 
-/// Metadata-selected logical layout persisted with one file version.
+/// Metadata-selected logical layout persisted with one file inode.
 message FileLayoutProto {
   uint32 block_size = 1;
   // Metadata-selected Beryl block data/meta interpretation format for new
-  // blocks of this file version. Worker format parameters are derived from it.
+  // blocks of this file. Worker format parameters are derived from it.
   uint32 block_format_id = 2;
 }
 
@@ -52,7 +52,7 @@ message ByteRangeProto {
 }
 
 /// Fencing token for write operations.
-/// Aligns with types::lease::FencingToken { block_id: BlockId, owner: ClientId, epoch: u64 }.
+/// Aligns with types::lease::FencingToken { block_id: BlockId, owner: ClientId, epoch: LeaseEpoch }.
 message FencingTokenProto {
   BlockIdProto block_id = 1;
   ClientIdProto owner = 2;

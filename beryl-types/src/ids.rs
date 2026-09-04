@@ -9,9 +9,11 @@
 //! - IDs should serialize cleanly for wire/proto/logging.
 //! - Do NOT embed layout semantics, placement, or state in IDs.
 
-pub use crate::fs::InodeId;
-use core::fmt;
-use serde::{Deserialize, Serialize};
+use core::fmt::{Debug, Display, Formatter, Result as FmtResult};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::error::Error;
+use std::str::FromStr;
+use uuid::Uuid;
 
 /// A strongly-typed identifier wrapper.
 ///
@@ -23,7 +25,7 @@ macro_rules! id_new_uint {
         #[repr(transparent)]
         #[derive(
             Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord,
-            ::serde::Serialize, ::serde::Deserialize
+            Serialize, Deserialize
         )]
         #[serde(transparent)]
         pub struct $name(
@@ -41,9 +43,9 @@ macro_rules! id_new_uint {
             pub const fn as_raw(self) -> $ty { self.0 }
         }
 
-        impl ::core::fmt::Debug for $name {
+        impl Debug for $name {
             #[inline]
-            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+            fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
                 f.debug_tuple(stringify!($name)).field(&self.0).finish()
             }
         }
@@ -60,16 +62,78 @@ macro_rules! id_new_uint {
     };
 }
 
+/// Inode identifier (64-bit).
+///
+/// Inodes are the authoritative identity for filesystem objects.
+/// Each mount has a root inode, and all files/directories/symlinks have unique inodes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct InodeId(pub u64);
+
+impl InodeId {
+    /// Creates a new InodeId from a raw value.
+    #[inline]
+    pub const fn new(v: u64) -> Self {
+        Self(v)
+    }
+
+    /// Returns the inner value.
+    #[inline]
+    pub const fn as_raw(self) -> u64 {
+        self.0
+    }
+
+    /// Encodes as fixed-width big-endian bytes (8 bytes).
+    /// Used for RocksDB key encoding.
+    #[inline]
+    pub fn to_be_bytes(self) -> [u8; 8] {
+        self.0.to_be_bytes()
+    }
+
+    /// Decodes from fixed-width big-endian bytes (8 bytes).
+    #[inline]
+    pub fn from_be_bytes(bytes: [u8; 8]) -> Self {
+        Self(u64::from_be_bytes(bytes))
+    }
+}
+
+impl Debug for InodeId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.debug_tuple("InodeId").field(&self.0).finish()
+    }
+}
+
+impl Display for InodeId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<u64> for InodeId {
+    #[inline]
+    fn from(v: u64) -> Self {
+        Self(v)
+    }
+}
+
+impl From<InodeId> for u64 {
+    #[inline]
+    fn from(v: InodeId) -> Self {
+        v.0
+    }
+}
+
 id_new_uint!(
-    /// A monotonically allocated block index within one file inode.
+    /// A monotonically allocated block sequence within one file inode.
     ///
-    /// This is a stable ordinal, not a byte offset. Failed allocations may
+    /// This is an allocation sequence, not a position in the file. Failed allocations may
     /// leave gaps, and an allocated value is never reused.
     BlockIndex(u32)
 );
 
-impl fmt::Display for BlockIndex {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for BlockIndex {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{}", self.0)
     }
 }
@@ -77,20 +141,20 @@ impl fmt::Display for BlockIndex {
 /// Data-plane block identity.
 ///
 /// Blocks are addressed under the owning file's stable `InodeId`. The derived
-/// order is lexicographic by inode and block index, providing a
+/// order is lexicographic by inode and allocation sequence, providing a
 /// deterministic traversal order without changing identity semantics.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct BlockId {
     /// The file inode this block belongs to.
     pub inode_id: InodeId,
-    /// The index of this block within the file (ordinal, not byte offset).
+    /// Allocation sequence within the inode; gaps do not imply holes in the file.
     pub index: BlockIndex,
 }
 
 impl<'de> Deserialize<'de> for BlockId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: serde::Deserializer<'de>,
+        D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
         struct SerializedBlockId {
@@ -107,7 +171,7 @@ impl<'de> Deserialize<'de> for BlockId {
 }
 
 impl BlockId {
-    /// Creates a new `BlockId` from an inode ID and block index.
+    /// Creates a new `BlockId` from an inode ID and allocation sequence.
     #[inline]
     pub const fn new(inode_id: InodeId, index: BlockIndex) -> Self {
         Self { inode_id, index }
@@ -123,20 +187,20 @@ impl BlockId {
     }
 }
 
-impl fmt::Debug for BlockId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Debug for BlockId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         // Concise but structured.
         write!(f, "BlockId(inode_id={}, index={})", self.inode_id.0, self.index.0)
     }
 }
-impl fmt::Display for BlockId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for BlockId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         // Stable, human-friendly: "<inode>:<block>"
         write!(f, "{}:{}", self.inode_id.0, self.index.0)
     }
 }
 
-impl std::str::FromStr for BlockId {
+impl FromStr for BlockId {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -170,8 +234,8 @@ id_new_uint!(
     /// `WorkerRunId`, which identifies a single worker process start.
     WorkerId(u64)
 );
-impl fmt::Display for WorkerId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for WorkerId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{}", self.0)
     }
 }
@@ -226,9 +290,9 @@ impl ClientId {
     }
 }
 
-impl fmt::Debug for ClientId {
+impl Debug for ClientId {
     #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_tuple("ClientId")
             .field(&format_args!("0x{:032x}", self.0))
             .finish()
@@ -249,15 +313,13 @@ impl From<ClientId> for u128 {
     }
 }
 
-impl fmt::Display for ClientId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for ClientId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "0x{:032x}", self.0)
     }
 }
 
 // CallId and TxId: UUID-based identifiers for request context
-use std::str::FromStr;
-use uuid::Uuid;
 
 /// Call ID: unique identifier for each RPC call.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -301,14 +363,14 @@ impl Default for CallId {
     }
 }
 
-impl fmt::Debug for CallId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Debug for CallId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "CallId({})", self.0)
     }
 }
 
-impl fmt::Display for CallId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for CallId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{}", self.0)
     }
 }
@@ -369,19 +431,19 @@ impl GroupName {
     }
 }
 
-impl fmt::Debug for GroupName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Debug for GroupName {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_tuple("GroupName").field(&self.0).finish()
     }
 }
 
-impl fmt::Display for GroupName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for GroupName {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.write_str(&self.0)
     }
 }
 
-impl std::str::FromStr for GroupName {
+impl FromStr for GroupName {
     type Err = GroupNameError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -392,7 +454,7 @@ impl std::str::FromStr for GroupName {
 impl<'de> Deserialize<'de> for GroupName {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: serde::Deserializer<'de>,
+        D: Deserializer<'de>,
     {
         let raw = String::deserialize(deserializer)?;
         Self::parse(raw).map_err(serde::de::Error::custom)
@@ -408,8 +470,8 @@ pub enum GroupNameError {
     InvalidCharacter,
 }
 
-impl fmt::Display for GroupNameError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for GroupNameError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::Empty => f.write_str("must not be empty"),
             Self::TooLong => f.write_str("must be at most 63 characters"),
@@ -419,7 +481,7 @@ impl fmt::Display for GroupNameError {
     }
 }
 
-impl std::error::Error for GroupNameError {}
+impl Error for GroupNameError {}
 
 id_new_uint!(
     /// Mount identity.
@@ -428,8 +490,8 @@ id_new_uint!(
     MountId(u64)
 );
 
-impl fmt::Display for MountId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for MountId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{}", self.0)
     }
 }

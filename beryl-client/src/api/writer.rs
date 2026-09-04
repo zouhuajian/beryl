@@ -3,11 +3,6 @@
 
 //! Public writer handle.
 
-use std::fmt;
-use std::sync::Arc;
-
-use bytes::Bytes;
-
 use crate::client_inner::{
     is_unknown_session_barrier_outcome, mark_session_after_metadata_error, metric_labels, ClientInner,
 };
@@ -16,6 +11,9 @@ use crate::metrics::ClientMetric;
 use crate::runtime::OperationDeadline;
 use crate::session::write_session::WriteSession;
 use crate::worker::BlockWrite;
+use bytes::Bytes;
+use std::fmt::{Debug, Formatter, Result};
+use std::sync::Arc;
 
 /// A uniquely owned sequential write session created through the filesystem client.
 ///
@@ -118,8 +116,8 @@ impl FileWriter {
             deadline,
         )?;
         match self.inner.metadata.sync_write(plan).await {
-            Ok(content_revision) => {
-                self.session.mark_sync_completed(content_revision, target_size)?;
+            Ok(generation) => {
+                self.session.mark_sync_completed(generation, target_size)?;
                 Ok(())
             }
             Err(err) if is_unknown_session_barrier_outcome(&err) => {
@@ -299,8 +297,8 @@ impl FileWriter {
     }
 }
 
-impl fmt::Debug for FileWriter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Debug for FileWriter {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         f.debug_struct("FileWriter")
             .field("path", &self.path())
             .field("cursor", &self.cursor())

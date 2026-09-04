@@ -7,10 +7,12 @@
 //! continuation state for the current Metadata process. The persisted inode
 //! lease epoch remains the durable fencing authority across replay and restart.
 
+use crate::config::MetadataConfig;
 use crate::observe;
-use beryl_types::fs::InodeId;
-use beryl_types::ids::MountId;
-use beryl_types::{BlockId, BlockShape, CallId, ClientId, FileLayout, WriteTarget};
+use beryl_types::ids::{InodeId, MountId};
+use beryl_types::{
+    BlockId, BlockShape, CallId, ClientId, ContentGeneration, FileLayout, LeaseEpoch, WriteMode, WriteTarget,
+};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -18,15 +20,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Maximum number of expired entries retired by one cleanup invocation.
 pub(crate) const MAX_EXPIRED_SESSION_RETIREMENTS_PER_CALL: usize = 64;
-
-/// Write behavior selected when opening one file session.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WriteMode {
-    /// Replace the currently visible file contents.
-    Write,
-    /// Append new extents after the currently visible file size.
-    Append,
-}
 
 /// Leader-local continuation state for one admitted write.
 ///
@@ -39,12 +32,12 @@ pub struct WriteSession {
     /// Mount ID.
     pub mount_id: MountId,
     /// Lease epoch (for fencing validation).
-    pub lease_epoch: u64,
+    pub lease_epoch: LeaseEpoch,
     /// Base file size at open time (for append-only validation).
     pub base_size: u64,
-    /// Last durable content revision observed by this session.
-    pub content_revision: u64,
-    /// Write mode (WRITE or APPEND).
+    /// Last durable content generation observed by this session.
+    pub generation: ContentGeneration,
+    /// Session intent: replace visible contents or append after the visible end.
     pub mode: WriteMode,
     /// Client that owns the OpenWrite call.
     pub open_client_id: ClientId,
@@ -70,7 +63,7 @@ pub struct WriteSession {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WriteSessionIdentity {
     pub(crate) mount_id: MountId,
-    pub(crate) lease_epoch: u64,
+    pub(crate) lease_epoch: LeaseEpoch,
     pub(crate) open_client_id: ClientId,
 }
 
@@ -81,9 +74,9 @@ pub(crate) struct BeginSessionInput {
     pub normalized_path: String,
     pub mount_id: MountId,
     pub inode_id: InodeId,
-    pub current_lease_epoch: Option<u64>,
+    pub current_lease_epoch: Option<LeaseEpoch>,
     pub base_size: u64,
-    pub content_revision: u64,
+    pub generation: ContentGeneration,
     pub mode: WriteMode,
     pub open_client_id: ClientId,
     pub layout: FileLayout,
@@ -158,9 +151,9 @@ struct OpeningSession {
     opening_id: WriteOpeningId,
     inode_id: InodeId,
     mount_id: MountId,
-    proposed_lease_epoch: u64,
+    proposed_lease_epoch: LeaseEpoch,
     base_size: u64,
-    content_revision: u64,
+    generation: ContentGeneration,
     mode: WriteMode,
     open_client_id: ClientId,
     layout: FileLayout,
@@ -303,7 +296,7 @@ pub(crate) enum CompleteWriteTargetError {
 pub(crate) struct WriteTargetReservation<'a> {
     registry: &'a SessionRegistry,
     inode_id: InodeId,
-    lease_epoch: u64,
+    lease_epoch: LeaseEpoch,
     pending: PendingAddBlock,
     layout: FileLayout,
     open_client_id: ClientId,
@@ -353,13 +346,13 @@ impl WritePublication<'_> {
         )
     }
 
-    /// Install the successful SyncWrite revision and release the boundary.
-    pub(crate) fn complete_sync(mut self, content_revision: u64, file_size: u64) -> Result<(), String> {
+    /// Install the successful SyncWrite generation and release the boundary.
+    pub(crate) fn complete_sync(mut self, generation: ContentGeneration, file_size: u64) -> Result<(), String> {
         let result = self.registry.complete_sync_publication(
             self.session.inode_id,
             self.session.lease_epoch,
             self.publication_id,
-            content_revision,
+            generation,
             file_size,
             current_time_ms(),
         );
@@ -399,7 +392,7 @@ impl WriteTargetReservation<'_> {
         self.file_offset
     }
 
-    /// Return the content revision stamp captured for this target attempt.
+    /// Return the content generation stamp captured for this target attempt.
     pub(crate) fn block_stamp(&self) -> u64 {
         self.block_stamp
     }
@@ -444,7 +437,7 @@ pub(crate) struct WriteOpening<'a> {
     registry: &'a SessionRegistry,
     inode_id: InodeId,
     opening_id: WriteOpeningId,
-    proposed_lease_epoch: u64,
+    proposed_lease_epoch: LeaseEpoch,
     armed: bool,
 }
 
@@ -470,10 +463,10 @@ pub(crate) enum BeginCreateSession<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CreateSessionReplay {
     pub(crate) inode_id: InodeId,
-    pub(crate) lease_epoch: u64,
+    pub(crate) lease_epoch: LeaseEpoch,
     pub(crate) layout: FileLayout,
     pub(crate) expires_at_ms: u64,
-    pub(crate) content_revision: u64,
+    pub(crate) generation: ContentGeneration,
 }
 
 /// Exact reason an atomic CreateFile session cannot be reserved.
@@ -495,12 +488,12 @@ pub(crate) enum BeginCreateSessionError {
 
 impl WriteOpening<'_> {
     /// Return the exact epoch that the matching Raft command must acquire.
-    pub(crate) fn proposed_lease_epoch(&self) -> u64 {
+    pub(crate) fn proposed_lease_epoch(&self) -> LeaseEpoch {
         self.proposed_lease_epoch
     }
 
     /// Atomically convert the matching, non-expired opening into an active session.
-    pub(crate) fn activate(mut self, returned_lease_epoch: u64) -> Result<WriteSession, WriteOpeningError> {
+    pub(crate) fn activate(mut self, returned_lease_epoch: LeaseEpoch) -> Result<WriteSession, WriteOpeningError> {
         let result =
             self.registry
                 .activate_opening(self.inode_id, self.opening_id, returned_lease_epoch, current_time_ms());
@@ -521,10 +514,10 @@ impl CreateOpening<'_> {
     pub(crate) fn activate(
         mut self,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         expires_at_ms: u64,
         layout: FileLayout,
-        content_revision: u64,
+        generation: ContentGeneration,
     ) -> Result<WriteSession, WriteOpeningError> {
         let result = self.registry.activate_create_opening(
             self.operation_id,
@@ -533,7 +526,7 @@ impl CreateOpening<'_> {
             lease_epoch,
             expires_at_ms,
             layout,
-            content_revision,
+            generation,
             current_time_ms(),
         );
         if result.is_ok() {
@@ -551,7 +544,7 @@ pub(crate) enum WriteOpeningError {
     /// Cleanup or replacement removed the exact opening identity.
     NotCurrent,
     /// The Raft result did not match the proposed fencing epoch.
-    LeaseEpochMismatch { expected: u64, got: u64 },
+    LeaseEpochMismatch { expected: LeaseEpoch, got: LeaseEpoch },
 }
 
 /// Exact leader-local failure returned while beginning one write session.
@@ -575,7 +568,7 @@ pub(crate) enum WriteSessionError {
     /// No active session exists for the inode.
     NotFound,
     /// The presented epoch does not identify the active session.
-    LeaseEpochMismatch { expected: u64, got: u64 },
+    LeaseEpochMismatch { expected: LeaseEpoch, got: LeaseEpoch },
     /// The presented client does not own the active session.
     OwnerMismatch,
     /// The active session has expired and was retired.
@@ -838,7 +831,7 @@ impl SessionRegistry {
         let proposed_lease_epoch = input
             .current_lease_epoch
             .unwrap_or_default()
-            .checked_add(1)
+            .checked_next()
             .ok_or(BeginSessionError::LeaseEpochExhausted)?;
         let opening_id = WriteOpeningId(state.next_opening_id);
         state.next_opening_id = state
@@ -853,7 +846,7 @@ impl SessionRegistry {
             mount_id: input.mount_id,
             proposed_lease_epoch,
             base_size: input.base_size,
-            content_revision: input.content_revision,
+            generation: input.generation,
             mode: input.mode,
             open_client_id: input.open_client_id,
             layout: input.layout,
@@ -877,7 +870,7 @@ impl SessionRegistry {
         &self,
         inode_id: InodeId,
         opening_id: WriteOpeningId,
-        returned_lease_epoch: u64,
+        returned_lease_epoch: LeaseEpoch,
         now_ms: u64,
     ) -> Result<WriteSession, WriteOpeningError> {
         let mut state = self.state.write();
@@ -901,7 +894,7 @@ impl SessionRegistry {
             mount_id: opening.mount_id,
             lease_epoch: opening.proposed_lease_epoch,
             base_size: opening.base_size,
-            content_revision: opening.content_revision,
+            generation: opening.generation,
             mode: opening.mode,
             open_client_id: opening.open_client_id,
             layout: opening.layout,
@@ -935,10 +928,10 @@ impl SessionRegistry {
         operation_id: CreateFileOperationId,
         opening_id: WriteOpeningId,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         expires_at_ms: u64,
         layout: FileLayout,
-        content_revision: u64,
+        generation: ContentGeneration,
         now_ms: u64,
     ) -> Result<WriteSession, WriteOpeningError> {
         let mut state = self.state.write();
@@ -951,7 +944,7 @@ impl SessionRegistry {
             observe::record_write_session_expired();
             return Err(WriteOpeningError::Expired);
         }
-        if lease_epoch == 0 || state.entries.contains_key(&inode_id) {
+        if lease_epoch.as_raw() == 0 || state.entries.contains_key(&inode_id) {
             return Err(WriteOpeningError::NotCurrent);
         }
         let mut ancestor_inode_ids = opening.parent_ancestor_inode_ids.clone();
@@ -965,15 +958,15 @@ impl SessionRegistry {
             lease_epoch,
             layout,
             expires_at_ms,
-            content_revision,
+            generation,
         };
         let session = WriteSession {
             inode_id,
             mount_id: removed.mount_id,
             lease_epoch,
             base_size: 0,
-            content_revision,
-            mode: WriteMode::Write,
+            generation,
+            mode: WriteMode::Overwrite,
             open_client_id: removed.open_client_id,
             layout,
             expires_at_ms,
@@ -1004,7 +997,7 @@ impl SessionRegistry {
     pub(crate) fn begin_add_block(
         &self,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         previous_block_id: Option<BlockId>,
     ) -> Result<BeginAddBlock<'_>, BeginAddBlockError> {
         let mut state = self.state.write();
@@ -1041,9 +1034,9 @@ impl SessionRegistry {
             }
             let file_offset = Self::next_target_file_offset(session).map_err(BeginAddBlockError::InvalidArgument)?;
             let block_stamp = session
-                .content_revision
-                .checked_add(1)
-                .ok_or_else(|| BeginAddBlockError::InvalidArgument("content revision overflow".to_string()))?;
+                .generation
+                .checked_next()
+                .ok_or_else(|| BeginAddBlockError::InvalidArgument("content generation overflow".to_string()))?;
             if session.issued_targets.len() >= self.max_write_targets_per_session {
                 observe::record_write_target_rejected(WriteTargetLimit::PerSession.label());
                 return Err(BeginAddBlockError::LimitExceeded(WriteTargetLimitExceeded {
@@ -1082,7 +1075,7 @@ impl SessionRegistry {
             layout,
             open_client_id,
             file_offset,
-            block_stamp,
+            block_stamp: block_stamp.as_raw(),
             armed: true,
         }))
     }
@@ -1095,7 +1088,7 @@ impl SessionRegistry {
     pub(crate) fn begin_publication(
         &self,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
     ) -> Result<WritePublication<'_>, BeginWritePublicationError> {
         let mut state = self.state.write();
         let now_ms = current_time_ms();
@@ -1138,7 +1131,7 @@ impl SessionRegistry {
     fn complete_write_target(
         &self,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         pending: &PendingAddBlock,
         target: WriteTarget,
         now_ms: u64,
@@ -1182,8 +1175,12 @@ impl SessionRegistry {
         Ok(target)
     }
 
-    /// Revalidate fencing, layout, offset, and revision before issuing a reserved target.
-    fn validate_write_target(session: &WriteSession, lease_epoch: u64, target: &WriteTarget) -> Result<(), String> {
+    /// Revalidate fencing, layout, offset, and generation before issuing a reserved target.
+    fn validate_write_target(
+        session: &WriteSession,
+        lease_epoch: LeaseEpoch,
+        target: &WriteTarget,
+    ) -> Result<(), String> {
         if target.block_id.inode_id != session.inode_id {
             return Err("write target inode mismatch".to_string());
         }
@@ -1213,10 +1210,10 @@ impl SessionRegistry {
             return Err("write target shape does not match the session layout".to_string());
         }
         let expected_block_stamp = session
-            .content_revision
-            .checked_add(1)
-            .ok_or_else(|| "content revision overflow".to_string())?;
-        if target.block_stamp != expected_block_stamp {
+            .generation
+            .checked_next()
+            .ok_or_else(|| "content generation overflow".to_string())?;
+        if target.block_stamp != expected_block_stamp.as_raw() {
             return Err(format!(
                 "write target block stamp changed: expected {expected_block_stamp}, got {}",
                 target.block_stamp
@@ -1272,7 +1269,7 @@ impl SessionRegistry {
     }
 
     /// Remove only the session identified by the presented lease epoch.
-    pub fn remove_session_if_epoch(&self, inode_id: InodeId, lease_epoch: u64) -> Option<WriteSession> {
+    pub fn remove_session_if_epoch(&self, inode_id: InodeId, lease_epoch: LeaseEpoch) -> Option<WriteSession> {
         let mut state = self.state.write();
         match state.entries.get(&inode_id) {
             Some(WriteSessionEntry::Active(session)) if session.lease_epoch == lease_epoch => {}
@@ -1287,7 +1284,7 @@ impl SessionRegistry {
     }
 
     /// Validate that a non-expired active session owns the presented epoch.
-    pub(crate) fn validate_session(&self, inode_id: InodeId, lease_epoch: u64) -> Result<(), WriteSessionError> {
+    pub(crate) fn validate_session(&self, inode_id: InodeId, lease_epoch: LeaseEpoch) -> Result<(), WriteSessionError> {
         let mut state = self.state.write();
         let now_ms = current_time_ms();
         if state
@@ -1316,7 +1313,7 @@ impl SessionRegistry {
     pub(crate) fn renew_session(
         &self,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         client_id: ClientId,
     ) -> Result<u64, WriteSessionError> {
         self.renew_session_at(inode_id, lease_epoch, client_id, current_time_ms())
@@ -1325,7 +1322,7 @@ impl SessionRegistry {
     fn renew_session_at(
         &self,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         client_id: ClientId,
         now_ms: u64,
     ) -> Result<u64, WriteSessionError> {
@@ -1451,7 +1448,7 @@ impl SessionRegistry {
     fn revalidate_publication(
         &self,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         publication_id: WritePublicationId,
         now_ms: u64,
     ) -> Result<WriteSession, String> {
@@ -1472,9 +1469,9 @@ impl SessionRegistry {
     fn complete_sync_publication(
         &self,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         publication_id: WritePublicationId,
-        content_revision: u64,
+        generation: ContentGeneration,
         file_size: u64,
         now_ms: u64,
     ) -> Result<(), String> {
@@ -1488,7 +1485,7 @@ impl SessionRegistry {
         if session.active_publication != Some(publication_id) {
             return Err("write publication is no longer current".to_string());
         }
-        if session.content_revision == content_revision {
+        if session.generation == generation {
             if session.base_size != file_size {
                 return Err(format!(
                     "replayed SyncWrite size changed: expected {}, got {file_size}",
@@ -1498,18 +1495,18 @@ impl SessionRegistry {
             session.active_publication = None;
             return Ok(());
         }
-        let expected_content_revision = session
-            .content_revision
-            .checked_add(1)
-            .ok_or_else(|| "content revision overflow".to_string())?;
-        if content_revision != expected_content_revision {
+        let expected_generation = session
+            .generation
+            .checked_next()
+            .ok_or_else(|| "content generation overflow".to_string())?;
+        if generation != expected_generation {
             return Err(format!(
-                "SyncWrite content revision changed: expected {expected_content_revision}, got {content_revision}"
+                "SyncWrite content generation changed: expected {expected_generation}, got {generation}"
             ));
         }
 
-        // Before the new revision is installed, every target at or beyond the
-        // visible end still belongs to the old session revision. Removing that
+        // Before the new generation is installed, every target at or beyond the
+        // visible end still belongs to the old session generation. Removing that
         // suffix prevents stale capacity-based offsets from being replayed.
         let retained_target_count = session
             .issued_targets
@@ -1519,7 +1516,7 @@ impl SessionRegistry {
         session
             .issued_steps
             .retain(|_, target_index| *target_index < retained_target_count);
-        session.content_revision = content_revision;
+        session.generation = generation;
         session.base_size = file_size;
         session.active_publication = None;
         state.outstanding_write_targets = state
@@ -1534,7 +1531,7 @@ impl SessionRegistry {
     fn complete_commit_publication(
         &self,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         publication_id: WritePublicationId,
     ) -> Result<(), String> {
         let mut state = self.state.write();
@@ -1556,7 +1553,7 @@ impl SessionRegistry {
     }
 
     /// Release only the matching publication so stale owners cannot clear new state.
-    fn cancel_publication(&self, inode_id: InodeId, lease_epoch: u64, publication_id: WritePublicationId) {
+    fn cancel_publication(&self, inode_id: InodeId, lease_epoch: LeaseEpoch, publication_id: WritePublicationId) {
         let mut state = self.state.write();
         if let Ok(session) = Self::active_session_mut(&mut state, inode_id) {
             if session.lease_epoch == lease_epoch && session.active_publication == Some(publication_id) {
@@ -1588,7 +1585,7 @@ impl SessionRegistry {
     }
 
     /// Release only the matching pending AddBlock step after failure or cancellation.
-    fn cancel_write_target(&self, inode_id: InodeId, lease_epoch: u64, pending: &PendingAddBlock) {
+    fn cancel_write_target(&self, inode_id: InodeId, lease_epoch: LeaseEpoch, pending: &PendingAddBlock) {
         let mut state = self.state.write();
         Self::cancel_write_target_locked(&mut state, inode_id, lease_epoch, pending);
     }
@@ -1597,7 +1594,7 @@ impl SessionRegistry {
     fn cancel_write_target_locked(
         state: &mut SessionRegistryState,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         pending: &PendingAddBlock,
     ) -> bool {
         let matches = matches!(
@@ -1971,7 +1968,7 @@ fn current_time_ms() -> u64 {
 
 impl Default for SessionRegistry {
     fn default() -> Self {
-        let config = crate::config::MetadataConfig::default();
+        let config = MetadataConfig::default();
         Self::new(
             config.write_session_limits.max_active,
             config.write_session_limits.max_active_per_client,
@@ -1988,6 +1985,7 @@ mod tests {
     use beryl_types::ids::BlockIndex;
     use beryl_types::lease::FencingToken;
     use beryl_types::{BlockFormatId, Tier};
+    use std::sync::{Arc, Barrier, Condvar, Mutex};
 
     fn write_target(inode_id: InodeId, index: u32) -> WriteTarget {
         let block_id = BlockId::new(inode_id, BlockIndex::new(index));
@@ -1999,7 +1997,7 @@ mod tests {
             fencing_token: FencingToken {
                 block_id,
                 owner: ClientId::new(1),
-                epoch: 7,
+                epoch: LeaseEpoch::new(7),
             },
             block_stamp: 1,
             chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.spec().unwrap().storage_chunk_size,
@@ -2013,10 +2011,10 @@ mod tests {
             normalized_path: format!("/inode-{}", inode_id.as_raw()),
             inode_id,
             mount_id: MountId::new(1),
-            current_lease_epoch: Some(6),
+            current_lease_epoch: Some(LeaseEpoch::new(6)),
             base_size: 0,
-            content_revision: 0,
-            mode: WriteMode::Write,
+            generation: ContentGeneration::new(0),
+            mode: WriteMode::Overwrite,
             open_client_id: ClientId::new(1),
             layout: FileLayout::new(64),
             ancestor_inode_ids: vec![inode_id],
@@ -2087,7 +2085,10 @@ mod tests {
         let mut target = write_target(inode_id, index);
         target.file_offset = file_offset;
         target.block_stamp = block_stamp;
-        let reservation = match registry.begin_add_block(inode_id, 7, previous_block_id).unwrap() {
+        let reservation = match registry
+            .begin_add_block(inode_id, LeaseEpoch::new(7), previous_block_id)
+            .unwrap()
+        {
             BeginAddBlock::Reserved(reservation) => reservation,
             BeginAddBlock::Replay(_) => panic!("new test target must reserve capacity"),
         };
@@ -2119,22 +2120,22 @@ mod tests {
             )
             .unwrap();
         replacement.armed = false;
-        assert_eq!(session.lease_epoch, 7);
+        assert_eq!(session.lease_epoch, LeaseEpoch::new(7));
     }
 
     #[test]
     fn concurrent_openings_never_exceed_global_capacity() {
-        let registry = std::sync::Arc::new(SessionRegistry::new(4, 4, 100, 100, 60_000));
+        let registry = Arc::new(SessionRegistry::new(4, 4, 100, 100, 60_000));
         let contender_count = 16;
-        let start = std::sync::Arc::new(std::sync::Barrier::new(contender_count + 1));
-        let release = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let start = Arc::new(Barrier::new(contender_count + 1));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let mut joins = Vec::new();
 
         for contender in 0..contender_count {
-            let registry = std::sync::Arc::clone(&registry);
-            let start = std::sync::Arc::clone(&start);
-            let release = std::sync::Arc::clone(&release);
+            let registry = Arc::clone(&registry);
+            let start = Arc::clone(&start);
+            let release = Arc::clone(&release);
             let result_tx = result_tx.clone();
             joins.push(std::thread::spawn(move || {
                 start.wait();
@@ -2216,10 +2217,10 @@ mod tests {
                 opening.operation_id,
                 opening.opening_id,
                 InodeId::new(2),
-                1,
+                LeaseEpoch::new(1),
                 expires_at_ms,
                 FileLayout::new(64),
-                0,
+                ContentGeneration::new(0),
                 now_ms + 1,
             )
             .unwrap();
@@ -2229,7 +2230,7 @@ mod tests {
         registry
             .begin_publication(session.inode_id, session.lease_epoch)
             .unwrap()
-            .complete_sync(1, 0)
+            .complete_sync(ContentGeneration::new(1), 0)
             .unwrap();
         let renewed_expires_at_ms = registry
             .renew_session_at(
@@ -2268,8 +2269,11 @@ mod tests {
         assert_eq!(current.inode_id, session.inode_id);
         assert_eq!(current.lease_epoch, session.lease_epoch);
         assert_eq!(current.expires_at_ms, expires_at_ms);
-        assert_eq!(current.content_revision, 0);
-        assert_eq!(registry.get_session(session.inode_id).unwrap().content_revision, 1);
+        assert_eq!(current.generation, ContentGeneration::new(0));
+        assert_eq!(
+            registry.get_session(session.inode_id).unwrap().generation,
+            ContentGeneration::new(1)
+        );
     }
 
     #[test]
@@ -2288,13 +2292,19 @@ mod tests {
         install_session(&registry, create_input(inode_id)).unwrap();
 
         assert!(matches!(
-            opening.activate(inode_id, 1, expires_at_ms, FileLayout::new(64), 0),
+            opening.activate(
+                inode_id,
+                LeaseEpoch::new(1),
+                expires_at_ms,
+                FileLayout::new(64),
+                ContentGeneration::new(0)
+            ),
             Err(WriteOpeningError::NotCurrent)
         ));
         assert!(registry.state.read().create_openings.is_empty());
         assert!(registry.state.read().create_openings_by_path.is_empty());
 
-        registry.remove_session_if_epoch(inode_id, 7).unwrap();
+        registry.remove_session_if_epoch(inode_id, LeaseEpoch::new(7)).unwrap();
         assert!(matches!(
             registry.begin_create_session(begin_create_input(operation_id)),
             Ok(BeginCreateSession::Reserved(_))
@@ -2306,13 +2316,13 @@ mod tests {
         let registry = SessionRegistry::default();
         let inode_id = InodeId::new(20);
         install_session(&registry, create_input(inode_id)).unwrap();
-        registry.remove_session_if_epoch(inode_id, 7).unwrap();
+        registry.remove_session_if_epoch(inode_id, LeaseEpoch::new(7)).unwrap();
         let mut replacement = create_input(inode_id);
-        replacement.current_lease_epoch = Some(7);
+        replacement.current_lease_epoch = Some(LeaseEpoch::new(7));
         install_session(&registry, replacement).unwrap();
 
-        assert!(registry.remove_session_if_epoch(inode_id, 7).is_none());
-        assert_eq!(registry.get_session(inode_id).unwrap().lease_epoch, 8);
+        assert!(registry.remove_session_if_epoch(inode_id, LeaseEpoch::new(7)).is_none());
+        assert_eq!(registry.get_session(inode_id).unwrap().lease_epoch, LeaseEpoch::new(8));
     }
 
     #[test]
@@ -2325,7 +2335,9 @@ mod tests {
             install_session_at(&registry, create_input(inode_id), 0).unwrap();
         }
         for raw in 1..=(historical_expired_count - residual_expired_count) {
-            registry.remove_session_if_epoch(InodeId::new(raw as u64), 7).unwrap();
+            registry
+                .remove_session_if_epoch(InodeId::new(raw as u64), LeaseEpoch::new(7))
+                .unwrap();
         }
         let active_inode_id = InodeId::new(20_000);
         let mut active = create_input(active_inode_id);
@@ -2368,7 +2380,9 @@ mod tests {
             assert!(registry.has_active_write_under_at(active_inode_id, 10));
         }
 
-        registry.remove_session_if_epoch(active_inode_id, 7).unwrap();
+        registry
+            .remove_session_if_epoch(active_inode_id, LeaseEpoch::new(7))
+            .unwrap();
         let state = registry.state.read();
         assert!(state.entries.is_empty());
         assert!(state.ancestor_activity.is_empty());
@@ -2377,20 +2391,20 @@ mod tests {
 
     #[test]
     fn concurrent_duplicate_add_block_reserves_one_target_before_completion() {
-        let registry = std::sync::Arc::new(SessionRegistry::default());
+        let registry = Arc::new(SessionRegistry::default());
         let inode_id = InodeId::new(15);
         install_session(&registry, create_input(inode_id)).unwrap();
-        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let reserved = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let start = Arc::new(Barrier::new(2));
+        let reserved = Arc::new(Barrier::new(2));
 
         let mut joins = Vec::new();
         for index in 0..2 {
-            let registry = std::sync::Arc::clone(&registry);
-            let start = std::sync::Arc::clone(&start);
-            let reserved = std::sync::Arc::clone(&reserved);
+            let registry = Arc::clone(&registry);
+            let start = Arc::clone(&start);
+            let reserved = Arc::clone(&reserved);
             joins.push(std::thread::spawn(move || {
                 start.wait();
-                match registry.begin_add_block(inode_id, 7, None) {
+                match registry.begin_add_block(inode_id, LeaseEpoch::new(7), None) {
                     Ok(BeginAddBlock::Reserved(reservation)) => {
                         reserved.wait();
                         Some(reservation.complete(write_target(inode_id, index)).unwrap())
@@ -2420,21 +2434,24 @@ mod tests {
         let inode_id = InodeId::new(16);
         install_session(&registry, create_input(inode_id)).unwrap();
         let first = issue_target(&registry, inode_id, None, 0, 0, 1);
-        let reservation = match registry.begin_add_block(inode_id, 7, Some(first.block_id)).unwrap() {
+        let reservation = match registry
+            .begin_add_block(inode_id, LeaseEpoch::new(7), Some(first.block_id))
+            .unwrap()
+        {
             BeginAddBlock::Reserved(reservation) => reservation,
             BeginAddBlock::Replay(_) => panic!("new predecessor must reserve"),
         };
         assert!(matches!(
-            registry.begin_publication(inode_id, 7),
+            registry.begin_publication(inode_id, LeaseEpoch::new(7)),
             Err(BeginWritePublicationError::AddBlockPending)
         ));
         drop(reservation);
 
         let publication = registry
-            .begin_publication(inode_id, 7)
+            .begin_publication(inode_id, LeaseEpoch::new(7))
             .expect("released AddBlock must unblock publication");
         assert!(matches!(
-            registry.begin_add_block(inode_id, 7, Some(first.block_id)),
+            registry.begin_add_block(inode_id, LeaseEpoch::new(7), Some(first.block_id)),
             Err(BeginAddBlockError::PublicationInProgress)
         ));
         drop(publication);
@@ -2458,7 +2475,7 @@ mod tests {
 
         let first = issue_target(&registry, first_inode, None, 0, 0, 1);
         assert!(matches!(
-            registry.begin_add_block(first_inode, 7, Some(first.block_id)),
+            registry.begin_add_block(first_inode, LeaseEpoch::new(7), Some(first.block_id)),
             Err(BeginAddBlockError::LimitExceeded(WriteTargetLimitExceeded {
                 limit: WriteTargetLimit::PerSession,
                 maximum: 1,
@@ -2466,20 +2483,22 @@ mod tests {
         ));
         issue_target(&registry, second_inode, None, 0, 0, 1);
         assert!(matches!(
-            registry.begin_add_block(third_inode, 7, None),
+            registry.begin_add_block(third_inode, LeaseEpoch::new(7), None),
             Err(BeginAddBlockError::LimitExceeded(WriteTargetLimitExceeded {
                 limit: WriteTargetLimit::Global,
                 maximum: 2,
             }))
         ));
         assert!(matches!(
-            registry.begin_add_block(first_inode, 7, None),
+            registry.begin_add_block(first_inode, LeaseEpoch::new(7), None),
             Ok(BeginAddBlock::Replay(target)) if target == first
         ));
 
-        registry.remove_session_if_epoch(second_inode, 7).unwrap();
+        registry
+            .remove_session_if_epoch(second_inode, LeaseEpoch::new(7))
+            .unwrap();
         assert!(matches!(
-            registry.begin_add_block(third_inode, 7, None),
+            registry.begin_add_block(third_inode, LeaseEpoch::new(7), None),
             Ok(BeginAddBlock::Reserved(_))
         ));
     }

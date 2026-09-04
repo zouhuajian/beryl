@@ -3,17 +3,19 @@
 
 //! gRPC WorkerDataService adapter and server entry point.
 
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Instant;
-
-use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
+use crate::control::RegistrationSet;
+use crate::data::convert::{proto_to_read_block_request, proto_to_write_block_request};
+use crate::data::core::{ActiveBlockRead, ActiveBlockWrite, WorkerCore};
+use crate::error::WorkerError;
+use crate::observe;
+use crate::runtime::DataRpcPermit;
+use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RpcErrorDetail, WorkerErrorKind};
 use beryl_common::header::{
     HEADER_WORKER_DATA_ERROR_DETAIL, HEADER_WORKER_DATA_REJECTION, WORKER_DATA_ERROR_DETAIL_V1,
     WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT,
 };
 use beryl_common::observe::propagation::{extract_trace_context, ExtractedContext};
-use beryl_proto::common::{ClientInfoProto, ErrorDetailProto};
+use beryl_proto::common::{ClientInfoProto, ErrorDetailProto, TraceContextProto};
 use beryl_proto::convert::require_worker_run_id;
 use beryl_proto::worker::worker_data_service_server::{WorkerDataService, WorkerDataServiceServer};
 use beryl_proto::worker::write_block_request_proto::Payload;
@@ -21,21 +23,18 @@ use beryl_proto::worker::{
     DataRequestHeaderProto, DataResponseHeaderProto, ReadBlockChunkProto, ReadBlockRequestProto,
     WriteBlockRequestProto, WriteBlockResponseProto,
 };
+use beryl_types::GroupName;
 use bytes::Bytes;
 use futures::{stream, Stream, StreamExt};
 use prost::Message;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Semaphore;
 use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::service::Routes;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status, Streaming};
 use tracing::Span;
-
-use crate::control::RegistrationSet;
-use crate::data::convert::{proto_to_read_block_request, proto_to_write_block_request};
-use crate::data::core::{ActiveBlockRead, ActiveBlockWrite, WorkerCore};
-use crate::error::WorkerError;
-use crate::observe;
-use crate::runtime::DataRpcPermit;
 
 /// Worker data service with independent process-wide read and write admission.
 #[derive(Clone)]
@@ -84,7 +83,7 @@ impl WorkerDataServiceImpl {
                     MetadataValue::from_static(WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT),
                 );
                 Err(Status::with_metadata(
-                    tonic::Code::ResourceExhausted,
+                    Code::ResourceExhausted,
                     format!("Worker {mode} RPC capacity exhausted"),
                     metadata,
                 ))
@@ -112,7 +111,7 @@ impl WorkerDataServiceImpl {
     }
 
     fn error_detail(error: &WorkerError) -> ErrorDetailProto {
-        let rpc_error: beryl_common::error::rpc::RpcErrorDetail = error.clone().into();
+        let rpc_error: RpcErrorDetail = error.clone().into();
         beryl_proto::convert::rpc_error_to_proto(&rpc_error)
     }
 
@@ -129,7 +128,7 @@ impl WorkerDataServiceImpl {
     }
 
     fn ensure_group_ready_for_run(&self, group_name: &str, worker_run_id: &str) -> Result<(), WorkerError> {
-        let group_name = beryl_types::GroupName::parse(group_name)
+        let group_name = GroupName::parse(group_name)
             .map_err(|error| WorkerError::InvalidArgument(format!("group_name invalid: {error}")))?;
         let requested = require_worker_run_id(worker_run_id, "worker_run_id").map_err(WorkerError::InvalidArgument)?;
         let Some(registration) = self.registration_state.registration_for_group(&group_name) else {
@@ -432,7 +431,7 @@ impl WorkerDataService for WorkerDataServiceImpl {
 
     async fn write_block(
         &self,
-        request: Request<tonic::Streaming<WriteBlockRequestProto>>,
+        request: Request<Streaming<WriteBlockRequestProto>>,
     ) -> Result<Response<Self::WriteBlockStream>, Status> {
         let started = Instant::now();
         let rpc_permit = self.acquire_write_rpc().inspect_err(|status| {
@@ -474,7 +473,7 @@ fn merge_data_header_transport_context(header: &mut Option<DataRequestHeaderProt
     }
 }
 
-fn trace_context_proto_is_empty(context: &beryl_proto::common::TraceContextProto) -> bool {
+fn trace_context_proto_is_empty(context: &TraceContextProto) -> bool {
     context.traceparent.is_none() && context.tracestate.is_none() && context.baggage.is_none()
 }
 
@@ -494,17 +493,17 @@ fn outcome_labels(outcome: StreamOutcome) -> (&'static str, &'static str) {
 
 fn status_error_kind(status: &Status) -> &'static str {
     match status.code() {
-        tonic::Code::Ok => "none",
-        tonic::Code::InvalidArgument => "invalid_argument",
-        tonic::Code::NotFound => "not_found",
-        tonic::Code::FailedPrecondition => "failed_precondition",
-        tonic::Code::PermissionDenied => "permission_denied",
-        tonic::Code::ResourceExhausted => "resource_exhausted",
-        tonic::Code::Unavailable => "unavailable",
-        tonic::Code::DeadlineExceeded => "timeout",
-        tonic::Code::Unimplemented => "unimplemented",
-        tonic::Code::Cancelled => "cancelled",
-        tonic::Code::Internal => "internal",
+        Code::Ok => "none",
+        Code::InvalidArgument => "invalid_argument",
+        Code::NotFound => "not_found",
+        Code::FailedPrecondition => "failed_precondition",
+        Code::PermissionDenied => "permission_denied",
+        Code::ResourceExhausted => "resource_exhausted",
+        Code::Unavailable => "unavailable",
+        Code::DeadlineExceeded => "timeout",
+        Code::Unimplemented => "unimplemented",
+        Code::Cancelled => "cancelled",
+        Code::Internal => "internal",
         _ => "rpc_status",
     }
 }
@@ -526,9 +525,12 @@ pub fn worker_data_routes(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
-
+    use super::{
+        WorkerDataServiceImpl, HEADER_WORKER_DATA_REJECTION, WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT,
+    };
+    use crate::control::{Registration, RegistrationSet};
+    use crate::data::core::WorkerCore;
+    use crate::store::block::{BlockState, FullBlockFileStore, FullBlockFileStoreConfig};
     use beryl_common::observe::propagation::extract_trace_context;
     use beryl_proto::common::{BlockIdProto, TierProto};
     use beryl_proto::worker::write_block_request_proto::Payload;
@@ -538,15 +540,12 @@ mod tests {
     use beryl_types::{GroupName, WorkerRunId};
     use bytes::Bytes;
     use futures::stream;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
+    use tokio::time::Instant as TokioInstant;
     use tonic::metadata::MetadataMap;
-
-    use super::{
-        WorkerDataServiceImpl, HEADER_WORKER_DATA_REJECTION, WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT,
-    };
-    use crate::control::{Registration, RegistrationSet};
-    use crate::data::core::WorkerCore;
-    use crate::store::block::{BlockState, FullBlockFileStore, FullBlockFileStoreConfig};
+    use tonic::{Code, Status};
 
     fn group_name() -> GroupName {
         GroupName::parse("root").expect("group name")
@@ -640,7 +639,7 @@ mod tests {
         assert!(
             !service
                 .core
-                .drain_block_writes_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .drain_block_writes_until(TokioInstant::now() + Duration::from_secs(1))
                 .await
         );
 
@@ -668,7 +667,7 @@ mod tests {
         let (error, _state) = state.next().await.expect("terminal error");
         assert_eq!(
             error.expect_err("second command must fail").code(),
-            tonic::Code::InvalidArgument
+            Code::InvalidArgument
         );
     }
 
@@ -677,8 +676,8 @@ mod tests {
         let (_temp, _store, service, _worker_run_id) = registered_service();
         let read = service.acquire_read_rpc().expect("read capacity");
         let write = service.acquire_write_rpc().expect("write capacity");
-        let assert_capacity_rejection = |status: tonic::Status| {
-            assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        let assert_capacity_rejection = |status: Status| {
+            assert_eq!(status.code(), Code::ResourceExhausted);
             assert_eq!(
                 status
                     .metadata()

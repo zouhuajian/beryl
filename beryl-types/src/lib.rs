@@ -23,12 +23,13 @@ pub mod raft_log_id;
 pub mod tier;
 pub mod worker;
 
-pub use fs::{Extent, FileAttrs, Inode, InodeData, InodeId, InodeKind, MAX_FILE_EXTENTS};
+pub use fs::{ContentGeneration, Extent, FileAttrs, FileType, Inode, InodeData, MAX_FILE_EXTENTS, WriteMode};
 pub use group_watermark::{GroupStateWatermark, MountEpoch};
-pub use ids::{BlockId, BlockIndex, CallId, ClientId, GroupName, GroupNameError, MountId, WorkerId};
+pub use ids::{BlockId, BlockIndex, CallId, ClientId, GroupName, GroupNameError, InodeId, MountId, WorkerId};
 pub use layout::{
     BlockFormatId, BlockFormatIdError, BlockShape, BlockShapeError, FileLayout, FileLayoutError, MAX_BLOCK_SIZE,
 };
+pub use lease::{FencingToken, LeaseEpoch, WriteHandle};
 pub use location::{CommittedBlock, FileBlockLocation, WriteTarget};
 pub use raft_log_id::RaftLogId;
 pub use tier::{Tier, TierError, TierFree};

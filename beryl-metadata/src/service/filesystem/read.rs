@@ -3,10 +3,9 @@
 
 //! Namespace and file-location read operations.
 
-use super::refresh_metadata_fs_failure;
 use super::{
-    missing_resolved_target_error, worker_endpoint_from_parts, FileRange, Freshness, FsFailure, FsResult, FsSuccess,
-    MetadataFileSystem, RequestContext, StaleStateStatus, SUPPORTED_REPLICA_COUNT,
+    missing_resolved_target_error, refresh_metadata_fs_failure, worker_endpoint_from_parts, FileRange, Freshness,
+    FsFailure, FsResult, FsSuccess, MetadataFileSystem, RequestContext, StaleStateStatus, SUPPORTED_REPLICA_COUNT,
 };
 use crate::error::MetadataError;
 use crate::observe;
@@ -15,9 +14,9 @@ use crate::placement::{
 };
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint, WorkerErrorKind};
 use beryl_common::header::CallerContextFields;
-use beryl_types::fs::{Extent, FileAttrs, InodeId, InodeKind};
-use beryl_types::ids::MountId;
-use beryl_types::{FileBlockLocation, GroupName};
+use beryl_types::fs::{Extent, FileAttrs, FileType, Inode, InodeData};
+use beryl_types::ids::{InodeId, MountId};
+use beryl_types::{ContentGeneration, FileBlockLocation, GroupName};
 use std::time::Instant;
 
 #[derive(Clone, Debug)]
@@ -29,7 +28,7 @@ pub(super) struct GetAttrInput {
 
 #[derive(Clone, Debug)]
 pub(super) struct GetAttrOutput {
-    pub(super) kind: InodeKind,
+    pub(super) kind: FileType,
     pub(super) attrs: FileAttrs,
 }
 
@@ -47,7 +46,7 @@ struct ReadDirInput {
 #[derive(Clone, Debug)]
 pub(crate) struct ReadDirEntry {
     pub(crate) name: String,
-    pub(crate) kind: InodeKind,
+    pub(crate) kind: FileType,
     pub(crate) attrs: FileAttrs,
 }
 
@@ -74,7 +73,7 @@ pub(super) struct GetFileLayoutInput {
 #[derive(Clone, Debug, Default)]
 pub(super) struct GetFileLayoutOutput {
     pub(super) file_size: u64,
-    pub(super) content_revision: Option<u64>,
+    pub(super) generation: Option<ContentGeneration>,
     pub(super) locations: Vec<FileBlockLocation>,
 }
 
@@ -85,7 +84,7 @@ pub(crate) struct GetStatusArgs {
 
 /// Required namespace status returned after inode authority validation.
 pub(crate) struct GetStatusOutput {
-    pub(crate) kind: InodeKind,
+    pub(crate) kind: FileType,
     pub(crate) attrs: FileAttrs,
 }
 
@@ -112,7 +111,7 @@ pub(crate) struct OpenFileArgs {
 pub(crate) struct OpenFileOutput {
     pub(crate) inode_id: InodeId,
     pub(crate) file_size: u64,
-    pub(crate) content_revision: Option<u64>,
+    pub(crate) generation: Option<ContentGeneration>,
 }
 
 pub(crate) enum BlockLocationsTarget {
@@ -129,7 +128,7 @@ pub(crate) struct GetBlockLocationsArgs {
 pub(crate) struct GetBlockLocationsOutput {
     pub(crate) inode_id: InodeId,
     pub(crate) file_size: u64,
-    pub(crate) content_revision: Option<u64>,
+    pub(crate) generation: Option<ContentGeneration>,
     pub(crate) locations: Vec<FileBlockLocation>,
 }
 
@@ -235,7 +234,7 @@ impl MetadataFileSystem {
             payload: OpenFileOutput {
                 inode_id,
                 file_size: success.payload.file_size,
-                content_revision: success.payload.content_revision,
+                generation: success.payload.generation,
             },
             group_name: success.group_name,
             mount_epoch: success.mount_epoch,
@@ -291,7 +290,7 @@ impl MetadataFileSystem {
             payload: GetBlockLocationsOutput {
                 inode_id,
                 file_size: success.payload.file_size,
-                content_revision: success.payload.content_revision,
+                generation: success.payload.generation,
                 locations: success.payload.locations,
             },
             group_name: success.group_name,
@@ -305,7 +304,7 @@ impl MetadataFileSystem {
         &self,
         req_ctx: &RequestContext,
         freshness: Freshness,
-        mount_id: beryl_types::ids::MountId,
+        mount_id: MountId,
         intent: &str,
     ) -> Result<(Option<GroupName>, Option<u64>, Option<u64>), FsFailure> {
         let (group_name, mount_epoch) = self
@@ -336,9 +335,9 @@ impl MetadataFileSystem {
         }
     }
 
-    fn content_revision_for_inode(inode: &beryl_types::fs::Inode) -> Option<u64> {
+    fn generation_for_inode(inode: &Inode) -> Option<ContentGeneration> {
         match &inode.data {
-            beryl_types::fs::InodeData::File { content_revision, .. } => *content_revision,
+            InodeData::File { generation, .. } => *generation,
             _ => None,
         }
     }
@@ -696,9 +695,9 @@ impl MetadataFileSystem {
                 .validate_read_freshness_for_mount(&req.ctx, req.freshness, inode.mount_id, "GetFileLayout")
                 .await?;
 
-            let content_revision = Self::content_revision_for_inode(&inode);
+            let generation = Self::generation_for_inode(&inode);
             let extents = match &inode.data {
-                beryl_types::fs::InodeData::File { extents, .. } => extents.clone(),
+                InodeData::File { extents, .. } => extents.clone(),
                 _ => Vec::new(),
             };
             let inode_id = req.inode_id;
@@ -916,7 +915,7 @@ impl MetadataFileSystem {
             self.success_with_route_epoch(
                 GetFileLayoutOutput {
                     file_size: inode.attrs.size,
-                    content_revision,
+                    generation,
                     locations,
                 },
                 group_name,
@@ -946,21 +945,22 @@ fn record_fs_read_result<T>(operation: &str, started: Instant, result: &FsResult
 mod tests {
     use super::*;
     use crate::service::filesystem::tests::*;
+    use beryl_types::{GroupStateWatermark, RaftLogId, WriteMode};
 
     fn seed_visible_block(storage: &RocksDBStorage, mount_id: MountId, inode_id: InodeId, block_id: BlockId) {
         let mut attrs = FileAttrs::new();
         attrs.size = 512;
         let mut inode = Inode::new_file(inode_id, attrs, mount_id);
-        inode.data = beryl_types::fs::InodeData::File {
-            extents: vec![beryl_types::fs::Extent {
+        inode.data = InodeData::File {
+            extents: vec![Extent {
                 file_offset: 0,
                 block_id,
                 block_offset: 0,
                 len: 512,
-                content_revision: Some(1),
+                generation: Some(ContentGeneration::new(1)),
                 block_stamp: Some(41),
             }],
-            content_revision: Some(1),
+            generation: Some(ContentGeneration::new(1)),
             lease_epoch: None,
             next_block_index: 1,
         };
@@ -1146,7 +1146,7 @@ mod tests {
                 "/file".to_string(),
                 env.inode_id,
                 vec![env.inode_id],
-                crate::session_registry::WriteMode::Write,
+                WriteMode::Overwrite,
                 Freshness::default(),
             )
             .await
@@ -1170,9 +1170,9 @@ mod tests {
             .and_then(|raft_node| raft_node.get_last_applied_state_id())
             .expect("commit should advance applied state");
         let mut ctx = request_context();
-        ctx.caller.state.push(beryl_types::GroupStateWatermark::new(
+        ctx.caller.state.push(GroupStateWatermark::new(
             group_name("g15"),
-            beryl_types::RaftLogId {
+            RaftLogId {
                 term: current_state.term,
                 leader_node_id: current_state.leader_node_id,
                 index: current_state.index + 1,
