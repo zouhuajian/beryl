@@ -7,8 +7,7 @@
 
 use crate::error::{MetadataError, MetadataResult};
 use crate::raft::RocksDBStorage;
-use beryl_types::fs::InodeId;
-use beryl_types::ids::MountId;
+use beryl_types::ids::{InodeId, MountId};
 use beryl_types::GroupName;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -233,7 +232,8 @@ impl Default for MountTable {
 mod tests {
     use super::*;
     use crate::raft::RocksDBStorage;
-    use beryl_types::ids::MountId;
+    use beryl_types::ids::{InodeId, MountId};
+    use beryl_types::GroupName;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -304,8 +304,6 @@ mod tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).unwrap());
 
         // Create initial mount entries via storage (simulating Raft apply)
-        use beryl_types::fs::InodeId;
-        use beryl_types::GroupName;
         let entry1 = MountEntry {
             mount_id: MountId::new(1),
             mount_prefix: "/mnt/s3".to_string(),

@@ -1,21 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use std::collections::{BTreeMap, VecDeque};
-use std::process::Stdio;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
 use beryl_common::error::rpc::RpcErrorDetail;
 use beryl_proto::common::ResponseHeaderProto;
 use beryl_proto::convert::rpc_error_to_proto;
+use beryl_proto::metadata::block_report_request_proto::Batch;
+use beryl_proto::metadata::delta_block_report_entry_proto::Block;
 use beryl_proto::metadata::metadata_worker_service_proto_server::{
     MetadataWorkerServiceProto, MetadataWorkerServiceProtoServer,
 };
 use beryl_proto::metadata::{
-    block_report_request_proto, delta_block_report_entry_proto, BlockCleanupCommandProto, BlockReportKindProto,
-    BlockReportRequestProto, BlockReportResponseProto, HeartbeatRequestProto, HeartbeatResponseProto,
-    RegisterWorkerRequestProto, RegisterWorkerResponseProto, ReportedBlockStateProto,
+    BlockCleanupCommandProto, BlockReportKindProto, BlockReportRequestProto, BlockReportResponseProto,
+    HeartbeatRequestProto, HeartbeatResponseProto, RegisterWorkerRequestProto, RegisterWorkerResponseProto,
+    ReportedBlockStateProto,
 };
 use beryl_proto::worker::worker_data_service_server::WorkerDataService;
 use beryl_proto::worker::ReadBlockRequestProto;
@@ -23,18 +20,10 @@ use beryl_types::chunk::ByteRange;
 use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
 use beryl_types::layout::BlockFormatId;
 use beryl_types::{GroupName, Tier, WorkerRunId};
-use bytes::Bytes;
-use futures::StreamExt;
-use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, Command};
-use tonic::transport::Server;
-use tonic::{Request, Response, Status};
-
 use beryl_worker::config::{StoreDirConfig, WorkerConfig, WorkerRegistrationConfig};
 use beryl_worker::control::{
-    BlockCleanupOptions, BlockCleanupRuntime, BlockReportOptions, HeartbeatSnapshot, MetadataBlockReportLoop,
-    MetadataHeartbeatLoop, Registration, RegistrationDescriptor, RegistrationSet,
+    BlockCleanupOptions, BlockCleanupRuntime, BlockReportError, BlockReportOptions, HeartbeatSnapshot,
+    MetadataBlockReportLoop, MetadataHeartbeatLoop, Registration, RegistrationDescriptor, RegistrationSet,
 };
 use beryl_worker::net::protocol::WorkerNetProtocol;
 use beryl_worker::net::server::grpc::WorkerDataServiceImpl;
@@ -43,7 +32,23 @@ use beryl_worker::store::block::{
     PublishReadyRequest, ReclaimBlockRequest,
 };
 use beryl_worker::store::dirs::StoreDirs;
-use beryl_worker::WorkerCore;
+use beryl_worker::{ReclaimBlockResult, WorkerCore};
+use bytes::Bytes;
+use futures::StreamExt;
+use std::collections::{BTreeMap, VecDeque};
+use std::io::Error;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::process::{Child, Command};
+use tokio::sync::oneshot::Sender;
+use tonic::transport::Server;
+use tonic::{Request, Response, Status};
 
 const BLOCK_SIZE: u64 = 4096;
 
@@ -232,7 +237,7 @@ fn apply_block_report(
     request: &BlockReportRequestProto,
 ) -> (BlockReportKindProto, u64, bool) {
     match request.batch.as_ref().expect("mock block report kind") {
-        block_report_request_proto::Batch::FullReport(full) => {
+        Batch::FullReport(full) => {
             let mut accepted = state.full_report.lock().unwrap();
             if accepted.worker_run_id.as_deref() != Some(request.worker_run_id.as_str())
                 || accepted.baseline_seq != Some(request.baseline_seq)
@@ -262,9 +267,7 @@ fn apply_block_report(
                 accepted.baseline_published,
             )
         }
-        block_report_request_proto::Batch::DeltaReport(delta) => {
-            (BlockReportKindProto::BlockReportKindDelta, delta.batch_seq + 1, true)
-        }
+        Batch::DeltaReport(delta) => (BlockReportKindProto::BlockReportKindDelta, delta.batch_seq + 1, true),
     }
 }
 
@@ -322,12 +325,8 @@ fn response_header_from_block_report_request(
     }
 }
 
-async fn start_mock_metadata(
-    replies: Vec<MockRegisterReply>,
-) -> (String, Arc<MockMetadataState>, tokio::sync::oneshot::Sender<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock metadata");
+async fn start_mock_metadata(replies: Vec<MockRegisterReply>) -> (String, Arc<MockMetadataState>, Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock metadata");
     let addr = listener.local_addr().expect("mock metadata local addr");
     let state = Arc::new(MockMetadataState {
         replies: Mutex::new(VecDeque::from(replies)),
@@ -343,7 +342,7 @@ async fn start_mock_metadata(
     };
     let incoming = futures::stream::try_unfold(listener, |listener| async move {
         let (stream, _) = listener.accept().await?;
-        Ok::<_, std::io::Error>(Some((stream, listener)))
+        Ok::<_, Error>(Some((stream, listener)))
     });
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
@@ -362,7 +361,7 @@ async fn start_mock_metadata(
 
 async fn start_mock_metadata_with_block_reports(
     replies: Vec<MockBlockReportReply>,
-) -> (String, Arc<MockMetadataState>, tokio::sync::oneshot::Sender<()>) {
+) -> (String, Arc<MockMetadataState>, Sender<()>) {
     let (endpoint, state, shutdown) = start_mock_metadata(Vec::new()).await;
     *state.block_report_replies.lock().unwrap() = VecDeque::from(replies);
     (endpoint, state, shutdown)
@@ -489,13 +488,13 @@ async fn wait_for_block_report_absent(mock: &MockMetadataState, expected_block_i
     tokio::time::timeout(timeout, async {
         loop {
             let found = mock.block_report_requests.lock().unwrap().iter().any(|request| {
-                let Some(block_report_request_proto::Batch::DeltaReport(delta)) = request.batch.as_ref() else {
+                let Some(Batch::DeltaReport(delta)) = request.batch.as_ref() else {
                     return false;
                 };
                 delta.entries.iter().any(|entry| {
                     matches!(
                         entry.block.as_ref(),
-                        Some(delta_block_report_entry_proto::Block::Absent(block_id))
+                        Some(Block::Absent(block_id))
                             if BlockId::try_from(*block_id) == Ok(expected_block_id)
                     )
                 })
@@ -517,7 +516,7 @@ struct WorkerProcess {
 
 #[cfg(unix)]
 impl WorkerProcess {
-    fn start(config_path: &std::path::Path) -> Self {
+    fn start(config_path: &Path) -> Self {
         let child = Command::new(env!("CARGO_BIN_EXE_beryl-worker"))
             .arg("start")
             .arg("--config")
@@ -551,10 +550,10 @@ impl WorkerProcess {
 }
 
 #[cfg(unix)]
-async fn wait_for_worker_http_status(address: std::net::SocketAddr, path: &str, status: &[u8]) {
+async fn wait_for_worker_http_status(address: SocketAddr, path: &str, status: &[u8]) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Ok(mut stream) = tokio::net::TcpStream::connect(address).await {
+            if let Ok(mut stream) = TcpStream::connect(address).await {
                 let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
                 stream.write_all(request.as_bytes()).await.ok();
                 let mut response = Vec::new();
@@ -571,7 +570,7 @@ async fn wait_for_worker_http_status(address: std::net::SocketAddr, path: &str, 
 }
 
 #[cfg(unix)]
-async fn request_http_keep_alive(stream: &mut tokio::net::TcpStream, path: &str) -> Vec<u8> {
+async fn request_http_keep_alive(stream: &mut TcpStream, path: &str) -> Vec<u8> {
     let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
     stream.write_all(request.as_bytes()).await.expect("write HTTP request");
     let mut response = Vec::new();
@@ -602,7 +601,7 @@ async fn request_http_keep_alive(stream: &mut tokio::net::TcpStream, path: &str)
 }
 
 #[cfg(unix)]
-fn worker_process_config(endpoint: &str) -> (TempDir, std::path::PathBuf, std::net::SocketAddr, WorkerConfig) {
+fn worker_process_config(endpoint: &str) -> (TempDir, PathBuf, SocketAddr, WorkerConfig) {
     let temp = TempDir::new().expect("worker process tempdir");
     let rpc_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve Worker RPC port");
     let rpc_addr = rpc_listener.local_addr().unwrap();
@@ -667,7 +666,7 @@ async fn wait_for_full_report_count(mock: &MockMetadataState, block_id: BlockId,
                 .unwrap()
                 .iter()
                 .filter(|request| {
-                    let Some(block_report_request_proto::Batch::FullReport(full)) = request.batch.as_ref() else {
+                    let Some(Batch::FullReport(full)) = request.batch.as_ref() else {
                         return false;
                     };
                     full.blocks.iter().any(|block| {
@@ -707,14 +706,14 @@ async fn worker_signals_exit_cleanly_and_restart_reports_current_blocks() {
     let first = WorkerProcess::start(&config_path);
     wait_for_worker_http_status(http_addr, "/ready", b"HTTP/1.1 200").await;
     wait_for_full_report_count(&mock, ready_block, 1).await;
-    let mut held_connection = tokio::net::TcpStream::connect(http_addr)
+    let mut held_connection = TcpStream::connect(http_addr)
         .await
         .expect("open accepted HTTP connection");
     held_connection
         .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n")
         .await
         .unwrap();
-    let mut readiness_connection = tokio::net::TcpStream::connect(http_addr)
+    let mut readiness_connection = TcpStream::connect(http_addr)
         .await
         .expect("open readiness connection before shutdown");
     let ready_response = request_http_keep_alive(&mut readiness_connection, "/ready").await;
@@ -881,13 +880,13 @@ fn latest_delta_has_present_state(mock: &MockMetadataState, expected_state: Repo
     let Some(request) = requests.last() else {
         return false;
     };
-    let Some(block_report_request_proto::Batch::DeltaReport(delta)) = request.batch.as_ref() else {
+    let Some(Batch::DeltaReport(delta)) = request.batch.as_ref() else {
         return false;
     };
     delta.entries.iter().any(|entry| {
         matches!(
             entry.block.as_ref(),
-            Some(delta_block_report_entry_proto::Block::Present(block)) if block.state() == expected_state
+            Some(Block::Present(block)) if block.state() == expected_state
         )
     })
 }
@@ -897,13 +896,13 @@ fn latest_delta_has_absent(mock: &MockMetadataState, expected_block_id: BlockId)
     let Some(request) = requests.last() else {
         return false;
     };
-    let Some(block_report_request_proto::Batch::DeltaReport(delta)) = request.batch.as_ref() else {
+    let Some(Batch::DeltaReport(delta)) = request.batch.as_ref() else {
         return false;
     };
     delta.entries.iter().any(|entry| {
         matches!(
             entry.block.as_ref(),
-            Some(delta_block_report_entry_proto::Block::Absent(block_id))
+            Some(Block::Absent(block_id))
                 if BlockId::try_from(*block_id) == Ok(expected_block_id)
         )
     })
@@ -945,18 +944,15 @@ async fn block_report_loop_sends_coalesced_present_and_absent_entries_on_store_c
 
     {
         let requests = mock.block_report_requests.lock().unwrap();
-        assert!(matches!(
-            requests[0].batch.as_ref(),
-            Some(block_report_request_proto::Batch::FullReport(_))
-        ));
-        let Some(block_report_request_proto::Batch::DeltaReport(delta)) = requests[1].batch.as_ref() else {
+        assert!(matches!(requests[0].batch.as_ref(), Some(Batch::FullReport(_))));
+        let Some(Batch::DeltaReport(delta)) = requests[1].batch.as_ref() else {
             panic!("expected event-driven delta report");
         };
         assert_eq!(delta.entries.len(), 2);
-        assert!(delta.entries.iter().all(|entry| matches!(
-            entry.block.as_ref(),
-            Some(delta_block_report_entry_proto::Block::Present(_))
-        )));
+        assert!(delta
+            .entries
+            .iter()
+            .all(|entry| matches!(entry.block.as_ref(), Some(Block::Present(_)))));
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
@@ -973,7 +969,7 @@ async fn block_report_loop_sends_coalesced_present_and_absent_entries_on_store_c
         })
         .await
         .expect("reclaim Ready block"),
-        beryl_worker::ReclaimBlockResult::Deleted {
+        ReclaimBlockResult::Deleted {
             effective_len: BLOCK_SIZE
         }
     );
@@ -1042,7 +1038,7 @@ async fn result_unknown_retries_immutable_batches_and_preserves_newer_changes() 
             block_id: fourth,
             expected_block_stamp: 104,
         }),
-        Ok(beryl_worker::ReclaimBlockResult::Deleted { .. })
+        Ok(ReclaimBlockResult::Deleted { .. })
     ));
     assert_eq!(reporter.send_delta_once().await.unwrap().accepted_peers, 1);
     assert_eq!(reporter.send_delta_once().await.unwrap().accepted_peers, 1);
@@ -1051,39 +1047,39 @@ async fn result_unknown_retries_immutable_batches_and_preserves_newer_changes() 
         let requests = mock.block_report_requests.lock().unwrap();
         assert_eq!(requests.len(), 7);
         assert_same_report_retry(&requests[0], &requests[2]);
-        let Some(block_report_request_proto::Batch::FullReport(full)) = requests[0].batch.as_ref() else {
+        let Some(Batch::FullReport(full)) = requests[0].batch.as_ref() else {
             panic!("expected Full request");
         };
         assert_eq!(full.batch_seq, 0);
         assert_eq!(full.blocks.len(), 1);
         assert_eq!(full.blocks[0].block_id.map(BlockId::try_from), Some(Ok(first)));
-        let Some(block_report_request_proto::Batch::FullReport(full)) = requests[1].batch.as_ref() else {
+        let Some(Batch::FullReport(full)) = requests[1].batch.as_ref() else {
             panic!("expected second Full batch");
         };
         assert_eq!(full.batch_seq, 1);
         assert_eq!(full.blocks[0].block_id.map(BlockId::try_from), Some(Ok(second)));
-        let Some(block_report_request_proto::Batch::FullReport(full)) = requests[3].batch.as_ref() else {
+        let Some(Batch::FullReport(full)) = requests[3].batch.as_ref() else {
             panic!("expected recovery to continue from Metadata's acknowledged cursor");
         };
         assert_eq!(full.batch_seq, 2);
         assert_eq!(full.blocks[0].block_id.map(BlockId::try_from), Some(Ok(third)));
         assert_same_report_retry(&requests[4], &requests[5]);
-        let Some(block_report_request_proto::Batch::DeltaReport(delta)) = requests[4].batch.as_ref() else {
+        let Some(Batch::DeltaReport(delta)) = requests[4].batch.as_ref() else {
             panic!("expected Delta request");
         };
         assert!(delta.entries.iter().any(|entry| {
             matches!(
                 entry.block.as_ref(),
-                Some(delta_block_report_entry_proto::Block::Present(block))
+                Some(Block::Present(block))
                     if block.block_id.map(BlockId::try_from) == Some(Ok(fourth))
             )
         }));
-        let Some(block_report_request_proto::Batch::DeltaReport(delta)) = requests[6].batch.as_ref() else {
+        let Some(Batch::DeltaReport(delta)) = requests[6].batch.as_ref() else {
             panic!("expected retained newer Delta request");
         };
         assert!(matches!(
             delta.entries[0].block.as_ref(),
-            Some(delta_block_report_entry_proto::Block::Absent(block_id))
+            Some(Block::Absent(block_id))
                 if BlockId::try_from(*block_id) == Ok(fourth)
         ));
     }
@@ -1157,7 +1153,7 @@ async fn block_report_rejects_responses_that_do_not_confirm_the_request() {
             .await
             .expect_err("invalid Full acknowledgement must fail closed");
         assert!(
-            matches!(&error, beryl_worker::control::BlockReportError::Fatal(_)),
+            matches!(&error, BlockReportError::Fatal(_)),
             "invalid Full acknowledgement must be fatal: {error}"
         );
         assert!(
@@ -1178,7 +1174,7 @@ async fn block_report_rejects_responses_that_do_not_confirm_the_request() {
         .send_delta_once()
         .await
         .expect_err("Delta acknowledgement without a published baseline must fail closed");
-    assert!(matches!(&error, beryl_worker::control::BlockReportError::Fatal(_)));
+    assert!(matches!(&error, BlockReportError::Fatal(_)));
     assert!(error.to_string().contains("published Delta baseline"));
 
     shutdown.send(()).ok();
@@ -1236,7 +1232,7 @@ async fn startup_marker_recovery_precedes_first_full_block_report() {
     assert_eq!(round.accepted_peers, 1);
     let requests = mock.block_report_requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
-    let block_report_request_proto::Batch::FullReport(full) = requests[0].batch.as_ref().expect("full report") else {
+    let Batch::FullReport(full) = requests[0].batch.as_ref().expect("full report") else {
         panic!("expected full block report");
     };
     assert!(full.blocks.is_empty(), "recovered block must not reappear as Ready");

@@ -7,9 +7,8 @@ use super::{fs_failure_from_metadata_error, Freshness, FsFailure, MetadataFileSy
 use crate::error::{MetadataError, MetadataResult};
 use crate::observe;
 use crate::raft::{ApplySuccess, Command};
-use beryl_types::fs::InodeId;
-use beryl_types::ids::{BlockId, MountId};
-use beryl_types::GroupName;
+use beryl_types::ids::{BlockId, InodeId, MountId};
+use beryl_types::{GroupName, LeaseEpoch};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::debug;
@@ -102,9 +101,7 @@ impl MetadataFileSystem {
         );
 
         if let Some(ref metrics) = self.metrics {
-            metrics
-                .fs_write_routed_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics.fs_write_routed_total.fetch_add(1, Ordering::Relaxed);
         }
 
         Ok(RoutedFsWriteCtx {
@@ -140,7 +137,7 @@ impl MetadataFileSystem {
     pub(super) async fn propose_block_allocation(
         &self,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
     ) -> MetadataResult<BlockId> {
         let started = Instant::now();
         let command = Command::AllocateBlock { inode_id, lease_epoch };
@@ -235,7 +232,7 @@ pub(super) fn unexpected_raft_apply_success(operation_name: &'static str, succes
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{unexpected_raft_apply_success, ApplySuccess, MetadataError};
 
     #[test]
     fn mismatched_raft_success_fails_closed() {

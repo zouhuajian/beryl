@@ -4,10 +4,10 @@
 //! Metadata authority commands replicated through Raft.
 
 use crate::session_registry::CreateFileOperationId;
-use beryl_types::fs::{Extent, FileAttrs, InodeId};
-use beryl_types::ids::{MountId, WorkerId};
+use beryl_types::fs::{Extent, FileAttrs};
+use beryl_types::ids::{InodeId, MountId, WorkerId};
 use beryl_types::layout::FileLayout;
-use beryl_types::GroupName;
+use beryl_types::{ContentGeneration, GroupName, LeaseEpoch};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,9 +26,9 @@ pub(crate) const MAX_COMMAND_BYTES: usize = 4 * 1024 * 1024;
 /// File publication precondition and merge behavior.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PublishMode {
-    /// Replace content only while the expected content revision is current.
+    /// Replace content only while the expected content generation is current.
     ReplaceIfUnchanged,
-    /// Append content only while the expected content revision is current.
+    /// Append content only while the expected content generation is current.
     AppendIfUnchanged,
 }
 
@@ -73,7 +73,7 @@ pub(crate) enum Command {
         mount_root_inode_id: InodeId,
         relative_components: Vec<String>,
         expected_inode_id: InodeId,
-        expected_file_lease_epoch: Option<u64>,
+        expected_file_lease_epoch: Option<LeaseEpoch>,
         recursive: bool,
     },
     Rename {
@@ -84,31 +84,31 @@ pub(crate) enum Command {
         dst_parent_inode_id: InodeId,
         dst_name: String,
         expected_dst_inode_id: Option<InodeId>,
-        expected_dst_lease_epoch: Option<u64>,
+        expected_dst_lease_epoch: Option<LeaseEpoch>,
         flags: u32,
     },
     AcquireWriteLease {
         proposed_at_ms: u64,
         inode_id: InodeId,
-        expected_lease_epoch: u64,
+        expected_lease_epoch: LeaseEpoch,
     },
     AllocateBlock {
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
     },
     EndWriteLease {
         proposed_at_ms: u64,
         inode_id: InodeId,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
     },
     PublishFile {
         proposed_at_ms: u64,
         inode_id: InodeId,
         extents: Vec<Extent>,
         target_size: u64,
-        expected_content_revision: u64,
+        expected_generation: ContentGeneration,
         expected_file_size: u64,
-        lease_epoch: u64,
+        lease_epoch: LeaseEpoch,
         mode: PublishMode,
     },
     RegisterWorkerDescriptor {
@@ -172,7 +172,7 @@ mod tests {
                 block_id: BlockId::new(inode_id, BlockIndex::new(index as u32)),
                 block_offset: u64::MAX,
                 len: u64::MAX,
-                content_revision: Some(u64::MAX),
+                generation: Some(ContentGeneration::new(u64::MAX)),
                 block_stamp: Some(u64::MAX),
             })
             .collect();
@@ -181,9 +181,9 @@ mod tests {
             inode_id,
             extents,
             target_size: u64::MAX,
-            expected_content_revision: u64::MAX,
+            expected_generation: ContentGeneration::new(u64::MAX),
             expected_file_size: u64::MAX,
-            lease_epoch: u64::MAX,
+            lease_epoch: LeaseEpoch::new(u64::MAX),
             mode: PublishMode::ReplaceIfUnchanged,
         };
 

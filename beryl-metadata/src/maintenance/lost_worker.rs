@@ -74,14 +74,16 @@ impl LostWorkerCleanupService {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::RaftConfig;
     use crate::maintenance::lost_worker::{LostWorkerCleanupDeps, LostWorkerCleanupService};
     use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
     use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerInfo, WorkerManager};
     use crate::MountTable;
     use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
-    use beryl_types::{GroupName, WorkerRunId};
+    use beryl_types::{GroupName, Tier, TierFree, WorkerRunId};
     use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio::time::Duration;
 
     fn group_name(raw: &str) -> GroupName {
         GroupName::parse(raw).unwrap()
@@ -91,7 +93,7 @@ mod tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
-        let raft_config = crate::config::RaftConfig::default();
+        let raft_config = RaftConfig::default();
         let raft_node = Arc::new(
             AppRaftNode::new(1, storage, state_machine, mount_table, &raft_config)
                 .await
@@ -106,7 +108,7 @@ mod tests {
                 if raft_node.is_leader() {
                     break;
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
             assert!(raft_node.is_leader());
         } else {
@@ -136,8 +138,8 @@ mod tests {
                 1,
                 &address,
                 1,
-                vec![beryl_types::TierFree {
-                    tier: beryl_types::Tier::Hdd,
+                vec![TierFree {
+                    tier: Tier::Hdd,
                     free_bytes: 500,
                 }],
             )
@@ -206,7 +208,7 @@ mod tests {
         let block_id = BlockId::new(InodeId::new(11), BlockIndex::new(0));
         live_worker(&worker_manager, dead);
         publish_report(&worker_manager, dead, 1, vec![block_id]);
-        tokio::time::sleep(tokio::time::Duration::from_millis(1_100)).await;
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
         live_worker(&worker_manager, source);
         publish_report(&worker_manager, source, 1, vec![block_id]);
 

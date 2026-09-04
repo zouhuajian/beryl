@@ -25,29 +25,29 @@ mod snapshot;
 mod state_machine_store;
 mod transaction;
 
-pub(crate) use generation::{GenerationHandle, GenerationWriteGuard, PinnedGeneration, StagedGeneration};
-pub(crate) use log_store::AppLogStorage;
-pub(crate) use snapshot::{SnapshotFile, SnapshotInstallTracker};
-pub(crate) use state_machine_store::StateMachineStorage;
-
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::MountEntry;
 use crate::raft::AppMetadataRaftState;
 use crate::session_registry::CreateFileOperationId;
 use crate::state::RouteEpoch;
 use crate::worker::WorkerInfo;
-use beryl_types::fs::{Inode, InodeId};
-use beryl_types::ids::{MountId, WorkerId};
+use beryl_types::fs::Inode;
+use beryl_types::ids::{InodeId, MountId, WorkerId};
 use beryl_types::layout::FileLayout;
-use beryl_types::GroupName;
+use beryl_types::{CallId, ClientId, ContentGeneration, GroupName, LeaseEpoch};
 use bincode::config::standard;
 use bincode::serde::{decode_from_slice, encode_to_vec};
+pub(crate) use generation::{GenerationHandle, GenerationWriteGuard, PinnedGeneration, StagedGeneration};
+pub(crate) use log_store::AppLogStorage;
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, WriteOptions, DB};
 use serde::{Deserialize, Serialize};
+pub(crate) use snapshot::{SnapshotFile, SnapshotInstallTracker};
+pub(crate) use state_machine_store::StateMachineStorage;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
+use uuid::Uuid;
 
 type DentryPage = (Vec<(String, InodeId)>, Option<Vec<u8>>, bool);
 
@@ -63,7 +63,8 @@ const CF_RAFT_SNAPSHOT: &str = "raft_snapshot"; // Raft snapshots
 const ROCKSDB_SCHEMA_VERSION_KEY: &[u8] = b"rocksdb_schema_version";
 const STORAGE_IDENTITY_KEY: &[u8] = b"storage_identity";
 const RAFT_STATE_KEY: &[u8] = b"raft_state";
-pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 1;
+/// Guards database and snapshot decoding against incompatible persisted metadata encodings.
+pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 2;
 const NEXT_INODE_ID_KEY: &[u8] = b"next_inode_id";
 const CREATE_FILE_REPLAY_COUNT_KEY: &[u8] = b"create_file_replay_count";
 const CREATE_FILE_REPLAY_PREFIX: &[u8] = b"create_file_replay/";
@@ -177,9 +178,9 @@ pub(crate) struct CreateFileReplayRecord {
     pub(crate) expected_mount_epoch: u64,
     pub(crate) mount_root_inode_id: InodeId,
     pub(crate) relative_components: Vec<String>,
-    pub(crate) lease_epoch: u64,
+    pub(crate) lease_epoch: LeaseEpoch,
     pub(crate) layout: FileLayout,
-    pub(crate) content_revision: u64,
+    pub(crate) generation: ContentGeneration,
     pub(crate) expires_at_ms: u64,
 }
 
@@ -383,10 +384,10 @@ impl RocksDBStorage {
                 "invalid CreateFile operation identity length".to_string(),
             ));
         }
-        let client_id = beryl_types::ClientId::new(u128::from_be_bytes(
+        let client_id = ClientId::new(u128::from_be_bytes(
             bytes[..16].try_into().expect("checked client identity length"),
         ));
-        let call_id = beryl_types::CallId::from_uuid(uuid::Uuid::from_bytes(
+        let call_id = CallId::from_uuid(Uuid::from_bytes(
             bytes[16..].try_into().expect("checked call identity length"),
         ));
         Ok(CreateFileOperationId { client_id, call_id })

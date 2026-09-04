@@ -3,9 +3,6 @@
 
 mod support;
 
-use std::collections::VecDeque;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
 use beryl_client::{
     ClientConfig, ClientError, ClientErrorKind, DeleteOptions, FsClient, ListStatusOptions, MkdirOptions,
 };
@@ -17,17 +14,20 @@ use beryl_proto::common::{
 };
 use beryl_proto::metadata::{
     AbortFileWriteResponseProto, AddBlockResponseProto, CommitFileResponseProto, CreateDirectoryResponseProto,
-    CreateFileResponseProto, FileAttrsProto, GetBlockLocationsResponseProto, GetStatusResponseProto, InodeKindProto,
-    MsyncResponseProto, OpenFileResponseProto, RenewLeaseResponseProto, SyncWriteResponseProto, WriteHandleProto,
-    WriteTargetProto,
+    CreateFileResponseProto, FileAttrsProto, FileBlockLocationProto, FileTypeProto, GetBlockLocationsResponseProto,
+    GetStatusResponseProto, MsyncResponseProto, OpenFileResponseProto, RenewLeaseResponseProto, SyncWriteResponseProto,
+    WriteHandleProto, WriteTargetProto,
 };
 use beryl_types::BlockFormatId;
 use bytes::Bytes;
+use std::collections::VecDeque;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use support::{
     MetadataCall, MetadataReply, MetadataScript, MockMetadata, MockWorker, ReadReply, ResponseAuthority, WorkerScript,
     WriteReply,
 };
-use tonic::Status;
+use tonic::metadata::{MetadataMap, MetadataValue};
+use tonic::{Code, Status};
 
 const WORKER_RUN_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -269,17 +269,17 @@ async fn reader_replans_without_advancing_position_and_rejects_local_bounds_befo
 
 #[tokio::test]
 async fn malformed_create_and_add_block_successes_fail_closed_before_worker_io() {
+    let mut missing_layout = create_response(301, 8);
+    missing_layout.layout = None;
+    let mut zero_inode = create_response(301, 8);
+    zero_inode.write_handle.as_mut().unwrap().inode_id = 0;
+    let mut zero_epoch = create_response(301, 8);
+    zero_epoch.write_handle.as_mut().unwrap().write_lease_epoch = 0;
     let metadata = MockMetadata::new(MetadataScript {
-        create_file: VecDeque::from([
-            MetadataReply::success(CreateFileResponseProto {
-                layout: None,
-                write_handle: Some(write_handle(301)),
-                expires_at_ms: unix_now_ms() + 60_000,
-                content_revision: 0,
-                ..CreateFileResponseProto::default()
-            }),
-            MetadataReply::success(create_response(302, 8)),
-        ]),
+        create_file: [missing_layout, zero_inode, zero_epoch, create_response(302, 8)]
+            .into_iter()
+            .map(MetadataReply::success)
+            .collect(),
         add_block: VecDeque::from([MetadataReply::success(AddBlockResponseProto {
             target: Some(write_target(302, 0, 1, "127.0.0.1:9", 8)),
             ..AddBlockResponseProto::default()
@@ -289,9 +289,15 @@ async fn malformed_create_and_add_block_successes_fail_closed_before_worker_io()
     let server = metadata.start().await;
     let client = FsClient::new(client_config(server.endpoint(), 1)).expect("client");
 
-    let create_error = client.create("/missing-layout").await.expect_err("missing layout");
-    assert_client_error(&create_error, ClientErrorKind::InvalidResponse, true, "layout missing");
-    assert_eq!(create_error.operation(), Some("CreateFile"));
+    for field in [
+        "layout missing",
+        "inode_id must be non-zero",
+        "write_lease_epoch must be non-zero",
+    ] {
+        let error = client.create("/invalid-create").await.expect_err("malformed create");
+        assert_client_error(&error, ClientErrorKind::InvalidResponse, true, field);
+        assert_eq!(error.operation(), Some("CreateFile"));
+    }
 
     let mut writer = client.create("/bad-target").await.expect("valid writer");
     let add_error = writer
@@ -361,17 +367,17 @@ async fn malformed_sync_response_blocks_new_writes_until_the_same_sync_resolves(
         sync_write: VecDeque::from([
             MetadataReply::success(SyncWriteResponseProto {
                 synced_size: 3,
-                content_revision: None,
+                generation: None,
                 ..SyncWriteResponseProto::default()
             }),
             MetadataReply::success(SyncWriteResponseProto {
                 synced_size: 4,
-                content_revision: Some(1),
+                generation: Some(1),
                 ..SyncWriteResponseProto::default()
             }),
             MetadataReply::success(SyncWriteResponseProto {
                 synced_size: 3,
-                content_revision: Some(1),
+                generation: Some(1),
                 ..SyncWriteResponseProto::default()
             }),
         ]),
@@ -383,7 +389,7 @@ async fn malformed_sync_response_blocks_new_writes_until_the_same_sync_resolves(
     let mut writer = client.create("/sync").await.expect("writer");
     writer.write_all(Bytes::from_static(b"abc")).await.expect("write");
 
-    for expected in ["content_revision missing", "synced_size"] {
+    for expected in ["generation missing", "synced_size"] {
         let error = writer.sync().await.expect_err("malformed SyncWrite response");
         assert_client_error(&error, ClientErrorKind::InvalidResponse, true, expected);
     }
@@ -518,7 +524,7 @@ fn client_config(metadata_endpoint: &str, max_attempts: usize) -> ClientConfig {
 fn status_response(size: u64) -> GetStatusResponseProto {
     GetStatusResponseProto {
         attrs: Some(file_attrs(size)),
-        kind: InodeKindProto::InodeKindFile as i32,
+        kind: FileTypeProto::FileTypeFile as i32,
         ..GetStatusResponseProto::default()
     }
 }
@@ -541,7 +547,7 @@ fn create_response(inode_id: u64, block_size: u32) -> CreateFileResponseProto {
         layout: Some(file_layout(block_size)),
         write_handle: Some(write_handle(inode_id)),
         expires_at_ms: unix_now_ms() + 60_000,
-        content_revision: 0,
+        generation: 0,
         ..CreateFileResponseProto::default()
     }
 }
@@ -550,7 +556,7 @@ fn open_file_response(inode_id: u64, file_size: u64) -> OpenFileResponseProto {
     OpenFileResponseProto {
         inode_id,
         file_size,
-        content_revision: Some(3),
+        generation: Some(3),
         ..OpenFileResponseProto::default()
     }
 }
@@ -558,13 +564,13 @@ fn open_file_response(inode_id: u64, file_size: u64) -> OpenFileResponseProto {
 fn locations_response(
     inode_id: u64,
     file_size: u64,
-    location: beryl_proto::metadata::FileBlockLocationProto,
+    location: FileBlockLocationProto,
 ) -> GetBlockLocationsResponseProto {
     GetBlockLocationsResponseProto {
         inode_id,
         file_size,
         locations: vec![location],
-        content_revision: Some(3),
+        generation: Some(3),
         ..GetBlockLocationsResponseProto::default()
     }
 }
@@ -575,9 +581,9 @@ fn block_location(
     file_offset: u64,
     len: u64,
     worker_endpoint: &str,
-) -> beryl_proto::metadata::FileBlockLocationProto {
+) -> FileBlockLocationProto {
     let format = BlockFormatId::CURRENT_FOR_NEW_FILE;
-    beryl_proto::metadata::FileBlockLocationProto {
+    FileBlockLocationProto {
         block_id: Some(BlockIdProto { inode_id, block_index }),
         file_offset,
         len,
@@ -650,13 +656,13 @@ fn watermark(index: u64) -> GroupStateWatermarkProto {
 }
 
 fn pre_handler_rejection() -> Status {
-    let mut metadata = tonic::metadata::MetadataMap::new();
+    let mut metadata = MetadataMap::new();
     metadata.insert(
         HEADER_PRE_HANDLER_REJECTION,
-        tonic::metadata::MetadataValue::from_static(PRE_HANDLER_REJECTION_RPC_CONCURRENCY),
+        MetadataValue::from_static(PRE_HANDLER_REJECTION_RPC_CONCURRENCY),
     );
     Status::with_metadata(
-        tonic::Code::ResourceExhausted,
+        Code::ResourceExhausted,
         "scripted Metadata capacity rejection",
         metadata,
     )

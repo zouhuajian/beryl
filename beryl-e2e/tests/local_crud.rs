@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use beryl_client::{ClientResult, InodeKind, ListStatusOptions, MkdirOptions};
-use beryl_e2e::{data::deterministic_bytes, TestCluster};
+use beryl_client::{ClientResult, FileType, ListStatusOptions, MkdirOptions};
+use beryl_e2e::data::deterministic_bytes;
+use beryl_e2e::TestCluster;
 use bytes::Bytes;
+use std::fmt::Debug;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_client_crud_roundtrip() {
@@ -15,7 +17,7 @@ async fn local_client_crud_roundtrip() {
 
     let created_dir = client.mkdirs(dir).await.expect("mkdirs through metadata");
     assert_eq!(created_dir.path(), dir);
-    assert_eq!(created_dir.kind, InodeKind::Dir);
+    assert_eq!(created_dir.kind, FileType::Dir);
 
     let first = Bytes::from(deterministic_bytes(1_337));
     let suffix = Bytes::from_static(b"-beryl-append-suffix");
@@ -26,7 +28,7 @@ async fn local_client_crud_roundtrip() {
 
     let status = client.get_status(path).await.expect("status after close");
     assert_eq!(status.path(), path);
-    assert_eq!(status.kind, InodeKind::File);
+    assert_eq!(status.kind, FileType::File);
     assert_eq!(status.attrs.size, first.len() as u64);
 
     let read = client
@@ -74,9 +76,9 @@ async fn local_client_crud_roundtrip() {
         listed.iter().map(|status| status.path()).collect::<Vec<_>>(),
         [path, subdir]
     );
-    assert_eq!(listed[0].kind, InodeKind::File);
+    assert_eq!(listed[0].kind, FileType::File);
     assert_eq!(listed[0].attrs.size, expected.len() as u64);
-    assert_eq!(listed[1].kind, InodeKind::Dir);
+    assert_eq!(listed[1].kind, FileType::Dir);
 
     client.delete(subdir).await.expect("delete empty listing subdirectory");
 
@@ -221,7 +223,7 @@ async fn write_more_than_ten_blocks_roundtrip() {
     cluster.shutdown().await.expect("local cluster shutdown");
 }
 
-fn assert_not_found<T: std::fmt::Debug>(result: ClientResult<T>, context: &str) {
+fn assert_not_found<T: Debug>(result: ClientResult<T>, context: &str) {
     let err = result.expect_err(context);
     let message = err.to_string().to_ascii_lowercase();
     assert!(

@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use super::*;
+use super::{
+    AppMetadataRaftState, AppRaftStateMachine, BootstrapNamespaceState, CreateFileOperationId, CreateFileReplayRecord,
+    DetachedRoot, FileAttrs, FileLayout, GroupName, Inode, InodeAllocation, InodeData, InodeId, MetadataError,
+    MetadataResult, MountId, PreparedRename, PreparedRenameOverwrite, PreparedUnlink, RecursiveMkdirEntry,
+    RenameAtomicUpdate, RenameOverwriteCleanup,
+};
+use crate::mount::{DataIoPolicy, MountEntry, MountKind};
+use beryl_types::{ContentGeneration, LeaseEpoch};
 
 impl AppRaftStateMachine {
     pub(super) fn apply_bootstrap_namespace(
@@ -9,7 +16,7 @@ impl AppRaftStateMachine {
         group_name: GroupName,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<crate::mount::MountEntry> {
+    ) -> MetadataResult<MountEntry> {
         let state = self.storage.bootstrap_namespace_state(&group_name)?;
         if state == BootstrapNamespaceState::Conflicting {
             return Err(MetadataError::InvalidArgument(
@@ -18,12 +25,12 @@ impl AppRaftStateMachine {
             ));
         }
 
-        let root_mount = crate::mount::MountEntry {
+        let root_mount = MountEntry {
             mount_id: MountId::new(1),
             mount_prefix: crate::mount::ROOT_MOUNT_PREFIX.to_string(),
-            mount_kind: crate::mount::MountKind::Internal,
+            mount_kind: MountKind::Internal,
             ufs_uri: None,
-            data_io_policy: crate::mount::DataIoPolicy::Allow,
+            data_io_policy: DataIoPolicy::Allow,
             mount_epoch: 1,
             namespace_owner_group_name: group_name,
             root_inode_id: crate::mount::ROOT_INODE_ID,
@@ -255,7 +262,7 @@ impl AppRaftStateMachine {
             let InodeData::File { lease_epoch, .. } = &mut inode.data else {
                 unreachable!("new file constructor must produce file authority")
             };
-            *lease_epoch = Some(1);
+            *lease_epoch = Some(LeaseEpoch::new(1));
 
             // Update parent directory mtime/ctime
             let mut parent_attrs = parent_inode.attrs.clone();
@@ -278,9 +285,9 @@ impl AppRaftStateMachine {
             expected_mount_epoch,
             mount_root_inode_id,
             relative_components,
-            lease_epoch: 1,
+            lease_epoch: LeaseEpoch::new(1),
             layout,
-            content_revision: 0,
+            generation: ContentGeneration::new(0),
             expires_at_ms: session_expires_at_ms,
         };
         self.storage.create_file_atomic(
@@ -331,7 +338,7 @@ impl AppRaftStateMachine {
         }
         let InodeData::File {
             extents,
-            content_revision,
+            generation,
             lease_epoch,
             next_block_index,
         } = &inode.data
@@ -347,7 +354,7 @@ impl AppRaftStateMachine {
             });
         }
         if !extents.is_empty()
-            || content_revision.unwrap_or_default() != record.content_revision
+            || generation.unwrap_or_default() != record.generation
             || *next_block_index != 0
             || inode.attrs.size != 0
         {
@@ -437,7 +444,7 @@ impl AppRaftStateMachine {
         mount_root_inode_id: InodeId,
         relative_components: Vec<String>,
         expected_inode_id: InodeId,
-        expected_file_lease_epoch: Option<u64>,
+        expected_file_lease_epoch: Option<LeaseEpoch>,
         recursive: bool,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
@@ -468,7 +475,7 @@ impl AppRaftStateMachine {
             }
         } else {
             let current_file_lease_epoch = match &child_inode.data {
-                InodeData::File { lease_epoch, .. } => Some(lease_epoch.unwrap_or(0)),
+                InodeData::File { lease_epoch, .. } => Some(lease_epoch.unwrap_or_default()),
                 _ => None,
             };
             if current_file_lease_epoch != expected_file_lease_epoch {
@@ -848,7 +855,7 @@ impl AppRaftStateMachine {
         dst_parent_inode_id: InodeId,
         dst_name: String,
         expected_dst_inode_id: Option<InodeId>,
-        expected_dst_lease_epoch: Option<u64>,
+        expected_dst_lease_epoch: Option<LeaseEpoch>,
         flags: u32,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
@@ -904,7 +911,7 @@ impl AppRaftStateMachine {
                     .get_inode(dst_inode_id)?
                     .ok_or_else(|| MetadataError::Internal("Destination inode disappeared".to_string()))?;
                 let current_dst_lease_epoch = match &dst_inode.data {
-                    InodeData::File { lease_epoch, .. } => Some(lease_epoch.unwrap_or(0)),
+                    InodeData::File { lease_epoch, .. } => Some(lease_epoch.unwrap_or_default()),
                     _ => None,
                 };
                 if current_dst_lease_epoch != expected_dst_lease_epoch {
@@ -1050,6 +1057,7 @@ mod tests {
     use super::*;
     use crate::raft::response::ApplyRejectionKind;
     use crate::raft::state_machine::tests::*;
+    use beryl_types::{CallId, ClientId};
 
     fn test_state() -> (TempDir, Arc<RocksDBStorage>, AppRaftStateMachine, InodeId) {
         let dir = TempDir::new().unwrap();
@@ -1060,12 +1068,12 @@ mod tests {
             .unwrap();
         storage.set_next_inode_id(InodeId::new(11)).unwrap();
         storage
-            .put_mount(&crate::mount::MountEntry {
+            .put_mount(&MountEntry {
                 mount_id: MountId::new(1),
                 mount_prefix: crate::mount::ROOT_MOUNT_PREFIX.to_string(),
-                mount_kind: crate::mount::MountKind::Internal,
+                mount_kind: MountKind::Internal,
                 ufs_uri: None,
-                data_io_policy: crate::mount::DataIoPolicy::Allow,
+                data_io_policy: DataIoPolicy::Allow,
                 mount_epoch: 1,
                 namespace_owner_group_name: group_name("root"),
                 root_inode_id: parent_inode_id,
@@ -1075,14 +1083,19 @@ mod tests {
         (dir, storage, sm, parent_inode_id)
     }
 
-    fn delete_command(name: &str, expected_inode_id: InodeId, lease_epoch: Option<u64>, recursive: bool) -> Command {
+    fn delete_command(
+        name: &str,
+        expected_inode_id: InodeId,
+        lease_epoch: Option<LeaseEpoch>,
+        recursive: bool,
+    ) -> Command {
         delete_path_command(vec![name.to_string()], expected_inode_id, lease_epoch, recursive)
     }
 
     fn delete_path_command(
         relative_components: Vec<String>,
         expected_inode_id: InodeId,
-        lease_epoch: Option<u64>,
+        lease_epoch: Option<LeaseEpoch>,
         recursive: bool,
     ) -> Command {
         Command::Delete {
@@ -1121,8 +1134,8 @@ mod tests {
     fn create_file(sm: &AppRaftStateMachine, mount_root_inode_id: InodeId, components: &[&str]) -> InodeId {
         let command = create_file_command(
             CreateFileOperationId {
-                client_id: beryl_types::ClientId::new(1),
-                call_id: beryl_types::CallId::new(),
+                client_id: ClientId::new(1),
+                call_id: CallId::new(),
             },
             mount_root_inode_id,
             components,
@@ -1151,8 +1164,8 @@ mod tests {
     fn create_file_replays_one_durable_result_without_allocating_again() {
         let (_dir, storage, sm, parent_inode_id) = test_state();
         let operation_id = CreateFileOperationId {
-            client_id: beryl_types::ClientId::new(7),
-            call_id: beryl_types::CallId::new(),
+            client_id: ClientId::new(7),
+            call_id: CallId::new(),
         };
         let command = create_file_command(operation_id, parent_inode_id, &["target"]);
 
@@ -1162,7 +1175,7 @@ mod tests {
             sm.apply(Command::AcquireWriteLease {
                 proposed_at_ms: 2,
                 inode_id: first.0,
-                expected_lease_epoch: 1,
+                expected_lease_epoch: LeaseEpoch::new(1),
             }),
             ApplyRejectionKind::Again,
         );
@@ -1228,7 +1241,7 @@ mod tests {
             sm.apply(Command::AcquireWriteLease {
                 proposed_at_ms: 100,
                 inode_id: first.0,
-                expected_lease_epoch: 1,
+                expected_lease_epoch: LeaseEpoch::new(1),
             })
             .unwrap(),
         );
@@ -1355,12 +1368,12 @@ mod tests {
         )
         .0;
         storage
-            .put_mount(&crate::mount::MountEntry {
+            .put_mount(&MountEntry {
                 mount_id: MountId::new(2),
                 mount_prefix: "/dir/nested".to_string(),
-                mount_kind: crate::mount::MountKind::Internal,
+                mount_kind: MountKind::Internal,
                 ufs_uri: None,
-                data_io_policy: crate::mount::DataIoPolicy::Allow,
+                data_io_policy: DataIoPolicy::Allow,
                 mount_epoch: 2,
                 namespace_owner_group_name: group_name("root"),
                 root_inode_id: InodeId::new(200),
@@ -1385,12 +1398,12 @@ mod tests {
             sm.apply(Command::AcquireWriteLease {
                 proposed_at_ms: 100,
                 inode_id,
-                expected_lease_epoch: 1,
+                expected_lease_epoch: LeaseEpoch::new(1),
             })
             .unwrap(),
         );
         expect_apply_rejection(
-            sm.apply(delete_command("target", inode_id, Some(1), false)),
+            sm.apply(delete_command("target", inode_id, Some(LeaseEpoch::new(1)), false)),
             ApplyRejectionKind::Again,
         );
 
@@ -1402,12 +1415,15 @@ mod tests {
         let (_dir, storage, sm, parent_inode_id) = test_state();
         let inode_id = create_file(&sm, parent_inode_id, &["target"]);
 
-        expect_delete_applied(sm.apply(delete_command("target", inode_id, Some(1), false)).unwrap());
+        expect_delete_applied(
+            sm.apply(delete_command("target", inode_id, Some(LeaseEpoch::new(1)), false))
+                .unwrap(),
+        );
         expect_apply_rejection(
             sm.apply(Command::AcquireWriteLease {
                 proposed_at_ms: 3,
                 inode_id,
-                expected_lease_epoch: 1,
+                expected_lease_epoch: LeaseEpoch::new(1),
             }),
             ApplyRejectionKind::NotFound,
         );

@@ -22,10 +22,10 @@ use crate::raft::storage::{
 use crate::raft::types::AppMetadataRaftState;
 use crate::raft::RoutingDelta;
 use crate::session_registry::CreateFileOperationId;
-use beryl_types::fs::{Extent, FileAttrs, Inode, InodeData, InodeId};
-use beryl_types::ids::{BlockId, BlockIndex, MountId, WorkerId};
+use beryl_types::fs::{Extent, FileAttrs, Inode, InodeData};
+use beryl_types::ids::{BlockId, BlockIndex, InodeId, MountId, WorkerId};
 use beryl_types::layout::FileLayout;
-use beryl_types::{GroupName, MAX_FILE_EXTENTS};
+use beryl_types::{ContentGeneration, GroupName, MAX_FILE_EXTENTS};
 use std::sync::Arc;
 
 /// Raft state machine.
@@ -185,7 +185,7 @@ impl AppRaftStateMachine {
                     layout: result.layout,
                     lease_epoch: result.lease_epoch,
                     expires_at_ms: result.expires_at_ms,
-                    content_revision: result.content_revision,
+                    generation: result.generation,
                 })
             }
             Command::Delete {
@@ -262,7 +262,7 @@ impl AppRaftStateMachine {
                 inode_id,
                 extents,
                 target_size,
-                expected_content_revision,
+                expected_generation,
                 expected_file_size,
                 lease_epoch,
                 mode,
@@ -274,21 +274,18 @@ impl AppRaftStateMachine {
                         MAX_FILE_EXTENTS
                     )));
                 }
-                let content_revision = self.apply_publish_file(
+                let generation = self.apply_publish_file(
                     inode_id,
                     extents,
                     target_size,
-                    expected_content_revision,
+                    expected_generation,
                     expected_file_size,
                     lease_epoch,
                     mode,
                     proposed_at_ms,
                     raft_state,
                 )?;
-                Ok(ApplySuccess::FilePublished {
-                    inode_id,
-                    content_revision,
-                })
+                Ok(ApplySuccess::FilePublished { inode_id, generation })
             }
             Command::ReclaimDetachedRoots {
                 candidate_root_inode_ids,
@@ -366,20 +363,21 @@ impl AppRaftStateMachine {
         expected_offset == target_size && visible.next().is_none()
     }
 
-    fn stamp_extents(extents: &mut [Extent], existing: &[Extent], content_revision: u64) {
+    /// Stamp every extent with its publication generation while retaining existing block stamps.
+    fn stamp_extents(extents: &mut [Extent], existing: &[Extent], generation: ContentGeneration) {
         for extent in extents {
             if let Some(visible) = Self::matching_visible_extent(existing, extent) {
                 if let Some(block_stamp) = visible.block_stamp {
-                    extent.content_revision = Some(content_revision);
+                    extent.generation = Some(generation);
                     extent.block_stamp = Some(block_stamp);
                     continue;
                 }
             }
-            extent.content_revision = Some(content_revision);
+            extent.generation = Some(generation);
             // The Raft apply boundary assigns the metadata-authoritative stamp
             // that direct readers must present to workers for newly visible
             // blocks.
-            extent.block_stamp = Some(content_revision);
+            extent.block_stamp = Some(generation.as_raw());
         }
     }
 
@@ -440,11 +438,12 @@ impl AppRaftStateMachine {
         Ok(publish)
     }
 
-    fn next_content_revision(inode_id: InodeId, current_content_revision: Option<u64>) -> MetadataResult<u64> {
-        current_content_revision.unwrap_or(0).checked_add(1).ok_or_else(|| {
+    /// Advance visible file authority, failing closed when the counter is exhausted.
+    fn next_generation(inode_id: InodeId, generation: Option<ContentGeneration>) -> MetadataResult<ContentGeneration> {
+        generation.unwrap_or_default().checked_next().ok_or_else(|| {
             MetadataError::Internal(format!(
-                "content_revision overflow for inode {} at {:?}",
-                inode_id, current_content_revision
+                "generation overflow for inode {} at {:?}",
+                inode_id, generation
             ))
         })
     }
@@ -453,10 +452,12 @@ impl AppRaftStateMachine {
 #[cfg(test)]
 pub(crate) mod tests {
     pub(crate) use super::*;
+    use crate::mount::MountEntry;
     use crate::raft::response::ApplyRejectionKind;
     pub(crate) use beryl_types::fs::{FileAttrs, Inode};
     pub(crate) use beryl_types::ids::{BlockId, InodeId, MountId, WorkerId};
     pub(crate) use beryl_types::layout::FileLayout;
+    use beryl_types::LeaseEpoch;
     pub(crate) use tempfile::TempDir;
 
     impl AppRaftStateMachine {
@@ -520,7 +521,7 @@ pub(crate) mod tests {
         assert_eq!(rejection.kind, expected);
     }
 
-    pub(crate) fn expect_mount_upserted(raw: ApplySuccess) -> crate::mount::MountEntry {
+    pub(crate) fn expect_mount_upserted(raw: ApplySuccess) -> MountEntry {
         match raw {
             ApplySuccess::MountUpserted(entry) => entry,
             other => panic!("unexpected apply response: {other:?}"),
@@ -536,24 +537,21 @@ pub(crate) mod tests {
 
     pub(crate) fn expect_write_lease_acquired(raw: ApplySuccess) -> (InodeId, u64) {
         match raw {
-            ApplySuccess::WriteLeaseAcquired { inode_id, lease_epoch } => (inode_id, lease_epoch),
+            ApplySuccess::WriteLeaseAcquired { inode_id, lease_epoch } => (inode_id, lease_epoch.as_raw()),
             other => panic!("unexpected apply response: {other:?}"),
         }
     }
 
     pub(crate) fn expect_write_lease_ended(raw: ApplySuccess) -> (InodeId, u64) {
         match raw {
-            ApplySuccess::WriteLeaseEnded { inode_id, lease_epoch } => (inode_id, lease_epoch),
+            ApplySuccess::WriteLeaseEnded { inode_id, lease_epoch } => (inode_id, lease_epoch.as_raw()),
             other => panic!("unexpected apply response: {other:?}"),
         }
     }
 
     pub(crate) fn expect_file_published(raw: ApplySuccess) -> (InodeId, u64) {
         match raw {
-            ApplySuccess::FilePublished {
-                inode_id,
-                content_revision,
-            } => (inode_id, content_revision),
+            ApplySuccess::FilePublished { inode_id, generation } => (inode_id, generation.as_raw()),
             other => panic!("unexpected apply response: {other:?}"),
         }
     }
@@ -564,7 +562,7 @@ pub(crate) mod tests {
             block_id,
             block_offset: 0,
             len,
-            content_revision: None,
+            generation: None,
             block_stamp: None,
         }
     }
@@ -595,7 +593,7 @@ pub(crate) mod tests {
             unreachable!("new file must carry file data");
         };
         *stored_extents = extents;
-        *lease_epoch = Some(1);
+        *lease_epoch = Some(LeaseEpoch::new(1));
         *stored_next_block_index = next_block_index;
         storage.put_inode(&parent).unwrap();
         storage.put_inode(&inode).unwrap();

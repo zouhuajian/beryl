@@ -4,10 +4,14 @@
 use beryl_types::ids::{BlockId, BlockIndex, InodeId};
 use beryl_types::{BlockFormatId, GroupName, Tier};
 use beryl_worker::config::StoreDirConfig;
-use beryl_worker::store::block::{ChecksumKind, CreateStagingBlockRequest, LocalBlockStore, ReclaimBlockRequest};
+use beryl_worker::store::block::{
+    ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
+    ReclaimBlockRequest,
+};
 use beryl_worker::store::dirs::StoreDirs;
 use beryl_worker::WorkerError;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -25,11 +29,11 @@ fn block_id(index: u32) -> BlockId {
     BlockId::new(InodeId::new(42), BlockIndex::new(index))
 }
 
-fn dir_config(path: std::path::PathBuf, capacity_bytes: u64) -> (String, StoreDirConfig) {
+fn dir_config(path: PathBuf, capacity_bytes: u64) -> (String, StoreDirConfig) {
     dir_config_with("hdd0", Tier::Hdd, path, capacity_bytes)
 }
 
-fn dir_config_with(id: &str, tier: Tier, path: std::path::PathBuf, capacity_bytes: u64) -> (String, StoreDirConfig) {
+fn dir_config_with(id: &str, tier: Tier, path: PathBuf, capacity_bytes: u64) -> (String, StoreDirConfig) {
     (
         id.to_string(),
         StoreDirConfig {
@@ -44,7 +48,7 @@ fn store_dirs(configs: Vec<(String, StoreDirConfig)>) -> BTreeMap<String, StoreD
     configs.into_iter().collect()
 }
 
-fn store_dir_config(path: std::path::PathBuf, tier: Tier, capacity_bytes: u64) -> StoreDirConfig {
+fn store_dir_config(path: PathBuf, tier: Tier, capacity_bytes: u64) -> StoreDirConfig {
     StoreDirConfig {
         path,
         tier,
@@ -97,9 +101,7 @@ fn reclaim_fails_closed_on_staging_artifact_in_any_store_dir() {
         30_000,
     )
     .unwrap();
-    let raw_store = beryl_worker::store::block::FullBlockFileStore::new(
-        beryl_worker::store::block::FullBlockFileStoreConfig::new(hdd1),
-    );
+    let raw_store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(hdd1));
     raw_store.create_staging_block(staging_req(0)).unwrap();
     let req = ReclaimBlockRequest {
         group_name: group_name(),
@@ -118,9 +120,7 @@ fn create_failure_releases_pending_reservation() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("hdd0");
     let store = StoreDirs::open(store_dirs(vec![dir_config(path.clone(), 32 * 1024)]), 0, 30_000).unwrap();
-    let raw_store = beryl_worker::store::block::FullBlockFileStore::new(
-        beryl_worker::store::block::FullBlockFileStoreConfig::new(path),
-    );
+    let raw_store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(path));
     raw_store.create_staging_block(staging_req(0)).unwrap();
 
     let duplicate = store.create_staging_block(staging_req(0));

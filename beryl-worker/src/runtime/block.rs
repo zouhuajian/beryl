@@ -3,19 +3,17 @@
 
 //! Block runtime metadata, validation, and local access lifecycle boundary.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
-use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
-use beryl_types::ids::BlockId;
-use beryl_types::layout::BlockShape;
-use beryl_types::GroupName;
-use tokio::sync::Notify;
-
 use crate::data::core::{ReadBlockRequest, WorkerCoreResult};
 use crate::error::WorkerError;
 use crate::report::BlockReportChangeTracker;
 use crate::store::block::{BlockState, LocalBlockStore};
+use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
+use beryl_types::ids::BlockId;
+use beryl_types::layout::BlockShape;
+use beryl_types::GroupName;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct BlockAccessKey {
@@ -511,11 +509,9 @@ impl Default for BlockManager {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use beryl_types::ids::{BlockId, BlockIndex, InodeId};
-
     use super::*;
+    use beryl_types::ids::{BlockId, BlockIndex, InodeId};
+    use std::time::Duration;
 
     fn group_name() -> GroupName {
         GroupName::parse("root").expect("valid test group")

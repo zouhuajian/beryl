@@ -4,64 +4,68 @@
 //! MetadataWorkerService implementation.
 
 use super::manager::{
-    worker_net_protocol_label, BlockReportBlock, BlockReportBlockState, BlockReportChange, WorkerManager,
+    worker_net_protocol_label, BlockReportBlock, BlockReportBlockState, BlockReportChange, HealthStatus, WorkerManager,
     WORKER_NET_PROTOCOL_GRPC,
 };
 use crate::error::{to_rpc_error, MetadataError, MetadataResult};
 use crate::maintenance::BlockCleanupCoordinator;
 use crate::observe;
-use crate::raft::Command;
-use crate::raft::{AppRaftNode, ApplySuccess};
+use crate::raft::{AppRaftNode, ApplySuccess, Command};
 use crate::service::extract_and_inject_context;
 use ::beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RpcErrorDetail, WorkerErrorKind};
 use ::beryl_common::header::ResponseHeader;
 use ::beryl_common::observe::propagation::{extract_trace_context, ExtractedContext};
+use beryl_common::header::ClientInfo;
+use beryl_proto::common::{
+    EndpointProto, ErrorDetailProto, RequestHeaderProto, ResponseHeaderProto, TraceContextProto,
+};
 use beryl_proto::convert::require_worker_run_id;
+use beryl_proto::metadata::block_report_request_proto::Batch;
+use beryl_proto::metadata::delta_block_report_entry_proto::Block;
 use beryl_proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProto;
-use beryl_proto::metadata::*;
-use beryl_types::{BlockId, GroupName, TierFree, WorkerId, MAX_REPORT_ENTRIES};
+use beryl_proto::metadata::{
+    BlockCleanupCommandProto, BlockReportKindProto, BlockReportRequestProto, BlockReportResponseProto,
+    DeltaBlockReportEntryProto, HeartbeatRequestProto, HeartbeatResponseProto, RegisterWorkerRequestProto,
+    RegisterWorkerResponseProto, ReportedBlockProto, ReportedBlockStateProto, TierFreeProto,
+};
+use beryl_types::{BlockId, GroupName, GroupStateWatermark, TierFree, WorkerId, MAX_REPORT_ENTRIES};
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Instant;
-use tonic::{Request, Response, Status};
+use std::time::{Instant, SystemTime};
+use tokio::sync::Mutex;
+use tonic::{Code, Request, Response, Status};
 use tracing::{info, instrument, warn};
 
-fn register_worker_response_with_header(
-    header: beryl_proto::common::ResponseHeaderProto,
-) -> RegisterWorkerResponseProto {
+fn register_worker_response_with_header(header: ResponseHeaderProto) -> RegisterWorkerResponseProto {
     RegisterWorkerResponseProto {
         header: Some(header),
         ..Default::default()
     }
 }
 
-fn heartbeat_response_with_header(header: beryl_proto::common::ResponseHeaderProto) -> HeartbeatResponseProto {
+fn heartbeat_response_with_header(header: ResponseHeaderProto) -> HeartbeatResponseProto {
     HeartbeatResponseProto {
         header: Some(header),
         ..Default::default()
     }
 }
 
-fn block_report_response_with_header(header: beryl_proto::common::ResponseHeaderProto) -> BlockReportResponseProto {
+fn block_report_response_with_header(header: ResponseHeaderProto) -> BlockReportResponseProto {
     BlockReportResponseProto {
         header: Some(header),
         ..Default::default()
     }
 }
 
-fn register_worker_response_header(
-    response: &RegisterWorkerResponseProto,
-) -> Option<&beryl_proto::common::ResponseHeaderProto> {
+fn register_worker_response_header(response: &RegisterWorkerResponseProto) -> Option<&ResponseHeaderProto> {
     response.header.as_ref()
 }
 
-fn heartbeat_response_header(response: &HeartbeatResponseProto) -> Option<&beryl_proto::common::ResponseHeaderProto> {
+fn heartbeat_response_header(response: &HeartbeatResponseProto) -> Option<&ResponseHeaderProto> {
     response.header.as_ref()
 }
 
-fn block_report_response_header(
-    response: &BlockReportResponseProto,
-) -> Option<&beryl_proto::common::ResponseHeaderProto> {
+fn block_report_response_header(response: &BlockReportResponseProto) -> Option<&ResponseHeaderProto> {
     response.header.as_ref()
 }
 
@@ -78,7 +82,7 @@ pub struct MetadataWorkerServiceImpl {
     worker_manager: Arc<WorkerManager>,
     served_group_name: GroupName,
     cleanup: Option<Arc<BlockCleanupCoordinator>>,
-    registration_serial: tokio::sync::Mutex<()>,
+    registration_serial: Mutex<()>,
 }
 
 impl MetadataWorkerServiceImpl {
@@ -110,20 +114,20 @@ impl MetadataWorkerServiceImpl {
             worker_manager,
             served_group_name,
             cleanup,
-            registration_serial: tokio::sync::Mutex::new(()),
+            registration_serial: Mutex::new(()),
         }
     }
 
     /// Helper: create a response header from request header with group name.
     fn create_response_header_from_request(
         &self,
-        req_header: &Option<beryl_proto::common::RequestHeaderProto>,
+        req_header: &Option<RequestHeaderProto>,
         group_name: Option<&GroupName>,
-    ) -> beryl_proto::common::ResponseHeaderProto {
-        let mut header: beryl_proto::common::ResponseHeaderProto = req_header
+    ) -> ResponseHeaderProto {
+        let mut header: ResponseHeaderProto = req_header
             .as_ref()
             .and_then(|h| h.client.as_ref())
-            .and_then(|c| ::beryl_common::header::ClientInfo::try_from(c.clone()).ok())
+            .and_then(|c| ClientInfo::try_from(c.clone()).ok())
             .map(|client| (&ResponseHeader::ok(client)).into())
             .unwrap_or_default();
         if let Some(group_name) = group_name {
@@ -131,15 +135,13 @@ impl MetadataWorkerServiceImpl {
         }
         if self.raft_node.is_leader() {
             if let (Some(group_name), Some(sid)) = (group_name, self.raft_node.get_last_applied_state_id()) {
-                header.state = vec![(&beryl_types::GroupStateWatermark::new(group_name.clone(), sid)).into()];
+                header.state = vec![(&GroupStateWatermark::new(group_name.clone(), sid)).into()];
             }
         }
         header
     }
 
-    fn group_name_from_request_header(
-        req_header: &Option<beryl_proto::common::RequestHeaderProto>,
-    ) -> Option<GroupName> {
+    fn group_name_from_request_header(req_header: &Option<RequestHeaderProto>) -> Option<GroupName> {
         req_header
             .as_ref()
             .and_then(|header| GroupName::parse_optional(&header.group_name).ok().flatten())
@@ -147,9 +149,9 @@ impl MetadataWorkerServiceImpl {
 
     fn error_response_header_from_request(
         &self,
-        req_header: &Option<beryl_proto::common::RequestHeaderProto>,
+        req_header: &Option<RequestHeaderProto>,
         error: RpcErrorDetail,
-    ) -> beryl_proto::common::ResponseHeaderProto {
+    ) -> ResponseHeaderProto {
         let mut header = self
             .create_response_header_from_request(req_header, Self::group_name_from_request_header(req_header).as_ref());
         header.error = Some(beryl_proto::convert::rpc_error_to_proto(&error));
@@ -158,9 +160,9 @@ impl MetadataWorkerServiceImpl {
 
     fn response_with_error<T>(
         &self,
-        req_header: &Option<beryl_proto::common::RequestHeaderProto>,
+        req_header: &Option<RequestHeaderProto>,
         error: RpcErrorDetail,
-        make_response: fn(beryl_proto::common::ResponseHeaderProto) -> T,
+        make_response: fn(ResponseHeaderProto) -> T,
     ) -> Result<Response<T>, Status> {
         Ok(Response::new(make_response(
             self.error_response_header_from_request(req_header, error),
@@ -169,8 +171,8 @@ impl MetadataWorkerServiceImpl {
 
     fn invalid_request_response<T>(
         &self,
-        req_header: &Option<beryl_proto::common::RequestHeaderProto>,
-        make_response: fn(beryl_proto::common::ResponseHeaderProto) -> T,
+        req_header: &Option<RequestHeaderProto>,
+        make_response: fn(ResponseHeaderProto) -> T,
         message: impl Into<String>,
     ) -> Result<Response<T>, Status> {
         self.response_with_error(
@@ -182,8 +184,8 @@ impl MetadataWorkerServiceImpl {
 
     fn metadata_error_response<T>(
         &self,
-        req_header: &Option<beryl_proto::common::RequestHeaderProto>,
-        make_response: fn(beryl_proto::common::ResponseHeaderProto) -> T,
+        req_header: &Option<RequestHeaderProto>,
+        make_response: fn(ResponseHeaderProto) -> T,
         error: MetadataError,
     ) -> Result<Response<T>, Status> {
         self.response_with_error(req_header, to_rpc_error(error), make_response)
@@ -191,8 +193,8 @@ impl MetadataWorkerServiceImpl {
 
     fn group_mismatch_response<T>(
         &self,
-        req_header: &Option<beryl_proto::common::RequestHeaderProto>,
-        make_response: fn(beryl_proto::common::ResponseHeaderProto) -> T,
+        req_header: &Option<RequestHeaderProto>,
+        make_response: fn(ResponseHeaderProto) -> T,
         message: impl Into<String>,
     ) -> Result<Response<T>, Status> {
         self.response_with_error(
@@ -204,8 +206,8 @@ impl MetadataWorkerServiceImpl {
 
     fn need_register_response<T>(
         &self,
-        req_header: &Option<beryl_proto::common::RequestHeaderProto>,
-        make_response: fn(beryl_proto::common::ResponseHeaderProto) -> T,
+        req_header: &Option<RequestHeaderProto>,
+        make_response: fn(ResponseHeaderProto) -> T,
         message: impl Into<String>,
     ) -> Result<Response<T>, Status> {
         self.response_with_error(
@@ -217,8 +219,8 @@ impl MetadataWorkerServiceImpl {
 
     fn worker_run_mismatch_response<T>(
         &self,
-        req_header: &Option<beryl_proto::common::RequestHeaderProto>,
-        make_response: fn(beryl_proto::common::ResponseHeaderProto) -> T,
+        req_header: &Option<RequestHeaderProto>,
+        make_response: fn(ResponseHeaderProto) -> T,
         message: impl Into<String>,
     ) -> Result<Response<T>, Status> {
         self.response_with_error(
@@ -230,8 +232,8 @@ impl MetadataWorkerServiceImpl {
 
     fn worker_descriptor_mismatch_response<T>(
         &self,
-        req_header: &Option<beryl_proto::common::RequestHeaderProto>,
-        make_response: fn(beryl_proto::common::ResponseHeaderProto) -> T,
+        req_header: &Option<RequestHeaderProto>,
+        make_response: fn(ResponseHeaderProto) -> T,
         message: impl Into<String>,
     ) -> Result<Response<T>, Status> {
         self.response_with_error(
@@ -247,8 +249,8 @@ impl MetadataWorkerServiceImpl {
 
     fn full_report_required_response<T>(
         &self,
-        req_header: &Option<beryl_proto::common::RequestHeaderProto>,
-        make_response: fn(beryl_proto::common::ResponseHeaderProto) -> T,
+        req_header: &Option<RequestHeaderProto>,
+        make_response: fn(ResponseHeaderProto) -> T,
         message: impl Into<String>,
     ) -> Result<Response<T>, Status> {
         self.response_with_error(
@@ -294,10 +296,8 @@ impl MetadataWorkerServiceImpl {
 
     fn proto_to_delta_entry(entry: DeltaBlockReportEntryProto) -> MetadataResult<BlockReportChange> {
         match entry.block {
-            Some(delta_block_report_entry_proto::Block::Present(block)) => {
-                Self::proto_to_report_block(block).map(BlockReportChange::Upsert)
-            }
-            Some(delta_block_report_entry_proto::Block::Absent(block_id)) => BlockId::try_from(block_id)
+            Some(Block::Present(block)) => Self::proto_to_report_block(block).map(BlockReportChange::Upsert),
+            Some(Block::Absent(block_id)) => BlockId::try_from(block_id)
                 .map(BlockReportChange::Remove)
                 .map_err(|error| MetadataError::InvalidArgument(format!("invalid absent block_id: {error}"))),
             None => Err(MetadataError::InvalidArgument(
@@ -311,7 +311,7 @@ impl MetadataWorkerServiceImpl {
         metric: MetadataWorkerMetric,
         started: Instant,
         outcome: &Result<Response<T>, Status>,
-        response_header: fn(&T) -> Option<&beryl_proto::common::ResponseHeaderProto>,
+        response_header: fn(&T) -> Option<&ResponseHeaderProto>,
     ) {
         let duration = started.elapsed().as_secs_f64();
         let (status, error_kind) = metadata_worker_outcome_labels(outcome, response_header);
@@ -329,7 +329,7 @@ impl MetadataWorkerServiceImpl {
 
 fn metadata_worker_outcome_labels<T>(
     outcome: &Result<Response<T>, Status>,
-    response_header: fn(&T) -> Option<&beryl_proto::common::ResponseHeaderProto>,
+    response_header: fn(&T) -> Option<&ResponseHeaderProto>,
 ) -> (&'static str, &'static str) {
     match outcome {
         Ok(response) => match response_header(response.get_ref()).and_then(|header| header.error.as_ref()) {
@@ -340,40 +340,37 @@ fn metadata_worker_outcome_labels<T>(
     }
 }
 
-fn metadata_worker_error_detail_kind(error: &beryl_proto::common::ErrorDetailProto) -> &'static str {
+fn metadata_worker_error_detail_kind(error: &ErrorDetailProto) -> &'static str {
     let rpc_error = beryl_proto::convert::rpc_error_from_proto(error);
     observe::rpc_error_kind(&rpc_error)
 }
 
 fn tonic_status_error_kind(status: &Status) -> &'static str {
     match status.code() {
-        tonic::Code::Ok => "none",
-        tonic::Code::InvalidArgument => "invalid_argument",
-        tonic::Code::NotFound => "not_found",
-        tonic::Code::FailedPrecondition => "failed_precondition",
-        tonic::Code::PermissionDenied => "permission_denied",
-        tonic::Code::ResourceExhausted => "resource_exhausted",
-        tonic::Code::Unavailable => "unavailable",
-        tonic::Code::DeadlineExceeded => "timeout",
-        tonic::Code::Unimplemented => "unimplemented",
-        tonic::Code::Cancelled => "cancelled",
-        tonic::Code::Internal => "internal",
+        Code::Ok => "none",
+        Code::InvalidArgument => "invalid_argument",
+        Code::NotFound => "not_found",
+        Code::FailedPrecondition => "failed_precondition",
+        Code::PermissionDenied => "permission_denied",
+        Code::ResourceExhausted => "resource_exhausted",
+        Code::Unavailable => "unavailable",
+        Code::DeadlineExceeded => "timeout",
+        Code::Unimplemented => "unimplemented",
+        Code::Cancelled => "cancelled",
+        Code::Internal => "internal",
         _ => "rpc_status",
     }
 }
 
 fn block_report_kind(req: &BlockReportRequestProto) -> &'static str {
     match &req.batch {
-        Some(block_report_request_proto::Batch::FullReport(_)) => "full",
-        Some(block_report_request_proto::Batch::DeltaReport(_)) => "delta",
+        Some(Batch::FullReport(_)) => "full",
+        Some(Batch::DeltaReport(_)) => "delta",
         None => "unknown",
     }
 }
 
-fn merge_request_header_transport_context(
-    header: &mut Option<beryl_proto::common::RequestHeaderProto>,
-    context: &ExtractedContext,
-) {
+fn merge_request_header_transport_context(header: &mut Option<RequestHeaderProto>, context: &ExtractedContext) {
     let Some(header) = header else {
         return;
     };
@@ -395,11 +392,11 @@ fn merge_request_header_transport_context(
     }
 }
 
-fn trace_context_proto_is_empty(context: &beryl_proto::common::TraceContextProto) -> bool {
+fn trace_context_proto_is_empty(context: &TraceContextProto) -> bool {
     context.traceparent.is_none() && context.tracestate.is_none() && context.baggage.is_none()
 }
 
-fn validate_advertised_endpoint(endpoint: beryl_proto::common::EndpointProto) -> Result<String, String> {
+fn validate_advertised_endpoint(endpoint: EndpointProto) -> Result<String, String> {
     if endpoint.host.trim().is_empty() {
         return Err("advertised_endpoint host must not be empty".to_string());
     }
@@ -433,9 +430,7 @@ fn parse_tier_free(entries: &[TierFreeProto]) -> Result<Vec<TierFree>, String> {
         .collect()
 }
 
-fn parse_worker_request_group_name(
-    req_header: &Option<beryl_proto::common::RequestHeaderProto>,
-) -> Result<GroupName, String> {
+fn parse_worker_request_group_name(req_header: &Option<RequestHeaderProto>) -> Result<GroupName, String> {
     let header = req_header
         .as_ref()
         .ok_or_else(|| "request header is required".to_string())?;
@@ -670,7 +665,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 }
             };
 
-            let _health_status = super::manager::HealthStatus::from(req.health() as i32);
+            let _health_status = HealthStatus::from(req.health() as i32);
             let worker_net_protocol = WORKER_NET_PROTOCOL_GRPC;
             let endpoint = match req.advertised_endpoint {
                 Some(endpoint) => endpoint,
@@ -848,7 +843,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 
             let live_count = self.worker_manager.list_live_workers().len();
             observe::set_worker_live(live_count);
-            let now_ms = std::time::SystemTime::now()
+            let now_ms = SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_millis() as u64)
                 .unwrap_or(live_state.last_seen_ms);
@@ -955,7 +950,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             };
 
             let (report_kind, report_kind_proto, batch_seq, final_batch, apply_result) = match batch {
-                block_report_request_proto::Batch::FullReport(full) => {
+                Batch::FullReport(full) => {
                     let batch_seq = full.batch_seq;
                     let final_batch = full.final_batch;
                     if full.blocks.len() > MAX_REPORT_ENTRIES {
@@ -999,7 +994,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                         result,
                     )
                 }
-                block_report_request_proto::Batch::DeltaReport(delta) => {
+                Batch::DeltaReport(delta) => {
                     let batch_seq = delta.batch_seq;
                     if delta.entries.is_empty() {
                         return self.invalid_request_response(
@@ -1184,26 +1179,26 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::BlockCleanupConfig;
+    use crate::config::{BlockCleanupConfig, RaftConfig};
     use crate::raft::{AppRaftStateMachine, RocksDBStorage};
     use crate::session_registry::SessionRegistry;
     use crate::MountTable;
     use ::beryl_common::error::rpc::RecoveryAction;
+    use beryl_common::header::RequestHeader;
+    use beryl_proto::common::{BlockIdProto, TierProto};
     use beryl_proto::convert::rpc_error_from_proto;
-    use beryl_types::{ClientId, WorkerRunId};
+    use beryl_proto::metadata::{CapacityInfoProto, DeltaBlockReportBatchProto, HealthStatusProto, LoadInfoProto};
+    use beryl_types::{BlockIndex, ClientId, InodeId, Tier, WorkerRunId};
     use std::time::Duration;
     use tempfile::TempDir;
 
-    fn assert_error_kind(error: &beryl_proto::common::ErrorDetailProto, expected_kind: ErrorKind) -> RpcErrorDetail {
+    fn assert_error_kind(error: &ErrorDetailProto, expected_kind: ErrorKind) -> RpcErrorDetail {
         let rpc_error = rpc_error_from_proto(error);
         assert_eq!(rpc_error.kind, expected_kind, "{rpc_error:?}");
         rpc_error
     }
 
-    fn assert_error_register_worker(
-        error: &beryl_proto::common::ErrorDetailProto,
-        expected_kind: ErrorKind,
-    ) -> RpcErrorDetail {
+    fn assert_error_register_worker(error: &ErrorDetailProto, expected_kind: ErrorKind) -> RpcErrorDetail {
         let rpc_error = assert_error_kind(error, expected_kind);
         assert!(
             matches!(rpc_error.recovery, RecoveryAction::RegisterWorker),
@@ -1224,7 +1219,7 @@ mod tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
-        let raft_config = crate::config::RaftConfig::default();
+        let raft_config = RaftConfig::default();
         let raft_node = Arc::new(
             AppRaftNode::new(1, Arc::clone(&storage), state_machine, mount_table, &raft_config)
                 .await
@@ -1238,7 +1233,7 @@ mod tests {
             if raft_node.is_leader() {
                 break;
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(raft_node.is_leader());
         (raft_node, storage)
@@ -1248,7 +1243,7 @@ mod tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
-        let raft_config = crate::config::RaftConfig::default();
+        let raft_config = RaftConfig::default();
         let raft_node = Arc::new(
             AppRaftNode::new(1, storage, state_machine, mount_table, &raft_config)
                 .await
@@ -1258,7 +1253,7 @@ mod tests {
         raft_node
     }
 
-    fn block_proto(block_id: BlockId) -> beryl_proto::common::BlockIdProto {
+    fn block_proto(block_id: BlockId) -> BlockIdProto {
         block_id.into()
     }
 
@@ -1275,14 +1270,12 @@ mod tests {
             worker_id: worker_id.as_raw(),
             worker_run_id: worker_run_id.to_string(),
             baseline_seq,
-            batch: Some(block_report_request_proto::Batch::DeltaReport(
-                DeltaBlockReportBatchProto {
-                    batch_seq,
-                    entries: vec![DeltaBlockReportEntryProto {
-                        block: Some(delta_block_report_entry_proto::Block::Absent(block_proto(block_id))),
-                    }],
-                },
-            )),
+            batch: Some(Batch::DeltaReport(DeltaBlockReportBatchProto {
+                batch_seq,
+                entries: vec![DeltaBlockReportEntryProto {
+                    block: Some(Block::Absent(block_proto(block_id))),
+                }],
+            })),
         }
     }
 
@@ -1336,8 +1329,8 @@ mod tests {
                 1,
                 &descriptor.address,
                 descriptor.worker_net_protocol,
-                vec![beryl_types::TierFree {
-                    tier: beryl_types::Tier::Hdd,
+                vec![TierFree {
+                    tier: Tier::Hdd,
                     free_bytes: 500,
                 }],
             )
@@ -1360,7 +1353,7 @@ mod tests {
             worker_id: worker_id.as_raw(),
             worker_run_id: worker_run_id.to_string(),
             heartbeat_seq,
-            advertised_endpoint: Some(beryl_proto::common::EndpointProto {
+            advertised_endpoint: Some(EndpointProto {
                 host: "127.0.0.1".to_string(),
                 port: endpoint_port,
             }),
@@ -1369,7 +1362,7 @@ mod tests {
                 used_bytes: 100,
                 available_bytes: 900,
                 tier_free: vec![TierFreeProto {
-                    tier: beryl_proto::common::TierProto::TierHdd as i32,
+                    tier: TierProto::TierHdd as i32,
                     free_bytes: 900,
                 }],
             }),
@@ -1381,8 +1374,8 @@ mod tests {
         }
     }
 
-    fn valid_request_header(group_name: &GroupName, client_id: ClientId) -> beryl_proto::common::RequestHeaderProto {
-        (&::beryl_common::header::RequestHeader::new(client_id).with_group_name(group_name.clone())).into()
+    fn valid_request_header(group_name: &GroupName, client_id: ClientId) -> RequestHeaderProto {
+        (&RequestHeader::new(client_id).with_group_name(group_name.clone())).into()
     }
 
     #[tokio::test]
@@ -1460,7 +1453,7 @@ mod tests {
                 header: Some(valid_request_header(&group_name("root"), ClientId::new(84))),
                 worker_id: 124,
                 worker_run_id: worker_run_id.to_string(),
-                advertised_endpoint: Some(beryl_proto::common::EndpointProto {
+                advertised_endpoint: Some(EndpointProto {
                     host: "127.0.0.1".to_string(),
                     port: 9091,
                 }),
@@ -1637,7 +1630,7 @@ mod tests {
         .await
         .expect("initial heartbeat succeeds");
 
-        let block_id = BlockId::new(beryl_types::InodeId::new(700), beryl_types::BlockIndex::new(0));
+        let block_id = BlockId::new(InodeId::new(700), BlockIndex::new(0));
         let block_stamp = 991;
         worker_manager
             .receive_full_block_report(

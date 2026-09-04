@@ -15,6 +15,7 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
+use tokio::sync::watch::{Receiver, Sender};
 
 pub(super) const WORKER_NET_PROTOCOL_GRPC: i32 = 1;
 
@@ -412,7 +413,7 @@ pub struct WorkerManager {
     ///
     /// Ready evidence is leader-local and reconstructable. The revision only
     /// wakes waiters so they can rebuild and revalidate a complete snapshot.
-    publication_observation: watch::Sender<u64>,
+    publication_observation: Sender<u64>,
     /// Heartbeat timeout shared by RPC responses and all soft-state checks.
     heartbeat_timeout_ms: u32,
 }
@@ -1299,7 +1300,7 @@ impl WorkerManager {
     /// Get block locations for one metadata group (only live workers in that group).
     pub fn get_block_locations(&self, group_name: &GroupName, block_id: BlockId) -> Vec<WorkerId> {
         let live_workers = self.list_live_workers_in_group(group_name);
-        let live_set: std::collections::HashSet<WorkerId> = live_workers.into_iter().collect();
+        let live_set: HashSet<WorkerId> = live_workers.into_iter().collect();
         let observations = self.block_report_observations.read();
 
         observations
@@ -1577,7 +1578,7 @@ impl WorkerManager {
 
     /// Subscribe before checking Ready evidence so a concurrent report cannot
     /// be lost between the snapshot check and the asynchronous wait.
-    pub(crate) fn subscribe_publication_observations(&self) -> watch::Receiver<u64> {
+    pub(crate) fn subscribe_publication_observations(&self) -> Receiver<u64> {
         self.publication_observation.subscribe()
     }
 
@@ -1718,11 +1719,12 @@ mod tests {
 
     use super::{
         BlockReportBlock, BlockReportBlockState, BlockReportChange, PublishReadyConflict, PublishReadyStatus,
-        PublishReadyTarget, WorkerManager, WorkerRegistrationKey,
+        PublishReadyTarget, WorkerLiveState, WorkerManager, WorkerRegistrationKey,
     };
     use crate::error::MetadataError;
+    use crate::MetadataResult;
     use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
-    use beryl_types::lease::FencingToken;
+    use beryl_types::lease::{FencingToken, LeaseEpoch};
     use beryl_types::{
         BlockFormatId, ClientId, GroupName, Tier, TierFree, WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId,
         WriteTarget,
@@ -1766,7 +1768,7 @@ mod tests {
         worker_run_id: WorkerRunId,
         heartbeat_seq: u64,
         free_bytes: u64,
-    ) -> crate::MetadataResult<super::WorkerLiveState> {
+    ) -> MetadataResult<WorkerLiveState> {
         let descriptor = manager
             .get_descriptor(group_name, worker_id)
             .expect("worker descriptor should be registered");
@@ -1817,7 +1819,7 @@ mod tests {
                 fencing_token: FencingToken {
                     block_id,
                     owner: ClientId::new(7),
-                    epoch: 1,
+                    epoch: LeaseEpoch::new(1),
                 },
                 block_stamp,
                 chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.spec().unwrap().storage_chunk_size,

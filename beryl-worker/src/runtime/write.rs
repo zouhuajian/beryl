@@ -3,14 +3,12 @@
 
 //! Process-local ownership for active block writes.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
-
+use crate::runtime::DataRpcPermit;
 use beryl_types::ids::BlockId;
 use beryl_types::GroupName;
 use parking_lot::Mutex;
-
-use crate::runtime::DataRpcPermit;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 /// Exact worker-local identity of staging state owned by one write RPC.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -271,14 +269,12 @@ impl BlockWriteRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use beryl_types::ids::{BlockId, BlockIndex, InodeId};
-    use beryl_types::GroupName;
-    use tokio::sync::Semaphore;
-
     use super::{BlockWriteKey, BlockWriteRegistry};
     use crate::runtime::DataRpcPermit;
+    use beryl_types::ids::{BlockId, BlockIndex, InodeId};
+    use beryl_types::GroupName;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
 
     fn key() -> BlockWriteKey {
         BlockWriteKey {

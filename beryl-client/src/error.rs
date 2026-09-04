@@ -3,20 +3,22 @@
 
 //! Stable public client errors and internal failure evidence.
 
-use std::fmt;
-use std::time::Duration;
-
+use crate::runtime::OperationContext;
 use beryl_common::error::rpc::{
-    ErrorKind, InternalErrorKind, MetadataErrorKind, RecoveryAction, RpcErrorDetail, WorkerErrorKind,
+    ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RpcErrorDetail,
+    WorkerEndpointHint, WorkerErrorKind,
 };
 use beryl_common::header::{
     HEADER_PRE_HANDLER_REJECTION, HEADER_WORKER_DATA_REJECTION, PRE_HANDLER_REJECTION_RPC_CONCURRENCY,
     WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT,
 };
 use beryl_common::{CommonError, CommonErrorKind};
-use beryl_types::{CallId, GroupName};
-
-use crate::runtime::OperationContext;
+use beryl_proto::common::WorkerEndpointInfoProto;
+use beryl_types::{CallId, ContentGeneration, GroupName};
+use std::error::Error;
+use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::time::Duration;
+use tonic::{Code, Status};
 
 /// Stable, caller-visible category for a client failure.
 ///
@@ -52,7 +54,7 @@ pub enum ClientErrorKind {
     ResourceExhausted,
     /// The requested operation or protocol is unsupported.
     Unsupported,
-    /// A public handle no longer refers to the version it opened.
+    /// An opened file or write session no longer matches current authority.
     StaleHandle,
     /// A write session is no longer current.
     SessionInvalid,
@@ -68,7 +70,7 @@ pub enum ClientErrorKind {
     Unavailable,
     /// Worker or local storage IO failed.
     Io,
-    /// An exact read reached the opened file version's end too early.
+    /// An exact read reached the opened file's end too early.
     UnexpectedEof,
     /// Returned data is corrupt.
     CorruptData,
@@ -118,8 +120,8 @@ pub(crate) struct EndpointHint {
     pub(crate) endpoint: String,
 }
 
-impl From<beryl_common::error::rpc::WorkerEndpointHint> for EndpointHint {
-    fn from(value: beryl_common::error::rpc::WorkerEndpointHint) -> Self {
+impl From<WorkerEndpointHint> for EndpointHint {
+    fn from(value: WorkerEndpointHint) -> Self {
         Self {
             worker_id: value.worker_id,
             endpoint: value.endpoint,
@@ -127,8 +129,8 @@ impl From<beryl_common::error::rpc::WorkerEndpointHint> for EndpointHint {
     }
 }
 
-impl From<beryl_proto::common::WorkerEndpointInfoProto> for EndpointHint {
-    fn from(value: beryl_proto::common::WorkerEndpointInfoProto) -> Self {
+impl From<WorkerEndpointInfoProto> for EndpointHint {
+    fn from(value: WorkerEndpointInfoProto) -> Self {
         Self {
             worker_id: value.worker_id,
             endpoint: value.endpoint,
@@ -157,7 +159,7 @@ enum FailureDetail {
         hint: Box<RefreshHint>,
     },
     Transport {
-        code: tonic::Code,
+        code: Code,
         definitely_before_side_effect: bool,
     },
 }
@@ -255,10 +257,11 @@ impl ClientError {
         Self::local(ClientErrorKind::StaleHandle, reason)
     }
 
-    pub(crate) fn version_mismatch(expected: u64, actual: u64) -> Self {
+    /// Report stale content authority without implying historical reads are supported.
+    pub(crate) fn generation_mismatch(expected: ContentGeneration, actual: ContentGeneration) -> Self {
         Self::local(
             ClientErrorKind::StaleHandle,
-            format!("version mismatch: expected {expected}, got {actual}"),
+            format!("generation mismatch: expected {expected}, got {actual}"),
         )
     }
 
@@ -346,7 +349,7 @@ impl ClientError {
         }
     }
 
-    pub(crate) fn transport_code(&self) -> Option<tonic::Code> {
+    pub(crate) fn transport_code(&self) -> Option<Code> {
         match &self.detail {
             FailureDetail::Transport { code, .. } => Some(*code),
             _ => None,
@@ -361,7 +364,7 @@ impl ClientError {
     pub(crate) fn is_retryable_transport(&self) -> bool {
         matches!(
             self.transport_code(),
-            Some(tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::ResourceExhausted)
+            Some(Code::Unavailable | Code::DeadlineExceeded | Code::ResourceExhausted)
         )
     }
 
@@ -397,8 +400,8 @@ impl ClientError {
     }
 }
 
-impl fmt::Display for ClientError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for ClientError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match (self.operation, self.call_id) {
             (Some(operation), Some(call_id)) => write!(f, "{operation} [{call_id}]: {}", self.message),
             (Some(operation), None) => write!(f, "{operation}: {}", self.message),
@@ -407,12 +410,12 @@ impl fmt::Display for ClientError {
     }
 }
 
-impl std::error::Error for ClientError {}
+impl Error for ClientError {}
 
 /// Result type alias for client operations.
 pub type ClientResult<T> = Result<T, ClientError>;
 
-pub(crate) fn side_effect_response_body_mismatch(operation: &'static str, detail: impl fmt::Display) -> ClientError {
+pub(crate) fn side_effect_response_body_mismatch(operation: &'static str, detail: impl Display) -> ClientError {
     let mut error =
         ClientError::invalid_response(operation, format!("response body mismatch after OK header: {detail}"));
     error.outcome_unknown = true;
@@ -438,8 +441,8 @@ impl From<CommonError> for ClientError {
     }
 }
 
-impl From<tonic::Status> for ClientError {
-    fn from(status: tonic::Status) -> Self {
+impl From<Status> for ClientError {
+    fn from(status: Status) -> Self {
         let definitely_before_side_effect = status
             .metadata()
             .get(HEADER_PRE_HANDLER_REJECTION)
@@ -451,18 +454,16 @@ impl From<tonic::Status> for ClientError {
                 .and_then(|value| value.to_str().ok())
                 == Some(WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT);
         let kind = match status.code() {
-            tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition | tonic::Code::OutOfRange => {
-                ClientErrorKind::InvalidArgument
-            }
-            tonic::Code::NotFound => ClientErrorKind::NotFound,
-            tonic::Code::AlreadyExists => ClientErrorKind::AlreadyExists,
-            tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => ClientErrorKind::PermissionDenied,
-            tonic::Code::ResourceExhausted => ClientErrorKind::ResourceExhausted,
-            tonic::Code::Unimplemented => ClientErrorKind::Unsupported,
-            tonic::Code::DeadlineExceeded => ClientErrorKind::Timeout,
-            tonic::Code::Cancelled => ClientErrorKind::Cancelled,
-            tonic::Code::Unavailable => ClientErrorKind::Unavailable,
-            tonic::Code::DataLoss => ClientErrorKind::CorruptData,
+            Code::InvalidArgument | Code::FailedPrecondition | Code::OutOfRange => ClientErrorKind::InvalidArgument,
+            Code::NotFound => ClientErrorKind::NotFound,
+            Code::AlreadyExists => ClientErrorKind::AlreadyExists,
+            Code::PermissionDenied | Code::Unauthenticated => ClientErrorKind::PermissionDenied,
+            Code::ResourceExhausted => ClientErrorKind::ResourceExhausted,
+            Code::Unimplemented => ClientErrorKind::Unsupported,
+            Code::DeadlineExceeded => ClientErrorKind::Timeout,
+            Code::Cancelled => ClientErrorKind::Cancelled,
+            Code::Unavailable => ClientErrorKind::Unavailable,
+            Code::DataLoss => ClientErrorKind::CorruptData,
             _ => ClientErrorKind::Internal,
         };
         Self {
@@ -521,12 +522,12 @@ fn client_kind_from_rpc(kind: ErrorKind) -> ClientErrorKind {
             | WorkerErrorKind::NodeUnavailable => ClientErrorKind::Unavailable,
         },
         ErrorKind::Protocol(kind) => match kind {
-            beryl_common::error::rpc::ProtocolErrorKind::InvalidHeader => ClientErrorKind::InvalidResponse,
-            beryl_common::error::rpc::ProtocolErrorKind::InvalidArgument => ClientErrorKind::InvalidArgument,
-            beryl_common::error::rpc::ProtocolErrorKind::PermissionDenied => ClientErrorKind::PermissionDenied,
-            beryl_common::error::rpc::ProtocolErrorKind::Unsupported => ClientErrorKind::Unsupported,
-            beryl_common::error::rpc::ProtocolErrorKind::Cancelled => ClientErrorKind::Cancelled,
-            beryl_common::error::rpc::ProtocolErrorKind::Corrupt => ClientErrorKind::CorruptData,
+            ProtocolErrorKind::InvalidHeader => ClientErrorKind::InvalidResponse,
+            ProtocolErrorKind::InvalidArgument => ClientErrorKind::InvalidArgument,
+            ProtocolErrorKind::PermissionDenied => ClientErrorKind::PermissionDenied,
+            ProtocolErrorKind::Unsupported => ClientErrorKind::Unsupported,
+            ProtocolErrorKind::Cancelled => ClientErrorKind::Cancelled,
+            ProtocolErrorKind::Corrupt => ClientErrorKind::CorruptData,
         },
         ErrorKind::Internal(kind) => match kind {
             InternalErrorKind::NodeUnavailable => ClientErrorKind::Unavailable,
