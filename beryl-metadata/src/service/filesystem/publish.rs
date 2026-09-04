@@ -224,12 +224,12 @@ impl MetadataFileSystem {
                     )
                     .expect_err("session_terminal_failure always returns Err"));
             }
-            Err(BeginWritePublicationError::AddBlockPending) => {
+            Err(BeginWritePublicationError::AllocateBlockPending) => {
                 return Err(self
                     .failure_from_error::<()>(
                         ctx,
                         MetadataError::Again(format!(
-                            "{operation} cannot freeze inode_id={inode_id} while AddBlock is pending"
+                            "{operation} cannot freeze inode_id={inode_id} while AllocateBlock is pending"
                         )),
                         None,
                         None,
@@ -435,7 +435,10 @@ impl MetadataFileSystem {
         let mut ready_targets = Vec::new();
         for block in committed_blocks {
             let target = issued.get(&block.block_id).ok_or_else(|| {
-                MetadataError::InvalidArgument(format!("Committed block {} was not issued by AddBlock", block.block_id))
+                MetadataError::InvalidArgument(format!(
+                    "Committed block {} was not issued by AllocateBlock",
+                    block.block_id
+                ))
             })?;
             let already_visible = visible_extents.iter().any(|extent| {
                 extent.block_id == block.block_id
@@ -1184,7 +1187,7 @@ impl MetadataFileSystem {
             }
             let Some(target) = issued.get(&block.block_id).copied() else {
                 return Err(MetadataError::InvalidArgument(format!(
-                    "Committed block {} was not issued by AddBlock",
+                    "Committed block {} was not issued by AllocateBlock",
                     block.block_id
                 )));
             };
@@ -1203,7 +1206,7 @@ impl MetadataFileSystem {
             let is_new_partial = target.file_offset >= session.base_size && block.len < target.block_size;
             if is_new_partial && last_issued_block_id != Some(block.block_id) {
                 return Err(MetadataError::InvalidArgument(format!(
-                    "partial committed block {} must be the last target issued by AddBlock",
+                    "partial committed block {} must be the last target issued by AllocateBlock",
                     block.block_id
                 )));
             }
@@ -1580,7 +1583,7 @@ mod tests {
     use beryl_common::error::rpc::MetadataErrorKind;
     use beryl_common::Deadline;
 
-    async fn open_write_with_target(env: &WriteFlowEnv) -> (OpenWriteOutput, WriteTarget) {
+    async fn open_write_with_target(env: &WriteFlowEnv) -> (OpenWriteOutput, LocatedBlock) {
         let open = env
             .filesystem
             .open_write_inode(
@@ -1594,11 +1597,11 @@ mod tests {
             .await
             .expect("open write")
             .payload;
-        let target = add_block_for_key(&env.filesystem, &open).await;
+        let target = allocate_block_for_key(&env.filesystem, &open).await;
         (open, target)
     }
 
-    fn target_intent(target: &WriteTarget, expected_file_size: u64) -> CloseWriteIntent {
+    fn target_intent(target: &LocatedBlock, expected_file_size: u64) -> CloseWriteIntent {
         CloseWriteIntent {
             committed_blocks: vec![committed_block(target.block_id, target.file_offset, 64)],
             final_size: target.file_offset + 64,
@@ -1622,7 +1625,7 @@ mod tests {
             .await
             .expect("open write")
             .payload;
-        let target = add_block_for_key(&env.filesystem, &open).await;
+        let target = allocate_block_for_key(&env.filesystem, &open).await;
         let committed = vec![committed_block(target.block_id, target.file_offset, 64)];
         let commit = commit_for_key(&env.filesystem, &open, committed, 64);
         tokio::pin!(commit);
@@ -1662,7 +1665,7 @@ mod tests {
             .await
             .expect("open write")
             .payload;
-        let target = add_block_for_key(&env.filesystem, &open).await;
+        let target = allocate_block_for_key(&env.filesystem, &open).await;
         let mut ctx = request_context();
         ctx.caller.deadline = Deadline::from_now(Duration::from_millis(40));
         let commit = env.filesystem.close_write_session(

@@ -69,9 +69,9 @@ impl ClientInner {
         session: &mut WriteSession,
         deadline: OperationDeadline,
     ) -> ClientResult<BlockWrite> {
-        let (add_block_operation, add_block) = match self
+        let (allocate_block_operation, allocate_block) = match self
             .metadata
-            .add_block(
+            .allocate_block(
                 session.path(),
                 session.write_handle(),
                 session.previous_block_id(),
@@ -79,25 +79,24 @@ impl ClientInner {
             )
             .await
         {
-            Ok(add_block) => add_block,
+            Ok(allocate_block) => allocate_block,
             Err(err) => {
                 mark_session_after_write_error(session, &err);
-                return Err(self.normalize_outcome_error("AddBlock", "metadata", err));
+                return Err(self.normalize_outcome_error("AllocateBlock", "metadata", err));
             }
         };
-        if let Err(err) = session.validate_target(&add_block.target) {
+        if let Err(err) = session.validate_target(&allocate_block.block) {
             session.mark_unknown_outcome();
             self.record_metric(
                 ClientMetric::WorkerResponseBodyMismatch,
-                metric_labels("AddBlock", "metadata").with_outcome("unknown"),
+                metric_labels("AllocateBlock", "metadata").with_outcome("unknown"),
             );
             self.record_metric(
                 ClientMetric::UnknownOutcome,
-                metric_labels("AddBlock", "metadata").with_outcome("unknown"),
+                metric_labels("AllocateBlock", "metadata").with_outcome("unknown"),
             );
-            return Err(
-                side_effect_response_body_mismatch("AddBlock", err).with_operation_context(&add_block_operation)
-            );
+            return Err(side_effect_response_body_mismatch("AllocateBlock", err)
+                .with_operation_context(&allocate_block_operation));
         }
         let operation = worker_write_context(
             self.metadata.client_id(),
@@ -114,8 +113,8 @@ impl ClientInner {
                     &operation,
                     self.worker.open_write_block(
                         ctx,
-                        add_block.group_name.clone(),
-                        add_block.target.clone(),
+                        allocate_block.group_name.clone(),
+                        allocate_block.block.clone(),
                         lease_expires_at_ms,
                     ),
                 )

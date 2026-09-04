@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use beryl_types::{GroupName, WriteTarget};
+use beryl_types::{GroupName, LocatedBlock};
 use bytes::Bytes;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -48,13 +48,13 @@ pub(crate) trait WorkerTransport: Send + Sync {
     ) -> ClientResult<BlockWrite>;
 }
 
-/// Internal worker write target derived from metadata AddBlock.
+/// Internal worker write target derived from metadata AllocateBlock.
 #[derive(Clone, Debug)]
 pub(crate) struct WorkerWriteTarget {
     /// Metadata owner group for the target block.
     pub(crate) group_name: GroupName,
-    /// Metadata AddBlock target.
-    pub(crate) target: WriteTarget,
+    /// Metadata AllocateBlock target.
+    pub(crate) target: LocatedBlock,
 }
 
 /// Renewable deadline shared by one `BlockWrite` and its response task.
@@ -162,7 +162,7 @@ pub(crate) enum BlockWriteInput {
 /// treats a dropped sender as pending cancellation, never as a successful EOF.
 pub(crate) struct BlockWrite {
     operation: OperationContext,
-    target: WriteTarget,
+    target: LocatedBlock,
     written_len: u64,
     requests: Option<mpsc::Sender<BlockWriteInput>>,
     cancellation: Option<watch::Sender<bool>>,
@@ -174,7 +174,7 @@ impl BlockWrite {
     /// Takes ownership of an acknowledged RPC and its exact metadata target.
     pub(crate) fn new(
         operation: OperationContext,
-        target: WriteTarget,
+        target: LocatedBlock,
         requests: mpsc::Sender<BlockWriteInput>,
         cancellation: watch::Sender<bool>,
         lease: Arc<BlockWriteLease>,
@@ -246,7 +246,7 @@ impl BlockWrite {
 
     /// Half-closes the request stream and accepts the block only after the
     /// Worker response stream ends normally, which is the Ready boundary.
-    pub(crate) async fn finish(mut self) -> ClientResult<(WriteTarget, u64)> {
+    pub(crate) async fn finish(mut self) -> ClientResult<(LocatedBlock, u64)> {
         self.check_open().await?;
         self.send_before_lease_expiry(BlockWriteInput::Finish).await?;
         self.requests.take();

@@ -11,16 +11,21 @@ use crate::lease::FencingToken;
 use crate::tier::Tier;
 use crate::worker::WorkerEndpointInfo;
 
-/// Metadata-issued target for writing one block to worker data-plane storage.
+/// Metadata-issued block identity, write locations, layout, and fencing authority.
+///
+/// Worker locations designate where the client may write; they do not prove that
+/// data exists, is durable, or has been published in the file's visible layout.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WriteTarget {
+pub struct LocatedBlock {
     pub block_id: BlockId,
+    /// Start of the block in the file, independent of its allocation index.
     pub file_offset: u64,
     /// Maximum writable capacity authorized by the persisted `FileLayout`.
     ///
     /// Workers reserve and enforce this bound before the final effective length
     /// is known, then persist it in `BlockMeta.format.block_size`.
     pub block_size: u64,
+    /// Selected Worker process identities retained unchanged when allocation replays.
     pub worker_endpoints: Vec<WorkerEndpointInfo>,
     pub fencing_token: FencingToken,
     pub block_stamp: u64,

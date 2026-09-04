@@ -11,7 +11,7 @@ use crate::config::MetadataConfig;
 use crate::observe;
 use beryl_types::ids::{InodeId, MountId};
 use beryl_types::{
-    BlockId, BlockShape, CallId, ClientId, ContentGeneration, FileLayout, LeaseEpoch, WriteMode, WriteTarget,
+    BlockId, BlockShape, CallId, ClientId, ContentGeneration, FileLayout, LeaseEpoch, LocatedBlock, WriteMode,
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -47,19 +47,19 @@ pub struct WriteSession {
     pub expires_at_ms: u64,
     /// Bounded mount-root-to-file chain captured while namespace topology was stable.
     ancestor_inode_ids: Vec<InodeId>,
-    /// Targets already issued to the client through AddBlock.
-    pub issued_targets: Vec<WriteTarget>,
-    /// Logical AddBlock steps issued for predecessor-based replay.
+    /// Targets already issued to the client through AllocateBlock.
+    pub issued_targets: Vec<LocatedBlock>,
+    /// Logical AllocateBlock steps issued for predecessor-based replay.
     issued_steps: HashMap<Option<BlockId>, usize>,
-    /// The one logical AddBlock step allowed to cross Raft allocation at a time.
-    pending_add_block: Option<PendingAddBlock>,
+    /// The one logical AllocateBlock step allowed to cross Raft allocation at a time.
+    pending_allocate_block: Option<PendingAllocateBlock>,
     /// Exact local publication currently freezing the issued-target sequence.
     active_publication: Option<WritePublicationId>,
     /// Immutable identity and response retained for exact CreateFile replay.
     create_replay: Option<ActiveCreateReplay>,
 }
 
-/// Small active-session snapshot used before AddBlock reserves target state.
+/// Small active-session snapshot used before AllocateBlock reserves target state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WriteSessionIdentity {
     pub(crate) mount_id: MountId,
@@ -197,9 +197,9 @@ impl WriteSessionEntry {
     }
 }
 
-/// One predecessor-addressed AddBlock step reserved before Raft allocation.
+/// One predecessor-addressed AllocateBlock step reserved before Raft allocation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PendingAddBlock {
+struct PendingAllocateBlock {
     previous_block_id: Option<BlockId>,
 }
 
@@ -253,17 +253,17 @@ pub(crate) struct WriteTargetLimitExceeded {
     pub(crate) maximum: usize,
 }
 
-/// Outcome of beginning one predecessor-addressed AddBlock step.
-pub(crate) enum BeginAddBlock<'a> {
+/// Outcome of beginning one predecessor-addressed AllocateBlock step.
+pub(crate) enum BeginAllocateBlock<'a> {
     /// The logical step was already issued and can be replayed without capacity.
-    Replay(WriteTarget),
+    Replay(LocatedBlock),
     /// New capacity is reserved and must be completed or released before return.
     Reserved(WriteTargetReservation<'a>),
 }
 
-/// Exact failure returned before an AddBlock step may allocate through Raft.
+/// Exact failure returned before an AllocateBlock step may allocate through Raft.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum BeginAddBlockError {
+pub(crate) enum BeginAllocateBlockError {
     /// The active session no longer exists or the presented epoch is stale.
     Session(String),
     /// The registry's compact replay index no longer resolves to its target.
@@ -278,7 +278,7 @@ pub(crate) enum BeginAddBlockError {
     LimitExceeded(WriteTargetLimitExceeded),
 }
 
-/// Exact failure returned while converting a pending AddBlock into an issued target.
+/// Exact failure returned while converting a pending AllocateBlock into an issued target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CompleteWriteTargetError {
     /// Expiry, abort, or replacement removed the reservation's active session.
@@ -297,7 +297,7 @@ pub(crate) struct WriteTargetReservation<'a> {
     registry: &'a SessionRegistry,
     inode_id: InodeId,
     lease_epoch: LeaseEpoch,
-    pending: PendingAddBlock,
+    pending: PendingAllocateBlock,
     layout: FileLayout,
     open_client_id: ClientId,
     file_offset: u64,
@@ -307,7 +307,7 @@ pub(crate) struct WriteTargetReservation<'a> {
 
 /// Exact leader-local ownership of a stable issued-target sequence.
 ///
-/// While this owner is alive, new AddBlock steps are rejected before block
+/// While this owner is alive, new AllocateBlock steps are rejected before block
 /// allocation. Dropping it releases only the matching publication identity.
 #[must_use = "dropping the owner releases its write-publication boundary"]
 pub(crate) struct WritePublication<'a> {
@@ -322,8 +322,8 @@ pub(crate) struct WritePublication<'a> {
 pub(crate) enum BeginWritePublicationError {
     /// The active session no longer exists or the presented epoch is stale.
     Session(String),
-    /// One AddBlock step is already crossing allocation or placement.
-    AddBlockPending,
+    /// One AllocateBlock step is already crossing allocation or placement.
+    AllocateBlockPending,
     /// Another SyncWrite or CommitFile already owns the session boundary.
     PublicationInProgress,
     /// The process-local publication identity cannot advance without reuse.
@@ -387,7 +387,7 @@ impl WriteTargetReservation<'_> {
         self.open_client_id
     }
 
-    /// Return the file offset reserved for this logical AddBlock step.
+    /// Return the file offset reserved for this logical AllocateBlock step.
     pub(crate) fn file_offset(&self) -> u64 {
         self.file_offset
     }
@@ -398,7 +398,7 @@ impl WriteTargetReservation<'_> {
     }
 
     /// Atomically install a validated target in place of this pending slot.
-    pub(crate) fn complete(mut self, target: WriteTarget) -> Result<WriteTarget, CompleteWriteTargetError> {
+    pub(crate) fn complete(mut self, target: LocatedBlock) -> Result<LocatedBlock, CompleteWriteTargetError> {
         let result = self.registry.complete_write_target(
             self.inode_id,
             self.lease_epoch,
@@ -902,7 +902,7 @@ impl SessionRegistry {
             ancestor_inode_ids: opening.ancestor_inode_ids,
             issued_targets: Vec::new(),
             issued_steps: HashMap::new(),
-            pending_add_block: None,
+            pending_allocate_block: None,
             active_publication: None,
             create_replay: None,
         };
@@ -973,7 +973,7 @@ impl SessionRegistry {
             ancestor_inode_ids,
             issued_targets: Vec::new(),
             issued_steps: HashMap::new(),
-            pending_add_block: None,
+            pending_allocate_block: None,
             active_publication: None,
             create_replay: Some(ActiveCreateReplay {
                 operation_id,
@@ -989,57 +989,60 @@ impl SessionRegistry {
         Ok(session)
     }
 
-    /// Replay an issued AddBlock step or reserve capacity before Raft allocation.
+    /// Replay an issued AllocateBlock step or reserve capacity before Raft allocation.
     ///
     /// Replay is resolved before capacity checks. A new step installs the one
     /// pending slot and increments global occupancy under the registry lock, so
     /// limit-plus-one cannot cross the subsequent Raft boundary concurrently.
-    pub(crate) fn begin_add_block(
+    /// A SyncWrite-retired suffix is no longer replayable: its predecessor may
+    /// become the end of the current chain and identify a fresh allocation.
+    pub(crate) fn begin_allocate_block(
         &self,
         inode_id: InodeId,
         lease_epoch: LeaseEpoch,
         previous_block_id: Option<BlockId>,
-    ) -> Result<BeginAddBlock<'_>, BeginAddBlockError> {
+    ) -> Result<BeginAllocateBlock<'_>, BeginAllocateBlockError> {
         let mut state = self.state.write();
         let now_ms = current_time_ms();
         Self::retire_expired_entry_for_inode(&mut state, inode_id, now_ms);
         Self::retire_expired_entries(&mut state, now_ms);
-        let pending = PendingAddBlock { previous_block_id };
+        let pending = PendingAllocateBlock { previous_block_id };
         let (layout, open_client_id, file_offset, block_stamp) = {
-            let session = Self::active_session_mut(&mut state, inode_id).map_err(BeginAddBlockError::Session)?;
+            let session = Self::active_session_mut(&mut state, inode_id).map_err(BeginAllocateBlockError::Session)?;
             if session.lease_epoch != lease_epoch {
-                return Err(BeginAddBlockError::Session(
+                return Err(BeginAllocateBlockError::Session(
                     "write session lease epoch mismatch".to_string(),
                 ));
             }
             if let Some(target_index) = session.issued_steps.get(&previous_block_id) {
                 let target = session.issued_targets.get(*target_index).cloned().ok_or_else(|| {
-                    BeginAddBlockError::Internal("issued AddBlock target index is inconsistent".to_string())
+                    BeginAllocateBlockError::Internal("issued AllocateBlock target index is inconsistent".to_string())
                 })?;
-                return Ok(BeginAddBlock::Replay(target));
+                return Ok(BeginAllocateBlock::Replay(target));
             }
 
             if session.active_publication.is_some() {
-                return Err(BeginAddBlockError::PublicationInProgress);
+                return Err(BeginAllocateBlockError::PublicationInProgress);
             }
 
             let expected_previous = session.issued_targets.last().map(|target| target.block_id);
             if previous_block_id != expected_previous {
-                return Err(BeginAddBlockError::InvalidArgument(format!(
-                    "AddBlock predecessor mismatch: expected {expected_previous:?}, got {previous_block_id:?}"
+                return Err(BeginAllocateBlockError::InvalidArgument(format!(
+                    "AllocateBlock predecessor mismatch: expected {expected_previous:?}, got {previous_block_id:?}"
                 )));
             }
-            if session.pending_add_block.is_some() {
-                return Err(BeginAddBlockError::Pending);
+            if session.pending_allocate_block.is_some() {
+                return Err(BeginAllocateBlockError::Pending);
             }
-            let file_offset = Self::next_target_file_offset(session).map_err(BeginAddBlockError::InvalidArgument)?;
+            let file_offset =
+                Self::next_target_file_offset(session).map_err(BeginAllocateBlockError::InvalidArgument)?;
             let block_stamp = session
                 .generation
                 .checked_next()
-                .ok_or_else(|| BeginAddBlockError::InvalidArgument("content generation overflow".to_string()))?;
+                .ok_or_else(|| BeginAllocateBlockError::InvalidArgument("content generation overflow".to_string()))?;
             if session.issued_targets.len() >= self.max_write_targets_per_session {
                 observe::record_write_target_rejected(WriteTargetLimit::PerSession.label());
-                return Err(BeginAddBlockError::LimitExceeded(WriteTargetLimitExceeded {
+                return Err(BeginAllocateBlockError::LimitExceeded(WriteTargetLimitExceeded {
                     limit: WriteTargetLimit::PerSession,
                     maximum: self.max_write_targets_per_session,
                 }));
@@ -1049,14 +1052,14 @@ impl SessionRegistry {
 
         if state.outstanding_write_targets >= self.max_write_targets {
             observe::record_write_target_rejected(WriteTargetLimit::Global.label());
-            return Err(BeginAddBlockError::LimitExceeded(WriteTargetLimitExceeded {
+            return Err(BeginAllocateBlockError::LimitExceeded(WriteTargetLimitExceeded {
                 limit: WriteTargetLimit::Global,
                 maximum: self.max_write_targets,
             }));
         }
         let session = Self::active_session_mut(&mut state, inode_id)
             .expect("validated active session must remain current under the registry lock");
-        assert!(session.pending_add_block.replace(pending.clone()).is_none());
+        assert!(session.pending_allocate_block.replace(pending.clone()).is_none());
         state.outstanding_write_targets = state
             .outstanding_write_targets
             .checked_add(1)
@@ -1067,7 +1070,7 @@ impl SessionRegistry {
             .expect("pending write-target occupancy must increment");
         Self::record_write_target_gauges(&state);
 
-        Ok(BeginAddBlock::Reserved(WriteTargetReservation {
+        Ok(BeginAllocateBlock::Reserved(WriteTargetReservation {
             registry: self,
             inode_id,
             lease_epoch,
@@ -1083,7 +1086,7 @@ impl SessionRegistry {
     /// Freeze one active session's issued-target sequence for file publication.
     ///
     /// The pending-target check and publication identity installation happen
-    /// under the same lock used by AddBlock, closing both allocation-completion
+    /// under the same lock used by AllocateBlock, closing both allocation-completion
     /// and pre-proposal races.
     pub(crate) fn begin_publication(
         &self,
@@ -1102,8 +1105,8 @@ impl SessionRegistry {
                     "write session lease epoch mismatch".to_string(),
                 ));
             }
-            if session.pending_add_block.is_some() {
-                return Err(BeginWritePublicationError::AddBlockPending);
+            if session.pending_allocate_block.is_some() {
+                return Err(BeginWritePublicationError::AllocateBlockPending);
             }
             if session.active_publication.is_some() {
                 return Err(BeginWritePublicationError::PublicationInProgress);
@@ -1132,10 +1135,10 @@ impl SessionRegistry {
         &self,
         inode_id: InodeId,
         lease_epoch: LeaseEpoch,
-        pending: &PendingAddBlock,
-        target: WriteTarget,
+        pending: &PendingAllocateBlock,
+        target: LocatedBlock,
         now_ms: u64,
-    ) -> Result<WriteTarget, CompleteWriteTargetError> {
+    ) -> Result<LocatedBlock, CompleteWriteTargetError> {
         let mut state = self.state.write();
         Self::retire_expired_entry_for_inode(&mut state, inode_id, now_ms);
         Self::retire_expired_entries(&mut state, now_ms);
@@ -1145,7 +1148,7 @@ impl SessionRegistry {
             if session.lease_epoch != lease_epoch {
                 return Err(CompleteWriteTargetError::NotCurrent);
             }
-            if session.pending_add_block.as_ref() != Some(pending) {
+            if session.pending_allocate_block.as_ref() != Some(pending) {
                 return Err(CompleteWriteTargetError::NotCurrent);
             }
             Self::validate_write_target(session, lease_epoch, &target)
@@ -1164,9 +1167,9 @@ impl SessionRegistry {
                 .issued_steps
                 .insert(pending.previous_block_id, target_index)
                 .is_none(),
-            "reserved AddBlock predecessor must not already be issued"
+            "reserved AllocateBlock predecessor must not already be issued"
         );
-        assert_eq!(session.pending_add_block.take().as_ref(), Some(pending));
+        assert_eq!(session.pending_allocate_block.take().as_ref(), Some(pending));
         state.pending_write_targets = state
             .pending_write_targets
             .checked_sub(1)
@@ -1179,7 +1182,7 @@ impl SessionRegistry {
     fn validate_write_target(
         session: &WriteSession,
         lease_epoch: LeaseEpoch,
-        target: &WriteTarget,
+        target: &LocatedBlock,
     ) -> Result<(), String> {
         if target.block_id.inode_id != session.inode_id {
             return Err("write target inode mismatch".to_string());
@@ -1584,8 +1587,8 @@ impl SessionRegistry {
         }
     }
 
-    /// Release only the matching pending AddBlock step after failure or cancellation.
-    fn cancel_write_target(&self, inode_id: InodeId, lease_epoch: LeaseEpoch, pending: &PendingAddBlock) {
+    /// Release only the matching pending AllocateBlock step after failure or cancellation.
+    fn cancel_write_target(&self, inode_id: InodeId, lease_epoch: LeaseEpoch, pending: &PendingAllocateBlock) {
         let mut state = self.state.write();
         Self::cancel_write_target_locked(&mut state, inode_id, lease_epoch, pending);
     }
@@ -1595,19 +1598,19 @@ impl SessionRegistry {
         state: &mut SessionRegistryState,
         inode_id: InodeId,
         lease_epoch: LeaseEpoch,
-        pending: &PendingAddBlock,
+        pending: &PendingAllocateBlock,
     ) -> bool {
         let matches = matches!(
             state.entries.get(&inode_id),
             Some(WriteSessionEntry::Active(session))
-                if session.lease_epoch == lease_epoch && session.pending_add_block.as_ref() == Some(pending)
+                if session.lease_epoch == lease_epoch && session.pending_allocate_block.as_ref() == Some(pending)
         );
         if !matches {
             return false;
         }
         let session = Self::active_session_mut(state, inode_id)
             .expect("matching pending target must belong to an active session");
-        assert_eq!(session.pending_add_block.take().as_ref(), Some(pending));
+        assert_eq!(session.pending_allocate_block.take().as_ref(), Some(pending));
         state.outstanding_write_targets = state
             .outstanding_write_targets
             .checked_sub(1)
@@ -1731,8 +1734,8 @@ impl SessionRegistry {
         let (owned_write_targets, pending_write_targets) = match entry {
             WriteSessionEntry::Opening(_) => (0, 0),
             WriteSessionEntry::Active(session) => (
-                session.issued_targets.len() + usize::from(session.pending_add_block.is_some()),
-                usize::from(session.pending_add_block.is_some()),
+                session.issued_targets.len() + usize::from(session.pending_allocate_block.is_some()),
+                usize::from(session.pending_allocate_block.is_some()),
             ),
         };
         assert!(
@@ -1987,9 +1990,9 @@ mod tests {
     use beryl_types::{BlockFormatId, Tier};
     use std::sync::{Arc, Barrier, Condvar, Mutex};
 
-    fn write_target(inode_id: InodeId, index: u32) -> WriteTarget {
+    fn write_target(inode_id: InodeId, index: u32) -> LocatedBlock {
         let block_id = BlockId::new(inode_id, BlockIndex::new(index));
-        WriteTarget {
+        LocatedBlock {
             block_id,
             file_offset: 0,
             block_size: 64,
@@ -2081,16 +2084,16 @@ mod tests {
         index: u32,
         file_offset: u64,
         block_stamp: u64,
-    ) -> WriteTarget {
+    ) -> LocatedBlock {
         let mut target = write_target(inode_id, index);
         target.file_offset = file_offset;
         target.block_stamp = block_stamp;
         let reservation = match registry
-            .begin_add_block(inode_id, LeaseEpoch::new(7), previous_block_id)
+            .begin_allocate_block(inode_id, LeaseEpoch::new(7), previous_block_id)
             .unwrap()
         {
-            BeginAddBlock::Reserved(reservation) => reservation,
-            BeginAddBlock::Replay(_) => panic!("new test target must reserve capacity"),
+            BeginAllocateBlock::Reserved(reservation) => reservation,
+            BeginAllocateBlock::Replay(_) => panic!("new test target must reserve capacity"),
         };
         reservation.complete(target).unwrap()
     }
@@ -2390,7 +2393,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_duplicate_add_block_reserves_one_target_before_completion() {
+    fn concurrent_duplicate_allocate_block_reserves_one_target_before_completion() {
         let registry = Arc::new(SessionRegistry::default());
         let inode_id = InodeId::new(15);
         install_session(&registry, create_input(inode_id)).unwrap();
@@ -2404,16 +2407,16 @@ mod tests {
             let reserved = Arc::clone(&reserved);
             joins.push(std::thread::spawn(move || {
                 start.wait();
-                match registry.begin_add_block(inode_id, LeaseEpoch::new(7), None) {
-                    Ok(BeginAddBlock::Reserved(reservation)) => {
+                match registry.begin_allocate_block(inode_id, LeaseEpoch::new(7), None) {
+                    Ok(BeginAllocateBlock::Reserved(reservation)) => {
                         reserved.wait();
                         Some(reservation.complete(write_target(inode_id, index)).unwrap())
                     }
-                    Err(BeginAddBlockError::Pending) => {
+                    Err(BeginAllocateBlockError::Pending) => {
                         reserved.wait();
                         None
                     }
-                    Ok(BeginAddBlock::Replay(_)) | Err(_) => panic!("unexpected concurrent AddBlock outcome"),
+                    Ok(BeginAllocateBlock::Replay(_)) | Err(_) => panic!("unexpected concurrent AllocateBlock outcome"),
                 }
             }));
         }
@@ -2429,30 +2432,30 @@ mod tests {
     }
 
     #[test]
-    fn add_block_and_publication_owners_exclude_each_other_until_drop() {
+    fn allocation_and_publication_preserve_only_the_active_replay_chain() {
         let registry = SessionRegistry::default();
         let inode_id = InodeId::new(16);
         install_session(&registry, create_input(inode_id)).unwrap();
         let first = issue_target(&registry, inode_id, None, 0, 0, 1);
         let reservation = match registry
-            .begin_add_block(inode_id, LeaseEpoch::new(7), Some(first.block_id))
+            .begin_allocate_block(inode_id, LeaseEpoch::new(7), Some(first.block_id))
             .unwrap()
         {
-            BeginAddBlock::Reserved(reservation) => reservation,
-            BeginAddBlock::Replay(_) => panic!("new predecessor must reserve"),
+            BeginAllocateBlock::Reserved(reservation) => reservation,
+            BeginAllocateBlock::Replay(_) => panic!("new predecessor must reserve"),
         };
         assert!(matches!(
             registry.begin_publication(inode_id, LeaseEpoch::new(7)),
-            Err(BeginWritePublicationError::AddBlockPending)
+            Err(BeginWritePublicationError::AllocateBlockPending)
         ));
         drop(reservation);
 
         let publication = registry
             .begin_publication(inode_id, LeaseEpoch::new(7))
-            .expect("released AddBlock must unblock publication");
+            .expect("released AllocateBlock must unblock publication");
         assert!(matches!(
-            registry.begin_add_block(inode_id, LeaseEpoch::new(7), Some(first.block_id)),
-            Err(BeginAddBlockError::PublicationInProgress)
+            registry.begin_allocate_block(inode_id, LeaseEpoch::new(7), Some(first.block_id)),
+            Err(BeginAllocateBlockError::PublicationInProgress)
         ));
         drop(publication);
 
@@ -2461,6 +2464,27 @@ mod tests {
         assert_eq!(second.block_stamp, 1);
         assert_eq!(registry.state.read().outstanding_write_targets, 2);
         assert_eq!(registry.state.read().pending_write_targets, 0);
+
+        let publication = registry.begin_publication(inode_id, LeaseEpoch::new(7)).unwrap();
+        assert!(matches!(
+            registry.begin_allocate_block(inode_id, LeaseEpoch::new(7), None),
+            Ok(BeginAllocateBlock::Replay(block)) if block == first
+        ));
+        publication.complete_sync(ContentGeneration::new(1), 64).unwrap();
+        assert_eq!(registry.state.read().outstanding_write_targets, 1);
+        for previous in [second.block_id, BlockId::from_u64_u32(999, 0)] {
+            assert!(matches!(
+                registry.begin_allocate_block(inode_id, LeaseEpoch::new(7), Some(previous)),
+                Err(BeginAllocateBlockError::InvalidArgument(_))
+            ));
+        }
+        let replacement = issue_target(&registry, inode_id, Some(first.block_id), 2, 64, 2);
+        for (previous, expected) in [(None, first.clone()), (Some(first.block_id), replacement)] {
+            assert!(matches!(
+                registry.begin_allocate_block(inode_id, LeaseEpoch::new(7), previous),
+                Ok(BeginAllocateBlock::Replay(block)) if block == expected
+            ));
+        }
     }
 
     #[test]
@@ -2475,31 +2499,31 @@ mod tests {
 
         let first = issue_target(&registry, first_inode, None, 0, 0, 1);
         assert!(matches!(
-            registry.begin_add_block(first_inode, LeaseEpoch::new(7), Some(first.block_id)),
-            Err(BeginAddBlockError::LimitExceeded(WriteTargetLimitExceeded {
+            registry.begin_allocate_block(first_inode, LeaseEpoch::new(7), Some(first.block_id)),
+            Err(BeginAllocateBlockError::LimitExceeded(WriteTargetLimitExceeded {
                 limit: WriteTargetLimit::PerSession,
                 maximum: 1,
             }))
         ));
         issue_target(&registry, second_inode, None, 0, 0, 1);
         assert!(matches!(
-            registry.begin_add_block(third_inode, LeaseEpoch::new(7), None),
-            Err(BeginAddBlockError::LimitExceeded(WriteTargetLimitExceeded {
+            registry.begin_allocate_block(third_inode, LeaseEpoch::new(7), None),
+            Err(BeginAllocateBlockError::LimitExceeded(WriteTargetLimitExceeded {
                 limit: WriteTargetLimit::Global,
                 maximum: 2,
             }))
         ));
         assert!(matches!(
-            registry.begin_add_block(first_inode, LeaseEpoch::new(7), None),
-            Ok(BeginAddBlock::Replay(target)) if target == first
+            registry.begin_allocate_block(first_inode, LeaseEpoch::new(7), None),
+            Ok(BeginAllocateBlock::Replay(target)) if target == first
         ));
 
         registry
             .remove_session_if_epoch(second_inode, LeaseEpoch::new(7))
             .unwrap();
         assert!(matches!(
-            registry.begin_add_block(third_inode, LeaseEpoch::new(7), None),
-            Ok(BeginAddBlock::Reserved(_))
+            registry.begin_allocate_block(third_inode, LeaseEpoch::new(7), None),
+            Ok(BeginAllocateBlock::Reserved(_))
         ));
     }
 }

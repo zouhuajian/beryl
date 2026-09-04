@@ -6,8 +6,8 @@
 use crate::error::{ClientError, ClientResult};
 use crate::runtime::context::{Operation, OperationContext, OperationDeadline};
 use beryl_types::{
-    BlockId, BlockShape, CallId, ClientId, CommittedBlock, ContentGeneration, FileLayout, InodeId, WriteHandle,
-    WriteMode, WriteTarget,
+    BlockId, BlockShape, CallId, ClientId, CommittedBlock, ContentGeneration, FileLayout, InodeId, LocatedBlock,
+    WriteHandle, WriteMode,
 };
 use std::fmt::{Debug, Formatter, Result};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -99,13 +99,15 @@ impl WriteSession {
         self.write_handle
     }
 
-    /// Predecessor that identifies the next logical AddBlock step.
+    /// Predecessor that identifies the next logical AllocateBlock step.
+    /// It advances only after Worker completion, so a definite rejection before
+    /// Worker IO leaves subsequent allocation calls addressing the same block.
     pub(crate) fn previous_block_id(&self) -> Option<BlockId> {
         self.ready_blocks.last().map(|block| block.target.block_id)
     }
 
     /// Validate a metadata write target before opening the worker stream.
-    pub(crate) fn validate_target(&mut self, target: &WriteTarget) -> ClientResult<()> {
+    pub(crate) fn validate_target(&mut self, target: &LocatedBlock) -> ClientResult<()> {
         self.ensure_open_for_write()?;
         if target.file_offset != self.flush_cursor {
             return Err(ClientError::invalid_layout(format!(
@@ -157,7 +159,7 @@ impl WriteSession {
     }
 
     /// Records a durable Worker Ready block pending Metadata publication.
-    pub(crate) fn push_ready_block(&mut self, target: WriteTarget, written_len: u64) -> ClientResult<()> {
+    pub(crate) fn push_ready_block(&mut self, target: LocatedBlock, written_len: u64) -> ClientResult<()> {
         let final_offset = self
             .flush_cursor
             .checked_add(written_len)
@@ -546,13 +548,13 @@ impl WriteSession {
 /// Durable Worker Ready block pending Metadata publication.
 #[derive(Clone, Debug)]
 pub(crate) struct ReadyBlock {
-    target: WriteTarget,
+    target: LocatedBlock,
     written_len: u64,
 }
 
 impl ReadyBlock {
     /// Metadata write target for this block.
-    pub(crate) fn target(&self) -> &WriteTarget {
+    pub(crate) fn target(&self) -> &LocatedBlock {
         &self.target
     }
 

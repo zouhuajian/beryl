@@ -15,7 +15,7 @@ use tonic::transport as tonic_net;
 
 use crate::config::ClientConfig;
 use crate::error::{side_effect_response_body_mismatch, ClientError, ClientResult};
-use crate::metadata::model::{AddBlockResult, MetadataAuthorityUpdate, ReadLayout, ValidatedMetadataResponse};
+use crate::metadata::model::{AllocateBlockResult, MetadataAuthorityUpdate, ReadLayout, ValidatedMetadataResponse};
 use crate::metrics::{self, ClientMetric, ClientMetricLabels};
 use crate::rpc_error::{invalid_header_error, validate_header};
 use crate::runtime::AttemptContext;
@@ -86,12 +86,13 @@ pub(crate) trait MetadataTransport: Send + Sync {
         req: beryl_proto::metadata::OpenWriteRequestProto,
     ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::OpenWriteResponseProto>>;
 
-    /// Allocate a worker write target for a write session.
-    async fn add_block(
+    /// Allocate or replay one block in the current session's predecessor chain.
+    /// Implementations validate the response authority and block before returning.
+    async fn allocate_block(
         &self,
         ctx: AttemptContext,
-        req: beryl_proto::metadata::AddBlockRequestProto,
-    ) -> ClientResult<ValidatedMetadataResponse<AddBlockResult>>;
+        req: beryl_proto::metadata::AllocateBlockRequestProto,
+    ) -> ClientResult<ValidatedMetadataResponse<AllocateBlockResult>>;
 
     /// Commit a write session after worker data commit succeeds.
     async fn commit_file(
@@ -406,29 +407,29 @@ impl MetadataTransport for GrpcMetadataTransport {
         validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
-    async fn add_block(
+    async fn allocate_block(
         &self,
         ctx: AttemptContext,
-        mut req: beryl_proto::metadata::AddBlockRequestProto,
-    ) -> ClientResult<ValidatedMetadataResponse<AddBlockResult>> {
+        mut req: beryl_proto::metadata::AllocateBlockRequestProto,
+    ) -> ClientResult<ValidatedMetadataResponse<AllocateBlockResult>> {
         req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
             .await?
-            .add_block(tonic_request(&ctx, req))
+            .allocate_block(tonic_request(&ctx, req))
             .await
             .map_err(ClientError::from)?
             .into_inner();
         let authority = parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        let target = response
-            .target
-            .ok_or_else(|| side_effect_response_body_mismatch("AddBlock", "missing target"))?;
-        let target = target
+        let block = response
+            .block
+            .ok_or_else(|| side_effect_response_body_mismatch("AllocateBlock", "missing block"))?;
+        let block = block
             .try_into()
-            .map_err(|err| side_effect_response_body_mismatch("AddBlock", err))?;
-        let body = AddBlockResult {
+            .map_err(|err| side_effect_response_body_mismatch("AllocateBlock", err))?;
+        let body = AllocateBlockResult {
             group_name: authority.group_name.clone(),
-            target,
+            block,
         };
         Ok(ValidatedMetadataResponse::new(authority, body))
     }

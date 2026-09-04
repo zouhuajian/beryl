@@ -7,13 +7,13 @@
 //! operation, and map its result back to the wire response.
 
 use super::filesystem::{
-    AbortFileWriteArgs, AddBlockArgs, BlockLocationsTarget, CommitFileArgs, CreateDirectoryArgs, CreateFileArgs,
+    AbortFileWriteArgs, AllocateBlockArgs, BlockLocationsTarget, CommitFileArgs, CreateDirectoryArgs, CreateFileArgs,
     DeleteArgs, FileRange, Freshness, GetBlockLocationsArgs, GetStatusArgs, ListStatusArgs, OpenFileArgs,
     OpenWriteArgs, RenameArgs, RenewLeaseArgs, SyncWriteArgs,
 };
 use super::wire::{
-    file_attrs_from_proto, file_attrs_to_proto, header_from_fs_failure, header_from_rpc_error, location_to_proto,
-    ok_header_from_fs_success, request_context_from_proto, write_target_to_proto,
+    file_attrs_from_proto, file_attrs_to_proto, header_from_fs_failure, header_from_rpc_error, located_block_to_proto,
+    location_to_proto, ok_header_from_fs_success, request_context_from_proto,
 };
 use super::{MetadataFileSystem, MsyncHandler};
 use crate::config::{NamespaceListConfig, MAX_LIST_STATUS_PAGE_SIZE};
@@ -22,14 +22,14 @@ use crate::raft::PublishMode;
 use beryl_proto::common::{RequestHeaderProto, ResponseHeaderProto};
 use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use beryl_proto::metadata::{
-    get_block_locations_request_proto, AbortFileWriteRequestProto, AbortFileWriteResponseProto, AddBlockRequestProto,
-    AddBlockResponseProto, CommitFileRequestProto, CommitFileResponseProto, CommittedBlockProto,
-    CreateDirectoryRequestProto, CreateDirectoryResponseProto, CreateFileRequestProto, CreateFileResponseProto,
-    DeleteRequestProto, DeleteResponseProto, DirEntryProto, FileTypeProto, GetBlockLocationsRequestProto,
-    GetBlockLocationsResponseProto, GetStatusRequestProto, GetStatusResponseProto, ListStatusRequestProto,
-    ListStatusResponseProto, MsyncRequestProto, MsyncResponseProto, OpenFileRequestProto, OpenFileResponseProto,
-    OpenWriteRequestProto, OpenWriteResponseProto, RenameRequestProto, RenameResponseProto, RenewLeaseRequestProto,
-    RenewLeaseResponseProto, SyncWriteRequestProto, SyncWriteResponseProto, WriteHandleProto,
+    get_block_locations_request_proto, AbortFileWriteRequestProto, AbortFileWriteResponseProto,
+    AllocateBlockRequestProto, AllocateBlockResponseProto, CommitFileRequestProto, CommitFileResponseProto,
+    CommittedBlockProto, CreateDirectoryRequestProto, CreateDirectoryResponseProto, CreateFileRequestProto,
+    CreateFileResponseProto, DeleteRequestProto, DeleteResponseProto, DirEntryProto, FileTypeProto,
+    GetBlockLocationsRequestProto, GetBlockLocationsResponseProto, GetStatusRequestProto, GetStatusResponseProto,
+    ListStatusRequestProto, ListStatusResponseProto, MsyncRequestProto, MsyncResponseProto, OpenFileRequestProto,
+    OpenFileResponseProto, OpenWriteRequestProto, OpenWriteResponseProto, RenameRequestProto, RenameResponseProto,
+    RenewLeaseRequestProto, RenewLeaseResponseProto, SyncWriteRequestProto, SyncWriteResponseProto, WriteHandleProto,
 };
 use beryl_types::ids::InodeId;
 use beryl_types::{CommittedBlock, ContentGeneration, WriteHandle, WriteMode, MAX_FILE_EXTENTS};
@@ -66,7 +66,7 @@ impl_header_response!(
     GetBlockLocationsResponseProto,
     CreateFileResponseProto,
     OpenWriteResponseProto,
-    AddBlockResponseProto,
+    AllocateBlockResponseProto,
     CommitFileResponseProto,
     AbortFileWriteResponseProto,
     RenewLeaseResponseProto,
@@ -565,22 +565,24 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         }
     }
 
+    /// Decode the allocation predecessor and return a block only after session
+    /// ownership, freshness, and allocation completion have been validated.
     #[instrument(skip_all)]
-    async fn add_block(
+    async fn allocate_block(
         &self,
-        request: Request<AddBlockRequestProto>,
-    ) -> Result<Response<AddBlockResponseProto>, Status> {
+        request: Request<AllocateBlockRequestProto>,
+    ) -> Result<Response<AllocateBlockResponseProto>, Status> {
         let req = request.into_inner();
-        let req_ctx = request_context_or_error!(req, AddBlockResponseProto);
+        let req_ctx = request_context_or_error!(req, AllocateBlockResponseProto);
         let handle = match Self::write_handle_or_error(&req.header, req.write_handle) {
             Ok(handle) => handle,
-            Err(header) => return response_with_header!(AddBlockResponseProto::default(), *header),
+            Err(header) => return response_with_header!(AllocateBlockResponseProto::default(), *header),
         };
         let previous_block_id = match req.previous_block_id.map(TryInto::try_into).transpose() {
             Ok(previous_block_id) => previous_block_id,
             Err(err) => {
                 return error_response!(
-                    AddBlockResponseProto,
+                    AllocateBlockResponseProto,
                     Self::header_from_conversion_error(
                         &req.header,
                         MetadataError::InvalidArgument(format!("invalid previous_block_id: {err:?}")),
@@ -590,9 +592,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
         match self
             .filesystem
-            .add_block(
+            .allocate_block(
                 &req_ctx,
-                AddBlockArgs {
+                AllocateBlockArgs {
                     handle,
                     previous_block_id,
                     freshness: Self::freshness_from_header(&req.header),
@@ -601,13 +603,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             .await
         {
             Ok(success) => response_with_header!(
-                AddBlockResponseProto {
-                    target: Some(write_target_to_proto(&success.payload.target)),
+                AllocateBlockResponseProto {
+                    block: Some(located_block_to_proto(&success.payload.block)),
                     ..Default::default()
                 },
                 ok_header_from_fs_success(&req_ctx, &success)
             ),
-            Err(failure) => error_response!(AddBlockResponseProto, header_from_fs_failure(&req_ctx, &failure)),
+            Err(failure) => error_response!(AllocateBlockResponseProto, header_from_fs_failure(&req_ctx, &failure)),
         }
     }
 
@@ -856,8 +858,8 @@ mod tests {
     use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
     use beryl_proto::metadata::get_block_locations_request_proto::Target;
     use beryl_proto::metadata::{
-        AddBlockRequestProto, CommitFileRequestProto, CommittedBlockProto, CreateFileRequestProto,
-        GetBlockLocationsRequestProto, OpenWriteModeProto, SyncWriteRequestProto, WriteHandleProto, WriteTargetProto,
+        AllocateBlockRequestProto, CommitFileRequestProto, CommittedBlockProto, CreateFileRequestProto,
+        GetBlockLocationsRequestProto, LocatedBlockProto, OpenWriteModeProto, SyncWriteRequestProto, WriteHandleProto,
     };
     use beryl_types::fs::{FileAttrs, Inode, InodeData};
     use beryl_types::ids::{BlockId, BlockIndex, InodeId, MountId, WorkerId};
@@ -1096,7 +1098,7 @@ mod tests {
             .expect("full block report should publish location");
     }
 
-    fn publish_target_reports(env: &PathTestEnv, targets: &[&WriteTargetProto]) {
+    fn publish_target_reports(env: &PathTestEnv, targets: &[&LocatedBlockProto]) {
         let mut by_worker = HashMap::<WorkerId, Vec<(BlockId, u64, u64)>>::new();
         for target in targets {
             let worker_id = WorkerId::new(
@@ -1138,9 +1140,9 @@ mod tests {
         let expected_generation = create.generation;
         let write_mode = OpenWriteModeProto::OpenWriteModeWrite as i32;
         let write_handle = create.write_handle.expect("write handle");
-        let target = FileSystemServiceProto::add_block(
+        let target = FileSystemServiceProto::allocate_block(
             &env.service,
-            Request::new(AddBlockRequestProto {
+            Request::new(AllocateBlockRequestProto {
                 header: header(client_id),
                 write_handle: Some(write_handle),
                 previous_block_id: None,
@@ -1149,7 +1151,7 @@ mod tests {
         .await
         .expect("transport status must remain OK")
         .into_inner()
-        .target
+        .block
         .expect("write target");
         let reported_block_id = target.block_id.as_ref().expect("target block id");
         let reported_worker_id = WorkerId::new(
@@ -1315,9 +1317,9 @@ mod tests {
 
         let write_handle = create.write_handle.expect("write handle");
 
-        let first_target = FileSystemServiceProto::add_block(
+        let first_target = FileSystemServiceProto::allocate_block(
             &env.service,
-            Request::new(AddBlockRequestProto {
+            Request::new(AllocateBlockRequestProto {
                 header: header(client_id),
                 write_handle: Some(write_handle),
                 previous_block_id: None,
@@ -1326,11 +1328,11 @@ mod tests {
         .await
         .expect("transport status must remain OK")
         .into_inner()
-        .target
+        .block
         .expect("first target");
-        let second_target = FileSystemServiceProto::add_block(
+        let second_target = FileSystemServiceProto::allocate_block(
             &env.service,
-            Request::new(AddBlockRequestProto {
+            Request::new(AllocateBlockRequestProto {
                 header: header(client_id),
                 write_handle: Some(write_handle),
                 previous_block_id: first_target.block_id,
@@ -1339,7 +1341,7 @@ mod tests {
         .await
         .expect("transport status must remain OK")
         .into_inner()
-        .target
+        .block
         .expect("second target");
         let first = CommittedBlockProto {
             block_id: first_target.block_id,

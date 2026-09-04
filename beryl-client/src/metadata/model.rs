@@ -6,7 +6,7 @@
 use crate::api::FileStatus;
 use crate::error::{ClientError, ClientResult};
 use beryl_proto::metadata::GetBlockLocationsResponseProto;
-use beryl_types::{ContentGeneration, FileBlockLocation, GroupName, GroupStateWatermark, InodeId, WriteTarget};
+use beryl_types::{ContentGeneration, FileBlockLocation, GroupName, GroupStateWatermark, InodeId, LocatedBlock};
 
 /// Server-authorized metadata state learned from one validated successful response.
 ///
@@ -140,11 +140,11 @@ impl ReadLayout {
     }
 }
 
-/// Write target returned by AddBlock with its owner group.
+/// Validated allocation result paired with the Metadata owner group for Worker IO.
 #[derive(Clone, Debug)]
-pub(crate) struct AddBlockResult {
+pub(crate) struct AllocateBlockResult {
     /// Metadata owner group for the block target.
     pub group_name: GroupName,
-    /// Worker target for this block.
-    pub target: WriteTarget,
+    /// Metadata-issued block and write authorization, including on allocation replay.
+    pub block: LocatedBlock,
 }

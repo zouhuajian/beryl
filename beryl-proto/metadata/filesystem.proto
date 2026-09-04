@@ -76,8 +76,11 @@ message WriteHandleProto {
   uint64 write_lease_epoch = 2;
 }
 
-message WriteTargetProto {
+// Metadata-issued block identity, write locations, layout, and fencing authority.
+// Locations are selected destinations, not evidence that data exists or is readable.
+message LocatedBlockProto {
   common.BlockIdProto block_id = 1;
+  // Start of this block in the file; new-block IO starts at block-local offset zero.
   uint64 file_offset = 2;
   // Metadata-selected Beryl block data/meta interpretation format for this target.
   // Worker-local execution backend selection is not encoded here.
@@ -275,17 +278,21 @@ message OpenWriteResponseProto {
   uint64 generation = 6;
 }
 
-message AddBlockRequestProto {
+message AllocateBlockRequestProto {
   common.RequestHeaderProto header = 1;
   WriteHandleProto write_handle = 2;
-  // The first allocation has no predecessor. Every later logical allocation
-  // names the block returned by the preceding AddBlock.
+  // Absent for the first allocation in this write session, including append.
+  // Otherwise identifies the preceding allocation in the active session chain.
+  // An existing successor is replayed unchanged while its record remains valid.
+  // SyncWrite may retire an unpublished suffix, allowing its predecessor to
+  // identify a new allocation. This is not cross-session historical deduplication.
   optional common.BlockIdProto previous_block_id = 3;
 }
 
-message AddBlockResponseProto {
+message AllocateBlockResponseProto {
   common.ResponseHeaderProto header = 1;
-  WriteTargetProto target = 2;
+  // Required on success. Allocation alone neither writes nor publishes file data.
+  LocatedBlockProto block = 2;
 }
 
 message CommitFileRequestProto {
@@ -366,7 +373,8 @@ service FileSystemServiceProto {
   // write
   rpc CreateFile(CreateFileRequestProto) returns (CreateFileResponseProto);
   rpc OpenWrite(OpenWriteRequestProto) returns (OpenWriteResponseProto);
-  rpc AddBlock(AddBlockRequestProto) returns (AddBlockResponseProto);
+  // Allocate a new block, or replay its still-valid predecessor-addressed result.
+  rpc AllocateBlock(AllocateBlockRequestProto) returns (AllocateBlockResponseProto);
   rpc CommitFile(CommitFileRequestProto) returns (CommitFileResponseProto);
   rpc AbortFileWrite(AbortFileWriteRequestProto) returns (AbortFileWriteResponseProto);
   rpc RenewLease(RenewLeaseRequestProto) returns (RenewLeaseResponseProto);

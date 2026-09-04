@@ -32,7 +32,7 @@ use tokio::sync::RwLock;
 pub(super) use namespace::{CreateDirectoryArgs, CreateFileArgs, DeleteArgs, RenameArgs};
 pub(super) use publish::{CommitFileArgs, SyncWriteArgs};
 pub(super) use read::{BlockLocationsTarget, GetBlockLocationsArgs, GetStatusArgs, ListStatusArgs, OpenFileArgs};
-pub(super) use write::{AbortFileWriteArgs, AddBlockArgs, OpenWriteArgs, RenewLeaseArgs};
+pub(super) use write::{AbortFileWriteArgs, AllocateBlockArgs, OpenWriteArgs, RenewLeaseArgs};
 
 /// The supported runtime authorizes exactly one worker for each block.
 const SUPPORTED_REPLICA_COUNT: u8 = 1;
@@ -418,7 +418,7 @@ mod tests {
     pub(super) use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
     pub(super) use crate::service::filesystem::publish::{CloseWriteIntent, CloseWriteOutput};
     pub(super) use crate::service::filesystem::write::OpenWriteOutput;
-    use crate::session_registry::{BeginAddBlock, BeginSessionInput, WriteSession};
+    use crate::session_registry::{BeginAllocateBlock, BeginSessionInput, WriteSession};
     use crate::state::RouteEpoch;
     pub(super) use crate::worker::{BlockReportBlock, BlockReportBlockState, WorkerDescriptor, WorkerManager};
     pub(super) use beryl_common::error::rpc::{
@@ -431,7 +431,7 @@ mod tests {
     pub(super) use beryl_types::layout::FileLayout;
     pub(super) use beryl_types::lease::FencingToken;
     use beryl_types::{BlockFormatId, ContentGeneration, LeaseEpoch, WriteMode};
-    pub(super) use beryl_types::{CommittedBlock, GroupName, Tier, TierFree, WorkerRunId, WriteTarget};
+    pub(super) use beryl_types::{CommittedBlock, GroupName, LocatedBlock, Tier, TierFree, WorkerRunId};
     use std::ops::Deref;
     use std::sync::atomic::{AtomicU64, Ordering};
     pub(super) use std::sync::Arc;
@@ -836,7 +836,7 @@ mod tests {
         let writer = ClientId::new(7);
         let lease_epoch = LeaseEpoch::new(1);
         let block_id = BlockId::new(inode_id, BlockIndex::new(0));
-        let target = WriteTarget {
+        let target = LocatedBlock {
             block_id,
             file_offset: 0,
             block_size: 64,
@@ -868,11 +868,11 @@ mod tests {
             .expect("session capacity");
         opening.activate(lease_epoch).expect("session created");
         let target_reservation = match session_registry
-            .begin_add_block(inode_id, lease_epoch, None)
+            .begin_allocate_block(inode_id, lease_epoch, None)
             .expect("target capacity")
         {
-            BeginAddBlock::Reserved(reservation) => reservation,
-            BeginAddBlock::Replay(_) => panic!("new target must reserve capacity"),
+            BeginAllocateBlock::Reserved(reservation) => reservation,
+            BeginAllocateBlock::Replay(_) => panic!("new target must reserve capacity"),
         };
         target_reservation.complete(target).expect("target installed");
     }
@@ -885,13 +885,13 @@ mod tests {
         }
     }
 
-    pub(super) async fn add_block_for_key(filesystem: &MetadataFileSystem, key: &OpenWriteOutput) -> WriteTarget {
+    pub(super) async fn allocate_block_for_key(filesystem: &MetadataFileSystem, key: &OpenWriteOutput) -> LocatedBlock {
         let previous_block_id = filesystem
             .session_registry
             .get_session(key.inode_id)
             .and_then(|session| session.issued_targets.last().map(|target| target.block_id));
         filesystem
-            .add_block_session(
+            .allocate_block_session(
                 &request_context(),
                 key.inode_id,
                 key.lease_epoch,
@@ -899,9 +899,9 @@ mod tests {
                 Freshness::default(),
             )
             .await
-            .expect("AddBlock should succeed")
+            .expect("AllocateBlock should succeed")
             .payload
-            .target
+            .block
     }
 
     pub(super) async fn commit_for_key(
@@ -983,13 +983,13 @@ mod tests {
         }
     }
 
-    pub(super) fn publish_env_write_target(env: &WriteFlowEnv, target: &WriteTarget, report_seq: u64) {
+    pub(super) fn publish_env_write_target(env: &WriteFlowEnv, target: &LocatedBlock, report_seq: u64) {
         publish_env_write_target_with_len(env, target, report_seq, 64);
     }
 
     pub(super) fn publish_env_write_target_with_len(
         env: &WriteFlowEnv,
-        target: &WriteTarget,
+        target: &LocatedBlock,
         report_seq: u64,
         effective_len: u64,
     ) {

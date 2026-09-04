@@ -30,7 +30,7 @@ pub use layout::{
     BlockFormatId, BlockFormatIdError, BlockShape, BlockShapeError, FileLayout, FileLayoutError, MAX_BLOCK_SIZE,
 };
 pub use lease::{FencingToken, LeaseEpoch, WriteHandle};
-pub use location::{CommittedBlock, FileBlockLocation, WriteTarget};
+pub use location::{CommittedBlock, FileBlockLocation, LocatedBlock};
 pub use raft_log_id::RaftLogId;
 pub use tier::{Tier, TierError, TierFree};
 pub use worker::{MAX_REPORT_ENTRIES, WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId};

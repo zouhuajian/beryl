@@ -17,8 +17,8 @@ use crate::common::{
     WorkerEndpointInfoProto, WorkerErrorKindProto,
 };
 use crate::metadata::{
-    CommittedBlockProto, FileAttrsProto, FileBlockLocationProto, FileTypeProto, OpenWriteModeProto, WriteHandleProto,
-    WriteTargetProto,
+    CommittedBlockProto, FileAttrsProto, FileBlockLocationProto, FileTypeProto, LocatedBlockProto, OpenWriteModeProto,
+    WriteHandleProto,
 };
 use ::beryl_common::Deadline;
 use ::beryl_common::error::rpc::{
@@ -32,7 +32,7 @@ use beryl_types::layout::{BlockFormatId, BlockShape, FileLayout};
 use beryl_types::lease::{FencingToken, LeaseEpoch, WriteHandle};
 use beryl_types::{
     CallId, ClientId, CommittedBlock, FileAttrs, FileBlockLocation, FileType, GroupName, GroupStateWatermark, InodeId,
-    RaftLogId, Tier, WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId, WriteMode, WriteTarget,
+    LocatedBlock, RaftLogId, Tier, WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId, WriteMode,
 };
 
 // ============================================================================
@@ -384,28 +384,29 @@ impl From<WorkerEndpointInfo> for WorkerEndpointInfoProto {
     }
 }
 
-impl TryFrom<WriteTargetProto> for WriteTarget {
+/// Validate write locations, block shape, and matching fencing identity at the wire boundary.
+impl TryFrom<LocatedBlockProto> for LocatedBlock {
     type Error = String;
 
-    fn try_from(target: WriteTargetProto) -> Result<Self, Self::Error> {
+    fn try_from(target: LocatedBlockProto) -> Result<Self, Self::Error> {
         let block_format_id = BlockFormatId::from_raw(target.block_format_id)
-            .map_err(|err| format!("WriteTargetProto.block_format_id invalid: {err}"))?;
+            .map_err(|err| format!("LocatedBlockProto.block_format_id invalid: {err}"))?;
         BlockShape::new(block_format_id, target.block_size, target.chunk_size, target.block_size)
-            .map_err(|err| format!("WriteTargetProto invalid block shape: {err}"))?;
+            .map_err(|err| format!("LocatedBlockProto invalid block shape: {err}"))?;
         if target.worker_endpoints.is_empty() {
-            return Err("WriteTargetProto.worker_endpoints must not be empty".to_string());
+            return Err("LocatedBlockProto.worker_endpoints must not be empty".to_string());
         }
         if target.block_stamp == 0 {
-            return Err("WriteTargetProto.block_stamp must be non-zero".to_string());
+            return Err("LocatedBlockProto.block_stamp must be non-zero".to_string());
         }
-        let tier = parse_known_tier(target.tier).map_err(|err| format!("WriteTargetProto.tier invalid: {err}"))?;
-        let block_id = required_block_id(target.block_id, "WriteTargetProto.block_id")?;
-        let fencing_token = required_fencing_token(target.fencing_token, "WriteTargetProto.fencing_token")?;
+        let tier = parse_known_tier(target.tier).map_err(|err| format!("LocatedBlockProto.tier invalid: {err}"))?;
+        let block_id = required_block_id(target.block_id, "LocatedBlockProto.block_id")?;
+        let fencing_token = required_fencing_token(target.fencing_token, "LocatedBlockProto.fencing_token")?;
         if fencing_token.block_id != block_id {
-            return Err("WriteTargetProto.fencing_token block_id must match block_id".to_string());
+            return Err("LocatedBlockProto.fencing_token block_id must match block_id".to_string());
         }
         if fencing_token.owner.is_zero() || fencing_token.epoch.as_raw() == 0 {
-            return Err("WriteTargetProto.fencing_token owner and epoch must be non-zero".to_string());
+            return Err("LocatedBlockProto.fencing_token owner and epoch must be non-zero".to_string());
         }
         let worker_endpoints = target
             .worker_endpoints
@@ -426,8 +427,8 @@ impl TryFrom<WriteTargetProto> for WriteTarget {
     }
 }
 
-impl From<&WriteTarget> for WriteTargetProto {
-    fn from(target: &WriteTarget) -> Self {
+impl From<&LocatedBlock> for LocatedBlockProto {
+    fn from(target: &LocatedBlock) -> Self {
         Self {
             block_id: Some(target.block_id.into()),
             file_offset: target.file_offset,
@@ -442,8 +443,8 @@ impl From<&WriteTarget> for WriteTargetProto {
     }
 }
 
-impl From<WriteTarget> for WriteTargetProto {
-    fn from(target: WriteTarget) -> Self {
+impl From<LocatedBlock> for LocatedBlockProto {
+    fn from(target: LocatedBlock) -> Self {
         Self {
             block_id: Some(target.block_id.into()),
             file_offset: target.file_offset,
@@ -1158,7 +1159,7 @@ mod tests {
         let block_id = BlockId::from_u64_u32(42, 3);
         let token = FencingToken::new(block_id, ClientId::new(9), LeaseEpoch::new(17));
 
-        let mut target = WriteTargetProto {
+        let mut target = LocatedBlockProto {
             block_id: Some(block_id.into()),
             file_offset: 128,
             worker_endpoints: Vec::new(),
@@ -1169,11 +1170,13 @@ mod tests {
             block_size: 4096,
             tier: TierProto::TierHdd as i32,
         };
-        let err = WriteTarget::try_from(target.clone()).expect_err("empty target workers must fail");
+        let err = LocatedBlock::try_from(target.clone()).expect_err("empty target workers must fail");
         assert!(err.contains("worker_endpoints"));
         target.worker_endpoints.push(endpoint());
+        let decoded = LocatedBlock::try_from(target.clone()).expect("valid allocated block");
+        assert_eq!(LocatedBlockProto::from(decoded), target);
         target.block_stamp = 0;
-        let err = WriteTarget::try_from(target).expect_err("zero target block_stamp must fail");
+        let err = LocatedBlock::try_from(target).expect_err("zero target block_stamp must fail");
         assert!(err.contains("block_stamp"));
 
         let mut location = FileBlockLocationProto {

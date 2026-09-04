@@ -15,7 +15,7 @@ use beryl_proto::common::{GroupStateWatermarkProto, RequestHeaderProto, Response
 use beryl_proto::convert::rpc_error_to_proto;
 use beryl_proto::metadata::file_system_service_proto_server::{FileSystemServiceProto, FileSystemServiceProtoServer};
 use beryl_proto::metadata::{
-    AbortFileWriteRequestProto, AbortFileWriteResponseProto, AddBlockRequestProto, AddBlockResponseProto,
+    AbortFileWriteRequestProto, AbortFileWriteResponseProto, AllocateBlockRequestProto, AllocateBlockResponseProto,
     CommitFileRequestProto, CommitFileResponseProto, CreateDirectoryRequestProto, CreateDirectoryResponseProto,
     CreateFileRequestProto, CreateFileResponseProto, DeleteRequestProto, DeleteResponseProto,
     GetBlockLocationsRequestProto, GetBlockLocationsResponseProto, GetStatusRequestProto, GetStatusResponseProto,
@@ -75,7 +75,7 @@ pub(crate) struct MetadataScript {
     pub(crate) get_block_locations: VecDeque<MetadataReply<GetBlockLocationsResponseProto>>,
     pub(crate) create_file: VecDeque<MetadataReply<CreateFileResponseProto>>,
     pub(crate) open_write: VecDeque<MetadataReply<OpenWriteResponseProto>>,
-    pub(crate) add_block: VecDeque<MetadataReply<AddBlockResponseProto>>,
+    pub(crate) allocate_block: VecDeque<MetadataReply<AllocateBlockResponseProto>>,
     pub(crate) commit_file: VecDeque<MetadataReply<CommitFileResponseProto>>,
     pub(crate) abort_file_write: VecDeque<MetadataReply<AbortFileWriteResponseProto>>,
     pub(crate) renew_lease: VecDeque<MetadataReply<RenewLeaseResponseProto>>,
@@ -97,6 +97,7 @@ pub(crate) struct MockMetadata {
 struct MetadataState {
     script: Mutex<MetadataScript>,
     calls: Mutex<Vec<MetadataCall>>,
+    allocations: Mutex<Vec<AllocateBlockRequestProto>>,
 }
 
 impl MockMetadata {
@@ -105,12 +106,17 @@ impl MockMetadata {
             state: Arc::new(MetadataState {
                 script: Mutex::new(script),
                 calls: Mutex::new(Vec::new()),
+                allocations: Mutex::new(Vec::new()),
             }),
         }
     }
 
     pub(crate) fn calls(&self) -> Vec<MetadataCall> {
         self.state.calls.lock().expect("metadata calls").clone()
+    }
+
+    pub(crate) fn allocations(&self) -> Vec<AllocateBlockRequestProto> {
+        self.state.allocations.lock().expect("allocation requests").clone()
     }
 
     pub(crate) async fn start(&self) -> RunningServer {
@@ -316,14 +322,27 @@ impl FileSystemServiceProto for MockMetadata {
         metadata_response(&header, reply, "OpenWrite", |body, header| body.header = Some(header))
     }
 
-    async fn add_block(
+    async fn allocate_block(
         &self,
-        request: Request<AddBlockRequestProto>,
-    ) -> Result<Response<AddBlockResponseProto>, Status> {
+        request: Request<AllocateBlockRequestProto>,
+    ) -> Result<Response<AllocateBlockResponseProto>, Status> {
         let request = request.into_inner();
-        let header = self.record("AddBlock", request.header.as_ref())?;
-        let reply = self.state.script.lock().expect("metadata script").add_block.pop_front();
-        metadata_response(&header, reply, "AddBlock", |body, header| body.header = Some(header))
+        let header = self.record("AllocateBlock", request.header.as_ref())?;
+        self.state
+            .allocations
+            .lock()
+            .expect("allocation requests")
+            .push(request);
+        let reply = self
+            .state
+            .script
+            .lock()
+            .expect("metadata script")
+            .allocate_block
+            .pop_front();
+        metadata_response(&header, reply, "AllocateBlock", |body, header| {
+            body.header = Some(header)
+        })
     }
 
     async fn commit_file(

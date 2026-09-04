@@ -453,8 +453,8 @@ mod tests {
     };
     use beryl_types::lease::FencingToken;
     use beryl_types::{
-        BlockFormatId, BlockId, BlockIndex, ClientId, InodeId, LeaseEpoch, Tier, WorkerEndpointInfo, WorkerId,
-        WorkerNetProtocol, WorkerRunId, WriteTarget,
+        BlockFormatId, BlockId, BlockIndex, ClientId, InodeId, LeaseEpoch, LocatedBlock, Tier, WorkerEndpointInfo,
+        WorkerId, WorkerNetProtocol, WorkerRunId,
     };
     use bytes::Bytes;
     use prost::Message;
@@ -741,7 +741,7 @@ mod tests {
         let block_id = block_id();
         WorkerWriteTarget {
             group_name: group_name(),
-            target: WriteTarget {
+            target: LocatedBlock {
                 block_id,
                 file_offset: 0,
                 block_size: 4096,
