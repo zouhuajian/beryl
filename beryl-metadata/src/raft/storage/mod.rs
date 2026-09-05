@@ -26,12 +26,12 @@ mod state_machine_store;
 mod transaction;
 
 use crate::error::{MetadataError, MetadataResult};
+use crate::inode::Inode;
 use crate::mount::MountEntry;
 use crate::raft::AppMetadataRaftState;
 use crate::session_registry::CreateFileOperationId;
 use crate::state::RouteEpoch;
 use crate::worker::WorkerInfo;
-use beryl_types::fs::Inode;
 use beryl_types::ids::{InodeId, MountId, WorkerId};
 use beryl_types::layout::FileLayout;
 use beryl_types::{CallId, ClientId, ContentGeneration, GroupName, LeaseEpoch};
@@ -64,7 +64,7 @@ const ROCKSDB_SCHEMA_VERSION_KEY: &[u8] = b"rocksdb_schema_version";
 const STORAGE_IDENTITY_KEY: &[u8] = b"storage_identity";
 const RAFT_STATE_KEY: &[u8] = b"raft_state";
 /// Guards database and snapshot decoding against incompatible persisted metadata encodings.
-pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 2;
+pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 3;
 const NEXT_INODE_ID_KEY: &[u8] = b"next_inode_id";
 const CREATE_FILE_REPLAY_COUNT_KEY: &[u8] = b"create_file_replay_count";
 const CREATE_FILE_REPLAY_PREFIX: &[u8] = b"create_file_replay/";

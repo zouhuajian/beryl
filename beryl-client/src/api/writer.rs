@@ -6,7 +6,7 @@
 use crate::client_inner::{
     is_unknown_session_barrier_outcome, mark_session_after_metadata_error, metric_labels, ClientInner,
 };
-use crate::error::ClientResult;
+use crate::error::{ClientErrorKind, ClientResult};
 use crate::metrics::ClientMetric;
 use crate::runtime::OperationDeadline;
 use crate::session::write_session::WriteSession;
@@ -219,7 +219,14 @@ impl FileWriter {
                 self.session.mark_closed();
                 Ok(())
             }
-            Err(err) if is_unknown_session_barrier_outcome(&err) => {
+            Err(err)
+                if retrying_unknown_commit
+                    || is_unknown_session_barrier_outcome(&err)
+                    || err.kind() == ClientErrorKind::Internal =>
+            {
+                // A later fence or missing receipt cannot establish the outcome
+                // of the original attempt, including a cancelled close future.
+                // Internal failures also lack proof that Raft did not apply.
                 self.session.mark_commit_unknown();
                 self.inner.record_metric(
                     ClientMetric::UnknownOutcome,

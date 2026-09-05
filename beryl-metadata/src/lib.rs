@@ -79,6 +79,7 @@
 pub mod config;
 pub(crate) mod data_io;
 pub(crate) mod error;
+pub(crate) mod inode;
 pub mod lifecycle;
 pub mod maintenance;
 pub(crate) mod metrics;

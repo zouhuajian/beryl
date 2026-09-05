@@ -6,13 +6,14 @@
 use super::command::unexpected_raft_apply_success;
 use super::{validate_active_write_layout, Freshness, FsResult, MetadataFileSystem, RequestContext, RoutedFsWriteCtx};
 use crate::error::{MetadataError, MetadataResult};
+use crate::inode::{Inode, InodeData};
 use crate::observe;
 use crate::path_resolver::PathResolver;
 use crate::raft::{ApplySuccess, Command};
 use crate::session_registry::{
     BeginCreateSession, BeginCreateSessionError, BeginCreateSessionInput, CreateFileOperationId, WriteOpeningError,
 };
-use beryl_types::fs::{FileAttrs, Inode, InodeData};
+use beryl_types::fs::FileAttrs;
 use beryl_types::ids::InodeId;
 use beryl_types::layout::FileLayout;
 use beryl_types::{ContentGeneration, LeaseEpoch};

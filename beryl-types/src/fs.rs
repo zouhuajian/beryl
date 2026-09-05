@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Filesystem (FS) domain types for inode/dentry-based metadata model.
+//! Shared filesystem attributes, write modes, and visible extent types.
 //!
-//! These types are the authoritative representation of filesystem metadata.
-//! They are independent of transport (gRPC/proto) and storage (RocksDB) layers.
+//! Metadata owns persisted inode state; these domain values remain independent
+//! of transport (gRPC/proto) and storage (RocksDB) layers.
 
-use crate::ids::{BlockId, InodeId, MountId};
-use crate::lease::LeaseEpoch;
+use crate::ids::BlockId;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter, Result};
 
@@ -174,124 +173,10 @@ pub struct Extent {
     pub block_stamp: Option<u64>,
 }
 
-/// Inode data (variant-specific information).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InodeData {
-    /// File inode data.
-    /// Includes extents for the committed block map, generation for visible
-    /// file state, lease_epoch for lease management, and the next durable block
-    /// ordinal reserved for this file inode.
-    File {
-        /// File extents (block map).
-        /// Supports append-only write path.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        extents: Vec<Extent>,
-        /// Generation of the currently visible file contents.
-        /// Advanced by authoritative metadata apply when committed content,
-        /// size or read-plan state changes.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        generation: Option<ContentGeneration>,
-        /// Lease epoch (monotonically increasing, for fencing).
-        /// Persisted in inode for lease management.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        lease_epoch: Option<LeaseEpoch>,
-        /// Next block ordinal to allocate for this file.
-        /// This counter is monotonic and is not derived from visible extents.
-        next_block_index: u64,
-    },
-    /// Directory inode data.
-    /// Payload intentionally empty; entries live in dentry/direntry index.
-    Dir,
-    /// Symlink inode data.
-    /// Placeholder for target path.
-    Symlink {
-        /// Placeholder: future target path.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        target: Option<String>,
-    },
-}
-
-impl InodeData {
-    /// Returns the FileType for this data.
-    pub fn kind(&self) -> FileType {
-        match self {
-            InodeData::File { .. } => FileType::File,
-            InodeData::Dir => FileType::Dir,
-            InodeData::Symlink { .. } => FileType::Symlink,
-        }
-    }
-}
-
-/// Inode (filesystem object).
-///
-/// This is the authoritative representation of a filesystem object.
-/// Each inode has a unique ID, kind, attributes, and optional variant-specific data.
-///
-/// Mount_id allows O(1) mount resolution during FS write routing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Inode {
-    /// Inode ID.
-    pub inode_id: InodeId,
-    /// Inode kind.
-    pub kind: FileType,
-    /// File attributes.
-    pub attrs: FileAttrs,
-    /// Variant-specific data.
-    pub data: InodeData,
-    /// Mount ID: identifies which mount this inode belongs to.
-    /// Root inode is set at mount creation; child inodes inherit from parent.
-    /// Used for O(1) mount resolution during FS write routing.
-    pub mount_id: MountId,
-}
-
-impl Inode {
-    /// Creates a new inode with mount_id.
-    pub fn new(inode_id: InodeId, kind: FileType, attrs: FileAttrs, mount_id: MountId) -> Self {
-        let data = match kind {
-            FileType::File => InodeData::File {
-                extents: Vec::new(),
-                generation: None,
-                lease_epoch: None,
-                next_block_index: 0,
-            },
-            FileType::Dir => InodeData::Dir,
-            FileType::Symlink => InodeData::Symlink { target: None },
-        };
-        Self {
-            inode_id,
-            kind,
-            attrs,
-            data,
-            mount_id,
-        }
-    }
-
-    /// Creates a new file inode.
-    pub fn new_file(inode_id: InodeId, attrs: FileAttrs, mount_id: MountId) -> Self {
-        Self::new(inode_id, FileType::File, attrs, mount_id)
-    }
-
-    /// Creates a new directory inode.
-    pub fn new_dir(inode_id: InodeId, attrs: FileAttrs, mount_id: MountId) -> Self {
-        Self::new(inode_id, FileType::Dir, attrs, mount_id)
-    }
-
-    /// Creates a new symlink inode.
-    pub fn new_symlink(inode_id: InodeId, attrs: FileAttrs, target: String, mount_id: MountId) -> Self {
-        Self {
-            inode_id,
-            kind: FileType::Symlink,
-            attrs,
-            data: InodeData::Symlink { target: Some(target) },
-            mount_id,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lease::LeaseEpoch;
 
     #[test]
     fn file_counters_preserve_scalar_encoding_and_never_wrap() {

@@ -3,11 +3,13 @@
 
 //! Metadata authority commands replicated through Raft.
 
+use crate::inode::FilePublication;
+pub(crate) use crate::inode::PublishMode;
 use crate::session_registry::CreateFileOperationId;
 use beryl_types::fs::{Extent, FileAttrs};
 use beryl_types::ids::{InodeId, MountId, WorkerId};
 use beryl_types::layout::FileLayout;
-use beryl_types::{ContentGeneration, GroupName, LeaseEpoch};
+use beryl_types::{CallId, ClientId, ContentGeneration, GroupName, LeaseEpoch};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,19 +25,10 @@ pub(crate) const MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES: u32 = 1024 * 1024;
 /// machine work after replay.
 pub(crate) const MAX_COMMAND_BYTES: usize = 4 * 1024 * 1024;
 
-/// File publication precondition and merge behavior.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum PublishMode {
-    /// Replace content only while the expected content generation is current.
-    ReplaceIfUnchanged,
-    /// Append content only while the expected content generation is current.
-    AppendIfUnchanged,
-}
-
 /// One durable metadata authority operation.
 ///
-/// RPC identity is absent except for atomic CreateFile, whose exact client/call
-/// identity is part of its durable response-loss replay contract.
+/// CreateFile and CommitFile carry stable client/call identities for durable
+/// response-loss replay. Other mutations retain their own state preconditions.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Command {
     BootstrapNamespace {
@@ -111,6 +104,14 @@ pub(crate) enum Command {
         lease_epoch: LeaseEpoch,
         mode: PublishMode,
     },
+    /// Publish content, end the exact writer epoch, and record completion atomically.
+    CommitFile {
+        proposed_at_ms: u64,
+        inode_id: InodeId,
+        client_id: ClientId,
+        call_id: CallId,
+        publication: FilePublication,
+    },
     RegisterWorkerDescriptor {
         proposed_at_ms: u64,
         group_name: GroupName,
@@ -144,6 +145,7 @@ impl Command {
             Self::AllocateBlock { .. } => "allocate_block",
             Self::EndWriteLease { .. } => "end_write_lease",
             Self::PublishFile { .. } => "publish_file",
+            Self::CommitFile { .. } => "commit_file",
             Self::RegisterWorkerDescriptor { .. } => "register_worker_descriptor",
             Self::ReclaimDetachedRoots { .. } => "reclaim_detached_roots",
         }
@@ -164,7 +166,7 @@ mod tests {
     use beryl_types::{BlockId, BlockIndex, MAX_FILE_EXTENTS};
 
     #[test]
-    fn maximum_publish_file_command_fits_command_limit() {
+    fn maximum_commit_file_command_fits_command_limit() {
         let inode_id = InodeId::new(u64::MAX);
         let extents = (0..MAX_FILE_EXTENTS)
             .map(|index| Extent {
@@ -176,21 +178,25 @@ mod tests {
                 block_stamp: Some(u64::MAX),
             })
             .collect();
-        let command = Command::PublishFile {
+        let command = Command::CommitFile {
             proposed_at_ms: u64::MAX,
             inode_id,
-            extents,
-            target_size: u64::MAX,
-            expected_generation: ContentGeneration::new(u64::MAX),
-            expected_file_size: u64::MAX,
-            lease_epoch: LeaseEpoch::new(u64::MAX),
-            mode: PublishMode::ReplaceIfUnchanged,
+            client_id: ClientId::new(u128::MAX),
+            call_id: CallId::new(),
+            publication: FilePublication {
+                extents,
+                target_size: u64::MAX,
+                expected_generation: ContentGeneration::new(u64::MAX),
+                expected_file_size: u64::MAX,
+                lease_epoch: LeaseEpoch::new(u64::MAX),
+                mode: PublishMode::ReplaceIfUnchanged,
+            },
         };
 
         let encoded = serde_json::to_vec(&command).expect("maximum legal command must serialize");
         assert!(
             encoded.len() <= MAX_COMMAND_BYTES,
-            "maximum legal PublishFile command is {} bytes, exceeding {}",
+            "maximum CommitFile command is {} bytes, exceeding {}",
             encoded.len(),
             MAX_COMMAND_BYTES
         );

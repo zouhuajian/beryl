@@ -295,6 +295,8 @@ message AllocateBlockResponseProto {
   LocatedBlockProto block = 2;
 }
 
+// Final publication and lease end are one transaction. Replay must preserve the
+// client/call identity and all business fields; content equality alone is insufficient.
 message CommitFileRequestProto {
   common.RequestHeaderProto header = 1;
   WriteHandleProto write_handle = 2;
@@ -305,6 +307,8 @@ message CommitFileRequestProto {
   uint64 expected_file_size = 7;
 }
 
+// Success confirms publication, lease revocation, and durable completion evidence.
+// A later content change or close can retire the bounded replay evidence.
 message CommitFileResponseProto {
   common.ResponseHeaderProto header = 1;
   uint64 committed_size = 2;

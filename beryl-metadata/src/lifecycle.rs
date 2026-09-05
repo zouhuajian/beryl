@@ -471,7 +471,7 @@ fn verify_root(storage: &RocksDBStorage, mount_table: &MountTable, group_name: &
         .ok_or_else(|| MetadataError::ServiceUnavailable("root inode missing after metadata format".to_string()))?;
     if inode.inode_id != ROOT_INODE_ID
         || !inode.kind.is_dir()
-        || !matches!(inode.data, beryl_types::fs::InodeData::Dir)
+        || !matches!(inode.data, crate::inode::InodeData::Dir)
         || inode.mount_id != root.mount_id
     {
         return Err(MetadataError::InvalidArgument(

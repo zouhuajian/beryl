@@ -449,7 +449,10 @@ impl WriteSession {
 
     /// Return whether CommitFile outcome is unresolved and retryable.
     pub(crate) fn is_commit_unknown(&self) -> bool {
-        matches!(self.state, WriteSessionState::CommitUnknown)
+        matches!(
+            self.state,
+            WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown
+        )
     }
 
     /// Reject writes unless the session is open and the lease is locally valid.

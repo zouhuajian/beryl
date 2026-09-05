@@ -143,7 +143,7 @@ impl RocksDBStorage {
         let matching_inode = root_inode.as_ref().is_some_and(|inode| {
             inode.inode_id == crate::mount::ROOT_INODE_ID
                 && inode.kind.is_dir()
-                && matches!(inode.data, beryl_types::fs::InodeData::Dir)
+                && matches!(inode.data, crate::inode::InodeData::Dir)
                 && inode.mount_id == MountId::new(1)
         });
         let matching_mount = mounts.len() == 1

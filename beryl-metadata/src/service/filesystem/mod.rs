@@ -11,6 +11,7 @@ mod read;
 mod write;
 
 use crate::error::{to_rpc_error, MetadataError, MetadataResult};
+use crate::inode::Inode;
 use crate::metrics::MetadataMetrics;
 use crate::mount::MountTable;
 use crate::path_resolver::{MountContext, PathResolver, ResolvedPath};
@@ -21,7 +22,6 @@ use crate::state::StateStore;
 use crate::worker::WorkerManager;
 use beryl_common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail};
 use beryl_common::header::RequestHeader;
-use beryl_types::fs::Inode;
 use beryl_types::ids::{InodeId, WorkerId};
 use beryl_types::{FileLayout, GroupName, GroupStateWatermark, WorkerEndpointInfo, WorkerRunId, WriteHandle};
 use command::RoutedFsWriteCtx;
@@ -413,6 +413,8 @@ mod tests {
     pub(super) use super::*;
     use crate::config::FileLayoutDefaults;
     pub(super) use crate::config::RaftConfig;
+    pub(super) use crate::inode::Inode;
+    use crate::inode::InodeData;
     pub(super) use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
     use crate::raft::PublishMode;
     pub(super) use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
@@ -425,8 +427,7 @@ mod tests {
         ErrorKind, InternalErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail, WorkerErrorKind,
     };
     pub(super) use beryl_common::header::RequestHeader;
-    use beryl_types::fs::InodeData;
-    pub(super) use beryl_types::fs::{FileAttrs, Inode};
+    pub(super) use beryl_types::fs::FileAttrs;
     pub(super) use beryl_types::ids::{BlockId, BlockIndex, ClientId, InodeId, MountId, WorkerId};
     pub(super) use beryl_types::layout::FileLayout;
     pub(super) use beryl_types::lease::FencingToken;

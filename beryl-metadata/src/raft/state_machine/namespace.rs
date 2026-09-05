@@ -341,6 +341,7 @@ impl AppRaftStateMachine {
             generation,
             lease_epoch,
             next_block_index,
+            ..
         } = &inode.data
         else {
             return Err(MetadataError::Internal(

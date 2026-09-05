@@ -11,6 +11,7 @@ mod worker;
 mod write;
 
 use crate::error::{MetadataError, MetadataResult};
+use crate::inode::{Inode, InodeData};
 use crate::raft::command::{Command, PublishMode};
 use crate::raft::response::{
     ApplyRejection, ApplySuccess, DetachedRootReclaimResult, FatalApplyError, RaftApplyResult,
@@ -22,7 +23,7 @@ use crate::raft::storage::{
 use crate::raft::types::AppMetadataRaftState;
 use crate::raft::RoutingDelta;
 use crate::session_registry::CreateFileOperationId;
-use beryl_types::fs::{Extent, FileAttrs, Inode, InodeData};
+use beryl_types::fs::{Extent, FileAttrs};
 use beryl_types::ids::{BlockId, BlockIndex, InodeId, MountId, WorkerId};
 use beryl_types::layout::FileLayout;
 use beryl_types::{ContentGeneration, GroupName, MAX_FILE_EXTENTS};
@@ -287,6 +288,25 @@ impl AppRaftStateMachine {
                 )?;
                 Ok(ApplySuccess::FilePublished { inode_id, generation })
             }
+            Command::CommitFile {
+                proposed_at_ms,
+                inode_id,
+                client_id,
+                call_id,
+                publication,
+            } => {
+                let ended_epoch = publication
+                    .lease_epoch
+                    .checked_next()
+                    .ok_or_else(|| MetadataError::InvalidArgument("write lease epoch overflow".into()))?;
+                let generation =
+                    self.apply_commit_file(inode_id, (client_id, call_id), publication, proposed_at_ms, raft_state)?;
+                Ok(ApplySuccess::FileCommitted {
+                    inode_id,
+                    generation,
+                    lease_epoch: ended_epoch,
+                })
+            }
             Command::ReclaimDetachedRoots {
                 candidate_root_inode_ids,
                 max_entries,
@@ -452,9 +472,10 @@ impl AppRaftStateMachine {
 #[cfg(test)]
 pub(crate) mod tests {
     pub(crate) use super::*;
+    pub(crate) use crate::inode::Inode;
     use crate::mount::MountEntry;
     use crate::raft::response::ApplyRejectionKind;
-    pub(crate) use beryl_types::fs::{FileAttrs, Inode};
+    pub(crate) use beryl_types::fs::FileAttrs;
     pub(crate) use beryl_types::ids::{BlockId, InodeId, MountId, WorkerId};
     pub(crate) use beryl_types::layout::FileLayout;
     use beryl_types::LeaseEpoch;
