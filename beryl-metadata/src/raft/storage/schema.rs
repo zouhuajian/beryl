@@ -357,8 +357,9 @@ fn missing_rocksdb_state_error(path: &Path, detail: &str) -> MetadataError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inode::Inode;
     use beryl_types::FileAttrs;
-    use beryl_types::{Inode, MountId};
+    use beryl_types::MountId;
     use tempfile::TempDir;
 
     impl RocksDBStorage {
@@ -370,7 +371,7 @@ mod tests {
 
     #[test]
     fn opening_non_current_schema_versions_requires_reformat_without_rewriting_them() {
-        for unsupported_version in [0, 1, 3, u64::MAX] {
+        for unsupported_version in [0, ROCKSDB_SCHEMA_VERSION - 1, ROCKSDB_SCHEMA_VERSION + 1, u64::MAX] {
             let dir = TempDir::new().unwrap();
             let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
             drop(storage);

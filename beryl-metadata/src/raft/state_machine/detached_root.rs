@@ -297,8 +297,8 @@ impl AppRaftStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inode::InodeData;
     use crate::raft::state_machine::tests::*;
-    use beryl_types::fs::InodeData;
 
     fn new_state_machine() -> (TempDir, Arc<RocksDBStorage>, AppRaftStateMachine) {
         let dir = TempDir::new().unwrap();
@@ -358,6 +358,12 @@ mod tests {
         }
     }
 
+    fn symlink_inode(inode_id: InodeId, attrs: FileAttrs, target: String, mount_id: MountId) -> Inode {
+        let mut inode = Inode::new(inode_id, beryl_types::FileType::Symlink, attrs, mount_id);
+        inode.data = InodeData::Symlink { target: Some(target) };
+        inode
+    }
+
     #[test]
     fn mixed_tree_reclaims_in_bounded_batches_and_inherits_detach_age() {
         let (_dir, storage, state_machine) = new_state_machine();
@@ -371,7 +377,7 @@ mod tests {
         storage.put_dentry(root_id, "a", child_dir_id).unwrap();
         seed_file(&storage, root_id, "b", file_id, marker.mount_id);
         storage
-            .put_inode(&Inode::new_symlink(
+            .put_inode(&symlink_inode(
                 symlink_id,
                 FileAttrs::new(),
                 "target".to_string(),
@@ -468,7 +474,7 @@ mod tests {
             let inode_id = InodeId::new(81 + index);
             let name = format!("{index:03}-{}", "x".repeat(96));
             storage
-                .put_inode(&Inode::new_symlink(
+                .put_inode(&symlink_inode(
                     inode_id,
                     FileAttrs::new(),
                     "target".to_string(),

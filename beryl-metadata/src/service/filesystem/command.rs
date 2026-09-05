@@ -7,6 +7,7 @@ use super::{fs_failure_from_metadata_error, Freshness, FsFailure, MetadataFileSy
 use crate::error::{MetadataError, MetadataResult};
 use crate::observe;
 use crate::raft::{ApplySuccess, Command};
+use crate::session_registry::WritePublication;
 use beryl_types::ids::{BlockId, InodeId, MountId};
 use beryl_types::{GroupName, LeaseEpoch};
 use std::sync::atomic::Ordering;
@@ -172,38 +173,92 @@ impl MetadataFileSystem {
         }
     }
 
-    async fn propose_write_command(&self, command: Command) -> MetadataResult<ApplySuccess> {
-        let raft_node = self
-            .raft_node
-            .as_ref()
-            .ok_or_else(|| MetadataError::Internal("Raft node not available".to_string()))?;
-
-        if let Some(metrics) = &self.metrics {
-            metrics.fs_raft_appends_total.fetch_add(1, Ordering::Relaxed);
-            match &command {
-                Command::CreateFile { .. } => {
-                    metrics.fs_raft_appends_create.fetch_add(1, Ordering::Relaxed);
-                }
-                Command::CreateDirectory { .. } => {
-                    metrics.fs_raft_appends_mkdir.fetch_add(1, Ordering::Relaxed);
-                }
-                Command::Rename { .. } => {
-                    metrics.fs_raft_appends_rename.fetch_add(1, Ordering::Relaxed);
-                }
-                Command::PublishFile { .. } => {
-                    metrics.fs_raft_appends_publish.fetch_add(1, Ordering::Relaxed);
-                }
-                Command::BootstrapNamespace { .. }
-                | Command::Delete { .. }
-                | Command::AcquireWriteLease { .. }
-                | Command::AllocateBlock { .. }
-                | Command::EndWriteLease { .. }
-                | Command::RegisterWorkerDescriptor { .. }
-                | Command::ReclaimDetachedRoots { .. } => {}
+    /// Finish one admitted Commit even if the RPC waiter is cancelled.
+    /// The pinned session bounds these tasks and protects Ready blocks until apply.
+    pub(super) async fn propose_file_commit(
+        &self,
+        command: Command,
+        publication: WritePublication,
+    ) -> MetadataResult<()> {
+        let Command::CommitFile {
+            inode_id,
+            publication: ref payload,
+            ..
+        } = command
+        else {
+            unreachable!("CommitFile command required")
+        };
+        let ended_epoch = payload.lease_epoch.checked_next();
+        let fence = self.propose_write_command(Command::EndWriteLease {
+            proposed_at_ms: crate::raft::proposal_timestamp_ms(),
+            inode_id,
+            lease_epoch: payload.lease_epoch,
+        });
+        let proposal = self.propose_write_command(command);
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let result = match proposal.await {
+                Ok(ApplySuccess::FileCommitted {
+                    inode_id: returned,
+                    lease_epoch,
+                    ..
+                }) if returned == inode_id && Some(lease_epoch) == ended_epoch => Ok(()),
+                Ok(unexpected) => Err(unexpected_raft_apply_success("CommitFile", unexpected)),
+                Err(error) => Err(error),
+            };
+            // An error can leave apply queued in the Raft state-machine worker.
+            // One ordered fence proves that no older Commit can still publish.
+            // If authority is unavailable, Drop retains the bounded pin until restart.
+            let resolved = result.is_ok()
+                || matches!(fence.await,
+                Ok(ApplySuccess::WriteLeaseEnded { inode_id: returned, lease_epoch })
+                    if returned == inode_id && Some(lease_epoch) >= ended_epoch);
+            if resolved {
+                publication.complete_commit();
             }
-        }
+            record_fs_write_result("commit_file", started, &result);
+            result
+        })
+        .await
+        .map_err(|error| MetadataError::Internal(format!("CommitFile completion task failed: {error}")))?
+    }
 
-        raft_node.propose(command).await
+    /// Own the proposal dependencies so a submitted close can outlive its RPC waiter.
+    fn propose_write_command(
+        &self,
+        command: Command,
+    ) -> impl std::future::Future<Output = MetadataResult<ApplySuccess>> + Send + 'static {
+        let raft_node = self.raft_node.clone();
+        let metrics = self.metrics.clone();
+        async move {
+            let raft_node = raft_node.ok_or_else(|| MetadataError::Internal("Raft node not available".to_string()))?;
+            if let Some(metrics) = &metrics {
+                metrics.fs_raft_appends_total.fetch_add(1, Ordering::Relaxed);
+                match &command {
+                    Command::CreateFile { .. } => {
+                        metrics.fs_raft_appends_create.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Command::CreateDirectory { .. } => {
+                        metrics.fs_raft_appends_mkdir.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Command::Rename { .. } => {
+                        metrics.fs_raft_appends_rename.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Command::PublishFile { .. } | Command::CommitFile { .. } => {
+                        metrics.fs_raft_appends_publish.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Command::BootstrapNamespace { .. }
+                    | Command::Delete { .. }
+                    | Command::AcquireWriteLease { .. }
+                    | Command::AllocateBlock { .. }
+                    | Command::EndWriteLease { .. }
+                    | Command::RegisterWorkerDescriptor { .. }
+                    | Command::ReclaimDetachedRoots { .. } => {}
+                }
+            }
+
+            raft_node.propose(command).await
+        }
     }
 }
 

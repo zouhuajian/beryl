@@ -321,34 +321,58 @@ async fn malformed_create_and_allocate_block_successes_fail_closed_before_worker
 }
 
 #[tokio::test]
-async fn malformed_commit_response_can_only_be_recovered_by_the_same_close() {
-    let metadata = MockMetadata::new(MetadataScript {
-        create_file: VecDeque::from([MetadataReply::success(create_response(303, 8))]),
-        commit_file: VecDeque::from([
+async fn ambiguous_commit_response_can_only_be_recovered_by_the_same_close() {
+    for internal in [false, true] {
+        let first_reply = if internal {
+            MetadataReply::error(RpcErrorDetail::fail(
+                ErrorKind::Internal(InternalErrorKind::Internal),
+                "commit completion failed",
+            ))
+        } else {
             MetadataReply::success(CommitFileResponseProto {
                 committed_size: 1,
                 ..CommitFileResponseProto::default()
-            }),
-            MetadataReply::success(CommitFileResponseProto {
-                committed_size: 0,
-                ..CommitFileResponseProto::default()
-            }),
-        ]),
-        ..MetadataScript::default()
-    });
-    let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 1)).expect("client");
-    let mut writer = client.create("/commit").await.expect("writer");
+            })
+        };
+        let metadata = MockMetadata::new(MetadataScript {
+            create_file: VecDeque::from([MetadataReply::success(create_response(303, 8))]),
+            commit_file: VecDeque::from([
+                first_reply,
+                MetadataReply::error(RpcErrorDetail::fail(
+                    ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                    "receipt no longer available",
+                )),
+                MetadataReply::success(CommitFileResponseProto {
+                    committed_size: 0,
+                    ..CommitFileResponseProto::default()
+                }),
+            ]),
+            ..MetadataScript::default()
+        });
+        let server = metadata.start().await;
+        let client = FsClient::new(client_config(server.endpoint(), 1)).expect("client");
+        let mut writer = client.create("/commit").await.expect("writer");
 
-    let error = writer.close().await.expect_err("invalid committed size");
-    assert_client_error(&error, ClientErrorKind::InvalidResponse, true, "committed_size");
-    writer.close().await.expect("frozen close retry succeeds");
+        let error = writer.close().await.expect_err("unconfirmed commit");
+        let (kind, message) = if internal {
+            (ClientErrorKind::Internal, "completion failed")
+        } else {
+            (ClientErrorKind::InvalidResponse, "committed_size")
+        };
+        assert_client_error(&error, kind, true, message);
+        let error = writer
+            .close()
+            .await
+            .expect_err("missing evidence cannot erase prior ambiguity");
+        assert!(error.is_outcome_unknown());
+        writer.close().await.expect("frozen close retry succeeds");
 
-    let metadata_calls = metadata.calls();
-    let calls = calls_for(&metadata_calls, "CommitFile");
-    assert_eq!(calls.len(), 2);
-    assert_same_call_id(&calls);
-    server.shutdown().await;
+        let metadata_calls = metadata.calls();
+        let calls = calls_for(&metadata_calls, "CommitFile");
+        assert_eq!(calls.len(), 3);
+        assert_same_call_id(&calls);
+        server.shutdown().await;
+    }
 }
 
 #[tokio::test]

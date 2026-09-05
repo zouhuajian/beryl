@@ -5,7 +5,8 @@ use super::{
     AppMetadataRaftState, AppRaftStateMachine, BlockId, BlockIndex, Extent, FileLayout, Inode, InodeData, InodeId,
     MetadataError, MetadataResult, PublishMode, MAX_FILE_EXTENTS,
 };
-use beryl_types::{ContentGeneration, LeaseEpoch};
+use crate::inode::{FileCommit, FilePublication};
+use beryl_types::{CallId, ClientId, ContentGeneration, LeaseEpoch};
 use std::collections::HashSet;
 
 impl AppRaftStateMachine {
@@ -85,6 +86,7 @@ impl AppRaftStateMachine {
                     generation,
                     lease_epoch,
                     next_block_index,
+                    ..
                 } = &inode.data
                 else {
                     unreachable!("file authority checked above")
@@ -189,7 +191,7 @@ impl AppRaftStateMachine {
     pub(super) fn apply_publish_file(
         &self,
         inode_id: InodeId,
-        mut requested_extents: Vec<Extent>,
+        requested_extents: Vec<Extent>,
         target_size: u64,
         expected_generation: ContentGeneration,
         expected_file_size: u64,
@@ -198,206 +200,303 @@ impl AppRaftStateMachine {
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<ContentGeneration> {
-        let prepared: MetadataResult<(Inode, FileLayout, ContentGeneration, bool)> = (|| {
-            let mut inode = self
-                .storage
-                .get_inode(inode_id)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {inode_id}")))?;
-            Self::ensure_file_inode_authority(inode_id, &inode)?;
-            let layout = self.storage.get_layout(inode_id)?;
-            requested_extents.sort_by_key(|extent| (extent.file_offset, extent.block_id.index.as_raw()));
-
-            let (existing_extents, generation, stored_lease_epoch) = match &inode.data {
-                InodeData::File {
-                    extents,
-                    generation,
-                    lease_epoch,
-                    ..
-                } => {
-                    if extents.len() > MAX_FILE_EXTENTS {
-                        return Err(MetadataError::ResourceExhausted(format!(
-                            "stored file extent count {} exceeds maximum {} for inode {}",
-                            extents.len(),
-                            MAX_FILE_EXTENTS,
-                            inode_id
-                        )));
-                    }
-                    (
-                        extents.clone(),
-                        generation.unwrap_or_default(),
-                        lease_epoch.unwrap_or_default(),
-                    )
-                }
-                _ => unreachable!("file inode must carry file data"),
-            };
-            if stored_lease_epoch != lease_epoch {
-                return Err(MetadataError::LeaseFenced {
-                    expected: stored_lease_epoch,
-                    got: lease_epoch,
-                });
-            }
-            if generation == expected_generation && inode.attrs.size != expected_file_size {
-                return Err(MetadataError::Again(format!(
-                    "file size changed for inode {inode_id}: expected {expected_file_size}, current {}",
-                    inode.attrs.size
-                )));
-            }
-
-            let mut seen = HashSet::with_capacity(requested_extents.len());
-            let block_capacity = u64::from(layout.block_size);
-            for extent in &requested_extents {
-                if extent.len == 0 {
-                    return Err(MetadataError::InvalidArgument(
-                        "Committed extent len must be greater than 0".to_string(),
-                    ));
-                }
-                if extent.block_id.inode_id != inode_id {
-                    return Err(MetadataError::InvalidArgument(format!(
-                        "Extent block inode_id {} does not match inode {inode_id}",
-                        extent.block_id.inode_id
-                    )));
-                }
-                if !seen.insert(extent.block_id) {
-                    return Err(MetadataError::InvalidArgument(format!(
-                        "Committed block {} was submitted more than once",
-                        extent.block_id
-                    )));
-                }
-                if extent.block_offset != 0 {
-                    return Err(MetadataError::InvalidArgument(format!(
-                        "Committed block {} must start at block offset 0",
-                        extent.block_id
-                    )));
-                }
-                if extent.len > block_capacity {
-                    return Err(MetadataError::InvalidArgument(format!(
-                        "Committed block {} length {} exceeds layout block capacity {}",
-                        extent.block_id, extent.len, block_capacity
-                    )));
-                }
-                if Self::extent_end(extent)? > target_size {
-                    return Err(MetadataError::InvalidArgument(format!(
-                        "Extent extends beyond target_size {target_size}: {}",
-                        extent.block_id
-                    )));
-                }
-            }
-
-            // Only the last block introduced by one publication may be partial.
-            // Exact visible extents are excluded so a later SyncWrite can append
-            // after a partial block already made durable by an earlier command.
-            let newly_visible = requested_extents
-                .iter()
-                .filter(|extent| !Self::extent_matches_visible(&existing_extents, extent))
-                .collect::<Vec<_>>();
-            for extent in newly_visible.iter().take(newly_visible.len().saturating_sub(1)) {
-                if extent.len != block_capacity {
-                    return Err(MetadataError::InvalidArgument(format!(
-                        "non-tail committed block {} must use full layout capacity {}",
-                        extent.block_id, block_capacity
-                    )));
-                }
-            }
-
-            let state_matches = inode.attrs.size == target_size
-                && match mode {
-                    PublishMode::ReplaceIfUnchanged => {
-                        existing_extents.len() == requested_extents.len()
-                            && requested_extents
-                                .iter()
-                                .all(|extent| Self::extent_matches_visible(&existing_extents, extent))
-                    }
-                    PublishMode::AppendIfUnchanged => {
-                        requested_extents
-                            .iter()
-                            .all(|extent| Self::extent_matches_visible(&existing_extents, extent))
-                            && Self::visible_suffix_matches(
-                                &existing_extents,
-                                &requested_extents,
-                                expected_file_size,
-                                target_size,
-                            )
-                    }
-                };
-            if expected_generation.checked_next() == Some(generation) && state_matches {
-                return Ok((inode, layout, generation, false));
-            }
-            if generation != expected_generation {
-                return Err(MetadataError::Again(format!(
-                    "content generation changed for inode {inode_id}: expected {expected_generation}, current {generation}"
-                )));
-            }
-            if state_matches {
-                return Ok((inode, layout, generation, false));
-            }
-
-            let mut extents_to_publish = match mode {
-                PublishMode::ReplaceIfUnchanged => {
-                    Self::validate_contiguous_extents(&requested_extents, 0, target_size, "ReplaceIfUnchanged")?;
-                    requested_extents
-                }
-                PublishMode::AppendIfUnchanged => {
-                    if target_size < inode.attrs.size {
-                        return Err(MetadataError::InvalidArgument(format!(
-                            "AppendIfUnchanged target_size {target_size} is smaller than current size {}",
-                            inode.attrs.size
-                        )));
-                    }
-                    Self::append_extents_not_already_visible(
-                        &existing_extents,
-                        &requested_extents,
-                        inode.attrs.size,
-                        target_size,
-                        "AppendIfUnchanged",
-                    )?
-                }
-            };
-            let final_extent_count = match mode {
-                PublishMode::ReplaceIfUnchanged => extents_to_publish.len(),
-                PublishMode::AppendIfUnchanged => existing_extents
-                    .len()
-                    .checked_add(extents_to_publish.len())
-                    .ok_or_else(|| {
-                        MetadataError::ResourceExhausted("final file extent count overflowed".to_string())
-                    })?,
-            };
-            if final_extent_count > MAX_FILE_EXTENTS {
-                return Err(MetadataError::ResourceExhausted(format!(
-                    "final file extent count {final_extent_count} exceeds maximum {MAX_FILE_EXTENTS} for inode {inode_id}"
-                )));
-            }
-            let generation = Self::next_generation(inode_id, Some(generation))?;
-            Self::stamp_extents(&mut extents_to_publish, &existing_extents, generation);
-            match &mut inode.data {
-                InodeData::File {
-                    extents,
-                    generation: stored_generation,
-                    ..
-                } => {
-                    match mode {
-                        PublishMode::ReplaceIfUnchanged => *extents = extents_to_publish,
-                        PublishMode::AppendIfUnchanged => extents.extend(extents_to_publish),
-                    }
-                    for extent in extents.iter_mut() {
-                        extent.generation = Some(generation);
-                    }
-                    *stored_generation = Some(generation);
-                }
-                _ => unreachable!("file inode must carry file data"),
-            }
-            inode.attrs.size = target_size;
-            inode
-                .attrs
-                .update_mtime_ctime(Self::mutation_timestamp(&inode, proposed_at_ms));
-            Ok((inode, layout, generation, true))
-        })();
-
-        let (inode, layout, generation, changed) = prepared?;
+        let inode = self
+            .storage
+            .get_inode(inode_id)?
+            .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {inode_id}")))?;
+        Self::ensure_file_inode_authority(inode_id, &inode)?;
+        let (inode, layout, generation, changed) = self.prepare_file_publication(
+            inode,
+            FilePublication {
+                extents: requested_extents,
+                target_size,
+                expected_generation,
+                expected_file_size,
+                lease_epoch,
+                mode,
+            },
+            proposed_at_ms,
+        )?;
         if changed {
             self.storage.publish_file_atomic(&inode, layout, raft_state)?;
         } else {
             self.storage.commit_applied_state(raft_state)?;
         }
+        Ok(generation)
+    }
+
+    /// Validate a publication and prepare its inode without performing any write.
+    /// Sync and Commit share content rules but select separate atomic persistence.
+    fn prepare_file_publication(
+        &self,
+        mut inode: Inode,
+        publication: FilePublication,
+        proposed_at_ms: u64,
+    ) -> MetadataResult<(Inode, FileLayout, ContentGeneration, bool)> {
+        let inode_id = inode.inode_id;
+        let FilePublication {
+            extents: mut requested_extents,
+            target_size,
+            expected_generation,
+            expected_file_size,
+            lease_epoch,
+            mode,
+        } = publication;
+        if requested_extents.len() > MAX_FILE_EXTENTS {
+            return Err(MetadataError::ResourceExhausted(
+                "file publication exceeds extent limit".into(),
+            ));
+        }
+        Self::ensure_file_inode_authority(inode_id, &inode)?;
+        let layout = self.storage.get_layout(inode_id)?;
+        requested_extents.sort_by_key(|extent| (extent.file_offset, extent.block_id.index.as_raw()));
+
+        let (existing_extents, generation, stored_lease_epoch) = match &inode.data {
+            InodeData::File {
+                extents,
+                generation,
+                lease_epoch,
+                ..
+            } => {
+                if extents.len() > MAX_FILE_EXTENTS {
+                    return Err(MetadataError::ResourceExhausted(format!(
+                        "stored file extent count {} exceeds maximum {} for inode {}",
+                        extents.len(),
+                        MAX_FILE_EXTENTS,
+                        inode_id
+                    )));
+                }
+                (
+                    extents.clone(),
+                    generation.unwrap_or_default(),
+                    lease_epoch.unwrap_or_default(),
+                )
+            }
+            _ => unreachable!("file inode must carry file data"),
+        };
+        if stored_lease_epoch != lease_epoch {
+            return Err(MetadataError::LeaseFenced {
+                expected: stored_lease_epoch,
+                got: lease_epoch,
+            });
+        }
+        if generation == expected_generation && inode.attrs.size != expected_file_size {
+            return Err(MetadataError::Again(format!(
+                "file size changed for inode {inode_id}: expected {expected_file_size}, current {}",
+                inode.attrs.size
+            )));
+        }
+
+        let mut seen = HashSet::with_capacity(requested_extents.len());
+        let block_capacity = u64::from(layout.block_size);
+        for extent in &requested_extents {
+            if extent.len == 0 {
+                return Err(MetadataError::InvalidArgument(
+                    "Committed extent len must be greater than 0".to_string(),
+                ));
+            }
+            if extent.block_id.inode_id != inode_id {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "Extent block inode_id {} does not match inode {inode_id}",
+                    extent.block_id.inode_id
+                )));
+            }
+            if !seen.insert(extent.block_id) {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "Committed block {} was submitted more than once",
+                    extent.block_id
+                )));
+            }
+            if extent.block_offset != 0 {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "Committed block {} must start at block offset 0",
+                    extent.block_id
+                )));
+            }
+            if extent.len > block_capacity {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "Committed block {} length {} exceeds layout block capacity {}",
+                    extent.block_id, extent.len, block_capacity
+                )));
+            }
+            if Self::extent_end(extent)? > target_size {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "Extent extends beyond target_size {target_size}: {}",
+                    extent.block_id
+                )));
+            }
+        }
+
+        // Only the last block introduced by one publication may be partial.
+        // Exact visible extents are excluded so a later SyncWrite can append
+        // after a partial block already made durable by an earlier command.
+        let newly_visible = requested_extents
+            .iter()
+            .filter(|extent| !Self::extent_matches_visible(&existing_extents, extent))
+            .collect::<Vec<_>>();
+        for extent in newly_visible.iter().take(newly_visible.len().saturating_sub(1)) {
+            if extent.len != block_capacity {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "non-tail committed block {} must use full layout capacity {}",
+                    extent.block_id, block_capacity
+                )));
+            }
+        }
+
+        let state_matches = inode.attrs.size == target_size
+            && match mode {
+                PublishMode::ReplaceIfUnchanged => {
+                    existing_extents.len() == requested_extents.len()
+                        && requested_extents
+                            .iter()
+                            .all(|extent| Self::extent_matches_visible(&existing_extents, extent))
+                }
+                PublishMode::AppendIfUnchanged => {
+                    requested_extents
+                        .iter()
+                        .all(|extent| Self::extent_matches_visible(&existing_extents, extent))
+                        && Self::visible_suffix_matches(
+                            &existing_extents,
+                            &requested_extents,
+                            expected_file_size,
+                            target_size,
+                        )
+                }
+            };
+        if expected_generation.checked_next() == Some(generation) && state_matches {
+            return Ok((inode, layout, generation, false));
+        }
+        if generation != expected_generation {
+            return Err(MetadataError::Again(format!(
+                "content generation changed for inode {inode_id}: expected {expected_generation}, current {generation}"
+            )));
+        }
+        if state_matches {
+            return Ok((inode, layout, generation, false));
+        }
+
+        let mut extents_to_publish = match mode {
+            PublishMode::ReplaceIfUnchanged => {
+                Self::validate_contiguous_extents(&requested_extents, 0, target_size, "ReplaceIfUnchanged")?;
+                requested_extents
+            }
+            PublishMode::AppendIfUnchanged => {
+                if target_size < inode.attrs.size {
+                    return Err(MetadataError::InvalidArgument(format!(
+                        "AppendIfUnchanged target_size {target_size} is smaller than current size {}",
+                        inode.attrs.size
+                    )));
+                }
+                Self::append_extents_not_already_visible(
+                    &existing_extents,
+                    &requested_extents,
+                    inode.attrs.size,
+                    target_size,
+                    "AppendIfUnchanged",
+                )?
+            }
+        };
+        let final_extent_count = match mode {
+            PublishMode::ReplaceIfUnchanged => extents_to_publish.len(),
+            PublishMode::AppendIfUnchanged => existing_extents
+                .len()
+                .checked_add(extents_to_publish.len())
+                .ok_or_else(|| MetadataError::ResourceExhausted("final file extent count overflowed".to_string()))?,
+        };
+        if final_extent_count > MAX_FILE_EXTENTS {
+            return Err(MetadataError::ResourceExhausted(format!(
+                "final file extent count {final_extent_count} exceeds maximum {MAX_FILE_EXTENTS} for inode {inode_id}"
+            )));
+        }
+        let generation = Self::next_generation(inode_id, Some(generation))?;
+        Self::stamp_extents(&mut extents_to_publish, &existing_extents, generation);
+        match &mut inode.data {
+            InodeData::File {
+                extents,
+                generation: stored_generation,
+                last_commit,
+                ..
+            } => {
+                match mode {
+                    PublishMode::ReplaceIfUnchanged => *extents = extents_to_publish,
+                    PublishMode::AppendIfUnchanged => extents.extend(extents_to_publish),
+                }
+                for extent in extents.iter_mut() {
+                    extent.generation = Some(generation);
+                }
+                *stored_generation = Some(generation);
+                *last_commit = None;
+            }
+            _ => unreachable!("file inode must carry file data"),
+        }
+        inode.attrs.size = target_size;
+        inode
+            .attrs
+            .update_mtime_ctime(Self::mutation_timestamp(&inode, proposed_at_ms));
+        Ok((inode, layout, generation, true))
+    }
+
+    /// Atomically publish and revoke one writer, including empty and no-op closes.
+    /// Only an exact persisted receipt may bypass the original generation/lease CAS.
+    pub(super) fn apply_commit_file(
+        &self,
+        inode_id: InodeId,
+        operation: (ClientId, CallId),
+        publication: FilePublication,
+        proposed_at_ms: u64,
+        raft_state: &AppMetadataRaftState,
+    ) -> MetadataResult<ContentGeneration> {
+        if publication.extents.len() > MAX_FILE_EXTENTS {
+            return Err(MetadataError::ResourceExhausted(
+                "CommitFile exceeds extent limit".into(),
+            ));
+        }
+        let inode = self
+            .storage
+            .get_inode(inode_id)?
+            .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {inode_id}")))?;
+        Self::ensure_file_inode_authority(inode_id, &inode)?;
+        if let Some(generation) = publication.resolve_commit(&inode, operation.0, operation.1)? {
+            self.storage.commit_applied_state(raft_state)?;
+            return Ok(generation);
+        }
+        let InodeData::File { generation, .. } = &inode.data else {
+            unreachable!("file checked above")
+        };
+        if generation.unwrap_or_default() != publication.expected_generation {
+            return Err(MetadataError::Again(
+                "CommitFile content generation changed without matching completion evidence".into(),
+            ));
+        }
+        let ended_epoch = publication
+            .lease_epoch
+            .checked_next()
+            .ok_or_else(|| MetadataError::InvalidArgument("write lease epoch overflow".into()))?;
+        let mut commit = FileCommit {
+            client_id: operation.0,
+            call_id: operation.1,
+            lease_epoch: publication.lease_epoch,
+            expected_generation: publication.expected_generation,
+            expected_file_size: publication.expected_file_size,
+            mode: publication.mode,
+            committed_size: publication.target_size,
+            generation: publication.expected_generation,
+        };
+        let (mut inode, _, generation, _) = self.prepare_file_publication(inode, publication, proposed_at_ms)?;
+        commit.generation = generation;
+        let InodeData::File {
+            lease_epoch,
+            last_commit,
+            ..
+        } = &mut inode.data
+        else {
+            unreachable!("file checked above")
+        };
+        *lease_epoch = Some(ended_epoch);
+        *last_commit = Some(commit);
+        // The layout is unchanged by publication; one inode put also stores the
+        // completion evidence, with last_applied in the same authority batch.
+        self.storage.put_inode_atomic(&inode, raft_state)?;
         Ok(generation)
     }
 }
@@ -454,6 +553,17 @@ mod tests {
                 lease_epoch: LeaseEpoch::new(1),
                 mode: PublishMode::ReplaceIfUnchanged,
             },
+            commit_command(
+                inode_id,
+                FilePublication {
+                    extents: Vec::new(),
+                    target_size: 0,
+                    expected_generation: ContentGeneration::new(0),
+                    expected_file_size: 0,
+                    lease_epoch: LeaseEpoch::new(1),
+                    mode: PublishMode::ReplaceIfUnchanged,
+                },
+            ),
         ];
 
         for command in commands {
@@ -461,6 +571,232 @@ mod tests {
             assert!(error.to_string().contains("inode authority is corrupt"));
             assert_eq!(storage.load_raft_state().unwrap(), applied_before);
             assert_eq!(storage.get_inode(inode_id).unwrap().as_ref(), Some(expected_inode));
+        }
+    }
+
+    fn commit_command(inode_id: InodeId, publication: FilePublication) -> Command {
+        Command::CommitFile {
+            proposed_at_ms: 10,
+            inode_id,
+            client_id: ClientId::new(9),
+            call_id: CallId::new(),
+            publication,
+        }
+    }
+
+    #[test]
+    fn commit_atomically_closes_empty_new_and_synced_content_and_bounds_replay() {
+        for (length, synced) in [(0, false), (64, false), (64, true)] {
+            let dir = TempDir::new().unwrap();
+            let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+            let sm = AppRaftStateMachine::new(Arc::clone(&storage));
+            let inode_id = InodeId::new(102);
+            install_file_with_extents(&storage, InodeId::new(100), "file", inode_id, Vec::new(), 0);
+            let extents = if length == 0 {
+                Vec::new()
+            } else {
+                vec![extent(BlockId::new(inode_id, BlockIndex::new(0)), 0, length)]
+            };
+            if synced {
+                sm.apply(Command::PublishFile {
+                    proposed_at_ms: 1,
+                    inode_id,
+                    extents: extents.clone(),
+                    target_size: length,
+                    expected_generation: ContentGeneration::new(0),
+                    expected_file_size: 0,
+                    lease_epoch: LeaseEpoch::new(1),
+                    mode: PublishMode::ReplaceIfUnchanged,
+                })
+                .unwrap();
+            }
+            let command = commit_command(
+                inode_id,
+                FilePublication {
+                    extents,
+                    target_size: length,
+                    expected_generation: ContentGeneration::new(u64::from(synced)),
+                    expected_file_size: if synced { length } else { 0 },
+                    lease_epoch: LeaseEpoch::new(1),
+                    mode: PublishMode::ReplaceIfUnchanged,
+                },
+            );
+            sm.apply(command.clone()).unwrap();
+            let committed = storage.get_inode(inode_id).unwrap().unwrap();
+            let InodeData::File {
+                generation,
+                lease_epoch,
+                last_commit,
+                ..
+            } = &committed.data
+            else {
+                panic!("file")
+            };
+            assert_eq!(
+                *generation,
+                if length == 0 {
+                    None
+                } else {
+                    Some(ContentGeneration::new(1))
+                }
+            );
+            assert_eq!(*lease_epoch, Some(LeaseEpoch::new(2)));
+            assert!(last_commit.is_some());
+            sm.apply(command.clone()).unwrap();
+            sm.apply(Command::EndWriteLease {
+                proposed_at_ms: 11,
+                inode_id,
+                lease_epoch: LeaseEpoch::new(1),
+            })
+            .unwrap();
+            assert_eq!(storage.get_inode(inode_id).unwrap().unwrap(), committed);
+            sm.apply(Command::AcquireWriteLease {
+                proposed_at_ms: 12,
+                inode_id,
+                expected_lease_epoch: LeaseEpoch::new(2),
+            })
+            .unwrap();
+            sm.apply(command.clone()).unwrap();
+            let reopened = storage.get_inode(inode_id).unwrap().unwrap();
+            assert!(
+                matches!(reopened.data, InodeData::File { lease_epoch: Some(epoch), .. } if epoch == LeaseEpoch::new(3))
+            );
+            let next = commit_command(
+                inode_id,
+                FilePublication {
+                    extents: Vec::new(),
+                    target_size: length,
+                    expected_generation: ContentGeneration::new(u64::from(length > 0)),
+                    expected_file_size: length,
+                    lease_epoch: LeaseEpoch::new(3),
+                    mode: PublishMode::AppendIfUnchanged,
+                },
+            );
+            sm.apply(next.clone()).unwrap();
+            sm.apply(next.clone()).unwrap();
+            assert!(
+                sm.apply(command).is_err(),
+                "a newer no-op close retires the old receipt"
+            );
+            sm.apply(Command::AcquireWriteLease {
+                proposed_at_ms: 13,
+                inode_id,
+                expected_lease_epoch: LeaseEpoch::new(4),
+            })
+            .unwrap();
+            for changed in [false, true] {
+                sm.apply(Command::PublishFile {
+                    proposed_at_ms: 14,
+                    inode_id,
+                    extents: if changed {
+                        vec![extent(BlockId::new(inode_id, BlockIndex::new(1)), length, 1)]
+                    } else {
+                        Vec::new()
+                    },
+                    target_size: length + u64::from(changed),
+                    expected_generation: ContentGeneration::new(u64::from(length > 0)),
+                    expected_file_size: length,
+                    lease_epoch: LeaseEpoch::new(5),
+                    mode: PublishMode::AppendIfUnchanged,
+                })
+                .unwrap();
+                assert_eq!(sm.apply(next.clone()).is_ok(), !changed);
+                let current = storage.get_inode(inode_id).unwrap().unwrap();
+                assert!(
+                    matches!(current.data, InodeData::File { last_commit, .. } if last_commit.is_none() == changed)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn commit_counter_exhaustion_leaves_content_and_lease_unchanged() {
+        for exhausted_lease in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+            let sm = AppRaftStateMachine::new(Arc::clone(&storage));
+            let inode_id = InodeId::new(102);
+            let mut inode = install_file_with_extents(&storage, InodeId::new(100), "file", inode_id, Vec::new(), 0);
+            let generation = ContentGeneration::new(if exhausted_lease { 0 } else { u64::MAX });
+            let epoch = LeaseEpoch::new(if exhausted_lease { u64::MAX } else { 1 });
+            let InodeData::File {
+                generation: stored_generation,
+                lease_epoch,
+                ..
+            } = &mut inode.data
+            else {
+                unreachable!()
+            };
+            *stored_generation = Some(generation);
+            *lease_epoch = Some(epoch);
+            storage.put_inode(&inode).unwrap();
+            assert!(sm
+                .apply(commit_command(
+                    inode_id,
+                    FilePublication {
+                        extents: vec![extent(BlockId::new(inode_id, BlockIndex::new(0)), 0, 1)],
+                        target_size: 1,
+                        expected_generation: generation,
+                        expected_file_size: 0,
+                        lease_epoch: epoch,
+                        mode: PublishMode::ReplaceIfUnchanged,
+                    }
+                ))
+                .is_err());
+            assert_eq!(storage.get_inode(inode_id).unwrap().unwrap(), inode);
+        }
+    }
+
+    #[test]
+    fn sync_abort_and_new_lease_never_supply_commit_evidence() {
+        for acquire in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+            let sm = AppRaftStateMachine::new(Arc::clone(&storage));
+            let inode_id = InodeId::new(102);
+            install_file_with_extents(&storage, InodeId::new(100), "file", inode_id, Vec::new(), 0);
+            let publication = FilePublication {
+                extents: vec![extent(BlockId::new(inode_id, BlockIndex::new(0)), 0, 64)],
+                target_size: 64,
+                expected_generation: ContentGeneration::new(0),
+                expected_file_size: 0,
+                lease_epoch: LeaseEpoch::new(1),
+                mode: PublishMode::ReplaceIfUnchanged,
+            };
+            sm.apply(Command::PublishFile {
+                proposed_at_ms: 1,
+                inode_id,
+                extents: publication.extents.clone(),
+                target_size: 64,
+                expected_generation: publication.expected_generation,
+                expected_file_size: 0,
+                lease_epoch: publication.lease_epoch,
+                mode: publication.mode,
+            })
+            .unwrap();
+            let transition = if acquire {
+                Command::AcquireWriteLease {
+                    proposed_at_ms: 2,
+                    inode_id,
+                    expected_lease_epoch: LeaseEpoch::new(1),
+                }
+            } else {
+                Command::EndWriteLease {
+                    proposed_at_ms: 2,
+                    inode_id,
+                    lease_epoch: LeaseEpoch::new(1),
+                }
+            };
+            sm.apply(transition).unwrap();
+            let before = storage.get_inode(inode_id).unwrap();
+            assert!(sm.apply(commit_command(inode_id, publication.clone())).is_err());
+            let noop = FilePublication {
+                expected_generation: ContentGeneration::new(1),
+                expected_file_size: 64,
+                ..publication
+            };
+            assert!(sm.apply(commit_command(inode_id, noop)).is_err());
+            assert_eq!(storage.get_inode(inode_id).unwrap(), before);
         }
     }
 

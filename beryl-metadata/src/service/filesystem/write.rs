@@ -9,6 +9,7 @@ use super::{
     Freshness, FsResult, FsSuccess, MetadataFileSystem, RequestContext, WriteHandle, SUPPORTED_REPLICA_COUNT,
 };
 use crate::error::MetadataError;
+use crate::inode::InodeData;
 use crate::observe;
 use crate::path_resolver::{PathResolver, ResolvedPath};
 use crate::placement::{PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus};
@@ -19,7 +20,6 @@ use crate::session_registry::{
 };
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
 use beryl_common::header::CallerContextFields;
-use beryl_types::fs::InodeData;
 use beryl_types::ids::{BlockId, InodeId};
 use beryl_types::layout::FileLayout;
 use beryl_types::lease::FencingToken;

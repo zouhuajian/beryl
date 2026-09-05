@@ -55,6 +55,12 @@ pub(crate) enum ApplySuccess {
         inode_id: InodeId,
         generation: ContentGeneration,
     },
+    /// Content, ended writer epoch, and exact completion evidence committed together.
+    FileCommitted {
+        inode_id: InodeId,
+        generation: ContentGeneration,
+        lease_epoch: LeaseEpoch,
+    },
     /// Durable worker descriptor accepted by the authority state.
     WorkerUpserted(WorkerId),
     /// Bounded progress made by one internal detached-root mutation.

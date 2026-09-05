@@ -55,7 +55,7 @@ async fn committed_visible_file_survives_metadata_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restart_after_empty_create_allows_noop_close_without_publishing_bytes() {
+async fn restart_after_empty_create_requires_new_authority_for_noop_close() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let client = cluster.client().clone();
     client.mkdirs("/restart").await.expect("create restart dir");
@@ -93,34 +93,29 @@ async fn restart_after_empty_create_allows_noop_close_without_publishing_bytes()
     let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
         .await
         .expect("reconnect metadata");
-    let mut foreign_close = close_request.clone();
-    foreign_close.header = Some(metadata_header(foreign_client_id));
-    let foreign = metadata
-        .commit_file(Request::new(foreign_close))
+    for client_id in [foreign_client_id, owner_client_id] {
+        let mut request = close_request.clone();
+        request.header = Some(metadata_header(client_id));
+        let response = metadata.commit_file(Request::new(request)).await.unwrap().into_inner();
+        let error = response
+            .header
+            .unwrap()
+            .error
+            .expect("CreateFile replay is not Commit evidence");
+        assert_eq!(
+            rpc_error_from_proto(&error).kind,
+            ErrorKind::Metadata(MetadataErrorKind::SessionInvalid)
+        );
+    }
+    let abort = metadata
+        .abort_file_write(Request::new(AbortFileWriteRequestProto {
+            header: Some(metadata_header(owner_client_id)),
+            write_handle: create.write_handle,
+        }))
         .await
-        .expect("foreign empty close response")
+        .unwrap()
         .into_inner();
-    let foreign_error = foreign
-        .header
-        .expect("foreign close response header")
-        .error
-        .expect("foreign close must fail");
-    assert_eq!(
-        rpc_error_from_proto(&foreign_error).kind,
-        ErrorKind::Metadata(MetadataErrorKind::SessionInvalid)
-    );
-    let owner = metadata
-        .commit_file(Request::new(close_request.clone()))
-        .await
-        .expect("owner empty close")
-        .into_inner();
-    assert_metadata_ok(owner.header);
-    let replay = metadata
-        .commit_file(Request::new(close_request))
-        .await
-        .expect("replay completed empty close")
-        .into_inner();
-    assert_metadata_ok(replay.header);
+    assert_metadata_ok(abort.header);
     aborted
         .abort()
         .await
@@ -129,7 +124,10 @@ async fn restart_after_empty_create_allows_noop_close_without_publishing_bytes()
         .append("/restart/create-before-close")
         .await
         .expect("new OpenWrite call establishes a new session after restart");
-    reopened.abort().await.expect("abort reopened session");
+    reopened
+        .close()
+        .await
+        .expect("new authority can complete a no-op close");
     let mut reopened_after_abort = client
         .append("/restart/create-before-abort")
         .await
@@ -440,7 +438,7 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn completed_commit_is_resolved_from_durable_state_after_metadata_restart() {
+async fn lost_commit_response_is_resolved_after_metadata_restart() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let path = "/restart/durable-publish";
     let active = raw_create_worker_ready_block(&cluster, path, b"durable-publish")
@@ -455,15 +453,32 @@ async fn completed_commit_is_resolved_from_durable_state_after_metadata_restart(
         write_mode: active.write_mode,
         expected_file_size: active.expected_file_size,
     };
-    let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
-        .await
-        .expect("connect metadata");
-    let first = metadata
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let proxy = DropCommitResponse(
+        tonic::transport::Endpoint::from_shared(cluster.metadata_endpoint())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap(),
+    );
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let proxy_task = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(proxy)
+            .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
+                let _ = stopped.await;
+            }),
+    );
+    let mut metadata = FileSystemServiceProtoClient::connect(endpoint).await.unwrap();
+    let error = metadata
         .commit_file(Request::new(request.clone()))
         .await
-        .expect("first CommitFile")
-        .into_inner();
-    assert_metadata_ok(first.header);
+        .expect_err("proxy discards the actual commit response");
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    drop(metadata);
+    stop.send(()).unwrap();
+    proxy_task.await.unwrap().unwrap();
 
     cluster.restart_metadata().await.expect("restart metadata");
 
@@ -476,8 +491,44 @@ async fn completed_commit_is_resolved_from_durable_state_after_metadata_restart(
         .expect("resolve completed CommitFile")
         .into_inner();
     assert_metadata_ok(replay.header);
-    assert_eq!(replay.committed_size, first.committed_size);
+    assert_eq!(replay.committed_size, b"durable-publish".len() as u64);
     cluster.shutdown().await.expect("shutdown cluster");
+}
+
+/// Forward the real request, then replace its response with a transport failure.
+/// This keeps fault injection outside Metadata and proves replay across a restart.
+#[derive(Clone)]
+struct DropCommitResponse(tonic::transport::Channel);
+
+impl tonic::server::NamedService for DropCommitResponse {
+    const NAME: &'static str = "metadata.FileSystemServiceProto";
+}
+
+impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>> for DropCommitResponse {
+    type Response = tonic::codegen::http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: tonic::codegen::http::Request<tonic::body::Body>) -> Self::Future {
+        let mut upstream = self.0.clone();
+        Box::pin(async move {
+            std::future::poll_fn(|cx| upstream.poll_ready(cx)).await.unwrap();
+            // Await the response body too: gRPC headers alone do not prove that
+            // the upstream handler has finished its application operation.
+            let response = upstream.call(request).await.unwrap();
+            let mut body = response.into_body();
+            use tonic::codegen::Body;
+            while std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
+                .await
+                .is_some()
+            {}
+            Ok(tonic::Status::unavailable("injected CommitFile response loss").into_http())
+        })
+    }
 }
 
 struct RawWorkerReadyWrite {

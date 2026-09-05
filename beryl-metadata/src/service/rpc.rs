@@ -845,6 +845,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
 #[cfg(test)]
 mod tests {
     use crate::config::{NamespaceListConfig, RaftConfig};
+    use crate::inode::{Inode, InodeData};
     use crate::mount::{DataIoPolicy, MountEntry, MountKind, MountTable};
     use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
     use crate::service::{MetadataFileSystem, MetadataFileSystemDeps, MetadataFileSystemServiceImpl, MsyncHandler};
@@ -854,17 +855,15 @@ mod tests {
     use crate::MetadataResult;
     use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RpcErrorDetail};
     use beryl_common::header::RequestHeader;
-    use beryl_proto::common::{ByteRangeProto, ErrorDetailProto, RequestHeaderProto, ResponseHeaderProto};
+    use beryl_proto::common::{ErrorDetailProto, RequestHeaderProto, ResponseHeaderProto};
     use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
-    use beryl_proto::metadata::get_block_locations_request_proto::Target;
     use beryl_proto::metadata::{
         AllocateBlockRequestProto, CommitFileRequestProto, CommittedBlockProto, CreateFileRequestProto,
-        GetBlockLocationsRequestProto, LocatedBlockProto, OpenWriteModeProto, SyncWriteRequestProto, WriteHandleProto,
+        OpenWriteModeProto, SyncWriteRequestProto, WriteHandleProto,
     };
-    use beryl_types::fs::{FileAttrs, Inode, InodeData};
+    use beryl_types::fs::FileAttrs;
     use beryl_types::ids::{BlockId, BlockIndex, InodeId, MountId, WorkerId};
     use beryl_types::{ClientId, ContentGeneration, FileLayout, GroupName, LeaseEpoch, Tier, TierFree, WorkerRunId};
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -1098,28 +1097,6 @@ mod tests {
             .expect("full block report should publish location");
     }
 
-    fn publish_target_reports(env: &PathTestEnv, targets: &[&LocatedBlockProto]) {
-        let mut by_worker = HashMap::<WorkerId, Vec<(BlockId, u64, u64)>>::new();
-        for target in targets {
-            let worker_id = WorkerId::new(
-                target
-                    .worker_endpoints
-                    .first()
-                    .expect("target worker endpoint")
-                    .worker_id,
-            );
-            let block_id = target.block_id.as_ref().expect("target block id");
-            by_worker.entry(worker_id).or_default().push((
-                BlockId::new(InodeId::new(block_id.inode_id), BlockIndex::new(block_id.block_index)),
-                target.block_stamp,
-                target.block_size,
-            ));
-        }
-        for (worker_id, blocks) in by_worker {
-            publish_reported_locations(env, worker_id, blocks);
-        }
-    }
-
     async fn open_write_session_with_committed_block(
         env: &PathTestEnv,
         path: &str,
@@ -1181,7 +1158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_write_resolves_equivalent_published_state_after_session_cleanup() {
+    async fn sync_recovery_preserves_owner_checks_and_never_proves_sessionless_commit() {
         let env = write_env().await;
         let (write_handle, committed, expected_generation, write_mode) =
             open_write_session_with_committed_block(&env, "/mnt/test/sync-completed", 51).await;
@@ -1202,6 +1179,33 @@ mod tests {
         assert_success_header(first.header);
         let first_generation = first.generation.expect("content generation");
         let inode_id = InodeId::new(write_handle.inode_id);
+        let mut foreign = request.clone();
+        foreign.header = header(52);
+        let rejected = FileSystemServiceProto::sync_write(&env.service, Request::new(foreign))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            rpc_error(&header_error(rejected.header)).kind,
+            ErrorKind::Metadata(MetadataErrorKind::SessionInvalid)
+        );
+        let commit = CommitFileRequestProto {
+            header: header(52),
+            write_handle: Some(write_handle),
+            committed_blocks: vec![committed],
+            final_size: 128,
+            expected_generation: first_generation,
+            write_mode,
+            expected_file_size: 128,
+        };
+        let rejected = FileSystemServiceProto::commit_file(&env.service, Request::new(commit.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            rpc_error(&header_error(rejected.header)).kind,
+            ErrorKind::Metadata(MetadataErrorKind::SessionInvalid)
+        );
         env.session_registry
             .remove_session_if_epoch(inode_id, LeaseEpoch::new(write_handle.write_lease_epoch))
             .expect("remove session to model cleanup or restart");
@@ -1213,6 +1217,26 @@ mod tests {
         assert_success_header(replay.header);
         assert_eq!(replay.synced_size, first.synced_size);
         assert_eq!(replay.generation, Some(first_generation));
+
+        let rejected = FileSystemServiceProto::commit_file(
+            &env.service,
+            Request::new(CommitFileRequestProto {
+                header: header(51),
+                ..commit
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            rpc_error(&header_error(rejected.header)).kind,
+            ErrorKind::Metadata(MetadataErrorKind::SessionInvalid)
+        );
+        let inode = env.storage.get_inode(inode_id).unwrap().unwrap();
+        assert!(
+            matches!(inode.data, InodeData::File { lease_epoch: Some(epoch), last_commit: None, .. }
+            if epoch == LeaseEpoch::new(write_handle.write_lease_epoch))
+        );
 
         let mut changed_payload = request;
         changed_payload.committed_blocks.clear();
@@ -1226,202 +1250,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_publish_recovery_cannot_bypass_active_session_owner() {
+    async fn commit_replay_requires_exact_identity_and_payload_without_worker_observations() {
         let env = write_env().await;
-        let owner_client_id = 53;
-        let foreign_client_id = 54;
-        let (write_handle, committed, expected_generation, write_mode) =
-            open_write_session_with_committed_block(&env, "/mnt/test/owned-completed-publish", owner_client_id).await;
-        let owner_sync = SyncWriteRequestProto {
-            header: header(owner_client_id),
-            write_handle: Some(write_handle),
-            committed_blocks: vec![committed],
-            target_size: 128,
-            expected_generation,
-            write_mode,
-            expected_file_size: 0,
-        };
-        let first = FileSystemServiceProto::sync_write(&env.service, Request::new(owner_sync.clone()))
-            .await
-            .expect("transport status must remain OK")
-            .into_inner();
-        assert_success_header(first.header);
-        let inode_id = InodeId::new(write_handle.inode_id);
-
-        let mut foreign_sync = owner_sync;
-        foreign_sync.header = header(foreign_client_id);
-        let rejected_sync = FileSystemServiceProto::sync_write(&env.service, Request::new(foreign_sync))
-            .await
-            .expect("transport status must remain OK")
-            .into_inner();
-        assert_eq!(
-            rpc_error(&header_error(rejected_sync.header)).kind,
-            ErrorKind::Metadata(MetadataErrorKind::SessionInvalid)
-        );
-        assert!(env.session_registry.get_session(inode_id).is_some());
-
-        let foreign_commit = CommitFileRequestProto {
-            header: header(foreign_client_id),
-            write_handle: Some(write_handle),
-            committed_blocks: vec![committed],
-            final_size: 128,
-            expected_generation,
-            write_mode,
-            expected_file_size: 0,
-        };
-        let rejected_commit = FileSystemServiceProto::commit_file(&env.service, Request::new(foreign_commit))
-            .await
-            .expect("transport status must remain OK")
-            .into_inner();
-        assert_eq!(
-            rpc_error(&header_error(rejected_commit.header)).kind,
-            ErrorKind::Metadata(MetadataErrorKind::SessionInvalid)
-        );
-        assert!(env.session_registry.get_session(inode_id).is_some());
-
-        let owner_commit = FileSystemServiceProto::commit_file(
-            &env.service,
-            Request::new(CommitFileRequestProto {
-                header: header(owner_client_id),
-                write_handle: Some(write_handle),
-                committed_blocks: vec![committed],
-                final_size: 128,
-                expected_generation,
-                write_mode,
-                expected_file_size: 0,
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
-        assert_success_header(owner_commit.header);
-        assert!(env.session_registry.get_session(inode_id).is_none());
-    }
-
-    #[tokio::test]
-    async fn completed_publish_recovery_uses_state_equivalence_not_request_history() {
-        let env = write_env().await;
-        let client_id = 52;
-        let path = "/mnt/test/state-equivalent-publish";
-        let create = FileSystemServiceProto::create_file(
-            &env.service,
-            Request::new(CreateFileRequestProto {
-                header: header(client_id),
-                path: path.to_string(),
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
-        assert_success_header(create.header);
-
-        let write_handle = create.write_handle.expect("write handle");
-
-        let first_target = FileSystemServiceProto::allocate_block(
-            &env.service,
-            Request::new(AllocateBlockRequestProto {
-                header: header(client_id),
-                write_handle: Some(write_handle),
-                previous_block_id: None,
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner()
-        .block
-        .expect("first target");
-        let second_target = FileSystemServiceProto::allocate_block(
-            &env.service,
-            Request::new(AllocateBlockRequestProto {
-                header: header(client_id),
-                write_handle: Some(write_handle),
-                previous_block_id: first_target.block_id,
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner()
-        .block
-        .expect("second target");
-        let first = CommittedBlockProto {
-            block_id: first_target.block_id,
-            file_offset: first_target.file_offset,
-            len: first_target.block_size,
-        };
-        let second = CommittedBlockProto {
-            block_id: second_target.block_id,
-            file_offset: second_target.file_offset,
-            len: second_target.block_size,
-        };
-        publish_target_reports(&env, &[&first_target, &second_target]);
-
-        let published = FileSystemServiceProto::commit_file(
-            &env.service,
-            Request::new(CommitFileRequestProto {
-                header: header(client_id),
-                write_handle: Some(write_handle),
-                committed_blocks: vec![first, second],
-                final_size: 256,
-                expected_generation: create.generation,
-                write_mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
-                expected_file_size: 0,
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
-        assert_success_header(published.header);
-
-        let equivalent = FileSystemServiceProto::commit_file(
-            &env.service,
-            Request::new(CommitFileRequestProto {
-                header: header(client_id),
-                write_handle: Some(write_handle),
-                committed_blocks: vec![second],
-                final_size: 256,
-                expected_generation: create.generation,
-                write_mode: OpenWriteModeProto::OpenWriteModeAppend as i32,
-                expected_file_size: 128,
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
-        assert_success_header(equivalent.header);
-        assert_eq!(equivalent.committed_size, published.committed_size);
-
-        let non_equivalent = FileSystemServiceProto::commit_file(
-            &env.service,
-            Request::new(CommitFileRequestProto {
-                header: header(client_id),
-                write_handle: Some(write_handle),
-                committed_blocks: vec![second],
-                final_size: 256,
-                expected_generation: create.generation,
-                write_mode: OpenWriteModeProto::OpenWriteModeAppend as i32,
-                expected_file_size: 64,
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
-        let err = header_error(non_equivalent.header);
-        assert_fail_kind(&err, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
-        assert!(err.message.contains("contiguous"));
-    }
-
-    #[tokio::test]
-    async fn commit_file_resolves_completed_publish_without_a_session() {
-        let env = write_env().await;
-
         let (write_handle, committed, expected_generation, write_mode) =
             open_write_session_with_committed_block(&env, "/mnt/test/replay-file", 30).await;
-        let inode_id = write_handle.inode_id;
-        assert_ne!(inode_id, 0);
-        let file_inode_id = InodeId::new(inode_id);
-        let session_inode_id = file_inode_id;
-        assert!(env.session_registry.get_session(session_inode_id).is_some());
-        let typed_block_id = BlockId::try_from(committed.block_id.unwrap()).unwrap();
+        let inode_id = InodeId::new(write_handle.inode_id);
         let request = CommitFileRequestProto {
             header: header(30),
             write_handle: Some(write_handle),
@@ -1431,90 +1264,58 @@ mod tests {
             write_mode,
             expected_file_size: 0,
         };
-
         let first = FileSystemServiceProto::commit_file(&env.service, Request::new(request.clone()))
             .await
-            .expect("transport status must remain OK")
+            .unwrap()
             .into_inner();
         assert_success_header(first.header);
         assert_eq!(first.committed_size, 128);
-        let first_generation = match env
-            .storage
-            .get_inode(file_inode_id)
-            .unwrap()
-            .expect("committed inode")
-            .data
-        {
-            InodeData::File {
-                generation: Some(generation),
-                ..
-            } => generation.as_raw(),
-            other => panic!("expected committed file inode data, got {:?}", other),
+        assert!(env.session_registry.get_session(inode_id).is_none());
+        let inode = env.storage.get_inode(inode_id).unwrap().unwrap();
+        let InodeData::File {
+            generation,
+            lease_epoch,
+            last_commit,
+            ..
+        } = &inode.data
+        else {
+            panic!("file")
         };
-        assert_ne!(first_generation, 0);
-        assert!(env.session_registry.get_session(session_inode_id).is_none());
-        assert_eq!(first_generation, expected_generation + 1);
-
-        let locations = FileSystemServiceProto::get_block_locations(
-            &env.service,
-            Request::new(GetBlockLocationsRequestProto {
-                header: header(33),
-                target: Some(Target::InodeId(inode_id)),
-                range: Some(ByteRangeProto { offset: 0, len: 128 }),
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
-        assert_success_header(locations.header);
-        assert_eq!(locations.generation, Some(first_generation));
-        assert_eq!(locations.locations.len(), 1);
-        assert_eq!(locations.locations[0].block_stamp, Some(first_generation));
-
-        env.worker_manager
-            .as_ref()
-            .expect("worker manager")
-            .reset_worker_soft_state();
-        let second = FileSystemServiceProto::commit_file(&env.service, Request::new(request.clone()))
+        assert_eq!(*generation, Some(ContentGeneration::new(expected_generation + 1)));
+        assert_eq!(*lease_epoch, Some(LeaseEpoch::new(write_handle.write_lease_epoch + 1)));
+        assert!(last_commit.is_some());
+        env.worker_manager.as_ref().unwrap().reset_worker_soft_state();
+        let replay = FileSystemServiceProto::commit_file(&env.service, Request::new(request.clone()))
             .await
-            .expect("transport status must remain OK")
-            .into_inner();
-        assert_success_header(second.header);
-        assert_eq!(second.committed_size, first.committed_size);
-
-        let inode = env.storage.get_inode(file_inode_id).unwrap().expect("committed inode");
-        assert_eq!(inode.attrs.size, 128);
-        match &inode.data {
-            InodeData::File {
-                extents, generation, ..
-            } => {
-                assert_eq!(*generation, Some(ContentGeneration::new(first_generation)));
-                assert_eq!(extents.len(), 1);
-                assert_eq!(extents[0].block_id, typed_block_id);
-                assert_eq!(extents[0].len, 128);
-                assert_eq!(extents[0].block_stamp, Some(first_generation));
-            }
-            other => panic!("expected file inode data, got {:?}", other),
-        }
-
-        let mismatch = FileSystemServiceProto::commit_file(
-            &env.service,
-            Request::new(CommitFileRequestProto {
-                final_size: 129,
-                ..request
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
-        let err = header_error(mismatch.header);
-        assert_fail_kind(&err, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
-        assert!(err.message.contains("completed publish payload ends"));
-        let after_mismatch = env
-            .storage
-            .get_inode(file_inode_id)
             .unwrap()
-            .expect("inode after mismatch");
-        assert_eq!(after_mismatch, inode);
+            .into_inner();
+        assert_success_header(replay.header);
+        assert_eq!(replay.committed_size, first.committed_size);
+        for change in 0..5 {
+            let mut altered = request.clone();
+            match change {
+                0 => altered.final_size += 1,
+                1 => altered.expected_generation += 1,
+                2 => altered.expected_file_size += 1,
+                3 => altered.write_mode = OpenWriteModeProto::OpenWriteModeAppend as i32,
+                _ => altered.committed_blocks[0].len -= 1,
+            }
+            let response = FileSystemServiceProto::commit_file(&env.service, Request::new(altered))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_fail_kind(
+                &header_error(response.header),
+                ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument),
+            );
+        }
+        let mut other = request;
+        other.header = header(31);
+        let response = FileSystemServiceProto::commit_file(&env.service, Request::new(other))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.header.unwrap().error.is_some());
+        assert_eq!(env.storage.get_inode(inode_id).unwrap().unwrap(), inode);
     }
 }

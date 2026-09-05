@@ -8,13 +8,14 @@ use super::{
     FsFailure, FsResult, FsSuccess, MetadataFileSystem, RequestContext, StaleStateStatus, SUPPORTED_REPLICA_COUNT,
 };
 use crate::error::MetadataError;
+use crate::inode::{Inode, InodeData};
 use crate::observe;
 use crate::placement::{
     PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus, ReportedBlockLocation, WorkerPlacementView,
 };
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint, WorkerErrorKind};
 use beryl_common::header::CallerContextFields;
-use beryl_types::fs::{Extent, FileAttrs, FileType, Inode, InodeData};
+use beryl_types::fs::{Extent, FileAttrs, FileType};
 use beryl_types::ids::{InodeId, MountId};
 use beryl_types::{ContentGeneration, FileBlockLocation, GroupName};
 use std::time::Instant;
@@ -963,6 +964,7 @@ mod tests {
             generation: Some(ContentGeneration::new(1)),
             lease_epoch: None,
             next_block_index: 1,
+            last_commit: None,
         };
         storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();

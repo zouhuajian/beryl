@@ -5,11 +5,11 @@
 
 use crate::config::BlockCleanupConfig;
 use crate::error::MetadataResult;
+use crate::inode::InodeData;
 use crate::observe;
 use crate::raft::{AppRaftNode, RocksDBStorage};
 use crate::session_registry::SessionRegistry;
 use crate::worker::{ReadyReplicaCursor, ReplicaKey, WorkerManager};
-use beryl_types::fs::InodeData;
 use beryl_types::{BlockId, GroupName, WorkerId, WorkerRunId};
 use openraft::ServerState;
 use parking_lot::Mutex;
@@ -662,11 +662,12 @@ impl BlockCleanupCoordinator {
 mod tests {
     use super::*;
     use crate::config::RaftConfig;
+    use crate::inode::{Inode, InodeData};
     use crate::raft::{AppMetadataRaftState, AppRaftStateMachine};
     use crate::session_registry::BeginSessionInput;
     use crate::worker::{BlockReportBlock, BlockReportBlockState};
     use crate::MountTable;
-    use beryl_types::fs::{Extent, FileAttrs, Inode, InodeData};
+    use beryl_types::fs::{Extent, FileAttrs};
     use beryl_types::ids::{BlockId, BlockIndex, InodeId, MountId, WorkerId};
     use beryl_types::{ClientId, ContentGeneration, FileLayout, LeaseEpoch, Tier, TierFree, WorkerRunId, WriteMode};
     use tempfile::TempDir;
@@ -755,6 +756,7 @@ mod tests {
             generation: Some(ContentGeneration::new(1)),
             lease_epoch: Some(LeaseEpoch::new(1)),
             next_block_index,
+            last_commit: None,
         };
         storage.put_inode(&inode).unwrap();
         inode_id
@@ -1100,7 +1102,15 @@ mod tests {
             .iter()
             .all(|candidate| coordinator.state.lock().entries.contains_key(candidate)));
 
+        persist_file(&storage, session_started.block_id.inode_id, Vec::new(), 1);
         create_session(&sessions, session_started.block_id.inode_id);
+        let mut pending = sessions
+            .begin_publication(session_started.block_id.inode_id, LeaseEpoch::new(1))
+            .unwrap();
+        pending.mark_submitted().unwrap();
+        // Lost completion ownership cannot make a pre-existing GC candidate safe.
+        drop(pending);
+        assert_eq!(coordinator.classify(&session_started).unwrap(), CleanupDecision::Wait);
 
         create_session(&sessions, became_visible.block_id.inode_id);
         let mut visible_inode = storage.get_inode(became_visible.block_id.inode_id).unwrap().unwrap();

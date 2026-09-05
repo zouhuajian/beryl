@@ -8,21 +8,48 @@ use super::{
     fs_failure_from_metadata_error, Freshness, FsFailure, FsResult, MetadataFileSystem, RequestContext, WriteHandle,
 };
 use crate::error::{MetadataError, MetadataResult};
+use crate::inode::{FilePublication, InodeData};
 use crate::observe;
 use crate::raft::{ApplySuccess, Command, PublishMode};
 use crate::session_registry::{BeginWritePublicationError, WritePublication, WriteSession};
 use crate::worker::{PublishReadyConflict, PublishReadyStatus, PublishReadyTarget};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint, WorkerErrorKind};
-use beryl_types::fs::{Extent, InodeData};
+use beryl_types::fs::Extent;
 use beryl_types::ids::{InodeId, MountId};
 use beryl_types::{CommittedBlock, ContentGeneration, GroupName, LeaseEpoch, WriteMode, MAX_FILE_EXTENTS};
 use std::collections::{HashMap, HashSet};
 
+/// Caller-supplied visible content boundary, frozen before the first RPC attempt.
 #[derive(Clone, Debug)]
 pub(super) struct CloseWriteIntent {
     pub(super) committed_blocks: Vec<CommittedBlock>,
     pub(super) final_size: u64,
     pub(super) expected_file_size: u64,
+}
+
+impl CloseWriteIntent {
+    /// Preserve the caller's frozen publication preconditions for durable replay.
+    fn publication(&self, handle: WriteHandle, generation: ContentGeneration, mode: PublishMode) -> FilePublication {
+        FilePublication {
+            extents: self
+                .committed_blocks
+                .iter()
+                .map(|block| Extent {
+                    file_offset: block.file_offset,
+                    block_id: block.block_id,
+                    block_offset: 0,
+                    len: block.len,
+                    generation: None,
+                    block_stamp: None,
+                })
+                .collect(),
+            target_size: self.final_size,
+            expected_generation: generation,
+            expected_file_size: self.expected_file_size,
+            lease_epoch: handle.lease_epoch,
+            mode,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -77,7 +104,10 @@ impl MetadataFileSystem {
 
         let handle = args.handle;
         let committed_block_count = args.committed_blocks.len();
-        let committed_bytes: u64 = args.committed_blocks.iter().map(|block| block.len).sum();
+        let committed_bytes: u64 = args
+            .committed_blocks
+            .iter()
+            .fold(0u64, |sum, block| sum.saturating_add(block.len));
         let result = self
             .close_write_session(
                 ctx,
@@ -203,14 +233,14 @@ impl MetadataFileSystem {
     }
 
     /// Freeze the current issued-target sequence before validating publication.
-    fn begin_write_publication<'a>(
-        &'a self,
+    fn begin_write_publication(
+        &self,
         ctx: &RequestContext,
         inode_id: InodeId,
         lease_epoch: LeaseEpoch,
         publish_mode: PublishMode,
         operation: &'static str,
-    ) -> Result<WritePublication<'a>, FsFailure> {
+    ) -> Result<WritePublication, FsFailure> {
         let publication = match self.session_registry.begin_publication(inode_id, lease_epoch) {
             Ok(publication) => publication,
             Err(BeginWritePublicationError::Session(message)) => {
@@ -276,13 +306,13 @@ impl MetadataFileSystem {
         Ok(publication)
     }
 
-    /// Resolve an ambiguous publish from the durable file state.
+    /// Resolve a SyncWrite postcondition; this never proves that CommitFile ran.
     ///
     /// This is state-equivalence recovery, not historical request replay. Once
     /// the requested postcondition is visible at the next content generation,
     /// preconditions such as the original publish mode are no longer
     /// distinguishable without persisting request history.
-    fn resolve_published_state(
+    fn resolve_synced_state(
         &self,
         inode_id: InodeId,
         lease_epoch: LeaseEpoch,
@@ -403,9 +433,6 @@ impl MetadataFileSystem {
         committed_blocks: &[CommittedBlock],
         expected_generation: ContentGeneration,
     ) -> MetadataResult<Vec<PublishReadyTarget>> {
-        let new_block_stamp = expected_generation
-            .checked_next()
-            .ok_or_else(|| MetadataError::InvalidArgument("content generation overflow".to_string()))?;
         let inode = self
             .read_inode(session.inode_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {}", session.inode_id)))?;
@@ -450,6 +477,9 @@ impl MetadataFileSystem {
             if already_visible {
                 continue;
             }
+            let new_block_stamp = expected_generation
+                .checked_next()
+                .ok_or_else(|| MetadataError::InvalidArgument("content generation overflow".to_string()))?;
             if target.block_stamp != new_block_stamp.as_raw() {
                 return Err(MetadataError::InvalidArgument(format!(
                     "Committed block {} was issued for block stamp {} but is not visible at content generation {expected_generation}",
@@ -747,7 +777,7 @@ impl MetadataFileSystem {
     async fn revalidate_publish_session(
         &self,
         ctx: &RequestContext,
-        publication: &WritePublication<'_>,
+        publication: &WritePublication,
         publish_mode: PublishMode,
         operation: &'static str,
     ) -> Result<WriteSession, FsFailure> {
@@ -828,7 +858,7 @@ impl MetadataFileSystem {
             Ok(session) => session,
             Err(failure) => return Err(failure),
         };
-        match self.resolve_published_state(inode_id, lease_epoch, &intent, expected_generation, publish_mode) {
+        match self.resolve_synced_state(inode_id, lease_epoch, &intent, expected_generation, publish_mode) {
             Ok(Some((_inode_id, mount_id, generation, _stored_lease_epoch))) => {
                 let publication = if active_session.is_some() {
                     Some(self.begin_write_publication(ctx, inode_id, lease_epoch, publish_mode, "SyncWrite")?)
@@ -1287,6 +1317,8 @@ impl MetadataFileSystem {
         Ok(extents)
     }
 
+    /// Confirm a durable close or submit one atomic publication and lease end.
+    /// Sessionless requests may only confirm existing completion evidence.
     pub(super) async fn close_write_session(
         &self,
         ctx: &RequestContext,
@@ -1298,86 +1330,32 @@ impl MetadataFileSystem {
     ) -> FsResult<CloseWriteOutput> {
         let inode_id = handle.inode_id;
         let lease_epoch = handle.lease_epoch;
-        let active_session = match self.active_publish_session(ctx, inode_id, lease_epoch, publish_mode, "CommitFile") {
-            Ok(session) => session,
-            Err(failure) => return Err(failure),
+        let mut payload = intent.publication(handle, expected_generation, publish_mode);
+        // Read the receipt and its layout together before checking any soft
+        // session state: a completed commit has already ended that session.
+        let resolved = match self.raft_node.as_ref() {
+            Some(raft) => {
+                raft.read(true, |_| {
+                    let inode = self
+                        .read_inode(inode_id)?
+                        .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {inode_id}")))?;
+                    if inode.inode_id != inode_id || inode.kind != inode.data.kind() {
+                        return Err(MetadataError::Internal("CommitFile inode authority is corrupt".into()));
+                    }
+                    payload
+                        .resolve_commit(&inode, ctx.caller.client.client_id, ctx.caller.client.call_id)
+                        .map(|generation| generation.map(|_| inode.mount_id))
+                })
+                .await
+            }
+            None => Err(MetadataError::Internal("Raft node not available".into())),
         };
-        match self.resolve_published_state(inode_id, lease_epoch, &intent, expected_generation, publish_mode) {
-            Ok(Some((_inode_id, mount_id, generation, stored_lease_epoch))) => {
-                let publication = if active_session.is_some() {
-                    Some(self.begin_write_publication(ctx, inode_id, lease_epoch, publish_mode, "CommitFile")?)
-                } else {
-                    None
-                };
-                if publication.as_ref().is_some_and(|publication| {
-                    let session = publication.session();
-                    session.generation != expected_generation && session.generation != generation
-                }) {
-                    return self.session_terminal_failure(
-                        ctx,
-                        ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
-                        "CommitFile content generation does not match the active session".to_string(),
-                        None,
-                        None,
-                    );
-                }
+        match resolved {
+            Ok(Some(mount_id)) => {
                 let (group_name, mount_epoch, route_epoch) = self
                     .completed_publish_hints(ctx, freshness, mount_id, "CommitFile")
                     .await?;
-                // A no-op close has no content mutation to prove that the initial
-                // CreateFile write right ended, so advance its durable fence explicitly.
-                if generation == expected_generation && stored_lease_epoch == lease_epoch {
-                    let proposed_at_ms = crate::raft::proposal_timestamp_ms();
-                    if active_session.is_none() {
-                        let owner_matches = match self.storage.get_create_file_replay_for_inode(inode_id) {
-                            Ok(Some(replay)) => {
-                                replay.operation_id.client_id == ctx.caller.client.client_id
-                                    && replay.inode_id == inode_id
-                                    && replay.mount_id == mount_id
-                                    && replay.lease_epoch == lease_epoch
-                                    && replay.generation == expected_generation
-                                    && replay.expires_at_ms > proposed_at_ms
-                            }
-                            Ok(None) => false,
-                            Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
-                        };
-                        if !owner_matches {
-                            return self.session_terminal_failure(
-                                ctx,
-                                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
-                                format!("CommitFile cannot authenticate the durable owner for inode_id={inode_id}"),
-                                group_name,
-                                mount_epoch,
-                            );
-                        }
-                    }
-                    self.require_publish_deadline(ctx, group_name.as_ref(), mount_epoch, route_epoch)?;
-                    let next_epoch = lease_epoch.checked_next();
-                    if let Err(error) = self
-                        .propose_fs_write_command(
-                            Command::EndWriteLease {
-                                proposed_at_ms,
-                                inode_id,
-                                lease_epoch,
-                            },
-                            move |success| match success {
-                                ApplySuccess::WriteLeaseEnded {
-                                    inode_id: returned_inode_id,
-                                    lease_epoch: ended_epoch,
-                                } if returned_inode_id == inode_id && Some(ended_epoch) == next_epoch => Ok(()),
-                                unexpected => Err(unexpected_raft_apply_success("EndWriteLease", unexpected)),
-                            },
-                        )
-                        .await
-                    {
-                        return self.failure_from_error(ctx, error, group_name, mount_epoch);
-                    }
-                }
-                if let Some(publication) = publication {
-                    if let Err(message) = publication.complete_commit() {
-                        return self.failure_from_error(ctx, MetadataError::Internal(message), group_name, mount_epoch);
-                    }
-                }
+                self.session_registry.remove_session_if_epoch(inode_id, lease_epoch);
                 return self.success_with_route_epoch(
                     CloseWriteOutput {
                         committed_size: intent.final_size,
@@ -1388,9 +1366,10 @@ impl MetadataFileSystem {
                 );
             }
             Ok(None) => {}
-            Err(err) => return self.failure_from_error(ctx, err, None, None),
+            Err(error) => return self.failure_from_error(ctx, error, None, None),
         }
-        let publication = match active_session {
+        let active_session = self.active_publish_session(ctx, inode_id, lease_epoch, publish_mode, "CommitFile")?;
+        let mut publication = match active_session {
             Some(_) => match self.begin_write_publication(ctx, inode_id, lease_epoch, publish_mode, "CommitFile") {
                 Ok(publication) => publication,
                 Err(failure) => return Err(failure),
@@ -1529,40 +1508,25 @@ impl MetadataFileSystem {
             route_epoch,
         )?;
 
-        let command = Command::PublishFile {
+        payload.extents = extents;
+        let command = Command::CommitFile {
             proposed_at_ms: crate::raft::proposal_timestamp_ms(),
-            inode_id: session.inode_id,
-            extents,
-            target_size: intent.final_size,
-            expected_generation,
-            expected_file_size: intent.expected_file_size,
-            lease_epoch,
-            mode: publish_mode,
+            inode_id,
+            client_id: ctx.caller.client.client_id,
+            call_id: ctx.caller.client.call_id,
+            publication: payload,
         };
-        let inode_id = session.inode_id;
-        match self
-            .propose_fs_write_command(command, move |success| match success {
-                ApplySuccess::FilePublished {
-                    inode_id: returned_inode_id,
-                    ..
-                } if returned_inode_id == inode_id => Ok(()),
-                unexpected => Err(unexpected_raft_apply_success("PublishFile", unexpected)),
-            })
-            .await
-        {
-            Ok(()) => {}
-            Err(err) => {
-                return self.failure_from_error(ctx, err, Some(routed.group_name.clone()), Some(routed.mount_epoch));
-            }
-        }
-
-        if let Err(message) = publication.complete_commit() {
-            return self.failure_from_error(
+        if let Err(message) = publication.mark_submitted() {
+            return self.session_terminal_failure(
                 ctx,
-                MetadataError::Internal(message),
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                message,
                 Some(routed.group_name.clone()),
                 Some(routed.mount_epoch),
             );
+        }
+        if let Err(error) = self.propose_file_commit(command, publication).await {
+            return self.failure_from_error(ctx, error, Some(routed.group_name.clone()), Some(routed.mount_epoch));
         }
 
         self.success_with_route_epoch(
@@ -1612,20 +1576,7 @@ mod tests {
     #[tokio::test]
     async fn commit_waits_for_ready_observation_then_publishes() {
         let env = write_flow_env(0).await;
-        let open = env
-            .filesystem
-            .open_write_inode(
-                &request_context(),
-                "/file".to_string(),
-                env.inode_id,
-                vec![env.inode_id],
-                WriteMode::Overwrite,
-                Freshness::default(),
-            )
-            .await
-            .expect("open write")
-            .payload;
-        let target = allocate_block_for_key(&env.filesystem, &open).await;
+        let (open, target) = open_write_with_target(&env).await;
         let committed = vec![committed_block(target.block_id, target.file_offset, 64)];
         let commit = commit_for_key(&env.filesystem, &open, committed, 64);
         tokio::pin!(commit);
@@ -1652,20 +1603,7 @@ mod tests {
     #[tokio::test]
     async fn deadline_expiring_after_ready_wait_does_not_publish() {
         let env = write_flow_env(0).await;
-        let open = env
-            .filesystem
-            .open_write_inode(
-                &request_context(),
-                "/file".to_string(),
-                env.inode_id,
-                vec![env.inode_id],
-                WriteMode::Overwrite,
-                Freshness::default(),
-            )
-            .await
-            .expect("open write")
-            .payload;
-        let target = allocate_block_for_key(&env.filesystem, &open).await;
+        let (open, target) = open_write_with_target(&env).await;
         let mut ctx = request_context();
         ctx.caller.deadline = Deadline::from_now(Duration::from_millis(40));
         let commit = env.filesystem.close_write_session(
@@ -1674,11 +1612,7 @@ mod tests {
                 inode_id: open.inode_id,
                 lease_epoch: open.lease_epoch,
             },
-            CloseWriteIntent {
-                committed_blocks: vec![committed_block(target.block_id, target.file_offset, 64)],
-                final_size: 64,
-                expected_file_size: open.base_size,
-            },
+            target_intent(&target, open.base_size),
             Freshness::default(),
             open.generation,
             PublishMode::ReplaceIfUnchanged,
@@ -1701,227 +1635,174 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn noop_close_requires_a_live_owner_and_deadline_before_ending_the_lease() {
-        let env = write_flow_env(0).await;
-        let open = env
-            .filesystem
-            .open_write_inode(
-                &request_context(),
-                "/file".to_string(),
-                env.inode_id,
-                vec![env.inode_id],
-                WriteMode::Overwrite,
-                Freshness::default(),
-            )
-            .await
-            .expect("open write")
-            .payload;
-        let mut ctx = request_context();
-        ctx.caller.deadline = Deadline::from_unix_ms(0);
+    async fn noop_close_checks_authority_without_advancing_exhausted_generation() {
+        for case in 0..3 {
+            let env = write_flow_env(0).await;
+            if case == 2 {
+                let mut inode = env.storage.get_inode(env.inode_id).unwrap().unwrap();
+                let InodeData::File { generation, .. } = &mut inode.data else {
+                    unreachable!()
+                };
+                *generation = Some(ContentGeneration::new(u64::MAX));
+                env.storage.put_inode(&inode).unwrap();
+            }
+            let open = env
+                .filesystem
+                .open_write_inode(
+                    &request_context(),
+                    "/file".into(),
+                    env.inode_id,
+                    vec![env.inode_id],
+                    WriteMode::Overwrite,
+                    Freshness::default(),
+                )
+                .await
+                .unwrap()
+                .payload;
+            let mut ctx = request_context();
+            if case == 0 {
+                ctx.caller.deadline = Deadline::from_unix_ms(0);
+            } else if case == 1 {
+                env.filesystem
+                    .session_registry()
+                    .remove_session_if_epoch(open.inode_id, open.lease_epoch)
+                    .unwrap();
+            }
+            let result = env
+                .filesystem
+                .close_write_session(
+                    &ctx,
+                    WriteHandle {
+                        inode_id: open.inode_id,
+                        lease_epoch: open.lease_epoch,
+                    },
+                    CloseWriteIntent {
+                        committed_blocks: Vec::new(),
+                        final_size: 0,
+                        expected_file_size: 0,
+                    },
+                    Freshness::default(),
+                    open.generation,
+                    PublishMode::ReplaceIfUnchanged,
+                )
+                .await;
+            assert_eq!(result.is_ok(), case == 2);
+            let inode = env.storage.get_inode(open.inode_id).unwrap().unwrap();
+            assert_eq!(
+                stored_generation(&env.storage, env.inode_id).unwrap_or_default(),
+                open.generation
+            );
+            assert!(
+                matches!(inode.data, InodeData::File { lease_epoch: Some(epoch), last_commit, .. }
+                if epoch.as_raw() == open.lease_epoch.as_raw() + u64::from(case == 2)
+                    && last_commit.is_some() == (case == 2))
+            );
+        }
+    }
 
-        env.filesystem
-            .close_write_session(
+    #[tokio::test]
+    async fn submitted_commit_survives_cancelled_waiter() {
+        use std::future::Future;
+        use std::task::Poll;
+        let env = write_flow_env(0).await;
+        let (open, target) = open_write_with_target(&env).await;
+        publish_env_write_target(&env, &target, 1);
+        let registry = env.filesystem.session_registry();
+        let mut publication = registry.begin_publication(open.inode_id, open.lease_epoch).unwrap();
+        publication.mark_submitted().unwrap();
+        let command = Command::CommitFile {
+            proposed_at_ms: 1,
+            inode_id: open.inode_id,
+            client_id: publication.session().open_client_id,
+            call_id: beryl_types::CallId::new(),
+            publication: target_intent(&target, 0).publication(
+                WriteHandle {
+                    inode_id: open.inode_id,
+                    lease_epoch: open.lease_epoch,
+                },
+                open.generation,
+                PublishMode::ReplaceIfUnchanged,
+            ),
+        };
+        {
+            let mut waiter = Box::pin(env.filesystem.propose_file_commit(command, publication));
+            // The current-thread executor cannot run the spawned completion task
+            // until this test yields, so cancellation occurs strictly before apply.
+            std::future::poll_fn(|cx| {
+                assert!(waiter.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+        }
+        assert!(registry.get_session_identity(open.inode_id).is_some());
+        assert_eq!(stored_generation(&env.storage, open.inode_id), None);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while registry.get_session_identity(open.inode_id).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let inode = env.storage.get_inode(open.inode_id).unwrap().unwrap();
+        assert_eq!(inode.attrs.size, 64);
+        assert!(
+            matches!(inode.data, InodeData::File { last_commit: Some(_), lease_epoch: Some(epoch), .. }
+            if epoch == open.lease_epoch.checked_next().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn authority_changes_during_ready_wait_prevent_commit() {
+        for change in 0..3 {
+            let env = write_flow_env(0).await;
+            let (open, target) = open_write_with_target(&env).await;
+            let ctx = request_context();
+            let commit = env.filesystem.close_write_session(
                 &ctx,
                 WriteHandle {
                     inode_id: open.inode_id,
                     lease_epoch: open.lease_epoch,
                 },
-                CloseWriteIntent {
-                    committed_blocks: Vec::new(),
-                    final_size: 0,
-                    expected_file_size: 0,
-                },
+                target_intent(&target, open.base_size),
                 Freshness::default(),
                 open.generation,
                 PublishMode::ReplaceIfUnchanged,
-            )
-            .await
-            .expect_err("an expired no-op close must fail before ending the lease");
-
-        let stored_epoch = env
-            .storage
-            .get_inode(open.inode_id)
-            .unwrap()
-            .and_then(|inode| match inode.data {
-                InodeData::File { lease_epoch, .. } => lease_epoch,
-                _ => None,
-            });
-        assert_eq!(stored_epoch, Some(open.lease_epoch));
-        assert!(env.filesystem.write_session_for_inode(open.inode_id).is_some());
-
-        let env = write_flow_env(0).await;
-        let open = env
-            .filesystem
-            .open_write_inode(
-                &request_context(),
-                "/file".to_string(),
-                env.inode_id,
-                vec![env.inode_id],
-                WriteMode::Overwrite,
-                Freshness::default(),
-            )
-            .await
-            .expect("open write")
-            .payload;
-        env.filesystem
-            .session_registry()
-            .remove_session_if_epoch(open.inode_id, open.lease_epoch)
-            .expect("remove leader-local session");
-        env.filesystem
-            .close_write_session(
-                &request_context(),
-                WriteHandle {
-                    inode_id: open.inode_id,
-                    lease_epoch: open.lease_epoch,
-                },
-                CloseWriteIntent {
-                    committed_blocks: Vec::new(),
-                    final_size: 0,
-                    expected_file_size: 0,
-                },
-                Freshness::default(),
-                open.generation,
-                PublishMode::ReplaceIfUnchanged,
-            )
-            .await
-            .expect_err("sessionless OpenWrite close must not advance its durable fence");
-        let stored_epoch = env
-            .storage
-            .get_inode(open.inode_id)
-            .unwrap()
-            .and_then(|inode| match inode.data {
-                InodeData::File { lease_epoch, .. } => lease_epoch,
-                _ => None,
-            });
-        assert_eq!(stored_epoch, Some(open.lease_epoch));
-    }
-
-    #[tokio::test]
-    async fn session_removed_during_ready_wait_prevents_publication() {
-        let env = write_flow_env(0).await;
-        let (open, target) = open_write_with_target(&env).await;
-        let ctx = request_context();
-        let commit = env.filesystem.close_write_session(
-            &ctx,
-            WriteHandle {
-                inode_id: open.inode_id,
-                lease_epoch: open.lease_epoch,
-            },
-            target_intent(&target, open.base_size),
-            Freshness::default(),
-            open.generation,
-            PublishMode::ReplaceIfUnchanged,
-        );
-        tokio::pin!(commit);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut commit)
+            );
+            tokio::pin!(commit);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut commit)
+                    .await
+                    .is_err(),
+                "Ready has not been reported"
+            );
+            let expected = match change {
+                0 => {
+                    env.filesystem
+                        .session_registry()
+                        .remove_session_if_epoch(open.inode_id, open.lease_epoch)
+                        .unwrap();
+                    MetadataErrorKind::SessionInvalid
+                }
+                1 => {
+                    let session = env.filesystem.write_session_for_inode(open.inode_id).unwrap();
+                    let table = env.filesystem.mount_table();
+                    let mut mount = table.get_mount(session.mount_id).unwrap().unwrap();
+                    mount.mount_epoch += 1;
+                    table.upsert(mount).unwrap();
+                    MetadataErrorKind::MountEpochMismatch
+                }
+                _ => {
+                    env.filesystem.raft_node().shutdown().await.unwrap();
+                    MetadataErrorKind::NotLeader
+                }
+            };
+            publish_env_write_target(&env, &target, 1);
+            let failure = tokio::time::timeout(Duration::from_secs(2), &mut commit)
                 .await
-                .is_err(),
-            "CommitFile must wait for Ready"
-        );
-        env.filesystem
-            .session_registry()
-            .remove_session_if_epoch(open.inode_id, open.lease_epoch)
-            .expect("remove active session");
-        publish_env_write_target(&env, &target, 1);
-
-        let failure = tokio::time::timeout(Duration::from_secs(2), &mut commit)
-            .await
-            .expect("session change must wake and finish publication")
-            .expect_err("a removed session must fail closed");
-        assert_eq!(
-            failure.error.kind,
-            ErrorKind::Metadata(MetadataErrorKind::SessionInvalid)
-        );
-        assert!(matches!(
-            failure.error.recovery,
-            RecoveryAction::ReopenWriteSession { .. }
-        ));
-        assert_eq!(stored_generation(&env.storage, env.inode_id), None);
-    }
-
-    #[tokio::test]
-    async fn mount_change_during_ready_wait_prevents_publication() {
-        let env = write_flow_env(0).await;
-        let (open, target) = open_write_with_target(&env).await;
-        let session = env
-            .filesystem
-            .write_session_for_inode(open.inode_id)
-            .expect("active session");
-        let ctx = request_context();
-        let commit = env.filesystem.close_write_session(
-            &ctx,
-            WriteHandle {
-                inode_id: open.inode_id,
-                lease_epoch: open.lease_epoch,
-            },
-            target_intent(&target, open.base_size),
-            Freshness::default(),
-            open.generation,
-            PublishMode::ReplaceIfUnchanged,
-        );
-        tokio::pin!(commit);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut commit)
-                .await
-                .is_err(),
-            "CommitFile must wait for Ready"
-        );
-        let mount_table = env.filesystem.mount_table();
-        let mut mount = mount_table
-            .get_mount(session.mount_id)
-            .expect("read mount")
-            .expect("active mount");
-        mount.mount_epoch += 1;
-        mount_table.upsert(mount).expect("replace mount");
-        publish_env_write_target(&env, &target, 1);
-
-        let failure = tokio::time::timeout(Duration::from_secs(2), &mut commit)
-            .await
-            .expect("mount change must wake and finish publication")
-            .expect_err("a changed mount must fail closed");
-        assert_refresh_metadata(
-            &failure.error,
-            ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
-        );
-        assert_eq!(stored_generation(&env.storage, env.inode_id), None);
-    }
-
-    #[tokio::test]
-    async fn leadership_loss_during_ready_wait_prevents_publication() {
-        let env = write_flow_env(0).await;
-        let (open, target) = open_write_with_target(&env).await;
-        let ctx = request_context();
-        let commit = env.filesystem.close_write_session(
-            &ctx,
-            WriteHandle {
-                inode_id: open.inode_id,
-                lease_epoch: open.lease_epoch,
-            },
-            target_intent(&target, open.base_size),
-            Freshness::default(),
-            open.generation,
-            PublishMode::ReplaceIfUnchanged,
-        );
-        tokio::pin!(commit);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut commit)
-                .await
-                .is_err(),
-            "CommitFile must wait for Ready"
-        );
-        env.filesystem
-            .raft_node()
-            .shutdown()
-            .await
-            .expect("stop Raft leadership");
-        publish_env_write_target(&env, &target, 1);
-
-        let failure = tokio::time::timeout(Duration::from_secs(2), &mut commit)
-            .await
-            .expect("leadership loss must wake and finish publication")
-            .expect_err("a nonleader must fail closed");
-        assert_refresh_metadata(&failure.error, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
-        assert_eq!(stored_generation(&env.storage, env.inode_id), None);
+                .unwrap()
+                .expect_err("changed authority must fail closed");
+            assert_eq!(failure.error.kind, ErrorKind::Metadata(expected));
+            assert_eq!(stored_generation(&env.storage, env.inode_id), None);
+        }
     }
 }

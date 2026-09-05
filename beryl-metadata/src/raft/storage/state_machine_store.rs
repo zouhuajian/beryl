@@ -955,6 +955,7 @@ impl RocksDBStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inode::Inode;
     use crate::mount::{DataIoPolicy, MountEntry, MountKind, MountTable};
     use crate::raft::state_machine::AppRaftStateMachine;
     use crate::raft::storage::DetachedRoot;
@@ -963,7 +964,7 @@ mod tests {
         MAX_RECLAIM_DETACHED_ROOT_ENTRIES,
     };
     use crate::state::RouteEpoch;
-    use beryl_types::fs::{FileAttrs, Inode};
+    use beryl_types::fs::FileAttrs;
     use beryl_types::ids::{InodeId, MountId};
     use beryl_types::GroupName;
     use metrics::{Counter, CounterFn, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
@@ -1158,6 +1159,33 @@ mod tests {
             .unwrap();
         storage_a.put_detached_root(detached_inode_id, detached_root).unwrap();
 
+        let file_id = InodeId::new(72);
+        let mut file = Inode::new_file(file_id, FileAttrs::new(), snapshot_mount.mount_id);
+        let crate::inode::InodeData::File { lease_epoch, .. } = &mut file.data else {
+            unreachable!()
+        };
+        *lease_epoch = Some(beryl_types::LeaseEpoch::new(1));
+        storage_a.put_inode(&file).unwrap();
+        storage_a
+            .put_layout(file_id, beryl_types::FileLayout::new(1024))
+            .unwrap();
+        let close = Command::CommitFile {
+            proposed_at_ms: 1,
+            inode_id: file_id,
+            client_id: beryl_types::ClientId::new(9),
+            call_id: beryl_types::CallId::new(),
+            publication: crate::inode::FilePublication {
+                extents: Vec::new(),
+                target_size: 0,
+                expected_generation: beryl_types::ContentGeneration::new(0),
+                expected_file_size: 0,
+                lease_epoch: beryl_types::LeaseEpoch::new(1),
+                mode: crate::inode::PublishMode::ReplaceIfUnchanged,
+            },
+        };
+        sm_a.apply(close.clone()).unwrap();
+        let committed_file = storage_a.get_inode(file_id).unwrap().unwrap();
+
         // Persist raft state for meta.
         let raft_state = sample_raft_state();
         storage_a.persist_raft_state_durable(&raft_state).unwrap();
@@ -1202,6 +1230,11 @@ mod tests {
 
         let (snapshot_meta, incoming) = receive_snapshot(&mut sm_store_b, snapshot).await;
         sm_store_b.install_snapshot(&snapshot_meta, incoming).await.unwrap();
+
+        assert_eq!(storage_b.get_inode(file_id).unwrap().unwrap(), committed_file);
+        sm_b.apply_with_raft_state(close, &storage_b.load_raft_state().unwrap())
+            .unwrap();
+        assert_eq!(storage_b.get_inode(file_id).unwrap().unwrap(), committed_file);
 
         // Validate data restored.
         assert_eq!(read_view_b.route_epoch(), RouteEpoch::new(7));
