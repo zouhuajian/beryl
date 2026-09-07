@@ -103,7 +103,6 @@ pub struct WorkerRuntime {
 /// Metadata maintenance lifecycle independent of worker RPC serving.
 pub struct Maintenance {
     cleanup: Arc<BlockCleanupCoordinator>,
-    _maintenance_service: Arc<MaintenanceService>,
     maintenance_handle: MaintenanceHandle,
 }
 
@@ -533,7 +532,7 @@ pub(crate) async fn build_maintenance(
         Arc::clone(&authority.storage),
         config.namespace_delete.clone(),
     ));
-    let maintenance_service = Arc::new(MaintenanceService::new(
+    let maintenance_service = MaintenanceService::new(
         Arc::clone(&authority.raft_node),
         Arc::clone(&worker.manager),
         Arc::clone(&cleanup),
@@ -541,12 +540,11 @@ pub(crate) async fn build_maintenance(
         Duration::from_millis(config.worker_liveness.scan_interval_ms),
         session_registry,
         WRITE_SESSION_EXPIRY_SCAN_INTERVAL,
-    ));
+    );
     let maintenance_handle = maintenance_service.start();
 
     Maintenance {
         cleanup,
-        _maintenance_service: maintenance_service,
         maintenance_handle,
     }
 }
