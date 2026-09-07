@@ -60,6 +60,7 @@ name = "beryl-metadata"
 path = "src/bin/main.rs"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 beryl-client = { path = "../beryl-client" }
 tempfile = { workspace = true }
 tokio-stream = { version = "0.1", features = ["net"] }
