@@ -86,7 +86,7 @@ impl Drop for MaintenanceHandle {
     }
 }
 
-/// Owns Metadata background cleanup and convergence tasks.
+/// Dependencies used to start Metadata background cleanup and convergence tasks.
 pub struct MaintenanceService {
     raft_node: Arc<AppRaftNode>,
     worker_manager: Arc<WorkerManager>,

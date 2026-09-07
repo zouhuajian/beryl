@@ -2052,6 +2052,78 @@ mod tests {
     use beryl_types::{BlockFormatId, Tier};
     use std::sync::{Arc, Barrier, Condvar, Mutex};
 
+    #[tokio::test]
+    async fn maintenance_retires_sessions_after_service_drop_and_releases_dependencies_on_shutdown() {
+        use crate::config::{BlockCleanupConfig, NamespaceDeleteConfig, RaftConfig};
+        use crate::maintenance::{BlockCleanupCoordinator, DetachedRootReclaimer, MaintenanceService};
+        use crate::mount::MountTable;
+        use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
+        use crate::worker::WorkerManager;
+        use std::time::Duration;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let raft_node = Arc::new(
+            AppRaftNode::new(
+                1,
+                Arc::clone(&storage),
+                Arc::new(AppRaftStateMachine::new(Arc::clone(&storage))),
+                Arc::new(MountTable::new()),
+                &RaftConfig::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        let sessions = Arc::new(SessionRegistry::new(1, 1, 1, 1, 1));
+        let inode_id = InodeId::new(2);
+        install_session_at(&sessions, create_input(inode_id), 1).unwrap();
+        assert!(sessions.state.read().entries.contains_key(&inode_id));
+        let worker_manager = Arc::new(WorkerManager::new(60_000));
+        let cleanup = Arc::new(BlockCleanupCoordinator::new(
+            Arc::clone(&raft_node),
+            Arc::clone(&storage),
+            Arc::clone(&worker_manager),
+            Arc::clone(&sessions),
+            beryl_types::GroupName::parse("root").unwrap(),
+            &BlockCleanupConfig::default(),
+        ));
+        let reclaimer = Arc::new(DetachedRootReclaimer::new(
+            Arc::clone(&raft_node),
+            storage,
+            NamespaceDeleteConfig::default(),
+        ));
+        let service = MaintenanceService::new(
+            Arc::clone(&raft_node),
+            worker_manager,
+            cleanup,
+            reclaimer,
+            Duration::from_secs(1),
+            Arc::clone(&sessions),
+            Duration::from_millis(10),
+        );
+        let handle = service.start();
+        drop(service);
+
+        // Inspect without calling registry APIs that also retire expired entries.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while sessions.state.read().entries.contains_key(&inode_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("maintenance must retire the expired session without the service");
+
+        let remaining_sessions = Arc::downgrade(&sessions);
+        drop(sessions);
+        assert!(remaining_sessions.upgrade().is_some());
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(remaining_sessions.upgrade().is_none());
+        raft_node.shutdown().await.unwrap();
+    }
+
     fn write_target(inode_id: InodeId, index: u32) -> LocatedBlock {
         let block_id = BlockId::new(inode_id, BlockIndex::new(index));
         LocatedBlock {
