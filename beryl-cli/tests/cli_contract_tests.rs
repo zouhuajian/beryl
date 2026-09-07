@@ -2,9 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -106,7 +107,8 @@ fn sigterm_reaches_the_execed_role_with_the_original_pid() {
         "beryl-worker",
         r#"#!/bin/sh
 trap 'exit 0' TERM INT
-printf '%s\n' "$$" > "$BERYL_TEST_READY_FILE"
+printf '%s\n' "$$" > "$BERYL_TEST_READY_FILE.tmp"
+mv "$BERYL_TEST_READY_FILE.tmp" "$BERYL_TEST_READY_FILE"
 while true; do
   sleep 1
 done
@@ -145,6 +147,8 @@ struct TestInstall {
 }
 
 impl TestInstall {
+    // Create executables in children so parallel test forks cannot inherit
+    // writable fixture fds and cause ETXTBSY when another test executes them.
     fn new() -> Self {
         let root = TempDir::new().unwrap();
         let bin_dir = root.path().join("bin");
@@ -152,15 +156,28 @@ impl TestInstall {
         fs::create_dir(root.path().join("libexec")).unwrap();
         fs::create_dir(root.path().join("conf")).unwrap();
         let cli = bin_dir.join("beryl");
-        fs::copy(env!("CARGO_BIN_EXE_beryl"), &cli).unwrap();
+        let status = Command::new("cp")
+            .arg(env!("CARGO_BIN_EXE_beryl"))
+            .arg(&cli)
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to copy CLI fixture: {status}");
         make_executable(&cli);
         Self { root, cli }
     }
 
     fn write_role(&self, name: &str, script: &str) {
         let path = self.root.path().join("libexec").join(name);
-        fs::write(&path, script).unwrap();
-        make_executable(&path);
+        let mut writer = Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "write-role"])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let write_result = writer.stdin.take().unwrap().write_all(script.as_bytes());
+        let status = writer.wait().unwrap();
+        write_result.unwrap();
+        assert!(status.success(), "failed to write role fixture: {status}");
     }
 }
 
