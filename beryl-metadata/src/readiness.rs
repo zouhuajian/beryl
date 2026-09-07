@@ -11,7 +11,7 @@ use crate::raft::{AppRaftNode, RocksDBStorage};
 use beryl_types::GroupName;
 use parking_lot::RwLock;
 use rand::Rng;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -80,13 +80,17 @@ pub struct RootReadinessLogFields {
 
 /// Sticky authority gate shared by filesystem RPCs and process readiness.
 ///
-/// Ready transitions hold the state lock through atomic publication, while a
-/// shutdown flag permanently rejects later startup observations.
+/// State transitions and readiness reads share a lock. Shutdown permanently
+/// rejects later startup observations.
 pub struct RootReadinessGate {
-    ready: AtomicUsize,
-    shutting_down: AtomicBool,
-    state: RwLock<RootReadinessState>,
+    state: RwLock<RootReadinessGateState>,
     metrics: Option<Arc<MetadataMetrics>>,
+}
+
+// A Shutdown reason is reversible; only begin_shutdown permanently closes the gate.
+enum RootReadinessGateState {
+    Active(RootReadinessState),
+    Shutdown,
 }
 
 impl RootReadinessGate {
@@ -96,39 +100,40 @@ impl RootReadinessGate {
             observe::record_root_ready(false);
         }
         Self {
-            ready: AtomicUsize::new(0),
-            shutting_down: AtomicBool::new(false),
-            state: RwLock::new(RootReadinessState::Starting),
+            state: RwLock::new(RootReadinessGateState::Active(RootReadinessState::Starting)),
             metrics,
         }
     }
 
     pub fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire) == 1
+        matches!(
+            *self.state.read(),
+            RootReadinessGateState::Active(RootReadinessState::Ready)
+        )
     }
 
     pub fn set_ready(&self) {
         let mut state = self.state.write();
-        if self.shutting_down.load(Ordering::Acquire) {
+        let RootReadinessGateState::Active(current) = &mut *state else {
+            return;
+        };
+        if *current == RootReadinessState::Ready {
             return;
         }
-        *state = RootReadinessState::Ready;
-        if self.ready.swap(1, Ordering::Release) == 0 {
-            if let Some(metrics) = &self.metrics {
-                metrics.root_ready.store(1, Ordering::Relaxed);
-                observe::record_root_ready(true);
-            }
+        *current = RootReadinessState::Ready;
+        if let Some(metrics) = &self.metrics {
+            metrics.root_ready.store(1, Ordering::Relaxed);
+            observe::record_root_ready(true);
         }
         drop(state);
     }
 
     pub fn set_not_ready(&self, reason: RootNotReadyReason) {
         let mut state = self.state.write();
-        if self.shutting_down.load(Ordering::Acquire) {
+        let RootReadinessGateState::Active(current) = &mut *state else {
             return;
-        }
-        *state = RootReadinessState::NotReady(reason);
-        self.ready.store(0, Ordering::Release);
+        };
+        *current = RootReadinessState::NotReady(reason);
         if let Some(metrics) = &self.metrics {
             metrics.root_ready.store(0, Ordering::Relaxed);
             observe::record_root_ready(false);
@@ -141,17 +146,20 @@ impl RootReadinessGate {
     /// The state is sticky so a concurrent startup watcher cannot publish
     /// readiness again after shutdown has started.
     pub fn begin_shutdown(&self) {
-        self.shutting_down.store(true, Ordering::Release);
-        *self.state.write() = RootReadinessState::NotReady(RootNotReadyReason::Shutdown);
-        self.ready.store(0, Ordering::Release);
+        let mut state = self.state.write();
+        *state = RootReadinessGateState::Shutdown;
         if let Some(metrics) = &self.metrics {
             metrics.root_ready.store(0, Ordering::Relaxed);
             observe::record_root_ready(false);
         }
+        drop(state);
     }
 
     pub fn state(&self) -> RootReadinessState {
-        self.state.read().clone()
+        match &*self.state.read() {
+            RootReadinessGateState::Active(state) => state.clone(),
+            RootReadinessGateState::Shutdown => RootReadinessState::NotReady(RootNotReadyReason::Shutdown),
+        }
     }
 }
 
@@ -422,14 +430,51 @@ mod tests {
 
     #[test]
     fn shutdown_readiness_is_sticky_against_late_startup_updates() {
-        let gate = RootReadinessGate::new(None);
+        let metrics = Arc::new(MetadataMetrics::new());
+        let gate = RootReadinessGate::new(Some(Arc::clone(&metrics)));
         gate.set_ready();
 
-        gate.begin_shutdown();
-        gate.set_ready();
-        gate.set_not_ready(RootNotReadyReason::NotLeader);
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let gate = &gate;
+            let watcher = scope.spawn(move || {
+                assert!(gate.is_ready());
+                observed_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                gate.set_ready();
+                gate.set_not_ready(RootNotReadyReason::NotLeader);
+            });
+
+            observed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            gate.begin_shutdown();
+            resume_tx.send(()).unwrap();
+            watcher.join().unwrap();
+        });
 
         assert!(!gate.is_ready());
         assert_eq!(gate.state(), RootReadinessState::NotReady(RootNotReadyReason::Shutdown));
+        assert_eq!(metrics.root_ready.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn not_ready_reasons_allow_later_readiness() {
+        let metrics = Arc::new(MetadataMetrics::new());
+        let gate = RootReadinessGate::new(Some(Arc::clone(&metrics)));
+        assert_eq!(gate.state(), RootReadinessState::Starting);
+        assert!(!gate.is_ready());
+
+        gate.set_ready();
+        for reason in [RootNotReadyReason::NotLeader, RootNotReadyReason::Shutdown] {
+            gate.set_not_ready(reason.clone());
+            assert!(!gate.is_ready());
+            assert_eq!(gate.state(), RootReadinessState::NotReady(reason));
+            assert_eq!(metrics.root_ready.load(Ordering::Relaxed), 0);
+
+            gate.set_ready();
+            assert!(gate.is_ready());
+            assert_eq!(gate.state(), RootReadinessState::Ready);
+            assert_eq!(metrics.root_ready.load(Ordering::Relaxed), 1);
+        }
     }
 }
