@@ -12,7 +12,6 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Bound::{Excluded, Included, Unbounded};
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 use tokio::sync::watch::{Receiver, Sender};
@@ -395,15 +394,15 @@ fn endpoint_host(endpoint: &str) -> Option<String> {
 /// Worker manager.
 pub struct WorkerManager {
     /// Worker descriptors (authoritative, from Raft state).
-    descriptors: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerDescriptor>>>,
+    descriptors: RwLock<HashMap<WorkerRegistrationKey, WorkerDescriptor>>,
     /// Accepted worker process runs for this metadata process, learned through Raft apply.
-    registrations: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerRegistrationState>>>,
+    registrations: RwLock<HashMap<WorkerRegistrationKey, WorkerRegistrationState>>,
     /// Worker runtime (soft-state, memory-only, updated by heartbeat).
-    runtime: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerRuntime>>>,
+    runtime: RwLock<HashMap<WorkerRegistrationKey, WorkerRuntime>>,
     /// Last heartbeat rejection state per worker, used only to suppress repeated unchanged warn logs.
-    heartbeat_rejections: Arc<RwLock<HashMap<WorkerRegistrationKey, HeartbeatRejectionState>>>,
+    heartbeat_rejections: RwLock<HashMap<WorkerRegistrationKey, HeartbeatRejectionState>>,
     /// Worker reports and their derived location index, published atomically.
-    block_report_observations: Arc<RwLock<BlockReportObservationState>>,
+    block_report_observations: RwLock<BlockReportObservationState>,
     /// Coalesced revision for publication-relevant worker observations.
     ///
     /// Ready evidence is leader-local and reconstructable. The revision only
@@ -417,11 +416,11 @@ impl WorkerManager {
     pub fn new(heartbeat_timeout_ms: u32) -> Self {
         let (publication_observation, _) = watch::channel(0);
         Self {
-            descriptors: Arc::new(RwLock::new(HashMap::new())),
-            registrations: Arc::new(RwLock::new(HashMap::new())),
-            runtime: Arc::new(RwLock::new(HashMap::new())),
-            heartbeat_rejections: Arc::new(RwLock::new(HashMap::new())),
-            block_report_observations: Arc::new(RwLock::new(BlockReportObservationState::default())),
+            descriptors: RwLock::new(HashMap::new()),
+            registrations: RwLock::new(HashMap::new()),
+            runtime: RwLock::new(HashMap::new()),
+            heartbeat_rejections: RwLock::new(HashMap::new()),
+            block_report_observations: RwLock::new(BlockReportObservationState::default()),
             publication_observation,
             heartbeat_timeout_ms,
         }
@@ -1725,6 +1724,7 @@ mod tests {
         BlockFormatId, ClientId, GroupName, LocatedBlock, Tier, TierFree, WorkerEndpointInfo, WorkerNetProtocol,
         WorkerRunId,
     };
+    use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
 
     fn group_name(raw: &str) -> GroupName {
@@ -2016,6 +2016,62 @@ mod tests {
             manager.check_publish_ready(&group_name_value, std::slice::from_ref(&target)),
             PublishReadyStatus::Ready
         );
+    }
+
+    #[test]
+    fn shared_manager_keeps_full_report_staging_invisible_across_threads() {
+        let manager = Arc::new(WorkerManager::new(60_000));
+        let group = group_name("g-shared-report");
+        let worker_id = WorkerId::new(5);
+        let run_id = report_run_id();
+        register_live_report_worker(&manager, &group, worker_id, run_id);
+        let block = report_block(0);
+        let target = publication_target(worker_id, run_id, block.block_id, block.lease_epoch);
+        let observations = manager.subscribe_publication_observations();
+        let (staged_tx, staged_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let (published_tx, published_rx) = mpsc::channel();
+        let timeout = Duration::from_secs(5);
+
+        let reporter = {
+            let manager = Arc::clone(&manager);
+            let group = group.clone();
+            std::thread::spawn(move || {
+                manager
+                    .receive_full_block_report(&group, worker_id, run_id, 1, 0, false, vec![block])
+                    .unwrap();
+                staged_tx.send(()).unwrap();
+                finish_rx.recv_timeout(timeout).unwrap();
+                manager
+                    .receive_full_block_report(&group, worker_id, run_id, 1, 1, true, vec![report_block(1)])
+                    .unwrap();
+                published_tx.send(()).unwrap();
+            })
+        };
+
+        staged_rx.recv_timeout(timeout).unwrap();
+        assert!(manager.get_block_locations(&group, target.target.block_id).is_empty());
+        assert_eq!(
+            manager.check_publish_ready(&group, std::slice::from_ref(&target)),
+            PublishReadyStatus::Pending {
+                block_id: target.target.block_id
+            }
+        );
+
+        finish_tx.send(()).unwrap();
+        published_rx.recv_timeout(timeout).unwrap();
+        reporter.join().unwrap();
+        assert!(observations.has_changed().unwrap());
+        assert_eq!(
+            manager.check_publish_ready(&group, &[target]),
+            PublishReadyStatus::Ready
+        );
+        for index in [0, 1] {
+            assert_eq!(
+                manager.get_block_locations(&group, report_block(index).block_id),
+                vec![worker_id]
+            );
+        }
     }
 
     #[test]
