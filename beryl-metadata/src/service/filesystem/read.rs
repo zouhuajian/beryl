@@ -321,9 +321,7 @@ impl MetadataFileSystem {
             .await?;
         match self.freshness_validator.validate_stale_state(
             req_ctx,
-            self.raft_node
-                .as_ref()
-                .and_then(|raft_node| raft_node.get_last_applied_state_id()),
+            self.raft_node.get_last_applied_state_id(),
             group_name.clone(),
             mount_epoch,
         )? {
@@ -655,8 +653,8 @@ impl MetadataFileSystem {
                 },
                 None => (0, file.len),
             };
-            let worker_manager = self.worker_manager.as_ref();
-            let worker_group = if worker_manager.is_some() && !file.blocks.is_empty() && range_start < range_end {
+            let manager = &self.worker_manager;
+            let worker_group = if !file.blocks.is_empty() && range_start < range_end {
                 Some(self.require_worker_lookup_group(
                     &req.ctx,
                     group_name.clone(),
@@ -676,7 +674,7 @@ impl MetadataFileSystem {
                     continue;
                 }
                 let mut workers = Vec::new();
-                if let (Some(manager), Some(worker_group)) = (worker_manager, worker_group.as_ref()) {
+                if let Some(worker_group) = worker_group.as_ref() {
                     let reported = manager.reported_block_locations(worker_group, block_id);
                     let views: Vec<_> = manager
                         .collect_worker_placement_views(worker_group)
@@ -796,7 +794,8 @@ mod tests {
         let stored_inode_id = InodeId::new(482);
         let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name("g8"))
             .with_storage(Arc::clone(&storage))
-            .build();
+            .build()
+            .await;
         storage
             .put_inode_at_storage_key(
                 storage_key_inode_id,
@@ -899,7 +898,8 @@ mod tests {
             let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
                 .with_storage(Arc::clone(&storage))
                 .with_worker_manager(worker_manager)
-                .build();
+                .build()
+                .await;
             seed_visible_block(&storage, mount_id, inode_id, block_id);
 
             let failure = match filesystem
@@ -927,7 +927,8 @@ mod tests {
         let parent_inode_id = InodeId::new(710);
         let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name("g18"))
             .with_storage(Arc::clone(&storage))
-            .build();
+            .build()
+            .await;
         storage
             .put_inode(&Inode::new_dir(parent_inode_id, InodeAttrs::new(), mount_id))
             .unwrap();
@@ -979,8 +980,7 @@ mod tests {
         let current_state = env
             .filesystem
             .raft_node
-            .as_ref()
-            .and_then(|raft_node| raft_node.get_last_applied_state_id())
+            .get_last_applied_state_id()
             .expect("commit should advance applied state");
         let mut ctx = request_context();
         ctx.caller.state.push(GroupStateWatermark::new(

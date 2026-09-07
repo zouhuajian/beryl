@@ -88,9 +88,7 @@ impl MetadataFileSystem {
             return self.failure_from_admission(failure);
         }
         let result = async {
-            let raft = self.raft_node.as_ref().ok_or_else(|| {
-                MetadataError::ServiceUnavailable("write authorization requires Raft authority".into())
-            })?;
+            let raft = &self.raft_node;
             raft.read(true, |_| {
                 let invalid = || MetadataError::PermissionDenied("block writer is no longer authorized".into());
                 let session = self.session_registry.get_session(inode_id).ok_or_else(invalid)?;
@@ -133,7 +131,7 @@ impl MetadataFileSystem {
                 }) {
                     return Err(invalid());
                 }
-                let manager = self.worker_manager.as_ref().ok_or_else(invalid)?;
+                let manager = &self.worker_manager;
                 if !manager
                     .collect_worker_placement_views(&args.group_name)
                     .iter()
@@ -752,10 +750,7 @@ impl MetadataFileSystem {
             .ok_or_else(|| MetadataError::Internal("partial file has no tail".into()))?;
         let block_id = file.blocks[ordinal];
         let len = file.block_len(ordinal);
-        let manager = self
-            .worker_manager
-            .as_ref()
-            .ok_or_else(|| MetadataError::ServiceUnavailable("Worker manager is unavailable".into()))?;
+        let manager = &self.worker_manager;
         let request = PlacementRequest {
             group_name: group_name.clone(),
             op: PlacementOp::Read,
@@ -983,17 +978,7 @@ impl MetadataFileSystem {
             Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
         };
 
-        let worker_manager = match self.worker_manager.as_ref() {
-            Some(worker_manager) => worker_manager,
-            None => {
-                return self.failure_from_error(
-                    ctx,
-                    MetadataError::ServiceUnavailable("Worker manager not available".to_string()),
-                    group_name,
-                    mount_epoch,
-                )
-            }
-        };
+        let worker_manager = &self.worker_manager;
         let placement_group_name =
             self.require_worker_lookup_group(ctx, group_name.clone(), mount_epoch, route_epoch, "AllocateBlock")?;
         let placement_views = worker_manager.collect_worker_placement_views(&placement_group_name);
@@ -1282,7 +1267,8 @@ mod tests {
             .with_storage(Arc::clone(&storage))
             .with_raft_node(raft_node)
             .with_session_registry(session_registry)
-            .build();
+            .build()
+            .await;
         let first_client = ClientId::new(7);
         let other_client = ClientId::new(8);
 
@@ -1372,7 +1358,8 @@ mod tests {
         let filesystem = builder
             .with_storage(Arc::clone(&storage))
             .with_raft_node(raft_node)
-            .build();
+            .build()
+            .await;
 
         for inode_id in [ROOT_INODE_ID, old_parent_inode_id, new_parent_inode_id] {
             storage
@@ -1460,7 +1447,8 @@ mod tests {
             .with_storage(Arc::clone(&storage))
             .with_raft_node(raft_node)
             .with_worker_manager(worker_manager_for_write_targets(&group_name_value))
-            .build();
+            .build()
+            .await;
 
         let success = filesystem
             .open_write_inode(
@@ -1533,7 +1521,8 @@ mod tests {
             .with_storage(Arc::clone(&storage))
             .with_raft_node(raft_node)
             .with_worker_manager(Arc::clone(&worker_manager))
-            .build();
+            .build()
+            .await;
         let opened = filesystem
             .open_write_inode(
                 &request_context(),
