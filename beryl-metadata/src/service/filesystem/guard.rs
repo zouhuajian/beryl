@@ -45,7 +45,7 @@ impl AdmissionFailure {
 #[derive(Clone)]
 pub struct AdmissionGuard {
     readiness_gate: Option<Arc<RootReadinessGate>>,
-    raft_node: Option<Arc<AppRaftNode>>,
+    raft_node: Arc<AppRaftNode>,
     mount_table: Arc<MountTable>,
 }
 
@@ -53,7 +53,7 @@ impl AdmissionGuard {
     pub fn new(
         mount_table: Arc<MountTable>,
         readiness_gate: Option<Arc<RootReadinessGate>>,
-        raft_node: Option<Arc<AppRaftNode>>,
+        raft_node: Arc<AppRaftNode>,
     ) -> Self {
         Self {
             readiness_gate,
@@ -95,11 +95,7 @@ impl AdmissionGuard {
     }
 
     fn check_leadership(&self, ctx: &RequestContext) -> Result<(), AdmissionFailure> {
-        let Some(raft_node) = self.raft_node.as_ref() else {
-            return Err(AdmissionFailure::from_rpc_metadata_error(
-                MetadataError::ServiceUnavailable("raft node not available".to_string()),
-            ));
-        };
+        let raft_node = &self.raft_node;
         if raft_node.is_leader() {
             Ok(())
         } else {
@@ -338,12 +334,27 @@ mod tests {
         async fn readiness_guard_blocks_when_not_ready() {
             let mount_table = Arc::new(MountTable::new());
             let gate = Arc::new(RootReadinessGate::new(None));
-            let chain = AdmissionGuard::new(mount_table, Some(Arc::clone(&gate)), None);
+            let dir = TempDir::new().unwrap();
+            let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+            let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
+            let raft_node = Arc::new(
+                AppRaftNode::new(
+                    1,
+                    storage,
+                    state_machine,
+                    Arc::clone(&mount_table),
+                    &RaftConfig::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            let chain = AdmissionGuard::new(mount_table, Some(Arc::clone(&gate)), Arc::clone(&raft_node));
 
             let err = chain.check_meta_read().unwrap_err();
             assert_eq!(err.err.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
             assert_eq!(err.err.recovery, RecoveryAction::Retry { after_ms: Some(1000) });
             assert!(!gate.is_ready());
+            raft_node.shutdown().await.unwrap();
         }
 
         #[tokio::test]
@@ -359,12 +370,13 @@ mod tests {
                     .unwrap(),
             );
             assert!(!raft_node.is_leader());
-            let chain = AdmissionGuard::new(mount_table, None, Some(raft_node));
+            let chain = AdmissionGuard::new(mount_table, None, Arc::clone(&raft_node));
 
             let err = chain.check_meta_write(&request_context(2)).unwrap_err();
 
             assert_eq!(err.err.kind, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
             assert!(matches!(err.err.recovery, RecoveryAction::RefreshMetadata { .. }));
+            raft_node.shutdown().await.unwrap();
         }
     }
 

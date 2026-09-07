@@ -939,7 +939,8 @@ mod tests {
         let filesystem = builder
             .with_storage(Arc::clone(&storage))
             .with_raft_node(raft_node)
-            .build();
+            .build()
+            .await;
 
         for inode_id in [parent_inode_id, root_inode_id, nested_inode_id] {
             storage
@@ -998,7 +999,8 @@ mod tests {
         let filesystem = builder
             .with_storage(Arc::clone(&storage))
             .with_raft_node(raft_node)
-            .build();
+            .build()
+            .await;
 
         storage
             .put_inode(&Inode::new_dir(ROOT_INODE_ID, InodeAttrs::new(), mount_id))
@@ -1070,7 +1072,8 @@ mod tests {
         let filesystem = builder
             .with_storage(Arc::clone(&storage))
             .with_raft_node(raft_node)
-            .build();
+            .build()
+            .await;
 
         for inode_id in [parent_inode_id, source_inode_id, nested_inode_id] {
             storage
@@ -1136,7 +1139,8 @@ mod tests {
         let file_inode_id = InodeId::new(694);
         let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
             .with_storage(Arc::clone(&storage))
-            .build();
+            .build()
+            .await;
 
         for inode_id in [parent_inode_id, source_inode_id, target_inode_id, nested_inode_id] {
             storage

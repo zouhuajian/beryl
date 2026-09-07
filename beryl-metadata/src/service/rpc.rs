@@ -42,7 +42,7 @@ use tracing::instrument;
 /// Unary gRPC adapter that validates wire requests before entering metadata authority.
 pub struct MetadataFileSystemServiceImpl {
     filesystem: Arc<MetadataFileSystem>,
-    msync: Option<MsyncHandler>,
+    msync: MsyncHandler,
     list_status: NamespaceListConfig,
 }
 
@@ -75,7 +75,7 @@ impl MetadataFileSystemServiceImpl {
     /// Builds the wire adapter with immutable request-boundary policy.
     pub(crate) fn new(
         filesystem: Arc<MetadataFileSystem>,
-        msync: Option<MsyncHandler>,
+        msync: MsyncHandler,
         list_status: NamespaceListConfig,
     ) -> Self {
         Self {
@@ -854,10 +854,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
 
     async fn msync(&self, request: Request<MsyncRequestProto>) -> Result<Response<MsyncResponseProto>, Status> {
         let req = request.into_inner();
-        let response = match self.msync.as_ref() {
-            Some(msync) => msync.handle(req),
-            None => MsyncHandler::unavailable(req),
-        };
+        let response = self.msync.handle(req);
         Ok(Response::new(response))
     }
 }
@@ -898,7 +895,7 @@ mod tests {
         storage: Arc<RocksDBStorage>,
         service: MetadataFileSystemServiceImpl,
         session_registry: Arc<SessionRegistry>,
-        worker_manager: Option<Arc<WorkerManager>>,
+        worker_manager: Arc<WorkerManager>,
     }
 
     struct TestStateStore {
@@ -974,7 +971,7 @@ mod tests {
     }
 
     async fn write_env() -> PathTestEnv {
-        let worker_manager = Some(worker_manager_for_write_targets());
+        let worker_manager = worker_manager_for_write_targets();
         let root_inode_id = InodeId::new(1000);
         let temp_dir = TempDir::new().expect("create temp dir");
         let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).expect("open rocksdb"));
@@ -1034,14 +1031,14 @@ mod tests {
             state_store,
             mount_table: Arc::clone(&mount_table),
             storage: Arc::clone(&storage),
-            raft_node: Some(Arc::clone(&raft_node)),
+            raft_node: Arc::clone(&raft_node),
             session_registry: Arc::clone(&session_registry),
             worker_manager: worker_manager.clone(),
             metrics: None,
             readiness_gate: None,
             file_create_layout: FileLayout::new(128),
         }));
-        let msync = Some(MsyncHandler::new(Arc::clone(&raft_node), owner_group_name));
+        let msync = MsyncHandler::new(Arc::clone(&raft_node), owner_group_name);
         let service = MetadataFileSystemServiceImpl::new(filesystem, msync, NamespaceListConfig::default());
 
         PathTestEnv {
@@ -1093,7 +1090,7 @@ mod tests {
     }
 
     fn publish_reported_locations(env: &PathTestEnv, worker_id: WorkerId, blocks: Vec<(BlockId, u64, u64)>) {
-        let worker_manager = env.worker_manager.as_ref().expect("worker manager");
+        let worker_manager = &env.worker_manager;
         let worker_run_id = worker_manager
             .get_registration(&group_name("root"), worker_id)
             .expect("worker registration")
@@ -1381,7 +1378,7 @@ mod tests {
         assert_eq!(*generation, ContentGeneration::new(expected_generation + 1));
         assert_eq!(*lease_epoch, LeaseEpoch::new(write_handle.write_lease_epoch + 1));
         assert!(last_commit.is_some());
-        env.worker_manager.as_ref().unwrap().reset_worker_soft_state();
+        env.worker_manager.reset_worker_soft_state();
         let replay = FileSystemServiceProto::commit_file(&env.service, Request::new(request.clone()))
             .await
             .unwrap()

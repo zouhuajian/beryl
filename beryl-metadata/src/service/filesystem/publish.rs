@@ -508,16 +508,7 @@ impl MetadataFileSystem {
         if targets.is_empty() {
             return Ok(());
         }
-        let Some(worker_manager) = self.worker_manager.as_ref() else {
-            return Err(self.publish_ready_refresh_failure(
-                ctx,
-                ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
-                "worker observations are unavailable for file publication",
-                group_name,
-                (mount_epoch, route_epoch),
-                false,
-            ));
-        };
+        let worker_manager = &self.worker_manager;
 
         let mut observations = worker_manager.subscribe_publication_observations();
         loop {
@@ -585,16 +576,7 @@ impl MetadataFileSystem {
         if targets.is_empty() {
             return Ok(());
         }
-        let Some(worker_manager) = self.worker_manager.as_ref() else {
-            return Err(self.publish_ready_refresh_failure(
-                ctx,
-                ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
-                "worker observations are unavailable for file publication",
-                group_name,
-                (mount_epoch, route_epoch),
-                false,
-            ));
-        };
+        let worker_manager = &self.worker_manager;
         match worker_manager.check_publish_ready(group_name, targets) {
             PublishReadyStatus::Ready => Ok(()),
             PublishReadyStatus::Pending { block_id } => Err(self.publish_ready_refresh_failure(
@@ -1044,23 +1026,20 @@ impl MetadataFileSystem {
         let mut payload = intent.publication(handle, expected_generation, publish_mode);
         // Read the receipt and its layout together before checking any soft
         // session state: a completed commit has already ended that session.
-        let resolved = match self.raft_node.as_ref() {
-            Some(raft) => {
-                raft.read(true, |_| {
-                    let inode = self
-                        .read_inode(inode_id)?
-                        .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {inode_id}")))?;
-                    if inode.inode_id != inode_id {
-                        return Err(MetadataError::Internal("CommitFile inode authority is corrupt".into()));
-                    }
-                    payload
-                        .resolve_commit(&inode, ctx.caller.client.client_id, ctx.caller.client.call_id)
-                        .map(|generation| generation.map(|_| inode.mount_id))
-                })
-                .await
-            }
-            None => Err(MetadataError::Internal("Raft node not available".into())),
-        };
+        let resolved = self
+            .raft_node
+            .read(true, |_| {
+                let inode = self
+                    .read_inode(inode_id)?
+                    .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {inode_id}")))?;
+                if inode.inode_id != inode_id {
+                    return Err(MetadataError::Internal("CommitFile inode authority is corrupt".into()));
+                }
+                payload
+                    .resolve_commit(&inode, ctx.caller.client.client_id, ctx.caller.client.call_id)
+                    .map(|generation| generation.map(|_| inode.mount_id))
+            })
+            .await;
         match resolved {
             Ok(Some(mount_id)) => {
                 let (group_name, mount_epoch, route_epoch) = self

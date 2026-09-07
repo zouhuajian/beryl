@@ -658,17 +658,14 @@ async fn build_filesystem_service_with_sessions(
         state_store: Arc::clone(&authority.state_store),
         mount_table: Arc::clone(&authority.mount_table),
         storage: Arc::clone(&authority.storage),
-        raft_node: Some(Arc::clone(&authority.raft_node)),
+        raft_node: Arc::clone(&authority.raft_node),
         session_registry,
-        worker_manager: Some(worker_manager),
+        worker_manager,
         metrics: Some(Arc::clone(&authority.metadata_metrics)),
         readiness_gate: Some(readiness.gate()),
         file_create_layout,
     }));
-    let msync = Some(MsyncHandler::new(
-        Arc::clone(&authority.raft_node),
-        authority.group_name.clone(),
-    ));
+    let msync = MsyncHandler::new(Arc::clone(&authority.raft_node), authority.group_name.clone());
 
     Ok(MetadataFileSystemServiceImpl::new(
         filesystem,
@@ -781,14 +778,14 @@ mod tests {
             state_store: Arc::new(RaftStateStore::new(Arc::clone(&raft_node))),
             mount_table,
             storage,
-            raft_node: Some(Arc::clone(&raft_node)),
+            raft_node: Arc::clone(&raft_node),
             session_registry: Arc::new(crate::session_registry::SessionRegistry::default()),
-            worker_manager: None,
+            worker_manager: Arc::new(WorkerManager::new(60_000)),
             metrics: None,
             readiness_gate: None,
             file_create_layout: crate::config::FileLayoutDefaults::default().layout().unwrap(),
         }));
-        let msync = Some(MsyncHandler::new(raft_node, group_name));
+        let msync = MsyncHandler::new(raft_node, group_name);
         MetadataFileSystemServiceImpl::new(filesystem, msync, crate::config::NamespaceListConfig::default())
     }
 

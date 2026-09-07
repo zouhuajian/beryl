@@ -11,6 +11,7 @@ use crate::session_registry::WritePublication;
 use beryl_types::ids::{BlockId, InodeId, MountId};
 use beryl_types::{ContentGeneration, GroupName, LeaseEpoch};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::debug;
 
@@ -251,10 +252,9 @@ impl MetadataFileSystem {
         &self,
         command: Command,
     ) -> impl std::future::Future<Output = MetadataResult<ApplySuccess>> + Send + 'static {
-        let raft_node = self.raft_node.clone();
+        let raft_node = Arc::clone(&self.raft_node);
         let metrics = self.metrics.clone();
         async move {
-            let raft_node = raft_node.ok_or_else(|| MetadataError::Internal("Raft node not available".to_string()))?;
             if let Some(metrics) = &metrics {
                 metrics.fs_raft_appends_total.fetch_add(1, Ordering::Relaxed);
                 match &command {

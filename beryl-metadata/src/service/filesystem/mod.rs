@@ -171,9 +171,9 @@ pub(crate) struct MetadataFileSystemDeps {
     pub(crate) state_store: Arc<dyn StateStore>,
     pub(crate) mount_table: Arc<MountTable>,
     pub(crate) storage: Arc<RocksDBStorage>,
-    pub(crate) raft_node: Option<Arc<AppRaftNode>>,
+    pub(crate) raft_node: Arc<AppRaftNode>,
     pub(crate) session_registry: Arc<SessionRegistry>,
-    pub(crate) worker_manager: Option<Arc<WorkerManager>>,
+    pub(crate) worker_manager: Arc<WorkerManager>,
     pub(crate) metrics: Option<Arc<MetadataMetrics>>,
     pub(crate) readiness_gate: Option<Arc<RootReadinessGate>>,
     /// Validated server-owned layout used by atomic CreateFile.
@@ -194,10 +194,10 @@ pub(crate) struct MetadataFileSystem {
     mount_table: Arc<MountTable>,
     freshness_validator: FreshnessValidator,
     storage: Arc<RocksDBStorage>,
-    raft_node: Option<Arc<AppRaftNode>>,
+    raft_node: Arc<AppRaftNode>,
     metrics: Option<Arc<MetadataMetrics>>,
     session_registry: Arc<SessionRegistry>,
-    worker_manager: Option<Arc<WorkerManager>>,
+    worker_manager: Arc<WorkerManager>,
     file_create_layout: FileLayout,
 }
 
@@ -207,7 +207,7 @@ impl MetadataFileSystem {
         let admission = AdmissionGuard::new(
             Arc::clone(&deps.mount_table),
             deps.readiness_gate,
-            deps.raft_node.clone(),
+            Arc::clone(&deps.raft_node),
         );
         let freshness_validator = FreshnessValidator::new(Arc::clone(&deps.state_store), Arc::clone(&deps.mount_table));
 
@@ -227,14 +227,14 @@ impl MetadataFileSystem {
     }
 
     fn response_state_for_success(&self, group_name: Option<&GroupName>) -> Vec<GroupStateWatermark> {
-        let (Some(group_name), Some(raft_node)) = (group_name, self.raft_node.as_ref()) else {
+        let Some(group_name) = group_name else {
             // A response without a known owner group cannot authorize a state cache advance.
             return Vec::new();
         };
-        if !raft_node.is_leader() {
+        if !self.raft_node.is_leader() {
             return Vec::new();
         }
-        raft_node
+        self.raft_node
             .get_last_applied_state_id()
             .map(|state_id| GroupStateWatermark::new(group_name.clone(), state_id))
             .into_iter()
@@ -486,7 +486,7 @@ mod tests {
         }
 
         pub(super) fn raft_node(&self) -> Arc<AppRaftNode> {
-            Arc::clone(self.filesystem.raft_node.as_ref().expect("test filesystem Raft node"))
+            Arc::clone(&self.filesystem.raft_node)
         }
     }
 
@@ -540,13 +540,30 @@ mod tests {
             self
         }
 
-        pub(super) fn build(self) -> TestFilesystem {
+        pub(super) async fn build(self) -> TestFilesystem {
             let (storage, storage_dir) = match self.storage {
                 Some(storage) => (storage, None),
                 None => {
                     let storage_dir = TempDir::new().unwrap();
                     let storage = Arc::new(RocksDBStorage::create_for_format(storage_dir.path()).unwrap());
                     (storage, Some(storage_dir))
+                }
+            };
+            let raft_node = match self.raft_node {
+                Some(raft_node) => raft_node,
+                None => {
+                    let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
+                    Arc::new(
+                        AppRaftNode::new(
+                            1,
+                            Arc::clone(&storage),
+                            state_machine,
+                            Arc::clone(&self.mount_table),
+                            &RaftConfig::default(),
+                        )
+                        .await
+                        .unwrap(),
+                    )
                 }
             };
             let session_registry = self
@@ -556,9 +573,11 @@ mod tests {
                 state_store: self.state_store.unwrap_or_else(|| Arc::new(MemoryStateStore::new())),
                 mount_table: self.mount_table,
                 storage,
-                raft_node: self.raft_node,
+                raft_node,
                 session_registry: Arc::clone(&session_registry),
-                worker_manager: self.worker_manager,
+                worker_manager: self
+                    .worker_manager
+                    .unwrap_or_else(|| Arc::new(WorkerManager::new(60_000))),
                 metrics: None,
                 readiness_gate: None,
                 file_create_layout: FileLayoutDefaults::default().layout().unwrap(),
@@ -974,7 +993,8 @@ mod tests {
             .with_storage(Arc::clone(&storage))
             .with_raft_node(raft_node)
             .with_worker_manager(worker_manager(&group_name))
-            .build();
+            .build()
+            .await;
 
         let attrs = InodeAttrs::new();
         let mut inode = Inode::new_file(inode_id, attrs, mount_id, beryl_types::FileLayout::new(4096));
@@ -1009,7 +1029,7 @@ mod tests {
         effective_len: u64,
     ) {
         let worker = target.worker_endpoints.first().expect("write target worker");
-        let worker_manager = env.filesystem.worker_manager.as_ref().expect("worker manager");
+        let worker_manager = &env.filesystem.worker_manager;
         publish_report_block(
             worker_manager,
             &env.group_name,

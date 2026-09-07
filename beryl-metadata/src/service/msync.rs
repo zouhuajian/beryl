@@ -79,23 +79,6 @@ impl MsyncHandler {
         }
     }
 
-    /// Return a structured application error for test-only services built without raft.
-    pub fn unavailable(req: MsyncRequestProto) -> MsyncResponseProto {
-        let group_name = req
-            .header
-            .as_ref()
-            .and_then(|header| GroupName::parse_optional(&header.group_name).ok().flatten());
-        Self::error_response(
-            &req.header,
-            group_name,
-            RpcErrorDetail::retry(
-                ErrorKind::Internal(InternalErrorKind::NodeUnavailable),
-                Some(10),
-                "msync raft node is not configured",
-            ),
-        )
-    }
-
     #[allow(clippy::result_large_err)]
     fn parse_header(proto: Option<beryl_proto::common::RequestHeaderProto>) -> Result<RequestHeader, RpcErrorDetail> {
         let Some(proto) = proto else {
