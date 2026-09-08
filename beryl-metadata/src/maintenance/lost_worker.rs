@@ -6,7 +6,6 @@
 use crate::error::MetadataResult;
 use crate::raft::AppRaftNode;
 use crate::worker::WorkerManager;
-use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::info;
 
@@ -42,19 +41,13 @@ impl LostWorkerCleanupService {
             return Ok(LostWorkerCleanupOutcome::default());
         }
 
-        let live_workers = self.worker_manager.list_live_workers();
-        let registered_workers = self.worker_manager.list_registered_workers();
-        let live_set: HashSet<_> = live_workers.iter().cloned().collect();
-        let dead_workers: Vec<_> = registered_workers
-            .into_iter()
-            .filter(|worker| !live_set.contains(worker))
-            .collect();
+        let dead_workers = self.worker_manager.list_expired_worker_runs();
 
         let mut outcome = LostWorkerCleanupOutcome::default();
-        for dead_worker in dead_workers {
-            let (removed, affected_blocks) = self
-                .worker_manager
-                .remove_dead_worker(&dead_worker.group_name, dead_worker.worker_id);
+        for (dead_worker, expected_run_id) in dead_workers {
+            let (removed, affected_blocks) =
+                self.worker_manager
+                    .remove_dead_worker(&dead_worker.group_name, dead_worker.worker_id, expected_run_id);
             if !removed {
                 continue;
             }

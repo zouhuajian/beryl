@@ -443,13 +443,15 @@ impl WorkerManager {
     /// Drops live registration and reconstructable report state on metadata restart.
     pub fn reset_worker_soft_state(&self) {
         let mut registrations = self.registrations.write();
+        let mut runtime = self.runtime.write();
         let mut observations = self.block_report_observations.write();
         registrations.clear();
+        runtime.clear();
         observations.reports.clear();
         observations.locations.clear();
         drop(observations);
+        drop(runtime);
         drop(registrations);
-        self.runtime.write().clear();
         self.heartbeat_rejections.write().clear();
         self.notify_publication_observation_changed();
     }
@@ -620,6 +622,7 @@ impl WorkerManager {
         self.upsert_descriptor(descriptor)?;
 
         let mut registrations = self.registrations.write();
+        let mut runtime = self.runtime.write();
         let mut observations = self.block_report_observations.write();
         let same_registered_run = registrations
             .get(&key)
@@ -638,13 +641,12 @@ impl WorkerManager {
         );
         if !same_registered_run {
             remove_worker_report(&mut observations, &key);
+            runtime.remove(&key);
         }
         drop(observations);
+        drop(runtime);
         drop(registrations);
         self.heartbeat_rejections.write().remove(&key);
-        if !same_registered_run {
-            self.runtime.write().remove(&key);
-        }
         self.notify_publication_observation_changed();
         Ok(())
     }
@@ -1069,7 +1071,6 @@ impl WorkerManager {
         worker_net_protocol: i32,
         tier_free: Vec<TierFree>,
     ) -> MetadataResult<WorkerLiveState> {
-        self.expire_liveness();
         let key = WorkerRegistrationKey::new(group_name, worker_id);
         let descriptor = {
             let descriptors = self.descriptors.read();
@@ -1081,16 +1082,15 @@ impl WorkerManager {
                 ))
             })?
         };
-        let registration = {
-            let registrations = self.registrations.read();
-            registrations.get(&key).cloned().ok_or_else(|| {
-                MetadataError::NotFound(format!(
-                    "live worker registration not found for group_name={}, worker_id={}",
-                    group_name,
-                    worker_id.as_raw()
-                ))
-            })?
-        };
+        // Keep the accepted run registered until its heartbeat update completes.
+        let registrations = self.registrations.read();
+        let registration = registrations.get(&key).ok_or_else(|| {
+            MetadataError::NotFound(format!(
+                "live worker registration not found for group_name={}, worker_id={}",
+                group_name,
+                worker_id.as_raw()
+            ))
+        })?;
 
         if !registration.worker_run_id.matches(worker_run_id) {
             return Err(MetadataError::StaleState(format!(
@@ -1107,9 +1107,16 @@ impl WorkerManager {
             )));
         }
 
+        let mut runtime = self.runtime.write();
         let now = Instant::now();
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        let mut runtime = self.runtime.write();
+        // Expiry discards the old sequence and capacity before this heartbeat renews liveness.
+        if runtime
+            .get(&key)
+            .is_some_and(|existing| now.duration_since(existing.last_seen_at) >= self.heartbeat_timeout())
+        {
+            runtime.remove(&key);
+        }
         let live_state = match runtime.get_mut(&key) {
             Some(existing) if heartbeat_seq <= existing.heartbeat_seq => {
                 existing.last_seen_at = now;
@@ -1147,6 +1154,7 @@ impl WorkerManager {
             }
         };
         drop(runtime);
+        drop(registrations);
         self.clear_heartbeat_rejection(&key);
         self.notify_publication_observation_changed();
 
@@ -1176,36 +1184,67 @@ impl WorkerManager {
         expired
     }
 
-    /// Remove dead-worker runtime state and keep the persisted descriptor.
-    pub fn remove_dead_worker(&self, group_name: &GroupName, worker_id: WorkerId) -> (bool, Vec<BlockId>) {
+    /// Remove soft state only if the candidate run is still current and has no live heartbeat.
+    /// The persisted descriptor is retained.
+    pub fn remove_dead_worker(
+        &self,
+        group_name: &GroupName,
+        worker_id: WorkerId,
+        expected_run_id: WorkerRunId,
+    ) -> (bool, Vec<BlockId>) {
         let key = WorkerRegistrationKey::new(group_name, worker_id);
-        let mut removed = false;
         let mut affected_blocks = HashSet::new();
 
+        // Registration, heartbeat, and report mutation use this same lock order.
         let mut registrations = self.registrations.write();
-        let mut observations = self.block_report_observations.write();
-        let registration_removed = registrations.remove(&key).is_some();
-        let removed_report = remove_worker_report(&mut observations, &key);
-        if registration_removed || removed_report.is_some() {
-            removed = true;
+        if !registrations
+            .get(&key)
+            .is_some_and(|registration| registration.worker_run_id.matches(expected_run_id))
+        {
+            return (false, Vec::new());
         }
+        let mut runtime = self.runtime.write();
+        let now = Instant::now();
+        if runtime.get(&key).is_some_and(|runtime| {
+            !runtime.worker_run_id.matches(expected_run_id)
+                || now.duration_since(runtime.last_seen_at) < self.heartbeat_timeout()
+        }) {
+            return (false, Vec::new());
+        }
+        let mut observations = self.block_report_observations.write();
+        registrations.remove(&key);
+        runtime.remove(&key);
+        let removed_report = remove_worker_report(&mut observations, &key);
         if let Some(report) = &removed_report {
             if let Some(active) = &report.active {
                 affected_blocks.extend(active.ready_blocks.iter().copied());
             }
         }
         drop(observations);
+        drop(runtime);
         drop(registrations);
-        if self.runtime.write().remove(&key).is_some() {
-            removed = true;
-        }
 
         let mut affected_blocks: Vec<_> = affected_blocks.into_iter().collect();
         affected_blocks.sort_by_key(|block_id| (block_id.inode_id.as_raw(), block_id.index.as_raw()));
-        if removed {
-            self.notify_publication_observation_changed();
-        }
-        (removed, affected_blocks)
+        self.notify_publication_observation_changed();
+        (true, affected_blocks)
+    }
+
+    /// Snapshot expired registrations with the run identity required for conditional removal.
+    pub(crate) fn list_expired_worker_runs(&self) -> Vec<(WorkerRegistrationKey, WorkerRunId)> {
+        let registrations = self.registrations.read();
+        let runtime = self.runtime.read();
+        let now = Instant::now();
+        let timeout = self.heartbeat_timeout();
+        registrations
+            .iter()
+            .filter(|(key, _)| {
+                runtime
+                    .get(*key)
+                    .is_none_or(|runtime| now.duration_since(runtime.last_seen_at) >= timeout)
+            })
+            .map(|(key, registration)| (key.clone(), registration.worker_run_id))
+            .collect()
     }
 
     /// List all live workers (based on runtime last_seen_ms), preserving group identity.
@@ -1873,6 +1912,13 @@ mod tests {
             manager.check_publish_ready(&group_name_value, std::slice::from_ref(&target)),
             PublishReadyStatus::Pending { block_id }
         );
+        assert!(manager.get_block_locations(&group_name_value, block_id).is_empty());
+        let views = manager.collect_worker_placement_views(&group_name_value);
+        assert!(!views[0].lease_valid);
+        assert!(matches!(
+            manager.receive_full_block_report(&group_name_value, worker_id, run_id, 2, 0, true, Vec::new()),
+            Err(MetadataError::NotFound(_))
+        ));
     }
 
     #[test]
@@ -2297,7 +2343,67 @@ mod tests {
     }
 
     #[test]
-    fn worker_heartbeat_updates_live_state_without_moving_stale_seq_backward() {
+    fn dead_worker_cleanup_preserves_recovered_heartbeat() {
+        let manager = WorkerManager::new(60_000);
+        let group = group_name("g1");
+        let worker_id = WorkerId::new(1);
+        let run_id = report_run_id();
+        register_live_report_worker(&manager, &group, worker_id, run_id);
+        manager
+            .receive_full_block_report(&group, worker_id, run_id, 1, 0, true, vec![report_block(0)])
+            .unwrap();
+        manager
+            .runtime
+            .write()
+            .get_mut(&WorkerRegistrationKey::new(&group, worker_id))
+            .unwrap()
+            .last_seen_at = Instant::now() - Duration::from_secs(61);
+
+        let (candidate, expected_run_id) = manager.list_expired_worker_runs().pop().unwrap();
+        record_heartbeat(&manager, &group, worker_id, run_id, 2, 900).unwrap();
+        assert_eq!(
+            manager.remove_dead_worker(&candidate.group_name, candidate.worker_id, expected_run_id),
+            (false, Vec::new())
+        );
+
+        assert_eq!(
+            manager.get_registration(&group, worker_id).unwrap().worker_run_id,
+            run_id
+        );
+        assert!(manager.is_worker_live(&group, worker_id));
+        assert_eq!(
+            manager.get_block_locations(&group, report_block(0).block_id),
+            vec![worker_id]
+        );
+    }
+
+    #[test]
+    fn dead_worker_cleanup_fences_replacement_before_first_heartbeat() {
+        let manager = WorkerManager::new(60_000);
+        let group = group_name("g1");
+        let worker_id = WorkerId::new(1);
+        let first_run = report_run_id();
+        let second_run = "550e8400-e29b-41d4-a716-446655440101".parse().unwrap();
+        manager
+            .register_worker_run(&group, worker_id, "127.0.0.1:9090".into(), 1, first_run, None)
+            .unwrap();
+        let (candidate, expected_run_id) = manager.list_expired_worker_runs().pop().unwrap();
+
+        manager
+            .register_worker_run(&group, worker_id, "127.0.0.1:9090".into(), 1, second_run, None)
+            .unwrap();
+        assert_eq!(
+            manager.remove_dead_worker(&candidate.group_name, candidate.worker_id, expected_run_id),
+            (false, Vec::new())
+        );
+        assert_eq!(
+            manager.get_registration(&group, worker_id).unwrap().worker_run_id,
+            second_run
+        );
+    }
+
+    #[test]
+    fn worker_heartbeat_preserves_stale_sequence_until_expiry() {
         let manager = WorkerManager::new(60_000);
         let group_name_value = group_name("g1");
         let worker_id = WorkerId::new(1);
@@ -2320,15 +2426,29 @@ mod tests {
         let stale = record_heartbeat(&manager, &group_name_value, worker_id, run_id, 9, 1_000).unwrap();
         assert_eq!(stale.heartbeat_seq, 10);
 
-        let runtime = manager.runtime.read();
+        let mut runtime = manager.runtime.write();
         let worker = runtime
-            .get(&WorkerRegistrationKey::new(&group_name_value, worker_id))
+            .get_mut(&WorkerRegistrationKey::new(&group_name_value, worker_id))
             .unwrap();
         assert_eq!(
             worker.tier_free,
             vec![TierFree {
                 tier: Tier::Hdd,
                 free_bytes: 900,
+            }]
+        );
+        worker.last_seen_at = Instant::now() - Duration::from_secs(61);
+        drop(runtime);
+
+        let renewed = record_heartbeat(&manager, &group_name_value, worker_id, run_id, 9, 1_000).unwrap();
+        assert_eq!(renewed.heartbeat_seq, 9);
+        let views = manager.collect_worker_placement_views(&group_name_value);
+        assert!(views[0].lease_valid);
+        assert_eq!(
+            views[0].tier_free,
+            vec![TierFree {
+                tier: Tier::Hdd,
+                free_bytes: 1_000
             }]
         );
     }

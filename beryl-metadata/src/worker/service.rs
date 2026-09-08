@@ -684,8 +684,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     return self.invalid_request_response(&req.header, heartbeat_response_with_header, message)
                 }
             };
-            self.worker_manager.expire_liveness();
-
             let descriptor = match self.worker_manager.get_descriptor(&group_name, worker_id) {
                 Some(descriptor) => descriptor,
                 None => {
