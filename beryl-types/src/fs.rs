@@ -9,13 +9,35 @@
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter, Result};
 
-/// Write behavior selected when opening a file session.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteMode {
-    /// Replace the currently visible file contents when publication succeeds.
-    Overwrite,
-    /// Append after the currently visible file contents.
-    Append,
+/// Largest number of blocks stored in one file inode by the inline layout.
+///
+/// This fixed ceiling bounds replicated publication and inode serialization.
+/// Files that need more blocks require paged block storage rather than a
+/// larger inline vector.
+pub const MAX_FILE_BLOCKS: usize = 10_000;
+
+/// Payload-free namespace type tag, independent of inode storage layout.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileType {
+    /// Regular file.
+    File,
+    /// Directory.
+    Dir,
+}
+
+impl FileType {
+    /// Returns true if this is a directory.
+    #[inline]
+    pub fn is_dir(self) -> bool {
+        matches!(self, FileType::Dir)
+    }
+
+    /// Returns true if this is a file.
+    #[inline]
+    pub fn is_file(self) -> bool {
+        matches!(self, FileType::File)
+    }
 }
 
 /// Change counter for the currently visible content of one inode.
@@ -50,35 +72,13 @@ impl Display for ContentGeneration {
     }
 }
 
-/// Largest number of blocks stored in one file inode by the inline layout.
-///
-/// This fixed ceiling bounds replicated publication and inode serialization.
-/// Files that need more blocks require paged block storage rather than a
-/// larger inline vector.
-pub const MAX_FILE_BLOCKS: usize = 10_000;
-
-/// Payload-free namespace type tag, independent of inode storage layout.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FileType {
-    /// Regular file.
-    File,
-    /// Directory.
-    Dir,
-}
-
-impl FileType {
-    /// Returns true if this is a directory.
-    #[inline]
-    pub fn is_dir(self) -> bool {
-        matches!(self, FileType::Dir)
-    }
-
-    /// Returns true if this is a file.
-    #[inline]
-    pub fn is_file(self) -> bool {
-        matches!(self, FileType::File)
-    }
+/// Write behavior selected when opening a file session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteMode {
+    /// Replace the currently visible file contents when publication succeeds.
+    Overwrite,
+    /// Append after the currently visible file contents.
+    Append,
 }
 
 #[cfg(test)]

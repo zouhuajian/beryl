@@ -400,7 +400,7 @@ fn classify_heartbeat_response(
     .map_err(HeartbeatError::Fatal)?;
     let expected_worker_run_id = require_worker_run_id(&request.worker_run_id, "HeartbeatRequest.worker_run_id")
         .map_err(HeartbeatError::Fatal)?;
-    if !accepted_worker_run_id.matches(expected_worker_run_id) {
+    if accepted_worker_run_id != expected_worker_run_id {
         return Err(HeartbeatError::Fatal(
             "metadata heartbeat response did not confirm worker_run_id".to_string(),
         ));

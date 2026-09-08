@@ -744,7 +744,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     );
                 }
             };
-            if !registration.worker_run_id.matches(worker_run_id) {
+            if registration.worker_run_id != worker_run_id {
                 if self
                     .worker_manager
                     .mark_heartbeat_run_mismatch_if_changed(&group_name, worker_id, worker_run_id)
@@ -1382,7 +1382,7 @@ mod tests {
         let raft_node = nonleader_raft(&dir).await;
         let worker_manager = Arc::new(WorkerManager::new(60_000));
         let worker_id = WorkerId::new(8);
-        let block_id = BlockId::from_u64_u32(80, 0);
+        let block_id = BlockId::new(InodeId::new(80), BlockIndex::new(0));
         worker_manager
             .register_worker_run(
                 &group_name("root"),

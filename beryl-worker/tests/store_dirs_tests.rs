@@ -18,7 +18,7 @@ use tempfile::TempDir;
 const BLOCK_SIZE: u64 = 4096;
 
 fn chunk_size() -> u32 {
-    BlockFormatId::DURABLE_PREFIX.spec().unwrap().storage_chunk_size
+    BlockFormatId::DURABLE_PREFIX.storage_chunk_size().unwrap()
 }
 
 fn group_name() -> GroupName {

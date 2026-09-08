@@ -16,13 +16,6 @@ pub enum Tier {
     Hdd,
 }
 
-/// Writable free bytes advertised for one worker-local storage tier.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TierFree {
-    pub tier: Tier,
-    pub free_bytes: u64,
-}
-
 impl Tier {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -76,3 +69,10 @@ impl fmt::Display for TierError {
 }
 
 impl std::error::Error for TierError {}
+
+/// Writable free bytes advertised for one worker-local storage tier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TierFree {
+    pub tier: Tier,
+    pub free_bytes: u64,
+}

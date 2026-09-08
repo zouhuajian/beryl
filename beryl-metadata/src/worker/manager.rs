@@ -7,7 +7,7 @@ use crate::error::{MetadataError, MetadataResult};
 use crate::placement::{ReportedBlockLocation, WorkerPlacementView};
 use beryl_types::ids::{BlockId, WorkerId};
 use beryl_types::layout::BlockFormatId;
-use beryl_types::{GroupName, LocatedBlock, TierFree, WorkerNetProtocol, WorkerRunId};
+use beryl_types::{GroupName, LocatedBlock, TierFree, WorkerRunId};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -539,7 +539,7 @@ impl WorkerManager {
             registrations.get(&key).cloned()
         };
         if let Some(existing) = existing {
-            let same_run = existing.worker_run_id.matches(worker_run_id);
+            let same_run = existing.worker_run_id == worker_run_id;
             let endpoint_changed = existing.address != address || existing.worker_net_protocol != worker_net_protocol;
             if same_run {
                 validate_same_run_descriptor(group_name, worker_id, &existing, address, worker_net_protocol)?;
@@ -584,7 +584,7 @@ impl WorkerManager {
                     worker_id.as_raw()
                 )));
             }
-            if existing.worker_run_id.matches(worker_run_id) {
+            if existing.worker_run_id == worker_run_id {
                 validate_same_run_descriptor(group_name, worker_id, existing, address, worker_net_protocol)?;
                 return Ok(());
             }
@@ -626,7 +626,7 @@ impl WorkerManager {
         let mut observations = self.block_report_observations.write();
         let same_registered_run = registrations
             .get(&key)
-            .map(|registration| registration.worker_run_id.matches(worker_run_id))
+            .map(|registration| registration.worker_run_id == worker_run_id)
             .unwrap_or(false);
         registrations.insert(
             key.clone(),
@@ -673,7 +673,7 @@ impl WorkerManager {
         let registrations = self.registrations.read();
         if !registrations
             .get(&key)
-            .is_some_and(|registration| registration.worker_run_id.matches(worker_run_id))
+            .is_some_and(|registration| registration.worker_run_id == worker_run_id)
         {
             return Err(MetadataError::StaleState(format!(
                 "worker_run_id mismatch for group_name={}, worker_id={}",
@@ -689,7 +689,7 @@ impl WorkerManager {
             active: None,
             staging: None,
         });
-        if !report.worker_run_id.matches(worker_run_id) {
+        if report.worker_run_id != worker_run_id {
             return Err(MetadataError::StaleState(format!(
                 "worker_run_id mismatch for group_name={}, worker_id={}",
                 group_name,
@@ -847,7 +847,7 @@ impl WorkerManager {
         let registrations = self.registrations.read();
         if !registrations
             .get(&key)
-            .is_some_and(|registration| registration.worker_run_id.matches(worker_run_id))
+            .is_some_and(|registration| registration.worker_run_id == worker_run_id)
         {
             return Err(MetadataError::StaleState(format!(
                 "worker_run_id mismatch for group_name={}, worker_id={}",
@@ -864,7 +864,7 @@ impl WorkerManager {
                 worker_id.as_raw()
             ))
         })?;
-        if !report.worker_run_id.matches(worker_run_id) {
+        if report.worker_run_id != worker_run_id {
             return Err(MetadataError::StaleState(format!(
                 "worker_run_id mismatch for group_name={}, worker_id={}",
                 group_name,
@@ -996,7 +996,7 @@ impl WorkerManager {
                 worker_id.as_raw()
             ))
         })?;
-        if !registration.worker_run_id.matches(worker_run_id) {
+        if registration.worker_run_id != worker_run_id {
             return Err(MetadataError::StaleState(format!(
                 "worker_run_id mismatch for group_name={}, worker_id={}",
                 group_name,
@@ -1092,7 +1092,7 @@ impl WorkerManager {
             ))
         })?;
 
-        if !registration.worker_run_id.matches(worker_run_id) {
+        if registration.worker_run_id != worker_run_id {
             return Err(MetadataError::StaleState(format!(
                 "worker_run_id mismatch for group_name={}, worker_id={}",
                 group_name,
@@ -1199,14 +1199,14 @@ impl WorkerManager {
         let mut registrations = self.registrations.write();
         if !registrations
             .get(&key)
-            .is_some_and(|registration| registration.worker_run_id.matches(expected_run_id))
+            .is_some_and(|registration| registration.worker_run_id == expected_run_id)
         {
             return (false, Vec::new());
         }
         let mut runtime = self.runtime.write();
         let now = Instant::now();
         if runtime.get(&key).is_some_and(|runtime| {
-            !runtime.worker_run_id.matches(expected_run_id)
+            runtime.worker_run_id != expected_run_id
                 || now.duration_since(runtime.last_seen_at) < self.heartbeat_timeout()
         }) {
             return (false, Vec::new());
@@ -1467,7 +1467,7 @@ impl WorkerManager {
                 .get(worker_key)
                 .map(|registration| registration.worker_run_id);
             let active = report.active.as_ref();
-            if !current_run.is_some_and(|run_id| run_id.matches(report_run_id))
+            if !current_run.is_some_and(|run_id| run_id == report_run_id)
                 || active.is_none_or(|active| active.ready_blocks.is_empty())
             {
                 visited += 1;
@@ -1593,14 +1593,14 @@ impl WorkerManager {
         let Some(registration) = registrations.get(&worker_key) else {
             return false;
         };
-        if !registration.worker_run_id.matches(replica.worker_run_id) {
+        if registration.worker_run_id != replica.worker_run_id {
             return false;
         }
 
         let Some(report) = observations.reports.get(&worker_key) else {
             return false;
         };
-        if !report.worker_run_id.matches(replica.worker_run_id) {
+        if report.worker_run_id != replica.worker_run_id {
             return false;
         }
         let Some(active) = &report.active else {
@@ -1658,7 +1658,7 @@ impl WorkerManager {
                     });
                     continue;
                 };
-                if !registration.worker_run_id.matches(endpoint.worker_run_id) {
+                if registration.worker_run_id != endpoint.worker_run_id {
                     conflict = Some(PublishReadyConflict::WorkerRunMismatch {
                         block_id: target.block_id,
                         worker_id: endpoint.worker_id,
@@ -1671,7 +1671,6 @@ impl WorkerManager {
                 let endpoint_matches = descriptors.get(&key).is_some_and(|descriptor| {
                     descriptor.address == endpoint.endpoint
                         && descriptor.worker_net_protocol == WORKER_NET_PROTOCOL_GRPC
-                        && endpoint.worker_net_protocol == WorkerNetProtocol::Grpc
                 }) && registration.address == endpoint.endpoint
                     && registration.worker_net_protocol == WORKER_NET_PROTOCOL_GRPC;
                 if !endpoint_matches {
@@ -1685,7 +1684,7 @@ impl WorkerManager {
                 let Some(worker_runtime) = runtime.get(&key) else {
                     continue;
                 };
-                if !worker_runtime.worker_run_id.matches(endpoint.worker_run_id)
+                if worker_runtime.worker_run_id != endpoint.worker_run_id
                     || now.duration_since(worker_runtime.last_seen_at) >= timeout
                 {
                     continue;
@@ -1694,7 +1693,7 @@ impl WorkerManager {
                 let Some(report) = observations.reports.get(&key) else {
                     continue;
                 };
-                if !report.worker_run_id.matches(endpoint.worker_run_id) {
+                if report.worker_run_id != endpoint.worker_run_id {
                     continue;
                 }
                 let Some(active) = &report.active else {
@@ -1760,8 +1759,7 @@ mod tests {
     use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
     use beryl_types::lease::{FencingToken, LeaseEpoch};
     use beryl_types::{
-        BlockFormatId, ClientId, GroupName, LocatedBlock, Tier, TierFree, WorkerEndpointInfo, WorkerNetProtocol,
-        WorkerRunId,
+        BlockFormatId, ClientId, GroupName, LocatedBlock, Tier, TierFree, WorkerEndpointInfo, WorkerRunId,
     };
     use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
@@ -1850,7 +1848,6 @@ mod tests {
                 worker_endpoints: vec![WorkerEndpointInfo {
                     worker_id,
                     endpoint: "127.0.0.1:9090".to_string(),
-                    worker_net_protocol: WorkerNetProtocol::Grpc,
                     worker_run_id: run_id,
                 }],
                 fencing_token: FencingToken {
@@ -1858,7 +1855,7 @@ mod tests {
                     owner: ClientId::new(7),
                     epoch: LeaseEpoch::new(lease_epoch),
                 },
-                chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.spec().unwrap().storage_chunk_size,
+                chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.storage_chunk_size().unwrap(),
                 block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
                 tier: Tier::Hdd,
             },

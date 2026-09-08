@@ -212,7 +212,7 @@ impl BlockCleanupCoordinator {
             .filter(|(key, entry)| {
                 &key.group_name == group_name
                     && key.worker_id == worker_id
-                    && key.worker_run_id.matches(worker_run_id)
+                    && key.worker_run_id == worker_run_id
                     && entry.is_due(term, now)
             })
             .map(|(key, entry)| (entry.attempts, key.clone()))
@@ -790,7 +790,7 @@ mod tests {
     ) {
         assert!(replicas
             .iter()
-            .all(|replica| replica.worker_id == worker_id && replica.worker_run_id.matches(run_id)));
+            .all(|replica| replica.worker_id == worker_id && replica.worker_run_id == run_id));
         let group_name = group_name();
         let address = format!("127.0.0.1:{}", 19_000 + worker_id.as_raw());
         manager

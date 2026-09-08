@@ -5,8 +5,8 @@
 
 use beryl_proto::convert as proto_convert;
 use beryl_proto::worker::{ReadBlockRequestProto, WriteBlockCommandProto};
-use beryl_types::chunk::ByteRange;
 use beryl_types::layout::BlockFormatId;
+use beryl_types::range::ByteRange;
 use beryl_types::{GroupName, WorkerRunId};
 
 use crate::data::core::{ReadBlockRequest, WorkerCoreResult, WriteBlockRequest};

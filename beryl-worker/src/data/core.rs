@@ -13,9 +13,9 @@ use crate::store::block::{
     CheckpointBlockRequest, ChecksumKind, LocalBlockStore, OpenBlockWriteRequest, ReclaimBlockRequest,
     ReclaimBlockResult,
 };
-use beryl_types::chunk::ByteRange;
 use beryl_types::ids::BlockId;
 use beryl_types::layout::{BlockFormatId, BlockShape, BlockShapeError};
+use beryl_types::range::ByteRange;
 use beryl_types::{FencingToken, GroupName, Tier, WorkerRunId};
 use bytes::Bytes;
 use std::sync::Arc;
@@ -664,9 +664,9 @@ mod tests {
         OpenBlockWriteRequest, ReclaimBlockRequest, ReclaimBlockResult, ReclaimBlockState, StoreResult,
     };
     use beryl_common::error::rpc::{ErrorKind, WorkerErrorKind};
-    use beryl_types::chunk::ByteRange;
     use beryl_types::ids::{BlockId, BlockIndex, InodeId};
     use beryl_types::layout::BlockFormatId;
+    use beryl_types::range::ByteRange;
     use beryl_types::{GroupName, Tier, WorkerRunId};
     use bytes::Bytes;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -681,7 +681,7 @@ mod tests {
     const LEASE_EPOCH: u64 = 55;
 
     fn chunk_size() -> u32 {
-        BlockFormatId::DURABLE_PREFIX.spec().unwrap().storage_chunk_size
+        BlockFormatId::DURABLE_PREFIX.storage_chunk_size().unwrap()
     }
 
     fn group_name() -> GroupName {

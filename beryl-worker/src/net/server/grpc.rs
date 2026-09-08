@@ -212,7 +212,7 @@ impl WorkerDataServiceImpl {
                 message: format!("worker is not ready for metadata group {group_name}"),
             });
         }
-        if !requested.matches(registration.worker_run_id) {
+        if requested != registration.worker_run_id {
             return Err(WorkerError::RefreshMetadata {
                 kind: ErrorKind::Worker(WorkerErrorKind::RunMismatch),
                 message: format!(
@@ -687,7 +687,7 @@ mod tests {
                 worker_run_id: worker_run_id.to_string(),
                 block_format_id: BlockFormatId::DURABLE_PREFIX.as_raw(),
                 block_size: 4096,
-                chunk_size: BlockFormatId::DURABLE_PREFIX.spec().unwrap().storage_chunk_size,
+                chunk_size: BlockFormatId::DURABLE_PREFIX.storage_chunk_size().unwrap(),
                 fencing_token: Some(
                     beryl_types::FencingToken::new(block_id(), ClientId::new(9), beryl_types::LeaseEpoch::new(55))
                         .into(),

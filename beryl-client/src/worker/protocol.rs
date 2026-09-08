@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use beryl_common::header::{HeaderIdentity, HEADER_WORKER_DATA_ERROR_DETAIL, WORKER_DATA_ERROR_DETAIL_V1};
 use beryl_proto::worker::write_block_request_proto::Payload;
-use beryl_types::chunk::ByteRange;
+use beryl_types::range::ByteRange;
 use beryl_types::{BlockShape, GroupName, WorkerEndpointInfo};
 use bytes::Bytes;
 use prost::Message;

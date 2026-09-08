@@ -127,9 +127,8 @@ impl WriteSession {
         let storage_chunk_size = self
             .layout
             .block_format_id
-            .spec()
-            .map_err(|err| ClientError::invalid_layout(format!("session block format is invalid: {err}")))?
-            .storage_chunk_size;
+            .storage_chunk_size()
+            .map_err(|err| ClientError::invalid_layout(format!("session block format is invalid: {err}")))?;
         if target.block_format_id != self.layout.block_format_id
             || target.block_size != u64::from(self.layout.block_size)
             || target.chunk_size != storage_chunk_size

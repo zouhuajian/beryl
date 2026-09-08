@@ -14,16 +14,6 @@ pub const MAX_BLOCK_SIZE: u32 = 1024 * 1024 * 1024;
 /// Storage integrity unit fixed by the `DURABLE_PREFIX` block format.
 const DURABLE_PREFIX_STORAGE_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
 
-/// Stable parameters selected by one block format identifier.
-///
-/// These values define persisted block interpretation for newly created
-/// blocks. Runtime buffering and transport framing are separate policies.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct BlockFormatSpec {
-    /// Storage integrity unit persisted in Worker block metadata.
-    pub storage_chunk_size: u32,
-}
-
 /// Beryl block data/meta interpretation format selected by metadata.
 ///
 /// This is not a worker StoreBackend or IoEngine. A worker may execute the same
@@ -55,15 +45,12 @@ impl BlockFormatId {
         }
     }
 
-    /// Return the immutable parameters of this block format.
-    pub fn spec(self) -> Result<BlockFormatSpec, BlockFormatIdError> {
-        Self::from_raw(self.as_raw())?;
-        Ok(match self {
-            Self::DURABLE_PREFIX => BlockFormatSpec {
-                storage_chunk_size: DURABLE_PREFIX_STORAGE_CHUNK_SIZE,
-            },
-            _ => unreachable!("validated block format id must have a specification"),
-        })
+    /// Return the storage integrity unit size in bytes, or an error for an unknown format.
+    pub fn storage_chunk_size(self) -> Result<u32, BlockFormatIdError> {
+        match self {
+            Self::DURABLE_PREFIX => Ok(DURABLE_PREFIX_STORAGE_CHUNK_SIZE),
+            other => Err(BlockFormatIdError { raw: other.as_raw() }),
+        }
     }
 }
 
@@ -76,7 +63,8 @@ pub struct BlockFormatIdError {
 /// Metadata-owned logical layout for a file inode.
 ///
 /// Metadata selects this immutable layout when creating the file and persists
-/// it with the inode. Worker-local format parameters are derived from
+/// it with the inode. Field order is also part of the binary encoding of
+/// Metadata CreateFile replay records. Worker-local format parameters are derived from
 /// `block_format_id`; replica execution is not part of the current product.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FileLayout {
@@ -98,19 +86,28 @@ impl FileLayout {
     }
 
     pub fn validate(&self) -> Result<(), FileLayoutError> {
-        let format = self
-            .block_format_id
-            .spec()
-            .map_err(FileLayoutError::UnknownBlockFormat)?;
-        BlockShape::new(
-            self.block_format_id,
-            u64::from(self.block_size),
-            format.storage_chunk_size,
-            u64::from(self.block_size),
-        )
-        .map_err(FileLayoutError::from_block_shape_error)?;
+        BlockFormatId::from_raw(self.block_format_id.as_raw()).map_err(FileLayoutError::UnknownBlockFormat)?;
+        if self.block_size == 0 {
+            return Err(FileLayoutError::ZeroBlockSize);
+        }
+        if self.block_size > MAX_BLOCK_SIZE {
+            return Err(FileLayoutError::BlockTooLarge {
+                actual: u64::from(self.block_size),
+                maximum: u64::from(MAX_BLOCK_SIZE),
+            });
+        }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum FileLayoutError {
+    #[error("block_size must be non-zero")]
+    ZeroBlockSize,
+    #[error("block_size {actual} exceeds maximum {maximum}")]
+    BlockTooLarge { actual: u64, maximum: u64 },
+    #[error("{0}")]
+    UnknownBlockFormat(BlockFormatIdError),
 }
 
 /// Validated shape of one metadata-authorized block.
@@ -144,14 +141,14 @@ impl BlockShape {
     }
 
     pub fn for_effective_len(layout: &FileLayout, effective_len: u64) -> Result<Self, BlockShapeError> {
-        let format = layout
+        let chunk_size = layout
             .block_format_id
-            .spec()
+            .storage_chunk_size()
             .map_err(BlockShapeError::UnknownBlockFormat)?;
         Self::new(
             layout.block_format_id,
             u64::from(layout.block_size),
-            format.storage_chunk_size,
+            chunk_size,
             effective_len,
         )
     }
@@ -181,10 +178,12 @@ fn validate_block_layout_parts(
             maximum: u64::from(MAX_BLOCK_SIZE),
         });
     }
-    let format = block_format_id.spec().map_err(BlockShapeError::UnknownBlockFormat)?;
-    if chunk_size != format.storage_chunk_size {
+    let expected_chunk_size = block_format_id
+        .storage_chunk_size()
+        .map_err(BlockShapeError::UnknownBlockFormat)?;
+    if chunk_size != expected_chunk_size {
         return Err(BlockShapeError::StorageChunkSizeMismatch {
-            expected: format.storage_chunk_size,
+            expected: expected_chunk_size,
             got: chunk_size,
         });
     }
@@ -207,39 +206,14 @@ pub enum BlockShapeError {
     EffectiveLenExceedsBlock,
 }
 
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-pub enum FileLayoutError {
-    #[error("block_size must be non-zero")]
-    ZeroBlockSize,
-    #[error("block_size {actual} exceeds maximum {maximum}")]
-    BlockTooLarge { actual: u64, maximum: u64 },
-    #[error("{0}")]
-    UnknownBlockFormat(BlockFormatIdError),
-}
-
-impl FileLayoutError {
-    fn from_block_shape_error(err: BlockShapeError) -> Self {
-        match err {
-            BlockShapeError::ZeroBlockSize => Self::ZeroBlockSize,
-            BlockShapeError::BlockTooLarge { actual, maximum } => Self::BlockTooLarge { actual, maximum },
-            BlockShapeError::StorageChunkSizeMismatch { .. } => {
-                unreachable!("FileLayout derives storage chunk size from its block format")
-            }
-            BlockShapeError::UnknownBlockFormat(err) => Self::UnknownBlockFormat(err),
-            BlockShapeError::ZeroEffectiveLen | BlockShapeError::EffectiveLenExceedsBlock => {
-                unreachable!("FileLayout validates block shape with effective_len=block_size")
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn block_shape_rejects_invalid_size_format_and_effective_length() {
-        let chunk_size = BlockFormatId::DURABLE_PREFIX.spec().unwrap().storage_chunk_size;
+        let chunk_size = BlockFormatId::DURABLE_PREFIX.storage_chunk_size().unwrap();
+        assert_eq!(chunk_size, 4 * 1024 * 1024);
         let cases = [
             (
                 BlockShape::new(BlockFormatId::DURABLE_PREFIX, 0, chunk_size, 1),
@@ -280,19 +254,32 @@ mod tests {
     }
 
     #[test]
-    fn file_layout_accepts_hard_maximum_and_rejects_larger_values() {
+    fn file_layout_preserves_size_boundaries() {
         FileLayout::new(MAX_BLOCK_SIZE)
             .validate()
             .expect("maximum supported layout must pass");
-
+        assert_eq!(FileLayout::new(0).validate(), Err(FileLayoutError::ZeroBlockSize));
         assert_eq!(
-            FileLayout::new(MAX_BLOCK_SIZE + 1)
-                .validate()
-                .expect_err("block size above the hard maximum must fail"),
-            FileLayoutError::BlockTooLarge {
+            FileLayout::new(MAX_BLOCK_SIZE + 1).validate(),
+            Err(FileLayoutError::BlockTooLarge {
                 actual: u64::from(MAX_BLOCK_SIZE) + 1,
                 maximum: u64::from(MAX_BLOCK_SIZE),
-            }
+            })
         );
+    }
+
+    #[test]
+    fn deserialized_unknown_format_is_rejected_by_chunk_size_and_layout() {
+        let block_format_id = serde_json::from_str::<BlockFormatId>("99").unwrap();
+        assert_eq!(
+            block_format_id.storage_chunk_size(),
+            Err(BlockFormatIdError { raw: 99 })
+        );
+        for block_size in [0, MAX_BLOCK_SIZE + 1] {
+            assert_eq!(
+                FileLayout::with_block_format(block_size, block_format_id).validate(),
+                Err(FileLayoutError::UnknownBlockFormat(BlockFormatIdError { raw: 99 }))
+            );
+        }
     }
 }
