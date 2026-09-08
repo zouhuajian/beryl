@@ -1071,7 +1071,6 @@ impl WorkerManager {
         worker_net_protocol: i32,
         tier_free: Vec<TierFree>,
     ) -> MetadataResult<WorkerLiveState> {
-        self.expire_liveness();
         let key = WorkerRegistrationKey::new(group_name, worker_id);
         let descriptor = {
             let descriptors = self.descriptors.read();
@@ -1111,6 +1110,13 @@ impl WorkerManager {
         let mut runtime = self.runtime.write();
         let now = Instant::now();
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        // Expiry discards the old sequence and capacity before this heartbeat renews liveness.
+        if runtime
+            .get(&key)
+            .is_some_and(|existing| now.duration_since(existing.last_seen_at) >= self.heartbeat_timeout())
+        {
+            runtime.remove(&key);
+        }
         let live_state = match runtime.get_mut(&key) {
             Some(existing) if heartbeat_seq <= existing.heartbeat_seq => {
                 existing.last_seen_at = now;
