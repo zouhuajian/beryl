@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Raft log position used as a monotonic "state watermark".
+//! Group state watermark for metadata freshness.
 //!
-//! This type represents the state machine's applied position (last_applied_log_id).
-//! It aligns with beryl_proto::common::RaftLogIdProto.
+//! This module defines types for tracking state-machine applied progress per
+//! metadata Raft owner group.
 
+use crate::GroupName;
 use serde::{Deserialize, Serialize};
 
 /// Raft log position used as a monotonic "state watermark".
@@ -56,5 +57,25 @@ impl Ord for RaftLogId {
 impl PartialOrd for RaftLogId {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+/// Group state watermark for a specific metadata Raft owner group.
+///
+/// `state_id` is the state-machine applied RaftLogId for `group_name`. It is not
+/// an append index, committed index, private apply counter, route epoch,
+/// mount epoch, worker process-run identity, or writer lease epoch.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GroupStateWatermark {
+    /// Metadata Raft owner group this watermark applies to.
+    pub group_name: GroupName,
+    /// Applied state-machine RaftLogId that must be reached.
+    pub state_id: RaftLogId,
+}
+
+impl GroupStateWatermark {
+    /// Create a new GroupStateWatermark.
+    pub fn new(group_name: GroupName, state_id: RaftLogId) -> Self {
+        Self { group_name, state_id }
     }
 }

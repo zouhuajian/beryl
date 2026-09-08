@@ -60,10 +60,7 @@ async fn stale_old_worker_run_is_rejected_after_restart() {
 
     cluster.restart_worker().await.expect("restart worker");
     let new_run = cluster.current_worker_run_id().expect("new worker run id");
-    assert!(
-        !old_run.matches(new_run),
-        "worker restart must create a new WorkerRunId"
-    );
+    assert!(old_run != new_run, "worker restart must create a new WorkerRunId");
     let after_locations = metadata_locations(&cluster, path, payload.len() as u32)
         .await
         .expect("post-restart metadata locations");
@@ -97,10 +94,7 @@ async fn multi_block_file_is_readable_after_worker_restart_full_report_convergen
     cluster.restart_worker().await.expect("restart worker");
 
     let new_run = cluster.current_worker_run_id().expect("new worker run id");
-    assert!(
-        !old_run.matches(new_run),
-        "worker restart must create a new WorkerRunId"
-    );
+    assert!(old_run != new_run, "worker restart must create a new WorkerRunId");
     let after_locations = metadata_locations(&cluster, path, payload.len() as u32)
         .await
         .expect("post-restart metadata locations");
@@ -229,7 +223,7 @@ fn assert_locations_use_only_run(locations: &[FileBlockLocationProto], expected:
         for worker in &location.workers {
             let actual = WorkerRunId::parse(&worker.worker_run_id).expect("valid worker run id");
             assert!(
-                actual.matches(expected),
+                actual == expected,
                 "metadata location used worker_run_id {actual}, expected {expected}"
             );
         }
@@ -240,10 +234,7 @@ fn assert_locations_do_not_use_run(locations: &[FileBlockLocationProto], stale: 
     for location in locations {
         for worker in &location.workers {
             let actual = WorkerRunId::parse(&worker.worker_run_id).expect("valid worker run id");
-            assert!(
-                !actual.matches(stale),
-                "metadata location reused stale worker_run_id {stale}"
-            );
+            assert!(actual != stale, "metadata location reused stale worker_run_id {stale}");
         }
     }
 }

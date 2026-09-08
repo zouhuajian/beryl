@@ -25,13 +25,13 @@ use ::beryl_common::error::rpc::{
     WorkerEndpointHint, WorkerErrorKind,
 };
 use ::beryl_common::header::{CallerContext, ClientInfo, RequestHeader, ResponseHeader, TraceContext};
-use beryl_types::chunk::ByteRange;
 use beryl_types::ids::{BlockId, BlockIndex, WorkerId};
 use beryl_types::layout::{BlockFormatId, BlockShape, FileLayout};
 use beryl_types::lease::{FencingToken, LeaseEpoch, WriteHandle};
+use beryl_types::range::ByteRange;
 use beryl_types::{
     CallId, ClientId, CommittedBlock, FileBlockLocation, FileType, GroupName, GroupStateWatermark, InodeId,
-    LocatedBlock, RaftLogId, Tier, WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId, WriteMode,
+    LocatedBlock, RaftLogId, Tier, WorkerEndpointInfo, WorkerRunId, WriteMode,
 };
 
 // ============================================================================
@@ -319,7 +319,6 @@ pub fn worker_endpoint_info_from_parts(
     Ok(WorkerEndpointInfo {
         worker_id,
         endpoint,
-        worker_net_protocol: WorkerNetProtocol::Grpc,
         worker_run_id,
     })
 }
@@ -1052,7 +1051,7 @@ mod tests {
         }
 
         let token = FencingToken::new(
-            BlockId::from_u64_u32(42, u32::MAX),
+            BlockId::new(InodeId::new(42), BlockIndex::new(u32::MAX)),
             ClientId::new(9),
             LeaseEpoch::new(17),
         );
@@ -1111,7 +1110,7 @@ mod tests {
             endpoint: "127.0.0.1:19101".to_string(),
             worker_run_id: test_worker_run_id().to_string(),
         };
-        let block_id = BlockId::from_u64_u32(42, 3);
+        let block_id = BlockId::new(InodeId::new(42), BlockIndex::new(3));
         let token = FencingToken::new(block_id, ClientId::new(9), LeaseEpoch::new(17));
 
         let mut target = LocatedBlockProto {
@@ -1121,7 +1120,7 @@ mod tests {
             worker_endpoints: Vec::new(),
             fencing_token: Some(token.into()),
 
-            chunk_size: BlockFormatId::DURABLE_PREFIX.spec().unwrap().storage_chunk_size,
+            chunk_size: BlockFormatId::DURABLE_PREFIX.storage_chunk_size().unwrap(),
             block_format_id: BlockFormatId::DURABLE_PREFIX.as_raw(),
             block_size: 4096,
             tier: TierProto::TierHdd as i32,
@@ -1142,7 +1141,7 @@ mod tests {
 
             block_format_id: BlockFormatId::DURABLE_PREFIX.as_raw(),
             block_size: 4096,
-            chunk_size: BlockFormatId::DURABLE_PREFIX.spec().unwrap().storage_chunk_size,
+            chunk_size: BlockFormatId::DURABLE_PREFIX.storage_chunk_size().unwrap(),
             effective_len: 4096,
         };
         let decoded_empty =

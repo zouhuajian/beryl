@@ -626,7 +626,7 @@ fn block_location(
 
         block_format_id: format.as_raw(),
         block_size: 64 * 1024 * 1024,
-        chunk_size: format.spec().expect("block format").storage_chunk_size,
+        chunk_size: format.storage_chunk_size().expect("block format"),
         effective_len: len,
     }
 }
@@ -646,7 +646,7 @@ fn write_target(
         file_offset,
         block_format_id: format.as_raw(),
         block_size,
-        chunk_size: format.spec().expect("block format").storage_chunk_size,
+        chunk_size: format.storage_chunk_size().expect("block format"),
 
         worker_endpoints: vec![worker(worker_endpoint)],
         fencing_token: Some(FencingTokenProto {

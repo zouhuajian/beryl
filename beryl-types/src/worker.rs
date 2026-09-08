@@ -17,21 +17,6 @@ use crate::ids::WorkerId;
 /// Worker.
 pub const MAX_REPORT_ENTRIES: usize = 1_000;
 
-/// Worker network protocol advertised by metadata and consumed by clients/workers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum WorkerNetProtocol {
-    Grpc,
-}
-
-/// Metadata-authoritative worker endpoint advertised for data-plane access.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct WorkerEndpointInfo {
-    pub worker_id: WorkerId,
-    pub endpoint: String,
-    pub worker_net_protocol: WorkerNetProtocol,
-    pub worker_run_id: WorkerRunId,
-}
-
 /// UUID generated once for a worker process run.
 ///
 /// This identifies a worker process start for metadata registration. It is not
@@ -60,11 +45,6 @@ impl WorkerRunId {
     pub const fn as_uuid(self) -> Uuid {
         self.0
     }
-
-    /// Compare two worker process-run identifiers without assigning ordering semantics.
-    pub const fn matches(self, other: Self) -> bool {
-        self.0.as_u128() == other.0.as_u128()
-    }
 }
 
 impl Default for WorkerRunId {
@@ -85,4 +65,12 @@ impl FromStr for WorkerRunId {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::parse(value)
     }
+}
+
+/// Metadata-authoritative worker endpoint advertised for data-plane access.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WorkerEndpointInfo {
+    pub worker_id: WorkerId,
+    pub worker_run_id: WorkerRunId,
+    pub endpoint: String,
 }

@@ -16,9 +16,9 @@ use beryl_proto::metadata::{
 };
 use beryl_proto::worker::worker_data_service_server::WorkerDataService;
 use beryl_proto::worker::ReadBlockRequestProto;
-use beryl_types::chunk::ByteRange;
 use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
 use beryl_types::layout::BlockFormatId;
+use beryl_types::range::ByteRange;
 use beryl_types::{GroupName, Tier, WorkerRunId};
 use beryl_worker::config::{StoreDirConfig, WorkerConfig, WorkerRegistrationConfig};
 use beryl_worker::control::{
@@ -53,7 +53,7 @@ use tonic::{Request, Response, Status};
 const BLOCK_SIZE: u64 = 4096;
 
 fn chunk_size() -> u32 {
-    BlockFormatId::DURABLE_PREFIX.spec().unwrap().storage_chunk_size
+    BlockFormatId::DURABLE_PREFIX.storage_chunk_size().unwrap()
 }
 
 fn block_id() -> BlockId {

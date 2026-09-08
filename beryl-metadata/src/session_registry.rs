@@ -2138,7 +2138,7 @@ mod tests {
                 epoch: LeaseEpoch::new(7),
             },
 
-            chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.spec().unwrap().storage_chunk_size,
+            chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.storage_chunk_size().unwrap(),
             block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
             tier: Tier::Hdd,
         }
@@ -2623,7 +2623,7 @@ mod tests {
         ));
         publication.complete_sync(ContentGeneration::new(1), 64).unwrap();
         assert_eq!(registry.state.read().outstanding_write_targets, 1);
-        for previous in [second.block_id, BlockId::from_u64_u32(999, 0)] {
+        for previous in [second.block_id, BlockId::new(InodeId::new(999), BlockIndex::new(0))] {
             assert!(matches!(
                 registry.begin_allocate_block(inode_id, LeaseEpoch::new(7), Some(previous)),
                 Err(BeginAllocateBlockError::InvalidArgument(_))

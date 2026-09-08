@@ -221,7 +221,7 @@ pub(crate) fn block_location_unavailable_error(message: impl Into<String>) -> Cl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beryl_types::{BlockId, BlockIndex, InodeId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol};
+    use beryl_types::{BlockId, BlockIndex, InodeId, WorkerEndpointInfo, WorkerId};
 
     #[test]
     fn planner_rejects_invalid_location_coverage_and_shape() {
@@ -279,12 +279,11 @@ mod tests {
             workers: vec![WorkerEndpointInfo {
                 worker_id: WorkerId::new(1),
                 endpoint: "127.0.0.1:19101".to_string(),
-                worker_net_protocol: WorkerNetProtocol::Grpc,
                 worker_run_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
             }],
             block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
             block_size: 4096,
-            chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.spec().unwrap().storage_chunk_size,
+            chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.storage_chunk_size().unwrap(),
             effective_len: len,
         }
     }

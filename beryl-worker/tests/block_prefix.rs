@@ -23,7 +23,7 @@ fn fixture() -> (TempDir, FullBlockFileStore, OpenBlockWriteRequest) {
         block_id,
         block_size: 16,
         block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
-        chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.spec().unwrap().storage_chunk_size,
+        chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.storage_chunk_size().unwrap(),
         checksum_kind: ChecksumKind::None,
         tier: Tier::Ssd,
         fencing_token: FencingToken::new(block_id, ClientId::generate(), LeaseEpoch::new(1)),

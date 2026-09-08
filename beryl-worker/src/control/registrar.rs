@@ -211,7 +211,7 @@ impl MetadataRegistrar {
             "RegisterWorkerResponse.accepted_worker_run_id",
         )
         .map_err(RegistrationError::Fatal)?;
-        if !accepted_worker_run_id.matches(self.descriptor.worker_run_id) {
+        if accepted_worker_run_id != self.descriptor.worker_run_id {
             return Err(RegistrationError::Fatal(
                 "metadata register response did not confirm worker_run_id".to_string(),
             ));

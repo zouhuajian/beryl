@@ -801,9 +801,8 @@ impl MetadataFileSystem {
             chunk_size: file
                 .layout
                 .block_format_id
-                .spec()
-                .map_err(|e| MetadataError::Internal(e.to_string()))?
-                .storage_chunk_size,
+                .storage_chunk_size()
+                .map_err(|e| MetadataError::Internal(e.to_string()))?,
             block_format_id: file.layout.block_format_id,
             tier,
         })
@@ -962,8 +961,8 @@ impl MetadataFileSystem {
         let layout = reservation.layout();
         let file_offset = reservation.file_offset();
         let open_client_id = reservation.open_client_id();
-        let storage_chunk_size = match layout.block_format_id.spec() {
-            Ok(spec) => spec.storage_chunk_size,
+        let storage_chunk_size = match layout.block_format_id.storage_chunk_size() {
+            Ok(chunk_size) => chunk_size,
             Err(error) => {
                 return self.failure_from_error(
                     ctx,

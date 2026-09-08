@@ -870,7 +870,7 @@ mod tests {
                 epoch: lease_epoch,
             },
 
-            chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.spec().unwrap().storage_chunk_size,
+            chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.storage_chunk_size().unwrap(),
             block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
             tier: Tier::Hdd,
         };

@@ -12,7 +12,7 @@
 
 ## Main Responsibilities
 
-- IDs and value types for namespace, blocks, chunks, mounts, workers, streams, leases, and requests.
+- IDs and value types for namespace, blocks, mounts, workers, leases, and requests.
 - File layout, block format, committed block, write target, byte range, worker run identity, epoch, and watermark values.
 - Small constructors and validation helpers for shared domain invariants.
 

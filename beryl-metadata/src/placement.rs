@@ -170,7 +170,7 @@ fn choose_read(req: &PlacementRequest, workers: &[WorkerPlacementView]) -> Place
         if is_live(worker)
             && worker
                 .worker_run_id
-                .is_some_and(|worker_run_id| worker_run_id.matches(location.worker_run_id))
+                .is_some_and(|worker_run_id| worker_run_id == location.worker_run_id)
         {
             candidates.push(worker);
         }

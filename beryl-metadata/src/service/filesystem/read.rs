@@ -633,11 +633,7 @@ impl MetadataFileSystem {
                 return self.failure_from_error_with_route_epoch(&req.ctx, error, group_name, mount_epoch, route_epoch);
             }
             let layout = file.layout;
-            let storage_chunk_size = layout
-                .block_format_id
-                .spec()
-                .expect("validated layout")
-                .storage_chunk_size;
+            let storage_chunk_size = layout.block_format_id.storage_chunk_size().expect("validated layout");
             let (range_start, range_end) = match req.range {
                 Some(range) => match range.offset.checked_add(range.len) {
                     Some(end) => (range.offset, end),

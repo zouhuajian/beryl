@@ -45,7 +45,7 @@ message WorkerEndpointInfoProto {
 }
 
 /// Byte range within a file.
-/// Aligns with types::chunk::ByteRange { offset: u64, len: u32 }.
+/// Aligns with types::range::ByteRange { offset: u64, len: u32 }.
 message ByteRangeProto {
   uint64 offset = 1;
   uint32 len = 2;

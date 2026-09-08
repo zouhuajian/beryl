@@ -20,23 +20,25 @@ pub struct LocatedBlock {
     pub block_id: BlockId,
     /// Start of the block in the file, independent of its allocation index.
     pub file_offset: u64,
+
+    /// Metadata-selected Beryl block data/meta interpretation format.
+    pub block_format_id: BlockFormatId,
     /// Maximum writable capacity authorized by the persisted `FileLayout`.
     ///
     /// Workers reserve and enforce this bound before the final effective length
     /// is known, then persist it in `BlockMeta.format.block_size`.
     pub block_size: u64,
-    /// Selected Worker process identities retained unchanged when allocation replays.
-    pub worker_endpoints: Vec<WorkerEndpointInfo>,
-    pub fencing_token: FencingToken,
+    pub chunk_size: u32,
     /// Block-local start of the next write: zero for allocation, the visible
     /// prefix for OpenWrite, or a locally confirmed checkpoint for continuation.
     pub write_offset: u64,
 
-    pub chunk_size: u32,
-    /// Metadata-selected Beryl block data/meta interpretation format.
-    pub block_format_id: BlockFormatId,
+    /// Selected Worker process identities retained unchanged when allocation replays.
+    pub worker_endpoints: Vec<WorkerEndpointInfo>,
     /// Worker-local storage tier requested for this replica.
     pub tier: Tier,
+
+    pub fencing_token: FencingToken,
 }
 
 /// Changed tail or new block included in a Metadata content publication.
@@ -53,9 +55,6 @@ pub struct FileBlockLocation {
     pub block_id: BlockId,
     pub file_offset: u64,
     pub len: u64,
-    /// Metadata-issued read candidates. Empty means the authoritative layout has
-    /// this block range but no live reported replica is currently eligible.
-    pub workers: Vec<WorkerEndpointInfo>,
 
     /// Metadata-selected Beryl block data/meta interpretation format.
     pub block_format_id: BlockFormatId,
@@ -65,4 +64,8 @@ pub struct FileBlockLocation {
     pub chunk_size: u32,
     /// Block-local readable prefix expected by metadata.
     pub effective_len: u64,
+
+    /// Metadata-issued read candidates. Empty means the authoritative layout has
+    /// this block range but no live reported replica is currently eligible.
+    pub workers: Vec<WorkerEndpointInfo>,
 }

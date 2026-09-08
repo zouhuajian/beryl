@@ -62,6 +62,119 @@ macro_rules! id_new_uint {
     };
 }
 
+/// Stable metadata group identity.
+///
+/// Group names are identity, not display labels. Renaming a group means creating
+/// a different group.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct GroupName(String);
+
+impl GroupName {
+    /// Parses and validates a metadata group name.
+    pub fn parse(raw: impl AsRef<str>) -> Result<Self, GroupNameError> {
+        let value = raw.as_ref().trim();
+        if value.is_empty() {
+            return Err(GroupNameError::Empty);
+        }
+        if value.len() > 63 {
+            return Err(GroupNameError::TooLong);
+        }
+        let mut chars = value.chars();
+        let first = chars.next().ok_or(GroupNameError::Empty)?;
+        if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+            return Err(GroupNameError::InvalidStart);
+        }
+        if !chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')) {
+            return Err(GroupNameError::InvalidCharacter);
+        }
+        Ok(Self(value.to_string()))
+    }
+
+    /// Parses an optional metadata group name from a wire/config field.
+    ///
+    /// An empty string is treated as absent. Non-empty values must satisfy the
+    /// same normalized `GroupName` contract as `parse`.
+    pub fn parse_optional(raw: impl AsRef<str>) -> Result<Option<Self>, GroupNameError> {
+        let value = raw.as_ref();
+        if value.is_empty() {
+            Ok(None)
+        } else {
+            Self::parse(value).map(Some)
+        }
+    }
+
+    /// Returns the validated group name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Debug for GroupName {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.debug_tuple("GroupName").field(&self.0).finish()
+    }
+}
+
+impl Display for GroupName {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for GroupName {
+    type Err = GroupNameError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for GroupName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Validation error for `GroupName`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GroupNameError {
+    Empty,
+    TooLong,
+    InvalidStart,
+    InvalidCharacter,
+}
+
+impl Display for GroupNameError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            Self::Empty => f.write_str("must not be empty"),
+            Self::TooLong => f.write_str("must be at most 63 characters"),
+            Self::InvalidStart => f.write_str("must start with lowercase ASCII letter or digit"),
+            Self::InvalidCharacter => f.write_str("must contain only lowercase ASCII letters, digits, '.', '_' or '-'"),
+        }
+    }
+}
+
+impl Error for GroupNameError {}
+
+id_new_uint!(
+    /// Mount identity.
+    ///
+    /// Identifies a mount point that maps a UFS path to the metadata namespace.
+    MountId(u64)
+);
+
+impl Display for MountId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Inode identifier (64-bit).
 ///
 /// Inodes are the authoritative identity for filesystem objects.
@@ -176,15 +289,6 @@ impl BlockId {
     pub const fn new(inode_id: InodeId, index: BlockIndex) -> Self {
         Self { inode_id, index }
     }
-
-    /// Convenience for tests/logging where you already have primitive values.
-    #[inline]
-    pub const fn from_u64_u32(inode_id: u64, index: u32) -> Self {
-        Self {
-            inode_id: InodeId(inode_id),
-            index: BlockIndex(index),
-        }
-    }
 }
 
 impl Debug for BlockId {
@@ -258,12 +362,7 @@ impl ClientId {
 
     /// Generates a non-zero 128-bit client identity.
     pub fn generate() -> Self {
-        loop {
-            let value = Uuid::new_v4().as_u128();
-            if value != 0 {
-                return Self(value);
-            }
-        }
+        Self(Uuid::new_v4().as_u128())
     }
 
     /// Returns the inner value.
@@ -380,118 +479,5 @@ impl FromStr for CallId {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::parse(s)
-    }
-}
-
-/// Stable metadata group identity.
-///
-/// Group names are identity, not display labels. Renaming a group means creating
-/// a different group.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
-#[serde(transparent)]
-pub struct GroupName(String);
-
-impl GroupName {
-    /// Parses and validates a metadata group name.
-    pub fn parse(raw: impl AsRef<str>) -> Result<Self, GroupNameError> {
-        let value = raw.as_ref().trim();
-        if value.is_empty() {
-            return Err(GroupNameError::Empty);
-        }
-        if value.len() > 63 {
-            return Err(GroupNameError::TooLong);
-        }
-        let mut chars = value.chars();
-        let first = chars.next().ok_or(GroupNameError::Empty)?;
-        if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
-            return Err(GroupNameError::InvalidStart);
-        }
-        if !chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')) {
-            return Err(GroupNameError::InvalidCharacter);
-        }
-        Ok(Self(value.to_string()))
-    }
-
-    /// Parses an optional metadata group name from a wire/config field.
-    ///
-    /// An empty string is treated as absent. Non-empty values must satisfy the
-    /// same normalized `GroupName` contract as `parse`.
-    pub fn parse_optional(raw: impl AsRef<str>) -> Result<Option<Self>, GroupNameError> {
-        let value = raw.as_ref();
-        if value.is_empty() {
-            Ok(None)
-        } else {
-            Self::parse(value).map(Some)
-        }
-    }
-
-    /// Returns the validated group name.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Debug for GroupName {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        f.debug_tuple("GroupName").field(&self.0).finish()
-    }
-}
-
-impl Display for GroupName {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for GroupName {
-    type Err = GroupNameError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::parse(s)
-    }
-}
-
-impl<'de> Deserialize<'de> for GroupName {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let raw = String::deserialize(deserializer)?;
-        Self::parse(raw).map_err(serde::de::Error::custom)
-    }
-}
-
-/// Validation error for `GroupName`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum GroupNameError {
-    Empty,
-    TooLong,
-    InvalidStart,
-    InvalidCharacter,
-}
-
-impl Display for GroupNameError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        match self {
-            Self::Empty => f.write_str("must not be empty"),
-            Self::TooLong => f.write_str("must be at most 63 characters"),
-            Self::InvalidStart => f.write_str("must start with lowercase ASCII letter or digit"),
-            Self::InvalidCharacter => f.write_str("must contain only lowercase ASCII letters, digits, '.', '_' or '-'"),
-        }
-    }
-}
-
-impl Error for GroupNameError {}
-
-id_new_uint!(
-    /// Mount identity.
-    ///
-    /// Identifies a mount point that maps a UFS path to the metadata namespace.
-    MountId(u64)
-);
-
-impl Display for MountId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        write!(f, "{}", self.0)
     }
 }

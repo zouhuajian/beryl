@@ -354,7 +354,7 @@ async fn run_cleanup_task(inner: Arc<BlockCleanupInner>, key: CleanupReplicaKey)
 /// Returns whether a cleanup key still belongs to the active registration.
 fn registration_matches(registrations: &RegistrationSet, key: &CleanupReplicaKey) -> bool {
     registrations.registration(&key.group_name).is_some_and(|registration| {
-        registration.worker_id == key.worker_id && registration.worker_run_id.matches(key.worker_run_id)
+        registration.worker_id == key.worker_id && registration.worker_run_id == key.worker_run_id
     })
 }
 

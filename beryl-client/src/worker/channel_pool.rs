@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use beryl_proto::worker::worker_data_service_client::WorkerDataServiceClient;
-use beryl_types::{WorkerEndpointInfo, WorkerNetProtocol};
+use beryl_types::WorkerEndpointInfo;
 use parking_lot::RwLock;
 use tonic::transport as tonic_net;
 
@@ -143,7 +143,6 @@ impl GrpcWorkerChannelPool {
         Ok(WorkerChannelKey {
             worker_id: worker.worker_id.as_raw(),
             endpoint: normalize_endpoint(&worker.endpoint)?,
-            protocol: worker.worker_net_protocol,
             worker_run_id: worker.worker_run_id,
         })
     }
@@ -198,7 +197,6 @@ fn configure_worker_data_client(channel: tonic_net::Channel) -> WorkerDataServic
 struct WorkerChannelKey {
     worker_id: u64,
     endpoint: String,
-    protocol: WorkerNetProtocol,
     worker_run_id: beryl_types::WorkerRunId,
 }
 
@@ -313,12 +311,17 @@ mod tests {
     // connect_lazy touches Hyper's Tokio executor even though acquisition is synchronous.
     #[tokio::test]
     async fn worker_run_mismatch_invalidates_target_channel() {
-        let pool = test_pool(true, 1);
+        let pool = test_pool(true, 2);
         let worker = worker_endpoint();
+        let mut new_run = worker.clone();
+        new_run.worker_run_id = "550e8400-e29b-41d4-a716-446655440001".parse().unwrap();
         let attempt = data_attempt_context();
 
         let _worker_client = pool.worker_data_service_client(&worker, "read").expect("worker client");
-        assert_eq!(pool.channels.read().len(), 1);
+        let _new_client = pool
+            .worker_data_service_client(&new_run, "read")
+            .expect("new worker client");
+        assert_eq!(pool.channels.read().len(), 2);
 
         let err = parse_worker_control_header(
             &attempt,
@@ -335,14 +338,21 @@ mod tests {
 
         pool.invalidate_on_worker_run_mismatch(&worker, &err);
 
-        assert_eq!(pool.channels.read().len(), 0);
+        assert_eq!(pool.channels.read().len(), 1);
+        assert!(pool
+            .channels
+            .read()
+            .contains_key(&GrpcWorkerChannelPool::channel_key(&new_run).unwrap()));
+
+        pool.mark_worker_unavailable(&worker, CacheInvalidationReason::WorkerRun);
+        assert!(pool.is_worker_cooling_down(&worker));
+        assert!(!pool.is_worker_cooling_down(&new_run));
     }
 
     fn worker_endpoint() -> WorkerEndpointInfo {
         WorkerEndpointInfo {
             worker_id: WorkerId::new(1),
             endpoint: "127.0.0.1:19101".to_string(),
-            worker_net_protocol: WorkerNetProtocol::Grpc,
             worker_run_id: "550e8400-e29b-41d4-a716-446655440000"
                 .parse()
                 .expect("valid test WorkerRunId"),
