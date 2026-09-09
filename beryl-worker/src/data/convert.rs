@@ -3,15 +3,12 @@
 
 //! Explicit conversion from worker wire messages to core domain types.
 
-use beryl_proto::convert as proto_convert;
-use beryl_proto::worker::{ReadBlockRequestProto, WriteBlockCommandProto};
-use beryl_types::layout::BlockFormatId;
-use beryl_types::range::ByteRange;
-use beryl_types::{GroupName, WorkerRunId};
-
 use crate::data::core::{ReadBlockRequest, WorkerCoreResult, WriteBlockRequest};
 use crate::error::WorkerError;
-use crate::store::block::ChecksumKind;
+use beryl_proto::convert as proto_convert;
+use beryl_proto::worker::{ReadBlockRequestProto, WriteBlockCommandProto};
+use beryl_types::range::ByteRange;
+use beryl_types::{GroupName, WorkerRunId};
 
 /// Converts and validates the metadata-issued facts on a read request.
 pub(crate) fn proto_to_read_block_request(proto: ReadBlockRequestProto) -> WorkerCoreResult<ReadBlockRequest> {
@@ -21,8 +18,6 @@ pub(crate) fn proto_to_read_block_request(proto: ReadBlockRequestProto) -> Worke
     let byte_range = proto
         .byte_range
         .ok_or_else(|| WorkerError::InvalidArgument("missing byte_range".to_string()))?;
-    let block_format_id = BlockFormatId::from_raw(proto.block_format_id)
-        .map_err(|error| WorkerError::InvalidArgument(format!("block_format_id invalid: {error}")))?;
 
     Ok(ReadBlockRequest {
         group_name,
@@ -32,9 +27,7 @@ pub(crate) fn proto_to_read_block_request(proto: ReadBlockRequestProto) -> Worke
             len: byte_range.len,
         },
 
-        block_format_id,
         block_size: proto.block_size,
-        chunk_size: proto.chunk_size,
         effective_len: proto.effective_len,
         frame_size: proto.frame_size,
     })
@@ -49,8 +42,7 @@ pub(crate) fn proto_to_write_block_request(proto: WriteBlockCommandProto) -> Wor
         .worker_run_id
         .parse::<WorkerRunId>()
         .map_err(|error| WorkerError::InvalidArgument(format!("worker_run_id invalid: {error}")))?;
-    let block_format_id = BlockFormatId::from_raw(proto.block_format_id)
-        .map_err(|error| WorkerError::InvalidArgument(format!("block_format_id invalid: {error}")))?;
+
     let tier = proto_convert::parse_known_tier(proto.tier)
         .map_err(|error| WorkerError::InvalidArgument(format!("tier invalid: {error}")))?;
 
@@ -62,9 +54,7 @@ pub(crate) fn proto_to_write_block_request(proto: WriteBlockCommandProto) -> Wor
             .map_err(WorkerError::InvalidArgument)?,
         write_offset: proto.write_offset,
         block_size: proto.block_size,
-        block_format_id,
-        chunk_size: proto.chunk_size,
-        checksum_kind: ChecksumKind::None,
+
         tier,
     })
 }

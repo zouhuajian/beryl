@@ -29,9 +29,7 @@ use beryl_proto::metadata::{
     OpenWriteModeProto, OpenWriteRequestProto, OpenWriteResponseProto, RenameRequestProto, RenewLeaseRequestProto,
     SyncWriteRequestProto,
 };
-use beryl_types::{
-    BlockId, ClientId, ContentGeneration, FileLayout, FileType, GroupName, InodeId, WriteHandle, WriteMode,
-};
+use beryl_types::{BlockId, ClientId, ContentGeneration, FileType, GroupName, InodeId, WriteHandle, WriteMode};
 use std::fmt::{Debug, Formatter, Result};
 use std::future::Future;
 use std::sync::Arc;
@@ -261,13 +259,13 @@ impl MetadataClient {
                 |transport, ctx, req| async move { transport.create_file(ctx, req).await },
             )
             .await?;
-        let layout = create.layout.ok_or_else(|| {
-            side_effect_response_body_mismatch("CreateFile", "CreateFileResponseProto.layout missing")
-                .with_operation_context(&create_operation)
-        })?;
-        let layout = FileLayout::try_from(layout).map_err(|err| {
-            side_effect_response_body_mismatch("CreateFile", format!("CreateFileResponseProto.layout invalid: {err}"))
-                .with_operation_context(&create_operation)
+        let block_size = create.block_size;
+        beryl_types::validate_block_size(u64::from(block_size)).map_err(|err| {
+            side_effect_response_body_mismatch(
+                "CreateFile",
+                format!("CreateFileResponseProto.block_size invalid: {err}"),
+            )
+            .with_operation_context(&create_operation)
         })?;
         let write_handle = create.write_handle.ok_or_else(|| {
             side_effect_response_body_mismatch("CreateFile", "CreateFileResponseProto.write_handle missing")
@@ -285,7 +283,7 @@ impl MetadataClient {
         }
         WriteSession::new(
             path,
-            layout,
+            block_size,
             write_handle,
             0,
             create.expires_at_ms,
@@ -798,12 +796,9 @@ fn write_session_from_open_response(
     mode: WriteMode,
     response: OpenWriteResponseProto,
 ) -> ClientResult<WriteSession> {
-    let layout = response.layout.ok_or_else(|| {
-        side_effect_response_body_mismatch("OpenWrite", "OpenWriteResponseProto.layout missing")
-            .with_operation_context(operation)
-    })?;
-    let layout = FileLayout::try_from(layout).map_err(|err| {
-        side_effect_response_body_mismatch("OpenWrite", format!("OpenWriteResponseProto.layout invalid: {err}"))
+    let block_size = response.block_size;
+    beryl_types::validate_block_size(u64::from(block_size)).map_err(|err| {
+        side_effect_response_body_mismatch("OpenWrite", format!("OpenWriteResponseProto.block_size invalid: {err}"))
             .with_operation_context(operation)
     })?;
     let write_handle = response.write_handle.ok_or_else(|| {
@@ -820,7 +815,7 @@ fn write_session_from_open_response(
     }
     let mut session = WriteSession::new(
         path,
-        layout,
+        block_size,
         write_handle,
         response.base_size,
         response.expires_at_ms,

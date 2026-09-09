@@ -8,7 +8,6 @@ use crate::inode::InodeAttrs;
 pub(crate) use crate::inode::PublishMode;
 use crate::session_registry::CreateFileOperationId;
 use beryl_types::ids::{InodeId, MountId, WorkerId};
-use beryl_types::layout::FileLayout;
 use beryl_types::{CallId, ClientId, GroupName, LeaseEpoch};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -53,7 +52,7 @@ pub(crate) enum Command {
         mount_root_inode_id: InodeId,
         relative_components: Vec<String>,
         attrs: InodeAttrs,
-        layout: FileLayout,
+        block_size: u32,
     },
     /// Delete one exact mount-relative target after revalidating its path.
     ///
@@ -166,7 +165,6 @@ mod tests {
         let blocks = (0..MAX_FILE_BLOCKS)
             .map(|index| CommittedBlock {
                 block_id: BlockId::new(inode_id, BlockIndex::new(index as u32)),
-
                 len: u64::MAX,
             })
             .collect();

@@ -3,20 +3,18 @@
 
 //! Worker data-service wire conversion and response validation helpers.
 
-use std::time::Duration;
-
-use beryl_common::header::{HeaderIdentity, HEADER_WORKER_DATA_ERROR_DETAIL, WORKER_DATA_ERROR_DETAIL_V1};
-use beryl_proto::worker::write_block_request_proto::Payload;
-use beryl_types::range::ByteRange;
-use beryl_types::{BlockShape, GroupName, WorkerEndpointInfo};
-use bytes::Bytes;
-use prost::Message;
-
 use super::WorkerWriteTarget;
 use crate::error::{ClientError, ClientResult};
 use crate::planner::PlannedBlockRead;
 use crate::rpc_error::{invalid_header_error, validate_data_header};
 use crate::runtime::AttemptContext;
+use beryl_common::header::{HeaderIdentity, HEADER_WORKER_DATA_ERROR_DETAIL, WORKER_DATA_ERROR_DETAIL_V1};
+use beryl_proto::worker::write_block_request_proto::Payload;
+use beryl_types::range::ByteRange;
+use beryl_types::{validate_block_size, validate_effective_len, GroupName, WorkerEndpointInfo};
+use bytes::Bytes;
+use prost::Message;
+use std::time::Duration;
 
 pub(super) fn build_read_block_request(
     attempt: &AttemptContext,
@@ -24,13 +22,10 @@ pub(super) fn build_read_block_request(
     block_read: &PlannedBlockRead,
     worker: &WorkerEndpointInfo,
 ) -> ClientResult<beryl_proto::worker::ReadBlockRequestProto> {
-    BlockShape::new(
-        block_read.block_format_id,
-        block_read.block_size,
-        block_read.chunk_size,
-        block_read.effective_len,
-    )
-    .map_err(|error| {
+    validate_block_size(block_read.block_size).map_err(|error| {
+        ClientError::invalid_layout(format!("planned block read has invalid expected block shape: {error}"))
+    })?;
+    validate_effective_len(block_read.block_size, block_read.effective_len).map_err(|error| {
         ClientError::invalid_layout(format!("planned block read has invalid expected block shape: {error}"))
     })?;
     Ok(beryl_proto::worker::ReadBlockRequestProto {
@@ -47,9 +42,7 @@ pub(super) fn build_read_block_request(
 
         frame_size: default_frame_size(block_read.len),
         worker_run_id: worker.worker_run_id.to_string(),
-        block_format_id: block_read.block_format_id.as_raw(),
         block_size: block_read.block_size,
-        chunk_size: block_read.chunk_size,
         effective_len: block_read.effective_len,
     })
 }
@@ -69,9 +62,7 @@ pub(super) fn build_write_block_command(
                 group_name: target.group_name.to_string(),
                 block_id: Some(target.target.block_id.into()),
                 worker_run_id: worker.worker_run_id.to_string(),
-                block_format_id: target.target.block_format_id.as_raw(),
                 block_size: target.target.block_size,
-                chunk_size: target.target.chunk_size,
                 fencing_token: Some(target.target.fencing_token.into()),
                 write_offset: target.target.write_offset,
                 tier: beryl_proto::common::TierProto::from(target.target.tier) as i32,
@@ -263,13 +254,8 @@ fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> 
             "write target block_id inode_id must be non-zero".to_string(),
         ));
     }
-    BlockShape::new(
-        target.target.block_format_id,
-        target.target.block_size,
-        target.target.chunk_size,
-        target.target.block_size,
-    )
-    .map_err(|error| ClientError::invalid_layout(format!("write target has invalid shape: {error}")))?;
+    validate_block_size(target.target.block_size)
+        .map_err(|error| ClientError::invalid_layout(format!("write target has invalid shape: {error}")))?;
     if target.target.worker_endpoints.is_empty() {
         return Err(ClientError::invalid_layout(
             "write target has no worker endpoints".to_string(),

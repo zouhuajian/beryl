@@ -452,8 +452,8 @@ mod tests {
     };
     use beryl_types::lease::FencingToken;
     use beryl_types::{
-        BlockFormatId, BlockId, BlockIndex, ClientId, InodeId, LeaseEpoch, LocatedBlock, Tier, WorkerEndpointInfo,
-        WorkerId, WorkerRunId,
+        BlockId, BlockIndex, ClientId, InodeId, LeaseEpoch, LocatedBlock, Tier, WorkerEndpointInfo, WorkerId,
+        WorkerRunId,
     };
     use bytes::Bytes;
     use prost::Message;
@@ -726,10 +726,7 @@ mod tests {
             end_file_offset: 4,
             block_id: block_id(),
             block_offset: 0,
-
-            block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
             block_size: 4096,
-            chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.storage_chunk_size().unwrap(),
             effective_len: 4,
             workers,
         }
@@ -746,9 +743,6 @@ mod tests {
                 block_size: 4096,
                 worker_endpoints: workers,
                 fencing_token: FencingToken::new(block_id, ClientId::new(7), LeaseEpoch::new(1)),
-
-                chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.storage_chunk_size().unwrap(),
-                block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
                 tier: Tier::Mem,
             },
         }

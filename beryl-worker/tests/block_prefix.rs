@@ -3,11 +3,10 @@
 
 //! Filesystem checkpoint and crash-image coverage through the local-store boundary.
 use beryl_proto::worker::{BlockMetaPayloadProto, BlockStateProto};
-use beryl_types::layout::BlockFormatId;
 use beryl_types::{BlockId, BlockIndex, ClientId, FencingToken, GroupName, InodeId, LeaseEpoch, Tier};
 use beryl_worker::store::block::{
-    CheckpointBlockRequest, ChecksumKind, FullBlockFileStore, FullBlockFileStoreConfig, OpenBlockWriteRequest,
-    ReclaimBlockRequest, ReclaimBlockResult,
+    CheckpointBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, OpenBlockWriteRequest, ReclaimBlockRequest,
+    ReclaimBlockResult,
 };
 use bytes::Bytes;
 use prost::Message;
@@ -22,9 +21,6 @@ fn fixture() -> (TempDir, FullBlockFileStore, OpenBlockWriteRequest) {
         group_name: GroupName::parse("root").unwrap(),
         block_id,
         block_size: 16,
-        block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
-        chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.storage_chunk_size().unwrap(),
-        checksum_kind: ChecksumKind::None,
         tier: Tier::Ssd,
         fencing_token: FencingToken::new(block_id, ClientId::generate(), LeaseEpoch::new(1)),
         write_offset: 0,
@@ -145,14 +141,14 @@ fn recovery_uses_checkpoint_after_unsynced_io_and_interrupted_takeover() {
 }
 
 #[test]
-fn recovery_rejects_short_prefix_and_old_format_without_deleting_data() {
-    for old_format in [false, true] {
+fn recovery_rejects_short_prefix_and_unknown_versions_without_changing_data() {
+    for version in [None, Some(2u32), Some(u32::MAX)] {
         let (_dir, store, req) = fixture();
         checkpoint(&store, &req, b"abcd");
         let paths = store.paths(&req.group_name, req.block_id);
-        if old_format {
+        if let Some(version) = version {
             let mut bytes = fs::read(&paths.meta_path).unwrap();
-            bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+            bytes[4..8].copy_from_slice(&version.to_le_bytes());
             fs::write(&paths.meta_path, bytes).unwrap();
         } else {
             OpenOptions::new()
@@ -162,9 +158,14 @@ fn recovery_rejects_short_prefix_and_old_format_without_deleting_data() {
                 .set_len(3)
                 .unwrap();
         }
+        let data_before = fs::read(&paths.data_path).unwrap();
+        let meta_before = fs::read(&paths.meta_path).unwrap();
+        if version.is_some() {
+            assert!(store.load_meta(&req.group_name, req.block_id).is_err());
+        }
         assert!(store.recover_blocks().is_err());
-        assert!(paths.data_path.exists());
-        assert!(paths.meta_path.exists());
+        assert_eq!(fs::read(&paths.data_path).unwrap(), data_before);
+        assert_eq!(fs::read(&paths.meta_path).unwrap(), meta_before);
     }
 }
 

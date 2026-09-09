@@ -8,6 +8,58 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter, Result};
+use thiserror::Error;
+
+/// Maximum logical block capacity, independent of transport buffering and local encoding.
+/// Lowering this persisted limit requires an explicit data migration.
+pub const MAX_BLOCK_SIZE: u32 = 1024 * 1024 * 1024;
+
+/// Validate a persisted or wire capacity before narrowing it to the inode's u32 field.
+/// This does not validate readable lengths, checkpoints, or writer authority.
+pub fn validate_block_size(block_size: u64) -> std::result::Result<(), BlockSizeError> {
+    if block_size == 0 {
+        return Err(BlockSizeError::ZeroBlockSize);
+    }
+    if block_size > u64::from(MAX_BLOCK_SIZE) {
+        return Err(BlockSizeError::BlockTooLarge {
+            actual: block_size,
+            maximum: u64::from(MAX_BLOCK_SIZE),
+        });
+    }
+    Ok(())
+}
+
+/// Invalid logical capacity received from configuration, metadata, or a Worker request.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum BlockSizeError {
+    #[error("block_size must be non-zero")]
+    ZeroBlockSize,
+    #[error("block_size {actual} exceeds maximum {maximum}")]
+    BlockTooLarge { actual: u64, maximum: u64 },
+}
+
+/// Validate a non-empty block prefix against its capacity.
+///
+/// The caller must validate the block capacity separately. Zero-length durable
+/// checkpoints are valid storage state and do not use this check.
+pub fn validate_effective_len(block_size: u64, effective_len: u64) -> std::result::Result<(), BlockLengthError> {
+    if effective_len == 0 {
+        return Err(BlockLengthError::ZeroEffectiveLen);
+    }
+    if effective_len > block_size {
+        return Err(BlockLengthError::EffectiveLenExceedsBlock);
+    }
+    Ok(())
+}
+
+/// A nonempty read or completed write prefix falls outside its block capacity.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum BlockLengthError {
+    #[error("effective_len must be non-zero")]
+    ZeroEffectiveLen,
+    #[error("effective_len must not exceed block_size")]
+    EffectiveLenExceedsBlock,
+}
 
 /// Largest number of blocks stored in one file inode by the inline layout.
 ///
@@ -85,6 +137,34 @@ pub enum WriteMode {
 mod tests {
     use super::*;
     use crate::lease::LeaseEpoch;
+
+    #[test]
+    fn block_capacity_and_nonempty_prefix_boundaries() {
+        for capacity in [1, u64::from(MAX_BLOCK_SIZE)] {
+            validate_block_size(capacity).unwrap();
+            for len in [1, capacity] {
+                validate_effective_len(capacity, len).unwrap();
+            }
+            assert_eq!(
+                validate_effective_len(capacity, 0),
+                Err(BlockLengthError::ZeroEffectiveLen)
+            );
+            assert_eq!(
+                validate_effective_len(capacity, capacity + 1),
+                Err(BlockLengthError::EffectiveLenExceedsBlock)
+            );
+        }
+        assert_eq!(validate_block_size(0), Err(BlockSizeError::ZeroBlockSize));
+        for actual in [u64::from(MAX_BLOCK_SIZE) + 1, u64::MAX] {
+            assert_eq!(
+                validate_block_size(actual),
+                Err(BlockSizeError::BlockTooLarge {
+                    actual,
+                    maximum: u64::from(MAX_BLOCK_SIZE),
+                })
+            );
+        }
+    }
 
     #[test]
     fn file_counters_preserve_scalar_encoding_and_never_wrap() {

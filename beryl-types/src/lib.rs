@@ -14,7 +14,6 @@ extern crate core;
 
 pub mod fs;
 pub mod ids;
-pub mod layout;
 pub mod lease;
 pub mod location;
 pub mod range;
@@ -22,11 +21,11 @@ pub mod tier;
 pub mod watermark;
 pub mod worker;
 
-pub use fs::{ContentGeneration, FileType, MAX_FILE_BLOCKS, WriteMode};
-pub use ids::{BlockId, BlockIndex, CallId, ClientId, GroupName, GroupNameError, InodeId, MountId, WorkerId};
-pub use layout::{
-    BlockFormatId, BlockFormatIdError, BlockShape, BlockShapeError, FileLayout, FileLayoutError, MAX_BLOCK_SIZE,
+pub use fs::{
+    BlockLengthError, BlockSizeError, ContentGeneration, FileType, MAX_BLOCK_SIZE, MAX_FILE_BLOCKS, WriteMode,
+    validate_block_size, validate_effective_len,
 };
+pub use ids::{BlockId, BlockIndex, CallId, ClientId, GroupName, GroupNameError, InodeId, MountId, WorkerId};
 pub use lease::{FencingToken, LeaseEpoch, WriteHandle};
 pub use location::{CommittedBlock, FileBlockLocation, LocatedBlock};
 pub use tier::{Tier, TierError, TierFree};

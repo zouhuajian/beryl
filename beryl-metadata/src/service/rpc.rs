@@ -461,7 +461,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 let payload = success.payload;
                 response_with_header!(
                     CreateFileResponseProto {
-                        layout: Some((&payload.layout).into()),
+                        block_size: payload.block_size,
                         write_handle: Some(
                             WriteHandle {
                                 inode_id: payload.inode_id,
@@ -525,7 +525,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         ),
                         base_size: payload.base_size,
                         expires_at_ms: payload.expires_at_ms,
-                        layout: Some((&payload.layout).into()),
+                        block_size: payload.block_size,
                         generation: payload.generation.as_raw(),
                         tail_block: payload.tail_block.as_ref().map(located_block_to_proto),
                         ..Default::default()
@@ -545,19 +545,18 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         let req = request.into_inner();
         let req_ctx = request_context_or_error!(req, AuthorizeBlockWriteResponseProto);
         let args = (|| -> Result<AuthorizeBlockWriteArgs, String> {
+            let group_name = beryl_types::GroupName::parse(&req.group_name).map_err(|e| e.to_string())?;
+            let worker_run_id = beryl_proto::convert::require_worker_run_id(&req.worker_run_id, "worker_run_id")?;
+            let fencing_token = beryl_proto::convert::required_fencing_token(req.fencing_token, "fencing_token")?;
+
+            beryl_types::fs::validate_block_size(req.block_size).map_err(|e| e.to_string())?;
             Ok(AuthorizeBlockWriteArgs {
-                group_name: beryl_types::GroupName::parse(&req.group_name).map_err(|e| e.to_string())?,
+                group_name,
                 worker_id: beryl_types::WorkerId::new(req.worker_id),
-                worker_run_id: beryl_proto::convert::require_worker_run_id(&req.worker_run_id, "worker_run_id")?,
-                fencing_token: beryl_proto::convert::required_fencing_token(req.fencing_token, "fencing_token")?,
+                worker_run_id,
+                fencing_token,
                 write_offset: req.write_offset,
-                shape: beryl_types::layout::BlockShape::new(
-                    beryl_types::layout::BlockFormatId::from_raw(req.block_format_id).map_err(|e| e.to_string())?,
-                    req.block_size,
-                    req.chunk_size,
-                    req.block_size,
-                )
-                .map_err(|e| e.to_string())?,
+                block_size: req.block_size,
                 tier: beryl_proto::convert::parse_known_tier(req.tier)?,
             })
         })();
@@ -884,7 +883,7 @@ mod tests {
     };
 
     use beryl_types::ids::{BlockId, BlockIndex, InodeId, MountId, WorkerId};
-    use beryl_types::{ClientId, ContentGeneration, FileLayout, GroupName, LeaseEpoch, Tier, TierFree, WorkerRunId};
+    use beryl_types::{ClientId, ContentGeneration, GroupName, LeaseEpoch, Tier, TierFree, WorkerRunId};
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -1036,7 +1035,7 @@ mod tests {
             worker_manager: worker_manager.clone(),
             metrics: None,
             readiness_gate: None,
-            file_create_layout: FileLayout::new(128),
+            file_block_size: 128,
         }));
         let msync = MsyncHandler::new(Arc::clone(&raft_node), owner_group_name);
         let service = MetadataFileSystemServiceImpl::new(filesystem, msync, NamespaceListConfig::default());
@@ -1170,7 +1169,6 @@ mod tests {
         );
         let committed = CommittedBlockProto {
             block_id: target.block_id,
-
             len: 128,
         };
 

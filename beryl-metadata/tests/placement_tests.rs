@@ -3,7 +3,6 @@ use beryl_metadata::placement::{
     PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus, WorkerPlacementView,
 };
 use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
-use beryl_types::layout::{BlockFormatId, FileLayout};
 use beryl_types::{GroupName, Tier, TierFree, WorkerRunId};
 
 fn run_id(suffix: u32) -> WorkerRunId {
@@ -38,45 +37,22 @@ fn worker(group_name: &GroupName, worker_id: u64, worker_run_id: WorkerRunId, ho
             tier: Tier::Hdd,
             free_bytes: 4096,
         }],
-        supported_block_formats: vec![BlockFormatId::DURABLE_PREFIX],
     }
 }
 
 fn request(group_name: &GroupName, op: PlacementOp, block_id: BlockId) -> PlacementRequest {
-    let layout = FileLayout::new(4096);
+    let block_size = 4096;
     PlacementRequest {
         group_name: group_name.clone(),
         op,
         block_id,
         visible_len: 64,
-        layout,
+        block_size,
         caller: None,
         existing: Vec::new(),
         exclude_workers: Vec::new(),
         target_replicas: 1,
     }
-}
-
-#[test]
-fn write_filters_workers_without_required_block_format() {
-    let group = group_name("g9");
-    let unsupported = WorkerPlacementView {
-        supported_block_formats: Vec::new(),
-        ..worker(&group, 1, run_id(11), "host-a")
-    };
-    let supported = worker(&group, 2, run_id(12), "host-b");
-    let req = request(&group, PlacementOp::Write, block(55, 0));
-
-    let plan = PlacementPlanner.plan(&req, &[unsupported.clone(), supported]);
-    assert_eq!(plan.status, PlacementStatus::Ok);
-    assert_eq!(
-        plan.workers.iter().map(|w| w.worker_id).collect::<Vec<_>>(),
-        vec![WorkerId::new(2)]
-    );
-
-    let plan = PlacementPlanner.plan(&req, &[unsupported]);
-    assert_eq!(plan.status, PlacementStatus::UnsupportedBlockFormat);
-    assert!(plan.workers.is_empty());
 }
 
 #[test]

@@ -1210,20 +1210,12 @@ mod tests {
         storage_a.put_detached_root(detached_inode_id, detached_root).unwrap();
 
         let file_id = InodeId::new(72);
-        let mut file = Inode::new_file(
-            file_id,
-            InodeAttrs::new(),
-            snapshot_mount.mount_id,
-            beryl_types::FileLayout::new(4096),
-        );
+        let mut file = Inode::new_file(file_id, InodeAttrs::new(), snapshot_mount.mount_id, 1024);
         let crate::inode::InodeKind::File(crate::inode::FileData { lease_epoch, .. }) = &mut file.kind else {
             unreachable!()
         };
         *lease_epoch = beryl_types::LeaseEpoch::new(1);
         storage_a.put_inode(&file).unwrap();
-        storage_a
-            .put_layout(file_id, beryl_types::FileLayout::new(1024))
-            .unwrap();
         let close = Command::CommitFile {
             proposed_at_ms: 1,
             inode_id: file_id,

@@ -3,13 +3,11 @@
 
 //! Shared read/write location value objects.
 
-use serde::{Deserialize, Serialize};
-
 use crate::ids::BlockId;
-use crate::layout::BlockFormatId;
 use crate::lease::FencingToken;
 use crate::tier::Tier;
 use crate::worker::WorkerEndpointInfo;
+use serde::{Deserialize, Serialize};
 
 /// Metadata-issued block identity, write locations, layout, and fencing authority.
 ///
@@ -21,14 +19,12 @@ pub struct LocatedBlock {
     /// Start of the block in the file, independent of its allocation index.
     pub file_offset: u64,
 
-    /// Metadata-selected Beryl block data/meta interpretation format.
-    pub block_format_id: BlockFormatId,
-    /// Maximum writable capacity authorized by the persisted `FileLayout`.
+    /// Maximum writable capacity authorized by the file inode.
     ///
     /// Workers reserve and enforce this bound before the final effective length
-    /// is known, then persist it in `BlockMeta.format.block_size`.
+    /// is known, then persist it in `BlockMetaPayload.block_size`.
     pub block_size: u64,
-    pub chunk_size: u32,
+
     /// Block-local start of the next write: zero for allocation, the visible
     /// prefix for OpenWrite, or a locally confirmed checkpoint for continuation.
     pub write_offset: u64,
@@ -37,7 +33,6 @@ pub struct LocatedBlock {
     pub worker_endpoints: Vec<WorkerEndpointInfo>,
     /// Worker-local storage tier requested for this replica.
     pub tier: Tier,
-
     pub fencing_token: FencingToken,
 }
 
@@ -56,12 +51,8 @@ pub struct FileBlockLocation {
     pub file_offset: u64,
     pub len: u64,
 
-    /// Metadata-selected Beryl block data/meta interpretation format.
-    pub block_format_id: BlockFormatId,
-    /// Full logical block size from the persisted `FileLayout`.
+    /// Immutable logical capacity from the file inode.
     pub block_size: u64,
-    /// Metadata-selected StorageChunk size for this block.
-    pub chunk_size: u32,
     /// Block-local readable prefix expected by metadata.
     pub effective_len: u64,
 

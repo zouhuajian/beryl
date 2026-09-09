@@ -10,11 +10,10 @@ use crate::runtime::block::{BlockManager, BlockPin, ReclaimingBlock};
 use crate::runtime::write::{BlockWriteIoGuard, BlockWriteKey, BlockWriteRegistration, BlockWriteRegistry};
 use crate::runtime::DataRpcPermit;
 use crate::store::block::{
-    CheckpointBlockRequest, ChecksumKind, LocalBlockStore, OpenBlockWriteRequest, ReclaimBlockRequest,
-    ReclaimBlockResult,
+    CheckpointBlockRequest, LocalBlockStore, OpenBlockWriteRequest, ReclaimBlockRequest, ReclaimBlockResult,
 };
+use beryl_types::fs::{validate_block_size, BlockLengthError};
 use beryl_types::ids::BlockId;
-use beryl_types::layout::{BlockFormatId, BlockShape, BlockShapeError};
 use beryl_types::range::ByteRange;
 use beryl_types::{FencingToken, GroupName, Tier, WorkerRunId};
 use bytes::Bytes;
@@ -35,12 +34,9 @@ pub(crate) struct ReadBlockRequest {
     pub(crate) block_id: BlockId,
     /// Block-local range; its offset is relative to `block_id`.
     pub(crate) byte_range: ByteRange,
-
-    pub(crate) block_format_id: BlockFormatId,
     pub(crate) block_size: u64,
-    pub(crate) chunk_size: u32,
     pub(crate) effective_len: u64,
-    /// Requested transport frame size, independent of the storage chunk size.
+    /// Requested transport frame size, independent of logical block capacity.
     pub(crate) frame_size: u32,
 }
 
@@ -67,9 +63,6 @@ pub(crate) struct WriteBlockRequest {
     pub(crate) fencing_token: FencingToken,
     pub(crate) write_offset: u64,
     pub(crate) block_size: u64,
-    pub(crate) block_format_id: BlockFormatId,
-    pub(crate) chunk_size: u32,
-    pub(crate) checksum_kind: ChecksumKind,
     pub(crate) tier: Tier,
 }
 
@@ -216,9 +209,6 @@ impl WorkerCore {
                 group_name: io_request.group_name,
                 block_id: io_request.block_id,
                 block_size: io_request.block_size,
-                block_format_id: io_request.block_format_id,
-                chunk_size: io_request.chunk_size,
-                checksum_kind: io_request.checksum_kind,
                 tier: io_request.tier,
                 fencing_token: io_request.fencing_token,
                 write_offset: io_request.write_offset,
@@ -600,41 +590,18 @@ fn validate_write_block_request(req: &WriteBlockRequest) -> WorkerCoreResult<()>
             "invalid block writer token or offset".into(),
         ));
     }
-    validate_block_shape(
-        req.block_format_id,
-        req.block_size,
-        req.chunk_size,
-        req.block_size,
-        req.checksum_kind,
-    )
-}
-
-fn validate_block_shape(
-    block_format_id: BlockFormatId,
-    block_size: u64,
-    chunk_size: u32,
-    effective_len: u64,
-    checksum_kind: ChecksumKind,
-) -> WorkerCoreResult<()> {
-    BlockShape::new(block_format_id, block_size, chunk_size, effective_len)
-        .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
-    if checksum_kind != ChecksumKind::None {
-        return Err(WorkerError::InvalidArgument(
-            "only checksum_kind None is supported".to_string(),
-        ));
-    }
+    validate_block_size(req.block_size).map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
     Ok(())
 }
 
 fn validate_effective_len(block_size: u64, effective_len: u64) -> WorkerCoreResult<()> {
-    BlockShape::validate_effective_len(block_size, effective_len).map_err(|error| match error {
-        BlockShapeError::ZeroEffectiveLen => {
+    beryl_types::fs::validate_effective_len(block_size, effective_len).map_err(|error| match error {
+        BlockLengthError::ZeroEffectiveLen => {
             WorkerError::InvalidArgument("WriteBlock requires at least one data byte".to_string())
         }
-        BlockShapeError::EffectiveLenExceedsBlock => WorkerError::InvalidArgument(format!(
+        BlockLengthError::EffectiveLenExceedsBlock => WorkerError::InvalidArgument(format!(
             "effective_len exceeds block_size: effective_len={effective_len}, block_size={block_size}"
         )),
-        other => WorkerError::InvalidArgument(other.to_string()),
     })
 }
 
@@ -660,12 +627,12 @@ mod tests {
     use crate::runtime::DataRpcPermit;
     use crate::store::block::{BlockMetaPayload, BlockState};
     use crate::store::block::{
-        CheckpointBlockRequest, ChecksumKind, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
-        OpenBlockWriteRequest, ReclaimBlockRequest, ReclaimBlockResult, ReclaimBlockState, StoreResult,
+        CheckpointBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore, OpenBlockWriteRequest,
+        ReclaimBlockRequest, ReclaimBlockResult, ReclaimBlockState, StoreResult,
     };
     use beryl_common::error::rpc::{ErrorKind, WorkerErrorKind};
     use beryl_types::ids::{BlockId, BlockIndex, InodeId};
-    use beryl_types::layout::BlockFormatId;
+
     use beryl_types::range::ByteRange;
     use beryl_types::{GroupName, Tier, WorkerRunId};
     use bytes::Bytes;
@@ -679,10 +646,6 @@ mod tests {
 
     const BLOCK_SIZE: u64 = 4096;
     const LEASE_EPOCH: u64 = 55;
-
-    fn chunk_size() -> u32 {
-        BlockFormatId::DURABLE_PREFIX.storage_chunk_size().unwrap()
-    }
 
     fn group_name() -> GroupName {
         GroupName::parse("root").expect("group name")
@@ -704,9 +667,6 @@ mod tests {
             ),
             write_offset: 0,
             block_size: BLOCK_SIZE,
-            block_format_id: BlockFormatId::DURABLE_PREFIX,
-            chunk_size: chunk_size(),
-            checksum_kind: ChecksumKind::None,
             tier: Tier::Hdd,
         }
     }
@@ -868,10 +828,7 @@ mod tests {
             group_name: group_name(),
             block_id: block_id(),
             byte_range: ByteRange { offset: 0, len },
-
-            block_format_id: BlockFormatId::DURABLE_PREFIX,
             block_size: BLOCK_SIZE,
-            chunk_size: chunk_size(),
             effective_len: 8,
             frame_size: 512,
         }

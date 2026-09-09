@@ -3,45 +3,35 @@
 
 //! Protobuf payload codec for worker-local block metadata.
 
+use super::block::{BlockIdentity, BlockMetaPayload, BlockSource, BlockState, BlockVisibility, StoreResult};
+use crate::error::WorkerError;
 use beryl_proto::common::TierProto;
 use beryl_proto::convert::parse_known_tier;
 use beryl_proto::worker::{
-    BlockFormatProto, BlockIdentityProto, BlockMetaPayloadProto, BlockSourceProto, BlockStateProto,
-    BlockVisibilityProto,
+    BlockIdentityProto, BlockMetaPayloadProto, BlockSourceProto, BlockStateProto, BlockVisibilityProto,
 };
 use beryl_types::ids::BlockId;
-use beryl_types::layout::BlockFormatId;
 use beryl_types::GroupName;
 use prost::Message;
 
-use super::block::{
-    BlockFormat, BlockIdentity, BlockMetaPayload, BlockSource, BlockState, BlockVisibility, ChecksumKind, StoreResult,
-};
-use crate::error::WorkerError;
-
-pub(super) fn encode_meta_payload(meta: &BlockMetaPayload) -> StoreResult<Vec<u8>> {
-    Ok(meta_to_proto(meta)?.encode_to_vec())
+/// Encode the payload inside the versioned local header; validation belongs to the store.
+pub(super) fn encode_meta_payload(meta: &BlockMetaPayload) -> Vec<u8> {
+    meta_to_proto(meta).encode_to_vec()
 }
 
+/// Decode known payload fields after the enclosing header version has been checked.
 pub(super) fn decode_meta_payload(encoded: &[u8]) -> StoreResult<BlockMetaPayload> {
     let proto = BlockMetaPayloadProto::decode(encoded).map_err(|err| corrupt(err.to_string()))?;
     meta_from_proto(proto)
 }
 
-fn meta_to_proto(meta: &BlockMetaPayload) -> StoreResult<BlockMetaPayloadProto> {
-    let chunk_size = u32::try_from(meta.format.chunk_size)
-        .map_err(|_| WorkerError::InvalidArgument("chunk size does not fit block metadata format".to_string()))?;
-
-    Ok(BlockMetaPayloadProto {
+fn meta_to_proto(meta: &BlockMetaPayload) -> BlockMetaPayloadProto {
+    BlockMetaPayloadProto {
         identity: Some(BlockIdentityProto {
             block_id: Some(meta.identity.block_id.into()),
             group_name: meta.identity.group_name.to_string(),
         }),
-        format: Some(BlockFormatProto {
-            format_id: meta.format.format_id.as_raw(),
-            block_size: meta.format.block_size,
-            chunk_size,
-        }),
+        block_size: meta.block_size,
         source: Some(BlockSourceProto {
             durable_len: meta.source.durable_len,
         }),
@@ -50,13 +40,13 @@ fn meta_to_proto(meta: &BlockMetaPayload) -> StoreResult<BlockMetaPayloadProto> 
             fencing_token: Some(meta.visibility.fencing_token.into()),
         }),
         tier: TierProto::from(meta.tier) as i32,
-    })
+    }
 }
 
 fn meta_from_proto(proto: BlockMetaPayloadProto) -> StoreResult<BlockMetaPayload> {
     let BlockMetaPayloadProto {
         identity,
-        format,
+        block_size,
         source,
         visibility,
         tier,
@@ -67,7 +57,6 @@ fn meta_from_proto(proto: BlockMetaPayloadProto) -> StoreResult<BlockMetaPayload
         .ok_or_else(|| corrupt("block meta payload missing block id"))?;
     let group_name = GroupName::parse(&identity.group_name)
         .map_err(|err| corrupt(format!("block meta payload invalid group name: {err}")))?;
-    let format = format.ok_or_else(|| corrupt("block meta payload missing format"))?;
     let source = source.ok_or_else(|| corrupt("block meta payload missing source"))?;
 
     let visibility = visibility.ok_or_else(|| corrupt("block meta payload missing visibility"))?;
@@ -84,13 +73,7 @@ fn meta_from_proto(proto: BlockMetaPayloadProto) -> StoreResult<BlockMetaPayload
                 .map_err(|error| corrupt(format!("block meta payload invalid block id: {error}")))?,
             group_name,
         },
-        format: BlockFormat {
-            format_id: BlockFormatId::from_raw(format.format_id)
-                .map_err(|err| corrupt(format!("unsupported block format id: {err}")))?,
-            block_size: format.block_size,
-            chunk_size: u64::from(format.chunk_size),
-            checksum_kind: ChecksumKind::None,
-        },
+        block_size,
         source: BlockSource {
             durable_len: source.durable_len,
         },

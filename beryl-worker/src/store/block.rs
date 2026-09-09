@@ -5,7 +5,7 @@
 
 use super::meta_codec::{decode_meta_payload, encode_meta_payload};
 use crate::error::WorkerError;
-use beryl_types::layout::{BlockFormatId, BlockShape};
+use beryl_types::fs::validate_block_size;
 use beryl_types::{BlockId, FencingToken, GroupName, Tier};
 use bytes::Bytes;
 use std::fs::{self, File, OpenOptions};
@@ -16,7 +16,9 @@ use std::sync::{Arc, RwLock};
 pub type StoreResult<T> = Result<T, WorkerError>;
 const BLOCK_META_MAGIC: [u8; 4] = *b"BRYL";
 const BLOCK_META_HEADER_LEN: usize = 20;
-const BLOCK_META_VERSION: u32 = 2;
+// Covers both the raw `.blk` byte interpretation and the atomic `.meta` checkpoint.
+// Changes to either representation require a version change; Metadata does not select it.
+const BLOCK_META_VERSION: u32 = 3;
 const MAX_META_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 
 /// Fixed little-endian header for a block metadata file.
@@ -27,7 +29,7 @@ const MAX_META_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 pub struct BlockMetaHeader {
     /// Fixed file magic used to identify Beryl block metadata.
     pub magic: [u8; 4],
-    /// Version of this fixed header and serialized payload layout.
+    /// Version of the local data and metadata interpretation.
     pub version: u32,
     /// Fixed header length in bytes.
     pub header_len: u32,
@@ -102,30 +104,18 @@ impl BlockMetaHeader {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockMetaPayload {
     pub identity: BlockIdentity,
-    pub format: BlockFormat,
+    /// Immutable logical capacity authorized by Metadata.
+    pub block_size: u64,
     pub source: BlockSource,
     pub visibility: BlockVisibility,
     pub tier: Tier,
 }
 
+/// Identity bound to the local storage path; unrelated blocks cannot share a checkpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockIdentity {
     pub block_id: BlockId,
     pub group_name: GroupName,
-}
-
-/// Persisted interpretation of the block, independent of runtime configuration.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BlockFormat {
-    pub format_id: BlockFormatId,
-    pub block_size: u64,
-    pub chunk_size: u64,
-    pub checksum_kind: ChecksumKind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChecksumKind {
-    None,
 }
 
 /// Bytes covered by a completed local checkpoint, possibly ahead of Metadata visibility.
@@ -134,6 +124,7 @@ pub struct BlockSource {
     pub durable_len: u64,
 }
 
+/// Local lifecycle and writer fencing; file visibility remains Metadata-owned.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockVisibility {
     pub block_state: BlockState,
@@ -164,9 +155,6 @@ pub struct OpenBlockWriteRequest {
     pub group_name: GroupName,
     pub block_id: BlockId,
     pub block_size: u64,
-    pub block_format_id: BlockFormatId,
-    pub chunk_size: u32,
-    pub checksum_kind: ChecksumKind,
     pub tier: Tier,
     pub fencing_token: FencingToken,
     pub write_offset: u64,
@@ -232,25 +220,18 @@ impl FullBlockFileStore {
     /// New epochs persist the reduced boundary before truncating uncommitted bytes.
     pub fn open_block_write(&self, req: OpenBlockWriteRequest) -> StoreResult<BlockMetaPayload> {
         let _checkpoint = self.checkpoint_access.write().expect("checkpoint access poisoned");
-        BlockShape::new(req.block_format_id, req.block_size, req.chunk_size, req.block_size)
-            .map_err(|e| invalid_argument(e.to_string()))?;
+        validate_block_size(req.block_size).map_err(|e| invalid_argument(e.to_string()))?;
         validate_token(req.fencing_token, req.block_id)?;
         if req.write_offset >= req.block_size || req.visible_len > req.write_offset {
             return Err(invalid_argument("invalid authorized write prefix"));
         }
         let paths = self.paths(&req.group_name, req.block_id);
         create_dir_durable(&self.config.data_root, paths.parent_dir()?)?;
-        let format = BlockFormat {
-            format_id: req.block_format_id,
-            block_size: req.block_size,
-            chunk_size: u64::from(req.chunk_size),
-            checksum_kind: req.checksum_kind,
-        };
         let mut meta = match self.load_meta(&req.group_name, req.block_id) {
             Ok(mut meta) => {
                 ensure_readable(&meta)?;
-                if meta.format != format || meta.tier != req.tier {
-                    return Err(corrupt("write authorization changed persisted block layout or tier"));
+                if meta.block_size != req.block_size || meta.tier != req.tier {
+                    return Err(corrupt("write authorization changed persisted block capacity or tier"));
                 }
                 let previous = meta.visibility.fencing_token;
                 if req.fencing_token.epoch < previous.epoch
@@ -283,7 +264,7 @@ impl FullBlockFileStore {
                         block_id: req.block_id,
                         group_name: req.group_name.clone(),
                     },
-                    format,
+                    block_size: req.block_size,
                     source: BlockSource { durable_len: 0 },
                     visibility: BlockVisibility {
                         block_state: BlockState::Ready,
@@ -324,7 +305,7 @@ impl FullBlockFileStore {
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or_else(|| invalid_argument("write range overflow"))?;
-        if data.is_empty() || offset < meta.source.durable_len || end > meta.format.block_size {
+        if data.is_empty() || offset < meta.source.durable_len || end > meta.block_size {
             return Err(invalid_argument("write crosses the durable prefix or block capacity"));
         }
         let mut file = OpenOptions::new()
@@ -349,9 +330,7 @@ impl FullBlockFileStore {
         if meta.visibility.fencing_token != req.fencing_token {
             return Err(fenced("checkpoint writer was fenced"));
         }
-        if req.effective_len < meta.source.durable_len
-            || req.effective_len > meta.format.block_size
-            || req.effective_len == 0
+        if req.effective_len < meta.source.durable_len || req.effective_len > meta.block_size || req.effective_len == 0
         {
             return Err(invalid_argument("invalid checkpoint length"));
         }
@@ -542,14 +521,17 @@ impl BlockPaths {
 
 /// IO boundary for the ordered block lifecycle. Callers serialize writers and pin all IO against reclaim.
 pub trait LocalBlockStore {
+    /// Validate capacity and fencing, then open exactly the Metadata-authorized prefix.
     fn open_block_write(&self, req: OpenBlockWriteRequest) -> StoreResult<BlockMetaPayload>;
 
     fn write_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, data: Bytes) -> StoreResult<()>;
 
+    /// Sync data before atomically publishing its durable prefix and writer token.
     fn checkpoint_block(&self, req: CheckpointBlockRequest) -> StoreResult<BlockMetaPayload>;
 
     fn read_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, len: u64) -> StoreResult<Bytes>;
 
+    /// Reject unsupported local versions and invalid identity or checkpoint bounds.
     fn load_meta(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<BlockMetaPayload>;
 
     fn inspect_reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockState>;
@@ -594,7 +576,7 @@ impl LocalBlockStore for FullBlockFileStore {
 }
 
 fn encode_meta(meta: &BlockMetaPayload) -> StoreResult<Vec<u8>> {
-    let payload = encode_meta_payload(meta)?;
+    let payload = encode_meta_payload(meta);
     let header = BlockMetaHeader::for_payload(payload.len())?;
     let mut encoded = Vec::with_capacity(BlockMetaHeader::encoded_len() + payload.len());
     encoded.extend_from_slice(&header.encode());
@@ -673,20 +655,15 @@ fn validate_token(token: FencingToken, block_id: BlockId) -> StoreResult<()> {
     Ok(())
 }
 
+/// Check persisted identity and checkpoint bounds before recovery or data access.
 fn validate_meta(meta: &BlockMetaPayload, group_name: &GroupName, block_id: BlockId) -> StoreResult<()> {
     if &meta.identity.group_name != group_name || meta.identity.block_id != block_id {
         return Err(corrupt("block metadata identity differs from path"));
     }
     validate_token(meta.visibility.fencing_token, block_id)?;
-    let chunk_size = u32::try_from(meta.format.chunk_size).map_err(|_| corrupt("chunk size overflow"))?;
-    BlockShape::new(
-        meta.format.format_id,
-        meta.format.block_size,
-        chunk_size,
-        meta.format.block_size,
-    )
-    .map_err(|e| corrupt(e.to_string()))?;
-    if meta.source.durable_len > meta.format.block_size {
+
+    validate_block_size(meta.block_size).map_err(|e| corrupt(e.to_string()))?;
+    if meta.source.durable_len > meta.block_size {
         return Err(corrupt("checkpoint exceeds block capacity"));
     }
     Ok(())

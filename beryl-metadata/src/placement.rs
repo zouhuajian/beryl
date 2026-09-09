@@ -7,12 +7,10 @@
 //! does not execute UFS loads, repair copies, worker commands, or report-state
 //! mutations, and it does not define client-side placement policy.
 
-use std::collections::HashSet;
-
 use beryl_common::header::CallerContextFields;
 use beryl_types::ids::{BlockId, WorkerId};
-use beryl_types::layout::{BlockFormatId, FileLayout};
 use beryl_types::{GroupName, Tier, TierFree, WorkerRunId};
+use std::collections::HashSet;
 
 const WRITE_TIER_ORDER: [Tier; 3] = [Tier::Nvme, Tier::Ssd, Tier::Hdd];
 
@@ -22,13 +20,14 @@ pub enum PlacementOp {
     Write,
 }
 
+/// Logical capacity and placement policy over Metadata-owned live Worker evidence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlacementRequest {
     pub group_name: GroupName,
     pub op: PlacementOp,
     pub block_id: BlockId,
     pub visible_len: u64,
-    pub layout: FileLayout,
+    pub block_size: u32,
     pub caller: Option<CallerContextFields>,
     pub existing: Vec<ReportedBlockLocation>,
     pub exclude_workers: Vec<WorkerId>,
@@ -60,9 +59,6 @@ pub struct WorkerPlacementView {
     pub rack: Option<String>,
     pub region: Option<String>,
     pub tier_free: Vec<TierFree>,
-    /// Metadata-visible block format capabilities. StoreBackend / IoEngine
-    /// details remain worker-local and are not part of placement input.
-    pub supported_block_formats: Vec<BlockFormatId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,7 +75,6 @@ pub enum PlacementStatus {
     Ok,
     NoLiveWorker,
     NoEligibleWorker,
-    UnsupportedBlockFormat,
     NoWritableTier,
     InsufficientCapacity,
     NoLiveReplica,
@@ -90,7 +85,6 @@ pub enum PlacementStatus {
 pub struct PlacementStats {
     pub live_count: usize,
     pub group_count: usize,
-    pub format_count: usize,
     pub tier_count: usize,
     pub capacity_count: usize,
     pub max_free_bytes: u64,
@@ -120,15 +114,13 @@ impl PlacementPlan {
             .map(|tier| tier.to_string())
             .unwrap_or_else(|| "-".to_string());
         format!(
-            "placement failed: status={:?} group={} format={} required={} policy=[{}] live={} group_ok={} format_ok={} tier_ok={} capacity_ok={} max_free={} max_worker={} max_tier={}",
+            "placement failed: status={:?} group={} required={} policy=[{}] live={} group_ok={} tier_ok={} capacity_ok={} max_free={} max_worker={} max_tier={}",
             self.status,
             req.group_name,
-            req.layout.block_format_id.as_raw(),
-            req.layout.block_size,
+            req.block_size,
             write_tier_policy_label(),
             self.stats.live_count,
             self.stats.group_count,
-            self.stats.format_count,
             self.stats.tier_count,
             self.stats.capacity_count,
             self.stats.max_free_bytes,
@@ -142,6 +134,7 @@ impl PlacementPlan {
 pub struct PlacementPlanner;
 
 impl PlacementPlanner {
+    /// Select eligible live replicas or writable tiers; local disk versions are Worker-owned.
     pub fn plan(&self, req: &PlacementRequest, workers: &[WorkerPlacementView]) -> PlacementPlan {
         match req.op {
             PlacementOp::Read => choose_read(req, workers),
@@ -206,16 +199,7 @@ fn choose_live_targets(req: &PlacementRequest, workers: &[WorkerPlacementView], 
         return plan_with_stats(req, Vec::new(), PlacementStatus::NoEligibleWorker, stats);
     }
 
-    let format_candidates: Vec<_> = group_candidates
-        .into_iter()
-        .filter(|worker| supports_block_format(worker, req.layout.block_format_id))
-        .collect();
-    stats.format_count = format_candidates.len();
-    if format_candidates.is_empty() {
-        return plan_with_stats(req, Vec::new(), PlacementStatus::UnsupportedBlockFormat, stats);
-    }
-
-    choose_write_targets(req, format_candidates, target_replicas, stats)
+    choose_write_targets(req, group_candidates, target_replicas, stats)
 }
 
 fn choose_write_targets(
@@ -224,7 +208,7 @@ fn choose_write_targets(
     target_replicas: u8,
     mut stats: PlacementStats,
 ) -> PlacementPlan {
-    let required_len = u64::from(req.layout.block_size);
+    let required_len = u64::from(req.block_size);
     for worker in &workers {
         for tier in WRITE_TIER_ORDER {
             if let Some(free_bytes) = tier_free_bytes(worker, tier) {
@@ -309,10 +293,6 @@ fn record_max_free(stats: &mut PlacementStats, worker_id: WorkerId, tier: Option
         stats.max_free_worker_id = Some(worker_id);
         stats.max_free_tier = tier;
     }
-}
-
-fn supports_block_format(worker: &WorkerPlacementView, block_format_id: BlockFormatId) -> bool {
-    worker.supported_block_formats.contains(&block_format_id)
 }
 
 fn sort_workers(req: &PlacementRequest, workers: &mut Vec<&WorkerPlacementView>, use_locality: bool) {

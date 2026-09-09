@@ -181,9 +181,7 @@ async fn assert_stale_worker_run_rejected(
 
             frame_size: 1024,
             worker_run_id: stale_run_id.to_string(),
-            block_format_id: location.block_format_id,
             block_size: location.block_size,
-            chunk_size: location.chunk_size,
             effective_len: location.effective_len,
         }))
         .await

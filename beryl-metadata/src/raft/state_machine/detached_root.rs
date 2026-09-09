@@ -288,15 +288,9 @@ mod tests {
 
     fn seed_file(storage: &RocksDBStorage, parent_inode_id: InodeId, name: &str, inode_id: InodeId, mount_id: MountId) {
         storage
-            .put_inode(&Inode::new_file(
-                inode_id,
-                InodeAttrs::new(),
-                mount_id,
-                beryl_types::FileLayout::new(4096),
-            ))
+            .put_inode(&Inode::new_file(inode_id, InodeAttrs::new(), mount_id, 4096))
             .unwrap();
         storage.put_dentry(parent_inode_id, name, inode_id).unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();
     }
 
     fn reclaim(
@@ -345,10 +339,9 @@ mod tests {
                 second_file_id,
                 InodeAttrs::new(),
                 marker.mount_id,
-                beryl_types::FileLayout::new(4096),
+                4096,
             ))
             .unwrap();
-        storage.put_layout(second_file_id, FileLayout::new(4096)).unwrap();
         storage.put_dentry(root_id, "c", second_file_id).unwrap();
         storage.put_detached_root(root_id, marker).unwrap();
 
@@ -359,7 +352,7 @@ mod tests {
         assert!(first.logical_batch_bytes <= MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES);
         assert_eq!(storage.get_detached_root(child_dir_id).unwrap(), Some(marker));
         assert!(storage.get_inode(file_id).unwrap().is_none());
-        assert!(storage.get_layout_optional(file_id).unwrap().is_none());
+        assert!(storage.get_block_size_optional(file_id).unwrap().is_none());
         assert!(storage.get_inode(root_id).unwrap().is_some());
 
         let second = reclaim(&state_machine, vec![root_id], 2).unwrap();
@@ -439,14 +432,8 @@ mod tests {
             let inode_id = InodeId::new(81 + index);
             let name = format!("{index:03}-{}", "x".repeat(96));
             storage
-                .put_inode(&Inode::new_file(
-                    inode_id,
-                    InodeAttrs::new(),
-                    marker.mount_id,
-                    beryl_types::FileLayout::new(4096),
-                ))
+                .put_inode(&Inode::new_file(inode_id, InodeAttrs::new(), marker.mount_id, 4096))
                 .unwrap();
-            storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();
             storage.put_dentry(root_id, &name, inode_id).unwrap();
         }
         storage.put_detached_root(root_id, marker).unwrap();

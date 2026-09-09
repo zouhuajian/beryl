@@ -3,9 +3,9 @@
 
 use super::{
     AppMetadataRaftState, AppRaftStateMachine, BootstrapNamespaceState, CreateFileOperationId, CreateFileReplayRecord,
-    DetachedRoot, FileLayout, GroupName, Inode, InodeAllocation, InodeAttrs, InodeId, InodeKind, MetadataError,
-    MetadataResult, MountId, PreparedRename, PreparedRenameOverwrite, PreparedUnlink, RecursiveMkdirEntry,
-    RenameAtomicUpdate, RenameOverwriteCleanup,
+    DetachedRoot, GroupName, Inode, InodeAllocation, InodeAttrs, InodeId, InodeKind, MetadataError, MetadataResult,
+    MountId, PreparedRename, PreparedRenameOverwrite, PreparedUnlink, RecursiveMkdirEntry, RenameAtomicUpdate,
+    RenameOverwriteCleanup,
 };
 use crate::mount::{DataIoPolicy, MountEntry, MountKind};
 use beryl_types::{ContentGeneration, LeaseEpoch};
@@ -203,7 +203,7 @@ impl AppRaftStateMachine {
         mount_root_inode_id: InodeId,
         relative_components: Vec<String>,
         mut attrs: InodeAttrs,
-        layout: FileLayout,
+        block_size: u32,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<CreateFileReplayRecord> {
@@ -233,9 +233,8 @@ impl AppRaftStateMachine {
                 "CreateFile write session expired before proposal".to_string(),
             ));
         }
-        layout
-            .validate()
-            .map_err(|error| MetadataError::InvalidArgument(format!("invalid CreateFile layout: {error}")))?;
+        beryl_types::validate_block_size(u64::from(block_size))
+            .map_err(|error| MetadataError::InvalidArgument(format!("invalid CreateFile block_size: {error}")))?;
         let (parent_inode_id, name, parent_inode) = self.resolve_create_parent(
             mount_id,
             expected_mount_epoch,
@@ -256,7 +255,7 @@ impl AppRaftStateMachine {
             attrs.initialize(now_ms);
 
             // Create the file under its single canonical inode identity.
-            let mut inode = Inode::new_file(inode_id, attrs, parent_inode.mount_id, layout);
+            let mut inode = Inode::new_file(inode_id, attrs, parent_inode.mount_id, block_size);
             let InodeKind::File(crate::inode::FileData { lease_epoch, .. }) = &mut inode.kind else {
                 unreachable!("new file constructor must produce file authority")
             };
@@ -284,7 +283,7 @@ impl AppRaftStateMachine {
             mount_root_inode_id,
             relative_components,
             lease_epoch: LeaseEpoch::new(1),
-            layout,
+            block_size,
             generation: ContentGeneration::new(0),
             expires_at_ms: session_expires_at_ms,
         };
@@ -356,9 +355,9 @@ impl AppRaftStateMachine {
                 "replayed CreateFile result no longer owns the initial file state".to_string(),
             ));
         }
-        if self.storage.get_layout(record.inode_id)? != record.layout {
+        if self.storage.get_block_size(record.inode_id)? != record.block_size {
             return Err(MetadataError::Internal(
-                "replayed CreateFile layout authority changed".to_string(),
+                "replayed CreateFile block_size authority changed".to_string(),
             ));
         }
         Ok(())
@@ -667,10 +666,10 @@ impl AppRaftStateMachine {
             match &child_inode.kind {
                 InodeKind::File(crate::inode::FileData { .. }) => {
                     if child_inode.inode_id != child_inode_id
-                        || self.storage.get_layout_optional(child_inode_id)?.is_none()
+                        || self.storage.get_block_size_optional(child_inode_id)?.is_none()
                     {
                         return Err(MetadataError::Internal(format!(
-                            "file inode {child_inode_id} has corrupt identity or missing layout: value_id={}",
+                            "file inode {child_inode_id} has corrupt identity or missing block_size: value_id={}",
                             child_inode.inode_id
                         )));
                     }
@@ -767,7 +766,7 @@ impl AppRaftStateMachine {
             if !root_inode.file_type().is_dir() || !matches!(&root_inode.kind, InodeKind::Dir) {
                 return Err(MetadataError::NotDir(format!("Not a directory: {name}")));
             }
-            if root_inode.inode_id != root_inode_id || self.storage.get_layout_optional(root_inode_id)?.is_some() {
+            if root_inode.inode_id != root_inode_id || self.storage.get_block_size_optional(root_inode_id)?.is_some() {
                 return Err(MetadataError::Internal(format!(
                     "directory inode {root_inode_id} carries file authority"
                 )));
@@ -983,9 +982,9 @@ impl AppRaftStateMachine {
     ) -> MetadataResult<PreparedRenameOverwrite> {
         match &dst_inode.kind {
             InodeKind::File(crate::inode::FileData { .. }) => {
-                if dst_inode.inode_id != dst_inode_id || self.storage.get_layout_optional(dst_inode_id)?.is_none() {
+                if dst_inode.inode_id != dst_inode_id || self.storage.get_block_size_optional(dst_inode_id)?.is_none() {
                     return Err(MetadataError::Internal(format!(
-                        "file inode {dst_inode_id} has corrupt identity or missing layout: value_id={}",
+                        "file inode {dst_inode_id} has corrupt identity or missing block_size: value_id={}",
                         dst_inode.inode_id
                     )));
                 }
@@ -997,7 +996,7 @@ impl AppRaftStateMachine {
                         "Cannot overwrite non-empty directory".to_string(),
                     ));
                 }
-                if dst_inode.inode_id != dst_inode_id || self.storage.get_layout_optional(dst_inode_id)?.is_some() {
+                if dst_inode.inode_id != dst_inode_id || self.storage.get_block_size_optional(dst_inode_id)?.is_some() {
                     return Err(MetadataError::Internal(format!(
                         "directory inode {dst_inode_id} carries invalid file authority: value_id={}",
                         dst_inode.inode_id
@@ -1084,7 +1083,7 @@ mod tests {
             mount_root_inode_id,
             relative_components,
             attrs: InodeAttrs::new(),
-            layout: FileLayout::new(4096),
+            block_size: 4096,
         }
     }
 
@@ -1152,12 +1151,15 @@ mod tests {
         *session_expires_at_ms = 200;
         expect_apply_rejection(sm.apply(replay_command.clone()), ApplyRejectionKind::InvalidArgument);
         let Command::CreateFile {
-            request_deadline_ms, ..
+            request_deadline_ms,
+            block_size,
+            ..
         } = &mut replay_command
         else {
             unreachable!("test helper must build CreateFile")
         };
         *request_deadline_ms = 100;
+        *block_size = 8192; // A changed new-file default cannot change a replayed result.
         let replay = expect_file_created(sm.apply(replay_command.clone()).unwrap());
 
         assert_eq!(replay, first);
@@ -1275,7 +1277,7 @@ mod tests {
         assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), None);
         assert!(storage.get_inode(directory).unwrap().is_some());
         assert!(storage.get_inode(file).unwrap().is_some());
-        assert!(storage.get_layout(file).is_ok());
+        assert!(storage.get_block_size(file).is_ok());
         assert_eq!(
             storage.get_detached_root(directory).unwrap(),
             Some(DetachedRoot {

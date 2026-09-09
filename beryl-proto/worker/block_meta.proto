@@ -9,7 +9,8 @@ import "common/common.proto";
 
 message BlockMetaPayloadProto {
   BlockIdentityProto identity = 1;
-  BlockFormatProto format = 2;
+  // Immutable logical capacity; the enclosing local header versions this encoding.
+  uint64 block_size = 2;
   BlockSourceProto source = 3;
   BlockVisibilityProto visibility = 4;
   // Worker-local tier where this replica was materialized.
@@ -19,14 +20,6 @@ message BlockMetaPayloadProto {
 message BlockIdentityProto {
   common.BlockIdProto block_id = 1;
   string group_name = 2;
-}
-
-message BlockFormatProto {
-  uint32 format_id = 1;
-  // Full logical block size from the persisted FileLayout. Tail or bounded
-  // valid length is stored in BlockSource.durable_len.
-  uint64 block_size = 2;
-  uint32 chunk_size = 3;
 }
 
 message BlockSourceProto {

@@ -50,7 +50,7 @@ impl FilePublication {
     /// Locate the changed tail and new blocks from the frozen pre-publication length.
     /// An empty append payload means an exact no-op, including a partial tail.
     pub(crate) fn start_index(&self, file: &FileData) -> MetadataResult<usize> {
-        let count = FileData::block_count(self.target_size, file.layout.block_size)?;
+        let count = FileData::block_count(self.target_size, file.block_size)?;
         let start = match self.mode {
             PublishMode::ReplaceIfUnchanged => 0,
             PublishMode::AppendIfUnchanged => {
@@ -62,7 +62,7 @@ impl FilePublication {
                 if self.blocks.is_empty() && self.target_size == self.expected_file_size {
                     count
                 } else {
-                    usize::try_from(self.expected_file_size / u64::from(file.layout.block_size))
+                    usize::try_from(self.expected_file_size / u64::from(file.block_size))
                         .map_err(|_| MetadataError::InvalidArgument("block ordinal overflows".into()))?
                 }
             }
@@ -74,7 +74,7 @@ impl FilePublication {
         }
         for (offset, block) in self.blocks.iter().enumerate() {
             let ordinal = start + offset;
-            let expected_len = Self::visible_block_len(self.target_size, file.layout.block_size, ordinal);
+            let expected_len = Self::visible_block_len(self.target_size, file.block_size, ordinal);
             if block.len != expected_len {
                 return Err(MetadataError::InvalidArgument(
                     "only the final block may be partial".into(),
@@ -214,7 +214,8 @@ impl InodeAttrs {
 /// visible length and is never rolled back when an unpublished block is lost.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FileData {
-    pub(crate) layout: beryl_types::FileLayout,
+    /// Immutable logical capacity; block offsets use ordinals, not allocation indices.
+    pub(crate) block_size: u32,
     pub(crate) len: u64,
     pub(crate) generation: ContentGeneration,
     pub(crate) blocks: Vec<BlockId>,
@@ -245,10 +246,9 @@ impl FileData {
 
     /// Validate persisted shape and identities before interpreting logical offsets.
     pub(crate) fn validate(&self, inode_id: InodeId) -> MetadataResult<()> {
-        self.layout
-            .validate()
-            .map_err(|error| MetadataError::Internal(format!("invalid file layout: {error}")))?;
-        if self.blocks.len() != Self::block_count(self.len, self.layout.block_size)? {
+        beryl_types::validate_block_size(u64::from(self.block_size))
+            .map_err(|error| MetadataError::Internal(format!("invalid file block size: {error}")))?;
+        if self.blocks.len() != Self::block_count(self.len, self.block_size)? {
             return Err(MetadataError::Internal(
                 "file length disagrees with its block count".into(),
             ));
@@ -262,9 +262,9 @@ impl FileData {
         Ok(())
     }
 
-    /// Return the visible prefix length of an ordinal in this validated layout.
+    /// Return the visible prefix length of an ordinal in this validated file.
     pub(crate) fn block_len(&self, ordinal: usize) -> u64 {
-        FilePublication::visible_block_len(self.len, self.layout.block_size, ordinal)
+        FilePublication::visible_block_len(self.len, self.block_size, ordinal)
     }
 }
 
@@ -319,19 +319,14 @@ impl Inode {
         }
     }
 
-    /// Create an empty file with its immutable, Metadata-selected layout.
-    pub(crate) fn new_file(
-        inode_id: InodeId,
-        attrs: InodeAttrs,
-        mount_id: MountId,
-        layout: beryl_types::FileLayout,
-    ) -> Self {
+    /// Create an empty file with its immutable, Metadata-selected block capacity.
+    pub(crate) fn new_file(inode_id: InodeId, attrs: InodeAttrs, mount_id: MountId, block_size: u32) -> Self {
         Self {
             inode_id,
             attrs,
             mount_id,
             kind: InodeKind::File(FileData {
-                layout,
+                block_size,
                 len: 0,
                 blocks: Vec::new(),
                 generation: ContentGeneration::default(),

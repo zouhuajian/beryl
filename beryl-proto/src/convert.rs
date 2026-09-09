@@ -10,11 +10,11 @@ use crate::common::error_kind_proto::Kind;
 use crate::common::recovery_action_proto::Action;
 use crate::common::{
     BlockIdProto, ByteRangeProto, CallerContextProto, ClientIdProto, ClientInfoProto, ErrorDetailProto, ErrorKindProto,
-    FailRecoveryProto, FencingTokenProto, FileLayoutProto, GroupStateWatermarkProto, InternalErrorKindProto,
-    MetadataErrorKindProto, ProtocolErrorKindProto, RaftLogIdProto, RecoveryActionProto, RefreshHintProto,
-    RefreshMetadataRecoveryProto, RegisterWorkerRecoveryProto, ReopenWriteSessionRecoveryProto, RequestHeaderProto,
-    ResponseHeaderProto, RetryRecoveryProto, SendFullBlockReportRecoveryProto, TierProto, TraceContextProto,
-    WorkerEndpointInfoProto, WorkerErrorKindProto,
+    FailRecoveryProto, FencingTokenProto, GroupStateWatermarkProto, InternalErrorKindProto, MetadataErrorKindProto,
+    ProtocolErrorKindProto, RaftLogIdProto, RecoveryActionProto, RefreshHintProto, RefreshMetadataRecoveryProto,
+    RegisterWorkerRecoveryProto, ReopenWriteSessionRecoveryProto, RequestHeaderProto, ResponseHeaderProto,
+    RetryRecoveryProto, SendFullBlockReportRecoveryProto, TierProto, TraceContextProto, WorkerEndpointInfoProto,
+    WorkerErrorKindProto,
 };
 use crate::metadata::{
     CommittedBlockProto, FileBlockLocationProto, FileTypeProto, LocatedBlockProto, OpenWriteModeProto, WriteHandleProto,
@@ -25,8 +25,8 @@ use ::beryl_common::error::rpc::{
     WorkerEndpointHint, WorkerErrorKind,
 };
 use ::beryl_common::header::{CallerContext, ClientInfo, RequestHeader, ResponseHeader, TraceContext};
+use beryl_types::fs::{validate_block_size, validate_effective_len};
 use beryl_types::ids::{BlockId, BlockIndex, WorkerId};
-use beryl_types::layout::{BlockFormatId, BlockShape, FileLayout};
 use beryl_types::lease::{FencingToken, LeaseEpoch, WriteHandle};
 use beryl_types::range::ByteRange;
 use beryl_types::{
@@ -110,35 +110,6 @@ impl From<ByteRange> for ByteRangeProto {
             offset: range.offset,
             len: range.len,
         }
-    }
-}
-
-impl TryFrom<FileLayoutProto> for FileLayout {
-    type Error = String;
-
-    fn try_from(layout: FileLayoutProto) -> Result<Self, Self::Error> {
-        let block_format_id = BlockFormatId::from_raw(layout.block_format_id)
-            .map_err(|err| format!("FileLayoutProto.block_format_id invalid: {err}"))?;
-        let layout = FileLayout::with_block_format(layout.block_size, block_format_id);
-        layout
-            .validate()
-            .map_err(|err| format!("FileLayoutProto invalid: {err}"))?;
-        Ok(layout)
-    }
-}
-
-impl From<&FileLayout> for FileLayoutProto {
-    fn from(layout: &FileLayout) -> Self {
-        Self {
-            block_size: layout.block_size,
-            block_format_id: layout.block_format_id.as_raw(),
-        }
-    }
-}
-
-impl From<FileLayout> for FileLayoutProto {
-    fn from(layout: FileLayout) -> Self {
-        Self::from(&layout)
     }
 }
 
@@ -348,9 +319,7 @@ impl TryFrom<LocatedBlockProto> for LocatedBlock {
     type Error = String;
 
     fn try_from(target: LocatedBlockProto) -> Result<Self, Self::Error> {
-        let block_format_id = BlockFormatId::from_raw(target.block_format_id)
-            .map_err(|err| format!("LocatedBlockProto.block_format_id invalid: {err}"))?;
-        BlockShape::new(block_format_id, target.block_size, target.chunk_size, target.block_size)
+        validate_block_size(target.block_size)
             .map_err(|err| format!("LocatedBlockProto invalid block shape: {err}"))?;
         if target.worker_endpoints.is_empty() {
             return Err("LocatedBlockProto.worker_endpoints must not be empty".to_string());
@@ -380,8 +349,6 @@ impl TryFrom<LocatedBlockProto> for LocatedBlock {
             worker_endpoints,
             fencing_token,
 
-            chunk_size: target.chunk_size,
-            block_format_id,
             tier,
         })
     }
@@ -395,9 +362,6 @@ impl From<&LocatedBlock> for LocatedBlockProto {
             write_offset: target.write_offset,
             worker_endpoints: target.worker_endpoints.iter().map(Into::into).collect(),
             fencing_token: Some(target.fencing_token.into()),
-
-            chunk_size: target.chunk_size,
-            block_format_id: target.block_format_id.as_raw(),
             block_size: target.block_size,
             tier: TierProto::from(target.tier) as i32,
         }
@@ -412,9 +376,6 @@ impl From<LocatedBlock> for LocatedBlockProto {
             write_offset: target.write_offset,
             worker_endpoints: target.worker_endpoints.into_iter().map(Into::into).collect(),
             fencing_token: Some(target.fencing_token.into()),
-
-            chunk_size: target.chunk_size,
-            block_format_id: target.block_format_id.as_raw(),
             block_size: target.block_size,
             tier: TierProto::from(target.tier) as i32,
         }
@@ -438,7 +399,6 @@ impl From<&CommittedBlock> for CommittedBlockProto {
     fn from(block: &CommittedBlock) -> Self {
         Self {
             block_id: Some(block.block_id.into()),
-
             len: block.len,
         }
     }
@@ -448,7 +408,6 @@ impl From<CommittedBlock> for CommittedBlockProto {
     fn from(block: CommittedBlock) -> Self {
         Self {
             block_id: Some(block.block_id.into()),
-
             len: block.len,
         }
     }
@@ -462,15 +421,10 @@ impl TryFrom<FileBlockLocationProto> for FileBlockLocation {
             return Err("FileBlockLocationProto.len must be non-zero".to_string());
         }
 
-        let block_format_id = BlockFormatId::from_raw(location.block_format_id)
-            .map_err(|err| format!("FileBlockLocationProto.block_format_id invalid: {err}"))?;
-        BlockShape::new(
-            block_format_id,
-            location.block_size,
-            location.chunk_size,
-            location.effective_len,
-        )
-        .map_err(|err| format!("FileBlockLocationProto invalid block shape: {err}"))?;
+        validate_block_size(location.block_size)
+            .map_err(|err| format!("FileBlockLocationProto invalid block shape: {err}"))?;
+        validate_effective_len(location.block_size, location.effective_len)
+            .map_err(|err| format!("FileBlockLocationProto invalid block shape: {err}"))?;
         let block_id = required_block_id(location.block_id, "FileBlockLocationProto.block_id")?;
         let workers = location
             .workers
@@ -482,9 +436,8 @@ impl TryFrom<FileBlockLocationProto> for FileBlockLocation {
             file_offset: location.file_offset,
             len: location.len,
             workers,
-            block_format_id,
+
             block_size: location.block_size,
-            chunk_size: location.chunk_size,
             effective_len: location.effective_len,
         })
     }
@@ -497,10 +450,7 @@ impl From<&FileBlockLocation> for FileBlockLocationProto {
             file_offset: location.file_offset,
             len: location.len,
             workers: location.workers.iter().map(Into::into).collect(),
-
-            block_format_id: location.block_format_id.as_raw(),
             block_size: location.block_size,
-            chunk_size: location.chunk_size,
             effective_len: location.effective_len,
         }
     }
@@ -513,10 +463,7 @@ impl From<FileBlockLocation> for FileBlockLocationProto {
             file_offset: location.file_offset,
             len: location.len,
             workers: location.workers.into_iter().map(Into::into).collect(),
-
-            block_format_id: location.block_format_id.as_raw(),
             block_size: location.block_size,
-            chunk_size: location.chunk_size,
             effective_len: location.effective_len,
         }
     }
@@ -1119,9 +1066,6 @@ mod tests {
             file_offset: 128,
             worker_endpoints: Vec::new(),
             fencing_token: Some(token.into()),
-
-            chunk_size: BlockFormatId::DURABLE_PREFIX.storage_chunk_size().unwrap(),
-            block_format_id: BlockFormatId::DURABLE_PREFIX.as_raw(),
             block_size: 4096,
             tier: TierProto::TierHdd as i32,
         };
@@ -1130,6 +1074,14 @@ mod tests {
         target.worker_endpoints.push(endpoint());
         let decoded = LocatedBlock::try_from(target.clone()).expect("valid allocated block");
         assert_eq!(LocatedBlockProto::from(decoded), target);
+        for block_size in [0, u64::from(beryl_types::MAX_BLOCK_SIZE) + 1] {
+            let invalid = LocatedBlockProto {
+                block_size,
+
+                ..target.clone()
+            };
+            assert!(LocatedBlock::try_from(invalid).is_err());
+        }
         target.write_offset = target.block_size;
         assert!(LocatedBlock::try_from(target).is_err());
 
@@ -1138,10 +1090,7 @@ mod tests {
             file_offset: 128,
             len: 4096,
             workers: Vec::new(),
-
-            block_format_id: BlockFormatId::DURABLE_PREFIX.as_raw(),
             block_size: 4096,
-            chunk_size: BlockFormatId::DURABLE_PREFIX.storage_chunk_size().unwrap(),
             effective_len: 4096,
         };
         let decoded_empty =
@@ -1149,6 +1098,24 @@ mod tests {
         assert!(decoded_empty.workers.is_empty());
         location.workers.push(endpoint());
         let decoded = FileBlockLocation::try_from(location.clone()).expect("valid read location");
+        assert_eq!(FileBlockLocationProto::from(decoded), location);
+        for (block_size, effective_len) in [
+            (0, 1),
+            (u64::from(beryl_types::MAX_BLOCK_SIZE) + 1, 1),
+            (location.block_size, 0),
+            (location.block_size, location.block_size + 1),
+        ] {
+            let invalid = FileBlockLocationProto {
+                block_size,
+
+                effective_len,
+                ..location.clone()
+            };
+            assert!(FileBlockLocation::try_from(invalid).is_err());
+        }
+        location.len = 1;
+        location.effective_len = 1;
+        let decoded = FileBlockLocation::try_from(location.clone()).expect("valid short tail");
         assert_eq!(FileBlockLocationProto::from(decoded), location);
     }
 }

@@ -8,8 +8,8 @@ use crate::error::WorkerError;
 use crate::report::BlockReportChangeTracker;
 use crate::store::block::{BlockState, LocalBlockStore};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
+use beryl_types::fs::{validate_block_size, validate_effective_len};
 use beryl_types::ids::BlockId;
-use beryl_types::layout::BlockShape;
 use beryl_types::GroupName;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -397,23 +397,15 @@ impl BlockManager {
             ));
         }
 
-        if req.block_format_id != meta.format.format_id
-            || req.block_size != meta.format.block_size
-            || u64::from(req.chunk_size) != meta.format.chunk_size
-            || req.effective_len > meta.source.durable_len
-        {
+        if req.block_size != meta.block_size || req.effective_len > meta.source.durable_len {
             return Err(Self::refresh_metadata(
                 ErrorKind::Metadata(MetadataErrorKind::StaleState),
                 format!(
-                    "block layout mismatch: group_name={}, block_id={}, requested_format={}, local_format={}, requested_block_size={}, local_block_size={}, requested_chunk_size={}, local_chunk_size={}, requested_effective_len={}, local_effective_len={}",
+                    "block layout mismatch: group_name={}, block_id={}, requested_block_size={}, local_block_size={}, requested_effective_len={}, local_effective_len={}",
                     req.group_name,
                     req.block_id,
-                    req.block_format_id.as_raw(),
-                    meta.format.format_id.as_raw(),
                     req.block_size,
-                    meta.format.block_size,
-                    req.chunk_size,
-                    meta.format.chunk_size,
+                    meta.block_size,
                     req.effective_len,
                     meta.source.durable_len
                 ),
@@ -437,7 +429,8 @@ impl BlockManager {
 
     /// Rejects malformed or internally inconsistent read authority before pinning.
     pub(crate) fn validate_read_request(&self, req: &ReadBlockRequest) -> WorkerCoreResult<()> {
-        BlockShape::new(req.block_format_id, req.block_size, req.chunk_size, req.effective_len)
+        validate_block_size(req.block_size).map_err(|err| WorkerError::InvalidArgument(err.to_string()))?;
+        validate_effective_len(req.block_size, req.effective_len)
             .map_err(|err| WorkerError::InvalidArgument(err.to_string()))?;
 
         let range_end = req

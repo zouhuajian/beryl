@@ -7,7 +7,8 @@ use crate::error::{ClientError, ClientResult, RefreshHint as ClientRefreshHint};
 use crate::metadata::ReadLayout;
 use beryl_common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind};
 use beryl_types::{
-    BlockFormatId, BlockId, BlockShape, ContentGeneration, FileBlockLocation, GroupName, InodeId, WorkerEndpointInfo,
+    validate_block_size, validate_effective_len, BlockId, ContentGeneration, FileBlockLocation, GroupName, InodeId,
+    WorkerEndpointInfo,
 };
 
 /// File byte range requested by a reader after EOF truncation.
@@ -31,10 +32,7 @@ pub(crate) struct PlannedBlockRead {
     pub(crate) end_file_offset: u64,
     pub(crate) block_id: BlockId,
     pub(crate) block_offset: u64,
-
-    pub(crate) block_format_id: BlockFormatId,
     pub(crate) block_size: u64,
-    pub(crate) chunk_size: u32,
     pub(crate) effective_len: u64,
     pub(crate) workers: Vec<WorkerEndpointInfo>,
 }
@@ -83,13 +81,10 @@ pub(crate) fn plan_block_reads(
                 expected_inode_id.as_raw()
             )));
         }
-        BlockShape::new(
-            location.block_format_id,
-            location.block_size,
-            location.chunk_size,
-            location.effective_len,
-        )
-        .map_err(|error| ClientError::invalid_layout(format!("invalid block shape: {error}")))?;
+        validate_block_size(location.block_size)
+            .map_err(|error| ClientError::invalid_layout(format!("invalid block shape: {error}")))?;
+        validate_effective_len(location.block_size, location.effective_len)
+            .map_err(|error| ClientError::invalid_layout(format!("invalid block shape: {error}")))?;
         if location.workers.is_empty() {
             return Err(block_location_unavailable_error(format!(
                 "block location unavailable: metadata returned no worker candidates for block {} file_offset={} len={}",
@@ -145,9 +140,7 @@ pub(crate) fn plan_block_reads(
             end_file_offset: read_end,
             block_id,
             block_offset: read_start - start,
-            block_format_id: location.block_format_id,
             block_size: location.block_size,
-            chunk_size: location.chunk_size,
             effective_len: location.effective_len,
             workers: location.workers.clone(),
         });
@@ -281,9 +274,8 @@ mod tests {
                 endpoint: "127.0.0.1:19101".to_string(),
                 worker_run_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
             }],
-            block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
+
             block_size: 4096,
-            chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.storage_chunk_size().unwrap(),
             effective_len: len,
         }
     }

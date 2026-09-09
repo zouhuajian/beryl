@@ -2,11 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
 use beryl_types::ids::{BlockId, BlockIndex, InodeId};
-use beryl_types::{BlockFormatId, GroupName, Tier};
+use beryl_types::{GroupName, Tier};
 use beryl_worker::config::StoreDirConfig;
 use beryl_worker::store::block::{
-    ChecksumKind, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore, OpenBlockWriteRequest,
-    ReclaimBlockRequest,
+    FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore, OpenBlockWriteRequest, ReclaimBlockRequest,
 };
 use beryl_worker::store::dirs::StoreDirs;
 use beryl_worker::WorkerError;
@@ -16,10 +15,6 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 const BLOCK_SIZE: u64 = 4096;
-
-fn chunk_size() -> u32 {
-    BlockFormatId::DURABLE_PREFIX.storage_chunk_size().unwrap()
-}
 
 fn group_name() -> GroupName {
     GroupName::parse("root").unwrap()
@@ -72,9 +67,6 @@ fn open_request(index: u32) -> OpenBlockWriteRequest {
         write_offset: 0,
         visible_len: 0,
         block_size: BLOCK_SIZE,
-        block_format_id: BlockFormatId::DURABLE_PREFIX,
-        chunk_size: chunk_size(),
-        checksum_kind: ChecksumKind::None,
         tier: Tier::Hdd,
     }
 }

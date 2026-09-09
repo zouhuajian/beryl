@@ -6,7 +6,6 @@
 use crate::error::{MetadataError, MetadataResult};
 use crate::placement::{ReportedBlockLocation, WorkerPlacementView};
 use beryl_types::ids::{BlockId, WorkerId};
-use beryl_types::layout::BlockFormatId;
 use beryl_types::{GroupName, LocatedBlock, TierFree, WorkerRunId};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -1323,7 +1322,6 @@ impl WorkerManager {
                 rack: descriptor.fault_domain.clone(),
                 region: None,
                 tier_free: live.map(|runtime| runtime.tier_free.clone()).unwrap_or_default(),
-                supported_block_formats: vec![BlockFormatId::CURRENT_FOR_NEW_FILE],
             });
         }
         views.sort_by_key(|view| view.worker_id.as_raw());
@@ -1758,9 +1756,7 @@ mod tests {
     use crate::MetadataResult;
     use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
     use beryl_types::lease::{FencingToken, LeaseEpoch};
-    use beryl_types::{
-        BlockFormatId, ClientId, GroupName, LocatedBlock, Tier, TierFree, WorkerEndpointInfo, WorkerRunId,
-    };
+    use beryl_types::{ClientId, GroupName, LocatedBlock, Tier, TierFree, WorkerEndpointInfo, WorkerRunId};
     use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
 
@@ -1855,8 +1851,7 @@ mod tests {
                     owner: ClientId::new(7),
                     epoch: LeaseEpoch::new(lease_epoch),
                 },
-                chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.storage_chunk_size().unwrap(),
-                block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
+
                 tier: Tier::Hdd,
             },
         }

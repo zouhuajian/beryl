@@ -62,19 +62,14 @@ message LocatedBlockProto {
   common.BlockIdProto block_id = 1;
   // Start of this block in the file; new-block IO starts at block-local offset zero.
   uint64 file_offset = 2;
-  // Metadata-selected Beryl block data/meta interpretation format for this target.
-  // Worker-local execution backend selection is not encoded here.
-  uint32 block_format_id = 3;
-  // Maximum writable capacity from the persisted FileLayout. Workers reserve
+  // Maximum writable capacity from the file inode. Workers reserve
   // and enforce this bound before the final effective length is known.
-  uint64 block_size = 4;
-  // Metadata-selected chunk size for the worker-local block format.
-  uint32 chunk_size = 5;
-  uint64 write_offset = 6;
-  repeated common.WorkerEndpointInfoProto worker_endpoints = 7;
-  common.FencingTokenProto fencing_token = 8;
+  uint64 block_size = 3;
+  uint64 write_offset = 4;
+  repeated common.WorkerEndpointInfoProto worker_endpoints = 5;
+  common.FencingTokenProto fencing_token = 6;
   // Worker-local storage tier requested for this block replica.
-  common.TierProto tier = 9;
+  common.TierProto tier = 7;
 }
 
 message CommittedBlockProto {
@@ -87,15 +82,13 @@ message FileBlockLocationProto {
   common.BlockIdProto block_id = 1;
   uint64 file_offset = 2;
   uint64 len = 3;
-  // Metadata-issued read candidates. Empty means FileLayout has this block
+  // Metadata-issued read candidates. Empty means the file has this block
   // range but no live reported replica is currently eligible.
   repeated common.WorkerEndpointInfoProto workers = 4;
-  // FileLayout-derived block format facts that workers validate before reads.
-  uint32 block_format_id = 5;
-  uint64 block_size = 6;
-  uint32 chunk_size = 7;
+  // Immutable logical capacity that workers validate before reads.
+  uint64 block_size = 5;
   // Block-local readable prefix expected by metadata for this block.
-  uint64 effective_len = 8;
+  uint64 effective_len = 6;
 }
 
 // ============================================================================
@@ -225,8 +218,8 @@ message CreateFileRequestProto {
 
 message CreateFileResponseProto {
   common.ResponseHeaderProto header = 1;
-  // Metadata-stored FileLayout selected by the durable namespace mutation.
-  common.FileLayoutProto layout = 2;
+  // Immutable block capacity selected and persisted at file creation.
+  uint32 block_size = 2;
   WriteHandleProto write_handle = 3;
   uint64 expires_at_ms = 4;
   // Durable content generation used as the first publish CAS precondition.
@@ -250,8 +243,8 @@ message OpenWriteResponseProto {
   WriteHandleProto write_handle = 2;
   uint64 base_size = 3;
   uint64 expires_at_ms = 4;
-  // Metadata-stored FileLayout for the existing file.
-  common.FileLayoutProto layout = 5;
+  // Stored capacity of the existing file, independent of current defaults.
+  uint32 block_size = 5;
   // Durable content generation used as the publish CAS precondition.
   uint64 generation = 6;
   // Existing partial tail, authorized for this newly acquired writer.
@@ -351,9 +344,7 @@ message AuthorizeBlockWriteRequestProto {
   common.FencingTokenProto fencing_token = 5;
   uint64 write_offset = 6;
   uint64 block_size = 7;
-  uint32 block_format_id = 8;
-  uint32 chunk_size = 9;
-  common.TierProto tier = 10;
+  common.TierProto tier = 8;
 }
 message AuthorizeBlockWriteResponseProto {
   common.ResponseHeaderProto header = 1;

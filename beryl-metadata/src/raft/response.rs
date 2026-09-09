@@ -6,9 +6,7 @@
 use crate::error::MetadataError;
 use crate::inode::InodeAttrs;
 use crate::mount::MountEntry;
-
 use beryl_types::ids::{BlockId, InodeId, WorkerId};
-use beryl_types::layout::FileLayout;
 use beryl_types::{ContentGeneration, LeaseEpoch};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -36,7 +34,7 @@ pub(crate) enum ApplySuccess {
     /// File inode, initial write lease, and replay record committed atomically.
     FileCreated {
         inode_id: InodeId,
-        layout: FileLayout,
+        block_size: u32,
         lease_epoch: LeaseEpoch,
         expires_at_ms: u64,
         generation: ContentGeneration,
