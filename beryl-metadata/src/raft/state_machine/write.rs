@@ -229,7 +229,7 @@ mod tests {
     use crate::inode::{InodeAttrs, PublishMode};
     use crate::raft::state_machine::tests::*;
     use crate::raft::{ApplySuccess, Command, RocksDBStorage};
-    use beryl_types::{CommittedBlock, FileLayout, MountId};
+    use beryl_types::{CommittedBlock, MountId};
     use openraft::{LeaderId, LogId};
     use std::sync::Arc;
 
@@ -237,7 +237,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let id = InodeId::new(42);
-        let mut inode = Inode::new_file(id, InodeAttrs::new(), MountId::new(1), FileLayout::new(4));
+        let mut inode = Inode::new_file(id, InodeAttrs::new(), MountId::new(1), 4);
         inode.file_mut().unwrap().lease_epoch = LeaseEpoch::new(1);
         storage.put_inode(&inode).unwrap();
         (dir, storage.clone(), AppRaftStateMachine::new(storage), id)

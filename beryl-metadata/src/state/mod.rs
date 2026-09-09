@@ -7,15 +7,14 @@
 
 mod raft_store;
 
-pub use raft_store::RaftStateStore;
-
 use crate::error::MetadataResult;
 use async_trait::async_trait;
+pub use raft_store::RaftStateStore;
 use serde::{Deserialize, Serialize};
 
 /// Authoritative route epoch used by metadata stale-route validation.
 ///
-/// This carrier is distinct from per-inode `FileLayout` state.
+/// This carrier is distinct from per-inode block capacity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RouteEpoch(u64);
 

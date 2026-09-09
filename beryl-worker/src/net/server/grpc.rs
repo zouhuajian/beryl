@@ -106,8 +106,6 @@ impl WorkerDataServiceImpl {
                 fencing_token: Some(req.fencing_token.into()),
                 write_offset: req.write_offset,
                 block_size: req.block_size,
-                block_format_id: req.block_format_id.as_raw(),
-                chunk_size: req.chunk_size,
                 tier: beryl_proto::common::TierProto::from(req.tier) as i32,
             })
             .await
@@ -633,7 +631,7 @@ mod tests {
     use beryl_proto::worker::write_block_request_proto::Payload;
     use beryl_proto::worker::{WriteBlockCommandProto, WriteBlockRequestProto};
     use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
-    use beryl_types::layout::BlockFormatId;
+
     use beryl_types::{GroupName, WorkerRunId};
     use bytes::Bytes;
     use futures::stream;
@@ -685,9 +683,7 @@ mod tests {
                     block_index: 3,
                 }),
                 worker_run_id: worker_run_id.to_string(),
-                block_format_id: BlockFormatId::DURABLE_PREFIX.as_raw(),
                 block_size: 4096,
-                chunk_size: BlockFormatId::DURABLE_PREFIX.storage_chunk_size().unwrap(),
                 fencing_token: Some(
                     beryl_types::FencingToken::new(block_id(), ClientId::new(9), beryl_types::LeaseEpoch::new(55))
                         .into(),

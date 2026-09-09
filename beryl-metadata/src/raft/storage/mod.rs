@@ -33,7 +33,6 @@ use crate::session_registry::CreateFileOperationId;
 use crate::state::RouteEpoch;
 use crate::worker::WorkerInfo;
 use beryl_types::ids::{InodeId, MountId, WorkerId};
-use beryl_types::layout::FileLayout;
 use beryl_types::{CallId, ClientId, ContentGeneration, GroupName, LeaseEpoch};
 use bincode::config::standard;
 use bincode::serde::{decode_from_slice, encode_to_vec};
@@ -63,7 +62,7 @@ const ROCKSDB_SCHEMA_VERSION_KEY: &[u8] = b"rocksdb_schema_version";
 const STORAGE_IDENTITY_KEY: &[u8] = b"storage_identity";
 const RAFT_STATE_KEY: &[u8] = b"raft_state";
 /// Guards database and snapshot decoding against incompatible persisted metadata encodings.
-pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 4;
+pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 5;
 const NEXT_INODE_ID_KEY: &[u8] = b"next_inode_id";
 const CREATE_FILE_REPLAY_COUNT_KEY: &[u8] = b"create_file_replay_count";
 const CREATE_FILE_REPLAY_PREFIX: &[u8] = b"create_file_replay/";
@@ -154,7 +153,7 @@ pub(crate) struct CreateFileReplayRecord {
     pub(crate) mount_root_inode_id: InodeId,
     pub(crate) relative_components: Vec<String>,
     pub(crate) lease_epoch: LeaseEpoch,
-    pub(crate) layout: FileLayout,
+    pub(crate) block_size: u32,
     pub(crate) generation: ContentGeneration,
     pub(crate) expires_at_ms: u64,
 }
@@ -194,12 +193,11 @@ pub(crate) struct RenameAtomicUpdate<'a> {
 /// One namespace child removed from a detached directory in a bounded apply.
 ///
 /// Directories carry a child marker and retain their inode. File entries mark
-/// that their layout authority must be removed with the inode.
+/// that their block mapping authority must be removed with the inode.
 pub(crate) struct DetachedRootReclaimEntry {
     pub(crate) parent_inode_id: InodeId,
     pub(crate) name: String,
     pub(crate) inode_id: InodeId,
-
     pub(crate) child_detached_root: Option<DetachedRoot>,
 }
 

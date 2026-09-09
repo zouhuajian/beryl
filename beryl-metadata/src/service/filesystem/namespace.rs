@@ -4,7 +4,9 @@
 //! Durable namespace creation, rename, and delete operations.
 
 use super::command::unexpected_raft_apply_success;
-use super::{validate_active_write_layout, Freshness, FsResult, MetadataFileSystem, RequestContext, RoutedFsWriteCtx};
+use super::{
+    validate_active_write_block_size, Freshness, FsResult, MetadataFileSystem, RequestContext, RoutedFsWriteCtx,
+};
 use crate::error::{MetadataError, MetadataResult};
 use crate::inode::InodeAttrs;
 use crate::inode::{Inode, InodeKind};
@@ -14,9 +16,7 @@ use crate::raft::{ApplySuccess, Command};
 use crate::session_registry::{
     BeginCreateSession, BeginCreateSessionError, BeginCreateSessionInput, CreateFileOperationId, WriteOpeningError,
 };
-
 use beryl_types::ids::InodeId;
-use beryl_types::layout::FileLayout;
 use beryl_types::{ContentGeneration, LeaseEpoch};
 use std::sync::atomic::Ordering;
 
@@ -467,7 +467,7 @@ pub(crate) struct CreateFileArgs {
 pub(crate) struct CreatedFileOutput {
     pub(crate) inode_id: InodeId,
     pub(crate) lease_epoch: LeaseEpoch,
-    pub(crate) layout: FileLayout,
+    pub(crate) block_size: u32,
     pub(crate) expires_at_ms: u64,
     pub(crate) generation: ContentGeneration,
 }
@@ -489,8 +489,7 @@ impl MetadataFileSystem {
                     call_id = %ctx.caller.client.call_id,
                     path = %path,
                     inode_id = payload.inode_id.as_raw(),
-                    layout_block_size = payload.layout.block_size,
-                    block_format_id = payload.layout.block_format_id.as_raw(),
+                    block_size = payload.block_size,
                     mount_epoch = success.mount_epoch,
                     route_epoch = success.route_epoch,
                     "CreateFile committed"
@@ -578,8 +577,8 @@ impl MetadataFileSystem {
         parent_ancestor_inode_ids: Vec<InodeId>,
         freshness: Freshness,
     ) -> FsResult<CreatedFileOutput> {
-        let layout = self.file_create_layout;
-        if let Err(err) = validate_active_write_layout(&layout) {
+        let block_size = self.file_block_size;
+        if let Err(err) = validate_active_write_block_size(block_size) {
             return self.failure_from_error(request_ctx, err, None, None);
         }
 
@@ -618,7 +617,7 @@ impl MetadataFileSystem {
                     CreatedFileOutput {
                         inode_id: session.inode_id,
                         lease_epoch: session.lease_epoch,
-                        layout: session.layout,
+                        block_size: session.block_size,
                         expires_at_ms: session.expires_at_ms,
                         generation: session.generation,
                     },
@@ -697,16 +696,16 @@ impl MetadataFileSystem {
                     mount_root_inode_id: ctx.mount_root_inode_id,
                     relative_components,
                     attrs: InodeAttrs::new(),
-                    layout,
+                    block_size,
                 },
                 |success| match success {
                     ApplySuccess::FileCreated {
                         inode_id,
-                        layout,
+                        block_size,
                         lease_epoch,
                         expires_at_ms,
                         generation,
-                    } => Ok((inode_id, layout, lease_epoch, expires_at_ms, generation)),
+                    } => Ok((inode_id, block_size, lease_epoch, expires_at_ms, generation)),
                     unexpected => Err(unexpected_raft_apply_success("CreateFile", unexpected)),
                 },
             )
@@ -718,8 +717,8 @@ impl MetadataFileSystem {
             }
         };
 
-        let (inode_id, layout, lease_epoch, expires_at_ms, generation) = result;
-        let session = match opening.activate(inode_id, lease_epoch, expires_at_ms, layout, generation) {
+        let (inode_id, block_size, lease_epoch, expires_at_ms, generation) = result;
+        let session = match opening.activate(inode_id, lease_epoch, expires_at_ms, block_size, generation) {
             Ok(session) => session,
             Err(WriteOpeningError::Expired | WriteOpeningError::NotCurrent | WriteOpeningError::TargetLimit) => {
                 return self.failure_from_error(
@@ -747,7 +746,7 @@ impl MetadataFileSystem {
             CreatedFileOutput {
                 inode_id: session.inode_id,
                 lease_epoch: session.lease_epoch,
-                layout: session.layout,
+                block_size: session.block_size,
                 expires_at_ms: session.expires_at_ms,
                 generation: session.generation,
             },
@@ -948,17 +947,11 @@ mod tests {
                 .unwrap();
         }
         storage
-            .put_inode(&Inode::new_file(
-                file_inode_id,
-                InodeAttrs::new(),
-                mount_id,
-                beryl_types::FileLayout::new(4096),
-            ))
+            .put_inode(&Inode::new_file(file_inode_id, InodeAttrs::new(), mount_id, 64))
             .unwrap();
         storage.put_dentry(parent_inode_id, "root", root_inode_id).unwrap();
         storage.put_dentry(root_inode_id, "nested", nested_inode_id).unwrap();
         storage.put_dentry(nested_inode_id, "file", file_inode_id).unwrap();
-        storage.put_layout(file_inode_id, FileLayout::new(64)).unwrap();
         install_write_session_with_ancestors(
             &filesystem,
             file_inode_id,
@@ -1006,15 +999,9 @@ mod tests {
             .put_inode(&Inode::new_dir(ROOT_INODE_ID, InodeAttrs::new(), mount_id))
             .unwrap();
         storage
-            .put_inode(&Inode::new_file(
-                file_inode_id,
-                InodeAttrs::new(),
-                mount_id,
-                beryl_types::FileLayout::new(4096),
-            ))
+            .put_inode(&Inode::new_file(file_inode_id, InodeAttrs::new(), mount_id, 64))
             .unwrap();
         storage.put_dentry(ROOT_INODE_ID, "file", file_inode_id).unwrap();
-        storage.put_layout(file_inode_id, FileLayout::new(64)).unwrap();
 
         let open_ctx = request_context();
         let delete_ctx = request_context();
@@ -1081,17 +1068,11 @@ mod tests {
                 .unwrap();
         }
         storage
-            .put_inode(&Inode::new_file(
-                file_inode_id,
-                InodeAttrs::new(),
-                mount_id,
-                beryl_types::FileLayout::new(4096),
-            ))
+            .put_inode(&Inode::new_file(file_inode_id, InodeAttrs::new(), mount_id, 64))
             .unwrap();
         storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
         storage.put_dentry(source_inode_id, "nested", nested_inode_id).unwrap();
         storage.put_dentry(nested_inode_id, "file", file_inode_id).unwrap();
-        storage.put_layout(file_inode_id, FileLayout::new(64)).unwrap();
         install_write_session_with_ancestors(
             &filesystem,
             file_inode_id,
@@ -1148,18 +1129,12 @@ mod tests {
                 .unwrap();
         }
         storage
-            .put_inode(&Inode::new_file(
-                file_inode_id,
-                InodeAttrs::new(),
-                mount_id,
-                beryl_types::FileLayout::new(4096),
-            ))
+            .put_inode(&Inode::new_file(file_inode_id, InodeAttrs::new(), mount_id, 64))
             .unwrap();
         storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
         storage.put_dentry(parent_inode_id, "target", target_inode_id).unwrap();
         storage.put_dentry(target_inode_id, "nested", nested_inode_id).unwrap();
         storage.put_dentry(nested_inode_id, "file", file_inode_id).unwrap();
-        storage.put_layout(file_inode_id, FileLayout::new(64)).unwrap();
         install_write_session_with_ancestors(
             &filesystem,
             file_inode_id,

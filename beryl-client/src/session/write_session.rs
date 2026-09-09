@@ -6,7 +6,7 @@
 use crate::error::{ClientError, ClientResult};
 use crate::runtime::context::{Operation, OperationContext, OperationDeadline};
 use beryl_types::{
-    BlockId, BlockShape, CallId, ClientId, CommittedBlock, ContentGeneration, FileLayout, InodeId, LocatedBlock,
+    validate_block_size, BlockId, CallId, ClientId, CommittedBlock, ContentGeneration, InodeId, LocatedBlock,
     WriteHandle, WriteMode,
 };
 use std::fmt::{Debug, Formatter, Result};
@@ -19,7 +19,7 @@ const LEASE_EXPIRY_SAFETY_WINDOW_MS: u64 = 1_000;
 pub(crate) struct WriteSession {
     path: String,
     inode_id: InodeId,
-    layout: FileLayout,
+    block_size: u32,
     generation: ContentGeneration,
     mode: WriteMode,
     write_handle: WriteHandle,
@@ -37,10 +37,10 @@ pub(crate) struct WriteSession {
 
 impl WriteSession {
     /// Create a session from Metadata state whose handle passed wire validation.
-    /// Layout and expiry are checked before accepting further write operations.
+    /// Capacity and expiry are checked before accepting further write operations.
     pub(crate) fn new(
         path: String,
-        layout: FileLayout,
+        block_size: u32,
         write_handle: WriteHandle,
         base_size: u64,
         expires_at_ms: u64,
@@ -53,13 +53,12 @@ impl WriteSession {
                 "write session expires_at_ms must be non-zero".to_string(),
             ));
         }
-        layout
-            .validate()
-            .map_err(|err| ClientError::invalid_layout(format!("write session layout invalid: {err}")))?;
+        validate_block_size(u64::from(block_size))
+            .map_err(|err| ClientError::invalid_layout(format!("write session block size invalid: {err}")))?;
         Ok(Self {
             path,
             inode_id,
-            layout,
+            block_size,
             generation,
             mode,
             write_handle,
@@ -117,30 +116,12 @@ impl WriteSession {
                 self.flush_cursor, target.file_offset
             )));
         }
-        BlockShape::new(
-            target.block_format_id,
-            target.block_size,
-            target.chunk_size,
-            target.block_size,
-        )
-        .map_err(|err| ClientError::invalid_layout(format!("write target has invalid shape: {err}")))?;
-        let storage_chunk_size = self
-            .layout
-            .block_format_id
-            .storage_chunk_size()
-            .map_err(|err| ClientError::invalid_layout(format!("session block format is invalid: {err}")))?;
-        if target.block_format_id != self.layout.block_format_id
-            || target.block_size != u64::from(self.layout.block_size)
-            || target.chunk_size != storage_chunk_size
-        {
+        validate_block_size(target.block_size)
+            .map_err(|err| ClientError::invalid_layout(format!("write target has invalid shape: {err}")))?;
+        if target.block_size != u64::from(self.block_size) {
             return Err(ClientError::invalid_layout(format!(
-                "write target layout does not match session layout: target=({}, {}, {}), session=({}, {}, {})",
-                target.block_format_id.as_raw(),
-                target.block_size,
-                target.chunk_size,
-                self.layout.block_format_id.as_raw(),
-                self.layout.block_size,
-                storage_chunk_size
+                "write target capacity {} differs from session capacity {}",
+                target.block_size, self.block_size
             )));
         }
         let block = target.block_id;
@@ -165,8 +146,7 @@ impl WriteSession {
         group: beryl_types::GroupName,
         tail: Option<LocatedBlock>,
     ) -> ClientResult<()> {
-        let needs_tail =
-            self.mode == WriteMode::Append && !self.base_size.is_multiple_of(u64::from(self.layout.block_size));
+        let needs_tail = self.mode == WriteMode::Append && !self.base_size.is_multiple_of(u64::from(self.block_size));
         if needs_tail != tail.is_some() {
             return Err(ClientError::invalid_layout("OpenWrite tail does not match file length"));
         }
@@ -862,7 +842,7 @@ mod tests {
     fn new_session(expires_at_ms: u64) -> WriteSession {
         WriteSession::new(
             "/alpha".to_string(),
-            test_layout(),
+            1024,
             write_handle(302),
             0,
             expires_at_ms,
@@ -870,10 +850,6 @@ mod tests {
             WriteMode::Overwrite,
         )
         .expect("session")
-    }
-
-    fn test_layout() -> FileLayout {
-        FileLayout::new(1024)
     }
 
     fn write_handle(inode_id: u64) -> WriteHandle {

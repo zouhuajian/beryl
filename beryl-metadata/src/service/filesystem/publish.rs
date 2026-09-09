@@ -969,8 +969,8 @@ impl MetadataFileSystem {
                 "expected file size does not match session".into(),
             ));
         }
-        let count = crate::inode::FileData::block_count(intent.final_size, session.layout.block_size)?;
-        let capacity = u64::from(session.layout.block_size);
+        let count = crate::inode::FileData::block_count(intent.final_size, session.block_size)?;
+        let capacity = u64::from(session.block_size);
         let start = if session.mode == WriteMode::Overwrite {
             0
         } else if intent.final_size == session.base_size && intent.committed_blocks.is_empty() {

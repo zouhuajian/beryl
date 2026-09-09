@@ -294,7 +294,7 @@ async fn create_replay_survives_restart_and_session_operations_converge() {
         .expect("replayed CreateFile")
         .into_inner();
     assert_metadata_ok(replay_create.header);
-    assert_eq!(replay_create.layout, create.layout);
+    assert_eq!(replay_create.block_size, create.block_size);
     assert_eq!(replay_create.write_handle, create.write_handle);
     assert_eq!(replay_create.expires_at_ms, create.expires_at_ms);
     assert_eq!(replay_create.generation, create.generation);
@@ -409,7 +409,6 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
             write_handle: Some(new_handle),
             committed_blocks: vec![CommittedBlockProto {
                 block_id: Some(block_id),
-
                 len: payload.len() as u64,
             }],
             final_size: payload.len() as u64,
@@ -718,7 +717,6 @@ async fn raw_create_worker_ready_block(
     write_worker_target(&target, payload).await?;
     let committed_block = CommittedBlockProto {
         block_id: target.block_id,
-
         len: payload.len() as u64,
     };
 
@@ -796,9 +794,7 @@ async fn write_worker_target(target: &LocatedBlockProto, payload: &[u8]) -> Test
                     group_name: "root".to_string(),
                     block_id: target.block_id,
                     worker_run_id: worker.worker_run_id,
-                    block_format_id: target.block_format_id,
                     block_size: target.block_size,
-                    chunk_size: target.chunk_size,
                     fencing_token: target.fencing_token,
                     write_offset: target.write_offset,
                     tier: target.tier,

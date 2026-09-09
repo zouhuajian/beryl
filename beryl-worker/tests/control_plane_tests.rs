@@ -17,7 +17,6 @@ use beryl_proto::metadata::{
 use beryl_proto::worker::worker_data_service_server::WorkerDataService;
 use beryl_proto::worker::ReadBlockRequestProto;
 use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
-use beryl_types::layout::BlockFormatId;
 use beryl_types::range::ByteRange;
 use beryl_types::{GroupName, Tier, WorkerRunId};
 use beryl_worker::config::{StoreDirConfig, WorkerConfig, WorkerRegistrationConfig};
@@ -28,8 +27,8 @@ use beryl_worker::control::{
 use beryl_worker::net::protocol::WorkerNetProtocol;
 use beryl_worker::net::server::grpc::WorkerDataServiceImpl;
 use beryl_worker::store::block::{
-    CheckpointBlockRequest, ChecksumKind, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
-    OpenBlockWriteRequest, ReclaimBlockRequest,
+    CheckpointBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore, OpenBlockWriteRequest,
+    ReclaimBlockRequest,
 };
 use beryl_worker::store::dirs::StoreDirs;
 use beryl_worker::{ReclaimBlockResult, WorkerCore};
@@ -51,10 +50,6 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 const BLOCK_SIZE: u64 = 4096;
-
-fn chunk_size() -> u32 {
-    BlockFormatId::DURABLE_PREFIX.storage_chunk_size().unwrap()
-}
 
 fn block_id() -> BlockId {
     BlockId::new(InodeId::new(7), BlockIndex::new(3))
@@ -452,9 +447,6 @@ fn publish_ready_block_for(
             group_name: group_name.clone(),
             block_id,
             block_size: BLOCK_SIZE,
-            block_format_id: BlockFormatId::DURABLE_PREFIX,
-            chunk_size: chunk_size(),
-            checksum_kind: ChecksumKind::None,
             tier: Tier::Hdd,
         })
         .expect("create staging block");
@@ -826,10 +818,7 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_absent() {
             block_id: Some(block_id().into()),
             worker_run_id: worker_run_id.to_string(),
             byte_range: Some(ByteRange { offset: 0, len: 1 }.into()),
-
-            block_format_id: BlockFormatId::DURABLE_PREFIX.as_raw(),
             block_size: BLOCK_SIZE,
-            chunk_size: chunk_size(),
             effective_len: BLOCK_SIZE,
             frame_size: 1024,
         }))

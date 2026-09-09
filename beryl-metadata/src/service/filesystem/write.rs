@@ -5,7 +5,7 @@
 
 use super::command::unexpected_raft_apply_success;
 use super::{
-    missing_resolved_target_error, validate_active_write_layout, worker_endpoint_from_parts, AdmissionFailure,
+    missing_resolved_target_error, validate_active_write_block_size, worker_endpoint_from_parts, AdmissionFailure,
     Freshness, FsResult, FsSuccess, MetadataFileSystem, RequestContext, WriteHandle, SUPPORTED_REPLICA_COUNT,
 };
 use crate::error::MetadataError;
@@ -20,19 +20,18 @@ use crate::session_registry::{
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
 use beryl_common::header::CallerContextFields;
 use beryl_types::ids::{BlockId, InodeId};
-use beryl_types::layout::FileLayout;
 use beryl_types::lease::FencingToken;
-use beryl_types::{ContentGeneration, LeaseEpoch, LocatedBlock, WriteMode};
+use beryl_types::{ContentGeneration, GroupName, LeaseEpoch, LocatedBlock, Tier, WorkerId, WorkerRunId, WriteMode};
 
 /// Exact stream facts checked against the active session and durable inode authority.
 pub(crate) struct AuthorizeBlockWriteArgs {
-    pub group_name: beryl_types::GroupName,
-    pub worker_id: beryl_types::WorkerId,
-    pub worker_run_id: beryl_types::WorkerRunId,
+    pub group_name: GroupName,
+    pub worker_id: WorkerId,
+    pub worker_run_id: WorkerRunId,
     pub fencing_token: FencingToken,
     pub write_offset: u64,
-    pub shape: beryl_types::layout::BlockShape,
-    pub tier: beryl_types::Tier,
+    pub block_size: u64,
+    pub tier: Tier,
 }
 
 /// Acquired writer authority and visible base returned to the client.
@@ -40,7 +39,7 @@ pub(crate) struct AuthorizeBlockWriteArgs {
 pub(crate) struct OpenWriteOutput {
     pub(crate) inode_id: InodeId,
     pub(crate) lease_epoch: LeaseEpoch,
-    pub(crate) layout: FileLayout,
+    pub(crate) block_size: u32,
     pub(crate) base_size: u64,
     pub(crate) expires_at_ms: u64,
     pub(crate) generation: ContentGeneration,
@@ -117,9 +116,7 @@ impl MetadataFileSystem {
                     .find(|target| target.block_id == args.fencing_token.block_id)
                     .ok_or_else(invalid)?;
                 if target.fencing_token != args.fencing_token
-                    || target.block_size != args.shape.block_size
-                    || target.block_format_id != args.shape.block_format_id
-                    || target.chunk_size != args.shape.chunk_size
+                    || target.block_size != args.block_size
                     || target.tier != args.tier
                     || args.write_offset < target.write_offset
                     || args.write_offset >= target.block_size
@@ -567,13 +564,13 @@ impl MetadataFileSystem {
             Err(err) => return Err(err),
         };
 
-        let layout = match self.read_layout(inode_id) {
-            Ok(layout) => layout,
+        let block_size = match self.storage.get_block_size(inode_id) {
+            Ok(block_size) => block_size,
             Err(err) => {
                 return self.failure_from_error(ctx, err, group_name, mount_epoch);
             }
         };
-        if let Err(err) = validate_active_write_layout(&layout) {
+        if let Err(err) = validate_active_write_block_size(block_size) {
             return self.failure_from_error(ctx, err, group_name, mount_epoch);
         }
 
@@ -589,7 +586,7 @@ impl MetadataFileSystem {
             current_lease_epoch: base_epoch,
             mode,
             open_client_id: caller_ctx.client.client_id,
-            layout,
+            block_size,
             ancestor_inode_ids,
         }) {
             Ok(opening) => opening,
@@ -690,7 +687,7 @@ impl MetadataFileSystem {
             }
             Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
         };
-        let tail_block = if mode == WriteMode::Append && file.len % u64::from(file.layout.block_size) != 0 {
+        let tail_block = if mode == WriteMode::Append && file.len % u64::from(file.block_size) != 0 {
             let group =
                 self.require_worker_lookup_group(ctx, group_name.clone(), mount_epoch, route_epoch, "OpenWrite")?;
             match self.locate_append_tail(&group, file, ctx.caller.client.client_id, lease_epoch) {
@@ -756,7 +753,7 @@ impl MetadataFileSystem {
             op: PlacementOp::Read,
             block_id,
             visible_len: len,
-            layout: file.layout,
+            block_size: file.block_size,
             caller: None,
             existing: manager.reported_block_locations(group_name, block_id),
             exclude_workers: Vec::new(),
@@ -793,17 +790,12 @@ impl MetadataFileSystem {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(LocatedBlock {
             block_id,
-            file_offset: ordinal as u64 * u64::from(file.layout.block_size),
-            block_size: u64::from(file.layout.block_size),
+            file_offset: ordinal as u64 * u64::from(file.block_size),
+            block_size: u64::from(file.block_size),
             worker_endpoints,
             fencing_token: FencingToken::new(block_id, owner, epoch),
             write_offset: len,
-            chunk_size: file
-                .layout
-                .block_format_id
-                .storage_chunk_size()
-                .map_err(|e| MetadataError::Internal(e.to_string()))?,
-            block_format_id: file.layout.block_format_id,
+
             tier,
         })
     }
@@ -958,20 +950,9 @@ impl MetadataFileSystem {
                 return self.failure_from_error(ctx, error, group_name, mount_epoch);
             }
         };
-        let layout = reservation.layout();
+        let block_size = reservation.block_size();
         let file_offset = reservation.file_offset();
         let open_client_id = reservation.open_client_id();
-        let storage_chunk_size = match layout.block_format_id.storage_chunk_size() {
-            Ok(chunk_size) => chunk_size,
-            Err(error) => {
-                return self.failure_from_error(
-                    ctx,
-                    MetadataError::Internal(format!("active write layout has an unknown block format: {error}")),
-                    group_name,
-                    mount_epoch,
-                )
-            }
-        };
         let block_id = match self.propose_block_allocation(inode_id, lease_epoch).await {
             Ok(block_id) => block_id,
             Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
@@ -986,7 +967,7 @@ impl MetadataFileSystem {
             op: PlacementOp::Write,
             block_id,
             visible_len: 0,
-            layout,
+            block_size,
             caller: ctx
                 .caller
                 .caller_context
@@ -1042,7 +1023,7 @@ impl MetadataFileSystem {
         let target = LocatedBlock {
             block_id,
             file_offset,
-            block_size: u64::from(layout.block_size),
+            block_size: u64::from(block_size),
             worker_endpoints,
             fencing_token: FencingToken {
                 block_id,
@@ -1050,8 +1031,7 @@ impl MetadataFileSystem {
                 epoch: lease_epoch,
             },
             write_offset: 0,
-            chunk_size: storage_chunk_size,
-            block_format_id: layout.block_format_id,
+
             tier,
         };
         let target = match reservation.complete(target) {
@@ -1089,7 +1069,7 @@ fn open_write_output(session: &WriteSession) -> OpenWriteOutput {
     OpenWriteOutput {
         inode_id: session.inode_id,
         lease_epoch: session.lease_epoch,
-        layout: session.layout,
+        block_size: session.block_size,
         base_size: session.base_size,
         expires_at_ms: session.expires_at_ms,
         generation: session.generation,
@@ -1248,14 +1228,8 @@ mod tests {
         let third_inode_id = InodeId::new(492);
         for inode_id in [first_inode_id, second_inode_id, third_inode_id] {
             storage
-                .put_inode(&Inode::new_file(
-                    inode_id,
-                    InodeAttrs::new(),
-                    mount_id,
-                    beryl_types::FileLayout::new(4096),
-                ))
+                .put_inode(&Inode::new_file(inode_id, InodeAttrs::new(), mount_id, 4096))
                 .unwrap();
-            storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();
         }
 
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name("g6"));
@@ -1366,17 +1340,11 @@ mod tests {
                 .unwrap();
         }
         storage
-            .put_inode(&Inode::new_file(
-                file_inode_id,
-                InodeAttrs::new(),
-                mount_id,
-                beryl_types::FileLayout::new(4096),
-            ))
+            .put_inode(&Inode::new_file(file_inode_id, InodeAttrs::new(), mount_id, 64))
             .unwrap();
         storage.put_dentry(ROOT_INODE_ID, "old", old_parent_inode_id).unwrap();
         storage.put_dentry(ROOT_INODE_ID, "new", new_parent_inode_id).unwrap();
         storage.put_dentry(old_parent_inode_id, "file", file_inode_id).unwrap();
-        storage.put_layout(file_inode_id, FileLayout::new(64)).unwrap();
 
         let open_path = "/old/file";
         let resolved = filesystem.path_resolver.resolve_path(open_path).unwrap();
@@ -1430,14 +1398,8 @@ mod tests {
         let group_name_value = group_name("g9");
         let inode_id = InodeId::new(510);
         storage
-            .put_inode(&Inode::new_file(
-                inode_id,
-                InodeAttrs::new(),
-                mount_id,
-                beryl_types::FileLayout::new(4096),
-            ))
+            .put_inode(&Inode::new_file(inode_id, InodeAttrs::new(), mount_id, 4096))
             .unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();
 
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
         let mount_table = builder.mount_table();
@@ -1467,6 +1429,9 @@ mod tests {
         assert!(session.issued_targets.is_empty());
         assert_eq!(success.payload.inode_id, inode_id);
         assert_eq!(session.inode_id, inode_id);
+        assert_ne!(filesystem.file_block_size, 4096);
+        assert_eq!(success.payload.block_size, 4096);
+        assert_eq!(session.block_size, 4096);
 
         let persisted_epoch = storage
             .get_inode(inode_id)
@@ -1503,14 +1468,8 @@ mod tests {
         let group_name_value = group_name("g10");
         let inode_id = InodeId::new(550);
         storage
-            .put_inode(&Inode::new_file(
-                inode_id,
-                InodeAttrs::new(),
-                mount_id,
-                beryl_types::FileLayout::new(4096),
-            ))
+            .put_inode(&Inode::new_file(inode_id, InodeAttrs::new(), mount_id, 4096))
             .unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();
 
         let worker_manager = Arc::new(WorkerManager::new(60_000));
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);

@@ -28,14 +28,6 @@ message ClientIdProto {
 // Common Data Structures
 // ============================================================================
 
-/// Metadata-selected logical layout persisted with one file inode.
-message FileLayoutProto {
-  uint32 block_size = 1;
-  // Metadata-selected Beryl block data/meta interpretation format for new
-  // blocks of this file. Worker format parameters are derived from it.
-  uint32 block_format_id = 2;
-}
-
 /// Worker endpoint information for client access.
 message WorkerEndpointInfoProto {
   uint64 worker_id = 1;

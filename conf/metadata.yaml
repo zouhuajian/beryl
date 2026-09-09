@@ -19,8 +19,9 @@ beryl.metadata.http.port: 18081
 beryl.metadata.write-session.max-active: 1024
 beryl.metadata.write-session.max-active-per-client: 64
 
-# -------------------- File layout --------------------
-beryl.file.block-size.default: 64MiB
+# -------------------- New-file block capacity --------------------
+# Persisted at creation; changes affect new files only.
+beryl.file.block-size: 64MiB
 
 # -------------------- Write-target limits --------------------
 beryl.metadata.write-target.max-outstanding: 65536

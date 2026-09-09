@@ -40,14 +40,12 @@ message ReadBlockRequestProto {
   // Metadata-confirmed worker process-run identity for the selected endpoint.
   string worker_run_id = 5;
 
-  // Metadata-issued expected block layout facts from the authoritative FileLayout.
-  uint32 block_format_id = 6;
-  uint64 block_size = 7;
-  uint32 chunk_size = 8;
-  uint64 effective_len = 9;
+  // Logical capacity and readable prefix authorized by Metadata.
+  uint64 block_size = 6;
+  uint64 effective_len = 7;
 
   // Stable metadata group name for the local block-store lookup.
-  string group_name = 10;
+  string group_name = 8;
 }
 
 // One ordered payload from a ReadBlock response stream. Normal stream
@@ -64,12 +62,10 @@ message WriteBlockCommandProto {
   string group_name = 2;
   common.BlockIdProto block_id = 3;
   string worker_run_id = 4;
-  uint32 block_format_id = 5;
-  uint64 block_size = 6;
-  uint32 chunk_size = 7;
-  common.FencingTokenProto fencing_token = 8;
-  uint64 write_offset = 9;
-  common.TierProto tier = 10;
+  uint64 block_size = 5;
+  common.FencingTokenProto fencing_token = 6;
+  uint64 write_offset = 7;
+  common.TierProto tier = 8;
 }
 
 // One ordered request payload. The first payload must be command and every

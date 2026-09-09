@@ -3,14 +3,13 @@
 
 //! Public filesystem-facing facade.
 
-use std::fmt;
-use std::sync::Arc;
-
 use super::{DeleteOptions, FileReader, FileStatus, FileWriter, ListStatusIterator, ListStatusOptions, MkdirOptions};
 use crate::api::path::NamespacePathBuf;
 use crate::client_inner::ClientInner;
 use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
+use std::fmt;
+use std::sync::Arc;
 
 /// Public filesystem-facing client facade.
 #[derive(Clone)]
@@ -125,7 +124,7 @@ impl FsClient {
 
     /// Opens an existing file for reads and returns a file reader.
     ///
-    /// Existing files use the metadata-stored `FileLayout`; there are no
+    /// Existing files use the metadata-stored block capacity; there are no
     /// public read-open options until they carry real behavior.
     pub async fn open(&self, path: &str) -> ClientResult<FileReader> {
         let path = NamespacePathBuf::parse(path)?;
@@ -142,7 +141,7 @@ impl FsClient {
 
     /// Opens an append write session for an existing file.
     ///
-    /// Append uses the metadata-stored `FileLayout` and does not send a new
+    /// Append uses the metadata-stored block capacity and does not send a new
     /// layout override.
     pub async fn append(&self, path: &str) -> ClientResult<FileWriter> {
         let path = NamespacePathBuf::parse(path)?;

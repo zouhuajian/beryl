@@ -9,8 +9,8 @@ use beryl_client::{
 use beryl_common::error::rpc::{ErrorKind, InternalErrorKind, MetadataErrorKind, RefreshHint, RpcErrorDetail};
 use beryl_common::header::{HEADER_PRE_HANDLER_REJECTION, PRE_HANDLER_REJECTION_RPC_CONCURRENCY};
 use beryl_proto::common::{
-    BlockIdProto, ClientIdProto, FencingTokenProto, FileLayoutProto, GroupStateWatermarkProto, RaftLogIdProto,
-    TierProto, WorkerEndpointInfoProto,
+    BlockIdProto, ClientIdProto, FencingTokenProto, GroupStateWatermarkProto, RaftLogIdProto, TierProto,
+    WorkerEndpointInfoProto,
 };
 use beryl_proto::metadata::{
     AbortFileWriteResponseProto, AllocateBlockResponseProto, CommitFileResponseProto, CreateDirectoryResponseProto,
@@ -18,7 +18,6 @@ use beryl_proto::metadata::{
     GetStatusResponseProto, LocatedBlockProto, MsyncResponseProto, OpenFileResponseProto, RenewLeaseResponseProto,
     SyncWriteResponseProto, WriteHandleProto,
 };
-use beryl_types::BlockFormatId;
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -270,14 +269,13 @@ async fn reader_replans_without_advancing_position_and_rejects_local_bounds_befo
 
 #[tokio::test]
 async fn malformed_create_and_allocate_block_successes_fail_closed_before_worker_io() {
-    let mut missing_layout = create_response(301, 8);
-    missing_layout.layout = None;
+    let invalid_capacity = create_response(301, 0);
     let mut zero_inode = create_response(301, 8);
     zero_inode.write_handle.as_mut().unwrap().inode_id = 0;
     let mut zero_epoch = create_response(301, 8);
     zero_epoch.write_handle.as_mut().unwrap().write_lease_epoch = 0;
     let metadata = MockMetadata::new(MetadataScript {
-        create_file: [missing_layout, zero_inode, zero_epoch, create_response(302, 8)]
+        create_file: [invalid_capacity, zero_inode, zero_epoch, create_response(302, 8)]
             .into_iter()
             .map(MetadataReply::success)
             .collect(),
@@ -291,7 +289,7 @@ async fn malformed_create_and_allocate_block_successes_fail_closed_before_worker
     let client = FsClient::new(client_config(server.endpoint(), 1)).expect("client");
 
     for field in [
-        "layout missing",
+        "block_size must be non-zero",
         "inode_id must be non-zero",
         "write_lease_epoch must be non-zero",
     ] {
@@ -579,7 +577,7 @@ fn status_response(size: u64) -> GetStatusResponseProto {
 
 fn create_response(inode_id: u64, block_size: u32) -> CreateFileResponseProto {
     CreateFileResponseProto {
-        layout: Some(file_layout(block_size)),
+        block_size,
         write_handle: Some(write_handle(inode_id)),
         expires_at_ms: unix_now_ms() + 60_000,
         generation: 0,
@@ -617,16 +615,12 @@ fn block_location(
     len: u64,
     worker_endpoint: &str,
 ) -> FileBlockLocationProto {
-    let format = BlockFormatId::CURRENT_FOR_NEW_FILE;
     FileBlockLocationProto {
         block_id: Some(BlockIdProto { inode_id, block_index }),
         file_offset,
         len,
         workers: vec![worker(worker_endpoint)],
-
-        block_format_id: format.as_raw(),
         block_size: 64 * 1024 * 1024,
-        chunk_size: format.storage_chunk_size().expect("block format"),
         effective_len: len,
     }
 }
@@ -639,14 +633,12 @@ fn write_target(
     block_size: u64,
 ) -> LocatedBlockProto {
     let block_id = BlockIdProto { inode_id, block_index };
-    let format = BlockFormatId::CURRENT_FOR_NEW_FILE;
     LocatedBlockProto {
         write_offset: 0,
         block_id: Some(block_id),
         file_offset,
-        block_format_id: format.as_raw(),
+
         block_size,
-        chunk_size: format.storage_chunk_size().expect("block format"),
 
         worker_endpoints: vec![worker(worker_endpoint)],
         fencing_token: Some(FencingTokenProto {
@@ -663,13 +655,6 @@ fn worker(endpoint: &str) -> WorkerEndpointInfoProto {
         worker_id: 1,
         endpoint: endpoint.to_string(),
         worker_run_id: WORKER_RUN_ID.to_string(),
-    }
-}
-
-fn file_layout(block_size: u32) -> FileLayoutProto {
-    FileLayoutProto {
-        block_size,
-        block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
     }
 }
 

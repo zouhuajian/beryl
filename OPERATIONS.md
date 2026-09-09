@@ -200,6 +200,16 @@ Placement failure after durable allocation can leave a permanent block-index gap
 The shipped defaults are `65536` globally and `10000` per session. The
 per-session value cannot exceed the compiled file extent maximum.
 
+`beryl.file.block-size` sets the logical capacity of newly created files
+(default `64MiB`, maximum `1GiB`). Metadata persists the capacity in each file;
+changing the setting does not resize existing files or their append targets.
+Transport frame sizes are independent of this capacity. Worker data and
+checkpoint encoding is versioned locally in the `BRYL` header.
+
+Metadata storage schema 5 and Worker local format 3 reject older persisted
+encodings. There is no automatic data migration or directory cleanup. Keep old
+data with its matching binaries; use separate fresh storage for a clean installation.
+
 The current alpha supports clean installation and same-version restart only.
 Do not perform an in-place upgrade, downgrade, mixed-version deployment, or
 rollback with these procedures.

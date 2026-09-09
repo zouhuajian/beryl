@@ -588,7 +588,6 @@ mod tests {
     use super::*;
     use crate::inode::InodeAttrs;
     use crate::session_registry::CreateFileOperationId;
-    use beryl_types::FileLayout;
 
     use beryl_types::{CallId, ClientId, ContentGeneration, LeaseEpoch, MountId};
     use openraft::{LeaderId, LogId};
@@ -609,15 +608,6 @@ mod tests {
             db.put_cf(cf, b"route_epoch", value)
                 .map_err(|e| MetadataError::Internal(format!("RocksDB error: {}", e)))?;
             Ok(())
-        }
-
-        /// Set fixture layout through the same inode value used by production.
-        pub fn put_layout(&self, inode_id: InodeId, layout: FileLayout) -> MetadataResult<()> {
-            let mut inode = self
-                .get_inode(inode_id)?
-                .ok_or_else(|| MetadataError::NotFound("inode missing".into()))?;
-            inode.file_mut()?.layout = layout;
-            self.put_inode(&inode)
         }
 
         /// Put mount entry.
@@ -784,7 +774,7 @@ mod tests {
             mount_root_inode_id: InodeId::new(10),
             relative_components: vec![name],
             lease_epoch: LeaseEpoch::new(1),
-            layout: FileLayout::new(4096),
+            block_size: 4096,
             generation: ContentGeneration::new(0),
             expires_at_ms,
         }
@@ -846,12 +836,7 @@ mod tests {
                 allocation,
                 parent_inode_id,
                 &rejected.name,
-                &Inode::new_file(
-                    allocation.inode_id,
-                    InodeAttrs::new(),
-                    MountId::new(1),
-                    beryl_types::FileLayout::new(4096),
-                ),
+                &Inode::new_file(allocation.inode_id, InodeAttrs::new(), MountId::new(1), 4096),
                 &parent,
                 &rejected,
                 100,
@@ -882,12 +867,7 @@ mod tests {
                 allocation,
                 parent_inode_id,
                 &replacement.name,
-                &Inode::new_file(
-                    allocation.inode_id,
-                    InodeAttrs::new(),
-                    MountId::new(1),
-                    beryl_types::FileLayout::new(4096),
-                ),
+                &Inode::new_file(allocation.inode_id, InodeAttrs::new(), MountId::new(1), 4096),
                 &parent,
                 &replacement,
                 100,
@@ -916,8 +896,8 @@ mod tests {
             Some(replacement.inode_id)
         );
         assert_eq!(
-            storage.get_layout_optional(replacement.inode_id).unwrap(),
-            Some(replacement.layout)
+            storage.get_block_size_optional(replacement.inode_id).unwrap(),
+            Some(replacement.block_size)
         );
         assert_eq!(storage.get_next_inode_id().unwrap(), Some(InodeId::new(12)));
     }
@@ -931,12 +911,7 @@ mod tests {
         storage.put_inode(&parent).unwrap();
         storage.set_next_inode_id(InodeId::new(11)).unwrap();
         let allocation = storage.prepare_inode_allocation().unwrap();
-        let existing = Inode::new_file(
-            allocation.inode_id,
-            InodeAttrs::new(),
-            MountId::new(1),
-            beryl_types::FileLayout::new(4096),
-        );
+        let existing = Inode::new_file(allocation.inode_id, InodeAttrs::new(), MountId::new(1), 4096);
         storage.put_inode(&existing).unwrap();
         let applied_before = storage.load_raft_state().unwrap();
         let rejected_applied_state = AppMetadataRaftState {
@@ -950,12 +925,7 @@ mod tests {
                 allocation,
                 parent_inode_id,
                 &replay_record.name,
-                &Inode::new_file(
-                    allocation.inode_id,
-                    InodeAttrs::new(),
-                    MountId::new(1),
-                    beryl_types::FileLayout::new(4096),
-                ),
+                &Inode::new_file(allocation.inode_id, InodeAttrs::new(), MountId::new(1), 4096),
                 &parent,
                 &replay_record,
                 1,

@@ -76,21 +76,20 @@ impl RocksDBStorage {
         }
     }
 
-    /// Load the layout for a specific inode.
-    pub fn get_layout(&self, inode_id: InodeId) -> MetadataResult<FileLayout> {
+    /// Load a validated file capacity; missing files and directories return NotFound.
+    pub fn get_block_size(&self, inode_id: InodeId) -> MetadataResult<u32> {
         let _generation = self.pin_generation()?;
-        self.get_layout_optional(inode_id)?
-            .ok_or_else(|| MetadataError::NotFound(format!("Layout not found for inode {}", inode_id)))
+        self.get_block_size_optional(inode_id)?
+            .ok_or_else(|| MetadataError::NotFound(format!("Block capacity not found for inode {}", inode_id)))
     }
 
-    pub(crate) fn get_layout_optional(&self, inode_id: InodeId) -> MetadataResult<Option<FileLayout>> {
+    pub(crate) fn get_block_size_optional(&self, inode_id: InodeId) -> MetadataResult<Option<u32>> {
         self.get_inode(inode_id)?
             .map(|inode| match inode.kind {
                 crate::inode::InodeKind::File(file) => {
-                    file.layout
-                        .validate()
-                        .map_err(|error| MetadataError::Internal(format!("invalid file layout: {error}")))?;
-                    Ok(Some(file.layout))
+                    beryl_types::validate_block_size(u64::from(file.block_size))
+                        .map_err(|error| MetadataError::Internal(format!("invalid file block size: {error}")))?;
+                    Ok(Some(file.block_size))
                 }
                 crate::inode::InodeKind::Dir => Ok(None),
             })

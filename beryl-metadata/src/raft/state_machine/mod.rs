@@ -25,7 +25,6 @@ use crate::raft::types::AppMetadataRaftState;
 use crate::raft::RoutingDelta;
 use crate::session_registry::CreateFileOperationId;
 use beryl_types::ids::{BlockId, BlockIndex, InodeId, MountId, WorkerId};
-use beryl_types::layout::FileLayout;
 use beryl_types::GroupName;
 use std::sync::Arc;
 
@@ -164,7 +163,7 @@ impl AppRaftStateMachine {
                 mount_root_inode_id,
                 relative_components,
                 attrs,
-                layout,
+                block_size,
             } => {
                 let result = self.apply_create(
                     operation_id,
@@ -176,13 +175,13 @@ impl AppRaftStateMachine {
                     mount_root_inode_id,
                     relative_components,
                     attrs,
-                    layout,
+                    block_size,
                     proposed_at_ms,
                     raft_state,
                 )?;
                 Ok(ApplySuccess::FileCreated {
                     inode_id: result.inode_id,
-                    layout: result.layout,
+                    block_size: result.block_size,
                     lease_epoch: result.lease_epoch,
                     expires_at_ms: result.expires_at_ms,
                     generation: result.generation,
@@ -324,7 +323,7 @@ pub(crate) mod tests {
     use crate::mount::MountEntry;
     use crate::raft::response::ApplyRejectionKind;
     pub(crate) use beryl_types::ids::{BlockId, InodeId, MountId, WorkerId};
-    pub(crate) use beryl_types::layout::FileLayout;
+
     pub(crate) use tempfile::TempDir;
 
     impl AppRaftStateMachine {
@@ -368,9 +367,11 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn expect_file_created(raw: ApplySuccess) -> (InodeId, FileLayout) {
+    pub(crate) fn expect_file_created(raw: ApplySuccess) -> (InodeId, u32) {
         match raw {
-            ApplySuccess::FileCreated { inode_id, layout, .. } => (inode_id, layout),
+            ApplySuccess::FileCreated {
+                inode_id, block_size, ..
+            } => (inode_id, block_size),
             other => panic!("unexpected apply response: {other:?}"),
         }
     }

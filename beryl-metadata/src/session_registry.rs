@@ -11,7 +11,7 @@ use crate::config::MetadataConfig;
 use crate::observe;
 use beryl_types::ids::{InodeId, MountId};
 use beryl_types::{
-    BlockId, BlockShape, CallId, ClientId, ContentGeneration, FileLayout, LeaseEpoch, LocatedBlock, WriteMode,
+    validate_block_size, BlockId, CallId, ClientId, ContentGeneration, LeaseEpoch, LocatedBlock, WriteMode,
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -42,8 +42,8 @@ pub struct WriteSession {
     pub mode: WriteMode,
     /// Client that owns the OpenWrite call.
     pub open_client_id: ClientId,
-    /// Layout returned by OpenWrite.
-    pub layout: FileLayout,
+    /// Immutable block capacity returned by OpenWrite.
+    pub block_size: u32,
     /// Exact lease expiry returned by OpenWrite.
     pub expires_at_ms: u64,
     /// Bounded mount-root-to-file chain captured while namespace topology was stable.
@@ -80,7 +80,7 @@ pub(crate) struct BeginSessionInput {
     pub current_lease_epoch: LeaseEpoch,
     pub mode: WriteMode,
     pub open_client_id: ClientId,
-    pub layout: FileLayout,
+    pub block_size: u32,
     pub ancestor_inode_ids: Vec<InodeId>,
 }
 
@@ -155,7 +155,7 @@ struct OpeningSession {
     proposed_lease_epoch: LeaseEpoch,
     mode: WriteMode,
     open_client_id: ClientId,
-    layout: FileLayout,
+    block_size: u32,
     expires_at_ms: u64,
     ancestor_inode_ids: Vec<InodeId>,
 }
@@ -305,7 +305,7 @@ pub(crate) struct WriteTargetReservation<'a> {
     inode_id: InodeId,
     lease_epoch: LeaseEpoch,
     pending: PendingAllocateBlock,
-    layout: FileLayout,
+    block_size: u32,
     open_client_id: ClientId,
     file_offset: u64,
     armed: bool,
@@ -404,9 +404,9 @@ impl WritePublication {
 }
 
 impl WriteTargetReservation<'_> {
-    /// Return the persisted layout that the allocated block must use.
-    pub(crate) fn layout(&self) -> FileLayout {
-        self.layout
+    /// Return the persisted block capacity that the allocated block must use.
+    pub(crate) fn block_size(&self) -> u32 {
+        self.block_size
     }
 
     /// Return the client identity embedded in the target fencing token.
@@ -486,7 +486,7 @@ pub(crate) enum BeginCreateSession<'a> {
 pub(crate) struct CreateSessionReplay {
     pub(crate) inode_id: InodeId,
     pub(crate) lease_epoch: LeaseEpoch,
-    pub(crate) layout: FileLayout,
+    pub(crate) block_size: u32,
     pub(crate) expires_at_ms: u64,
     pub(crate) generation: ContentGeneration,
 }
@@ -548,7 +548,7 @@ impl CreateOpening<'_> {
         inode_id: InodeId,
         lease_epoch: LeaseEpoch,
         expires_at_ms: u64,
-        layout: FileLayout,
+        block_size: u32,
         generation: ContentGeneration,
     ) -> Result<WriteSession, WriteOpeningError> {
         let result = self.registry.activate_create_opening(
@@ -557,7 +557,7 @@ impl CreateOpening<'_> {
             inode_id,
             lease_epoch,
             expires_at_ms,
-            layout,
+            block_size,
             generation,
             current_time_ms(),
         );
@@ -880,7 +880,7 @@ impl SessionRegistry {
             proposed_lease_epoch,
             mode: input.mode,
             open_client_id: input.open_client_id,
-            layout: input.layout,
+            block_size: input.block_size,
             expires_at_ms,
             ancestor_inode_ids: input.ancestor_inode_ids,
         };
@@ -922,7 +922,7 @@ impl SessionRegistry {
             });
         }
 
-        if file.lease_epoch != returned_lease_epoch || file.layout != opening.layout {
+        if file.lease_epoch != returned_lease_epoch || file.block_size != opening.block_size {
             return Err(WriteOpeningError::NotCurrent);
         }
         if tail.is_some() && state.outstanding_write_targets >= self.max_write_targets {
@@ -937,7 +937,7 @@ impl SessionRegistry {
             generation: file.generation,
             mode: opening.mode,
             open_client_id: opening.open_client_id,
-            layout: opening.layout,
+            block_size: opening.block_size,
             expires_at_ms: opening.expires_at_ms,
             ancestor_inode_ids: opening.ancestor_inode_ids,
             issued_targets: tail.into_iter().collect(),
@@ -971,7 +971,7 @@ impl SessionRegistry {
         inode_id: InodeId,
         lease_epoch: LeaseEpoch,
         expires_at_ms: u64,
-        layout: FileLayout,
+        block_size: u32,
         generation: ContentGeneration,
         now_ms: u64,
     ) -> Result<WriteSession, WriteOpeningError> {
@@ -997,7 +997,7 @@ impl SessionRegistry {
         let response = CreateSessionReplay {
             inode_id,
             lease_epoch,
-            layout,
+            block_size,
             expires_at_ms,
             generation,
         };
@@ -1009,7 +1009,7 @@ impl SessionRegistry {
             generation,
             mode: WriteMode::Overwrite,
             open_client_id: removed.open_client_id,
-            layout,
+            block_size,
             expires_at_ms,
             ancestor_inode_ids,
             issued_targets: Vec::new(),
@@ -1049,7 +1049,7 @@ impl SessionRegistry {
         Self::retire_expired_entry_for_inode(&mut state, inode_id, now_ms);
         Self::retire_expired_entries(&mut state, now_ms);
         let pending = PendingAllocateBlock { previous_block_id };
-        let (layout, open_client_id, file_offset) = {
+        let (block_size, open_client_id, file_offset) = {
             let session = Self::active_session_mut(&mut state, inode_id).map_err(BeginAllocateBlockError::Session)?;
             if session.lease_epoch != lease_epoch {
                 return Err(BeginAllocateBlockError::Session(
@@ -1085,7 +1085,7 @@ impl SessionRegistry {
                     maximum: self.max_write_targets_per_session,
                 }));
             }
-            (session.layout, session.open_client_id, file_offset)
+            (session.block_size, session.open_client_id, file_offset)
         };
 
         if state.outstanding_write_targets >= self.max_write_targets {
@@ -1113,7 +1113,7 @@ impl SessionRegistry {
             inode_id,
             lease_epoch,
             pending,
-            layout,
+            block_size,
             open_client_id,
             file_offset,
             armed: true,
@@ -1216,7 +1216,7 @@ impl SessionRegistry {
         Ok(target)
     }
 
-    /// Revalidate fencing, layout, offset, and generation before issuing a reserved target.
+    /// Revalidate fencing, capacity, offset, and generation before issuing a reserved target.
     fn validate_write_target(
         session: &WriteSession,
         lease_epoch: LeaseEpoch,
@@ -1238,17 +1238,11 @@ impl SessionRegistry {
                 target.file_offset
             ));
         }
-        let target_shape = BlockShape::new(
-            target.block_format_id,
-            target.block_size,
-            target.chunk_size,
-            target.block_size,
-        )
-        .map_err(|error| format!("invalid write target shape: {error}"))?;
-        let expected_shape = BlockShape::for_effective_len(&session.layout, u64::from(session.layout.block_size))
-            .map_err(|error| format!("invalid session layout shape: {error}"))?;
-        if target_shape != expected_shape {
-            return Err("write target shape does not match the session layout".to_string());
+        validate_block_size(target.block_size).map_err(|error| format!("invalid write target shape: {error}"))?;
+        beryl_types::validate_block_size(u64::from(session.block_size))
+            .map_err(|error| format!("invalid session block size shape: {error}"))?;
+        if target.block_size != u64::from(session.block_size) {
+            return Err("write target shape does not match the session block size".to_string());
         }
         if target.write_offset != 0 {
             return Err("new block must start at offset zero".into());
@@ -2049,7 +2043,7 @@ mod tests {
     use super::*;
     use beryl_types::ids::BlockIndex;
     use beryl_types::lease::FencingToken;
-    use beryl_types::{BlockFormatId, Tier};
+    use beryl_types::Tier;
     use std::sync::{Arc, Barrier, Condvar, Mutex};
 
     #[tokio::test]
@@ -2138,8 +2132,6 @@ mod tests {
                 epoch: LeaseEpoch::new(7),
             },
 
-            chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.storage_chunk_size().unwrap(),
-            block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
             tier: Tier::Hdd,
         }
     }
@@ -2152,7 +2144,7 @@ mod tests {
             current_lease_epoch: LeaseEpoch::new(6),
             mode: WriteMode::Overwrite,
             open_client_id: ClientId::new(1),
-            layout: FileLayout::new(64),
+            block_size: 64,
             ancestor_inode_ids: vec![inode_id],
         }
     }
@@ -2163,7 +2155,7 @@ mod tests {
             panic!("opening fixture")
         };
         crate::inode::FileData {
-            layout: entry.layout,
+            block_size: entry.block_size,
             len: 0,
             generation: ContentGeneration::default(),
             blocks: Vec::new(),
@@ -2374,7 +2366,7 @@ mod tests {
                 InodeId::new(2),
                 LeaseEpoch::new(1),
                 expires_at_ms,
-                FileLayout::new(64),
+                64,
                 ContentGeneration::new(0),
                 now_ms + 1,
             )
@@ -2451,7 +2443,7 @@ mod tests {
                 inode_id,
                 LeaseEpoch::new(1),
                 expires_at_ms,
-                FileLayout::new(64),
+                64,
                 ContentGeneration::new(0)
             ),
             Err(WriteOpeningError::NotCurrent)

@@ -23,7 +23,7 @@ use crate::worker::WorkerManager;
 use beryl_common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail};
 use beryl_common::header::RequestHeader;
 use beryl_types::ids::{InodeId, WorkerId};
-use beryl_types::{FileLayout, GroupName, GroupStateWatermark, WorkerEndpointInfo, WorkerRunId, WriteHandle};
+use beryl_types::{GroupName, GroupStateWatermark, WorkerEndpointInfo, WorkerRunId, WriteHandle};
 use command::RoutedFsWriteCtx;
 use guard::{AdmissionFailure, AdmissionGuard, FreshnessValidator, StaleStateStatus};
 use std::sync::Arc;
@@ -176,8 +176,8 @@ pub(crate) struct MetadataFileSystemDeps {
     pub(crate) worker_manager: Arc<WorkerManager>,
     pub(crate) metrics: Option<Arc<MetadataMetrics>>,
     pub(crate) readiness_gate: Option<Arc<RootReadinessGate>>,
-    /// Validated server-owned layout used by atomic CreateFile.
-    pub(crate) file_create_layout: FileLayout,
+    /// Validated server-owned block capacity used by atomic CreateFile.
+    pub(crate) file_block_size: u32,
 }
 
 /// Metadata service state combining durable Raft authority with leader-local admission state.
@@ -198,7 +198,7 @@ pub(crate) struct MetadataFileSystem {
     metrics: Option<Arc<MetadataMetrics>>,
     session_registry: Arc<SessionRegistry>,
     worker_manager: Arc<WorkerManager>,
-    file_create_layout: FileLayout,
+    file_block_size: u32,
 }
 
 impl MetadataFileSystem {
@@ -222,7 +222,7 @@ impl MetadataFileSystem {
             metrics: deps.metrics,
             session_registry: deps.session_registry,
             worker_manager: deps.worker_manager,
-            file_create_layout: deps.file_create_layout,
+            file_block_size: deps.file_block_size,
         }
     }
 
@@ -396,22 +396,18 @@ impl MetadataFileSystem {
     fn read_dentry(&self, parent_inode_id: InodeId, name: &str) -> MetadataResult<Option<InodeId>> {
         self.storage.get_dentry(parent_inode_id, name)
     }
-
-    fn read_layout(&self, inode_id: InodeId) -> MetadataResult<FileLayout> {
-        self.storage.get_layout(inode_id)
-    }
 }
 
-fn validate_active_write_layout(layout: &FileLayout) -> Result<(), MetadataError> {
-    layout
-        .validate()
-        .map_err(|error| MetadataError::InvalidArgument(format!("invalid file layout: {error}")))
+/// Check a capacity at the write-service boundary before opening a session.
+fn validate_active_write_block_size(block_size: u32) -> Result<(), MetadataError> {
+    beryl_types::validate_block_size(u64::from(block_size))
+        .map_err(|error| MetadataError::InvalidArgument(format!("invalid file block size: {error}")))
 }
 
 #[cfg(test)]
 mod tests {
     pub(super) use super::*;
-    use crate::config::FileLayoutDefaults;
+
     pub(super) use crate::config::RaftConfig;
     pub(super) use crate::inode::Inode;
     pub(super) use crate::inode::InodeAttrs;
@@ -429,10 +425,10 @@ mod tests {
     };
     pub(super) use beryl_common::header::RequestHeader;
     pub(super) use beryl_types::ids::{BlockId, BlockIndex, ClientId, InodeId, MountId, WorkerId};
-    pub(super) use beryl_types::layout::FileLayout;
+
     pub(super) use beryl_types::lease::FencingToken;
-    use beryl_types::{BlockFormatId, ContentGeneration, LeaseEpoch, WriteMode};
     pub(super) use beryl_types::{CommittedBlock, GroupName, LocatedBlock, Tier, TierFree, WorkerRunId};
+    use beryl_types::{ContentGeneration, LeaseEpoch, WriteMode};
     use std::ops::Deref;
     use std::sync::atomic::{AtomicU64, Ordering};
     pub(super) use std::sync::Arc;
@@ -580,7 +576,7 @@ mod tests {
                     .unwrap_or_else(|| Arc::new(WorkerManager::new(60_000))),
                 metrics: None,
                 readiness_gate: None,
-                file_create_layout: FileLayoutDefaults::default().layout().unwrap(),
+                file_block_size: crate::config::MetadataConfig::default().file_block_size,
             });
 
             TestFilesystem {
@@ -870,8 +866,6 @@ mod tests {
                 epoch: lease_epoch,
             },
 
-            chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.storage_chunk_size().unwrap(),
-            block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
             tier: Tier::Hdd,
         };
         let session_registry = filesystem.session_registry();
@@ -883,12 +877,12 @@ mod tests {
                 current_lease_epoch: LeaseEpoch::new(0),
                 mode: WriteMode::Overwrite,
                 open_client_id: writer,
-                layout: FileLayout::new(64),
+                block_size: 64,
                 ancestor_inode_ids,
             })
             .expect("session capacity");
         let file = crate::inode::FileData {
-            layout: FileLayout::new(64),
+            block_size: 64,
             len: 0,
             generation: ContentGeneration::default(),
             blocks: Vec::new(),
@@ -997,9 +991,8 @@ mod tests {
             .await;
 
         let attrs = InodeAttrs::new();
-        let mut inode = Inode::new_file(inode_id, attrs, mount_id, beryl_types::FileLayout::new(4096));
+        let mut inode = Inode::new_file(inode_id, attrs, mount_id, 64);
         let file = inode.file_mut().unwrap();
-        file.layout = FileLayout::new(64);
         file.len = base_size;
         let count = crate::inode::FileData::block_count(base_size, 64).unwrap();
         file.blocks = (0..count)
@@ -1007,7 +1000,6 @@ mod tests {
             .collect();
         file.next_index = count as u64;
         storage.put_inode(&inode).unwrap();
-        storage.put_layout(inode_id, FileLayout::new(64)).unwrap();
 
         WriteFlowEnv {
             _dir: dir,

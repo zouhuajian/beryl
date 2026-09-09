@@ -10,7 +10,7 @@
 //! invalid response-header handling. Public reads fill caller-owned buffers
 //! through bounded data-plane steps; public writes use internal write-state
 //! tracking and data-plane adapters. Metadata selects and persists the layout
-//! for new files; existing files reuse that stored `FileLayout`.
+//! for new files; existing files reuse that stored block capacity.
 //! Sequential reads retain only the current Metadata-authorized block plan;
 //! positioned reads never bypass Metadata authority. [`FileWriter::sync`]
 //! publishes durable data while retaining the open write session.

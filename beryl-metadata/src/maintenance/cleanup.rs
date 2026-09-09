@@ -126,7 +126,7 @@ fn replica_sort_key(replica: &ReplicaKey) -> (u64, u64, u32) {
 /// Coordinates reclaimable-replica detection and heartbeat dispatch.
 ///
 /// The coordinator owns only leader-local, report-derived soft state. Durable
-/// namespace and layout state remain the cleanup authority, while workers
+/// namespace and block mappings remain the cleanup authority, while workers
 /// fence local access and reclaim the exact block identity from heartbeat commands.
 pub(crate) struct BlockCleanupCoordinator {
     raft_node: Arc<AppRaftNode>,
@@ -655,7 +655,7 @@ mod tests {
     use crate::MountTable;
     use beryl_types::ids::{BlockId, BlockIndex, InodeId, MountId, WorkerId};
     use beryl_types::CommittedBlock;
-    use beryl_types::{ClientId, ContentGeneration, FileLayout, LeaseEpoch, Tier, TierFree, WorkerRunId, WriteMode};
+    use beryl_types::{ClientId, ContentGeneration, LeaseEpoch, Tier, TierFree, WorkerRunId, WriteMode};
     use tempfile::TempDir;
 
     fn group_name() -> GroupName {
@@ -728,15 +728,10 @@ mod tests {
         blocks: Vec<CommittedBlock>,
         next_index: u64,
     ) -> InodeId {
-        let mut inode = Inode::new_file(
-            inode_id,
-            InodeAttrs::new(),
-            MountId::new(1),
-            beryl_types::FileLayout::new(4096),
-        );
+        let mut inode = Inode::new_file(inode_id, InodeAttrs::new(), MountId::new(1), 4096);
         inode.kind = InodeKind::File(crate::inode::FileData {
             len: blocks.iter().map(|block| block.len).sum(),
-            layout: beryl_types::FileLayout::new(4096),
+            block_size: 4096,
             blocks: blocks.into_iter().map(|block| block.block_id).collect(),
             generation: ContentGeneration::new(1),
             lease_epoch: LeaseEpoch::new(1),
@@ -757,12 +752,12 @@ mod tests {
                 current_lease_epoch: LeaseEpoch::new(0),
                 mode: WriteMode::Overwrite,
                 open_client_id: client_id,
-                layout: FileLayout::new(64),
+                block_size: 64,
                 ancestor_inode_ids: vec![inode_id],
             })
             .expect("session capacity");
         let file = crate::inode::FileData {
-            layout: beryl_types::FileLayout::new(64),
+            block_size: 64,
             len: 0,
             generation: ContentGeneration::default(),
             blocks: Vec::new(),

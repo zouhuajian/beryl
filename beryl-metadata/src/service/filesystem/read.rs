@@ -632,8 +632,8 @@ impl MetadataFileSystem {
             if let Err(error) = file.validate(req.inode_id) {
                 return self.failure_from_error_with_route_epoch(&req.ctx, error, group_name, mount_epoch, route_epoch);
             }
-            let layout = file.layout;
-            let storage_chunk_size = layout.block_format_id.storage_chunk_size().expect("validated layout");
+            let block_size = file.block_size;
+
             let (range_start, range_end) = match req.range {
                 Some(range) => match range.offset.checked_add(range.len) {
                     Some(end) => (range.offset, end),
@@ -664,7 +664,7 @@ impl MetadataFileSystem {
             let caller = Self::caller_context_fields(&req.ctx);
             let mut locations = Vec::new();
             for (ordinal, block_id) in file.blocks.iter().copied().enumerate() {
-                let file_offset = ordinal as u64 * u64::from(layout.block_size);
+                let file_offset = ordinal as u64 * u64::from(block_size);
                 let effective_len = file.block_len(ordinal);
                 if range_start == range_end || file_offset >= range_end || file_offset + effective_len <= range_start {
                     continue;
@@ -683,7 +683,7 @@ impl MetadataFileSystem {
                             op: PlacementOp::Read,
                             block_id,
                             visible_len: effective_len,
-                            layout,
+                            block_size,
                             caller: caller.clone(),
                             existing: reported.clone(),
                             exclude_workers: Vec::new(),
@@ -721,9 +721,9 @@ impl MetadataFileSystem {
                     file_offset,
                     len: effective_len,
                     workers,
-                    block_format_id: layout.block_format_id,
-                    block_size: u64::from(layout.block_size),
-                    chunk_size: storage_chunk_size,
+
+                    block_size: u64::from(block_size),
+
                     effective_len,
                 });
             }
@@ -767,10 +767,10 @@ mod tests {
 
     fn seed_visible_block(storage: &RocksDBStorage, mount_id: MountId, inode_id: InodeId, block_id: BlockId) {
         let attrs = InodeAttrs::new();
-        let mut inode = Inode::new_file(inode_id, attrs, mount_id, beryl_types::FileLayout::new(4096));
+        let mut inode = Inode::new_file(inode_id, attrs, mount_id, 4096);
         inode.kind = InodeKind::File(crate::inode::FileData {
             len: 512,
-            layout: FileLayout::new(4096),
+            block_size: 4096,
             blocks: vec![block_id],
             generation: ContentGeneration::new(1),
             lease_epoch: beryl_types::LeaseEpoch::default(),
@@ -778,7 +778,6 @@ mod tests {
             last_commit: None,
         });
         storage.put_inode(&inode).unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();
     }
 
     #[tokio::test]
@@ -795,15 +794,9 @@ mod tests {
         storage
             .put_inode_at_storage_key(
                 storage_key_inode_id,
-                &Inode::new_file(
-                    stored_inode_id,
-                    InodeAttrs::new(),
-                    mount_id,
-                    beryl_types::FileLayout::new(4096),
-                ),
+                &Inode::new_file(stored_inode_id, InodeAttrs::new(), mount_id, 4096),
             )
             .unwrap();
-        storage.put_layout(storage_key_inode_id, FileLayout::new(4096)).unwrap();
 
         let failure = filesystem
             .get_file_layout_resolved(GetFileLayoutInput {
