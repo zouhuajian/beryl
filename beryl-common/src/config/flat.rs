@@ -7,7 +7,7 @@ use crate::error::{CommonError, CommonErrorKind};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use serde_yaml::{Number, Value};
+use serde_yaml::Value;
 
 /// Flat configuration storage using dotted keys.
 #[derive(Clone, Debug)]
@@ -33,12 +33,8 @@ impl FlatConfig {
     }
 
     #[inline]
-    pub fn set<V: IntoYamlValue>(&mut self, key: &str, value: V) {
-        self.insert(key.to_string(), value.into_yaml_value());
-    }
-
-    pub fn insert_str(&mut self, key: String, value: Value) {
-        self.data.insert(key, value);
+    pub fn set<V: Into<Value>>(&mut self, key: &str, value: V) {
+        self.insert(key.to_string(), value.into());
     }
 
     /// Get a string value.
@@ -50,48 +46,12 @@ impl FlatConfig {
         })
     }
 
-    /// Get a required string value.
-    pub fn get_required_str(&self, key: &str) -> Result<String, CommonError> {
-        self.get_str(key).ok_or_else(|| {
-            CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!("missing required config key: {}", key),
-            )
-        })
-    }
-
     /// Get an i64 value.
     pub fn get_i64(&self, key: &str) -> Option<i64> {
         self.data.get(key).and_then(|v| match v {
             Value::Number(n) => n.as_i64(),
             Value::String(s) => s.parse().ok(),
             _ => None,
-        })
-    }
-
-    /// Get a required i64 value.
-    pub fn get_required_i64(&self, key: &str) -> Result<i64, CommonError> {
-        self.get_i64(key).ok_or_else(|| {
-            CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!("missing or invalid config key: {} (expected i64)", key),
-            )
-        })
-    }
-
-    /// Get a usize value.
-    pub fn get_usize(&self, key: &str) -> Option<usize> {
-        self.get_i64(key)
-            .and_then(|v| if v >= 0 { Some(v as usize) } else { None })
-    }
-
-    /// Get a required usize value.
-    pub fn get_required_usize(&self, key: &str) -> Result<usize, CommonError> {
-        self.get_usize(key).ok_or_else(|| {
-            CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!("missing or invalid config key: {} (expected usize)", key),
-            )
         })
     }
 
@@ -105,21 +65,6 @@ impl FlatConfig {
                 _ => None,
             },
             _ => None,
-        })
-    }
-
-    /// Get a duration in milliseconds.
-    pub fn get_duration_ms(&self, key: &str) -> Option<Duration> {
-        self.get_i64(key).map(|ms| Duration::from_millis(ms.max(0) as u64))
-    }
-
-    /// Get a required duration in milliseconds.
-    pub fn get_required_duration_ms(&self, key: &str) -> Result<Duration, CommonError> {
-        self.get_duration_ms(key).ok_or_else(|| {
-            CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!("missing or invalid config key: {} (expected duration_ms)", key),
-            )
         })
     }
 
@@ -247,70 +192,6 @@ impl FlatConfig {
             .ok_or_else(|| invalid_config(key, "must be a size such as 1GiB"))
     }
 
-    /// Get a sub-configuration with the given prefix.
-    ///
-    /// Returns a new FlatConfig containing only keys that start with `prefix.`.
-    pub fn sub(&self, prefix: &str) -> FlatConfig {
-        let prefix_with_dot = if prefix.is_empty() {
-            String::new()
-        } else {
-            format!("{}.", prefix)
-        };
-
-        let mut sub_data = BTreeMap::new();
-        for (key, value) in &self.data {
-            if key.starts_with(&prefix_with_dot) {
-                let sub_key = key[prefix_with_dot.len()..].to_string();
-                sub_data.insert(sub_key, value.clone());
-            }
-        }
-
-        FlatConfig::from_map(sub_data)
-    }
-
-    /// Get all keys with the given prefix.
-    pub fn keys_with_prefix(&self, prefix: &str) -> Vec<String> {
-        let prefix_with_dot = if prefix.is_empty() {
-            String::new()
-        } else {
-            format!("{}.", prefix)
-        };
-
-        self.data
-            .keys()
-            .filter(|k| k.starts_with(&prefix_with_dot))
-            .cloned()
-            .collect()
-    }
-
-    /// Merge another FlatConfig into this one (other takes precedence).
-    pub fn merge(&mut self, other: FlatConfig) {
-        for (key, value) in other.data {
-            self.data.insert(key, value);
-        }
-    }
-
-    /// Redact sensitive keys for logging.
-    ///
-    /// Returns a new FlatConfig with sensitive values replaced with "***".
-    pub fn redact_for_log(&self) -> FlatConfig {
-        let sensitive_patterns = &["secret", "token", "password", "key", "credential"];
-        let mut redacted = BTreeMap::new();
-
-        for (key, value) in &self.data {
-            let key_lower = key.to_lowercase();
-            let is_sensitive = sensitive_patterns.iter().any(|pattern| key_lower.contains(pattern));
-
-            if is_sensitive {
-                redacted.insert(key.clone(), Value::String("***".to_string()));
-            } else {
-                redacted.insert(key.clone(), value.clone());
-            }
-        }
-
-        FlatConfig::from_map(redacted)
-    }
-
     /// Get all keys.
     pub fn keys(&self) -> impl Iterator<Item = &String> {
         self.data.keys()
@@ -390,59 +271,9 @@ impl Default for FlatConfig {
     }
 }
 
-pub trait IntoYamlValue {
-    fn into_yaml_value(self) -> Value;
-}
-
-impl IntoYamlValue for &str {
-    fn into_yaml_value(self) -> Value {
-        Value::String(self.to_string())
-    }
-}
-impl IntoYamlValue for String {
-    fn into_yaml_value(self) -> Value {
-        Value::String(self)
-    }
-}
-impl IntoYamlValue for bool {
-    fn into_yaml_value(self) -> Value {
-        Value::Bool(self)
-    }
-}
-impl IntoYamlValue for i64 {
-    fn into_yaml_value(self) -> Value {
-        Value::Number(Number::from(self))
-    }
-}
-impl IntoYamlValue for u64 {
-    fn into_yaml_value(self) -> Value {
-        Value::Number(Number::from(self))
-    }
-}
-impl IntoYamlValue for Vec<String> {
-    fn into_yaml_value(self) -> Value {
-        Value::Sequence(self.into_iter().map(Value::String).collect())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_yaml::Value;
-
-    #[test]
-    fn test_redact_for_log() {
-        let mut config = FlatConfig::new();
-        config.insert("password".to_string(), Value::String("secret123".to_string()));
-        config.insert("api_key".to_string(), Value::String("key123".to_string()));
-        config.insert("normal_name".to_string(), Value::String("value".to_string()));
-
-        let redacted = config.redact_for_log();
-        assert_eq!(redacted.get_str("password"), Some("***".to_string()));
-        assert_eq!(redacted.get_str("api_key"), Some("***".to_string()));
-        assert_eq!(redacted.get_str("normal_name"), Some("value".to_string()));
-    }
-
     #[test]
     fn typed_values_use_defaults_and_parse_supported_units() {
         let mut config = FlatConfig::new();

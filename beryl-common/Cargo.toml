@@ -5,16 +5,9 @@ edition = "2024"
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-anyhow = { workspace = true }
 thiserror = { workspace = true }
-bytes = { workspace = true }
-parking_lot = { workspace = true }
-uuid = { workspace = true, features = ["serde"] }
-chrono = { workspace = true }
 beryl-types = { path = "../beryl-types" }
-futures = { workspace = true }
 
 # Observability dependencies
 tracing = { workspace = true }
@@ -30,14 +23,10 @@ hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 http = { workspace = true }
 tonic = { workspace = true }
-tower = { workspace = true, features = ["limit"] }
-
-[features]
-default = ["prometheus"]
-prometheus = []
+tower = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+futures = { workspace = true }
 
 [[example]]
 name = "observe_demo"

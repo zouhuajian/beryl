@@ -3,7 +3,8 @@
 
 //! Worker control-plane startup registration.
 
-use beryl_common::observe::propagation::{inject_trace_context, ExtractedContext};
+use beryl_common::header::TraceContext;
+use beryl_common::observe::propagation::inject_trace_context;
 use beryl_proto::common::RequestHeaderProto;
 use beryl_types::{CallId, ClientId};
 
@@ -53,7 +54,7 @@ fn metadata_tonic_request<T>(message: T, header: Option<&RequestHeaderProto>) ->
     let mut request = tonic::Request::new(message);
     if let Some(header) = header {
         if let Some(trace_context) = &header.trace_context {
-            let context = ExtractedContext {
+            let context = TraceContext {
                 traceparent: trace_context.traceparent.clone(),
                 tracestate: trace_context.tracestate.clone(),
                 baggage: trace_context.baggage.clone(),

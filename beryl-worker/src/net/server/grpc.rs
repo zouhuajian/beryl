@@ -11,11 +11,12 @@ use crate::error::WorkerError;
 use crate::observe;
 use crate::runtime::DataRpcPermit;
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RpcErrorDetail, WorkerErrorKind};
+use beryl_common::header::TraceContext;
 use beryl_common::header::{
     HEADER_WORKER_DATA_ERROR_DETAIL, HEADER_WORKER_DATA_REJECTION, WORKER_DATA_ERROR_DETAIL_V1,
     WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT,
 };
-use beryl_common::observe::propagation::{extract_trace_context, ExtractedContext};
+use beryl_common::observe::propagation::extract_trace_context;
 use beryl_proto::common::RequestHeaderProto;
 use beryl_proto::common::{ClientInfoProto, ErrorDetailProto, TraceContextProto};
 use beryl_proto::convert::require_worker_run_id;
@@ -228,7 +229,7 @@ impl WorkerDataServiceImpl {
         &self,
         mut requests: S,
         rpc_permit: DataRpcPermit,
-        transport_context: &ExtractedContext,
+        transport_context: &TraceContext,
         started: Instant,
     ) -> Result<WriteBlockState<S>, Status>
     where
@@ -540,7 +541,7 @@ impl WorkerDataService for WorkerDataServiceImpl {
     }
 }
 
-fn merge_data_header_transport_context(header: &mut Option<DataRequestHeaderProto>, context: &ExtractedContext) {
+fn merge_data_header_transport_context(header: &mut Option<DataRequestHeaderProto>, context: &TraceContext) {
     record_transport_context(context);
     let Some(header) = header else {
         return;
@@ -567,7 +568,7 @@ fn trace_context_proto_is_empty(context: &TraceContextProto) -> bool {
     context.traceparent.is_none() && context.tracestate.is_none() && context.baggage.is_none()
 }
 
-fn record_transport_context(context: &ExtractedContext) {
+fn record_transport_context(context: &TraceContext) {
     if let Some(traceparent) = &context.traceparent {
         Span::current().record("traceparent", traceparent);
     }
@@ -700,7 +701,7 @@ mod tests {
             &self,
             mut requests: S,
             permit: DataRpcPermit,
-            _context: &ExtractedContext,
+            _context: &TraceContext,
             started: Instant,
         ) -> Result<WriteBlockState<S>, Status>
         where

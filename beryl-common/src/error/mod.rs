@@ -198,13 +198,6 @@ pub enum CommonErrorKind {
     Internal,
 }
 
-impl CommonErrorKind {
-    /// Check if this error kind is retryable.
-    pub fn is_retryable(&self) -> bool {
-        matches!(self, CommonErrorKind::Timeout | CommonErrorKind::Overloaded)
-    }
-}
-
 impl fmt::Display for CommonErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -235,11 +228,6 @@ impl CommonError {
             kind,
             message: message.into(),
         }
-    }
-
-    /// Check if this error is retryable.
-    pub fn is_retryable(&self) -> bool {
-        self.kind.is_retryable()
     }
 }
 

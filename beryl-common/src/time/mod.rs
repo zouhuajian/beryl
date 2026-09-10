@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Deadline and timeout utilities.
+//! Absolute request deadlines.
 
-use crate::error::{CommonError, CommonErrorKind};
-use std::future::Future;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::time::timeout as tokio_timeout;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Deadline represents an absolute time point for request expiration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -51,46 +48,4 @@ impl Deadline {
     pub fn has_passed(&self) -> bool {
         self.remaining().is_zero()
     }
-
-    /// Convert to tokio Instant (for use with tokio::time::sleep_until).
-    pub fn to_tokio_instant(&self) -> Option<Instant> {
-        let now = Instant::now();
-        let remaining = self.remaining();
-        if remaining.is_zero() {
-            None
-        } else {
-            Some(now + remaining)
-        }
-    }
-}
-
-/// Execute a future with a deadline, returning a timeout error if exceeded.
-pub async fn timeout_at<F>(deadline: Deadline, future: F) -> Result<F::Output, CommonError>
-where
-    F: Future,
-{
-    let remaining = deadline.remaining();
-    if remaining.is_zero() {
-        return Err(CommonError::new(
-            CommonErrorKind::Timeout,
-            "deadline has already passed",
-        ));
-    }
-
-    match tokio_timeout(remaining, future).await {
-        Ok(result) => Ok(result),
-        Err(_) => Err(CommonError::new(
-            CommonErrorKind::Timeout,
-            format!("operation timed out after {}ms", remaining.as_millis()),
-        )),
-    }
-}
-
-/// Execute a future with a duration timeout.
-pub async fn timeout<F>(duration: Duration, future: F) -> Result<F::Output, CommonError>
-where
-    F: Future,
-{
-    let deadline = Deadline::from_now(duration);
-    timeout_at(deadline, future).await
 }

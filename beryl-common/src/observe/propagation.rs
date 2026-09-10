@@ -1,76 +1,82 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Context propagation for distributed tracing.
+//! Context propagation through gRPC metadata.
 
-use std::str::FromStr;
+use tonic::metadata::{MetadataMap, MetadataValue};
 
-/// Trait for setting trace context in a carrier (e.g., gRPC metadata).
-pub trait CarrierSet {
-    /// Set a key-value pair in the carrier.
-    fn set(&mut self, key: &str, value: &str);
-}
+use crate::header::TraceContext;
 
-/// Trait for getting trace context from a carrier.
-pub trait CarrierGet {
-    /// Get a value by key from the carrier.
-    fn get(&self, key: &str) -> Option<&str>;
-}
-
-/// Extracted trace context.
-#[derive(Clone, Debug, Default)]
-pub struct ExtractedContext {
-    /// Trace parent (W3C traceparent header).
-    pub traceparent: Option<String>,
-    /// Trace state (W3C tracestate header).
-    pub tracestate: Option<String>,
-    /// Baggage (W3C baggage header).
-    pub baggage: Option<String>,
-}
-
-impl ExtractedContext {
-    pub fn is_empty(&self) -> bool {
-        self.traceparent.is_none() && self.tracestate.is_none() && self.baggage.is_none()
+/// Injects present trace fields, ignoring values that are invalid gRPC metadata.
+pub fn inject_trace_context(carrier: &mut MetadataMap, context: &TraceContext) {
+    for (key, value) in [
+        ("traceparent", &context.traceparent),
+        ("tracestate", &context.tracestate),
+        ("baggage", &context.baggage),
+    ] {
+        if let Some(value) = value
+            && let Ok(value) = value.parse::<MetadataValue<_>>()
+        {
+            carrier.insert(key, value);
+        }
     }
 }
 
-/// Inject trace context into a carrier.
-pub fn inject_trace_context(carrier: &mut dyn CarrierSet, context: &ExtractedContext) {
-    if let Some(ref traceparent) = context.traceparent {
-        carrier.set("traceparent", traceparent);
-    }
-    if let Some(ref tracestate) = context.tracestate {
-        carrier.set("tracestate", tracestate);
-    }
-    if let Some(ref baggage) = context.baggage {
-        carrier.set("baggage", baggage);
-    }
-}
-
-/// Extract trace context from a carrier.
-pub fn extract_trace_context(carrier: &dyn CarrierGet) -> ExtractedContext {
-    ExtractedContext {
-        traceparent: carrier.get("traceparent").map(|s| s.to_string()),
-        tracestate: carrier.get("tracestate").map(|s| s.to_string()),
-        baggage: carrier.get("baggage").map(|s| s.to_string()),
+/// Extracts trace fields that can be represented as strings.
+pub fn extract_trace_context(carrier: &MetadataMap) -> TraceContext {
+    let get = |key| {
+        carrier
+            .get(key)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    TraceContext {
+        traceparent: get("traceparent"),
+        tracestate: get("tracestate"),
+        baggage: get("baggage"),
     }
 }
 
-impl CarrierSet for tonic::metadata::MetadataMap {
-    fn set(&mut self, key: &str, value: &str) {
-        let Ok(key) = tonic::metadata::MetadataKey::from_bytes(key.as_bytes()) else {
-            return;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trace_fields_round_trip_without_changing_unrelated_metadata() {
+        let mut carrier = MetadataMap::new();
+        carrier.insert("other", MetadataValue::from_static("keep"));
+        let context = TraceContext {
+            traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
+            tracestate: Some("vendor=value".into()),
+            baggage: Some("region=east".into()),
         };
-        let Ok(value) = tonic::metadata::MetadataValue::from_str(value) else {
-            return;
-        };
-        self.insert(key, value);
-    }
-}
 
-impl CarrierGet for tonic::metadata::MetadataMap {
-    fn get(&self, key: &str) -> Option<&str> {
-        let key = tonic::metadata::MetadataKey::from_bytes(key.as_bytes()).ok()?;
-        self.get(key)?.to_str().ok()
+        inject_trace_context(&mut carrier, &context);
+
+        assert_eq!(extract_trace_context(&carrier), context);
+        assert_eq!(carrier.get("other").unwrap(), "keep");
+    }
+
+    #[test]
+    fn absent_or_invalid_fields_do_not_overwrite_existing_metadata() {
+        let mut carrier = MetadataMap::new();
+        carrier.insert("traceparent", MetadataValue::from_static("existing"));
+        let context = TraceContext {
+            traceparent: Some("invalid\nvalue".into()),
+            baggage: Some("region=east".into()),
+            ..Default::default()
+        };
+
+        inject_trace_context(&mut carrier, &context);
+
+        assert_eq!(
+            extract_trace_context(&carrier),
+            TraceContext {
+                traceparent: Some("existing".into()),
+                baggage: context.baggage,
+                ..Default::default()
+            }
+        );
+        assert!(extract_trace_context(&MetadataMap::new()).is_empty());
     }
 }

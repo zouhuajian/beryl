@@ -5,36 +5,27 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use metrics_exporter_prometheus::PrometheusHandle;
+
 use crate::observe::config::{ObservabilityConfig, ServiceInfo};
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-/// Guard that keeps process observability resources alive.
-pub struct ObservabilityGuard {
-    prometheus_handle: metrics_exporter_prometheus::PrometheusHandle,
-}
-
-impl ObservabilityGuard {
-    /// Return the renderer used by the process-owned HTTP server.
-    pub fn prometheus_handle(&self) -> metrics_exporter_prometheus::PrometheusHandle {
-        self.prometheus_handle.clone()
-    }
-}
-
 /// Initialize observability infrastructure.
 ///
+/// Returns the metrics renderer for the process HTTP endpoint.
 /// This function should be called once at application startup. Subsequent calls
 /// will return an error if already initialized.
 pub fn init_observability(
     config: &ObservabilityConfig,
     service_info: ServiceInfo,
-) -> Result<ObservabilityGuard, Box<dyn std::error::Error>> {
+) -> Result<PrometheusHandle, Box<dyn std::error::Error>> {
     if INITIALIZED.swap(true, Ordering::SeqCst) {
         return Err("Observability already initialized".into());
     }
 
     match init_observability_once(config, service_info) {
-        Ok(guard) => Ok(guard),
+        Ok(handle) => Ok(handle),
         Err(err) => {
             INITIALIZED.store(false, Ordering::SeqCst);
             Err(err)
@@ -45,7 +36,7 @@ pub fn init_observability(
 fn init_observability_once(
     config: &ObservabilityConfig,
     service_info: ServiceInfo,
-) -> Result<ObservabilityGuard, Box<dyn std::error::Error>> {
+) -> Result<PrometheusHandle, Box<dyn std::error::Error>> {
     crate::observe::tracing::init_tracing_subscriber(config)?;
     let handle = metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder()?;
 
@@ -57,15 +48,13 @@ fn init_observability_once(
         "Observability initialized"
     );
 
-    Ok(ObservabilityGuard {
-        prometheus_handle: handle,
-    })
+    Ok(handle)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observe::config::{LogConfig, ResourceConfig};
+    use crate::observe::config::LogConfig;
 
     #[test]
     fn failed_initialization_resets_process_guard() {
@@ -77,7 +66,6 @@ mod tests {
                 output: "stderr".to_string(),
                 level: "warn".to_string(),
             },
-            resource: ResourceConfig::default(),
         };
         assert!(init_observability(&config, test_service_info()).is_err());
         assert!(!INITIALIZED.load(Ordering::SeqCst));
@@ -88,8 +76,6 @@ mod tests {
             name: "test-service".to_string(),
             version: "0.0.0".to_string(),
             environment: "test".to_string(),
-            instance_id: "test-instance".to_string(),
-            node_name: None,
         }
     }
 }

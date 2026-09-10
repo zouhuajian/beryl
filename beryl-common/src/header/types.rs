@@ -28,16 +28,6 @@ pub struct HeaderIdentity {
     pub group_name: Option<GroupName>,
 }
 
-impl HeaderIdentity {
-    /// Return true when a response identity matches the basic request identity.
-    ///
-    /// This intentionally excludes freshness, replay, and state-watermark
-    /// checks; those remain owned by the caller's boundary logic.
-    pub fn matches_request(&self, request: &Self) -> bool {
-        self.client_id == request.client_id && self.call_id == request.call_id && self.group_name == request.group_name
-    }
-}
-
 /// W3C trace propagation context.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TraceContext {
@@ -47,6 +37,13 @@ pub struct TraceContext {
     pub tracestate: Option<String>,
     /// W3C baggage header value. Do not put secrets or credentials here.
     pub baggage: Option<String>,
+}
+
+impl TraceContext {
+    /// Returns whether all propagation fields are absent.
+    pub fn is_empty(&self) -> bool {
+        self.traceparent.is_none() && self.tracestate.is_none() && self.baggage.is_none()
+    }
 }
 
 /// Request header carried with every RPC request.
@@ -180,20 +177,6 @@ impl ClientInfo {
             client_name: None,
         }
     }
-
-    fn identity_with_group(&self, group_name: Option<GroupName>) -> HeaderIdentity {
-        HeaderIdentity {
-            call_id: self.call_id,
-            client_id: self.client_id,
-            group_name,
-        }
-    }
-
-    /// Set the client name.
-    pub fn with_client_name(mut self, client_name: String) -> Self {
-        self.client_name = Some(client_name);
-        self
-    }
 }
 
 impl RequestHeader {
@@ -228,72 +211,19 @@ impl RequestHeader {
         self
     }
 
-    /// Return the basic parsed header identity.
-    pub fn identity(&self) -> HeaderIdentity {
-        self.client.identity_with_group(self.group_name.clone())
-    }
-
-    /// Set the traceparent.
-    pub fn with_traceparent(mut self, traceparent: String) -> Self {
-        self.trace_context.traceparent = Some(traceparent);
-        self
-    }
-
-    /// Set the tracestate header value.
-    pub fn with_tracestate(mut self, tracestate: String) -> Self {
-        self.trace_context.tracestate = Some(tracestate);
-        self
-    }
-
-    /// Set the baggage header value.
-    pub fn with_baggage(mut self, baggage: String) -> Self {
-        self.trace_context.baggage = Some(baggage);
-        self
-    }
-
-    /// Set the caller context.
-    pub fn with_caller_context(mut self, caller_context: CallerContext) -> Self {
-        self.caller_context = Some(caller_context);
-        self
-    }
-
     /// Create a child header (for nested calls).
     ///
     /// Inherits client_id, deadline, trace context, state watermarks, and group name.
     /// Generates a new call_id by default.
     pub fn child(&self) -> Self {
-        Self {
-            client: ClientInfo {
-                call_id: CallId::new(),
-                client_id: self.client.client_id,
-                client_name: self.client.client_name.clone(),
-            },
-            trace_context: self.trace_context.clone(),
-            group_name: self.group_name.clone(),
-            mount_epoch: self.mount_epoch,
-            state: self.state.clone(),
-            route_epoch: self.route_epoch,
-            deadline: self.deadline,
-            caller_context: self.caller_context.clone(),
-        }
+        let mut child = self.clone();
+        child.client.call_id = CallId::new();
+        child
     }
 
     /// Create a child header with the same call_id (for retries).
     pub fn child_with_same_call_id(&self) -> Self {
-        Self {
-            client: ClientInfo {
-                call_id: self.client.call_id,
-                client_id: self.client.client_id,
-                client_name: self.client.client_name.clone(),
-            },
-            trace_context: self.trace_context.clone(),
-            group_name: self.group_name.clone(),
-            mount_epoch: self.mount_epoch,
-            state: self.state.clone(),
-            route_epoch: self.route_epoch,
-            deadline: self.deadline,
-            caller_context: self.caller_context.clone(),
-        }
+        self.clone()
     }
 }
 
@@ -308,11 +238,6 @@ impl ResponseHeader {
             route_epoch: None,
             group_name: None,
         }
-    }
-
-    /// Create an error response header from RPC error.
-    pub fn error(client: ClientInfo, rpc_error: RpcErrorDetail) -> Self {
-        Self::from_rpc_error(client, rpc_error)
     }
 
     /// Create an error response header from RPC error.
