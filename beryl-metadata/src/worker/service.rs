@@ -14,8 +14,9 @@ use crate::raft::{AppRaftNode, ApplySuccess, Command};
 use crate::service::extract_and_inject_context;
 use ::beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RpcErrorDetail, WorkerErrorKind};
 use ::beryl_common::header::ResponseHeader;
-use ::beryl_common::observe::propagation::{extract_trace_context, ExtractedContext};
+use ::beryl_common::observe::propagation::extract_trace_context;
 use beryl_common::header::ClientInfo;
+use beryl_common::header::TraceContext;
 use beryl_proto::common::{
     EndpointProto, ErrorDetailProto, RequestHeaderProto, ResponseHeaderProto, TraceContextProto,
 };
@@ -371,7 +372,7 @@ fn block_report_kind(req: &BlockReportRequestProto) -> &'static str {
     }
 }
 
-fn merge_request_header_transport_context(header: &mut Option<RequestHeaderProto>, context: &ExtractedContext) {
+fn merge_request_header_transport_context(header: &mut Option<RequestHeaderProto>, context: &TraceContext) {
     let Some(header) = header else {
         return;
     };

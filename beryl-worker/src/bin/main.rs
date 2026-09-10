@@ -121,10 +121,8 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
         name: "beryl-worker".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         environment: "development".to_string(),
-        instance_id: format!("worker-{}", std::process::id()),
-        node_name: Some(format!("worker-node-{}", std::process::id())),
     };
-    let obs_guard = init_observability(&obs_config, service_info)
+    let prometheus_handle = init_observability(&obs_config, service_info)
         .map_err(|e| anyhow::anyhow!("Failed to initialize observability: {}", e))?;
     observe::record_worker_started("worker", env!("CARGO_PKG_VERSION"));
     observe::set_worker_registered(false);
@@ -163,7 +161,7 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
     let readiness_group = config.metadata.group_name.clone();
     let http = spawn_service_http(
         config.http_addr(),
-        obs_guard.prometheus_handle(),
+        prometheus_handle,
         Arc::new(move || readiness_state.is_ready(&readiness_group)),
     )
     .context("Failed to start Worker HTTP service")?;

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-pub mod audit;
 pub mod build_info;
 pub mod config;
 pub mod error;
@@ -12,8 +11,7 @@ pub mod service_http;
 pub mod termination;
 pub mod time;
 
-pub use audit::{AuditLogger, AuditRecord};
 pub use config::FlatConfig;
 pub use error::{CommonError, CommonErrorKind};
 pub use header::{CallerContext, CallerContextFields, RequestHeader, ResponseHeader};
-pub use time::{Deadline, timeout, timeout_at};
+pub use time::Deadline;

@@ -14,12 +14,13 @@ use crate::{observe, MetadataConfig, MountTable};
 use beryl_common::grpc_server::{
     spawn_grpc_server_with_concurrency_limits, GrpcRequestConcurrencyConfig, RpcRequestClass,
 };
-use beryl_common::observe::{init_observability as init_common_observability, ObservabilityGuard, ServiceInfo};
+use beryl_common::observe::{init_observability as init_common_observability, ServiceInfo};
 use beryl_common::service_http::spawn_service_http;
 use beryl_common::termination::TerminationMonitor;
 use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProtoServer;
 use beryl_proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProtoServer;
 use beryl_types::GroupName;
+use metrics_exporter_prometheus::PrometheusHandle;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -63,9 +64,9 @@ fn classify_metadata_rpc(path: &str) -> RpcRequestClass {
     }
 }
 
-/// Keeps the tracing and metrics provider alive for the process lifetime.
+/// Metrics renderer for the process HTTP endpoint.
 pub struct Observability {
-    observability_guard: ObservabilityGuard,
+    prometheus_handle: PrometheusHandle,
 }
 
 /// Authoritative metadata dependencies built before public services are exposed.
@@ -324,7 +325,7 @@ impl MetadataServer {
         let readiness_gate = Arc::clone(&handles.readiness.gate);
         let http = match spawn_service_http(
             config.http_addr(),
-            observability.observability_guard.prometheus_handle(),
+            observability.prometheus_handle.clone(),
             Arc::new(move || readiness_gate.is_ready()),
         ) {
             Ok(http) => http,
@@ -437,10 +438,8 @@ pub fn init_observability(config: &MetadataConfig) -> Result<Observability, DynE
         name: "metadata".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         environment: "development".to_string(),
-        instance_id: uuid::Uuid::new_v4().to_string(),
-        node_name: None,
     };
-    let observability_guard = init_common_observability(&obs_config, service_info)?;
+    let prometheus_handle = init_common_observability(&obs_config, service_info)?;
     observe::record_metadata_started("metadata", env!("CARGO_PKG_VERSION"));
 
     info!(
@@ -453,7 +452,7 @@ pub fn init_observability(config: &MetadataConfig) -> Result<Observability, DynE
         "Configuration loaded (sensitive values redacted)"
     );
 
-    Ok(Observability { observability_guard })
+    Ok(Observability { prometheus_handle })
 }
 
 /// Builds authoritative storage, mount, raft, and state-store dependencies in startup order.

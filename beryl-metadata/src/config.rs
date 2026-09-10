@@ -11,7 +11,7 @@ use crate::readiness::RootReadinessConfig;
 use beryl_common::config::{format_host_port, load_from_yaml_file, validate_public_host, FlatConfig};
 use beryl_common::error::{CommonError, CommonErrorKind};
 use beryl_common::grpc_server::MAX_GRPC_CONCURRENT_REQUESTS;
-use beryl_common::observe::config::{LogConfig, ResourceConfig};
+use beryl_common::observe::config::LogConfig;
 use beryl_common::observe::ObservabilityConfig;
 use beryl_types::{GroupName, MAX_FILE_BLOCKS};
 use std::net::{IpAddr, SocketAddr};
@@ -365,7 +365,6 @@ impl Default for MetadataConfig {
                     output: "stderr".to_string(),
                     level: "info".to_string(),
                 },
-                resource: ResourceConfig::default(),
             },
         }
     }

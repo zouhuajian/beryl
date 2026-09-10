@@ -15,4 +15,4 @@ pub mod propagation;
 pub mod tracing;
 
 pub use config::{ObservabilityConfig, ServiceInfo};
-pub use init::{ObservabilityGuard, init_observability};
+pub use init::init_observability;

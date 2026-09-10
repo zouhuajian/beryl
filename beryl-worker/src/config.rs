@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use beryl_common::config::{format_host_port, load_from_yaml_file, validate_public_host, FlatConfig};
 use beryl_common::error::{CommonError, CommonErrorKind};
-use beryl_common::observe::config::{LogConfig, ResourceConfig};
+use beryl_common::observe::config::LogConfig;
 use beryl_common::observe::ObservabilityConfig;
 use beryl_types::{GroupName, Tier};
 use serde_yaml::{Mapping, Value};
@@ -204,7 +204,6 @@ impl Default for WorkerConfig {
                     output: "stderr".to_string(),
                     level: "info".to_string(),
                 },
-                resource: ResourceConfig::default(),
             },
         }
     }

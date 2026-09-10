@@ -248,10 +248,7 @@ dependencies = [
 name = "beryl-common"
 version = "0.1.0-alpha.1"
 dependencies = [
- "anyhow",
  "beryl-types",
- "bytes",
- "chrono",
  "futures",
  "http",
  "http-body-util",
@@ -259,11 +256,8 @@ dependencies = [
  "hyper-util",
  "metrics",
  "metrics-exporter-prometheus",
- "parking_lot",
  "serde",
- "serde_json",
  "serde_yaml",
- "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "tokio-util",
@@ -271,7 +265,6 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -313,6 +306,7 @@ dependencies = [
  "futures",
  "lru",
  "metrics",
+ "metrics-exporter-prometheus",
  "openraft",
  "parking_lot",
  "prost",
@@ -572,7 +566,6 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
- "serde",
  "wasm-bindgen",
  "windows-link",
 ]

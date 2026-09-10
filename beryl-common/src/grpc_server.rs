@@ -29,7 +29,6 @@ use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::service::Routes;
 use tonic::{Code, Status};
 use tower::Service;
-use tower::limit::ConcurrencyLimit;
 
 /// Largest request concurrency supported by the underlying Tokio semaphore.
 pub const MAX_GRPC_CONCURRENT_REQUESTS: usize = Semaphore::MAX_PERMITS;
@@ -288,8 +287,6 @@ where
 enum RequestConcurrencyPolicy {
     /// Applies no request-concurrency limit at the connection service layer.
     Unbounded,
-    /// Uses Tower readiness to backpressure excess requests on each connection.
-    BackpressurePerConnection { max_inflight: usize },
     /// Rejects excess requests immediately at connection or server-wide bounds.
     RejectExcess {
         state: GrpcRequestConcurrencyState,
@@ -380,20 +377,10 @@ impl Drop for GrpcServerHandle {
 
 /// Binds and starts one HTTP/2 gRPC listener with tracked connections.
 ///
-/// `max_inflight_per_connection` optionally backpressures request futures on
-/// each connection. Stream-lifecycle admission belongs in the owning service;
-/// callers that need immediate generic RPC rejection use
-/// [`spawn_grpc_server_with_concurrency_limits`].
-pub fn spawn_grpc_server(
-    bind: SocketAddr,
-    routes: Routes,
-    max_inflight_per_connection: Option<usize>,
-) -> io::Result<GrpcServerHandle> {
-    let request_policy = match max_inflight_per_connection {
-        Some(max_inflight) => RequestConcurrencyPolicy::BackpressurePerConnection { max_inflight },
-        None => RequestConcurrencyPolicy::Unbounded,
-    };
-    spawn_grpc_server_with_request_policy(bind, routes, request_policy)
+/// Stream-lifecycle admission belongs in the owning service; callers that need
+/// immediate generic RPC rejection use [`spawn_grpc_server_with_concurrency_limits`].
+pub fn spawn_grpc_server(bind: SocketAddr, routes: Routes) -> io::Result<GrpcServerHandle> {
+    spawn_grpc_server_with_request_policy(bind, routes, RequestConcurrencyPolicy::Unbounded)
 }
 
 /// Binds a gRPC listener that rejects excess requests before protobuf decoding.
@@ -453,15 +440,6 @@ fn spawn_grpc_server_with_request_policy(
                         let request_executor = request_executor.clone();
                         connections.spawn(async move {
                             match request_policy {
-                                RequestConcurrencyPolicy::BackpressurePerConnection { max_inflight } => {
-                                    serve_connection(
-                                        stream,
-                                        ConcurrencyLimit::new(routes, max_inflight),
-                                        connection_shutdown,
-                                        request_executor,
-                                    )
-                                    .await;
-                                }
                                 RequestConcurrencyPolicy::Unbounded => {
                                     serve_connection(stream, routes, connection_shutdown, request_executor).await;
                                 }
