@@ -333,7 +333,7 @@ impl TryFrom<LocatedBlockProto> for LocatedBlock {
         if fencing_token.block_id != block_id {
             return Err("LocatedBlockProto.fencing_token block_id must match block_id".to_string());
         }
-        if fencing_token.owner.is_zero() || fencing_token.epoch.as_raw() == 0 {
+        if fencing_token.epoch.as_raw() == 0 {
             return Err("LocatedBlockProto.fencing_token owner and epoch must be non-zero".to_string());
         }
         let worker_endpoints = target
@@ -406,10 +406,7 @@ impl From<&CommittedBlock> for CommittedBlockProto {
 
 impl From<CommittedBlock> for CommittedBlockProto {
     fn from(block: CommittedBlock) -> Self {
-        Self {
-            block_id: Some(block.block_id.into()),
-            len: block.len,
-        }
+        Self::from(&block)
     }
 }
 
@@ -475,11 +472,7 @@ impl From<FileBlockLocation> for FileBlockLocationProto {
 
 impl From<&RaftLogId> for RaftLogIdProto {
     fn from(log_id: &RaftLogId) -> Self {
-        RaftLogIdProto {
-            term: log_id.term,
-            leader_node_id: log_id.leader_node_id,
-            index: log_id.index,
-        }
+        Self::from(*log_id)
     }
 }
 
@@ -640,11 +633,7 @@ impl TryFrom<ResponseHeaderProto> for ResponseHeader {
     type Error = String;
 
     fn try_from(proto: ResponseHeaderProto) -> Result<Self, Self::Error> {
-        let client = proto
-            .client
-            .clone()
-            .ok_or_else(|| "missing client".to_string())?
-            .try_into()?;
+        let client = proto.client.ok_or_else(|| "missing client".to_string())?.try_into()?;
 
         let rpc_error = proto.error.as_ref().map(rpc_error_from_proto);
 
@@ -1074,6 +1063,21 @@ mod tests {
         target.worker_endpoints.push(endpoint());
         let decoded = LocatedBlock::try_from(target.clone()).expect("valid allocated block");
         assert_eq!(LocatedBlockProto::from(decoded), target);
+        for invalid_token in [
+            FencingToken::new(block_id, ClientId::new(0), token.epoch),
+            FencingToken::new(block_id, token.owner, LeaseEpoch::new(0)),
+            FencingToken::new(
+                BlockId::new(block_id.inode_id, BlockIndex::new(4)),
+                token.owner,
+                token.epoch,
+            ),
+        ] {
+            let invalid = LocatedBlockProto {
+                fencing_token: Some(invalid_token.into()),
+                ..target.clone()
+            };
+            assert!(LocatedBlock::try_from(invalid).is_err());
+        }
         for block_size in [0, u64::from(beryl_types::MAX_BLOCK_SIZE) + 1] {
             let invalid = LocatedBlockProto {
                 block_size,

@@ -14,13 +14,14 @@
 
 - `.proto` files, generated Rust modules, service contracts, field numbers, and enum values.
 - Metadata filesystem, metadata-worker control, and worker data service contracts.
+- Protobuf payloads for worker-local block metadata inside the versioned local header.
 - Structural proto/domain conversion helpers and wire-level comments.
 
 ## Current Active Use
 
 The current runtime uses metadata filesystem RPCs for client-to-metadata operations, metadata-worker control RPCs for registration/heartbeat/block reports, and worker data RPCs for metadata-authorized reads and writes.
 
-Admin and metadata-peer proto packages are generated as crate-private future/schema-only surfaces. They are not registered or served by the current runtime. Worker maintenance command schemas do not make repair, rebalance, worker peer transfer, or physical block reclamation a completed product behavior.
+The worker block store encodes and decodes `BlockMetaPayloadProto` for durable local checkpoints. The Worker owns header version validation, checkpoint persistence, and recovery.
 
 ## Not in Current Scope
 
