@@ -6,7 +6,6 @@ syntax = "proto3";
 package worker;
 
 import "common/common.proto";
-import "worker/block_meta.proto";
 import "worker/data_header.proto";
 
 // ============================================================================
