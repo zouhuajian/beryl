@@ -4,10 +4,9 @@
 //! Worker operation orchestration above the block-local transport boundary.
 
 use std::fmt;
-use std::sync::Arc;
 
 use super::transport::GrpcWorkerTransport;
-use super::{BlockWrite, WorkerTransport, WorkerWriteTarget};
+use super::{BlockWrite, WorkerWriteTarget};
 use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
 use crate::planner::PlannedBlockRead;
@@ -16,20 +15,16 @@ use beryl_types::{GroupName, LocatedBlock};
 
 /// Owns file-level Worker orchestration while delegating each block-local IO
 /// operation to a transport implementation.
-#[derive(Clone)]
 pub(crate) struct WorkerClient {
-    transport: Arc<dyn WorkerTransport>,
+    transport: GrpcWorkerTransport,
 }
 
 impl WorkerClient {
-    /// Takes ownership of the transport used for all block-local Worker IO.
-    pub(crate) fn new(transport: Arc<dyn WorkerTransport>) -> Self {
-        Self { transport }
-    }
-
     /// Builds the production Worker client and its gRPC transport.
     pub(crate) fn from_config(config: &ClientConfig) -> Self {
-        Self::new(Arc::new(GrpcWorkerTransport::from_config(config)))
+        Self {
+            transport: GrpcWorkerTransport::from_config(config),
+        }
     }
 
     /// Fills a caller-owned buffer from ordered Metadata-planned block ranges.
@@ -53,15 +48,10 @@ impl WorkerClient {
         }
         let mut remaining = output;
         for block_read in block_reads {
-            let expected_end = block_read
+            block_read
                 .file_offset
                 .checked_add(u64::from(block_read.len))
                 .ok_or_else(|| ClientError::invalid_layout("planned block read end overflow".to_string()))?;
-            if expected_end != block_read.end_file_offset {
-                return Err(ClientError::invalid_layout(
-                    "planned block read coverage is inconsistent".to_string(),
-                ));
-            }
             let (block_output, tail) = remaining.split_at_mut(block_read.len as usize);
             self.transport
                 .read_block_range(attempt.clone(), group_name.clone(), block_read, block_output)

@@ -15,38 +15,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use async_trait::async_trait;
 use beryl_types::{GroupName, LocatedBlock};
 use bytes::Bytes;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::error::{ClientError, ClientResult};
-use crate::planner::PlannedBlockRead;
-use crate::runtime::{AttemptContext, OperationContext};
-
-/// Internal boundary that isolates Worker RPC transport from client runtime
-/// and provides a narrow seam for orchestration tests.
-#[async_trait]
-pub(crate) trait WorkerTransport: Send + Sync {
-    /// Reads one metadata-planned block-local range with exact-length semantics.
-    async fn read_block_range(
-        &self,
-        attempt: AttemptContext,
-        group_name: GroupName,
-        block_read: &PlannedBlockRead,
-        output: &mut [u8],
-    ) -> ClientResult<()>;
-
-    /// Opens one metadata-authorized block write and returns only after the
-    /// Worker acknowledges write ownership.
-    async fn open_write_block(
-        &self,
-        attempt: AttemptContext,
-        target: WorkerWriteTarget,
-        lease_expires_at_ms: u64,
-    ) -> ClientResult<BlockWrite>;
-}
+use crate::runtime::OperationContext;
 
 /// Internal worker write target derived from metadata AllocateBlock.
 #[derive(Clone, Debug)]

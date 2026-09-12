@@ -14,9 +14,9 @@ use beryl_proto::common::{
 };
 use beryl_proto::metadata::{
     AbortFileWriteResponseProto, AllocateBlockResponseProto, CommitFileResponseProto, CreateDirectoryResponseProto,
-    CreateFileResponseProto, FileBlockLocationProto, FileTypeProto, GetBlockLocationsResponseProto,
-    GetStatusResponseProto, LocatedBlockProto, MsyncResponseProto, OpenFileResponseProto, RenewLeaseResponseProto,
-    SyncWriteResponseProto, WriteHandleProto,
+    CreateFileResponseProto, DirEntryProto, FileBlockLocationProto, FileTypeProto, GetBlockLocationsResponseProto,
+    GetStatusResponseProto, ListStatusResponseProto, LocatedBlockProto, MsyncResponseProto, OpenFileResponseProto,
+    RenewLeaseResponseProto, SyncWriteResponseProto, WriteHandleProto,
 };
 use bytes::Bytes;
 use std::collections::VecDeque;
@@ -31,7 +31,7 @@ use tonic::{Code, Status};
 const WORKER_RUN_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
 #[tokio::test]
-async fn list_status_rejects_zero_page_size_before_rpc() {
+async fn list_status_validates_options_and_drains_the_final_page() {
     let client = FsClient::new(client_config("127.0.0.1:1", 1)).expect("client");
 
     let error = match client
@@ -43,6 +43,43 @@ async fn list_status_rejects_zero_page_size_before_rpc() {
     };
 
     assert_client_error(&error, ClientErrorKind::InvalidArgument, false, "greater than zero");
+
+    let metadata = MockMetadata::new(MetadataScript {
+        list_status: VecDeque::from([
+            MetadataReply::success(ListStatusResponseProto {
+                entries: vec![DirEntryProto {
+                    name: "first".into(),
+                    kind: FileTypeProto::FileTypeFile as i32,
+                    ..Default::default()
+                }],
+                next_cursor: vec![1],
+                eof: false,
+                ..Default::default()
+            }),
+            MetadataReply::status(Status::unavailable("page request failed")),
+            MetadataReply::success(ListStatusResponseProto {
+                entries: vec![DirEntryProto {
+                    name: "last".into(),
+                    kind: FileTypeProto::FileTypeFile as i32,
+                    ..Default::default()
+                }],
+                eof: true,
+                ..Default::default()
+            }),
+        ]),
+        ..MetadataScript::default()
+    });
+    let server = metadata.start().await;
+    let client = FsClient::new(client_config(server.endpoint(), 1)).expect("client");
+    let mut entries = client.list_status("/alpha").await.expect("first page");
+    assert_eq!(entries.next().await.unwrap().unwrap().path(), "/alpha/first");
+    entries.next().await.expect_err("failed page remains retryable");
+    assert_eq!(entries.next().await.unwrap().unwrap().path(), "/alpha/last");
+    let calls = metadata.calls().len();
+    assert!(entries.next().await.unwrap().is_none());
+    assert!(entries.next().await.unwrap().is_none());
+    assert_eq!(metadata.calls().len(), calls);
+    server.shutdown().await;
 }
 
 #[tokio::test]
@@ -201,6 +238,8 @@ async fn reader_replans_without_advancing_position_and_rejects_local_bounds_befo
             ReadReply::RefreshMetadata,
             ReadReply::Data(Bytes::from_static(b"abcdefgh")),
             ReadReply::Data(Bytes::from_static(b"abcdefgh")),
+            ReadReply::Data(Bytes::from_static(b"abcdefgh")),
+            ReadReply::Data(Bytes::from_static(b"abcdefgh")),
         ]),
         ..WorkerScript::default()
     });
@@ -244,6 +283,14 @@ async fn reader_replans_without_advancing_position_and_rejects_local_bounds_befo
     assert_eq!(reader.read_at(4, &mut positioned).await.expect("positioned read"), 3);
     assert_eq!(&positioned, b"efg");
     assert_eq!(reader.position(), 3);
+
+    let before_cached_read = metadata.calls().len();
+    assert_eq!(reader.read(&mut sequential).await.expect("cached block subrange"), 3);
+    assert_eq!(&sequential[..3], b"def");
+    assert_eq!(reader.read(&mut sequential).await.expect("cached block tail"), 2);
+    assert_eq!(&sequential[..2], b"gh");
+    assert_eq!(reader.position(), 8);
+    assert_eq!(metadata.calls().len(), before_cached_read);
 
     let metadata_before_eof = metadata.calls().len();
     let worker_before_eof = worker.read_calls();

@@ -256,11 +256,7 @@ pub(crate) struct AttemptContext {
 
 impl AttemptContext {
     /// Create a metadata context and require an explicit group name.
-    pub(crate) fn for_metadata(
-        operation: &OperationContext,
-        group_name: GroupName,
-        _attempt_number: u32,
-    ) -> ClientResult<Self> {
+    pub(crate) fn for_metadata(operation: &OperationContext, group_name: GroupName) -> ClientResult<Self> {
         validate_client_id(operation.client_id)?;
         Ok(Self {
             call_id_text: operation.call_id.to_string(),
@@ -275,7 +271,7 @@ impl AttemptContext {
     }
 
     /// Create a data-plane context. Data RPCs carry block ownership in their operation payload.
-    pub(crate) fn for_data(operation: &OperationContext, _attempt_number: u32) -> Self {
+    pub(crate) fn for_data(operation: &OperationContext) -> Self {
         Self {
             call_id_text: operation.call_id.to_string(),
             operation: operation.clone(),

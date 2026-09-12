@@ -9,15 +9,13 @@ use super::protocol::{
     is_transient_worker_transport_status, parse_worker_data_status, read_block_stream_into,
 };
 use super::{
-    duration_until_unix_ms, write_lease_expired_error, BlockWrite, BlockWriteInput, BlockWriteLease, WorkerTransport,
-    WorkerWriteTarget,
+    duration_until_unix_ms, write_lease_expired_error, BlockWrite, BlockWriteInput, BlockWriteLease, WorkerWriteTarget,
 };
 use crate::cache::CacheInvalidationReason;
 use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
 use crate::planner::{block_location_unavailable_error, PlannedBlockRead};
 use crate::runtime::{is_definite_worker_capacity_rejection, AttemptContext};
-use async_trait::async_trait;
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, WorkerErrorKind};
 use beryl_proto::worker::{WriteBlockRequestProto, WriteBlockResponseProto};
 use beryl_types::{GroupName, WorkerEndpointInfo};
@@ -351,9 +349,8 @@ fn is_stale_read_location_error(error: &ClientError) -> bool {
     })
 }
 
-#[async_trait]
-impl WorkerTransport for GrpcWorkerTransport {
-    async fn read_block_range(
+impl GrpcWorkerTransport {
+    pub(super) async fn read_block_range(
         &self,
         attempt: AttemptContext,
         group_name: GroupName,
@@ -417,7 +414,7 @@ impl WorkerTransport for GrpcWorkerTransport {
         }))
     }
 
-    async fn open_write_block(
+    pub(super) async fn open_write_block(
         &self,
         attempt: AttemptContext,
         target: WorkerWriteTarget,
@@ -694,7 +691,7 @@ mod tests {
             OperationDeadline::new(5_000),
         )
         .expect("operation context");
-        AttemptContext::for_data(&operation, 0)
+        AttemptContext::for_data(&operation)
     }
 
     fn lease_expiry_after(delay_ms: u64) -> u64 {
@@ -723,7 +720,6 @@ mod tests {
         PlannedBlockRead {
             file_offset: 0,
             len: 4,
-            end_file_offset: 4,
             block_id: block_id(),
             block_offset: 0,
             block_size: 4096,

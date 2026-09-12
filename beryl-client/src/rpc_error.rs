@@ -9,7 +9,7 @@ use beryl_common::header::ResponseHeader;
 use beryl_proto::convert::rpc_error_from_proto;
 use beryl_types::GroupName;
 
-use crate::error::{ClientError, EndpointHint, RefreshHint};
+use crate::error::{ClientError, RefreshHint};
 
 /// Validates a Metadata response header before its body is consumed.
 pub(crate) fn validate_header(header: &ResponseHeader) -> Result<(), ClientError> {
@@ -59,12 +59,6 @@ fn refresh_hint_from_rpc_error(rpc_hint: Option<&beryl_common::error::rpc::Refre
     let Some(rpc_hint) = rpc_hint else {
         return RefreshHint::default();
     };
-    let worker_endpoints = rpc_hint
-        .worker_endpoints
-        .iter()
-        .cloned()
-        .map(EndpointHint::from)
-        .collect::<Vec<_>>();
     RefreshHint {
         leader_endpoint: rpc_hint.leader_endpoint.clone(),
         group_name: rpc_hint
@@ -74,8 +68,5 @@ fn refresh_hint_from_rpc_error(rpc_hint: Option<&beryl_common::error::rpc::Refre
         mount_prefix: rpc_hint.mount_prefix.clone(),
         route_epoch: rpc_hint.route_epoch,
         mount_epoch: rpc_hint.mount_epoch,
-        endpoint_hint: worker_endpoints.first().cloned(),
-        worker_endpoints,
-        worker_resolve_required: rpc_hint.worker_resolve_required,
     }
 }

@@ -5,7 +5,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
-use std::sync::Arc;
 
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
 use beryl_types::{GroupName, GroupStateWatermark};
@@ -18,40 +17,19 @@ use crate::runtime::context::{AttemptContext, OperationContext};
 
 const METADATA_TARGET_CACHE_LIMIT: usize = 300;
 
-/// Configured metadata group bootstrap target.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MetadataGroupTargets {
-    /// Stable metadata group name.
-    pub(crate) group_name: GroupName,
-    /// Metadata endpoints for this group.
-    pub(crate) endpoints: Vec<String>,
-}
-
 /// Routing and freshness caches protected by one lock so one response update
 /// cannot become partially visible to a concurrent request.
 #[derive(Debug)]
 struct MetadataTargetState {
-    groups: Vec<MetadataGroupTargets>,
-    leader_cache: HashMap<GroupName, String>,
-    route_cache: HashMap<String, GroupName>,
-    route_cache_order: VecDeque<String>,
+    leader_endpoint: Option<String>,
     mount_epoch_cache: HashMap<String, u64>,
     mount_epoch_cache_order: VecDeque<String>,
     route_epoch_cache: HashMap<String, u64>,
     route_epoch_cache_order: VecDeque<String>,
-    watermarks: HashMap<GroupName, GroupStateWatermark>,
+    watermark: Option<GroupStateWatermark>,
 }
 
 impl MetadataTargetState {
-    fn insert_route(&mut self, path: String, group_name: GroupName) {
-        let MetadataTargetState {
-            route_cache,
-            route_cache_order,
-            ..
-        } = self;
-        insert_bounded(route_cache, route_cache_order, path, group_name);
-    }
-
     fn record_mount_epoch_hint(&mut self, operation_path: Option<&str>, mount_prefix: Option<&str>, epoch: u64) {
         let MetadataTargetState {
             mount_epoch_cache,
@@ -85,70 +63,43 @@ impl MetadataTargetState {
 
 /// Owns metadata target selection and monotonic correctness cache updates from
 /// successful response authority and structured refresh signals.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct MetadataTargets {
-    state: Arc<RwLock<MetadataTargetState>>,
+    group_name: GroupName,
+    endpoints: Vec<String>,
+    state: RwLock<MetadataTargetState>,
 }
 
 impl MetadataTargets {
-    /// Create metadata targets from configured metadata groups.
-    pub(crate) fn new(groups: Vec<MetadataGroupTargets>) -> ClientResult<Self> {
-        if groups.is_empty() {
-            return Err(ClientError::invalid_argument(
-                "MetadataTargets requires at least one metadata group".to_string(),
-            ));
-        }
-        if let Some(group) = groups.iter().find(|group| group.endpoints.is_empty()) {
-            return Err(ClientError::invalid_argument(format!(
-                "MetadataTargets group {} requires at least one endpoint",
-                group.group_name
-            )));
-        }
+    /// Builds the single supported root route from sealed client configuration.
+    pub(crate) fn from_config(config: &ClientConfig) -> ClientResult<Self> {
+        let group_name = GroupName::parse("root")
+            .map_err(|error| ClientError::invalid_configuration(format!("invalid built-in root group: {error}")))?;
         Ok(Self {
-            state: Arc::new(RwLock::new(MetadataTargetState {
-                groups,
-                leader_cache: HashMap::new(),
-                route_cache: HashMap::new(),
-                route_cache_order: VecDeque::new(),
+            group_name,
+            endpoints: config.metadata_endpoints().to_vec(),
+            state: RwLock::new(MetadataTargetState {
+                leader_endpoint: None,
                 mount_epoch_cache: HashMap::new(),
                 mount_epoch_cache_order: VecDeque::new(),
                 route_epoch_cache: HashMap::new(),
                 route_epoch_cache_order: VecDeque::new(),
-                watermarks: HashMap::new(),
-            })),
+                watermark: None,
+            }),
         })
     }
 
-    /// Builds the single supported root route from sealed client configuration.
-    pub(crate) fn from_config(config: &ClientConfig) -> ClientResult<Self> {
-        let root = GroupName::parse("root")
-            .map_err(|error| ClientError::invalid_configuration(format!("invalid built-in root group: {error}")))?;
-        Self::new(vec![MetadataGroupTargets {
-            group_name: root,
-            endpoints: config.metadata_endpoints().to_vec(),
-        }])
+    pub(crate) fn group_name(&self) -> &GroupName {
+        &self.group_name
     }
 
-    /// Choose the owner group for a path, using owner cache before bootstrap config.
-    pub(crate) fn group_for_path(&self, path: &str) -> ClientResult<GroupName> {
-        let state = self.state.read();
-        if let Some(group_name) = state.route_cache.get(path) {
-            return Ok(group_name.clone());
+    fn validate_group(&self, group_name: &GroupName) -> ClientResult<()> {
+        if group_name != &self.group_name {
+            return Err(ClientError::invalid_configuration(format!(
+                "metadata group {group_name} is not configured"
+            )));
         }
-        state
-            .groups
-            .first()
-            .map(|group| group.group_name.clone())
-            .ok_or_else(|| ClientError::invalid_configuration("metadata group configuration is empty".to_string()))
-    }
-
-    /// Choose the owner group for an operation.
-    pub(crate) fn group_for_operation(&self, operation: &OperationContext) -> ClientResult<GroupName> {
-        if let Some(path) = operation.original_target_path() {
-            self.group_for_path(path)
-        } else {
-            self.group_for_path("")
-        }
+        Ok(())
     }
 
     /// Return cached mount epoch for a path or its best matching mount prefix.
@@ -161,34 +112,20 @@ impl MetadataTargets {
         cached_epoch_for_path(&self.state.read().route_epoch_cache, path)
     }
 
-    /// Select endpoint for the next attempt.
-    pub(crate) fn endpoint_for_group(&self, group_name: &GroupName, attempt: u32) -> ClientResult<String> {
-        let state = self.state.read();
-        if let Some(endpoint) = state.leader_cache.get(group_name) {
-            return Ok(endpoint.clone());
-        }
-        state
-            .groups
-            .iter()
-            .find(|group| &group.group_name == group_name)
-            .map(|group| {
-                let index = attempt as usize % group.endpoints.len();
-                group.endpoints[index].clone()
-            })
-            .ok_or_else(|| {
-                ClientError::invalid_configuration(format!("metadata group {} is not configured", group_name))
-            })
+    /// Selects the cached leader or a configured bootstrap endpoint.
+    pub(crate) fn endpoint(&self, attempt: u32) -> String {
+        self.state
+            .read()
+            .leader_endpoint
+            .clone()
+            .unwrap_or_else(|| self.endpoints[attempt as usize % self.endpoints.len()].clone())
     }
 
-    /// Clear a cached leader when transport failed against that exact endpoint.
-    pub(crate) fn record_transport_failure(&self, group_name: &GroupName, endpoint: &str) {
+    /// Clears only the leader endpoint whose transport failed.
+    pub(crate) fn record_transport_failure(&self, endpoint: &str) {
         let mut state = self.state.write();
-        if state
-            .leader_cache
-            .get(group_name)
-            .is_some_and(|cached| cached == endpoint)
-        {
-            state.leader_cache.remove(group_name);
+        if state.leader_endpoint.as_deref() == Some(endpoint) {
+            state.leader_endpoint = None;
         }
     }
 
@@ -203,7 +140,8 @@ impl MetadataTargets {
         match kind {
             ErrorKind::Metadata(MetadataErrorKind::NotLeader) => {
                 if let (Some(group_name), Some(endpoint)) = (hint.group_name.as_ref(), hint.leader_endpoint.as_ref()) {
-                    state.leader_cache.insert(group_name.clone(), endpoint.clone());
+                    self.validate_group(group_name)?;
+                    state.leader_endpoint = Some(endpoint.clone());
                 }
             }
             ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch | MetadataErrorKind::GroupMismatch) => {
@@ -212,11 +150,9 @@ impl MetadataTargets {
                         "owner group mismatch refresh missing group_name hint".to_string(),
                     ));
                 };
-                if let Some(path) = operation.original_target_path() {
-                    state.insert_route(path.to_string(), group_name.clone());
-                }
+                self.validate_group(group_name)?;
                 if let Some(endpoint) = hint.leader_endpoint.as_ref() {
-                    state.leader_cache.insert(group_name.clone(), endpoint.clone());
+                    state.leader_endpoint = Some(endpoint.clone());
                 }
             }
             ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch) => {
@@ -254,6 +190,7 @@ impl MetadataTargets {
         operation: &OperationContext,
         update: MetadataAuthorityUpdate,
     ) -> ClientResult<()> {
+        self.validate_group(&update.group_name)?;
         if update
             .state
             .iter()
@@ -272,7 +209,13 @@ impl MetadataTargets {
 
         let mut state = self.state.write();
         for watermark in update.state {
-            update_watermark_if_ahead(&mut state.watermarks, watermark);
+            if state
+                .watermark
+                .as_ref()
+                .is_none_or(|current| watermark.state_id > current.state_id)
+            {
+                state.watermark = Some(watermark);
+            }
         }
         if let Some(mount_epoch) = update.mount_epoch {
             state.record_mount_epoch_hint(operation_path, None, mount_epoch);
@@ -301,16 +244,9 @@ impl MetadataTargets {
         ctx
     }
 
-    /// Return cached watermark as proto for a group.
-    pub(crate) fn state_watermark_proto(
-        &self,
-        group_name: &GroupName,
-    ) -> Option<beryl_proto::common::GroupStateWatermarkProto> {
-        self.state
-            .read()
-            .watermarks
-            .get(group_name)
-            .map(beryl_proto::common::GroupStateWatermarkProto::from)
+    /// Returns the highest observed root-group watermark.
+    pub(crate) fn state_watermark_proto(&self) -> Option<beryl_proto::common::GroupStateWatermarkProto> {
+        self.state.read().watermark.as_ref().map(Into::into)
     }
 }
 
@@ -336,20 +272,6 @@ fn insert_bounded_epoch(cache: &mut HashMap<String, u64>, order: &mut VecDeque<S
         return;
     }
     insert_bounded(cache, order, key, epoch);
-}
-
-/// Advances one group watermark and ignores equal or older observations.
-fn update_watermark_if_ahead(
-    watermarks: &mut HashMap<GroupName, GroupStateWatermark>,
-    new_watermark: GroupStateWatermark,
-) {
-    match watermarks.get_mut(&new_watermark.group_name) {
-        Some(existing) if new_watermark.state_id > existing.state_id => *existing = new_watermark,
-        None => {
-            watermarks.insert(new_watermark.group_name.clone(), new_watermark);
-        }
-        Some(_) => {}
-    }
 }
 
 fn insert_bounded<K, V>(cache: &mut HashMap<K, V>, order: &mut VecDeque<K>, key: K, value: V)
@@ -392,16 +314,6 @@ fn path_matches_prefix(path: &str, prefix: &str) -> bool {
             .is_some_and(|remaining| remaining.starts_with('/'))
 }
 
-impl Default for MetadataTargets {
-    fn default() -> Self {
-        Self::new(vec![MetadataGroupTargets {
-            group_name: GroupName::parse("root").expect("default group name is valid"),
-            endpoints: vec!["127.0.0.1:18080".to_string()],
-        }])
-        .expect("default metadata group must be valid")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,11 +323,7 @@ mod tests {
     use beryl_types::{ClientId, GroupName};
 
     fn manager() -> MetadataTargets {
-        MetadataTargets::new(vec![MetadataGroupTargets {
-            group_name: group_name("root"),
-            endpoints: vec!["http://127.0.0.1:18080".to_string()],
-        }])
-        .expect("refresh manager")
+        MetadataTargets::from_config(&ClientConfig::builder().build().unwrap()).unwrap()
     }
 
     fn path_operation() -> OperationContext {
@@ -430,41 +338,14 @@ mod tests {
     }
 
     fn metadata_attempt(operation: &OperationContext) -> AttemptContext {
-        AttemptContext::for_metadata(operation, group_name("root"), 0).expect("metadata attempt")
-    }
-
-    #[test]
-    fn not_leader_hint_updates_leader_cache() {
-        let manager = manager();
-        let op = path_operation();
-
-        manager
-            .record_refresh(
-                &op,
-                ErrorKind::Metadata(MetadataErrorKind::NotLeader),
-                &RefreshHint {
-                    group_name: Some(group_name("root")),
-                    leader_endpoint: Some("http://127.0.0.1:18081".to_string()),
-                    ..RefreshHint::default()
-                },
-            )
-            .expect("refresh recorded");
-
-        assert_eq!(
-            manager
-                .endpoint_for_group(&group_name("root"), 0)
-                .expect("leader endpoint"),
-            "http://127.0.0.1:18081"
-        );
+        AttemptContext::for_metadata(operation, group_name("root")).expect("metadata attempt")
     }
 
     #[test]
     fn transport_failure_clears_failed_cached_leader() {
-        let targets = MetadataTargets::new(vec![MetadataGroupTargets {
-            group_name: group_name("root"),
-            endpoints: vec!["a".to_string(), "b".to_string()],
-        }])
-        .expect("metadata targets");
+        let targets =
+            MetadataTargets::from_config(&ClientConfig::builder().metadata_endpoints(["a", "b"]).build().unwrap())
+                .unwrap();
         let op = path_operation();
 
         targets
@@ -478,11 +359,13 @@ mod tests {
                 },
             )
             .expect("refresh recorded");
-        assert_eq!(targets.endpoint_for_group(&group_name("root"), 0).unwrap(), "leader");
+        assert_eq!(targets.endpoint(0), "leader");
 
-        targets.record_transport_failure(&group_name("root"), "leader");
+        targets.record_transport_failure("a");
+        assert_eq!(targets.endpoint(0), "leader");
+        targets.record_transport_failure("leader");
 
-        assert_eq!(targets.endpoint_for_group(&group_name("root"), 1).unwrap(), "b");
+        assert_eq!(targets.endpoint(1), "b");
     }
 
     #[test]
@@ -537,7 +420,7 @@ mod tests {
 
         let header = manager
             .enrich_attempt_context(&op, metadata_attempt(&op))
-            .with_state(manager.state_watermark_proto(&group_name("root")).into_iter().collect())
+            .with_state(manager.state_watermark_proto().into_iter().collect())
             .metadata_header()
             .expect("metadata header");
         assert_eq!(header.mount_epoch, Some(31));

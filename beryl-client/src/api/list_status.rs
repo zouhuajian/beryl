@@ -25,7 +25,6 @@ pub struct ListStatusIterator {
     options: ListStatusOptions,
     cursor: Option<Vec<u8>>,
     buffered: IntoIter<FileStatus>,
-    eof: bool,
 }
 
 impl ListStatusIterator {
@@ -42,7 +41,6 @@ impl ListStatusIterator {
             options,
             cursor: first_page.next_cursor,
             buffered: first_page.entries.into_iter(),
-            eof: first_page.eof,
         }
     }
 
@@ -60,7 +58,7 @@ impl ListStatusIterator {
             if let Some(status) = self.buffered.next() {
                 return Ok(Some(status));
             }
-            if self.eof {
+            if self.cursor.is_none() {
                 return Ok(None);
             }
 
@@ -78,7 +76,6 @@ impl ListStatusIterator {
 
             self.cursor = page.next_cursor;
             self.buffered = page.entries.into_iter();
-            self.eof = page.eof;
         }
     }
 }

@@ -3,9 +3,7 @@
 
 //! Public writer handle.
 
-use crate::client_inner::{
-    is_unknown_session_barrier_outcome, mark_session_after_metadata_error, metric_labels, ClientInner,
-};
+use crate::client_inner::{mark_session_after_metadata_error, metric_labels, ClientInner};
 use crate::error::{ClientErrorKind, ClientResult};
 use crate::metrics::ClientMetric;
 use crate::runtime::OperationDeadline;
@@ -107,7 +105,7 @@ impl FileWriter {
         let path = self.session.path().to_string();
         self.finish_pending_block(&deadline).await?;
         let target_size = self.session.cursor();
-        let committed_blocks = self.inner.committed_blocks_for_barrier(&self.session);
+        let committed_blocks = self.session.publication_blocks();
         let plan = self.session.prepare_sync_write(
             self.inner.metadata.client_id(),
             self.inner.metadata.client_name(),
@@ -120,7 +118,7 @@ impl FileWriter {
                 self.session.mark_sync_completed(generation, target_size)?;
                 Ok(())
             }
-            Err(err) if is_unknown_session_barrier_outcome(&err) => {
+            Err(err) if err.is_outcome_unknown() => {
                 self.inner.record_metric(
                     ClientMetric::UnknownOutcome,
                     metric_labels("SyncWrite", "metadata").with_outcome("unknown"),
@@ -198,9 +196,9 @@ impl FileWriter {
         let path = self.session.path().to_string();
         self.finish_pending_block(&deadline).await?;
         let final_size = self.session.cursor();
-        let committed_blocks = self.inner.committed_blocks_for_barrier(&self.session);
+        let committed_blocks = self.session.publication_blocks();
 
-        let retrying_unknown_commit = self.session.is_commit_unknown();
+        let retrying_unknown_commit = self.session.is_commit_pending();
         let plan = self.session.prepare_commit_file(
             self.inner.metadata.client_id(),
             self.inner.metadata.client_name(),
@@ -220,14 +218,11 @@ impl FileWriter {
                 Ok(())
             }
             Err(err)
-                if retrying_unknown_commit
-                    || is_unknown_session_barrier_outcome(&err)
-                    || err.kind() == ClientErrorKind::Internal =>
+                if retrying_unknown_commit || err.is_outcome_unknown() || err.kind() == ClientErrorKind::Internal =>
             {
                 // A later fence or missing receipt cannot establish the outcome
                 // of the original attempt, including a cancelled close future.
                 // Internal failures also lack proof that Raft did not apply.
-                self.session.mark_commit_unknown();
                 self.inner.record_metric(
                     ClientMetric::UnknownOutcome,
                     metric_labels("CommitFile", "metadata").with_outcome("unknown"),
@@ -263,7 +258,6 @@ impl FileWriter {
             .abort_file_write(plan.metadata_operation(), plan.metadata_write_handle())
             .await
         {
-            self.session.mark_abort_unknown();
             let normalized = self.inner.normalize_outcome_error("AbortFileWrite", "metadata", err);
             let metric = if normalized.is_outcome_unknown() {
                 ClientMetric::AbortUnknown

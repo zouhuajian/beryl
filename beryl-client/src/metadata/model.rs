@@ -40,8 +40,6 @@ pub(crate) struct ListStatusPage {
     pub(crate) entries: Vec<FileStatus>,
     /// Opaque continuation cursor, present exactly when `eof` is false.
     pub(crate) next_cursor: Option<Vec<u8>>,
-    /// Whether this page reached the current end of the directory scan.
-    pub(crate) eof: bool,
 }
 
 impl<T> ValidatedMetadataResponse<T> {
