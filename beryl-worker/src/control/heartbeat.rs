@@ -25,8 +25,8 @@ use tracing::{debug, info, warn};
 
 use crate::config::WorkerRegistrationConfig;
 use crate::control::{
-    metadata_tonic_request, BlockCleanupCommand, BlockCleanupExecutor, ControlIdentity, ControlOp, MetadataRegistrar,
-    Registration, RegistrationDescriptor, RegistrationSet,
+    BlockCleanupCommand, BlockCleanupExecutor, ControlIdentity, ControlOp, MetadataRegistrar, Registration,
+    RegistrationDescriptor, RegistrationSet,
 };
 use crate::observe;
 use crate::store::dirs::{StoreDirs, StoreReport};
@@ -115,27 +115,6 @@ impl MetadataHeartbeatLoop {
         })
     }
 
-    pub fn spawn_with_registrar(self, registrar: Arc<MetadataRegistrar>) -> tokio::task::JoinHandle<()> {
-        self.spawn_with_registrar_until_shutdown(registrar, CancellationToken::new())
-    }
-
-    /// Starts the heartbeat loop under the process shutdown token.
-    pub fn spawn_with_registrar_until_shutdown(
-        self,
-        registrar: Arc<MetadataRegistrar>,
-        shutdown: CancellationToken,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move { self.run(registrar, None, shutdown).await })
-    }
-
-    pub fn spawn_with_registrar_and_store(
-        self,
-        registrar: Arc<MetadataRegistrar>,
-        store: Arc<StoreDirs>,
-    ) -> tokio::task::JoinHandle<()> {
-        self.spawn_with_registrar_and_store_until_shutdown(registrar, store, CancellationToken::new())
-    }
-
     /// Starts store-backed heartbeat reporting under the process shutdown token.
     pub fn spawn_with_registrar_and_store_until_shutdown(
         self,
@@ -143,7 +122,7 @@ impl MetadataHeartbeatLoop {
         store: Arc<StoreDirs>,
         shutdown: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move { self.run(registrar, Some(store), shutdown).await })
+        tokio::spawn(async move { self.run(registrar, store, shutdown).await })
     }
 
     /// Sends one heartbeat round and enqueues commands from accepted responses.
@@ -263,7 +242,7 @@ impl MetadataHeartbeatLoop {
             .map_err(|_| HeartbeatError::Retryable("metadata heartbeat connect timed out".to_string()))?
             .map_err(|err| HeartbeatError::Retryable(format!("metadata heartbeat endpoint unavailable: {err}")))?;
         let mut client = MetadataWorkerServiceProtoClient::new(channel);
-        let tonic_request = metadata_tonic_request(request.clone(), request.header.as_ref());
+        let tonic_request = tonic::Request::new(request.clone());
         let response = time::timeout(timeout, client.heartbeat(tonic_request))
             .await
             .map_err(|_| HeartbeatError::Retryable("metadata heartbeat request timed out".to_string()))?
@@ -272,7 +251,7 @@ impl MetadataHeartbeatLoop {
         classify_heartbeat_response(&request, response)
     }
 
-    async fn run(self, registrar: Arc<MetadataRegistrar>, store: Option<Arc<StoreDirs>>, shutdown: CancellationToken) {
+    async fn run(self, registrar: Arc<MetadataRegistrar>, store: Arc<StoreDirs>, shutdown: CancellationToken) {
         let mut interval = time::interval(self.interval);
         loop {
             tokio::select! {
@@ -300,18 +279,15 @@ impl MetadataHeartbeatLoop {
                 }
             }
 
-            let snapshot = match store.as_ref() {
-                Some(store) => match store.report() {
-                    Ok(report) => {
-                        observe::record_store_report(&report);
-                        HeartbeatSnapshot::from(report)
-                    }
-                    Err(error) => {
-                        warn!(%error, "Worker store report failed before heartbeat");
-                        continue;
-                    }
-                },
-                None => HeartbeatSnapshot::default(),
+            let snapshot = match store.report() {
+                Ok(report) => {
+                    observe::record_store_report(&report);
+                    HeartbeatSnapshot::from(report)
+                }
+                Err(error) => {
+                    warn!(%error, "Worker store report failed before heartbeat");
+                    continue;
+                }
             };
 
             let heartbeat = tokio::select! {

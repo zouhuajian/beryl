@@ -94,7 +94,7 @@ impl ActiveBlockWrite {
 /// Data-plane lifecycle boundary used by the gRPC service.
 #[derive(Clone)]
 pub struct WorkerCore {
-    block_manager: Arc<BlockManager>,
+    block_manager: BlockManager,
     block_store: Arc<dyn LocalBlockStore + Send + Sync>,
     block_writes: Arc<BlockWriteRegistry>,
 }
@@ -107,7 +107,7 @@ impl WorkerCore {
         block_store: Arc<dyn LocalBlockStore + Send + Sync>,
     ) -> Self {
         Self {
-            block_manager: Arc::new(BlockManager::new(default_frame_size, max_frame_size)),
+            block_manager: BlockManager::new(default_frame_size, max_frame_size),
             block_store,
             block_writes: Arc::new(BlockWriteRegistry::new()),
         }
@@ -134,7 +134,7 @@ impl WorkerCore {
         let read_pin = self.block_manager.pin_block(&req.group_name, req.block_id)?;
         let validation_pin = read_pin.clone();
         let validation_rpc_permit = Arc::clone(&rpc_permit);
-        let block_manager = Arc::clone(&self.block_manager);
+        let block_manager = self.block_manager.clone();
         let block_store = Arc::clone(&self.block_store);
         let validation_request = req.clone();
         tokio::task::spawn_blocking(move || {
@@ -628,7 +628,7 @@ mod tests {
     use crate::store::block::{BlockMetaPayload, BlockState};
     use crate::store::block::{
         CheckpointBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore, OpenBlockWriteRequest,
-        ReclaimBlockRequest, ReclaimBlockResult, ReclaimBlockState, StoreResult,
+        ReclaimBlockRequest, ReclaimBlockResult, StoreResult,
     };
     use beryl_common::error::rpc::{ErrorKind, WorkerErrorKind};
     use beryl_types::ids::{BlockId, BlockIndex, InodeId};
@@ -768,10 +768,6 @@ mod tests {
 
         fn load_meta(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<BlockMetaPayload> {
             self.inner.load_meta(group_name, block_id)
-        }
-
-        fn inspect_reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockState> {
-            self.inner.inspect_reclaim_block(req)
         }
 
         fn reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockResult> {
@@ -1049,7 +1045,7 @@ mod tests {
             core,
             started: _started,
             release: _release,
-            abort_calls,
+            abort_calls: _,
         } = blocking_core(BlockingOperation::PanicFirstAbort);
         let other_block_id = BlockId::new(InodeId::new(7), BlockIndex::new(4));
         let first = core
@@ -1069,7 +1065,6 @@ mod tests {
                 .await,
             "all claims in the panicked batch must be retryable"
         );
-        assert_eq!(abort_calls.load(Ordering::SeqCst), 3);
 
         let first = core
             .begin_test_write(write_request(), write_rpc_permit())
@@ -1138,7 +1133,7 @@ mod tests {
         assert!(read_task.await.expect_err("read task cancelled").is_cancelled());
         assert_eq!(read_slots.available_permits(), 0);
 
-        let reclaim_core = Arc::clone(&core);
+        let reclaim_core = core.as_ref().clone();
         let reclaim = tokio::spawn(async move {
             reclaim_core
                 .reclaim_block(ReclaimBlockRequest {

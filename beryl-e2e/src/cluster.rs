@@ -252,7 +252,7 @@ impl TestCluster {
 
     pub fn current_worker_run_id(&self) -> Option<WorkerRunId> {
         self.registration_state
-            .registration_for_group(&self.group_name)
+            .registration(&self.group_name)
             .map(|registration| registration.worker_run_id)
     }
 
@@ -261,7 +261,7 @@ impl TestCluster {
         run_ids.extend(self.additional_workers.iter().filter_map(|worker| {
             worker
                 .registration_state
-                .registration_for_group(&self.group_name)
+                .registration(&self.group_name)
                 .map(|registration| registration.worker_run_id)
         }));
         run_ids
@@ -848,13 +848,12 @@ fn start_worker_instance(
     )?;
     let heartbeat = MetadataHeartbeatLoop::new(
         worker_config.metadata.clone(),
-        descriptor.clone(),
+        descriptor,
         Arc::clone(&registration_state),
         cleanup.executor(),
     )?;
     let block_report = Arc::new(MetadataBlockReportLoop::new(
         worker_config.metadata.clone(),
-        descriptor,
         Arc::clone(&registration_state),
         Arc::clone(&block_store),
         Arc::clone(&worker_core),

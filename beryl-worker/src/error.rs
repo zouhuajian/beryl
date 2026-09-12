@@ -60,13 +60,6 @@ pub enum WorkerError {
     Internal(String),
 }
 
-/// Error metadata for retry and observability.
-#[derive(Clone, Debug)]
-pub struct ErrorMetadata {
-    /// Suggested retry delay hint for retryable errors.
-    pub retry_after_ms: Option<u64>,
-}
-
 impl WorkerError {
     /// Check if this error is retryable.
     pub fn is_retryable(&self) -> bool {
@@ -74,25 +67,6 @@ impl WorkerError {
             self,
             WorkerError::Timeout(_) | WorkerError::ResourceExhausted(_) | WorkerError::Unavailable(_)
         )
-    }
-
-    /// Get error metadata.
-    pub fn metadata(&self) -> ErrorMetadata {
-        let retry_after_ms = match self {
-            WorkerError::Timeout(_) => Some(100),
-            WorkerError::ResourceExhausted(_) => Some(5000),
-            WorkerError::Unavailable(_) => Some(500),
-            WorkerError::DiskError(_)
-            | WorkerError::Cancelled(_)
-            | WorkerError::InvalidArgument(_)
-            | WorkerError::NotFound(_)
-            | WorkerError::Corrupt(_)
-            | WorkerError::RefreshMetadata { .. }
-            | WorkerError::PermissionDenied(_)
-            | WorkerError::Internal(_) => None,
-        };
-
-        ErrorMetadata { retry_after_ms }
     }
 
     /// Convert to gRPC Status (without modifying proto).
@@ -145,23 +119,16 @@ impl From<std::io::Error> for WorkerError {
 
 impl From<WorkerError> for RpcErrorDetail {
     fn from(err: WorkerError) -> Self {
-        let metadata = err.metadata();
         match err {
-            WorkerError::Timeout(msg) => RpcErrorDetail::retry(
-                ErrorKind::Worker(WorkerErrorKind::Timeout),
-                metadata.retry_after_ms,
-                msg,
-            ),
-            WorkerError::ResourceExhausted(msg) => RpcErrorDetail::retry(
-                ErrorKind::Worker(WorkerErrorKind::ResourceExhausted),
-                metadata.retry_after_ms,
-                msg,
-            ),
-            WorkerError::Unavailable(msg) => RpcErrorDetail::retry(
-                ErrorKind::Worker(WorkerErrorKind::NodeUnavailable),
-                metadata.retry_after_ms,
-                msg,
-            ),
+            WorkerError::Timeout(msg) => {
+                RpcErrorDetail::retry(ErrorKind::Worker(WorkerErrorKind::Timeout), Some(100), msg)
+            }
+            WorkerError::ResourceExhausted(msg) => {
+                RpcErrorDetail::retry(ErrorKind::Worker(WorkerErrorKind::ResourceExhausted), Some(5000), msg)
+            }
+            WorkerError::Unavailable(msg) => {
+                RpcErrorDetail::retry(ErrorKind::Worker(WorkerErrorKind::NodeUnavailable), Some(500), msg)
+            }
             WorkerError::DiskError(msg) => RpcErrorDetail::fail(
                 ErrorKind::Worker(WorkerErrorKind::Io),
                 format!("disk I/O error: {}", msg),

@@ -21,7 +21,7 @@ use tonic::Code;
 use tracing::{info, warn};
 
 use crate::config::{WorkerConfig, WorkerRegistrationConfig};
-use crate::control::{metadata_tonic_request, ControlIdentity, ControlOp, Registration, RegistrationSet};
+use crate::control::{ControlIdentity, ControlOp, Registration, RegistrationSet};
 use crate::net::protocol::WorkerNetProtocol;
 
 /// Worker descriptor sent to metadata during startup registration.
@@ -33,7 +33,6 @@ pub struct RegistrationDescriptor {
     pub endpoint_host: String,
     pub endpoint_port: u32,
     pub advertised_endpoint: String,
-    pub worker_net_protocol: WorkerNetProtocol,
 }
 
 #[derive(Debug, Error)]
@@ -88,7 +87,7 @@ impl MetadataRegistrar {
         config: &WorkerConfig,
         worker_id: WorkerId,
     ) -> Result<RegistrationDescriptor, RegistrationError> {
-        let listener = config
+        config
             .net
             .listeners
             .iter()
@@ -105,7 +104,6 @@ impl MetadataRegistrar {
             endpoint_host,
             endpoint_port,
             advertised_endpoint: config.rpc_address(),
-            worker_net_protocol: listener.protocol,
         })
     }
 
@@ -119,7 +117,7 @@ impl MetadataRegistrar {
         let channel = self.connect(timeout).await?;
         let mut client = MetadataWorkerServiceProtoClient::new(channel);
         let request = self.build_request(op);
-        let tonic_request = metadata_tonic_request(request.clone(), request.header.as_ref());
+        let tonic_request = tonic::Request::new(request.clone());
         let response = time::timeout(timeout, client.register_worker(tonic_request))
             .await
             .map_err(|_| RegistrationError::Retryable("metadata register request timed out".to_string()))?

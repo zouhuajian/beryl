@@ -417,8 +417,7 @@ fn validate_options(options: &BlockCleanupOptions) -> Result<(), WorkerError> {
 mod tests {
     use super::*;
     use crate::store::block::{
-        BlockMetaPayload, CheckpointBlockRequest, LocalBlockStore, OpenBlockWriteRequest, ReclaimBlockState,
-        StoreResult,
+        BlockMetaPayload, CheckpointBlockRequest, LocalBlockStore, OpenBlockWriteRequest, StoreResult,
     };
     use beryl_types::{BlockIndex, InodeId};
     use bytes::Bytes;
@@ -476,10 +475,6 @@ mod tests {
 
         fn load_meta(&self, _group_name: &GroupName, _block_id: BlockId) -> StoreResult<BlockMetaPayload> {
             panic!("unused test operation")
-        }
-
-        fn inspect_reclaim_block(&self, _req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockState> {
-            Ok(ReclaimBlockState::Ready)
         }
 
         fn reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockResult> {
@@ -637,67 +632,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owned_runtime_cancels_retrying_cleanup_work() {
-        let run_id = WorkerRunId::new();
-        let registrations = registered(run_id);
-        let store = Arc::new(ControlledStore::new(ReclaimBehavior::Fail, Duration::ZERO));
-        let core = Arc::new(WorkerCore::with_local_store(1_024, 1_024, store.clone()));
-        let runtime = BlockCleanupRuntime::start(
-            core,
-            registrations,
-            BlockCleanupOptions {
-                max_pending: 2,
-                max_concurrent: 1,
-                retry_initial_backoff: Duration::from_secs(30),
-                retry_max_backoff: Duration::from_secs(30),
-            },
-        )
-        .unwrap();
-        runtime
-            .executor()
-            .enqueue(&registration(run_id), [command(test_block_id(1))]);
-        wait_for(|| store.calls.load(Ordering::SeqCst) == 1).await;
-
-        let forced = tokio::time::timeout(Duration::from_secs(1), runtime.shutdown_until(Instant::now()))
-            .await
-            .expect("cleanup shutdown must cancel retry backoff")
-            .unwrap();
-        assert!(forced);
-    }
-
-    #[tokio::test]
     async fn shutdown_deadline_forces_and_awaits_retrying_cleanup_work() {
-        let run_id = WorkerRunId::new();
-        let registrations = registered(run_id);
-        let store = Arc::new(ControlledStore::new(ReclaimBehavior::Fail, Duration::ZERO));
-        let core = Arc::new(WorkerCore::with_local_store(1_024, 1_024, store.clone()));
-        let runtime = BlockCleanupRuntime::start(
-            core,
-            registrations,
-            BlockCleanupOptions {
-                max_pending: 2,
-                max_concurrent: 1,
-                retry_initial_backoff: Duration::from_secs(30),
-                retry_max_backoff: Duration::from_secs(30),
-            },
-        )
-        .unwrap();
-        let executor = runtime.executor();
-        executor.enqueue(&registration(run_id), [command(test_block_id(1))]);
-        wait_for(|| store.calls.load(Ordering::SeqCst) == 1).await;
-
-        let forced = runtime
-            .shutdown_until(Instant::now() + Duration::from_millis(20))
-            .await
+        for grace in [Duration::ZERO, Duration::from_millis(20)] {
+            let run_id = WorkerRunId::new();
+            let registrations = registered(run_id);
+            let store = Arc::new(ControlledStore::new(ReclaimBehavior::Fail, Duration::ZERO));
+            let core = Arc::new(WorkerCore::with_local_store(1_024, 1_024, store.clone()));
+            let runtime = BlockCleanupRuntime::start(
+                core,
+                registrations,
+                BlockCleanupOptions {
+                    max_pending: 2,
+                    max_concurrent: 1,
+                    retry_initial_backoff: Duration::from_secs(30),
+                    retry_max_backoff: Duration::from_secs(30),
+                },
+            )
             .unwrap();
+            let executor = runtime.executor();
+            executor.enqueue(&registration(run_id), [command(test_block_id(1))]);
+            wait_for(|| store.calls.load(Ordering::SeqCst) == 1).await;
 
-        assert!(forced);
-        assert!(executor
-            .inner
-            .pending
-            .lock()
-            .expect("cleanup state poisoned")
-            .is_empty());
+            let forced = tokio::time::timeout(Duration::from_secs(1), runtime.shutdown_until(Instant::now() + grace))
+                .await
+                .expect("cleanup shutdown must cancel retry backoff")
+                .unwrap();
+
+            assert!(forced);
+            assert!(executor
+                .inner
+                .pending
+                .lock()
+                .expect("cleanup state poisoned")
+                .is_empty());
+        }
     }
 
     struct TestExecutor {

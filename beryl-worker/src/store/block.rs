@@ -534,8 +534,6 @@ pub trait LocalBlockStore {
     /// Reject unsupported local versions and invalid identity or checkpoint bounds.
     fn load_meta(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<BlockMetaPayload>;
 
-    fn inspect_reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockState>;
-
     fn reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockResult>;
 
     fn discard_unsynced_suffix(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<()>;
@@ -560,10 +558,6 @@ impl LocalBlockStore for FullBlockFileStore {
 
     fn load_meta(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<BlockMetaPayload> {
         FullBlockFileStore::load_meta(self, group_name, block_id)
-    }
-
-    fn inspect_reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockState> {
-        FullBlockFileStore::inspect_reclaim_block(self, req)
     }
 
     fn reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockResult> {

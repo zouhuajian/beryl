@@ -155,25 +155,6 @@ impl RegistrationSet {
             .map(|deadline| deadline > Instant::now())
             .unwrap_or(false)
     }
-
-    pub fn is_any_ready(&self) -> bool {
-        if self.shutting_down.load(Ordering::Acquire) {
-            return false;
-        }
-        self.registrations
-            .read()
-            .expect("registration state poisoned")
-            .values()
-            .any(|entry| {
-                entry
-                    .heartbeat_deadline
-                    .is_some_and(|deadline| deadline > Instant::now())
-            })
-    }
-
-    pub fn registration_for_group(&self, group_name: &GroupName) -> Option<Registration> {
-        self.registration(group_name)
-    }
 }
 
 #[cfg(test)]

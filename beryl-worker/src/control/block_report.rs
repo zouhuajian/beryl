@@ -26,9 +26,7 @@ use tonic::Code;
 use tracing::{debug, warn};
 
 use crate::config::WorkerRegistrationConfig;
-use crate::control::{
-    metadata_tonic_request, ControlIdentity, ControlOp, Registration, RegistrationDescriptor, RegistrationSet,
-};
+use crate::control::{ControlIdentity, ControlOp, Registration, RegistrationSet};
 use crate::error::WorkerError;
 use crate::observe;
 use crate::report::DirtyBlock;
@@ -127,7 +125,6 @@ struct ReportRuntime {
 /// periodic Full report while the current baseline remains continuous.
 pub struct MetadataBlockReportLoop {
     config: WorkerRegistrationConfig,
-    _descriptor: RegistrationDescriptor,
     state: Arc<RegistrationSet>,
     endpoint: Endpoint,
     store: Arc<StoreDirs>,
@@ -135,43 +132,32 @@ pub struct MetadataBlockReportLoop {
     options: BlockReportOptions,
     delta_flush_interval: Duration,
     control_identity: ControlIdentity,
-    reports: Mutex<HashMap<GroupName, ReportRuntime>>,
+    report: Mutex<ReportRuntime>,
 }
 
 impl MetadataBlockReportLoop {
     pub fn new(
         config: WorkerRegistrationConfig,
-        descriptor: RegistrationDescriptor,
         state: Arc<RegistrationSet>,
         store: Arc<StoreDirs>,
         core: Arc<WorkerCore>,
     ) -> Result<Self, BlockReportError> {
-        Self::with_options(config, descriptor, state, store, core, BlockReportOptions::default())
+        Self::with_options(config, state, store, core, BlockReportOptions::default())
     }
 
     pub fn with_options(
         config: WorkerRegistrationConfig,
-        descriptor: RegistrationDescriptor,
         state: Arc<RegistrationSet>,
         store: Arc<StoreDirs>,
         core: Arc<WorkerCore>,
         options: BlockReportOptions,
     ) -> Result<Self, BlockReportError> {
-        Self::with_options_and_delta_flush_interval(
-            config,
-            descriptor,
-            state,
-            store,
-            core,
-            options,
-            Duration::from_secs(1),
-        )
+        Self::with_options_and_delta_flush_interval(config, state, store, core, options, Duration::from_secs(1))
     }
 
     /// Builds a reporter with an explicit retry and Delta flush cadence.
     pub fn with_options_and_delta_flush_interval(
         config: WorkerRegistrationConfig,
-        descriptor: RegistrationDescriptor,
         state: Arc<RegistrationSet>,
         store: Arc<StoreDirs>,
         core: Arc<WorkerCore>,
@@ -194,7 +180,6 @@ impl MetadataBlockReportLoop {
 
         Ok(Self {
             config,
-            _descriptor: descriptor,
             state,
             endpoint,
             store,
@@ -202,7 +187,7 @@ impl MetadataBlockReportLoop {
             options,
             delta_flush_interval,
             control_identity: ControlIdentity::new_local(),
-            reports: Mutex::new(HashMap::new()),
+            report: Mutex::new(ReportRuntime::default()),
         })
     }
 
@@ -217,16 +202,14 @@ impl MetadataBlockReportLoop {
 
     /// Returns whether the current registration owns an accepted Full baseline.
     pub fn has_delta_baseline(&self, group_name: &GroupName) -> bool {
+        if group_name != &self.config.group_name {
+            return false;
+        }
         let Some((_, registration_epoch)) = self.state.ready_registration(group_name) else {
             return false;
         };
-        self.reports
-            .lock()
-            .expect("block report state poisoned")
-            .get(group_name)
-            .is_some_and(|report| {
-                report.registration_epoch == registration_epoch && report.active_baseline_seq.is_some()
-            })
+        let report = self.report.lock().expect("block report state poisoned");
+        report.registration_epoch == registration_epoch && report.active_baseline_seq.is_some()
     }
 
     /// Sends or exactly retries one Full snapshot for the current registration.
@@ -332,9 +315,8 @@ impl MetadataBlockReportLoop {
         group_name: &GroupName,
         registration_epoch: u64,
     ) -> Result<Arc<FullReportInFlight>, BlockReportError> {
-        let mut reports = self.reports.lock().expect("block report state poisoned");
-        let report = reports.entry(group_name.clone()).or_default();
-        bind_registration(report, registration_epoch);
+        let mut report = self.report.lock().expect("block report state poisoned");
+        bind_registration(&mut report, registration_epoch);
         if let Some(full) = &report.full_inflight {
             return Ok(Arc::clone(full));
         }
@@ -368,9 +350,8 @@ impl MetadataBlockReportLoop {
         group_name: &GroupName,
         registration_epoch: u64,
     ) -> Result<DeltaPreparation, BlockReportError> {
-        let mut reports = self.reports.lock().expect("block report state poisoned");
-        let report = reports.entry(group_name.clone()).or_default();
-        bind_registration(report, registration_epoch);
+        let mut report = self.report.lock().expect("block report state poisoned");
+        bind_registration(&mut report, registration_epoch);
         if let Some(delta) = &report.delta_inflight {
             return Ok(DeltaPreparation::Ready(Arc::clone(delta)));
         }
@@ -381,14 +362,14 @@ impl MetadataBlockReportLoop {
         let store_dirty = match self.store.block_report_changes().snapshot(group_name) {
             Ok(dirty) => dirty,
             Err(()) => {
-                reset_baseline(report);
+                reset_baseline(&mut report);
                 return Ok(DeltaPreparation::FullRequired);
             }
         };
         let runtime_dirty = match self.core.block_report_changes().snapshot(group_name) {
             Ok(dirty) => dirty,
             Err(()) => {
-                reset_baseline(report);
+                reset_baseline(&mut report);
                 return Ok(DeltaPreparation::FullRequired);
             }
         };
@@ -429,7 +410,7 @@ impl MetadataBlockReportLoop {
             }));
         }
         match self.store.load_report_meta(group_name, block_id) {
-            Ok(meta) => meta_to_report_block(meta).map(present_entry),
+            Ok(meta) => Ok(present_entry(meta_to_report_block(meta))),
             Err(WorkerError::NotFound(_)) => Ok(DeltaBlockReportEntryProto {
                 block: Some(delta_block_report_entry_proto::Block::Absent(block_id.into())),
             }),
@@ -447,7 +428,7 @@ impl MetadataBlockReportLoop {
             .map_err(|err| BlockReportError::Retryable(format!("scan local block report group failed: {err}")))?;
         let mut blocks = HashMap::with_capacity(metas.len());
         for meta in metas {
-            let block = meta_to_report_block(meta)?;
+            let block = meta_to_report_block(meta);
             let id = block_id(&block).expect("local block report entry has an id");
             blocks.insert(id, block);
         }
@@ -470,10 +451,7 @@ impl MetadataBlockReportLoop {
 
     /// Commits a Full acknowledgement only if it still names the in-flight snapshot.
     fn accept_full_report(&self, group_name: &GroupName, registration_epoch: u64, baseline_seq: u64) {
-        let mut reports = self.reports.lock().expect("block report state poisoned");
-        let Some(report) = reports.get_mut(group_name) else {
-            return;
-        };
+        let mut report = self.report.lock().expect("block report state poisoned");
         let Some(full) = report.full_inflight.as_ref() else {
             return;
         };
@@ -494,7 +472,7 @@ impl MetadataBlockReportLoop {
             report.active_baseline_seq = Some(baseline_seq);
             report.next_delta_batch_seq = 0;
         } else {
-            reset_baseline(report);
+            reset_baseline(&mut report);
         }
     }
 
@@ -514,10 +492,7 @@ impl MetadataBlockReportLoop {
                 "metadata acknowledged next delta batch {next_batch_seq}, expected {expected_next}"
             )));
         }
-        let mut reports = self.reports.lock().expect("block report state poisoned");
-        let Some(report) = reports.get_mut(group_name) else {
-            return Ok(());
-        };
+        let mut report = self.report.lock().expect("block report state poisoned");
         let Some(delta) = report.delta_inflight.as_ref() else {
             return Ok(());
         };
@@ -538,11 +513,9 @@ impl MetadataBlockReportLoop {
         Ok(())
     }
 
-    fn reset_baseline(&self, group_name: &GroupName) {
-        let mut reports = self.reports.lock().expect("block report state poisoned");
-        if let Some(report) = reports.get_mut(group_name) {
-            reset_baseline(report);
-        }
+    fn reset_baseline(&self) {
+        let mut report = self.report.lock().expect("block report state poisoned");
+        reset_baseline(&mut report);
     }
 
     fn record_structured_outcome(
@@ -556,19 +529,19 @@ impl MetadataBlockReportLoop {
         let error_kind = match outcome {
             BlockReportPeerOutcome::FullReportRequired => {
                 round.full_report_required = true;
-                self.reset_baseline(group_name);
+                self.reset_baseline();
                 "full_report_required"
             }
             BlockReportPeerOutcome::NeedRegister => {
                 round.needs_register = true;
                 self.state.mark_needs_register(group_name);
-                self.reset_baseline(group_name);
+                self.reset_baseline();
                 "need_register"
             }
             BlockReportPeerOutcome::WorkerRunMismatch => {
                 round.worker_run_mismatch = true;
                 self.state.mark_needs_register(group_name);
-                self.reset_baseline(group_name);
+                self.reset_baseline();
                 "worker_run_mismatch"
             }
             BlockReportPeerOutcome::FullAccepted { .. } | BlockReportPeerOutcome::DeltaAccepted { .. } => {
@@ -662,7 +635,7 @@ impl MetadataBlockReportLoop {
                 },
             )),
         };
-        let tonic_request = metadata_tonic_request(request.clone(), request.header.as_ref());
+        let tonic_request = tonic::Request::new(request.clone());
         let response = time::timeout(timeout, client.block_report(tonic_request))
             .await
             .map_err(|_| BlockReportError::Retryable("metadata full block report timed out".to_string()))?
@@ -695,7 +668,7 @@ impl MetadataBlockReportLoop {
                 },
             )),
         };
-        let tonic_request = metadata_tonic_request(request.clone(), request.header.as_ref());
+        let tonic_request = tonic::Request::new(request.clone());
         let response = time::timeout(timeout, client.block_report(tonic_request))
             .await
             .map_err(|_| BlockReportError::Retryable("metadata delta block report timed out".to_string()))?
@@ -821,20 +794,20 @@ fn present_entry(block: ReportedBlockProto) -> DeltaBlockReportEntryProto {
     }
 }
 
-fn meta_to_report_block(meta: BlockMetaPayload) -> Result<ReportedBlockProto, BlockReportError> {
+fn meta_to_report_block(meta: BlockMetaPayload) -> ReportedBlockProto {
     let block_state = match meta.visibility.block_state {
         BlockState::Ready => ReportedBlockStateProto::ReportedBlockStateReady,
         BlockState::Corrupt => ReportedBlockStateProto::ReportedBlockStateCorrupt,
         BlockState::Deleting => ReportedBlockStateProto::ReportedBlockStateDeleting,
     };
     let block_id = meta.identity.block_id;
-    Ok(ReportedBlockProto {
+    ReportedBlockProto {
         block_id: Some(block_id.into()),
         lease_epoch: meta.visibility.fencing_token.epoch.as_raw(),
         tier: beryl_proto::common::TierProto::from(meta.tier) as i32,
         state: block_state as i32,
         effective_len: meta.source.durable_len,
-    })
+    }
 }
 
 fn block_id(block: &ReportedBlockProto) -> Option<BlockId> {
