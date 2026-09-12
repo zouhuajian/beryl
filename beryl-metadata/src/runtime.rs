@@ -278,9 +278,7 @@ impl MetadataServer {
             Arc::clone(&worker.manager),
             Arc::clone(&session_registry),
             &readiness,
-        )
-        .await
-        {
+        ) {
             Ok(filesystem) => filesystem,
             Err(error) => {
                 readiness.handle.begin_shutdown().await;
@@ -288,7 +286,7 @@ impl MetadataServer {
                 return Err(error);
             }
         };
-        let maintenance = build_maintenance(config.as_ref(), &authority, &worker, &readiness, session_registry).await;
+        let maintenance = build_maintenance(config.as_ref(), &authority, &worker, session_registry);
         let worker_service = worker.service(&authority, Arc::clone(&maintenance.cleanup));
         let (services, handles) = compose_services(filesystem, worker_service, readiness, maintenance);
 
@@ -474,7 +472,6 @@ pub async fn build_authority(config: &MetadataConfig) -> Result<MetadataAuthorit
             Arc::clone(&storage),
             Arc::clone(&state_machine),
             Arc::clone(&mount_table),
-            &config.raft,
         )
         .await
         .map_err(|e| format!("Failed to initialize Raft node: {e}"))?,
@@ -511,11 +508,10 @@ pub(crate) fn build_worker_runtime(
 ///
 /// `session_registry` must be the same registry owned by the filesystem service;
 /// cleanup classification would otherwise miss active writes.
-pub(crate) async fn build_maintenance(
+pub(crate) fn build_maintenance(
     config: &MetadataConfig,
     authority: &MetadataAuthority,
     worker: &WorkerRuntime,
-    _readiness: &Readiness,
     session_registry: Arc<crate::session_registry::SessionRegistry>,
 ) -> Maintenance {
     let cleanup = Arc::new(BlockCleanupCoordinator::new(
@@ -637,14 +633,13 @@ pub async fn build_filesystem_service(
         )),
         readiness,
     )
-    .await
 }
 
 /// Constructs the filesystem service with a caller-owned session registry.
 ///
 /// Production startup uses this path to share active-write authority with
 /// maintenance cleanup observation.
-async fn build_filesystem_service_with_sessions(
+fn build_filesystem_service_with_sessions(
     config: &MetadataConfig,
     authority: &MetadataAuthority,
     worker_manager: Arc<WorkerManager>,
@@ -722,7 +717,6 @@ mod tests {
                 Arc::clone(&storage),
                 Arc::clone(&state_machine),
                 Arc::clone(&mount_table),
-                &raft_config,
             )
             .await
             .unwrap(),
@@ -768,7 +762,6 @@ mod tests {
                 Arc::clone(&storage),
                 state_machine,
                 Arc::clone(&mount_table),
-                &raft_config,
             )
             .await
             .unwrap(),

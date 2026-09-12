@@ -70,7 +70,6 @@ pub async fn format_metadata_storage(config: &MetadataConfig) -> MetadataResult<
             Arc::clone(&storage),
             state_machine,
             Arc::clone(&mount_table),
-            &config.raft,
         )
         .await?,
     );

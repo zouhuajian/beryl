@@ -2048,7 +2048,7 @@ mod tests {
 
     #[tokio::test]
     async fn maintenance_retires_sessions_after_service_drop_and_releases_dependencies_on_shutdown() {
-        use crate::config::{BlockCleanupConfig, NamespaceDeleteConfig, RaftConfig};
+        use crate::config::{BlockCleanupConfig, NamespaceDeleteConfig};
         use crate::maintenance::{BlockCleanupCoordinator, DetachedRootReclaimer, MaintenanceService};
         use crate::mount::MountTable;
         use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
@@ -2063,7 +2063,6 @@ mod tests {
                 Arc::clone(&storage),
                 Arc::new(AppRaftStateMachine::new(Arc::clone(&storage))),
                 Arc::new(MountTable::new()),
-                &RaftConfig::default(),
             )
             .await
             .unwrap(),

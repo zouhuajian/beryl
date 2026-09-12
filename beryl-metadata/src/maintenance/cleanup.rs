@@ -646,7 +646,6 @@ impl BlockCleanupCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RaftConfig;
     use crate::inode::InodeAttrs;
     use crate::inode::{Inode, InodeKind};
     use crate::raft::{AppMetadataRaftState, AppRaftStateMachine};
@@ -678,15 +677,9 @@ mod tests {
     async fn test_raft(storage: Arc<RocksDBStorage>, leader: bool) -> Arc<AppRaftNode> {
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
         let raft_node = Arc::new(
-            AppRaftNode::new(
-                1,
-                storage,
-                state_machine,
-                Arc::new(MountTable::new()),
-                &RaftConfig::default(),
-            )
-            .await
-            .unwrap(),
+            AppRaftNode::new(1, storage, state_machine, Arc::new(MountTable::new()))
+                .await
+                .unwrap(),
         );
         if leader {
             raft_node

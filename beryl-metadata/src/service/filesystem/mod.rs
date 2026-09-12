@@ -408,7 +408,6 @@ fn validate_active_write_block_size(block_size: u32) -> Result<(), MetadataError
 mod tests {
     pub(super) use super::*;
 
-    pub(super) use crate::config::RaftConfig;
     pub(super) use crate::inode::Inode;
     pub(super) use crate::inode::InodeAttrs;
     use crate::inode::InodeKind;
@@ -550,15 +549,9 @@ mod tests {
                 None => {
                     let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
                     Arc::new(
-                        AppRaftNode::new(
-                            1,
-                            Arc::clone(&storage),
-                            state_machine,
-                            Arc::clone(&self.mount_table),
-                            &RaftConfig::default(),
-                        )
-                        .await
-                        .unwrap(),
+                        AppRaftNode::new(1, Arc::clone(&storage), state_machine, Arc::clone(&self.mount_table))
+                            .await
+                            .unwrap(),
                     )
                 }
             };
@@ -1047,9 +1040,8 @@ mod tests {
             storage.put_mount(&mount).unwrap();
         }
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
-        let raft_config = RaftConfig::default();
         let raft_node = Arc::new(
-            AppRaftNode::new(1, storage, Arc::clone(&state_machine), mount_table, &raft_config)
+            AppRaftNode::new(1, storage, Arc::clone(&state_machine), mount_table)
                 .await
                 .unwrap(),
         );
