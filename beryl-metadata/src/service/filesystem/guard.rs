@@ -314,7 +314,6 @@ impl FreshnessValidator {
 mod tests {
     mod admission {
         use super::super::*;
-        use crate::config::RaftConfig;
         use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
         use crate::readiness::RootReadinessGate;
         use beryl_common::error::rpc::InternalErrorKind;
@@ -338,15 +337,9 @@ mod tests {
             let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
             let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
             let raft_node = Arc::new(
-                AppRaftNode::new(
-                    1,
-                    storage,
-                    state_machine,
-                    Arc::clone(&mount_table),
-                    &RaftConfig::default(),
-                )
-                .await
-                .unwrap(),
+                AppRaftNode::new(1, storage, state_machine, Arc::clone(&mount_table))
+                    .await
+                    .unwrap(),
             );
             let chain = AdmissionGuard::new(mount_table, Some(Arc::clone(&gate)), Arc::clone(&raft_node));
 
@@ -363,9 +356,8 @@ mod tests {
             let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
             let mount_table = Arc::new(MountTable::new());
             let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
-            let raft_config = RaftConfig::default();
             let raft_node = Arc::new(
-                AppRaftNode::new(1, storage, state_machine, Arc::clone(&mount_table), &raft_config)
+                AppRaftNode::new(1, storage, state_machine, Arc::clone(&mount_table))
                     .await
                     .unwrap(),
             );

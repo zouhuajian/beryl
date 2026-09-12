@@ -278,9 +278,7 @@ impl MetadataServer {
             Arc::clone(&worker.manager),
             Arc::clone(&session_registry),
             &readiness,
-        )
-        .await
-        {
+        ) {
             Ok(filesystem) => filesystem,
             Err(error) => {
                 readiness.handle.begin_shutdown().await;
@@ -288,7 +286,7 @@ impl MetadataServer {
                 return Err(error);
             }
         };
-        let maintenance = build_maintenance(config.as_ref(), &authority, &worker, &readiness, session_registry).await;
+        let maintenance = build_maintenance(config.as_ref(), &authority, &worker, session_registry);
         let worker_service = worker.service(&authority, Arc::clone(&maintenance.cleanup));
         let (services, handles) = compose_services(filesystem, worker_service, readiness, maintenance);
 
@@ -474,7 +472,6 @@ pub async fn build_authority(config: &MetadataConfig) -> Result<MetadataAuthorit
             Arc::clone(&storage),
             Arc::clone(&state_machine),
             Arc::clone(&mount_table),
-            &config.raft,
         )
         .await
         .map_err(|e| format!("Failed to initialize Raft node: {e}"))?,
@@ -511,11 +508,10 @@ pub(crate) fn build_worker_runtime(
 ///
 /// `session_registry` must be the same registry owned by the filesystem service;
 /// cleanup classification would otherwise miss active writes.
-pub(crate) async fn build_maintenance(
+pub(crate) fn build_maintenance(
     config: &MetadataConfig,
     authority: &MetadataAuthority,
     worker: &WorkerRuntime,
-    _readiness: &Readiness,
     session_registry: Arc<crate::session_registry::SessionRegistry>,
 ) -> Maintenance {
     let cleanup = Arc::new(BlockCleanupCoordinator::new(
@@ -565,7 +561,6 @@ pub async fn build_readiness(config: &MetadataConfig, authority: &MetadataAuthor
     let raft_node_clone = Arc::clone(&authority.raft_node);
     let storage_clone = Arc::clone(&authority.storage);
     let group_name = authority.group_name.clone();
-    let metrics = Arc::clone(&authority.metadata_metrics);
     let fail_fast = config.startup.root_readiness.fail_fast;
     let log_fields = RootReadinessLogFields {
         cluster_id: config.cluster_id.clone(),
@@ -581,7 +576,6 @@ pub async fn build_readiness(config: &MetadataConfig, authority: &MetadataAuthor
             namespace_owner_group_name: group_name,
             readiness_gate: readiness_gate_clone,
             config: readiness_config,
-            metrics: Some(metrics),
             log_fields,
         })
         .await;
@@ -637,14 +631,13 @@ pub async fn build_filesystem_service(
         )),
         readiness,
     )
-    .await
 }
 
 /// Constructs the filesystem service with a caller-owned session registry.
 ///
 /// Production startup uses this path to share active-write authority with
 /// maintenance cleanup observation.
-async fn build_filesystem_service_with_sessions(
+fn build_filesystem_service_with_sessions(
     config: &MetadataConfig,
     authority: &MetadataAuthority,
     worker_manager: Arc<WorkerManager>,
@@ -661,7 +654,6 @@ async fn build_filesystem_service_with_sessions(
         raft_node: Arc::clone(&authority.raft_node),
         session_registry,
         worker_manager,
-        metrics: Some(Arc::clone(&authority.metadata_metrics)),
         readiness_gate: Some(readiness.gate()),
         file_block_size,
     }));
@@ -722,7 +714,6 @@ mod tests {
                 Arc::clone(&storage),
                 Arc::clone(&state_machine),
                 Arc::clone(&mount_table),
-                &raft_config,
             )
             .await
             .unwrap(),
@@ -768,7 +759,6 @@ mod tests {
                 Arc::clone(&storage),
                 state_machine,
                 Arc::clone(&mount_table),
-                &raft_config,
             )
             .await
             .unwrap(),
@@ -781,7 +771,6 @@ mod tests {
             raft_node: Arc::clone(&raft_node),
             session_registry: Arc::new(crate::session_registry::SessionRegistry::default()),
             worker_manager: Arc::new(WorkerManager::new(60_000)),
-            metrics: None,
             readiness_gate: None,
             file_block_size: crate::config::MetadataConfig::default().file_block_size,
         }));

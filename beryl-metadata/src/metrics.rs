@@ -1,47 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Process-local metadata counters shared by metadata subsystems.
+//! Process-local metadata readiness state.
 //!
 //! The common observability layer owns exported metrics. This module only holds
-//! in-process state used by metadata readiness, maintenance, and MetadataFileSystem paths.
+//! the root readiness value shared with the readiness gate.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-/// Process-local metadata counters.
+/// Process-local metadata readiness state.
 #[derive(Clone)]
 pub struct MetadataMetrics {
-    // Root readiness.
     pub(crate) root_ready: Arc<AtomicUsize>,
-    pub(crate) root_wait_attempts: Arc<AtomicU64>,
-    pub(crate) root_wait_elapsed_ms: Arc<AtomicU64>,
-
-    // Filesystem routing and Raft append guardrails.
-    pub(crate) fs_write_routed_total: Arc<AtomicU64>,
-    pub(crate) fs_write_cross_mount_rename_exdev_total: Arc<AtomicU64>,
-    pub(crate) fs_write_mount_epoch_mismatch_total: Arc<AtomicU64>,
-    pub(crate) fs_raft_appends_total: Arc<AtomicU64>,
-    pub(crate) fs_raft_appends_create: Arc<AtomicU64>,
-    pub(crate) fs_raft_appends_mkdir: Arc<AtomicU64>,
-    pub(crate) fs_raft_appends_rename: Arc<AtomicU64>,
-    pub(crate) fs_raft_appends_publish: Arc<AtomicU64>,
 }
 
 impl MetadataMetrics {
     pub fn new() -> Self {
         Self {
             root_ready: Arc::new(AtomicUsize::new(0)),
-            root_wait_attempts: Arc::new(AtomicU64::new(0)),
-            root_wait_elapsed_ms: Arc::new(AtomicU64::new(0)),
-            fs_write_routed_total: Arc::new(AtomicU64::new(0)),
-            fs_write_cross_mount_rename_exdev_total: Arc::new(AtomicU64::new(0)),
-            fs_write_mount_epoch_mismatch_total: Arc::new(AtomicU64::new(0)),
-            fs_raft_appends_total: Arc::new(AtomicU64::new(0)),
-            fs_raft_appends_create: Arc::new(AtomicU64::new(0)),
-            fs_raft_appends_mkdir: Arc::new(AtomicU64::new(0)),
-            fs_raft_appends_rename: Arc::new(AtomicU64::new(0)),
-            fs_raft_appends_publish: Arc::new(AtomicU64::new(0)),
         }
     }
 }

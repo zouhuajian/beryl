@@ -170,7 +170,6 @@ pub(crate) struct RootReadyInputs {
     pub(crate) namespace_owner_group_name: GroupName,
     pub(crate) readiness_gate: Arc<RootReadinessGate>,
     pub(crate) config: RootReadinessConfig,
-    pub(crate) metrics: Option<Arc<MetadataMetrics>>,
     pub(crate) log_fields: RootReadinessLogFields,
 }
 
@@ -186,7 +185,6 @@ async fn wait_for_root_ready_inner(inputs: RootReadyInputs) -> MetadataResult<()
         namespace_owner_group_name,
         readiness_gate,
         config,
-        metrics,
         log_fields,
     } = inputs;
     let start = Instant::now();
@@ -238,13 +236,6 @@ async fn wait_for_root_ready_inner(inputs: RootReadyInputs) -> MetadataResult<()
                 }
             }
 
-            if let Some(metrics) = &metrics {
-                metrics
-                    .root_wait_elapsed_ms
-                    .store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
-                metrics.root_wait_attempts.store(attempts, Ordering::Relaxed);
-            }
-
             readiness_gate.set_ready();
             info!(
                 elapsed_ms = start.elapsed().as_millis(),
@@ -257,13 +248,6 @@ async fn wait_for_root_ready_inner(inputs: RootReadyInputs) -> MetadataResult<()
             reason = RootNotReadyReason::NotLeader;
         }
         readiness_gate.set_not_ready(reason.clone());
-
-        if let Some(metrics) = &metrics {
-            metrics
-                .root_wait_elapsed_ms
-                .store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
-            metrics.root_wait_attempts.store(attempts, Ordering::Relaxed);
-        }
 
         if start.elapsed() >= Duration::from_millis(config.warn_after_ms) {
             warn!(
@@ -336,7 +320,6 @@ mod tests {
                     Arc::clone(&storage),
                     state_machine,
                     Arc::clone(&mount_table),
-                    &raft_config,
                 )
                 .await
                 .unwrap(),
@@ -373,7 +356,6 @@ mod tests {
                 timeout_ms: 10,
                 fail_fast: true,
             },
-            metrics: None,
             log_fields: RootReadinessLogFields {
                 cluster_id: "test-cluster".to_string(),
                 group_name: "root".to_string(),

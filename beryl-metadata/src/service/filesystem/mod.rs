@@ -12,7 +12,6 @@ mod write;
 
 use crate::error::{to_rpc_error, MetadataError, MetadataResult};
 use crate::inode::Inode;
-use crate::metrics::MetadataMetrics;
 use crate::mount::MountTable;
 use crate::path_resolver::{MountContext, PathResolver, ResolvedPath};
 use crate::raft::{AppRaftNode, RocksDBStorage};
@@ -174,7 +173,6 @@ pub(crate) struct MetadataFileSystemDeps {
     pub(crate) raft_node: Arc<AppRaftNode>,
     pub(crate) session_registry: Arc<SessionRegistry>,
     pub(crate) worker_manager: Arc<WorkerManager>,
-    pub(crate) metrics: Option<Arc<MetadataMetrics>>,
     pub(crate) readiness_gate: Option<Arc<RootReadinessGate>>,
     /// Validated server-owned block capacity used by atomic CreateFile.
     pub(crate) file_block_size: u32,
@@ -195,7 +193,6 @@ pub(crate) struct MetadataFileSystem {
     freshness_validator: FreshnessValidator,
     storage: Arc<RocksDBStorage>,
     raft_node: Arc<AppRaftNode>,
-    metrics: Option<Arc<MetadataMetrics>>,
     session_registry: Arc<SessionRegistry>,
     worker_manager: Arc<WorkerManager>,
     file_block_size: u32,
@@ -219,7 +216,6 @@ impl MetadataFileSystem {
             freshness_validator,
             storage: deps.storage,
             raft_node: deps.raft_node,
-            metrics: deps.metrics,
             session_registry: deps.session_registry,
             worker_manager: deps.worker_manager,
             file_block_size: deps.file_block_size,
@@ -408,7 +404,6 @@ fn validate_active_write_block_size(block_size: u32) -> Result<(), MetadataError
 mod tests {
     pub(super) use super::*;
 
-    pub(super) use crate::config::RaftConfig;
     pub(super) use crate::inode::Inode;
     pub(super) use crate::inode::InodeAttrs;
     use crate::inode::InodeKind;
@@ -550,15 +545,9 @@ mod tests {
                 None => {
                     let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
                     Arc::new(
-                        AppRaftNode::new(
-                            1,
-                            Arc::clone(&storage),
-                            state_machine,
-                            Arc::clone(&self.mount_table),
-                            &RaftConfig::default(),
-                        )
-                        .await
-                        .unwrap(),
+                        AppRaftNode::new(1, Arc::clone(&storage), state_machine, Arc::clone(&self.mount_table))
+                            .await
+                            .unwrap(),
                     )
                 }
             };
@@ -574,7 +563,6 @@ mod tests {
                 worker_manager: self
                     .worker_manager
                     .unwrap_or_else(|| Arc::new(WorkerManager::new(60_000))),
-                metrics: None,
                 readiness_gate: None,
                 file_block_size: crate::config::MetadataConfig::default().file_block_size,
             });
@@ -1047,9 +1035,8 @@ mod tests {
             storage.put_mount(&mount).unwrap();
         }
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
-        let raft_config = RaftConfig::default();
         let raft_node = Arc::new(
-            AppRaftNode::new(1, storage, Arc::clone(&state_machine), mount_table, &raft_config)
+            AppRaftNode::new(1, storage, Arc::clone(&state_machine), mount_table)
                 .await
                 .unwrap(),
         );

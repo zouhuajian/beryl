@@ -3,7 +3,6 @@
 
 //! Metadata-owned OpenRaft node lifecycle and request interface.
 
-use crate::config::RaftConfig;
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::MountTable;
 use crate::observe;
@@ -41,7 +40,6 @@ impl AppRaftNode {
         storage: Arc<RocksDBStorage>,
         state_machine: Arc<AppStateMachine>,
         mount_table: Arc<MountTable>,
-        _raft_config: &RaftConfig,
     ) -> MetadataResult<Self> {
         info!(node_id = node_id, "Initializing Raft node");
 
@@ -357,7 +355,6 @@ mod tests {
             Arc::clone(&storage),
             Arc::new(AppStateMachine::new(Arc::clone(&storage))),
             Arc::new(MountTable::new()),
-            &RaftConfig::default(),
         )
         .await
         .unwrap();
@@ -384,15 +381,9 @@ mod tests {
         let mount_table = Arc::new(MountTable::new());
         let state_machine = Arc::new(AppStateMachine::new(Arc::clone(&storage)));
         let node = Arc::new(
-            AppRaftNode::new(
-                1,
-                Arc::clone(&storage),
-                state_machine,
-                mount_table,
-                &RaftConfig::default(),
-            )
-            .await
-            .unwrap(),
+            AppRaftNode::new(1, Arc::clone(&storage), state_machine, mount_table)
+                .await
+                .unwrap(),
         );
         node.initialize_single_node("127.0.0.1:0".to_string()).await.unwrap();
         let route_store = RaftStateStore::new(Arc::clone(&node));
@@ -460,15 +451,9 @@ mod tests {
         let mount_table = Arc::new(MountTable::new());
         let state_machine = Arc::new(AppStateMachine::new(Arc::clone(&storage)));
         let node = Arc::new(
-            AppRaftNode::new(
-                1,
-                Arc::clone(&storage),
-                state_machine,
-                mount_table,
-                &RaftConfig::default(),
-            )
-            .await
-            .unwrap(),
+            AppRaftNode::new(1, Arc::clone(&storage), state_machine, mount_table)
+                .await
+                .unwrap(),
         );
         node.initialize_single_node("127.0.0.1:0".to_string()).await.unwrap();
         for _ in 0..100 {

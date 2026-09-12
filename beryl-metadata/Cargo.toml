@@ -8,7 +8,6 @@ edition = "2021"
 beryl-common = { path = "../beryl-common" }
 beryl-types = { path = "../beryl-types" }
 beryl-proto = { path = "../beryl-proto" }
-bytes = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
@@ -33,7 +32,6 @@ metrics-exporter-prometheus = { workspace = true }
 # Utilities
 clap = { workspace = true }
 parking_lot = { workspace = true }
-dashmap = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -48,7 +46,6 @@ openraft = { workspace = true, features = ["serde", "storage-v2"] }
 rocksdb = { workspace = true, default-features = false, features = ["snappy"] }
 fs2 = { workspace = true }
 bincode = { workspace = true }
-lru = { workspace = true }
 
 # Hashing (for stable worker identity)
 sha2 = { workspace = true }

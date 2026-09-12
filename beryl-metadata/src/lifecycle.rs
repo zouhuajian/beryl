@@ -70,7 +70,6 @@ pub async fn format_metadata_storage(config: &MetadataConfig) -> MetadataResult<
             Arc::clone(&storage),
             state_machine,
             Arc::clone(&mount_table),
-            &config.raft,
         )
         .await?,
     );
@@ -93,7 +92,6 @@ pub async fn format_metadata_storage(config: &MetadataConfig) -> MetadataResult<
         namespace_owner_group_name: group_name.clone(),
         readiness_gate: Arc::new(RootReadinessGate::new(None)),
         config: config.startup.root_readiness.clone(),
-        metrics: None,
         log_fields: RootReadinessLogFields {
             cluster_id: config.cluster_id.clone(),
             group_name: group_name.to_string(),

@@ -1178,7 +1178,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BlockCleanupConfig, RaftConfig};
+    use crate::config::BlockCleanupConfig;
     use crate::raft::{AppRaftStateMachine, RocksDBStorage};
     use crate::session_registry::SessionRegistry;
     use crate::MountTable;
@@ -1218,9 +1218,8 @@ mod tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
-        let raft_config = RaftConfig::default();
         let raft_node = Arc::new(
-            AppRaftNode::new(1, Arc::clone(&storage), state_machine, mount_table, &raft_config)
+            AppRaftNode::new(1, Arc::clone(&storage), state_machine, mount_table)
                 .await
                 .unwrap(),
         );
@@ -1242,12 +1241,7 @@ mod tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
-        let raft_config = RaftConfig::default();
-        let raft_node = Arc::new(
-            AppRaftNode::new(1, storage, state_machine, mount_table, &raft_config)
-                .await
-                .unwrap(),
-        );
+        let raft_node = Arc::new(AppRaftNode::new(1, storage, state_machine, mount_table).await.unwrap());
         assert!(!raft_node.is_leader());
         raft_node
     }

@@ -8,7 +8,6 @@ use beryl_common::header::{ClientInfo, ResponseHeader};
 use beryl_proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
 use beryl_types::{GroupName, GroupStateWatermark};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 use tonic::transport as tonic_net;
 
@@ -20,9 +19,9 @@ use crate::rpc_error::{invalid_header_error, validate_header};
 use crate::runtime::AttemptContext;
 
 /// Tonic-backed Metadata transport for one selected-endpoint attempt.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct GrpcMetadataTransport {
-    channels: Arc<parking_lot::RwLock<HashMap<MetadataChannelKey, tonic_net::Channel>>>,
+    channels: parking_lot::RwLock<HashMap<MetadataChannelKey, tonic_net::Channel>>,
     channel_pool_enabled: bool,
     max_channels_per_group: usize,
 }
@@ -35,7 +34,7 @@ impl GrpcMetadataTransport {
 
     fn new_lazy_with_pool_options(channel_pool_enabled: bool, max_channels_per_group: usize) -> Self {
         Self {
-            channels: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            channels: parking_lot::RwLock::new(HashMap::new()),
             channel_pool_enabled,
             max_channels_per_group: max_channels_per_group.max(1),
         }
@@ -73,13 +72,13 @@ impl GrpcMetadataTransport {
             }
             None => {
                 self.record_pool_metric(ClientMetric::MetadataChannelPoolMiss, operation, "miss");
-                self.create_metadata_channel(key, operation).await?
+                self.create_metadata_channel(key, operation)?
             }
         };
         Ok(FileSystemServiceProtoClient::new(channel))
     }
 
-    async fn create_metadata_channel(
+    fn create_metadata_channel(
         &self,
         key: MetadataChannelKey,
         operation: &'static str,
@@ -576,6 +575,7 @@ mod tests {
     use crate::runtime::{retry_decision, Operation, OperationContext, OperationDeadline, RetryDecision, RetrySafety};
     use beryl_common::error::rpc::{ErrorKind, InternalErrorKind, MetadataErrorKind, RpcErrorDetail};
     use beryl_types::{CallId, ClientId};
+    use std::sync::Arc;
     #[tokio::test]
     async fn concurrent_metadata_channel_requests_same_key_reuse_inserted_channel() {
         let transport = Arc::new(GrpcMetadataTransport::new_lazy_with_pool_options(true, 8));
