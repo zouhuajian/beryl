@@ -1,37 +1,22 @@
 # beryl-types Agent Instructions
 
-Follow the repository root `AGENTS.md`. This file adds crate-specific
-constraints.
+Follow the repository root instructions.
 
-## Crate Boundary
+## Responsibility
 
-`beryl-types` owns stable Rust domain and value types shared by the current
-runtime. It may enforce domain invariants but must not choose runtime policy.
+Own shared domain values and their invariants. Domain validity belongs here;
+runtime policy and execution do not.
 
-## Allowed Changes
+## Invariants
 
-- Add or refine values required by current production callers.
-- Enforce invariants through constructors, parsing, and validation.
-- Clarify ambiguous names and identity boundaries.
-- Test value semantics and invalid states.
+- Add values for current requirements with concrete callers.
+- Keep domain values independent of runtime implementations and generated wire
+  representations.
+- Preserve identity, ordering, and serialization contracts unless their change
+  is explicitly authorized.
+- Do not weaken domain invariants for serialization or test convenience.
 
-## Prohibited Changes
+## Validation Focus
 
-- Do not depend on runtime crates or generated proto modules.
-- Do not add metadata, worker, client, proto, or UFS policy.
-- Do not expose runtime implementation details as shared domain contracts.
-- Do not add future-only values without a current producer and consumer.
-- Do not weaken a type invariant for serialization or test convenience.
-
-## Cross-Crate Rules
-
-- Keep values usable across current crates without dependency cycles.
-- Convert wire values at proto or service boundaries.
-- Preserve identity, ordering, and serialization semantics when changing shared
-  values.
-
-## Focused Validation
-
-```bash
-cargo test -p beryl-types
-```
+Verify affected value semantics and invalid states, including consumer behavior
+when a shared contract changes.

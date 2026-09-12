@@ -1,42 +1,24 @@
 # beryl-e2e Agent Instructions
 
-Follow the repository root `AGENTS.md`. This file adds crate-specific
-constraints.
+Follow the repository root instructions.
 
-## Crate Boundary
+## Responsibility
 
-`beryl-e2e` owns black-box validation of the supported runtime across public
-client, metadata, worker, persistence, and RPC boundaries.
+Own black-box validation of the supported runtime across public client,
+metadata, worker, persistence, and communication boundaries.
 
-## Allowed Changes
+## Invariants
 
-- Add coverage for supported public behavior and cross-process invariants.
-- Exercise restart, recovery, replay, freshness, fencing, visibility, and
-  convergence through real runtime boundaries.
-- Improve deterministic service startup, shutdown, temporary storage, and
-  failure orchestration in the test harness.
+- Exercise user-visible behavior through public runtime boundaries.
+- Isolate each test's service endpoints, identities, and persistent state.
+- Use bounded readiness checks and deterministic failure coordination.
+- Keep fault injection within the test harness and clean up its effects and
+  resources after each test.
+- Assert required recovery and convergence outcomes as well as immediate results.
+- Do not mask failures with blind retries, disabled coverage, or assertions that
+  accept incompatible outcomes.
 
-## Prohibited Changes
+## Validation Focus
 
-- Do not add production APIs or widen production visibility for E2E setup.
-- Do not validate private implementation shape when public behavior can express
-  the invariant.
-- Do not add coverage for unsupported product surfaces as if they were active.
-- Do not hide failures with ignored tests, unbounded sleeps, blind retries, or
-  assertions that accept multiple incompatible outcomes.
-- Do not share mutable state between tests without explicit isolation.
-
-## Test Rules
-
-- Use public client and RPC boundaries for user-visible behavior.
-- Use bounded readiness checks and deterministic synchronization.
-- Give every test isolated ports, identities, and temporary persistent state.
-- Assert both externally visible results and required recovery/convergence
-  outcomes.
-- Keep fault injection local to the test harness and remove it after each test.
-
-## Focused Validation
-
-```bash
-cargo test -p beryl-e2e
-```
+Run scenarios affected by the change and verify that startup, failure
+orchestration, shutdown, and cleanup remain isolated and bounded.

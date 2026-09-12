@@ -1,31 +1,26 @@
 # beryl-cli Agent Instructions
 
-Follow the repository root `AGENTS.md`. This file adds crate-specific
-constraints.
+Follow the repository root instructions.
 
-## Crate Boundary
+## Responsibility
 
-`beryl-cli` owns the public command contract, installed-package path
-resolution, and routing to package-internal Metadata and Worker processes.
+Own the public command contract, installed-package resolution, and routing to
+the appropriate runtime role.
 
-## Required Behavior
+## Invariants
 
-- Resolve role binaries from the installed `libexec` directory, never `PATH`.
-- Replace the CLI process for long-running roles so PID and signal ownership are
-  preserved.
-- Keep static configuration validation separate from runtime startup.
-- Keep the public command surface explicit and fail closed on invalid layout or
-  child process failures.
+- Resolve runtime roles within the installed package, independently of ambient
+  command lookup.
+- Preserve the public process identity and signal behavior of long-running
+  roles.
+- Keep static configuration validation separate from service startup.
+- Reject invalid installation state and report role failures explicitly.
+- Leave configuration semantics and runtime policy with the owning role.
+  Process supervision and arbitrary command execution are outside this crate's
+  current responsibility.
 
-## Prohibited Changes
+## Validation Focus
 
-- Do not depend on `beryl-metadata` or `beryl-worker` production crates.
-- Do not add daemonization, process supervision, service discovery, shell
-  evaluation, or arbitrary command passthrough.
-- Do not duplicate role configuration parsing or runtime policy.
-
-## Focused Validation
-
-```bash
-cargo test -p beryl-cli
-```
+Verify affected command behavior through process boundaries, including package
+resolution, configuration validation, failure reporting, and signal behavior
+when relevant.
