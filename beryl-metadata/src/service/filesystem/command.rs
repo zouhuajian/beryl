@@ -10,7 +10,6 @@ use crate::raft::{ApplySuccess, Command};
 use crate::session_registry::WritePublication;
 use beryl_types::ids::{BlockId, InodeId, MountId};
 use beryl_types::{ContentGeneration, GroupName, LeaseEpoch};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::debug;
@@ -56,17 +55,8 @@ impl MetadataFileSystem {
             }
         };
 
-        if let Err(failure) = self
-            .freshness_validator
-            .validate_mount_epoch(req_ctx, freshness, ctx.mount_id)
-        {
-            if let Some(metrics) = &self.metrics {
-                metrics
-                    .fs_write_mount_epoch_mismatch_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            return Err(failure);
-        }
+        self.freshness_validator
+            .validate_mount_epoch(req_ctx, freshness, ctx.mount_id)?;
         Ok(ctx)
     }
 
@@ -101,10 +91,6 @@ impl MetadataFileSystem {
             mount_epoch = mount_entry.mount_epoch,
             "FS write routed to mount namespace owner group"
         );
-
-        if let Some(ref metrics) = self.metrics {
-            metrics.fs_write_routed_total.fetch_add(1, Ordering::Relaxed);
-        }
 
         Ok(RoutedFsWriteCtx {
             mount_id,
@@ -253,35 +239,7 @@ impl MetadataFileSystem {
         command: Command,
     ) -> impl std::future::Future<Output = MetadataResult<ApplySuccess>> + Send + 'static {
         let raft_node = Arc::clone(&self.raft_node);
-        let metrics = self.metrics.clone();
-        async move {
-            if let Some(metrics) = &metrics {
-                metrics.fs_raft_appends_total.fetch_add(1, Ordering::Relaxed);
-                match &command {
-                    Command::CreateFile { .. } => {
-                        metrics.fs_raft_appends_create.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Command::CreateDirectory { .. } => {
-                        metrics.fs_raft_appends_mkdir.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Command::Rename { .. } => {
-                        metrics.fs_raft_appends_rename.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Command::PublishFile { .. } | Command::CommitFile { .. } => {
-                        metrics.fs_raft_appends_publish.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Command::BootstrapNamespace { .. }
-                    | Command::Delete { .. }
-                    | Command::AcquireWriteLease { .. }
-                    | Command::AllocateBlock { .. }
-                    | Command::EndWriteLease { .. }
-                    | Command::RegisterWorkerDescriptor { .. }
-                    | Command::ReclaimDetachedRoots { .. } => {}
-                }
-            }
-
-            raft_node.propose(command).await
-        }
+        async move { raft_node.propose(command).await }
     }
 }
 

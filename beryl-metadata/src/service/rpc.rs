@@ -1026,7 +1026,6 @@ mod tests {
             raft_node: Arc::clone(&raft_node),
             session_registry: Arc::clone(&session_registry),
             worker_manager: worker_manager.clone(),
-            metrics: None,
             readiness_gate: None,
             file_block_size: 128,
         }));

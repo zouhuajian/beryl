@@ -12,7 +12,6 @@ mod write;
 
 use crate::error::{to_rpc_error, MetadataError, MetadataResult};
 use crate::inode::Inode;
-use crate::metrics::MetadataMetrics;
 use crate::mount::MountTable;
 use crate::path_resolver::{MountContext, PathResolver, ResolvedPath};
 use crate::raft::{AppRaftNode, RocksDBStorage};
@@ -174,7 +173,6 @@ pub(crate) struct MetadataFileSystemDeps {
     pub(crate) raft_node: Arc<AppRaftNode>,
     pub(crate) session_registry: Arc<SessionRegistry>,
     pub(crate) worker_manager: Arc<WorkerManager>,
-    pub(crate) metrics: Option<Arc<MetadataMetrics>>,
     pub(crate) readiness_gate: Option<Arc<RootReadinessGate>>,
     /// Validated server-owned block capacity used by atomic CreateFile.
     pub(crate) file_block_size: u32,
@@ -195,7 +193,6 @@ pub(crate) struct MetadataFileSystem {
     freshness_validator: FreshnessValidator,
     storage: Arc<RocksDBStorage>,
     raft_node: Arc<AppRaftNode>,
-    metrics: Option<Arc<MetadataMetrics>>,
     session_registry: Arc<SessionRegistry>,
     worker_manager: Arc<WorkerManager>,
     file_block_size: u32,
@@ -219,7 +216,6 @@ impl MetadataFileSystem {
             freshness_validator,
             storage: deps.storage,
             raft_node: deps.raft_node,
-            metrics: deps.metrics,
             session_registry: deps.session_registry,
             worker_manager: deps.worker_manager,
             file_block_size: deps.file_block_size,
@@ -567,7 +563,6 @@ mod tests {
                 worker_manager: self
                     .worker_manager
                     .unwrap_or_else(|| Arc::new(WorkerManager::new(60_000))),
-                metrics: None,
                 readiness_gate: None,
                 file_block_size: crate::config::MetadataConfig::default().file_block_size,
             });

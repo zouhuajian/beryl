@@ -18,7 +18,6 @@ use crate::session_registry::{
 };
 use beryl_types::ids::InodeId;
 use beryl_types::{ContentGeneration, LeaseEpoch};
-use std::sync::atomic::Ordering;
 
 pub(crate) struct CreateDirectoryArgs {
     pub(crate) path: String,
@@ -362,11 +361,6 @@ impl MetadataFileSystem {
         };
 
         if src_parent_inode.mount_id != dst_parent_inode.mount_id {
-            if let Some(metrics) = &self.metrics {
-                metrics
-                    .fs_write_cross_mount_rename_exdev_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
             let (group_name, mount_epoch) = self
                 .freshness_validator
                 .mount_hints_for_mount(src_parent_inode.mount_id);
