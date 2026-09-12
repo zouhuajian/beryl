@@ -85,7 +85,7 @@ impl WorkerDataServiceImpl {
     async fn authorize_write(&self, req: &crate::data::core::WriteBlockRequest) -> Result<u64, WorkerError> {
         let registration = self
             .registration_state
-            .registration_for_group(&req.group_name)
+            .registration(&req.group_name)
             .ok_or_else(|| WorkerError::Unavailable("Worker registration is unavailable".into()))?;
         let header = RequestHeaderProto {
             client: Some(ClientInfoProto {
@@ -199,7 +199,7 @@ impl WorkerDataServiceImpl {
         let group_name = GroupName::parse(group_name)
             .map_err(|error| WorkerError::InvalidArgument(format!("group_name invalid: {error}")))?;
         let requested = require_worker_run_id(worker_run_id, "worker_run_id").map_err(WorkerError::InvalidArgument)?;
-        let Some(registration) = self.registration_state.registration_for_group(&group_name) else {
+        let Some(registration) = self.registration_state.registration(&group_name) else {
             return Err(WorkerError::RefreshMetadata {
                 kind: ErrorKind::Metadata(MetadataErrorKind::StaleState),
                 message: format!("worker is not registered for metadata group {group_name}"),

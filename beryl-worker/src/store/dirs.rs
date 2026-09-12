@@ -21,7 +21,7 @@ use crate::error::WorkerError;
 use crate::report::BlockReportChangeTracker;
 use crate::store::block::{
     BlockMetaPayload, CheckpointBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
-    OpenBlockWriteRequest, ReclaimBlockRequest, ReclaimBlockResult, ReclaimBlockState, StoreResult,
+    OpenBlockWriteRequest, ReclaimBlockRequest, ReclaimBlockResult, StoreResult,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,7 +167,7 @@ impl StoreDirs {
 
     pub fn report(&self) -> StoreResult<StoreReport> {
         let mut inner = self.inner.lock().expect("store dir state poisoned");
-        self.refresh_due(&mut inner)?;
+        self.refresh_due(&mut inner);
         Ok(build_report(&inner, self.reserve_bytes))
     }
 
@@ -223,7 +223,7 @@ impl StoreDirs {
         self.block_report_changes.wait().await;
     }
 
-    fn refresh_due(&self, inner: &mut StoreDirsState) -> StoreResult<()> {
+    fn refresh_due(&self, inner: &mut StoreDirsState) {
         for dir in &mut inner.dirs {
             if dir.last_check.elapsed() < self.check_interval {
                 continue;
@@ -255,7 +255,6 @@ impl StoreDirs {
             }
             dir.last_check = now;
         }
-        Ok(())
     }
 
     /// Reserves only the remaining capacity in the directory already owning a tail.
@@ -270,7 +269,7 @@ impl StoreDirs {
             .checked_sub(previous_len.unwrap_or(0))
             .ok_or_else(|| WorkerError::Corrupt("checkpoint exceeds capacity".into()))?;
         let mut inner = self.inner.lock().expect("store dir state poisoned");
-        self.refresh_due(&mut inner)?;
+        self.refresh_due(&mut inner);
         let report = build_report(&inner, self.reserve_bytes);
         let candidates: Vec<usize> = report
             .dirs
@@ -366,19 +365,6 @@ impl StoreDirs {
         }
         Ok(found)
     }
-
-    fn inspect_absent_reclaim(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockState> {
-        let store = self
-            .inner
-            .lock()
-            .expect("store dir state poisoned")
-            .dirs
-            .first()
-            .expect("store dirs validated non-empty")
-            .store
-            .clone();
-        store.inspect_reclaim_block(req)
-    }
 }
 
 impl LocalBlockStore for StoreDirs {
@@ -459,13 +445,6 @@ impl LocalBlockStore for StoreDirs {
             )));
         };
         store.load_meta(group_name, block_id)
-    }
-
-    fn inspect_reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockState> {
-        let Some((_, store)) = self.find_reclaim_store(&req.group_name, req.block_id)? else {
-            return self.inspect_absent_reclaim(req);
-        };
-        store.inspect_reclaim_block(req)
     }
 
     fn reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockResult> {

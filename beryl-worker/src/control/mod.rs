@@ -3,9 +3,6 @@
 
 //! Worker control-plane startup registration.
 
-use beryl_common::header::TraceContext;
-use beryl_common::observe::propagation::inject_trace_context;
-use beryl_proto::common::RequestHeaderProto;
 use beryl_types::{CallId, ClientId};
 
 mod block_report;
@@ -48,19 +45,4 @@ impl ControlIdentity {
 struct ControlOp {
     client_id: ClientId,
     call_id: CallId,
-}
-
-fn metadata_tonic_request<T>(message: T, header: Option<&RequestHeaderProto>) -> tonic::Request<T> {
-    let mut request = tonic::Request::new(message);
-    if let Some(header) = header {
-        if let Some(trace_context) = &header.trace_context {
-            let context = TraceContext {
-                traceparent: trace_context.traceparent.clone(),
-                tracestate: trace_context.tracestate.clone(),
-                baggage: trace_context.baggage.clone(),
-            };
-            inject_trace_context(request.metadata_mut(), &context);
-        }
-    }
-    request
 }

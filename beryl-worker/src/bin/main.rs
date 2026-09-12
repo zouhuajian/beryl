@@ -180,7 +180,7 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
             return Err(error).context("Failed to build worker registration descriptor");
         }
     };
-    let block_report_descriptor = descriptor.clone();
+    let heartbeat_descriptor = descriptor.clone();
     let registrar = match MetadataRegistrar::new(config.metadata.clone(), descriptor, Arc::clone(&registration_state)) {
         Ok(registrar) => Arc::new(registrar),
         Err(error) => {
@@ -233,7 +233,7 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
     };
     let heartbeat = match MetadataHeartbeatLoop::with_interval(
         config.metadata.clone(),
-        block_report_descriptor.clone(),
+        heartbeat_descriptor,
         Arc::clone(&registration_state),
         cleanup.executor(),
         Duration::from_millis(config.heartbeat_interval_ms),
@@ -247,7 +247,6 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
     };
     let block_report = match MetadataBlockReportLoop::with_options_and_delta_flush_interval(
         config.metadata.clone(),
-        block_report_descriptor,
         Arc::clone(&registration_state),
         Arc::clone(&block_store),
         Arc::clone(&core),

@@ -376,7 +376,6 @@ impl BlockManager {
         store: &(dyn LocalBlockStore + Send + Sync),
         req: &ReadBlockRequest,
     ) -> WorkerCoreResult<()> {
-        self.validate_read_request(req)?;
         let meta = match store.load_meta(&req.group_name, req.block_id) {
             Ok(meta) => meta,
             Err(WorkerError::NotFound(message)) => {
