@@ -1,40 +1,21 @@
 # beryl-common Agent Instructions
 
-Follow the repository root `AGENTS.md`. This file adds crate-specific
-constraints.
+Follow the repository root instructions.
 
-## Crate Boundary
+## Responsibility
 
-`beryl-common` owns crate-independent infrastructure shared by current runtime
-crates: structured errors, headers, config mechanics, retry/time helpers, and
-observability utilities.
+Own shared infrastructure mechanics for errors, request context, configuration,
+retry and time handling, and observability. Service policy stays with the
+owning runtime crate.
 
-## Allowed Changes
+## Invariants
 
-- Improve shared error and header structures while preserving machine-readable
-  detail.
-- Add config, retry, time, or observability mechanics that are independent of
-  service policy.
-- Tighten validation and operational failure reporting at shared boundaries.
+- Add shared functionality only when its ownership and reuse are concrete.
+- Preserve structured, machine-readable failure information.
+- Keep shared concepts consistent rather than introducing competing definitions.
+- Remain independent of runtime implementations and wire-specific policy.
 
-## Prohibited Changes
+## Validation Focus
 
-- Do not put metadata, worker, client, proto, or UFS policy here.
-- Do not hide structured operational failures behind string-only errors.
-- Do not create competing error, header, config, or retry vocabularies.
-- Do not use this crate as a dumping ground for unrelated helpers.
-- Do not add a shared helper until its ownership and reuse are concrete.
-
-## Cross-Crate Rules
-
-- Owning crates retain policy; `beryl-common` supplies mechanics.
-- Shared values must not create dependency cycles or pull runtime crates into
-  `beryl-common`.
-- Changes to shared error or header semantics require validation in affected
-  producers and consumers.
-
-## Focused Validation
-
-```bash
-cargo test -p beryl-common
-```
+Validate changed shared semantics in affected producers and consumers as well
+as at the local boundary.

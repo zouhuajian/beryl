@@ -1,188 +1,130 @@
 # Beryl Agent Instructions
 
-`AGENTS.md` files are operational instructions for AI coding agents. Read this
-file first, then the local `AGENTS.md` for every touched subtree. Local files
-may narrow these rules for their crate, but must not weaken them.
-
-## Decision Order
-
-Resolve engineering trade-offs in this order:
-
-1. Functional correctness.
-2. Safety and invariant preservation.
-3. Simplicity.
-4. Readability.
-5. Abstraction.
-
-Do not make implicit trade-offs between these priorities.
+These rules apply across the repository. Read the local instructions for each
+subtree involved in the task; they add crate-specific responsibilities and
+invariants.
 
 ## Work Contract
 
-- Follow the user's requested mode: review, diagnose, plan, or change.
-- A read-only request does not authorize edits, formatting, staging, commits,
-  pushes, or commands that materially modify the workspace.
-- Before editing, inspect the relevant code path, local instructions, current
-  worktree state, and existing tests.
-- Preserve unrelated user changes and keep the diff limited to the requested
-  behavior.
-- State assumptions when behavior, authority, failure handling, or scope is
-  uncertain. Do not silently guess in correctness-sensitive paths.
-- Do not claim unsupported behavior, unperformed validation, or incomplete
-  lifecycle work as finished.
+- Follow the requested mode. Analysis, review, and planning are read-only unless
+  the user also authorizes implementation.
+- Before changing files, inspect the worktree and task-related differences.
+  Read code, tests, and documentation as needed to establish the affected
+  behavior and boundaries; do not require a full repository survey.
+- Preserve unrelated changes and existing external contracts unless the user
+  explicitly authorizes changing them.
+- Within an authorized implementation, complete the requested behavior, correct
+  regressions introduced by the change, and finish necessary validation.
+  Respect user-requested checkpoints.
+- Resolve routine implementation choices autonomously. Ask only when missing
+  information materially changes scope, correctness, risk, or authorization.
+- Git operations require authorization for the requested operation and include
+  its necessary routine steps. Permission to commit includes staging reviewed
+  changes, but does not authorize pushing or merging.
 
-## Scope and Design
+## Design and Scope
 
-- Prefer direct, concrete implementations with clear local control flow.
-- Add an abstraction only when it enforces a real invariant or boundary,
-  isolates an external dependency, removes stable duplication, or materially
-  improves testing of critical behavior.
-- Do not add speculative traits, managers, wrappers, compatibility layers,
-  fallback paths, or parallel implementations.
-- Preserve external contracts unless the task explicitly authorizes a breaking
-  change.
-- Keep refactoring local to the behavior being changed. Do not use a focused
-  change as authorization for cross-module reorganization.
-- Remove obsolete code when replacing behavior; do not retain dead compatibility
-  paths without a current requirement.
+- Resolve trade-offs in this order: correctness, safety and invariants,
+  simplicity, readability, then abstraction. Make material trade-offs explicit.
+- Prefer direct, local implementations. Introduce abstractions only for a real
+  boundary, invariant, external dependency, stable duplication, or critical
+  testing need.
+- Keep changes within the current requirement. Remove obsolete behavior when
+  replacing it; do not add speculative capabilities or compatibility paths.
+- Keep these instructions focused on responsibilities, observable contracts,
+  and engineering constraints. Put implementation details and code walkthroughs
+  in task-relevant documentation.
 
 ## Product Boundary
 
-- The supported runtime currently uses one metadata group and one metadata
-  leader.
-- The Rust native client is the supported client interface.
-- Reads and writes go through metadata-authorized worker storage.
-- External/UFS-backed IO has no adapter in the current workspace and is not an
-  active read or write path.
-- The internal writable namespace is rooted at `/`; `/local` has no special
-  namespace semantics.
-- Multi-group metadata, multiple metadata leaders, metadata peer RPC, admin
-  APIs, replication, repair, rebalancing, alternate transports, POSIX, FUSE,
-  Hadoop compatibility, and UFS-backed IO are outside the supported product
-  boundary unless explicitly requested and completed end to end.
+- The supported runtime has one metadata group and one metadata leader.
+- The Rust native client is the supported client interface. Data access goes
+  through metadata-authorized worker storage.
+- The internal writable namespace is unified; names alone do not establish
+  separate authority or storage behavior.
+- Multi-group metadata, metadata peer services, administration APIs, replication,
+  repair, rebalancing, alternate transports, POSIX, FUSE, Hadoop compatibility,
+  and external-storage IO are outside the current supported product boundary.
+  Expanding it requires an explicit user request and complete end-to-end work.
+- Do not present internal primitives or partial implementations as supported
+  product capabilities.
 
-Do not add placeholder surfaces or documentation claims for unsupported
-capabilities.
+## Architectural Boundaries
 
-## Crate Ownership
+- Metadata owns namespace and data-access authority. Workers own local data
+  execution. The client coordinates those boundaries; the CLI owns process
+  entry and command behavior.
+- Shared domain values, common infrastructure, and wire contracts have distinct
+  ownership. Keep service policy in its owning crate.
+- Production dependencies must preserve these boundaries: the CLI and client
+  must not depend on Metadata or Worker implementations; Worker must not depend
+  on Metadata or Client implementations; Metadata must not depend on Worker or
+  Client implementations.
+- Shared crates must remain independent of runtime implementations. Test
+  dependencies must not leak into production dependency relationships.
 
-- `beryl-cli`: public command contract, installed layout resolution, and
-  package-internal process routing.
-- `beryl-types`: stable domain and value types.
-- `beryl-common`: shared errors, headers, config mechanics, retry/time helpers,
-  and observability utilities.
-- `beryl-proto`: protobuf/gRPC schema, generated bindings, and structural
-  conversions.
-- `beryl-metadata`: namespace, layout, visibility, leases/write sessions,
-  worker registry, block locations, freshness, and Raft/RocksDB-backed metadata
-  authority.
-- `beryl-worker`: local block storage, stream execution, block lifecycle,
-  registration, heartbeat, and block reports.
-- `beryl-client`: Rust native API and metadata/worker RPC orchestration.
-- `beryl-e2e`: black-box coverage of the supported runtime path.
+## Correctness and Recovery
 
-Production dependency direction must remain clean:
-
-- `beryl-cli` must not production-depend on `beryl-metadata` or
-  `beryl-worker`.
-- `beryl-client` must not production-depend on `beryl-metadata` or
-  `beryl-worker`.
-- `beryl-worker` must not production-depend on `beryl-metadata` or
-  `beryl-client`.
-- Shared contracts belong in `beryl-types`, `beryl-common`, or `beryl-proto`
-  according to their ownership.
-- Test-only dependency direction must not leak into production dependency
-  graphs.
-
-## Correctness and Failure Handling
-
-- Identify the source of truth before changing distributed or persistent
-  behavior.
-- Preserve ordering, fencing, identity, freshness, visibility, and ownership
-  checks across RPC, concurrency, and restart boundaries.
-- Treat timeout, cancellation, partial IO, process restart, replay, duplicate
-  delivery, and stale state as normal failure modes.
+- Identify authoritative state before changing distributed or persistent
+  behavior. Preserve identity, ordering, fencing, freshness, and visibility
+  across concurrency, communication, and restart boundaries.
+- Treat cancellation, timeout, partial IO, duplicate delivery, and restart as
+  normal failure cases. Distinguish definite failure from unknown outcome;
+  retry only when side-effect and replay semantics make it safe.
 - Fail closed when authority, persisted state, or destructive-operation
-  preconditions cannot be verified.
-- Destructive operations must resolve an exact target, be safe under retries,
-  and have explicit crash-recovery behavior.
-- Do not treat an in-memory lock as protection for a resource whose lifetime
-  extends beyond that lock.
-- Keep IO, retries, queues, batches, and background work bounded.
-- Do not silently convert consistency failures into fallback or stale success.
+  preconditions cannot be verified. Do not turn consistency failures into stale
+  success or silent fallback.
+- Destructive operations require exact targets, protection over the full
+  lifetime of affected activity, retry safety, and defined crash recovery.
+- Keep resource use and recovery work bounded.
 
-## Rust Code
+## Code and Tests
 
-- Keep production code straightforward and use the narrowest necessary
-  visibility.
-- Do not widen visibility or add production APIs solely for tests.
-- Keep Rust comments and documentation in English.
-- Comments should explain stable responsibilities, preconditions, invariants,
-  or failure behavior. Do not record task history, review history, or temporary
-  implementation phases in production comments.
-- Avoid unnecessary `allow` attributes. Fix warnings in touched code instead of
-  suppressing them without justification.
-
-## Test Organization
-
-- Production items must appear before unit-test code.
-- New or moved inline unit tests must be contained in one
-  `#[cfg(test)] mod tests` at the end of the file.
-- When tests are split into separate files, keep the `#[cfg(test)] mod tests;`
-  declaration at the end of the production module.
-- Except for the single `#[cfg(test)] mod tests { ... }` or
-  `#[cfg(test)] mod tests;` at the end of a production module, do not place any
-  `#[cfg(test)]` item in production code, including imports, impl blocks,
-  methods, types, constants, or helper functions.
-- Keep test helpers, fixtures, helper implementations, and test-only types
-  inside test modules or dedicated test files.
-- Do not add test-only re-exports, visibility widening, getters, injection
-  points, force methods, or fake APIs to production modules.
-- Test private behavior in its owning module. Test cross-module behavior through
-  existing production boundaries.
-- Prefer a small number of strong behavior and invariant tests over broad
-  implementation-detail coverage.
-- Do not test source text, item ordering, directory layout, or the absence of
-  obsolete names.
-- Preserve coverage for edge cases, concurrency, failure recovery, replay,
-  restart, wire contracts, and public behavior when relevant.
-- Existing nonconforming test layout is not authorization for unrelated
-  reorganization. Consolidate it only when the file is already in scope.
+- Use the narrowest necessary visibility. Do not add production interfaces or
+  widen access solely to support tests.
+- Keep Rust comments and documentation in English. Explain stable contracts,
+  non-obvious reasons, and failure behavior rather than task history.
+- Address warnings in affected code rather than suppressing them without a
+  concrete reason.
+- Keep unit tests and their helpers together after production items, in a single
+  terminal test module or a separate test file declared there. Keep test-only
+  declarations and conditional test logic out of production items.
+- Test private behavior within its owning module and cross-module behavior
+  through existing production boundaries.
+- Add tests for observable regressions, non-trivial invariants, and meaningful
+  failure cases. Distinguish externally observable contracts from incidental
+  source shape or obsolete names when selecting coverage.
+- Use deterministic coordination for concurrency tests. Preserve relevant
+  recovery, restart, and compatibility coverage.
+- Do not reorganize unrelated tests merely because their file is touched.
 
 ## Validation
 
-Run validation in proportion to the change and report every command not run.
-
-For every change:
-
-```bash
-git diff --check
-```
-
-For Rust code changes:
-
-```bash
-cargo fmt --all --check
-cargo test -p <affected-crate>
-cargo check --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-```
-
-Run `cargo test -p beryl-e2e` explicitly for changes to public behavior,
-cross-crate orchestration, RPC contracts, persistence, restart, or lifecycle
-semantics. Documentation-only changes do not require Cargo validation unless
-they change generated artifacts, executable examples, or validation tooling.
+- Select validation from the actual differences, affected callers, and risk.
+  Start with focused checks; use the project's existing build and validation
+  entry points.
+- Check every change for whitespace errors. For Rust changes, check formatting,
+  run affected tests, and verify compilation and lint checks for affected
+  targets.
+- Shared-contract, dependency, or build changes require validation of affected
+  producers and consumers. Run workspace-wide checks when impact spans the
+  workspace or cannot be safely bounded.
+- Public behavior, cross-crate orchestration, communication contracts,
+  persistence, restart, and lifecycle changes require relevant end-to-end
+  coverage through the supported runtime.
+- Run required broader checks after the final differences are stable. Reuse
+  results that cover the same code state; repeat or expand checks only for new
+  changes, failures, unresolved risks, or explicit user requirements.
+- Documentation-only changes need content and difference review, not runtime
+  tests, unless executable examples, generated artifacts, or validation tooling
+  are affected.
 
 ## Review and Handoff
 
-- Classify findings as `Blocking`, `Non-blocking`, or `Notes`.
-- For each actionable finding, identify the affected symbol or boundary,
-  impact, smallest safe correction, and required test.
-- Passing tests are regression evidence, not proof that unsupported behavior is
-  complete.
-- Commit subjects must use `<type>(<scope>): <outcome>` with `feat`, `fix`,
-  `refactor`, `test`, `docs`, or `chore` as the type.
-- Keep commit messages concise and describe the behavioral or structural
-  outcome.
-- Do not stage, commit, push, or open a pull request unless the task requests
-  that Git operation.
+- Lead reviews with the overall conclusion. Classify findings as Blocking,
+  Non-blocking, or Notes, with concrete evidence, impact, and the smallest safe
+  correction.
+- Report actual changes, validation performed, relevant checks not run, and
+  remaining uncertainty. Passing tests are evidence, not proof of completeness.
+- Keep commit and pull-request metadata concise and in English. Use a
+  conventional commit subject with a type, scope, and outcome.
