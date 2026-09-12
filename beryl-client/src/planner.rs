@@ -29,7 +29,6 @@ impl RequestedReadRange {
 pub(crate) struct PlannedBlockRead {
     pub(crate) file_offset: u64,
     pub(crate) len: u32,
-    pub(crate) end_file_offset: u64,
     pub(crate) block_id: BlockId,
     pub(crate) block_offset: u64,
     pub(crate) block_size: u64,
@@ -137,7 +136,6 @@ pub(crate) fn plan_block_reads(
         block_reads.push(PlannedBlockRead {
             file_offset: read_start,
             len,
-            end_file_offset: read_end,
             block_id,
             block_offset: read_start - start,
             block_size: location.block_size,
@@ -202,13 +200,7 @@ pub(crate) fn block_location_unavailable_error(message: impl Into<String>) -> Cl
         },
         message,
     );
-    ClientError::from_remote(
-        rpc_error,
-        ClientRefreshHint {
-            worker_resolve_required: true,
-            ..ClientRefreshHint::default()
-        },
-    )
+    ClientError::from_remote(rpc_error, ClientRefreshHint::default())
 }
 
 #[cfg(test)]

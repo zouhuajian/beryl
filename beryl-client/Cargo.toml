@@ -16,12 +16,10 @@ prost = { workspace = true }
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
 futures = { workspace = true }
-async-trait = { workspace = true }
 
 # Utilities
 bytes = { workspace = true }
 parking_lot = { workspace = true }
-uuid = { workspace = true }
 
 # Metrics
 metrics = { workspace = true }

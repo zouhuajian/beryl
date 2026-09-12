@@ -178,10 +178,18 @@ async fn visibility_sync_then_continue_write_roundtrip() {
         .expect("read published prefix while writer remains open");
     assert_eq!(visible_prefix, first);
 
+    let boundary = 1024 - first.len();
+    for chunk in [&second[..200], &second[200..boundary], &second[boundary..]] {
+        writer
+            .write_all(Bytes::copy_from_slice(chunk))
+            .await
+            .expect("write after visibility sync");
+        writer.sync().await.expect("publish another tail checkpoint");
+    }
     writer
-        .write_all(second.clone())
+        .sync()
         .await
-        .expect("write after visibility sync");
+        .expect("empty sync preserves the allocation predecessor");
     writer.close().await.expect("close after second block");
 
     let actual = client

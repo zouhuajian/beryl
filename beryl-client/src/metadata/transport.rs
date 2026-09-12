@@ -3,7 +3,6 @@
 
 //! Metadata transport boundary and tonic implementation.
 
-use async_trait::async_trait;
 use beryl_common::error::rpc::{RecoveryAction, RefreshHint as RpcRefreshHint};
 use beryl_common::header::{ClientInfo, ResponseHeader};
 use beryl_proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
@@ -19,117 +18,6 @@ use crate::metrics::{self, ClientMetric, ClientMetricLabels};
 use crate::rpc_error::{invalid_header_error, validate_header};
 use crate::runtime::AttemptContext;
 
-/// Client-owned metadata control-plane adapter.
-#[async_trait]
-pub(crate) trait MetadataTransport: Send + Sync {
-    /// Get file or directory status.
-    async fn get_status(
-        &self,
-        ctx: AttemptContext,
-        req: beryl_proto::metadata::GetStatusRequestProto,
-    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::GetStatusResponseProto>>;
-
-    /// List directory status.
-    async fn list_status(
-        &self,
-        ctx: AttemptContext,
-        req: beryl_proto::metadata::ListStatusRequestProto,
-    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::ListStatusResponseProto>>;
-
-    /// Create a directory.
-    async fn create_directory(
-        &self,
-        ctx: AttemptContext,
-        req: beryl_proto::metadata::CreateDirectoryRequestProto,
-    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::CreateDirectoryResponseProto>>;
-
-    /// Delete a namespace entry.
-    async fn delete(
-        &self,
-        ctx: AttemptContext,
-        req: beryl_proto::metadata::DeleteRequestProto,
-    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::DeleteResponseProto>>;
-
-    /// Rename a namespace entry.
-    async fn rename(
-        &self,
-        ctx: AttemptContext,
-        req: beryl_proto::metadata::RenameRequestProto,
-    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::RenameResponseProto>>;
-
-    /// Open a file for read planning.
-    async fn open_file(
-        &self,
-        ctx: AttemptContext,
-        req: beryl_proto::metadata::OpenFileRequestProto,
-    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::OpenFileResponseProto>>;
-
-    /// Get the file data layout for a public read.
-    async fn read_layout(
-        &self,
-        ctx: AttemptContext,
-        req: beryl_proto::metadata::GetBlockLocationsRequestProto,
-    ) -> ClientResult<ValidatedMetadataResponse<ReadLayout>>;
-
-    /// Apply the durable CreateFile namespace mutation.
-    async fn create_file(
-        &self,
-        ctx: AttemptContext,
-        req: beryl_proto::metadata::CreateFileRequestProto,
-    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::CreateFileResponseProto>>;
-
-    /// Open a leader-local write session.
-    async fn open_write(
-        &self,
-        ctx: AttemptContext,
-        req: beryl_proto::metadata::OpenWriteRequestProto,
-    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::OpenWriteResponseProto>>;
-
-    /// Allocate or replay one block in the current session's predecessor chain.
-    /// Implementations validate the response authority and block before returning.
-    async fn allocate_block(
-        &self,
-        ctx: AttemptContext,
-        req: beryl_proto::metadata::AllocateBlockRequestProto,
-    ) -> ClientResult<ValidatedMetadataResponse<AllocateBlockResult>>;
-
-    /// Commit a write session after worker data commit succeeds.
-    async fn commit_file(
-        &self,
-        ctx: AttemptContext,
-        req: beryl_proto::metadata::CommitFileRequestProto,
-    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::CommitFileResponseProto>>;
-
-    /// Abort a write session best effort.
-    async fn abort_file_write(
-        &self,
-        ctx: AttemptContext,
-        req: beryl_proto::metadata::AbortFileWriteRequestProto,
-    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::AbortFileWriteResponseProto>>;
-
-    /// Renew an active write session lease.
-    async fn renew_lease(
-        &self,
-        ctx: AttemptContext,
-        req: beryl_proto::metadata::RenewLeaseRequestProto,
-    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::RenewLeaseResponseProto>>;
-
-    /// Apply a write-session visibility or durability barrier.
-    async fn sync_write(
-        &self,
-        ctx: AttemptContext,
-        req: beryl_proto::metadata::SyncWriteRequestProto,
-    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::metadata::SyncWriteResponseProto>>;
-
-    /// Synchronize metadata freshness and include the returned watermark in
-    /// the validated authority update.
-    async fn msync(
-        &self,
-        ctx: AttemptContext,
-        req: beryl_proto::metadata::MsyncRequestProto,
-    ) -> ClientResult<ValidatedMetadataResponse<beryl_proto::common::GroupStateWatermarkProto>>;
-}
-
 /// Tonic-backed Metadata transport for one selected-endpoint attempt.
 #[derive(Debug)]
 pub(crate) struct GrpcMetadataTransport {
@@ -140,16 +28,16 @@ pub(crate) struct GrpcMetadataTransport {
 
 impl GrpcMetadataTransport {
     /// Creates a lazily connecting Metadata transport from sealed client configuration.
-    pub(crate) fn new_lazy_with_config(config: &ClientConfig) -> ClientResult<Self> {
+    pub(crate) fn new_lazy_with_config(config: &ClientConfig) -> Self {
         Self::new_lazy_with_pool_options(config.metadata_connection_reuse(), config.metadata_connection_limit())
     }
 
-    fn new_lazy_with_pool_options(channel_pool_enabled: bool, max_channels_per_group: usize) -> ClientResult<Self> {
-        Ok(Self {
+    fn new_lazy_with_pool_options(channel_pool_enabled: bool, max_channels_per_group: usize) -> Self {
+        Self {
             channels: parking_lot::RwLock::new(HashMap::new()),
             channel_pool_enabled,
             max_channels_per_group: max_channels_per_group.max(1),
-        })
+        }
     }
 
     async fn client(
@@ -258,9 +146,8 @@ fn evict_metadata_channel_if_needed(
     }
 }
 
-#[async_trait]
-impl MetadataTransport for GrpcMetadataTransport {
-    async fn get_status(
+impl GrpcMetadataTransport {
+    pub(crate) async fn get_status(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::GetStatusRequestProto,
@@ -276,7 +163,7 @@ impl MetadataTransport for GrpcMetadataTransport {
         validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
-    async fn list_status(
+    pub(crate) async fn list_status(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::ListStatusRequestProto,
@@ -292,7 +179,7 @@ impl MetadataTransport for GrpcMetadataTransport {
         validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
-    async fn create_directory(
+    pub(crate) async fn create_directory(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::CreateDirectoryRequestProto,
@@ -308,7 +195,7 @@ impl MetadataTransport for GrpcMetadataTransport {
         validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
-    async fn delete(
+    pub(crate) async fn delete(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::DeleteRequestProto,
@@ -324,7 +211,7 @@ impl MetadataTransport for GrpcMetadataTransport {
         validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
-    async fn rename(
+    pub(crate) async fn rename(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::RenameRequestProto,
@@ -340,7 +227,7 @@ impl MetadataTransport for GrpcMetadataTransport {
         validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
-    async fn open_file(
+    pub(crate) async fn open_file(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::OpenFileRequestProto,
@@ -356,7 +243,7 @@ impl MetadataTransport for GrpcMetadataTransport {
         validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
-    async fn read_layout(
+    pub(crate) async fn read_layout(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::GetBlockLocationsRequestProto,
@@ -374,7 +261,7 @@ impl MetadataTransport for GrpcMetadataTransport {
         Ok(ValidatedMetadataResponse::new(authority, body))
     }
 
-    async fn create_file(
+    pub(crate) async fn create_file(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::CreateFileRequestProto,
@@ -390,7 +277,7 @@ impl MetadataTransport for GrpcMetadataTransport {
         validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
-    async fn open_write(
+    pub(crate) async fn open_write(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::OpenWriteRequestProto,
@@ -406,7 +293,7 @@ impl MetadataTransport for GrpcMetadataTransport {
         validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
-    async fn allocate_block(
+    pub(crate) async fn allocate_block(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::AllocateBlockRequestProto,
@@ -433,7 +320,7 @@ impl MetadataTransport for GrpcMetadataTransport {
         Ok(ValidatedMetadataResponse::new(authority, body))
     }
 
-    async fn commit_file(
+    pub(crate) async fn commit_file(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::CommitFileRequestProto,
@@ -449,7 +336,7 @@ impl MetadataTransport for GrpcMetadataTransport {
         validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
-    async fn abort_file_write(
+    pub(crate) async fn abort_file_write(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::AbortFileWriteRequestProto,
@@ -465,7 +352,7 @@ impl MetadataTransport for GrpcMetadataTransport {
         validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
-    async fn renew_lease(
+    pub(crate) async fn renew_lease(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::RenewLeaseRequestProto,
@@ -481,7 +368,7 @@ impl MetadataTransport for GrpcMetadataTransport {
         validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
-    async fn sync_write(
+    pub(crate) async fn sync_write(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::SyncWriteRequestProto,
@@ -497,7 +384,7 @@ impl MetadataTransport for GrpcMetadataTransport {
         validated_metadata_response(&ctx, response.header.clone(), response)
     }
 
-    async fn msync(
+    pub(crate) async fn msync(
         &self,
         ctx: AttemptContext,
         mut req: beryl_proto::metadata::MsyncRequestProto,
@@ -691,7 +578,7 @@ mod tests {
     use std::sync::Arc;
     #[tokio::test]
     async fn concurrent_metadata_channel_requests_same_key_reuse_inserted_channel() {
-        let transport = Arc::new(GrpcMetadataTransport::new_lazy_with_pool_options(true, 8).expect("transport"));
+        let transport = Arc::new(GrpcMetadataTransport::new_lazy_with_pool_options(true, 8));
         let ctx = metadata_attempt("root", Some("127.0.0.1:18080"));
 
         let mut tasks = Vec::with_capacity(8);
@@ -818,7 +705,7 @@ mod tests {
             OperationDeadline::new(5_000),
         )
         .expect("operation");
-        let ctx = AttemptContext::for_metadata(&operation, GroupName::parse(group_name).unwrap(), 0).expect("attempt");
+        let ctx = AttemptContext::for_metadata(&operation, GroupName::parse(group_name).unwrap()).expect("attempt");
         if let Some(endpoint) = endpoint {
             ctx.with_metadata_endpoint(endpoint.to_string())
         } else {

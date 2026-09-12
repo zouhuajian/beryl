@@ -4,7 +4,7 @@
 //! Client-owned metadata control-plane boundary.
 //!
 //! [`MetadataClient`] owns operation execution, retry, and authority state.
-//! [`MetadataTransport`] owns one selected-endpoint RPC attempt, including
+//! [`GrpcMetadataTransport`] owns one selected-endpoint RPC attempt, including
 //! request-header construction and validated wire-response conversion.
 
 pub(crate) mod client;
@@ -15,4 +15,4 @@ pub(crate) use client::MetadataClient;
 pub(crate) use model::{
     AllocateBlockResult, ListStatusPage, MetadataAuthorityUpdate, OpenedFile, ReadLayout, ValidatedMetadataResponse,
 };
-pub(crate) use transport::{GrpcMetadataTransport, MetadataTransport};
+pub(crate) use transport::GrpcMetadataTransport;

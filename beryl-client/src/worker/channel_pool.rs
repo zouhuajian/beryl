@@ -368,7 +368,7 @@ mod tests {
             OperationDeadline::new(1_000),
         )
         .expect("operation context");
-        AttemptContext::for_data(&operation, 0)
+        AttemptContext::for_data(&operation)
     }
 
     fn data_header_with_error(

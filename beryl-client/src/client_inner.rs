@@ -5,13 +5,13 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::config::ClientConfig;
 use crate::error::side_effect_response_body_mismatch;
 use crate::error::{ClientError, ClientErrorKind, ClientResult, RefreshHint};
-use crate::metadata::{GrpcMetadataTransport, MetadataClient, MetadataTransport};
+use crate::metadata::{GrpcMetadataTransport, MetadataClient};
 use crate::metrics::{self, ClientMetric, ClientMetricLabels};
+use crate::runtime::retry::backoff_delay;
 use crate::runtime::{
     is_definite_worker_capacity_rejection, AttemptContext, ClientIdentity, MetadataTargets, Operation,
     OperationContext, OperationDeadline,
@@ -38,22 +38,10 @@ impl ClientInner {
     pub(crate) fn from_config(config: ClientConfig) -> ClientResult<Self> {
         config.validate()?;
         let metadata_targets = MetadataTargets::from_config(&config)?;
-        let metadata_transport = Arc::new(GrpcMetadataTransport::new_lazy_with_config(&config)?);
+        let metadata_transport = Arc::new(GrpcMetadataTransport::new_lazy_with_config(&config));
         let worker = WorkerClient::from_config(&config);
-        Self::from_parts(config, metadata_transport, metadata_targets, worker)
-    }
-
-    /// Establishes exactly one owner for identity, authority state, Worker
-    /// orchestration, and immutable configuration.
-    fn from_parts(
-        config: ClientConfig,
-        metadata_transport: Arc<dyn MetadataTransport>,
-        metadata_targets: MetadataTargets,
-        worker: WorkerClient,
-    ) -> ClientResult<Self> {
-        config.validate()?;
         let identity = ClientIdentity::generate(config.client_name().to_string())?;
-        let metadata = MetadataClient::new(identity, metadata_transport, metadata_targets, &config)?;
+        let metadata = MetadataClient::new(identity, metadata_transport, metadata_targets, &config);
         Ok(Self {
             config,
             metadata,
@@ -118,9 +106,9 @@ impl ClientInner {
             session.path(),
             deadline,
         )?;
-        let lease_expires_at_ms = session.expires_at_ms()?;
+        let lease_expires_at_ms = session.expires_at_ms();
         for attempt_index in 0..self.config.max_attempts() {
-            let ctx = self.data_context(&operation, attempt_index as u32);
+            let ctx = AttemptContext::for_data(&operation);
             match self
                 .worker_rpc_with_timeout(
                     &operation,
@@ -227,16 +215,6 @@ impl ClientInner {
         Err(timeout_error("worker", "WriteBlock cancellation"))
     }
 
-    /// Converts durable Worker blocks into the Metadata visibility-barrier shape.
-    pub(crate) fn committed_blocks_for_barrier(&self, session: &WriteSession) -> Vec<beryl_types::CommittedBlock> {
-        session.publication_blocks()
-    }
-
-    /// Builds a data-plane attempt context under the public operation deadline.
-    pub(crate) fn data_context(&self, operation: &OperationContext, attempt: u32) -> AttemptContext {
-        AttemptContext::for_data(operation, attempt)
-    }
-
     /// Runs a worker RPC under the shared public operation deadline.
     pub(crate) async fn worker_rpc_with_timeout<T, Fut>(
         &self,
@@ -286,7 +264,7 @@ impl ClientInner {
         retry_index: usize,
         operation: &OperationContext,
     ) -> ClientResult<()> {
-        let delay = fixed_backoff_delay(retry_index);
+        let delay = backoff_delay(retry_index);
         let remaining = operation.deadline().remaining();
         if remaining.is_zero() || delay >= remaining {
             self.record_worker_timeout(operation.operation_name());
@@ -364,11 +342,6 @@ pub(crate) fn metric_labels(operation: &'static str, target_plane: &'static str)
 /// Extracts a structured refresh hint from action errors when one is available.
 pub(crate) fn refresh_hint_from_error(err: &ClientError) -> RefreshHint {
     err.refresh_hint().cloned().unwrap_or_default()
-}
-
-/// Returns true when a metadata session barrier has an unknown result.
-pub(crate) fn is_unknown_session_barrier_outcome(err: &ClientError) -> bool {
-    err.is_outcome_unknown()
 }
 
 /// Marks a write session after a metadata session-level failure.
@@ -458,11 +431,4 @@ fn map_outcome_error(operation: &'static str, err: ClientError) -> ClientError {
         return err.with_unknown_outcome_name(operation, message);
     }
     err
-}
-
-fn fixed_backoff_delay(retry_index: usize) -> Duration {
-    const INITIAL_MS: u64 = 100;
-    const MAX_MS: u64 = 2_000;
-    let shift = retry_index.min(20) as u32;
-    Duration::from_millis(INITIAL_MS.saturating_mul(1u64 << shift).min(MAX_MS))
 }

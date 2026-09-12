@@ -223,7 +223,6 @@ dependencies = [
 name = "beryl-client"
 version = "0.1.0-alpha.1"
 dependencies = [
- "async-trait",
  "beryl-common",
  "beryl-proto",
  "beryl-types",
@@ -235,7 +234,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
- "uuid",
 ]
 
 [[package]]

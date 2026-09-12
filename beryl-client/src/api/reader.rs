@@ -9,7 +9,7 @@ use crate::metadata::{OpenedFile, ReadLayout};
 use crate::metrics::ClientMetric;
 use crate::planner;
 use crate::planner::{PlannedBlockRead, RequestedReadRange};
-use crate::runtime::{retry_decision, Operation, OperationContext, OperationDeadline, RetryDecision};
+use crate::runtime::{retry_decision, AttemptContext, Operation, OperationContext, OperationDeadline, RetryDecision};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
 use beryl_types::GroupName;
 use bytes::Bytes;
@@ -226,8 +226,8 @@ impl FileReader {
                 file_offset: offset,
                 len: read_len,
             };
-            let (group_name, block_reads) = plan.plan(&self.file, range)?;
-            let ctx = self.inner.data_context(&operation, attempt_index as u32);
+            let (group_name, block_reads) = plan.plan(range)?;
+            let ctx = AttemptContext::for_data(&operation);
             match self
                 .inner
                 .worker_rpc_with_timeout(
@@ -285,7 +285,7 @@ impl FileReader {
                 range,
                 layout.as_ref().expect("read layout was initialized"),
             )?;
-            let ctx = self.inner.data_context(&operation, attempt_index as u32);
+            let ctx = AttemptContext::for_data(&operation);
             match self
                 .inner
                 .worker_rpc_with_timeout(
@@ -373,16 +373,16 @@ impl Debug for FileReader {
 }
 
 /// Metadata-authorized layout retained only for the current sequential block.
-#[derive(Clone)]
 struct CurrentBlockPlan {
-    layout: ReadLayout,
+    group_name: GroupName,
+    block: PlannedBlockRead,
     start: u64,
     end: u64,
 }
 
 impl CurrentBlockPlan {
     /// Validates a fresh layout and identifies the first block serving the cursor.
-    fn new(file: &OpenedFile, range: RequestedReadRange, mut layout: ReadLayout) -> ClientResult<Self> {
+    fn new(file: &OpenedFile, range: RequestedReadRange, layout: ReadLayout) -> ClientResult<Self> {
         let (_, reads) =
             planner::plan_block_reads_from_layout(file.inode_id(), file.generation(), file.len(), range, &layout)?;
         let first = reads
@@ -401,8 +401,12 @@ impl CurrentBlockPlan {
         let end = start
             .checked_add(location.len)
             .ok_or_else(|| ClientError::invalid_layout("planned block end overflow"))?;
-        layout.locations = vec![location];
-        Ok(Self { layout, start, end })
+        Ok(Self {
+            group_name: layout.group_name,
+            block: first.clone(),
+            start,
+            end,
+        })
     }
 
     /// Returns whether this plan authorizes the supplied sequential cursor.
@@ -410,9 +414,21 @@ impl CurrentBlockPlan {
         self.start <= offset && offset < self.end
     }
 
-    /// Re-plans a subrange while rechecking opened-file authority invariants.
-    fn plan(&self, file: &OpenedFile, range: RequestedReadRange) -> ClientResult<(GroupName, Vec<PlannedBlockRead>)> {
-        planner::plan_block_reads_from_layout(file.inode_id(), file.generation(), file.len(), range, &self.layout)
+    /// Slices the immutable, already validated block without changing its authority lifetime.
+    fn plan(&self, range: RequestedReadRange) -> ClientResult<(GroupName, [PlannedBlockRead; 1])> {
+        if !self.contains(range.file_offset)
+            || range
+                .file_offset
+                .checked_add(u64::from(range.len))
+                .is_none_or(|end| end > self.end)
+        {
+            return Err(ClientError::invalid_layout("read range exceeds the cached block"));
+        }
+        let mut block = self.block.clone();
+        block.file_offset = range.file_offset;
+        block.block_offset = range.file_offset - self.start;
+        block.len = range.len;
+        Ok((self.group_name.clone(), [block]))
     }
 }
 

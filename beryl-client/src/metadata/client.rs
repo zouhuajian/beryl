@@ -10,12 +10,13 @@ use crate::error::{
     invalid_response, side_effect_response_body_mismatch, ClientError, ClientErrorKind, ClientResult, RefreshHint,
 };
 use crate::metadata::{
-    AllocateBlockResult, ListStatusPage, MetadataTransport, OpenedFile, ReadLayout, ValidatedMetadataResponse,
+    AllocateBlockResult, GrpcMetadataTransport, ListStatusPage, OpenedFile, ReadLayout, ValidatedMetadataResponse,
 };
 use crate::metrics;
 use crate::metrics::{ClientMetric, ClientMetricLabels};
 use crate::runtime::context::{AttemptContext, ClientIdentity, Operation, OperationContext, OperationDeadline};
 use crate::runtime::refresh::MetadataTargets;
+use crate::runtime::retry::backoff_delay;
 use crate::runtime::{retry_decision, transport_outcome_is_ambiguous, RetryDecision};
 use crate::session::write_session::{CommitFilePlan, SyncWritePlan, WriteSession};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
@@ -36,18 +37,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tonic::Status;
 
-const INITIAL_BACKOFF_MS: u64 = 100;
-const MAX_BACKOFF_MS: u64 = 2_000;
 const MAX_SERVER_RETRY_AFTER_MS: u64 = 5_000;
 
 /// Owns Metadata operation identity, retry policy, authority state, and the
 /// transport used for each selected-endpoint attempt.
-#[derive(Clone)]
 pub(crate) struct MetadataClient {
     /// Stable process-local identity reused when creating logical operations.
     identity: ClientIdentity,
     /// Sole Metadata network and wire-validation seam.
-    transport: Arc<dyn MetadataTransport>,
+    transport: Arc<GrpcMetadataTransport>,
     /// Client-side route and monotonic authority state learned from Metadata.
     metadata_targets: MetadataTargets,
     /// Bounded retry and absolute operation-timeout configuration.
@@ -59,17 +57,17 @@ impl MetadataClient {
     /// Creates the Metadata owner from validated client-wide dependencies.
     pub(crate) fn new(
         identity: ClientIdentity,
-        transport: Arc<dyn MetadataTransport>,
+        transport: Arc<GrpcMetadataTransport>,
         metadata_targets: MetadataTargets,
         config: &ClientConfig,
-    ) -> ClientResult<Self> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             identity,
             transport,
             metadata_targets,
             max_attempts: config.max_attempts(),
             operation_timeout_ms: config.operation_timeout_ms(),
-        })
+        }
     }
 
     /// Starts one absolute deadline shared by all work in a public operation.
@@ -493,7 +491,7 @@ impl MetadataClient {
     ) -> ClientResult<T>
     where
         Req: Clone,
-        F: FnMut(Arc<dyn MetadataTransport>, AttemptContext, Req) -> Fut,
+        F: FnMut(Arc<GrpcMetadataTransport>, AttemptContext, Req) -> Fut,
         Fut: Future<Output = ClientResult<ValidatedMetadataResponse<T>>>,
     {
         let operation_name = operation.operation_name();
@@ -534,7 +532,7 @@ impl MetadataClient {
     ) -> ClientResult<T>
     where
         Req: Clone,
-        F: FnMut(Arc<dyn MetadataTransport>, AttemptContext, Req) -> Fut,
+        F: FnMut(Arc<GrpcMetadataTransport>, AttemptContext, Req) -> Fut,
         Fut: Future<Output = ClientResult<ValidatedMetadataResponse<T>>>,
     {
         let operation_context = operation.clone();
@@ -554,26 +552,20 @@ impl MetadataClient {
     ) -> (ClientResult<T>, bool)
     where
         Req: Clone,
-        F: FnMut(Arc<dyn MetadataTransport>, AttemptContext, Req) -> Fut,
+        F: FnMut(Arc<GrpcMetadataTransport>, AttemptContext, Req) -> Fut,
         Fut: Future<Output = ClientResult<ValidatedMetadataResponse<T>>>,
     {
-        let mut target_group = match self.metadata_targets.group_for_operation(&operation) {
-            Ok(group) => group,
-            Err(err) => return (Err(err), false),
-        };
+        let target_group = self.metadata_targets.group_name().clone();
         let mut saw_transport_ambiguity = false;
         for attempt_index in 0..self.max_attempts {
             let attempt = attempt_index as u32;
-            let endpoint = match self.metadata_targets.endpoint_for_group(&target_group, attempt) {
-                Ok(endpoint) => endpoint,
-                Err(err) => return (Err(err), saw_transport_ambiguity),
-            };
-            let mut ctx = match AttemptContext::for_metadata(&operation, target_group.clone(), attempt) {
+            let endpoint = self.metadata_targets.endpoint(attempt);
+            let mut ctx = match AttemptContext::for_metadata(&operation, target_group.clone()) {
                 Ok(ctx) => ctx.with_metadata_endpoint(&endpoint),
                 Err(err) => return (Err(err), saw_transport_ambiguity),
             };
             ctx = self.metadata_targets.enrich_attempt_context(&operation, ctx);
-            if let Some(watermark) = self.metadata_targets.state_watermark_proto(&target_group) {
+            if let Some(watermark) = self.metadata_targets.state_watermark_proto() {
                 ctx = ctx.with_state(vec![watermark]);
             }
 
@@ -604,7 +596,7 @@ impl MetadataClient {
             match (decision, has_next) {
                 (RetryDecision::Retry, true) => {
                     if err.is_retryable_transport() && !err.is_definitely_before_side_effect() {
-                        self.metadata_targets.record_transport_failure(&target_group, &endpoint);
+                        self.metadata_targets.record_transport_failure(&endpoint);
                     }
                     self.record_retry(&operation, &err);
                     let delay = server_retry_delay(&err).unwrap_or_else(|| backoff_delay(attempt_index));
@@ -625,10 +617,6 @@ impl MetadataClient {
                             return (Err(err), saw_transport_ambiguity);
                         }
                     }
-                    target_group = match self.metadata_targets.group_for_operation(&operation) {
-                        Ok(group) => group,
-                        Err(err) => return (Err(err), saw_transport_ambiguity),
-                    };
                     self.record_retry(&operation, &err);
                 }
                 (RetryDecision::Retry | RetryDecision::RefreshMetadata(_), false) => {
@@ -665,13 +653,13 @@ impl MetadataClient {
         target_group: GroupName,
         attempt: u32,
     ) -> ClientResult<()> {
-        let endpoint = self.metadata_targets.endpoint_for_group(&target_group, attempt)?;
+        let endpoint = self.metadata_targets.endpoint(attempt);
         let operation = self.operation(
             Operation::Msync,
             parent.original_target_path().map(ToOwned::to_owned),
             parent.deadline().clone(),
         )?;
-        let ctx = AttemptContext::for_metadata(&operation, target_group, 0)?.with_metadata_endpoint(endpoint);
+        let ctx = AttemptContext::for_metadata(&operation, target_group)?.with_metadata_endpoint(endpoint);
         let response = self
             .metadata_rpc_with_deadline(
                 &operation,
@@ -775,11 +763,6 @@ fn refresh_hint_from_error(err: &ClientError) -> RefreshHint {
 fn server_retry_delay(err: &ClientError) -> Option<Duration> {
     err.retry_after()
         .map(|delay| delay.min(Duration::from_millis(MAX_SERVER_RETRY_AFTER_MS)))
-}
-
-fn backoff_delay(retry_index: usize) -> Duration {
-    let shift = retry_index.min(20) as u32;
-    Duration::from_millis(INITIAL_BACKOFF_MS.saturating_mul(1u64 << shift).min(MAX_BACKOFF_MS))
 }
 
 fn timeout_error(target_plane: &str, operation: &str) -> ClientError {
@@ -907,11 +890,7 @@ fn list_status_page_from_response(path: String, response: ListStatusResponseProt
             ))
         })
         .collect::<ClientResult<Vec<_>>>()?;
-    Ok(ListStatusPage {
-        entries,
-        next_cursor,
-        eof: response.eof,
-    })
+    Ok(ListStatusPage { entries, next_cursor })
 }
 
 /// Rejects unknown and UNSPECIFIED wire values before they enter the public status model.

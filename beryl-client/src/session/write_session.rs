@@ -6,8 +6,8 @@
 use crate::error::{ClientError, ClientResult};
 use crate::runtime::context::{Operation, OperationContext, OperationDeadline};
 use beryl_types::{
-    validate_block_size, BlockId, CallId, ClientId, CommittedBlock, ContentGeneration, InodeId, LocatedBlock,
-    WriteHandle, WriteMode,
+    validate_block_size, BlockId, CallId, ClientId, CommittedBlock, ContentGeneration, LocatedBlock, WriteHandle,
+    WriteMode,
 };
 use std::fmt::{Debug, Formatter, Result};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,7 +18,6 @@ const LEASE_EXPIRY_SAFETY_WINDOW_MS: u64 = 1_000;
 #[derive(Debug)]
 pub(crate) struct WriteSession {
     path: String,
-    inode_id: InodeId,
     block_size: u32,
     generation: ContentGeneration,
     mode: WriteMode,
@@ -26,13 +25,10 @@ pub(crate) struct WriteSession {
     base_size: u64,
     cursor: u64,
     flush_cursor: u64,
-    expires_at_ms: Option<u64>,
+    expires_at_ms: u64,
     ready_blocks: Vec<ReadyBlock>,
     write_group: Option<beryl_types::GroupName>,
     state: WriteSessionState,
-    sync: Option<SyncWriteState>,
-    commit: Option<CommitFileState>,
-    abort: Option<AbortCleanupState>,
 }
 
 impl WriteSession {
@@ -47,7 +43,6 @@ impl WriteSession {
         generation: ContentGeneration,
         mode: WriteMode,
     ) -> ClientResult<Self> {
-        let inode_id = write_handle.inode_id;
         if expires_at_ms == 0 {
             return Err(ClientError::invalid_argument(
                 "write session expires_at_ms must be non-zero".to_string(),
@@ -57,7 +52,6 @@ impl WriteSession {
             .map_err(|err| ClientError::invalid_layout(format!("write session block size invalid: {err}")))?;
         Ok(Self {
             path,
-            inode_id,
             block_size,
             generation,
             mode,
@@ -65,13 +59,10 @@ impl WriteSession {
             base_size,
             cursor: if mode == WriteMode::Overwrite { 0 } else { base_size },
             flush_cursor: if mode == WriteMode::Overwrite { 0 } else { base_size },
-            expires_at_ms: Some(expires_at_ms),
+            expires_at_ms,
             ready_blocks: Vec::new(),
             write_group: None,
             state: WriteSessionState::Open,
-            sync: None,
-            commit: None,
-            abort: None,
         })
     }
 
@@ -125,11 +116,11 @@ impl WriteSession {
             )));
         }
         let block = target.block_id;
-        if block.inode_id != self.inode_id {
+        if block.inode_id != self.write_handle.inode_id {
             return Err(ClientError::stale_handle(format!(
                 "write target inode_id {} does not match session inode_id {}",
                 block.inode_id.as_raw(),
-                self.inode_id.as_raw()
+                self.write_handle.inode_id.as_raw()
             )));
         }
         if target.write_offset >= target.block_size || target.fencing_token.epoch != self.write_handle.lease_epoch {
@@ -237,9 +228,9 @@ impl WriteSession {
         target_size: u64,
         deadline: OperationDeadline,
     ) -> ClientResult<SyncWritePlan> {
-        match self.state {
+        match &self.state {
             WriteSessionState::Open => {
-                self.sync = Some(SyncWriteState {
+                self.state = WriteSessionState::SyncPending(SyncWriteState {
                     call_id: CallId::new(),
                     write_handle: self.write_handle,
                     committed_blocks,
@@ -248,15 +239,11 @@ impl WriteSession {
                     expected_file_size: self.base_size,
                     write_mode: self.mode,
                 });
-                self.state = WriteSessionState::SyncPending;
             }
-            WriteSessionState::SyncPending => {
-                let sync = self.sync.as_ref().ok_or_else(|| {
-                    ClientError::invalid_argument("SyncWrite state missing frozen identity".to_string())
-                })?;
+            WriteSessionState::SyncPending(sync) => {
                 if sync.target_size != target_size || sync.committed_blocks != committed_blocks {
                     return Err(ClientError::invalid_argument(
-                        "SyncWrite payload changed after sync started".to_string(),
+                        "SyncWrite payload changed after sync started",
                     ));
                 }
                 if sync.write_handle != self.write_handle
@@ -265,17 +252,15 @@ impl WriteSession {
                     || sync.write_mode != self.mode
                 {
                     return Err(ClientError::invalid_argument(
-                        "SyncWrite session state changed after sync started".to_string(),
+                        "SyncWrite session state changed after sync started",
                     ));
                 }
             }
             _ => return Err(self.state_error_value()),
         }
-
-        let sync = self
-            .sync
-            .as_ref()
-            .ok_or_else(|| ClientError::invalid_argument("SyncWrite state missing frozen identity".to_string()))?;
+        let WriteSessionState::SyncPending(sync) = &self.state else {
+            return Err(self.state_error_value());
+        };
         let operation = OperationContext::with_call_id_named(
             client_id,
             client_name,
@@ -304,9 +289,9 @@ impl WriteSession {
         final_size: u64,
         deadline: OperationDeadline,
     ) -> ClientResult<CommitFilePlan> {
-        match self.state {
+        match &self.state {
             WriteSessionState::Open => {
-                self.commit = Some(CommitFileState {
+                self.state = WriteSessionState::CommitPending(CommitFileState {
                     commit_call_id: CallId::new(),
                     commit_write_handle: self.write_handle,
                     commit_final_size: final_size,
@@ -315,51 +300,25 @@ impl WriteSession {
                     expected_file_size: self.base_size,
                     write_mode: self.mode,
                 });
-                self.state = WriteSessionState::CommitStarted;
             }
-            WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown => {
-                let commit = self.commit.as_ref().ok_or_else(|| {
-                    ClientError::invalid_argument("CommitFile state missing frozen identity".to_string())
-                })?;
+            WriteSessionState::CommitPending(commit) => {
                 if commit.commit_final_size != final_size || commit.commit_committed_blocks_snapshot != committed_blocks
                 {
                     return Err(ClientError::invalid_argument(
-                        "CommitFile payload changed after commit started".to_string(),
+                        "CommitFile payload changed after commit started",
                     ));
                 }
                 if commit.commit_write_handle != self.write_handle {
                     return Err(ClientError::invalid_argument(
-                        "CommitFile write handle changed after commit started".to_string(),
+                        "CommitFile write handle changed after commit started",
                     ));
                 }
             }
-            WriteSessionState::Closed => {
-                return Err(ClientError::stale_handle("write handle is closed"));
-            }
-            WriteSessionState::Aborted => {
-                return Err(ClientError::stale_handle("write handle is aborted"));
-            }
-            WriteSessionState::UnknownOutcome => {
-                return Err(ClientError::stale_handle("write handle has an unknown outcome"));
-            }
-            WriteSessionState::SessionInvalid => {
-                return Err(ClientError::stale_handle("write session is invalid"));
-            }
-            WriteSessionState::SessionExpired => {
-                return Err(ClientError::stale_handle("write session lease expired"));
-            }
-            WriteSessionState::AbortUnknown => {
-                return Err(ClientError::stale_handle("write handle abort outcome is unknown"));
-            }
-            WriteSessionState::SyncPending => {
-                return Err(ClientError::stale_handle("write handle has an unresolved SyncWrite"));
-            }
+            _ => return Err(self.state_error_value()),
         }
-
-        let commit = self
-            .commit
-            .as_ref()
-            .ok_or_else(|| ClientError::invalid_argument("CommitFile state missing frozen identity".to_string()))?;
+        let WriteSessionState::CommitPending(commit) = &self.state else {
+            return Err(self.state_error_value());
+        };
         let operation = OperationContext::with_call_id_named(
             client_id,
             client_name,
@@ -386,31 +345,20 @@ impl WriteSession {
         client_name: &str,
         deadline: OperationDeadline,
     ) -> ClientResult<AbortCleanupPlan> {
-        match self.state {
-            WriteSessionState::Open => {
-                self.abort = Some(AbortCleanupState {
-                    metadata_call_id: CallId::new(),
-                    metadata_write_handle: self.write_handle,
-                });
-                self.state = WriteSessionState::AbortUnknown;
-            }
-            WriteSessionState::AbortUnknown => {
-                let abort = self.abort.as_ref().ok_or_else(|| {
-                    ClientError::invalid_argument("AbortUnknown state missing frozen cleanup plan".to_string())
-                })?;
-                if abort.metadata_write_handle != self.write_handle {
-                    return Err(ClientError::invalid_argument(
-                        "Abort cleanup handle changed after cleanup started".to_string(),
-                    ));
-                }
-            }
-            _ => return Err(self.state_error_value()),
+        if matches!(self.state, WriteSessionState::Open) {
+            self.state = WriteSessionState::AbortPending(AbortCleanupState {
+                metadata_call_id: CallId::new(),
+                metadata_write_handle: self.write_handle,
+            });
         }
-
-        let abort = self
-            .abort
-            .as_ref()
-            .ok_or_else(|| ClientError::invalid_argument("abort cleanup state missing frozen plan".to_string()))?;
+        let WriteSessionState::AbortPending(abort) = &self.state else {
+            return Err(self.state_error_value());
+        };
+        if abort.metadata_write_handle != self.write_handle {
+            return Err(ClientError::invalid_argument(
+                "Abort cleanup handle changed after cleanup started",
+            ));
+        }
         let metadata_operation = OperationContext::with_call_id_named(
             client_id,
             client_name,
@@ -425,13 +373,6 @@ impl WriteSession {
         })
     }
 
-    /// Mark CommitFile outcome as unknown and keep the session retryable.
-    pub(crate) fn mark_commit_unknown(&mut self) {
-        if matches!(self.state, WriteSessionState::CommitStarted) {
-            self.state = WriteSessionState::CommitUnknown;
-        }
-    }
-
     /// Mark the session closed after metadata commit succeeds.
     pub(crate) fn mark_closed(&mut self) {
         self.state = WriteSessionState::Closed;
@@ -439,13 +380,15 @@ impl WriteSession {
 
     /// Completes the frozen SyncWrite and restores normal writer operations.
     pub(crate) fn mark_sync_completed(&mut self, generation: ContentGeneration, file_size: u64) -> ClientResult<()> {
-        if !matches!(self.state, WriteSessionState::SyncPending) {
+        if !matches!(self.state, WriteSessionState::SyncPending(_)) {
             return Err(self.state_error_value());
         }
         self.generation = generation;
         self.base_size = file_size;
         self.mode = WriteMode::Append;
-        self.sync = None;
+        // Published history is no longer needed; retain the tail for reuse or
+        // as the predecessor of the next allocation, including after an empty sync.
+        self.ready_blocks = self.ready_blocks.pop().into_iter().collect();
         self.state = WriteSessionState::Open;
         Ok(())
     }
@@ -453,7 +396,6 @@ impl WriteSession {
     /// Marks the session aborted after Metadata accepts `AbortFileWrite`.
     /// Metadata cleanup owns any durable Worker Ready blocks left unpublished.
     pub(crate) fn mark_aborted(&mut self) {
-        self.abort = None;
         self.state = WriteSessionState::Aborted;
     }
 
@@ -472,20 +414,14 @@ impl WriteSession {
         self.state = WriteSessionState::SessionExpired;
     }
 
-    /// Mark abort cleanup as uncertain while keeping retry metadata.
-    pub(crate) fn mark_abort_unknown(&mut self) {
-        self.state = WriteSessionState::AbortUnknown;
-    }
-
     /// Record the latest metadata lease expiration returned by RenewLease.
     pub(crate) fn update_expires_at_ms(&mut self, expires_at_ms: u64) {
-        self.expires_at_ms = Some(expires_at_ms);
+        self.expires_at_ms = expires_at_ms;
     }
 
     /// Current Metadata lease expiry used to bound an open Worker block RPC.
-    pub(crate) fn expires_at_ms(&self) -> ClientResult<u64> {
+    pub(crate) fn expires_at_ms(&self) -> u64 {
         self.expires_at_ms
-            .ok_or_else(|| ClientError::invalid_argument("write session expiry is missing".to_string()))
     }
 
     /// Return whether the open session should renew before another side-effecting operation.
@@ -494,11 +430,8 @@ impl WriteSession {
     }
 
     /// Return whether CommitFile outcome is unresolved and retryable.
-    pub(crate) fn is_commit_unknown(&self) -> bool {
-        matches!(
-            self.state,
-            WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown
-        )
+    pub(crate) fn is_commit_pending(&self) -> bool {
+        matches!(self.state, WriteSessionState::CommitPending(_))
     }
 
     /// Reject writes unless the session is open and the lease is locally valid.
@@ -531,7 +464,7 @@ impl WriteSession {
     }
 
     fn ensure_operation_allowed_at_ms(&mut self, operation: WriteSessionOperation, now_ms: u64) -> ClientResult<()> {
-        let safety_window_ms = match (self.state, operation) {
+        let safety_window_ms = match (&self.state, operation) {
             (WriteSessionState::Open, WriteSessionOperation::Renew) => 0,
             (
                 WriteSessionState::Open,
@@ -540,9 +473,9 @@ impl WriteSession {
                 | WriteSessionOperation::Abort
                 | WriteSessionOperation::Sync,
             ) => LEASE_EXPIRY_SAFETY_WINDOW_MS,
-            (WriteSessionState::SyncPending, WriteSessionOperation::Sync)
-            | (WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown, WriteSessionOperation::Close)
-            | (WriteSessionState::AbortUnknown, WriteSessionOperation::Abort) => return Ok(()),
+            (WriteSessionState::SyncPending(_), WriteSessionOperation::Sync)
+            | (WriteSessionState::CommitPending(_), WriteSessionOperation::Close)
+            | (WriteSessionState::AbortPending(_), WriteSessionOperation::Abort) => return Ok(()),
             _ => return Err(self.state_error_value()),
         };
         self.ensure_lease_valid_at_ms(now_ms, safety_window_ms)
@@ -552,9 +485,7 @@ impl WriteSession {
         if !matches!(self.state, WriteSessionState::Open) {
             return Ok(false);
         }
-        let Some(expires_at_ms) = self.expires_at_ms else {
-            return Ok(false);
-        };
+        let expires_at_ms = self.expires_at_ms;
         if expires_at_ms <= now_ms {
             self.mark_session_expired();
             return Err(ClientError::stale_handle("write session lease expired"));
@@ -563,9 +494,7 @@ impl WriteSession {
     }
 
     fn ensure_lease_valid_at_ms(&mut self, now_ms: u64, safety_window_ms: u64) -> ClientResult<()> {
-        let Some(expires_at_ms) = self.expires_at_ms else {
-            return Ok(());
-        };
+        let expires_at_ms = self.expires_at_ms;
         if expires_at_ms <= now_ms {
             self.mark_session_expired();
             return Err(ClientError::stale_handle("write session lease expired"));
@@ -578,10 +507,10 @@ impl WriteSession {
     }
 
     fn state_error_value(&self) -> ClientError {
-        match self.state {
+        match &self.state {
             WriteSessionState::Open => ClientError::invalid_argument("write session is open".to_string()),
-            WriteSessionState::SyncPending => ClientError::stale_handle("write handle has an unresolved SyncWrite"),
-            WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown => {
+            WriteSessionState::SyncPending(_) => ClientError::stale_handle("write handle has an unresolved SyncWrite"),
+            WriteSessionState::CommitPending(_) => {
                 ClientError::stale_handle("write handle has an in-progress CommitFile")
             }
             WriteSessionState::Closed => ClientError::stale_handle("write handle is closed"),
@@ -589,7 +518,7 @@ impl WriteSession {
             WriteSessionState::UnknownOutcome => ClientError::stale_handle("write handle has an unknown outcome"),
             WriteSessionState::SessionInvalid => ClientError::stale_handle("write session is invalid"),
             WriteSessionState::SessionExpired => ClientError::stale_handle("write session lease expired"),
-            WriteSessionState::AbortUnknown => ClientError::stale_handle("write handle abort outcome is unknown"),
+            WriteSessionState::AbortPending(_) => ClientError::stale_handle("write handle abort outcome is unknown"),
         }
     }
 }
@@ -601,18 +530,17 @@ pub(crate) struct ReadyBlock {
     written_len: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum WriteSessionState {
     Open,
-    SyncPending,
-    CommitStarted,
-    CommitUnknown,
+    SyncPending(SyncWriteState),
+    CommitPending(CommitFileState),
     Closed,
     Aborted,
     UnknownOutcome,
     SessionInvalid,
     SessionExpired,
-    AbortUnknown,
+    AbortPending(AbortCleanupState),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -735,7 +663,6 @@ mod tests {
         let first = prepare(&mut session, 5).expect("first commit plan");
         let err = prepare(&mut session, 6).expect_err("changed commit payload must fail");
         assert_error(&err, ClientErrorKind::InvalidArgument, "payload changed");
-        session.mark_commit_unknown();
         session.write_handle.lease_epoch = LeaseEpoch::new(2);
         let err = prepare(&mut session, 5).expect_err("changed session identity must fail");
         assert_error(&err, ClientErrorKind::InvalidArgument, "write handle changed");
@@ -767,10 +694,7 @@ mod tests {
         assert_eq!(first_sync.operation.call_id(), retry_sync.operation.call_id());
         assert_eq!(retry_sync.target_size, first_sync.target_size);
         assert_eq!(retry_sync.committed_blocks, first_sync.committed_blocks);
-    }
 
-    #[test]
-    fn prepare_abort_cleanup_rejects_session_identity_drift_after_unknown_without_replacing_call_id() {
         let mut session = new_session(1_000);
 
         let prepare = |session: &mut WriteSession| {
@@ -824,18 +748,37 @@ mod tests {
             assert_error(&error, ClientErrorKind::StaleHandle, "near expiry");
         }
 
-        for (state, operation) in [
-            (WriteSessionState::SyncPending, WriteSessionOperation::Sync),
-            (WriteSessionState::CommitStarted, WriteSessionOperation::Close),
-            (WriteSessionState::CommitUnknown, WriteSessionOperation::Close),
-            (WriteSessionState::AbortUnknown, WriteSessionOperation::Abort),
+        for operation in [
+            WriteSessionOperation::Sync,
+            WriteSessionOperation::Close,
+            WriteSessionOperation::Abort,
         ] {
             let mut session = new_session(1);
-            session.state = state;
+            let deadline = OperationDeadline::new(1_000);
+            match operation {
+                WriteSessionOperation::Sync => {
+                    session
+                        .prepare_sync_write(ClientId::new(7), "test-client", vec![], 0, deadline)
+                        .unwrap();
+                }
+                WriteSessionOperation::Close => {
+                    session
+                        .prepare_commit_file(ClientId::new(7), "test-client", vec![], 0, deadline)
+                        .unwrap();
+                }
+                WriteSessionOperation::Abort => {
+                    session
+                        .prepare_abort_cleanup(ClientId::new(7), "test-client", deadline)
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
             session
                 .ensure_operation_allowed_at_ms(operation, 2)
                 .expect("frozen lifecycle retry must not be blocked by lease expiry");
-            assert_eq!(session.state, state);
+            session
+                .ensure_operation_allowed_at_ms(WriteSessionOperation::Write, 2)
+                .expect_err("unresolved publication blocks new writes");
         }
     }
 

@@ -5,15 +5,13 @@
 
 use crate::runtime::OperationContext;
 use beryl_common::error::rpc::{
-    ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RpcErrorDetail,
-    WorkerEndpointHint, WorkerErrorKind,
+    ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RpcErrorDetail, WorkerErrorKind,
 };
 use beryl_common::header::{
     HEADER_PRE_HANDLER_REJECTION, HEADER_WORKER_DATA_REJECTION, PRE_HANDLER_REJECTION_RPC_CONCURRENCY,
     WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT,
 };
 use beryl_common::{CommonError, CommonErrorKind};
-use beryl_proto::common::WorkerEndpointInfoProto;
 use beryl_types::{CallId, ContentGeneration, GroupName};
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
@@ -113,31 +111,6 @@ impl ClientErrorKind {
     }
 }
 
-/// Endpoint hint preserved from a validated structured RPC failure.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct EndpointHint {
-    pub(crate) worker_id: u64,
-    pub(crate) endpoint: String,
-}
-
-impl From<WorkerEndpointHint> for EndpointHint {
-    fn from(value: WorkerEndpointHint) -> Self {
-        Self {
-            worker_id: value.worker_id,
-            endpoint: value.endpoint,
-        }
-    }
-}
-
-impl From<WorkerEndpointInfoProto> for EndpointHint {
-    fn from(value: WorkerEndpointInfoProto) -> Self {
-        Self {
-            worker_id: value.worker_id,
-            endpoint: value.endpoint,
-        }
-    }
-}
-
 /// Authority hints preserved from a validated structured RPC failure.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RefreshHint {
@@ -146,9 +119,6 @@ pub(crate) struct RefreshHint {
     pub(crate) mount_prefix: Option<String>,
     pub(crate) route_epoch: Option<u64>,
     pub(crate) mount_epoch: Option<u64>,
-    pub(crate) endpoint_hint: Option<EndpointHint>,
-    pub(crate) worker_endpoints: Vec<EndpointHint>,
-    pub(crate) worker_resolve_required: bool,
 }
 
 #[derive(Clone, Debug)]

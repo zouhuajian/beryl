@@ -48,3 +48,9 @@ pub(crate) fn transport_outcome_is_ambiguous(error: &ClientError, safety: RetryS
 pub(crate) fn is_definite_worker_capacity_rejection(error: &ClientError) -> bool {
     error.transport_code() == Some(tonic::Code::ResourceExhausted) && error.is_definitely_before_side_effect()
 }
+
+/// Exponential delay shared by bounded Metadata and Worker retries.
+pub(crate) fn backoff_delay(retry_index: usize) -> std::time::Duration {
+    let shift = retry_index.min(20) as u32;
+    std::time::Duration::from_millis(100u64.saturating_mul(1u64 << shift).min(2_000))
+}
