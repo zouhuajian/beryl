@@ -182,7 +182,6 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         AppSnapshotBuilder {
             storage: Arc::clone(&self.storage),
-            _state: Arc::clone(&self.state),
             storage_task: self.storage_task.clone(),
         }
     }
@@ -295,7 +294,6 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
 /// Snapshot builder for Raft.
 pub(crate) struct AppSnapshotBuilder {
     storage: Arc<RocksDBStorage>,
-    _state: Arc<RwLock<AppMetadataRaftState>>,
     // Detached builders must release their storage owners before shutdown completes.
     storage_task: TaskTrackerToken,
 }
