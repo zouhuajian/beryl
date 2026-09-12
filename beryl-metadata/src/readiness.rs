@@ -336,7 +336,6 @@ mod tests {
                     Arc::clone(&storage),
                     state_machine,
                     Arc::clone(&mount_table),
-                    &raft_config,
                 )
                 .await
                 .unwrap(),

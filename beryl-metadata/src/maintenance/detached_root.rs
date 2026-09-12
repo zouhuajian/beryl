@@ -142,7 +142,6 @@ impl DetachedRootReclaimer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RaftConfig;
     use crate::inode::InodeAttrs;
     use crate::mount::{MountTable, ROOT_INODE_ID};
     use crate::raft::AppRaftStateMachine;
@@ -162,15 +161,9 @@ mod tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
         let raft_node = Arc::new(
-            AppRaftNode::new(
-                1,
-                Arc::clone(&storage),
-                state_machine,
-                Arc::new(MountTable::new()),
-                &RaftConfig::default(),
-            )
-            .await
-            .unwrap(),
+            AppRaftNode::new(1, Arc::clone(&storage), state_machine, Arc::new(MountTable::new()))
+                .await
+                .unwrap(),
         );
         if initialize_leader {
             raft_node

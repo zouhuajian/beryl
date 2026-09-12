@@ -860,7 +860,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{NamespaceListConfig, RaftConfig};
+    use crate::config::NamespaceListConfig;
     use crate::inode::InodeAttrs;
     use crate::inode::{Inode, InodeKind};
     use crate::mount::{DataIoPolicy, MountEntry, MountKind, MountTable};
@@ -999,17 +999,10 @@ mod tests {
         storage.put_mount(&mount_entry).expect("put authoritative mount");
 
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
-        let raft_config = RaftConfig::default();
         let raft_node = Arc::new(
-            AppRaftNode::new(
-                1,
-                Arc::clone(&storage),
-                state_machine,
-                Arc::clone(&mount_table),
-                &raft_config,
-            )
-            .await
-            .expect("create raft node"),
+            AppRaftNode::new(1, Arc::clone(&storage), state_machine, Arc::clone(&mount_table))
+                .await
+                .expect("create raft node"),
         );
         raft_node
             .initialize_single_node("127.0.0.1:0".to_string())

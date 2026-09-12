@@ -67,7 +67,6 @@ impl LostWorkerCleanupService {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::RaftConfig;
     use crate::maintenance::lost_worker::{LostWorkerCleanupDeps, LostWorkerCleanupService};
     use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
     use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerInfo, WorkerManager};
@@ -86,12 +85,7 @@ mod tests {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
-        let raft_config = RaftConfig::default();
-        let raft_node = Arc::new(
-            AppRaftNode::new(1, storage, state_machine, mount_table, &raft_config)
-                .await
-                .unwrap(),
-        );
+        let raft_node = Arc::new(AppRaftNode::new(1, storage, state_machine, mount_table).await.unwrap());
         if leader {
             raft_node
                 .initialize_single_node("127.0.0.1:0".to_string())
