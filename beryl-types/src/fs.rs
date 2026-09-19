@@ -10,6 +10,65 @@ use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter, Result};
 use thiserror::Error;
 
+/// Metadata-visible inode state with optional observation-path context.
+/// This value neither retains historical contents nor authorizes Worker IO.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileStatus {
+    /// Path used to obtain this status, if known. It may since have been renamed.
+    /// This is observation context, not inode identity or read authority.
+    pub path: Option<String>,
+    pub inode_id: crate::InodeId,
+    pub kind: FileType,
+    pub len: u64,
+    /// Present for files, absent for directories. This does not retain history.
+    pub generation: Option<ContentGeneration>,
+    pub create_time: u64,
+    pub modify_time: u64,
+}
+
+impl FileStatus {
+    /// Returns the path used to obtain this status, or None without path context.
+    /// The name may since have been renamed and is not part of inode identity.
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
+    }
+
+    /// Returns the inode identity, which is independent of the path.
+    pub fn inode_id(&self) -> crate::InodeId {
+        self.inode_id
+    }
+
+    /// Returns the namespace entry kind.
+    pub fn kind(&self) -> FileType {
+        self.kind
+    }
+
+    /// Returns the observed visible length; directories report zero.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Returns whether the observed length is zero.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the file content change counter; directories have no generation.
+    pub fn generation(&self) -> Option<ContentGeneration> {
+        self.generation
+    }
+
+    /// Returns the creation time in milliseconds since Unix epoch.
+    pub fn create_time(&self) -> u64 {
+        self.create_time
+    }
+
+    /// Returns the modification time in milliseconds since Unix epoch.
+    pub fn modify_time(&self) -> u64 {
+        self.modify_time
+    }
+}
+
 /// Maximum logical block capacity, independent of transport buffering and local encoding.
 /// Lowering this persisted limit requires an explicit data migration.
 pub const MAX_BLOCK_SIZE: u32 = 1024 * 1024 * 1024;

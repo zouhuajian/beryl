@@ -47,12 +47,77 @@ and configuration parsing details remain crate-internal.
 
 The Rust native API is the client interface used today. Its namespace surface follows common distributed-filesystem naming: `get_status`, `list_status`, `mkdirs`, `delete`, and `rename`. Methods with operation options use a `_with_options` suffix.
 
-Reads fill caller-owned buffers through Worker requests bounded by
-`beryl.client.read.max-request-bytes`. `FileReader::read` advances a sequential
-position, while `read_at` and `read_exact_at` leave it unchanged.
-`FileReader::read_to_end` is additionally bounded by
-`beryl.client.read.max-buffered-bytes` and commits its position only after the
-complete remaining file succeeds.
+`get_status`, listing entries, directory creation, and `FileReader::status()`
+reuse the same inode status fields: identity, kind, visible length, content
+generation for files, and timestamps. The client re-exports `beryl_types::FileStatus`.
+Its optional `path` records the request path or the full path of a listed child;
+status without path context has `None`. The path is observation context and does
+not participate in reader identity, generation, or length checks.
+
+`open(path)` validates the file and returns its status without consulting Worker
+locations. Reader operations specify the actual position and range; layout
+queries return the full visible blocks intersecting that range, clipped at EOF.
+The existing inline file block limit bounds layout size. Readers retain one layout
+and reuse it for sequential and positioned reads, fetching another range on a
+cache miss or refreshing failed locations. Open captures inode, generation, and
+length; newly fetched layouts must match those values. Cached layouts do not
+guarantee immediate detection of changes or deletion, and do not retain
+historical contents. Renames do not rebind a reader to a different inode.
+
+`FileReader` implements `futures::io::AsyncRead` and `AsyncSeek`. Import the
+futures `AsyncReadExt` and `AsyncSeekExt` traits to use `read`, `read_exact`,
+`read_to_end`, and `seek`; `futures::io::copy` works directly. `position()` tracks
+only delivered bytes and successful seeks. Seeking uses `std::io::SeekFrom`,
+allows positions beyond EOF, and cancels pending IO and buffered data without
+querying Metadata. A cancelled read wait retains its pending request and any
+undelivered data until another read, seek, or reader drop.
+
+`read_range(range)` returns owned `Bytes` for the complete file-relative range
+without moving the stream position; shared references support concurrent calls.
+Unbounded endpoints use zero and the length captured at open. Explicit endpoints
+beyond that length return `UnexpectedEof`; reversed ranges and boundary overflow
+return `InvalidArgument`. Valid empty ranges do no IO. The result size is bounded
+by `beryl.client.read.max-range-bytes` (builder: `read_range_limit`) before any
+allocation or IO.
+
+Both interfaces use the same bounded block read, layout validation, and retries.
+On a layout miss, the client queries the block containing the actual offset,
+then limits the Worker request to that block and
+`beryl.client.read.max-request-bytes`. A future block's unavailability cannot
+prevent delivery of the current block. The client accepts a bounded response
+only after receiving exactly the requested bytes and a normal stream end.
+Worker frames are collected into one owned request buffer. Stream reads copy
+the result into the caller's buffer. A range completed by one request returns
+that buffer directly; ranges spanning requests allocate a bounded aggregate.
+Converting an owned `Vec` to `Bytes` reuses its allocation. Each in-flight read
+uses at most one request buffer in addition to transport buffers and any range aggregate.
+Concurrent range reads each have their own buffers, with no reader-wide total
+memory budget.
+
+Transient Worker failures retry the same locations and retain the layout on
+success. A requested layout refresh or terminal read failure invalidates only
+the layout used by that request, preserving any concurrent replacement. A later
+read can then discover a replacement for an unreachable endpoint.
+
+Each `read_range` shares one operation deadline across all chunks and retries.
+Each underlying stream read has its own deadline, including retries. Callers
+control the total timeout and destination size of `read_exact`, `read_to_end`,
+and `copy`; the range limit does not bound their destination `Vec`. On a later
+failure, the stream keeps progress from already delivered bytes. Stream errors
+use `std::io::ErrorKind` and retain `ClientError` as the inner error, accessible
+with `get_ref().and_then(|error| error.downcast_ref::<ClientError>())`.
+
+The public IO traits do not depend on Tokio, but the current implementation
+still requires a Tokio runtime for Tonic and timers. Tokio IO callers can use
+`tokio-util` with its `compat` feature:
+
+```rust
+use tokio_util::compat::FuturesAsyncReadCompatExt;
+
+let mut reader = client.open("/file").await?.compat();
+let mut bytes = Vec::new();
+tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut bytes).await?;
+```
 
 `FsClient::list_status` returns a `ListStatusIterator`. The client fetches one bounded page before returning it, then fetches later pages only as `next` consumes buffered statuses. Listing is non-recursive and weakly consistent across pages because Metadata retains no server-side snapshot.
 

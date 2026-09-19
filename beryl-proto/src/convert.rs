@@ -17,7 +17,8 @@ use crate::common::{
     WorkerErrorKindProto,
 };
 use crate::metadata::{
-    CommittedBlockProto, FileBlockLocationProto, FileTypeProto, LocatedBlockProto, OpenWriteModeProto, WriteHandleProto,
+    CommittedBlockProto, FileBlockLocationProto, FileStatusProto, FileTypeProto, LocatedBlockProto, OpenWriteModeProto,
+    WriteHandleProto,
 };
 use ::beryl_common::Deadline;
 use ::beryl_common::error::rpc::{
@@ -126,6 +127,50 @@ impl TryFrom<FileTypeProto> for FileType {
             FileTypeProto::FileTypeDir => Ok(Self::Dir),
             FileTypeProto::FileTypeUnspecified => Err("unspecified inode kind is not a domain value".to_string()),
         }
+    }
+}
+
+impl From<&beryl_types::FileStatus> for FileStatusProto {
+    fn from(status: &beryl_types::FileStatus) -> Self {
+        Self {
+            inode_id: status.inode_id.as_raw(),
+            kind: FileTypeProto::from(status.kind) as i32,
+            len: status.len,
+            generation: status.generation.map(beryl_types::ContentGeneration::as_raw),
+            create_time: status.create_time,
+            modify_time: status.modify_time,
+        }
+    }
+}
+
+impl TryFrom<FileStatusProto> for beryl_types::FileStatus {
+    type Error = String;
+
+    fn try_from(status: FileStatusProto) -> Result<Self, Self::Error> {
+        if status.inode_id == 0 {
+            return Err("FileStatusProto.inode_id must be non-zero".into());
+        }
+        let kind = FileType::try_from(
+            FileTypeProto::try_from(status.kind).map_err(|_| "FileStatusProto.kind invalid".to_string())?,
+        )?;
+        match kind {
+            FileType::File if status.generation.is_none() => {
+                return Err("FileStatusProto.generation missing for file".into());
+            }
+            FileType::Dir if status.generation.is_some() || status.len != 0 => {
+                return Err("directory status must have zero length and no generation".into());
+            }
+            _ => {}
+        }
+        Ok(Self {
+            path: None,
+            inode_id: InodeId::new(status.inode_id),
+            kind,
+            len: status.len,
+            generation: status.generation.map(beryl_types::ContentGeneration::new),
+            create_time: status.create_time,
+            modify_time: status.modify_time,
+        })
     }
 }
 
@@ -948,6 +993,32 @@ pub fn rpc_error_to_proto(err: &RpcErrorDetail) -> ErrorDetailProto {
 mod tests {
     use super::*;
     use prost::Message;
+
+    #[test]
+    fn file_status_preserves_identity_and_requires_kind_specific_content_state() {
+        for kind in [FileType::File, FileType::Dir] {
+            let status = beryl_types::FileStatus {
+                path: None,
+                inode_id: InodeId::new(7),
+                kind,
+                len: if kind.is_file() { 42 } else { 0 },
+                generation: kind.is_file().then(|| beryl_types::ContentGeneration::new(3)),
+                create_time: 10,
+                modify_time: 20,
+            };
+            let wire = FileStatusProto::from(&status);
+            assert_eq!(beryl_types::FileStatus::try_from(wire).unwrap(), status);
+            let mut contextual = status.clone();
+            contextual.path = Some("/observed".into());
+            assert_eq!(FileStatusProto::from(&contextual), wire);
+            let mut invalid = wire;
+            invalid.inode_id = 0;
+            assert!(beryl_types::FileStatus::try_from(invalid).is_err());
+            let mut invalid = wire;
+            invalid.generation = if kind.is_file() { None } else { Some(0) };
+            assert!(beryl_types::FileStatus::try_from(invalid).is_err());
+        }
+    }
 
     #[test]
     fn write_domain_values_preserve_wire_identity_and_intent() {

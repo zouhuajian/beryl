@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use beryl_client::{ClientConfig, FsClient};
 use bytes::Bytes;
+use futures::io::AsyncReadExt;
 
 const DIRECTORY: &str = "/examples";
 const FILE: &str = "/examples/rust-client-crud.bin";
@@ -34,16 +35,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     writer.close().await?;
 
     let status = client.get_status(FILE).await?;
-    if status.len != payload.len() as u64 {
+    if status.len() != payload.len() as u64 {
         return Err(io::Error::other(format!(
             "stat size mismatch: expected {}, got {}",
             payload.len(),
-            status.len
+            status.len()
         ))
         .into());
     }
 
-    let actual = client.open(FILE).await?.read_to_end().await?;
+    let mut reader = client.open(FILE).await?;
+    let mut actual = Vec::new();
+    reader.read_to_end(&mut actual).await?;
     if actual != payload {
         return Err(io::Error::other("read content mismatch").into());
     }

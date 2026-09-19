@@ -11,7 +11,7 @@ use crate::runtime::AttemptContext;
 use beryl_common::header::{HeaderIdentity, HEADER_WORKER_DATA_ERROR_DETAIL, WORKER_DATA_ERROR_DETAIL_V1};
 use beryl_proto::worker::write_block_request_proto::Payload;
 use beryl_types::range::ByteRange;
-use beryl_types::{validate_block_size, validate_effective_len, GroupName, WorkerEndpointInfo};
+use beryl_types::{validate_block_size, GroupName, WorkerEndpointInfo};
 use bytes::Bytes;
 use prost::Message;
 use std::time::Duration;
@@ -21,14 +21,8 @@ pub(super) fn build_read_block_request(
     group_name: &GroupName,
     block_read: &PlannedBlockRead,
     worker: &WorkerEndpointInfo,
-) -> ClientResult<beryl_proto::worker::ReadBlockRequestProto> {
-    validate_block_size(block_read.block_size).map_err(|error| {
-        ClientError::invalid_layout(format!("planned block read has invalid expected block shape: {error}"))
-    })?;
-    validate_effective_len(block_read.block_size, block_read.effective_len).map_err(|error| {
-        ClientError::invalid_layout(format!("planned block read has invalid expected block shape: {error}"))
-    })?;
-    Ok(beryl_proto::worker::ReadBlockRequestProto {
+) -> beryl_proto::worker::ReadBlockRequestProto {
+    beryl_proto::worker::ReadBlockRequestProto {
         header: Some(attempt.data_header()),
         group_name: group_name.to_string(),
         block_id: Some(block_read.block_id.into()),
@@ -44,7 +38,7 @@ pub(super) fn build_read_block_request(
         worker_run_id: worker.worker_run_id.to_string(),
         block_size: block_read.block_size,
         effective_len: block_read.effective_len,
-    })
+    }
 }
 
 /// Builds the sole control payload for one block write. Fencing remains a
@@ -90,68 +84,50 @@ pub(super) fn build_write_block_data(data: Bytes) -> ClientResult<beryl_proto::w
     })
 }
 
-/// Fills one caller-owned block range and accepts only exact stream completion.
-pub(super) async fn read_block_stream_into(
+/// Collects one bounded response, including its terminal status, before delivering bytes.
+pub(super) async fn read_block_stream(
     attempt: &AttemptContext,
     stream: &mut tonic::codec::Streaming<beryl_proto::worker::ReadBlockChunkProto>,
     block_read: &PlannedBlockRead,
-    output: &mut [u8],
-) -> ClientResult<()> {
-    if output.len() != block_read.len as usize {
-        return Err(ClientError::invalid_layout(format!(
-            "worker output length {} does not match planned block read {}",
-            output.len(),
-            block_read.len
-        )));
-    }
-    let mut filled = 0usize;
+) -> ClientResult<Bytes> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(block_read.len as usize)
+        .map_err(|error| ClientError::resource_exhausted(format!("failed to allocate block read: {error}")))?;
     while let Some(chunk) = stream
         .message()
         .await
         .map_err(|status| parse_worker_data_status(attempt, status))?
     {
-        append_read_block_chunk(output, &mut filled, chunk)?;
+        if chunk.data.is_empty() {
+            return Err(ClientError::invalid_response(
+                "ReadBlock",
+                "worker read returned an empty chunk",
+            ));
+        }
+        let remaining = block_read.len as usize - output.len();
+        if chunk.data.len() > remaining {
+            return Err(ClientError::invalid_response(
+                "ReadBlock",
+                format!(
+                    "worker read chunk exceeded requested block read: remaining {remaining}, got {}",
+                    chunk.data.len()
+                ),
+            ));
+        }
+        output.extend_from_slice(&chunk.data);
     }
-    finish_read_block_output(filled, output.len())
-}
-
-/// Copies one nonempty chunk without crossing the caller-owned output range.
-pub(super) fn append_read_block_chunk(
-    output: &mut [u8],
-    filled: &mut usize,
-    chunk: beryl_proto::worker::ReadBlockChunkProto,
-) -> ClientResult<()> {
-    if chunk.data.is_empty() {
-        return Err(ClientError::invalid_response(
-            "ReadBlock",
-            "worker read returned an empty chunk",
-        ));
-    }
-    let remaining = output.len() - *filled;
-    if chunk.data.len() > remaining {
+    if output.len() != block_read.len as usize {
         return Err(ClientError::invalid_response(
             "ReadBlock",
             format!(
-                "worker read chunk exceeded requested block read: remaining {remaining}, got {}",
-                chunk.data.len()
+                "worker read ended after {} bytes, expected {}",
+                output.len(),
+                block_read.len
             ),
         ));
     }
-    let end = *filled + chunk.data.len();
-    output[*filled..end].copy_from_slice(&chunk.data);
-    *filled = end;
-    Ok(())
-}
-
-/// Accepts normal read completion only after the exact planned byte count.
-pub(super) fn finish_read_block_output(filled: usize, expected_len: usize) -> ClientResult<()> {
-    if filled != expected_len {
-        return Err(ClientError::invalid_response(
-            "ReadBlock",
-            format!("worker read ended after {} bytes, expected {}", filled, expected_len),
-        ));
-    }
-    Ok(())
+    Ok(Bytes::from(output))
 }
 
 pub(super) fn parse_worker_control_header(

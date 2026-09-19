@@ -1,28 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Read planning from metadata block locations to worker block reads.
+//! Planning one bounded block read from Metadata-authorized locations.
 
 use crate::error::{ClientError, ClientResult, RefreshHint as ClientRefreshHint};
 use crate::metadata::ReadLayout;
 use beryl_common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind};
-use beryl_types::{
-    validate_block_size, validate_effective_len, BlockId, ContentGeneration, FileBlockLocation, GroupName, InodeId,
-    WorkerEndpointInfo,
-};
-
-/// File byte range requested by a reader after EOF truncation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RequestedReadRange {
-    pub(crate) file_offset: u64,
-    pub(crate) len: u32,
-}
-
-impl RequestedReadRange {
-    pub(crate) fn end_file_offset(self) -> u64 {
-        self.file_offset + self.len as u64
-    }
-}
+use beryl_types::{BlockId, FileStatus, WorkerEndpointInfo};
 
 /// A block-local worker read planned from metadata block locations.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,159 +20,37 @@ pub(crate) struct PlannedBlockRead {
     pub(crate) workers: Vec<WorkerEndpointInfo>,
 }
 
-pub(crate) fn requested_range(offset: u64, len: u32, file_size: u64) -> ClientResult<Option<RequestedReadRange>> {
-    if len == 0 || offset >= file_size {
-        return Ok(None);
+/// Plans the current block's prefix from a layout validated against the opened file.
+pub(crate) fn plan_block_read(
+    file: &FileStatus,
+    offset: u64,
+    max_len: u32,
+    layout: &ReadLayout,
+) -> ClientResult<PlannedBlockRead> {
+    if max_len == 0 || offset >= file.len() {
+        return Err(ClientError::invalid_argument(
+            "block read requires a nonempty range before EOF",
+        ));
     }
-    let requested_end = offset
-        .checked_add(len as u64)
-        .ok_or_else(|| ClientError::invalid_argument("read range offset overflow".to_string()))?;
-    let end = requested_end.min(file_size);
-    let effective_len = end
-        .checked_sub(offset)
-        .ok_or_else(|| ClientError::invalid_argument("read range end precedes offset".to_string()))?;
-    let effective_len = u32::try_from(effective_len)
-        .map_err(|_| ClientError::invalid_argument("read range length exceeds u32".to_string()))?;
-    if effective_len == 0 {
-        return Ok(None);
+    let location = layout
+        .location_at(offset)
+        .ok_or_else(|| ClientError::invalid_layout("layout gap at requested offset"))?;
+    let end = location.file_offset + location.len;
+    if location.workers.is_empty() {
+        return Err(block_location_unavailable_error(format!(
+            "block location unavailable for {}",
+            location.block_id
+        )));
     }
-    Ok(Some(RequestedReadRange {
+    Ok(PlannedBlockRead {
         file_offset: offset,
-        len: effective_len,
-    }))
-}
-
-pub(crate) fn plan_block_reads(
-    expected_inode_id: InodeId,
-    requested_range: RequestedReadRange,
-    locations: &[FileBlockLocation],
-) -> ClientResult<Vec<PlannedBlockRead>> {
-    let mut normalized = Vec::with_capacity(locations.len());
-    for location in locations {
-        if location.len == 0 {
-            return Err(ClientError::invalid_layout("zero-length block location".to_string()));
-        }
-        let end = location
-            .file_offset
-            .checked_add(location.len)
-            .ok_or_else(|| ClientError::invalid_layout("block location range overflow".to_string()))?;
-        let block_id = location.block_id;
-        if block_id.inode_id != expected_inode_id {
-            return Err(ClientError::invalid_layout(format!(
-                "block location inode_id {} does not match handle {}",
-                block_id.inode_id.as_raw(),
-                expected_inode_id.as_raw()
-            )));
-        }
-        validate_block_size(location.block_size)
-            .map_err(|error| ClientError::invalid_layout(format!("invalid block shape: {error}")))?;
-        validate_effective_len(location.block_size, location.effective_len)
-            .map_err(|error| ClientError::invalid_layout(format!("invalid block shape: {error}")))?;
-        if location.workers.is_empty() {
-            return Err(block_location_unavailable_error(format!(
-                "block location unavailable: metadata returned no worker candidates for block {} file_offset={} len={}",
-                block_id, location.file_offset, location.len
-            )));
-        }
-        if end <= requested_range.file_offset || location.file_offset >= requested_range.end_file_offset() {
-            continue;
-        }
-        normalized.push((location.file_offset, end, block_id, location));
-    }
-    normalized.sort_by_key(|(start, _, block_id, _)| (*start, block_id.index.as_raw()));
-
-    let mut block_reads = Vec::with_capacity(normalized.len());
-    let mut cursor = requested_range.file_offset;
-    let requested_end = requested_range.end_file_offset();
-    let mut previous_end = None;
-
-    for (start, end, block_id, location) in normalized {
-        if let Some(prev_end) = previous_end {
-            if start < prev_end {
-                return Err(ClientError::invalid_layout(format!(
-                    "layout overlap at file offset {start}"
-                )));
-            }
-        }
-        previous_end = Some(end);
-
-        if start > cursor {
-            return Err(ClientError::invalid_layout(format!(
-                "layout gap at file offset {cursor}"
-            )));
-        }
-        if end <= cursor {
-            continue;
-        }
-
-        let read_start = cursor.max(start);
-        let read_end = requested_end.min(end);
-        if read_start >= read_end {
-            continue;
-        }
-        let len = u32::try_from(read_end - read_start)
-            .map_err(|_| ClientError::invalid_layout("planned block read length exceeds u32".to_string()))?;
-        if len == 0 {
-            return Err(ClientError::invalid_layout(
-                "zero-length planned block read".to_string(),
-            ));
-        }
-        block_reads.push(PlannedBlockRead {
-            file_offset: read_start,
-            len,
-            block_id,
-            block_offset: read_start - start,
-            block_size: location.block_size,
-            effective_len: location.effective_len,
-            workers: location.workers.clone(),
-        });
-        cursor = read_end;
-        if cursor == requested_end {
-            break;
-        }
-    }
-
-    if cursor < requested_end {
-        return Err(ClientError::invalid_layout(format!(
-            "layout gap at file offset {cursor}"
-        )));
-    }
-    Ok(block_reads)
-}
-
-pub(crate) fn plan_block_reads_from_layout(
-    expected_inode_id: InodeId,
-    expected_generation: ContentGeneration,
-    expected_file_size: u64,
-    requested_range: RequestedReadRange,
-    response: &ReadLayout,
-) -> ClientResult<(GroupName, Vec<PlannedBlockRead>)> {
-    let group_name = response.group_name.clone();
-    let inode_id = response.inode_id;
-    if inode_id != expected_inode_id {
-        return Err(ClientError::stale_handle(format!(
-            "layout inode_id {} does not match handle {}",
-            inode_id.as_raw(),
-            expected_inode_id.as_raw()
-        )));
-    }
-    let generation = generation_from_response(response.generation, "GetBlockLocationsResponseProto.generation")?;
-    if generation != expected_generation {
-        return Err(ClientError::generation_mismatch(expected_generation, generation));
-    }
-    if response.file_size != expected_file_size {
-        return Err(ClientError::stale_handle(format!(
-            "layout file size {} does not match opened length {}",
-            response.file_size, expected_file_size
-        )));
-    }
-    let block_reads = plan_block_reads(expected_inode_id, requested_range, &response.locations)?;
-    Ok((group_name, block_reads))
-}
-
-/// Require Metadata visibility authority before accepting a read layout.
-fn generation_from_response(value: Option<ContentGeneration>, field: &str) -> ClientResult<ContentGeneration> {
-    value.ok_or_else(|| ClientError::invalid_layout(format!("{field} missing")))
+        len: u64::from(max_len).min(end - offset) as u32,
+        block_id: location.block_id,
+        block_offset: offset - location.file_offset,
+        block_size: location.block_size,
+        effective_len: location.effective_len,
+        workers: location.workers.clone(),
+    })
 }
 
 pub(crate) fn block_location_unavailable_error(message: impl Into<String>) -> ClientError {
@@ -206,54 +68,52 @@ pub(crate) fn block_location_unavailable_error(message: impl Into<String>) -> Cl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beryl_types::{BlockId, BlockIndex, InodeId, WorkerEndpointInfo, WorkerId};
+    use beryl_types::{BlockIndex, ContentGeneration, FileBlockLocation, FileType, GroupName, InodeId, WorkerId};
+
+    fn file() -> FileStatus {
+        FileStatus {
+            path: Some("/file".into()),
+            inode_id: InodeId::new(10),
+            kind: FileType::File,
+            len: 16,
+            generation: Some(ContentGeneration::new(1)),
+            create_time: 0,
+            modify_time: 0,
+        }
+    }
+
+    fn layout(file: &FileStatus, locations: Vec<FileBlockLocation>) -> ReadLayout {
+        let layout = ReadLayout::from_response(
+            GroupName::parse("root").unwrap(),
+            Some(file.into()),
+            locations.into_iter().map(Into::into).collect(),
+        )
+        .unwrap();
+        layout.validate_file(file).unwrap();
+        layout
+    }
 
     #[test]
-    fn planner_rejects_invalid_location_coverage_and_shape() {
-        let cases = vec![
-            (
-                "gap",
-                12,
-                vec![location(10, 0, 0, 4), location(10, 1, 8, 8)],
-                "layout gap",
-            ),
-            (
-                "overlap",
-                12,
-                vec![location(10, 0, 0, 8), location(10, 1, 4, 8)],
-                "layout overlap",
-            ),
-            ("zero length", 4, vec![location(10, 0, 0, 0)], "zero-length"),
-        ];
+    fn block_plan_is_bounded_by_the_current_block_and_request() {
+        let file = file();
+        let layout = layout(&file, vec![location(10, 4, 0, 8)]);
+        let plan = plan_block_read(&file, 3, 10, &layout).unwrap();
+        assert_eq!((plan.file_offset, plan.block_offset, plan.len), (3, 3, 5));
+        assert_eq!(plan.block_id.index.as_raw(), 4, "block index is not file offset");
+        assert_eq!(plan_block_read(&file, 3, 2, &layout).unwrap().len, 2);
+    }
 
-        for (case, len, locations, expected) in cases {
-            let requested_range = requested_range(0, len, 20)
-                .expect("range planning succeeds")
-                .expect("non-empty requested range");
-            let err = plan_block_reads(InodeId::new(10), requested_range, &locations).expect_err("layout must fail");
-            assert!(
-                format!("{err}").contains(expected),
-                "case {case} should mention {expected:?}, got {err}"
-            );
+    #[test]
+    fn block_plan_requires_range_coverage_and_workers() {
+        let file = file();
+        let covered = layout(&file, vec![location(10, 0, 0, 8)]);
+        for (offset, len) in [(8, 4), (16, 4), (0, 0)] {
+            assert!(plan_block_read(&file, offset, len, &covered).is_err());
         }
-
-        let range = requested_range(0, 4, 4).expect("range").expect("nonempty range");
-        for (generation, file_size, expected) in [
-            (None, 4, "generation missing"),
-            (Some(2), 4, "generation mismatch"),
-            (Some(1), 5, "opened length"),
-        ] {
-            let layout = ReadLayout {
-                group_name: GroupName::parse("root").expect("group name"),
-                inode_id: InodeId::new(10),
-                file_size,
-                generation: generation.map(ContentGeneration::new),
-                locations: vec![location(10, 0, 0, 4)],
-            };
-            let err = plan_block_reads_from_layout(InodeId::new(10), ContentGeneration::new(1), 4, range, &layout)
-                .expect_err("opened-file authority mismatch must fail");
-            assert!(err.message().contains(expected), "expected {expected:?}, got {err}");
-        }
+        let mut unavailable = location(10, 0, 0, 8);
+        unavailable.workers.clear();
+        let unavailable = layout(&file, vec![unavailable]);
+        assert!(plan_block_read(&file, 0, 4, &unavailable).is_err());
     }
 
     fn location(inode_id: u64, block_index: u32, file_offset: u64, len: u64) -> FileBlockLocation {

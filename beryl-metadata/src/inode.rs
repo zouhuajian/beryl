@@ -287,6 +287,22 @@ pub(crate) struct Inode {
 }
 
 impl Inode {
+    /// Project file structure information without consulting Worker observations.
+    pub(crate) fn status(&self) -> beryl_types::FileStatus {
+        beryl_types::FileStatus {
+            path: None,
+            inode_id: self.inode_id,
+            kind: self.file_type(),
+            len: self.len(),
+            generation: match &self.kind {
+                InodeKind::File(file) => Some(file.generation),
+                InodeKind::Dir => None,
+            },
+            create_time: self.attrs.create_time,
+            modify_time: self.attrs.modify_time,
+        }
+    }
+
     /// Visible file length; directory status has no file content.
     pub(crate) fn len(&self) -> u64 {
         match &self.kind {

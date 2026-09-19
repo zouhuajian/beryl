@@ -1,290 +1,228 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Bounded sequential and positioned file reads.
+//! Standard asynchronous streams and bounded owned range reads.
 
+use crate::api::FileStatus;
 use crate::client_inner::{metric_labels, refresh_hint_from_error, ClientInner};
 use crate::error::{ClientError, ClientResult};
-use crate::metadata::{OpenedFile, ReadLayout};
+use crate::metadata::ReadLayout;
 use crate::metrics::ClientMetric;
 use crate::planner;
-use crate::planner::{PlannedBlockRead, RequestedReadRange};
 use crate::runtime::{retry_decision, AttemptContext, Operation, OperationContext, OperationDeadline, RetryDecision};
-use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
-use beryl_types::GroupName;
-use bytes::Bytes;
-use std::fmt::{Debug, Formatter, Result};
+use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, WorkerErrorKind};
+use bytes::{Buf, Bytes};
+use futures::future::BoxFuture;
+use futures::io::{AsyncRead, AsyncSeek};
+use parking_lot::Mutex;
+use std::fmt;
+use std::io::{self, SeekFrom};
+use std::ops::{Bound, Range, RangeBounds};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{ready, Context, Poll};
 
-/// Reads against the inode, content generation, and length captured at open.
+/// A seekable asynchronous reader bound to the inode, generation, and length at open.
 ///
-/// Fresh layouts must match that authority; cached block plans retain their
-/// existing lifetime. This reader does not retain historical file contents.
+/// Use futures IO's `AsyncReadExt` and `AsyncSeekExt` for stream operations. The
+/// current transport still requires a Tokio runtime. Each underlying bounded
+/// read has one deadline, including retries. Callers control the total deadline and destination size of operations such as `read_to_end`
+/// and `copy`. Cancelling a stream wait retains pending IO and undelivered data;
+/// seeking or dropping the reader cancels that IO.
+///
+/// Cached locations need not detect changes or deletion immediately. A fixed
+/// generation does not retain historical file contents.
+///
+/// ```no_run
+/// use beryl_client::FsClient;
+/// use futures::io::{AsyncReadExt, AsyncSeekExt};
+/// use std::io::SeekFrom;
+/// use tokio_util::compat::FuturesAsyncReadCompatExt;
+///
+/// # async fn example(client: &FsClient) -> Result<(), Box<dyn std::error::Error>> {
+/// let mut reader = client.open("/file").await?;
+/// let tail = reader.read_range(reader.len().saturating_sub(16)..).await?;
+/// let mut contents = Vec::new();
+/// reader.read_to_end(&mut contents).await?;
+/// reader.seek(SeekFrom::Start(0)).await?;
+/// let mut compatible = reader.compat();
+/// tokio::io::copy(&mut compatible, &mut tokio::io::sink()).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct FileReader {
-    inner: Arc<ClientInner>,
-    file: OpenedFile,
+    source: Arc<ReadSource>,
     position: u64,
-    current_block: Option<CurrentBlockPlan>,
+    buffered: Bytes,
+    // Only polled through &mut self. The mutex keeps FileReader Sync even though
+    // its owned future is Send, allowing concurrent read_range calls through &self.
+    pending: Mutex<Option<BoxFuture<'static, ClientResult<Bytes>>>>,
+}
+
+/// Shared authority and layout cache, independent of the stream's pending future.
+struct ReadSource {
+    inner: Arc<ClientInner>,
+    file: FileStatus,
+    layout: Mutex<Option<Arc<ReadLayout>>>,
 }
 
 impl FileReader {
-    /// Creates a reader from Metadata-validated opened-file state.
-    pub(crate) fn new(inner: Arc<ClientInner>, file: OpenedFile) -> Self {
+    pub(crate) fn new(inner: Arc<ClientInner>, file: FileStatus) -> Self {
         Self {
-            inner,
-            file,
+            source: Arc::new(ReadSource {
+                inner,
+                file,
+                layout: Mutex::new(None),
+            }),
             position: 0,
-            current_block: None,
+            buffered: Bytes::new(),
+            pending: Mutex::new(None),
         }
     }
 
-    /// Returns the namespace path used to open this file.
+    /// Returns the immutable file status captured at open.
+    pub fn status(&self) -> &FileStatus {
+        &self.source.file
+    }
+
+    /// Returns the path used to open this inode; renames do not change it.
     pub fn path(&self) -> &str {
-        self.file.path()
+        self.status().path().expect("opened file path")
     }
 
-    /// Returns the immutable file length observed by `open`.
+    /// Returns the length captured at open.
     pub fn len(&self) -> u64 {
-        self.file.len()
+        self.status().len()
     }
 
-    /// Returns whether the opened file is empty.
+    /// Returns whether the opened file has zero length.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Returns the next offset used by the sequential read methods.
+    /// Returns the stream position, advanced only by delivered bytes or a seek.
     pub fn position(&self) -> u64 {
         self.position
     }
 
-    /// Reads one sequential step and advances only after full success.
+    /// Reads a complete file-relative range without changing the stream position.
     ///
-    /// A successful read may stop at EOF, the configured request bound, or the
-    /// current block boundary. Zero is returned only for an empty buffer or EOF.
-    pub async fn read(&mut self, dst: &mut [u8]) -> ClientResult<usize> {
-        if dst.is_empty() || self.position >= self.len() {
-            return Ok(0);
-        }
-        let mut current_block = self.current_block.take();
-        let result = self
-            .read_sequential_step(
-                self.position,
-                dst,
-                &mut current_block,
-                self.inner.metadata.operation_deadline(),
-            )
-            .await;
-        match result {
-            Ok(read) => {
-                self.position += read as u64;
-                self.current_block = current_block;
-                Ok(read)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Reads one positioned step without changing the sequential position.
-    ///
-    /// A successful read may stop at EOF or the configured request bound.
-    pub async fn read_at(&self, offset: u64, dst: &mut [u8]) -> ClientResult<usize> {
-        let Some(range) = self.bounded_range(offset, dst.len())? else {
-            return Ok(0);
-        };
-        self.read_range_step(
-            range,
-            &mut dst[..range.len as usize],
-            self.inner.metadata.operation_deadline(),
-        )
-        .await?;
-        Ok(range.len as usize)
-    }
-
-    /// Fills the entire positioned buffer without changing the sequential position.
-    ///
-    /// The method uses bounded internal steps and returns `UnexpectedEof` before
-    /// issuing IO when the requested range exceeds the opened file length.
-    pub async fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> ClientResult<()> {
-        if dst.is_empty() {
-            return Ok(());
-        }
-        let end = offset.checked_add(dst.len() as u64).ok_or_else(|| {
-            ClientError::unexpected_eof(format!(
-                "exact read at offset {offset} with length {} exceeds the opened file",
-                dst.len()
-            ))
-        })?;
-        if end > self.len() {
-            return Err(ClientError::unexpected_eof(format!(
-                "exact read range {offset}..{end} exceeds opened file length {}",
-                self.len()
-            )));
-        }
-
-        let deadline = self.inner.metadata.operation_deadline();
-        let mut filled = 0usize;
-        while filled < dst.len() {
-            let step_len = (dst.len() - filled).min(self.inner.config.max_read_step_bytes() as usize);
-            let step_offset = offset + filled as u64;
-            let range = RequestedReadRange {
-                file_offset: step_offset,
-                len: step_len as u32,
-            };
-            self.read_range_step(range, &mut dst[filled..filled + step_len], deadline.clone())
-                .await?;
-            filled += step_len;
-        }
-        Ok(())
-    }
-
-    /// Reads from the current position to EOF within the configured owned-buffer bound.
-    ///
-    /// The bound is checked before allocation or IO. The position changes only
-    /// when the complete remaining range succeeds.
-    pub async fn read_to_end(&mut self) -> ClientResult<Bytes> {
-        let remaining = self.len().saturating_sub(self.position);
-        if remaining == 0 {
+    /// Unbounded endpoints use zero and the opened length. Reversed ranges and
+    /// boundary overflow are invalid arguments; endpoints beyond EOF return
+    /// UnexpectedEof. Valid empty ranges perform no IO. The configured range
+    /// limit is checked before allocation or IO. All chunks and retries share
+    /// one deadline. Shared references can read ranges concurrently.
+    pub async fn read_range(&self, range: impl RangeBounds<u64>) -> ClientResult<Bytes> {
+        let range = resolve_range(range, self.len())?;
+        let len = range.end - range.start;
+        if len == 0 {
             return Ok(Bytes::new());
         }
-        if remaining > self.inner.config.read_to_end_limit() {
+        if len > self.source.inner.config.read_range_limit() {
             return Err(ClientError::invalid_argument(format!(
-                "remaining file length {remaining} exceeds configured read_to_end maximum {}",
-                self.inner.config.read_to_end_limit()
+                "range length {len} exceeds configured read_range maximum {}",
+                self.source.inner.config.read_range_limit()
             )));
         }
-        let capacity = usize::try_from(remaining)
-            .map_err(|_| ClientError::invalid_argument("remaining file length exceeds addressable memory"))?;
+        let capacity = usize::try_from(len)
+            .map_err(|_| ClientError::invalid_argument("range length exceeds addressable memory"))?;
+        let deadline = self.source.inner.metadata.operation_deadline();
         let mut output = Vec::new();
-        output.try_reserve_exact(capacity).map_err(|error| {
-            ClientError::resource_exhausted(format!(
-                "failed to reserve {capacity} read_to_end buffer bytes: {error}"
-            ))
-        })?;
-        output.resize(capacity, 0);
-
-        let deadline = self.inner.metadata.operation_deadline();
-        let mut staged_position = self.position;
-        let mut current_block = self.current_block.take();
-        let mut filled = 0usize;
-        while filled < output.len() {
-            let read = self
-                .read_sequential_step(
-                    staged_position,
-                    &mut output[filled..],
-                    &mut current_block,
-                    deadline.clone(),
-                )
-                .await?;
-            if read == 0 {
-                return Err(ClientError::unexpected_eof(format!(
-                    "read_to_end stopped at offset {staged_position} before opened file length {}",
-                    self.len()
-                )));
+        let mut offset = range.start;
+        while offset < range.end {
+            let len = (range.end - offset).min(u64::from(self.source.inner.config.max_read_step_bytes())) as u32;
+            let bytes = self.source.read(offset, len, deadline.clone()).await?;
+            offset += bytes.len() as u64;
+            if output.is_empty() {
+                if offset == range.end {
+                    return Ok(bytes);
+                }
+                output.try_reserve_exact(capacity).map_err(|error| {
+                    ClientError::resource_exhausted(format!("failed to reserve {capacity} range bytes: {error}"))
+                })?;
             }
-            staged_position += read as u64;
-            filled += read;
+            output.extend_from_slice(&bytes);
         }
-        self.position = staged_position;
-        self.current_block = current_block;
         Ok(Bytes::from(output))
     }
+}
 
-    /// Returns the EOF-truncated range for one bounded public read step.
-    fn bounded_range(&self, offset: u64, output_len: usize) -> ClientResult<Option<RequestedReadRange>> {
-        let step_len = output_len.min(self.inner.config.max_read_step_bytes() as usize);
-        let step_len =
-            u32::try_from(step_len).map_err(|_| ClientError::invalid_argument("bounded read length exceeds u32"))?;
-        planner::requested_range(offset, step_len, self.len())
-    }
-
-    /// Executes one sequential step, stopping at the current block boundary.
-    async fn read_sequential_step(
-        &self,
-        offset: u64,
-        dst: &mut [u8],
-        current_block: &mut Option<CurrentBlockPlan>,
-        deadline: OperationDeadline,
-    ) -> ClientResult<usize> {
-        let Some(target) = self.bounded_range(offset, dst.len())? else {
-            return Ok(0);
-        };
-        let operation = self.read_operation(deadline)?;
-
-        for attempt_index in 0..self.inner.config.max_attempts() {
-            if !current_block.as_ref().is_some_and(|plan| plan.contains(offset)) {
-                let layout = self
-                    .inner
-                    .metadata
-                    .read_layout_for_inode(operation.clone(), self.file.inode_id(), target.file_offset, target.len)
-                    .await?;
-                *current_block = Some(CurrentBlockPlan::new(&self.file, target, layout)?);
-            }
-            let plan = current_block.as_ref().expect("current block plan was initialized");
-            let read_len = (u64::from(target.len).min(plan.end - offset)) as u32;
-            let range = RequestedReadRange {
-                file_offset: offset,
-                len: read_len,
-            };
-            let (group_name, block_reads) = plan.plan(range)?;
-            let ctx = AttemptContext::for_data(&operation);
-            match self
-                .inner
-                .worker_rpc_with_timeout(
-                    &operation,
-                    self.inner.worker.read_block_ranges_into(
-                        ctx,
-                        group_name,
-                        &block_reads,
-                        &mut dst[..read_len as usize],
-                    ),
-                )
-                .await
-            {
-                Ok(()) => {
-                    if offset + u64::from(read_len) == plan.end {
-                        *current_block = None;
-                    }
-                    return Ok(read_len as usize);
-                }
-                Err(error) => {
-                    let decision = self.handle_worker_failure(&operation, attempt_index, &error).await?;
-                    match decision {
-                        RetryDecision::RefreshMetadata(_) => *current_block = None,
-                        RetryDecision::Retry => {}
-                        _ => return Err(error),
-                    }
-                }
-            }
+impl AsyncRead for FileReader {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if buf.is_empty() || this.position >= this.len() {
+            return Poll::Ready(Ok(0));
         }
-        unreachable!("read attempt loop returns on its final attempt")
+        if this.buffered.is_empty() {
+            if this.pending.get_mut().is_none() {
+                let source = Arc::clone(&this.source);
+                let offset = this.position;
+                let len = buf.len().min(source.inner.config.max_read_step_bytes() as usize) as u32;
+                let deadline = source.inner.metadata.operation_deadline();
+                *this.pending.get_mut() = Some(Box::pin(async move { source.read(offset, len, deadline).await }));
+            }
+            let result = ready!(this.pending.get_mut().as_mut().expect("pending read").as_mut().poll(cx));
+            *this.pending.get_mut() = None;
+            this.buffered = result.map_err(io::Error::from)?;
+        }
+        let len = buf.len().min(this.buffered.len());
+        buf[..len].copy_from_slice(&this.buffered[..len]);
+        this.buffered.advance(len);
+        if this.buffered.is_empty() {
+            this.buffered = Bytes::new();
+        }
+        this.position += len as u64;
+        Poll::Ready(Ok(len))
     }
+}
 
-    /// Executes one positioned range with one call identity and absolute deadline.
-    async fn read_range_step(
-        &self,
-        range: RequestedReadRange,
-        dst: &mut [u8],
-        deadline: OperationDeadline,
-    ) -> ClientResult<()> {
+impl AsyncSeek for FileReader {
+    fn poll_seek(self: Pin<&mut Self>, _: &mut Context<'_>, from: SeekFrom) -> Poll<io::Result<u64>> {
+        let this = self.get_mut();
+        let position = match from {
+            SeekFrom::Start(position) => Some(position),
+            SeekFrom::Current(delta) => this.position.checked_add_signed(delta),
+            SeekFrom::End(delta) => this.len().checked_add_signed(delta),
+        }
+        .ok_or_else(|| ClientError::invalid_argument("seek position is negative or overflows"))?;
+        // Seeking completes locally. Dropping the future prevents any old result
+        // from being delivered or invalidating a later stream position's layout.
+        *this.pending.get_mut() = None;
+        this.buffered = Bytes::new();
+        this.position = position;
+        Poll::Ready(Ok(position))
+    }
+}
+
+impl ReadSource {
+    /// Reads at most one block's visible prefix, with the same bounds on cache hits and misses.
+    async fn read(&self, offset: u64, len: u32, deadline: OperationDeadline) -> ClientResult<Bytes> {
         let operation = self.read_operation(deadline)?;
         let mut layout = None;
         for attempt_index in 0..self.inner.config.max_attempts() {
+            let mut fetched = false;
             if layout.is_none() {
-                layout = Some(
-                    self.inner
+                let cached = self.layout.lock().clone();
+                layout = if let Some(cached) = cached.filter(|cached| cached.location_at(offset).is_some()) {
+                    Some(cached)
+                } else {
+                    // The block boundary is only known after lookup. Asking for
+                    // this byte avoids depending on unread subsequent blocks.
+                    let fresh = self
+                        .inner
                         .metadata
-                        .read_layout_for_inode(operation.clone(), self.file.inode_id(), range.file_offset, range.len)
-                        .await?,
-                );
+                        .read_layout_for_inode(operation.clone(), self.file.inode_id(), offset, 1)
+                        .await?;
+                    fresh.validate_file(&self.file)?;
+                    fetched = true;
+                    Some(Arc::new(fresh))
+                };
             }
-            let (group_name, block_reads) = planner::plan_block_reads_from_layout(
-                self.file.inode_id(),
-                self.file.generation(),
-                self.file.len(),
-                range,
-                layout.as_ref().expect("read layout was initialized"),
-            )?;
+            let current = layout.as_ref().expect("read layout initialized");
+            let plan = planner::plan_block_read(&self.file, offset, len, current)?;
+            if fetched {
+                *self.layout.lock() = Some(Arc::clone(current));
+            }
             let ctx = AttemptContext::for_data(&operation);
             match self
                 .inner
@@ -292,14 +230,23 @@ impl FileReader {
                     &operation,
                     self.inner
                         .worker
-                        .read_block_ranges_into(ctx, group_name, &block_reads, dst),
+                        .read_block_range(ctx, current.group_name.clone(), &plan),
                 )
                 .await
             {
-                Ok(()) => return Ok(()),
+                Ok(bytes) => return Ok(bytes),
                 Err(error) => {
-                    let decision = self.handle_worker_failure(&operation, attempt_index, &error).await?;
-                    match decision {
+                    let decision = self.handle_worker_failure(&operation, attempt_index, &error).await;
+                    // Retain the layout only while retrying it. A terminal failure
+                    // lets a later read discover a replacement endpoint.
+                    if !matches!(decision, Ok(RetryDecision::Retry)) {
+                        let mut cached = self.layout.lock();
+                        // An old failed request must not evict a concurrent replacement.
+                        if cached.as_ref().is_some_and(|cached| Arc::ptr_eq(cached, current)) {
+                            *cached = None;
+                        }
+                    }
+                    match decision? {
                         RetryDecision::RefreshMetadata(_) => layout = None,
                         RetryDecision::Retry => {}
                         _ => return Err(error),
@@ -356,14 +303,14 @@ impl FileReader {
             self.inner.metadata.client_id(),
             self.inner.metadata.client_name(),
             Operation::Read,
-            Some(self.path().to_string()),
+            self.file.path.clone(),
             deadline,
         )
     }
 }
 
-impl Debug for FileReader {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+impl fmt::Debug for FileReader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FileReader")
             .field("path", &self.path())
             .field("len", &self.len())
@@ -372,78 +319,91 @@ impl Debug for FileReader {
     }
 }
 
-/// Metadata-authorized layout retained only for the current sequential block.
-struct CurrentBlockPlan {
-    group_name: GroupName,
-    block: PlannedBlockRead,
-    start: u64,
-    end: u64,
+fn resolve_range(range: impl RangeBounds<u64>, len: u64) -> ClientResult<Range<u64>> {
+    let start = match range.start_bound() {
+        Bound::Unbounded => 0,
+        Bound::Included(&start) => start,
+        Bound::Excluded(&start) => start
+            .checked_add(1)
+            .ok_or_else(|| ClientError::invalid_argument("excluded range start overflows"))?,
+    };
+    let end = match range.end_bound() {
+        Bound::Unbounded => len,
+        Bound::Excluded(&end) => end,
+        Bound::Included(&end) => end
+            .checked_add(1)
+            .ok_or_else(|| ClientError::invalid_argument("inclusive range end overflows"))?,
+    };
+    if matches!(range.end_bound(), Bound::Unbounded) && start > len {
+        return Err(ClientError::unexpected_eof("range exceeds opened file length"));
+    }
+    if start > end {
+        return Err(ClientError::invalid_argument("range start exceeds end"));
+    }
+    if start > len || end > len {
+        return Err(ClientError::unexpected_eof("range exceeds opened file length"));
+    }
+    Ok(start..end)
 }
 
-impl CurrentBlockPlan {
-    /// Validates a fresh layout and identifies the first block serving the cursor.
-    fn new(file: &OpenedFile, range: RequestedReadRange, layout: ReadLayout) -> ClientResult<Self> {
-        let (_, reads) =
-            planner::plan_block_reads_from_layout(file.inode_id(), file.generation(), file.len(), range, &layout)?;
-        let first = reads
-            .first()
-            .ok_or_else(|| ClientError::invalid_layout("read layout produced no block plan"))?;
-        let start = first
-            .file_offset
-            .checked_sub(first.block_offset)
-            .ok_or_else(|| ClientError::invalid_layout("planned block start underflow"))?;
-        let location = layout
-            .locations
-            .iter()
-            .find(|location| location.block_id == first.block_id && location.file_offset == start)
-            .cloned()
-            .ok_or_else(|| ClientError::invalid_layout("planned block is missing from its layout"))?;
-        let end = start
-            .checked_add(location.len)
-            .ok_or_else(|| ClientError::invalid_layout("planned block end overflow"))?;
-        Ok(Self {
-            group_name: layout.group_name,
-            block: first.clone(),
-            start,
-            end,
-        })
-    }
-
-    /// Returns whether this plan authorizes the supplied sequential cursor.
-    fn contains(&self, offset: u64) -> bool {
-        self.start <= offset && offset < self.end
-    }
-
-    /// Slices the immutable, already validated block without changing its authority lifetime.
-    fn plan(&self, range: RequestedReadRange) -> ClientResult<(GroupName, [PlannedBlockRead; 1])> {
-        if !self.contains(range.file_offset)
-            || range
-                .file_offset
-                .checked_add(u64::from(range.len))
-                .is_none_or(|end| end > self.end)
-        {
-            return Err(ClientError::invalid_layout("read range exceeds the cached block"));
-        }
-        let mut block = self.block.clone();
-        block.file_offset = range.file_offset;
-        block.block_offset = range.file_offset - self.start;
-        block.len = range.len;
-        Ok((self.group_name.clone(), [block]))
-    }
-}
-
-/// Returns true when a structured Worker failure invalidates cached layout authority.
 fn should_replan_after_worker_error(error: &ClientError) -> bool {
     error.remote_error().is_some_and(|detail| {
-        matches!(
-            detail.kind,
-            ErrorKind::Metadata(MetadataErrorKind::StaleState | MetadataErrorKind::RouteEpochMismatch)
-                | ErrorKind::Worker(
-                    WorkerErrorKind::BlockLocationUnavailable
-                        | WorkerErrorKind::RunMismatch
-                        | WorkerErrorKind::FullReportRequired
-                        | WorkerErrorKind::NotRegistered
-                )
-        )
+        matches!(detail.recovery, RecoveryAction::RefreshMetadata { .. })
+            && matches!(
+                detail.kind,
+                ErrorKind::Metadata(MetadataErrorKind::StaleState | MetadataErrorKind::RouteEpochMismatch)
+                    | ErrorKind::Worker(
+                        WorkerErrorKind::BlockLocationUnavailable
+                            | WorkerErrorKind::RunMismatch
+                            | WorkerErrorKind::FullReportRequired
+                            | WorkerErrorKind::NotRegistered
+                    )
+            )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ClientErrorKind;
+
+    #[test]
+    fn reader_supports_shared_ranges_and_standard_io() {
+        fn assert_traits<T: Send + Sync + Unpin + AsyncRead + AsyncSeek>() {}
+        assert_traits::<FileReader>();
+    }
+
+    #[test]
+    fn range_boundaries_are_exact_and_checked() {
+        assert_eq!(resolve_range(.., 10).unwrap(), 0..10);
+        assert_eq!(resolve_range(3.., 10).unwrap(), 3..10);
+        assert_eq!(resolve_range(..=9, 10).unwrap(), 0..10);
+        assert_eq!(
+            resolve_range((Bound::Excluded(2), Bound::Included(4)), 10).unwrap(),
+            3..5
+        );
+        assert_eq!(resolve_range(10..10, 10).unwrap(), 10..10);
+        assert_eq!(resolve_range(.., 0).unwrap(), 0..0);
+        assert_eq!(resolve_range(.., u64::MAX).unwrap(), 0..u64::MAX);
+        for range in [
+            (Bound::Included(4), Bound::Excluded(3)),
+            (Bound::Excluded(u64::MAX), Bound::Unbounded),
+            (Bound::Unbounded, Bound::Included(u64::MAX)),
+        ] {
+            assert_eq!(
+                resolve_range(range, 10).unwrap_err().kind(),
+                ClientErrorKind::InvalidArgument
+            );
+        }
+        for range in [
+            (Bound::Included(11), Bound::Unbounded),
+            (Bound::Included(11), Bound::Excluded(11)),
+            (Bound::Included(0), Bound::Included(10)),
+        ] {
+            assert_eq!(
+                resolve_range(range, 10).unwrap_err().kind(),
+                ClientErrorKind::UnexpectedEof
+            );
+        }
+    }
 }

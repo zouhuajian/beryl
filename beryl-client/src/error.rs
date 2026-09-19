@@ -382,6 +382,31 @@ impl Display for ClientError {
 
 impl Error for ClientError {}
 
+/// Preserves the typed client failure as the IO error's inner source.
+impl From<ClientError> for std::io::Error {
+    fn from(error: ClientError) -> Self {
+        use std::io::ErrorKind as Io;
+        let kind = match error.kind() {
+            ClientErrorKind::InvalidArgument | ClientErrorKind::InvalidConfiguration => Io::InvalidInput,
+            ClientErrorKind::NotFound => Io::NotFound,
+            ClientErrorKind::AlreadyExists => Io::AlreadyExists,
+            ClientErrorKind::NotDirectory => Io::NotADirectory,
+            ClientErrorKind::IsDirectory => Io::IsADirectory,
+            ClientErrorKind::DirectoryNotEmpty => Io::DirectoryNotEmpty,
+            ClientErrorKind::PermissionDenied => Io::PermissionDenied,
+            ClientErrorKind::Unsupported => Io::Unsupported,
+            ClientErrorKind::Timeout => Io::TimedOut,
+            // futures IO forbids returning Interrupted or WouldBlock.
+            ClientErrorKind::Cancelled => Io::Other,
+            ClientErrorKind::UnexpectedEof => Io::UnexpectedEof,
+            ClientErrorKind::CorruptData | ClientErrorKind::InvalidResponse => Io::InvalidData,
+            ClientErrorKind::ResourceExhausted => Io::Other,
+            _ => Io::Other,
+        };
+        Self::new(kind, error)
+    }
+}
+
 /// Result type alias for client operations.
 pub type ClientResult<T> = Result<T, ClientError>;
 
@@ -506,5 +531,40 @@ fn client_kind_from_rpc(kind: ErrorKind) -> ClientErrorKind {
             InternalErrorKind::Corrupt => ClientErrorKind::CorruptData,
             InternalErrorKind::Internal => ClientErrorKind::Internal,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn io_errors_preserve_semantics_and_original_client_error() {
+        for (kind, expected) in [
+            (ClientErrorKind::InvalidArgument, io::ErrorKind::InvalidInput),
+            (ClientErrorKind::NotFound, io::ErrorKind::NotFound),
+            (ClientErrorKind::PermissionDenied, io::ErrorKind::PermissionDenied),
+            (ClientErrorKind::Timeout, io::ErrorKind::TimedOut),
+            (ClientErrorKind::UnexpectedEof, io::ErrorKind::UnexpectedEof),
+            (ClientErrorKind::InvalidResponse, io::ErrorKind::InvalidData),
+            (ClientErrorKind::CorruptData, io::ErrorKind::InvalidData),
+            (ClientErrorKind::StaleHandle, io::ErrorKind::Other),
+            // Futures IO forbids Interrupted and WouldBlock, including cancellations.
+            (ClientErrorKind::Cancelled, io::ErrorKind::Other),
+            (ClientErrorKind::Unavailable, io::ErrorKind::Other),
+        ] {
+            let mut original = ClientError::local(kind, "retained detail");
+            original.operation = Some("ReadBlock");
+            original.call_id = Some(CallId::new());
+            let call_id = original.call_id;
+            let error = io::Error::from(original);
+            assert_eq!(error.kind(), expected);
+            let preserved = error.get_ref().unwrap().downcast_ref::<ClientError>().unwrap();
+            assert_eq!(preserved.kind(), kind);
+            assert_eq!(preserved.operation, Some("ReadBlock"));
+            assert_eq!(preserved.call_id, call_id);
+            assert_eq!(preserved.message(), "retained detail");
+        }
     }
 }

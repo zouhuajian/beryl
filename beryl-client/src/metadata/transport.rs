@@ -257,7 +257,7 @@ impl GrpcMetadataTransport {
             .map_err(ClientError::from)?
             .into_inner();
         let authority = parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        let body = ReadLayout::from_get_block_locations_response(authority.group_name.clone(), response)?;
+        let body = ReadLayout::from_response(authority.group_name.clone(), response.status, response.locations)?;
         Ok(ValidatedMetadataResponse::new(authority, body))
     }
 

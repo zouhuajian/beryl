@@ -8,7 +8,7 @@ use super::{
     FsFailure, FsResult, FsSuccess, MetadataFileSystem, RequestContext, StaleStateStatus, SUPPORTED_REPLICA_COUNT,
 };
 use crate::error::MetadataError;
-use crate::inode::InodeAttrs;
+use crate::inode::Inode;
 use crate::observe;
 use crate::placement::{
     PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus, ReportedBlockLocation, WorkerPlacementView,
@@ -16,8 +16,8 @@ use crate::placement::{
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint, WorkerErrorKind};
 use beryl_common::header::CallerContextFields;
 use beryl_types::ids::{InodeId, MountId};
-use beryl_types::FileType;
-use beryl_types::{ContentGeneration, FileBlockLocation, GroupName};
+use beryl_types::FileStatus;
+use beryl_types::{FileBlockLocation, GroupName};
 use std::time::Instant;
 
 #[derive(Clone, Debug)]
@@ -25,13 +25,6 @@ pub(super) struct GetAttrInput {
     pub(super) ctx: RequestContext,
     pub(super) inode_id: InodeId,
     pub(super) freshness: Freshness,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct GetAttrOutput {
-    pub(super) kind: FileType,
-    pub(super) attrs: InodeAttrs,
-    pub(super) len: u64,
 }
 
 /// Internal request for one bounded directory-authority scan.
@@ -48,9 +41,7 @@ struct ReadDirInput {
 #[derive(Clone, Debug)]
 pub(crate) struct ReadDirEntry {
     pub(crate) name: String,
-    pub(crate) kind: FileType,
-    pub(crate) attrs: InodeAttrs,
-    pub(crate) len: u64,
+    pub(crate) status: FileStatus,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -73,23 +64,15 @@ pub(super) struct GetFileLayoutInput {
     pub(super) freshness: Freshness,
 }
 
-#[derive(Clone, Debug, Default)]
-pub(super) struct GetFileLayoutOutput {
-    pub(super) file_size: u64,
-    pub(super) generation: Option<ContentGeneration>,
-    pub(super) locations: Vec<FileBlockLocation>,
+#[derive(Clone, Debug)]
+pub(crate) struct GetFileLayoutOutput {
+    pub(crate) status: FileStatus,
+    pub(crate) locations: Vec<FileBlockLocation>,
 }
 
 pub(crate) struct GetStatusArgs {
     pub(crate) path: String,
     pub(crate) freshness: Freshness,
-}
-
-/// Required namespace status returned after inode authority validation.
-pub(crate) struct GetStatusOutput {
-    pub(crate) kind: FileType,
-    pub(crate) attrs: InodeAttrs,
-    pub(crate) len: u64,
 }
 
 /// Validated filesystem arguments for one public directory-listing page.
@@ -112,12 +95,6 @@ pub(crate) struct OpenFileArgs {
     pub(crate) freshness: Freshness,
 }
 
-pub(crate) struct OpenFileOutput {
-    pub(crate) inode_id: InodeId,
-    pub(crate) file_size: u64,
-    pub(crate) generation: Option<ContentGeneration>,
-}
-
 pub(crate) enum BlockLocationsTarget {
     Path(String),
     InodeId(InodeId),
@@ -129,15 +106,8 @@ pub(crate) struct GetBlockLocationsArgs {
     pub(crate) freshness: Freshness,
 }
 
-pub(crate) struct GetBlockLocationsOutput {
-    pub(crate) inode_id: InodeId,
-    pub(crate) file_size: u64,
-    pub(crate) generation: Option<ContentGeneration>,
-    pub(crate) locations: Vec<FileBlockLocation>,
-}
-
 impl MetadataFileSystem {
-    pub(crate) async fn get_status(&self, ctx: &RequestContext, args: GetStatusArgs) -> FsResult<GetStatusOutput> {
+    pub(crate) async fn get_status(&self, ctx: &RequestContext, args: GetStatusArgs) -> FsResult<FileStatus> {
         if let Err(failure) = self.admission.check_meta_read() {
             return self.failure_from_admission(failure);
         }
@@ -159,17 +129,6 @@ impl MetadataFileSystem {
             freshness: args.freshness,
         })
         .await
-        .map(|success| FsSuccess {
-            payload: GetStatusOutput {
-                kind: success.payload.kind,
-                attrs: success.payload.attrs,
-                len: success.payload.len,
-            },
-            group_name: success.group_name,
-            mount_epoch: success.mount_epoch,
-            route_epoch: success.route_epoch,
-            state: success.state,
-        })
     }
 
     /// Resolves a directory path and returns one bounded weakly consistent page.
@@ -209,7 +168,7 @@ impl MetadataFileSystem {
         })
     }
 
-    pub(crate) async fn open_file(&self, ctx: &RequestContext, args: OpenFileArgs) -> FsResult<OpenFileOutput> {
+    pub(crate) async fn open_file(&self, ctx: &RequestContext, args: OpenFileArgs) -> FsResult<FileStatus> {
         if let Err(failure) = self.admission.check_meta_read() {
             return self.failure_from_admission(failure);
         }
@@ -228,31 +187,22 @@ impl MetadataFileSystem {
             return self.failure_from_admission(failure);
         }
 
-        self.get_file_layout_resolved(GetFileLayoutInput {
-            ctx: ctx.clone(),
-            inode_id,
-            range: None,
-            freshness: args.freshness,
-        })
-        .await
-        .map(|success| FsSuccess {
-            payload: OpenFileOutput {
-                inode_id,
-                file_size: success.payload.file_size,
-                generation: success.payload.generation,
-            },
-            group_name: success.group_name,
-            mount_epoch: success.mount_epoch,
-            route_epoch: success.route_epoch,
-            state: success.state,
-        })
+        self.read_file_inode(ctx, inode_id, args.freshness, "OpenFile")
+            .await
+            .map(|success| FsSuccess {
+                payload: success.payload.status(),
+                group_name: success.group_name,
+                mount_epoch: success.mount_epoch,
+                route_epoch: success.route_epoch,
+                state: success.state,
+            })
     }
 
     pub(crate) async fn get_block_locations(
         &self,
         ctx: &RequestContext,
         args: GetBlockLocationsArgs,
-    ) -> FsResult<GetBlockLocationsOutput> {
+    ) -> FsResult<GetFileLayoutOutput> {
         if let Err(failure) = self.admission.check_meta_read() {
             return self.failure_from_admission(failure);
         }
@@ -291,18 +241,6 @@ impl MetadataFileSystem {
             freshness: args.freshness,
         })
         .await
-        .map(|success| FsSuccess {
-            payload: GetBlockLocationsOutput {
-                inode_id,
-                file_size: success.payload.file_size,
-                generation: success.payload.generation,
-                locations: success.payload.locations,
-            },
-            group_name: success.group_name,
-            mount_epoch: success.mount_epoch,
-            route_epoch: success.route_epoch,
-            state: success.state,
-        })
     }
 
     async fn validate_read_freshness_for_mount(
@@ -418,7 +356,7 @@ impl MetadataFileSystem {
         )
     }
 
-    pub(super) async fn get_attr_resolved(&self, req: GetAttrInput) -> FsResult<GetAttrOutput> {
+    pub(super) async fn get_attr_resolved(&self, req: GetAttrInput) -> FsResult<FileStatus> {
         let started = Instant::now();
         let result = async {
             let inode = match self.read_inode(req.inode_id) {
@@ -451,16 +389,7 @@ impl MetadataFileSystem {
             let (group_name, mount_epoch, route_epoch) = self
                 .validate_read_freshness_for_mount(&req.ctx, req.freshness, inode.mount_id, "GetStatus")
                 .await?;
-            self.success_with_route_epoch(
-                GetAttrOutput {
-                    kind: inode.file_type(),
-                    attrs: inode.attrs.clone(),
-                    len: inode.len(),
-                },
-                group_name,
-                mount_epoch,
-                route_epoch,
-            )
+            self.success_with_route_epoch(inode.status(), group_name, mount_epoch, route_epoch)
         }
         .await;
         record_fs_read_result("get_status", started, &result);
@@ -562,8 +491,7 @@ impl MetadataFileSystem {
                 }
                 dir_entries.push(ReadDirEntry {
                     name,
-                    kind: child_inode.file_type(),
-                    attrs: child_inode.attrs.clone(), len: child_inode.len(),
+                    status: child_inode.status(),
                 });
             }
 
@@ -583,60 +511,78 @@ impl MetadataFileSystem {
         result
     }
 
+    async fn read_file_inode(
+        &self,
+        ctx: &RequestContext,
+        inode_id: InodeId,
+        freshness: Freshness,
+        operation: &str,
+    ) -> FsResult<Inode> {
+        let inode = match self.read_inode(inode_id) {
+            Ok(Some(inode)) => inode,
+            Ok(None) => {
+                return self.failure_from_error(
+                    ctx,
+                    MetadataError::NotFound(format!("Inode not found: {}", inode_id)),
+                    None,
+                    None,
+                );
+            }
+            Err(err) => {
+                return self.failure_from_error(ctx, err, None, None);
+            }
+        };
+
+        if inode.inode_id != inode_id {
+            return self.failure_from_error(
+                ctx,
+                MetadataError::Internal(format!(
+                    "inode authority is corrupt for {operation}: key={}, value_id={}, kind={:?}, payload={:?}",
+                    inode_id,
+                    inode.inode_id,
+                    inode.file_type(),
+                    inode.file_type()
+                )),
+                None,
+                None,
+            );
+        }
+        if !inode.file_type().is_file() {
+            return self.failure_from_error(
+                ctx,
+                MetadataError::IsDir(format!("Inode is not a file: {}", inode_id)),
+                None,
+                None,
+            );
+        }
+
+        let (group_name, mount_epoch, route_epoch) = self
+            .validate_read_freshness_for_mount(ctx, freshness, inode.mount_id, operation)
+            .await?;
+
+        let file = inode.file().expect("file kind checked above");
+        if let Err(error) = file.validate(inode_id) {
+            return self.failure_from_error_with_route_epoch(ctx, error, group_name, mount_epoch, route_epoch);
+        }
+        self.success_with_route_epoch(inode, group_name, mount_epoch, route_epoch)
+    }
+
     pub(super) async fn get_file_layout_resolved(&self, req: GetFileLayoutInput) -> FsResult<GetFileLayoutOutput> {
         let started = Instant::now();
         let result = async {
-            let inode = match self.read_inode(req.inode_id) {
-                Ok(Some(inode)) => inode,
-                Ok(None) => {
-                    return self.failure_from_error(
-                        &req.ctx,
-                        MetadataError::NotFound(format!("Inode not found: {}", req.inode_id)),
-                        None,
-                        None,
-                    );
-                }
-                Err(err) => {
-                    return self.failure_from_error(&req.ctx, err, None, None);
-                }
-            };
-
-            if inode.inode_id != req.inode_id {
-                return self.failure_from_error(
-                    &req.ctx,
-                    MetadataError::Internal(format!(
-                        "inode authority is corrupt for GetFileLayout: key={}, value_id={}, kind={:?}, payload={:?}",
-                        req.inode_id,
-                        inode.inode_id,
-                        inode.file_type(),
-                        inode.file_type()
-                    )),
-                    None,
-                    None,
-                );
-            }
-            if !inode.file_type().is_file() {
-                return self.failure_from_error(
-                    &req.ctx,
-                    MetadataError::IsDir(format!("Inode is not a file: {}", req.inode_id)),
-                    None,
-                    None,
-                );
-            }
-
-            let (group_name, mount_epoch, route_epoch) = self
-                .validate_read_freshness_for_mount(&req.ctx, req.freshness, inode.mount_id, "GetFileLayout")
+            let success = self
+                .read_file_inode(&req.ctx, req.inode_id, req.freshness, "GetFileLayout")
                 .await?;
-
-            let file = inode.file().expect("file kind checked above");
-            if let Err(error) = file.validate(req.inode_id) {
-                return self.failure_from_error_with_route_epoch(&req.ctx, error, group_name, mount_epoch, route_epoch);
-            }
+            let inode = success.payload;
+            let group_name = success.group_name;
+            let mount_epoch = success.mount_epoch;
+            let route_epoch = success.route_epoch;
+            let file = inode.file().expect("validated file inode");
             let block_size = file.block_size;
 
             let (range_start, range_end) = match req.range {
                 Some(range) => match range.offset.checked_add(range.len) {
-                    Some(end) => (range.offset, end),
+                    Some(end) => (range.offset.min(file.len), end.min(file.len)),
                     None => {
                         return self.failure_from_error_with_route_epoch(
                             &req.ctx,
@@ -663,12 +609,13 @@ impl MetadataFileSystem {
             };
             let caller = Self::caller_context_fields(&req.ctx);
             let mut locations = Vec::new();
-            for (ordinal, block_id) in file.blocks.iter().copied().enumerate() {
+            let first = (range_start / u64::from(block_size)) as usize;
+            let end = range_end.div_ceil(u64::from(block_size)) as usize;
+            let end = if range_start == range_end { first } else { end };
+            for (index, block_id) in file.blocks[first..end].iter().copied().enumerate() {
+                let ordinal = first + index;
                 let file_offset = ordinal as u64 * u64::from(block_size);
                 let effective_len = file.block_len(ordinal);
-                if range_start == range_end || file_offset >= range_end || file_offset + effective_len <= range_start {
-                    continue;
-                }
                 let mut workers = Vec::new();
                 if let Some(worker_group) = worker_group.as_ref() {
                     let reported = manager.reported_block_locations(worker_group, block_id);
@@ -727,12 +674,10 @@ impl MetadataFileSystem {
                     effective_len,
                 });
             }
-            let generation = Some(file.generation);
 
             self.success_with_route_epoch(
                 GetFileLayoutOutput {
-                    file_size: inode.len(),
-                    generation,
+                    status: inode.status(),
                     locations,
                 },
                 group_name,
@@ -763,7 +708,7 @@ mod tests {
     use super::*;
     use crate::inode::{Inode, InodeKind};
     use crate::service::filesystem::tests::*;
-    use beryl_types::{GroupStateWatermark, RaftLogId, WriteMode};
+    use beryl_types::{ContentGeneration, GroupStateWatermark, RaftLogId, WriteMode};
 
     fn seed_visible_block(storage: &RocksDBStorage, mount_id: MountId, inode_id: InodeId, block_id: BlockId) {
         let attrs = InodeAttrs::new();
@@ -778,6 +723,87 @@ mod tests {
             last_commit: None,
         });
         storage.put_inode(&inode).unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_status_is_independent_of_locations_and_range_selects_only_intersecting_blocks() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_id = MountId::new(48);
+        let group = group_name("g8");
+        let inode_id = InodeId::new(481);
+        let first = BlockId::new(inode_id, BlockIndex::new(0));
+        let second = BlockId::new(inode_id, BlockIndex::new(1));
+        let manager = Arc::new(WorkerManager::new(60_000));
+        let filesystem = filesystem_builder_with_mount(mount_id, 9, &group)
+            .with_storage(Arc::clone(&storage))
+            .with_worker_manager(Arc::clone(&manager))
+            .build()
+            .await;
+        storage
+            .put_inode(&Inode::new_dir(ROOT_INODE_ID, InodeAttrs::new(), mount_id))
+            .unwrap();
+        seed_visible_block(&storage, mount_id, inode_id, first);
+        let mut inode = storage.get_inode(inode_id).unwrap().unwrap();
+        let file = inode.file_mut().unwrap();
+        file.len = 4096 + 512;
+        file.blocks.push(second);
+        file.next_index = 2;
+        storage.put_inode(&inode).unwrap();
+        storage.put_dentry(ROOT_INODE_ID, "file", inode_id).unwrap();
+        let status = filesystem
+            .open_file(
+                &request_context(),
+                OpenFileArgs {
+                    path: "/file".into(),
+                    freshness: Freshness::default(),
+                },
+            )
+            .await
+            .unwrap()
+            .payload;
+        assert_eq!(status, inode.status());
+        let locations = |range| GetBlockLocationsArgs {
+            target: BlockLocationsTarget::InodeId(inode_id),
+            range: Some(range),
+            freshness: Freshness::default(),
+        };
+        assert!(filesystem
+            .get_block_locations(&request_context(), locations(FileRange { offset: 0, len: 1 }))
+            .await
+            .is_err());
+        let worker_id = WorkerId::new(1);
+        register_worker_descriptor(&manager, &group, worker_id, "127.0.0.1:9101".into());
+        record_worker_heartbeat(&manager, &group, worker_id, 8192);
+        publish_report_block(
+            &manager,
+            &group,
+            worker_id,
+            1,
+            report_block_with_epoch_and_len(second, 1, 512),
+        );
+        let tail = filesystem
+            .get_block_locations(
+                &request_context(),
+                locations(FileRange {
+                    offset: 4200,
+                    len: 1000,
+                }),
+            )
+            .await
+            .unwrap()
+            .payload;
+        assert_eq!(tail.status, status);
+        assert_eq!(tail.locations.len(), 1);
+        assert_eq!(tail.locations[0].block_id, second);
+        assert_eq!(tail.locations[0].len, 512);
+        // The unavailable first block must not prevent an explicitly requested tail layout.
+        let eof = filesystem
+            .get_block_locations(&request_context(), locations(FileRange { offset: 9000, len: 1 }))
+            .await
+            .unwrap()
+            .payload;
+        assert!(eof.locations.is_empty());
     }
 
     #[tokio::test]

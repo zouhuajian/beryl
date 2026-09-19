@@ -26,7 +26,7 @@ use beryl_proto::metadata::{
     AllocateBlockRequestProto, AllocateBlockResponseProto, AuthorizeBlockWriteRequestProto,
     AuthorizeBlockWriteResponseProto, CommitFileRequestProto, CommitFileResponseProto, CommittedBlockProto,
     CreateDirectoryRequestProto, CreateDirectoryResponseProto, CreateFileRequestProto, CreateFileResponseProto,
-    DeleteRequestProto, DeleteResponseProto, DirEntryProto, FileTypeProto, GetBlockLocationsRequestProto,
+    DeleteRequestProto, DeleteResponseProto, DirEntryProto, GetBlockLocationsRequestProto,
     GetBlockLocationsResponseProto, GetStatusRequestProto, GetStatusResponseProto, ListStatusRequestProto,
     ListStatusResponseProto, MsyncRequestProto, MsyncResponseProto, OpenFileRequestProto, OpenFileResponseProto,
     OpenWriteRequestProto, OpenWriteResponseProto, RenameRequestProto, RenameResponseProto, RenewLeaseRequestProto,
@@ -167,10 +167,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         {
             Ok(success) => response_with_header!(
                 GetStatusResponseProto {
-                    len: success.payload.len,
-                    create_time: success.payload.attrs.create_time,
-                    modify_time: success.payload.attrs.modify_time,
-                    kind: FileTypeProto::from(success.payload.kind) as i32,
+                    status: Some((&success.payload).into()),
                     ..Default::default()
                 },
                 ok_header_from_fs_success(&req_ctx, &success)
@@ -216,10 +213,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     .into_iter()
                     .map(|entry| DirEntryProto {
                         name: entry.name,
-                        kind: FileTypeProto::from(entry.kind) as i32,
-                        len: entry.len,
-                        create_time: entry.attrs.create_time,
-                        modify_time: entry.attrs.modify_time,
+                        status: Some((&entry.status).into()),
                     })
                     .collect();
                 response_with_header!(
@@ -261,8 +255,18 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 let payload = success.payload;
                 response_with_header!(
                     CreateDirectoryResponseProto {
-                        create_time: payload.attrs.create_time,
-                        modify_time: payload.attrs.modify_time,
+                        status: Some(
+                            (&beryl_types::FileStatus {
+                                path: None,
+                                inode_id: payload.inode_id,
+                                kind: beryl_types::FileType::Dir,
+                                len: 0,
+                                generation: None,
+                                create_time: payload.attrs.create_time,
+                                modify_time: payload.attrs.modify_time,
+                            })
+                                .into()
+                        ),
                         ..Default::default()
                     },
                     header
@@ -357,9 +361,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 let payload = success.payload;
                 response_with_header!(
                     OpenFileResponseProto {
-                        inode_id: payload.inode_id.as_raw(),
-                        file_size: payload.file_size,
-                        generation: payload.generation.map(ContentGeneration::as_raw),
+                        status: Some((&payload).into()),
                         ..Default::default()
                     },
                     header
@@ -421,9 +423,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 let payload = success.payload;
                 response_with_header!(
                     GetBlockLocationsResponseProto {
-                        inode_id: payload.inode_id.as_raw(),
-                        file_size: payload.file_size,
-                        generation: payload.generation.map(ContentGeneration::as_raw),
+                        status: Some((&payload.status).into()),
                         locations: payload.locations.iter().map(location_to_proto).collect(),
                         ..Default::default()
                     },
