@@ -37,16 +37,21 @@ enum FileTypeProto {
   FILE_TYPE_DIR = 2;
 }
 
-/// Directory entry metadata visible through listing APIs.
-message DirEntryProto {
-  /// Entry name (UTF-8).
-  string name = 1;
-  /// Required inode kind for the child status.
+// Metadata-visible inode state. Paths and block locations have separate lifetimes.
+message FileStatusProto {
+  uint64 inode_id = 1;
   FileTypeProto kind = 2;
   uint64 len = 3;
+  // Required for files, absent for directories. Does not retain historical content.
+  optional uint64 generation = 4;
   // Milliseconds since Unix epoch.
-  uint64 create_time = 4;
-  uint64 modify_time = 5;
+  uint64 create_time = 5;
+  uint64 modify_time = 6;
+}
+
+message DirEntryProto {
+  string name = 1;
+  FileStatusProto status = 2;
 }
 
 // Identifies a file write lease. Both fields must be non-zero; Metadata checks
@@ -102,12 +107,7 @@ message GetStatusRequestProto {
 
 message GetStatusResponseProto {
   common.ResponseHeaderProto header = 1;
-  uint64 len = 2;
-  // Milliseconds since Unix epoch.
-  uint64 create_time = 3;
-  uint64 modify_time = 4;
-  // Required namespace kind. UNSPECIFIED is not a successful domain value.
-  FileTypeProto kind = 5;
+  FileStatusProto status = 2;
 }
 
 message ListStatusRequestProto {
@@ -141,9 +141,7 @@ message CreateDirectoryRequestProto {
 
 message CreateDirectoryResponseProto {
   common.ResponseHeaderProto header = 1;
-  // Milliseconds since Unix epoch.
-  uint64 create_time = 2;
-  uint64 modify_time = 3;
+  FileStatusProto status = 2;
 }
 
 message DeleteOptionsProto {
@@ -182,11 +180,7 @@ message OpenFileRequestProto {
 
 message OpenFileResponseProto {
   common.ResponseHeaderProto header = 1;
-  uint64 inode_id = 2;
-  uint64 file_size = 3;
-  // Content change counter scoped to this inode; it does not retain history.
-  // It advances when the Metadata-visible file contents change.
-  optional uint64 generation = 4;
+  FileStatusProto status = 2;
 }
 
 message GetBlockLocationsRequestProto {
@@ -200,11 +194,8 @@ message GetBlockLocationsRequestProto {
 
 message GetBlockLocationsResponseProto {
   common.ResponseHeaderProto header = 1;
-  uint64 inode_id = 2;
-  uint64 file_size = 3;
-  repeated FileBlockLocationProto locations = 4;
-  // Same generation contract as OpenFileResponseProto.generation.
-  optional uint64 generation = 5;
+  FileStatusProto status = 2;
+  repeated FileBlockLocationProto locations = 3;
 }
 
 // ============================================================================

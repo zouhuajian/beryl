@@ -5,6 +5,7 @@ use beryl_client::{ClientResult, FileType, ListStatusOptions, MkdirOptions};
 use beryl_e2e::data::deterministic_bytes;
 use beryl_e2e::TestCluster;
 use bytes::Bytes;
+use futures::io::AsyncReadExt;
 use std::fmt::Debug;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -16,8 +17,8 @@ async fn local_client_crud_roundtrip() {
     let renamed_path = "/e2e/file.renamed";
 
     let created_dir = client.mkdirs(dir).await.expect("mkdirs through metadata");
-    assert_eq!(created_dir.path(), dir);
-    assert_eq!(created_dir.kind, FileType::Dir);
+    assert_eq!(created_dir.path(), Some(dir));
+    assert_eq!(created_dir.kind(), FileType::Dir);
 
     let first = Bytes::from(deterministic_bytes(1_337));
     let suffix = Bytes::from_static(b"-beryl-append-suffix");
@@ -27,15 +28,15 @@ async fn local_client_crud_roundtrip() {
     writer.close().await.expect("close through metadata");
 
     let status = client.get_status(path).await.expect("status after close");
-    assert_eq!(status.path(), path);
-    assert_eq!(status.kind, FileType::File);
-    assert_eq!(status.len, first.len() as u64);
+    assert_eq!(status.path(), Some(path));
+    assert_eq!(status.kind(), FileType::File);
+    assert_eq!(status.len(), first.len() as u64);
 
     let read = client
         .open(path)
         .await
         .expect("open after close")
-        .read_to_end()
+        .read_range(..)
         .await
         .expect("read first bytes");
     assert_eq!(read, first);
@@ -51,7 +52,7 @@ async fn local_client_crud_roundtrip() {
         .open(path)
         .await
         .expect("open after append")
-        .read_to_end()
+        .read_range(..)
         .await
         .expect("read appended bytes");
     assert_eq!(read.as_ref(), expected.as_slice());
@@ -71,20 +72,20 @@ async fn local_client_crud_roundtrip() {
     while let Some(status) = statuses.next().await.expect("fetch next directory status") {
         listed.push(status);
     }
-    listed.sort_by(|left, right| left.path().cmp(right.path()));
+    listed.sort_by(|left, right| left.path().cmp(&right.path()));
     assert_eq!(
         listed.iter().map(|status| status.path()).collect::<Vec<_>>(),
-        [path, subdir]
+        [Some(path), Some(subdir)]
     );
-    assert_eq!(listed[0].kind, FileType::File);
-    assert_eq!(listed[0].len, expected.len() as u64);
-    assert_eq!(listed[1].kind, FileType::Dir);
+    assert_eq!(listed[0].kind(), FileType::File);
+    assert_eq!(listed[0].len(), expected.len() as u64);
+    assert_eq!(listed[1].kind(), FileType::Dir);
 
     client.delete(subdir).await.expect("delete empty listing subdirectory");
 
     let before_rename = client.get_status(path).await.unwrap();
-    assert_eq!(before_rename.create_time, status.create_time);
-    assert!(before_rename.modify_time >= status.modify_time);
+    assert_eq!(before_rename.create_time(), status.create_time());
+    assert!(before_rename.modify_time() >= status.modify_time());
     let reader_opened_before_rename = client.open(path).await.expect("open reader before rename");
     client
         .rename(path, renamed_path)
@@ -93,37 +94,35 @@ async fn local_client_crud_roundtrip() {
     assert_not_found(client.get_status(path).await, "old path after rename");
 
     let renamed_status = client.get_status(renamed_path).await.expect("status after rename");
-    assert_eq!(renamed_status.path(), renamed_path);
-    assert_eq!(renamed_status.create_time, before_rename.create_time);
-    assert_eq!(renamed_status.modify_time, before_rename.modify_time);
-    assert_eq!(renamed_status.len, expected.len() as u64);
+    assert_eq!(renamed_status.path(), Some(renamed_path));
+    assert_eq!(reader_opened_before_rename.status().path(), Some(path));
+    assert_eq!(reader_opened_before_rename.path(), path);
+    assert_eq!(renamed_status.create_time(), before_rename.create_time());
+    assert_eq!(renamed_status.modify_time(), before_rename.modify_time());
+    assert_eq!(renamed_status.len(), expected.len() as u64);
 
     let renamed_read = client
         .open(renamed_path)
         .await
         .expect("open renamed file")
-        .read_to_end()
+        .read_range(..)
         .await
         .expect("read renamed file");
     assert_eq!(renamed_read.as_ref(), expected.as_slice());
-    let mut moved_reader_bytes = vec![0u8; expected.len()];
-    reader_opened_before_rename
-        .read_exact_at(0, &mut moved_reader_bytes)
+    let moved_reader_bytes = reader_opened_before_rename
+        .read_range(..)
         .await
         .expect("reader opened before rename remains bound to the inode");
-    assert_eq!(moved_reader_bytes.as_slice(), expected.as_slice());
+    assert_eq!(moved_reader_bytes.as_ref(), expected.as_slice());
 
+    let uncached_reader = client.open(renamed_path).await.expect("open before delete");
     client
         .delete(renamed_path)
         .await
         .expect("namespace delete renamed file");
     assert_not_found(client.get_status(renamed_path).await, "deleted path status");
     assert_not_found(client.open(renamed_path).await, "deleted path open");
-    let mut probe = [0u8; 1];
-    assert_not_found(
-        reader_opened_before_rename.read_at(0, &mut probe).await,
-        "reader for deleted inode",
-    );
+    assert_not_found(uncached_reader.read_range(0..1).await, "reader for deleted inode");
 
     let replacement = Bytes::from_static(b"replacement-file");
     let mut replacement_writer = client.create(renamed_path).await.expect("recreate deleted path");
@@ -136,14 +135,14 @@ async fn local_client_crud_roundtrip() {
         .await
         .unwrap_or_else(|err| panic!("close replacement file: {err} ({err:?})"));
     assert_not_found(
-        reader_opened_before_rename.read_at(0, &mut probe).await,
+        uncached_reader.read_range(0..1).await,
         "old reader must not bind to recreated path",
     );
     let replacement_read = client
         .open(renamed_path)
         .await
         .expect("open replacement file")
-        .read_to_end()
+        .read_range(..)
         .await
         .expect("read replacement file");
     assert_eq!(replacement_read, replacement);
@@ -173,7 +172,7 @@ async fn visibility_sync_then_continue_write_roundtrip() {
         .open(path)
         .await
         .expect("open immediately after visibility sync")
-        .read_to_end()
+        .read_range(..)
         .await
         .expect("read published prefix while writer remains open");
     assert_eq!(visible_prefix, first);
@@ -196,7 +195,7 @@ async fn visibility_sync_then_continue_write_roundtrip() {
         .open(path)
         .await
         .expect("open after close")
-        .read_to_end()
+        .read_range(..)
         .await
         .expect("read both publication revisions");
     let expected = [first.as_ref(), second.as_ref()].concat();

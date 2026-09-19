@@ -22,8 +22,8 @@ pub mod watermark;
 pub mod worker;
 
 pub use fs::{
-    BlockLengthError, BlockSizeError, ContentGeneration, FileType, MAX_BLOCK_SIZE, MAX_FILE_BLOCKS, WriteMode,
-    validate_block_size, validate_effective_len,
+    BlockLengthError, BlockSizeError, ContentGeneration, FileStatus, FileType, MAX_BLOCK_SIZE, MAX_FILE_BLOCKS,
+    WriteMode, validate_block_size, validate_effective_len,
 };
 pub use ids::{BlockId, BlockIndex, CallId, ClientId, GroupName, GroupNameError, InodeId, MountId, WorkerId};
 pub use lease::{FencingToken, LeaseEpoch, WriteHandle};

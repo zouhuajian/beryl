@@ -7,12 +7,14 @@
 //! [`FileWriter`], namespace operation options, and small namespace value types.
 //! Metadata-facing operations are executed through the internal metadata
 //! client and transport, with bounded retry, structured refresh, and
-//! invalid response-header handling. Public reads fill caller-owned buffers
-//! through bounded data-plane steps; public writes use internal write-state
+//! invalid response-header handling. Readers implement futures IO and offer
+//! owned range reads through the same bounded data-plane steps. The current
+//! implementation requires a Tokio runtime; Tokio IO callers can use
+//! `tokio_util::compat`. Public writes use internal write-state
 //! tracking and data-plane adapters. Metadata selects and persists the layout
 //! for new files; existing files reuse that stored block capacity.
-//! Sequential reads retain only the current Metadata-authorized block plan;
-//! positioned reads never bypass Metadata authority. [`FileWriter::sync`]
+//! Readers reuse one bounded Metadata-authorized layout for sequential and
+//! positioned reads. [`FileWriter::sync`]
 //! publishes durable data while retaining the open write session.
 
 #![forbid(unsafe_code)]
@@ -33,8 +35,9 @@ pub(crate) mod metadata;
 mod worker;
 
 // Re-export commonly used types
+pub use api::ListStatusIterator;
 pub use api::{DeleteOptions, ListStatusOptions, MkdirOptions};
 pub use api::{FileReader, FileWriter, FsClient};
-pub use api::{FileStatus, FileType, ListStatusIterator};
+pub use beryl_types::{FileStatus, FileType};
 pub use config::{ClientConfig, ClientConfigBuilder};
 pub use error::{ClientError, ClientErrorKind, ClientResult};

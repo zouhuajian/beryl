@@ -5,8 +5,8 @@
 
 use crate::api::FileStatus;
 use crate::error::{ClientError, ClientResult};
-use beryl_proto::metadata::GetBlockLocationsResponseProto;
-use beryl_types::{ContentGeneration, FileBlockLocation, GroupName, GroupStateWatermark, InodeId, LocatedBlock};
+use beryl_proto::metadata::{FileBlockLocationProto, FileStatusProto};
+use beryl_types::{FileBlockLocation, GroupName, GroupStateWatermark, LocatedBlock};
 
 /// Server-authorized metadata state learned from one validated successful response.
 ///
@@ -54,85 +54,84 @@ impl<T> ValidatedMetadataResponse<T> {
     }
 }
 
-/// Immutable file identity, visible generation, and length captured by `OpenFile`.
-#[derive(Clone, Debug)]
-pub(crate) struct OpenedFile {
-    path: String,
-    inode_id: InodeId,
-    generation: ContentGeneration,
-    file_size: u64,
-}
-
-impl OpenedFile {
-    /// Creates validated opened-file state from Metadata's response.
-    pub(crate) fn new(path: String, inode_id: InodeId, generation: ContentGeneration, file_size: u64) -> Self {
-        Self {
-            path,
-            inode_id,
-            generation,
-            file_size,
-        }
-    }
-
-    /// Returns the path used to open this file.
-    pub(crate) fn path(&self) -> &str {
-        &self.path
-    }
-
-    /// Returns the immutable inode identity used for layout requests.
-    pub(crate) fn inode_id(&self) -> InodeId {
-        self.inode_id
-    }
-
-    /// Returns the visible content generation fenced by this opened file.
-    pub(crate) fn generation(&self) -> ContentGeneration {
-        self.generation
-    }
-
-    /// Returns the file size observed by `OpenFile`.
-    pub(crate) fn len(&self) -> u64 {
-        self.file_size
-    }
-}
-
-/// Validated read layout returned by metadata.
+/// Validated inode state and range locations from one Metadata response.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ReadLayout {
-    /// Metadata owner group from the validated response header.
     pub group_name: GroupName,
-    /// File inode identity this layout belongs to.
-    pub inode_id: InodeId,
-    /// Authoritative file size at this content generation.
-    pub file_size: u64,
-    /// Durable visible content generation for this read plan.
-    pub generation: Option<ContentGeneration>,
-    /// Metadata-authoritative block locations for the requested range.
-    pub locations: Vec<FileBlockLocation>,
+    status: FileStatus,
+    locations: Vec<FileBlockLocation>,
 }
 
 impl ReadLayout {
-    /// Convert a metadata wire response into the client read-layout domain view.
-    pub(crate) fn from_get_block_locations_response(
-        group_name: GroupName,
-        response: GetBlockLocationsResponseProto,
-    ) -> ClientResult<Self> {
-        if response.inode_id == 0 {
-            return Err(ClientError::invalid_layout(
-                "GetBlockLocationsResponseProto.inode_id must be non-zero".to_string(),
-            ));
+    /// Checks the opened authority before this immutable layout enters a reader cache.
+    pub(crate) fn validate_file(&self, file: &FileStatus) -> ClientResult<()> {
+        if self.status.inode_id != file.inode_id() {
+            return Err(ClientError::stale_handle("layout inode_id does not match opened inode"));
         }
-        let inode_id = InodeId::new(response.inode_id);
-        let locations = response
-            .locations
+        let generation = self.status.generation.expect("validated layout generation");
+        let expected = file.generation().expect("validated file generation");
+        if generation != expected {
+            return Err(ClientError::generation_mismatch(expected, generation));
+        }
+        if self.status.len != file.len() {
+            return Err(ClientError::stale_handle("layout length does not match opened length"));
+        }
+        Ok(())
+    }
+
+    /// Locations cover full visible blocks, even when the original request was smaller.
+    pub(crate) fn location_at(&self, offset: u64) -> Option<&FileBlockLocation> {
+        self.locations
+            .iter()
+            .find(|location| location.file_offset <= offset && offset < location.file_offset + location.len)
+    }
+
+    pub(crate) fn from_response(
+        group_name: GroupName,
+        status: Option<FileStatusProto>,
+        locations: Vec<FileBlockLocationProto>,
+    ) -> ClientResult<Self> {
+        let status = beryl_types::FileStatus::try_from(
+            status.ok_or_else(|| ClientError::invalid_layout("read response status missing"))?,
+        )
+        .map_err(ClientError::invalid_layout)?;
+        if !status.kind.is_file() {
+            return Err(ClientError::invalid_layout("read response is not a file"));
+        }
+        if locations.len() > beryl_types::MAX_FILE_BLOCKS {
+            return Err(ClientError::invalid_layout("read layout exceeds file block limit"));
+        }
+        let mut locations: Vec<FileBlockLocation> = locations
             .into_iter()
             .map(FileBlockLocation::try_from)
             .collect::<Result<Vec<_>, _>>()
             .map_err(ClientError::invalid_layout)?;
+        locations.sort_by_key(|location| location.file_offset);
+        let mut previous_end = None;
+        for location in &locations {
+            let end = location
+                .file_offset
+                .checked_add(location.len)
+                .filter(|end| *end <= status.len)
+                .ok_or_else(|| ClientError::invalid_layout("block location exceeds file length"))?;
+            if location.block_id.inode_id != status.inode_id {
+                return Err(ClientError::invalid_layout(
+                    "block inode_id does not match layout inode",
+                ));
+            }
+            if location.len != location.effective_len {
+                return Err(ClientError::invalid_layout(
+                    "location length differs from visible block prefix",
+                ));
+            }
+            if previous_end.is_some_and(|previous| previous > location.file_offset) {
+                return Err(ClientError::invalid_layout("layout overlap"));
+            }
+            previous_end = Some(end);
+        }
         Ok(Self {
             group_name,
-            inode_id,
-            file_size: response.file_size,
-            generation: response.generation.map(ContentGeneration::new),
+            status,
             locations,
         })
     }
@@ -145,4 +144,100 @@ pub(crate) struct AllocateBlockResult {
     pub group_name: GroupName,
     /// Metadata-issued block and write authorization, including on allocation replay.
     pub block: LocatedBlock,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beryl_types::{BlockId, BlockIndex, ContentGeneration, FileType, InodeId};
+
+    fn file() -> FileStatus {
+        FileStatus {
+            path: Some("/file".into()),
+            inode_id: InodeId::new(10),
+            kind: FileType::File,
+            len: 16,
+            generation: Some(ContentGeneration::new(1)),
+            create_time: 0,
+            modify_time: 0,
+        }
+    }
+
+    fn location(inode_id: u64, file_offset: u64, len: u64) -> FileBlockLocationProto {
+        FileBlockLocationProto {
+            block_id: Some(BlockId::new(InodeId::new(inode_id), BlockIndex::new(4)).into()),
+            file_offset,
+            len,
+            block_size: 4096,
+            effective_len: len,
+            workers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn layout_conversion_rejects_invalid_identity_shape_and_overlap() {
+        let valid = location(10, 0, 8);
+        let cases = [
+            vec![location(10, 0, 0)],
+            vec![location(11, 0, 8)],
+            vec![location(10, 0, 8), location(10, 4, 8)],
+            vec![location(10, u64::MAX, 8)],
+            vec![location(10, 12, 8)],
+            vec![FileBlockLocationProto {
+                block_size: 0,
+                ..valid.clone()
+            }],
+            vec![FileBlockLocationProto {
+                effective_len: 3,
+                ..valid.clone()
+            }],
+            vec![FileBlockLocationProto {
+                effective_len: 4097,
+                ..valid.clone()
+            }],
+            vec![valid; beryl_types::MAX_FILE_BLOCKS + 1],
+        ];
+        for locations in cases {
+            ReadLayout::from_response(GroupName::parse("root").unwrap(), Some((&file()).into()), locations)
+                .expect_err("malformed layout must fail at the response boundary");
+        }
+        let mut missing_generation = FileStatusProto::from(&file());
+        missing_generation.generation = None;
+        assert!(ReadLayout::from_response(
+            GroupName::parse("root").unwrap(),
+            Some(missing_generation),
+            vec![location(10, 0, 8)]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn layout_matches_opened_authority_independently_of_observation_path() {
+        let file = file();
+        let mut layout = ReadLayout::from_response(
+            GroupName::parse("root").unwrap(),
+            Some((&file).into()),
+            vec![location(10, 0, 8)],
+        )
+        .unwrap();
+        for path in [None, Some("/renamed".into())] {
+            layout.status.path = path;
+            layout.validate_file(&file).unwrap();
+        }
+        for opened in [
+            FileStatus {
+                inode_id: InodeId::new(11),
+                ..file.clone()
+            },
+            FileStatus {
+                generation: Some(ContentGeneration::new(2)),
+                ..file.clone()
+            },
+            FileStatus { len: 17, ..file },
+        ] {
+            layout
+                .validate_file(&opened)
+                .expect_err("new layout must match the opened authority");
+        }
+    }
 }

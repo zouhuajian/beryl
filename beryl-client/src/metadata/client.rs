@@ -10,7 +10,7 @@ use crate::error::{
     invalid_response, side_effect_response_body_mismatch, ClientError, ClientErrorKind, ClientResult, RefreshHint,
 };
 use crate::metadata::{
-    AllocateBlockResult, GrpcMetadataTransport, ListStatusPage, OpenedFile, ReadLayout, ValidatedMetadataResponse,
+    AllocateBlockResult, GrpcMetadataTransport, ListStatusPage, ReadLayout, ValidatedMetadataResponse,
 };
 use crate::metrics;
 use crate::metrics::{ClientMetric, ClientMetricLabels};
@@ -25,7 +25,7 @@ use beryl_proto::metadata::get_block_locations_request_proto::Target;
 use beryl_proto::metadata::{
     AbortFileWriteRequestProto, AbortFileWriteResponseProto, AllocateBlockRequestProto, CommitFileRequestProto,
     CommitFileResponseProto, CreateDirectoryRequestProto, CreateDirectoryResponseProto, CreateFileRequestProto,
-    DeleteOptionsProto, DeleteRequestProto, FileTypeProto, GetBlockLocationsRequestProto, GetStatusRequestProto,
+    DeleteOptionsProto, DeleteRequestProto, GetBlockLocationsRequestProto, GetStatusRequestProto,
     GetStatusResponseProto, ListStatusRequestProto, ListStatusResponseProto, MsyncRequestProto, OpenFileRequestProto,
     OpenWriteModeProto, OpenWriteRequestProto, OpenWriteResponseProto, RenameRequestProto, RenewLeaseRequestProto,
     SyncWriteRequestProto,
@@ -146,7 +146,9 @@ impl MetadataClient {
                 transport.create_directory(ctx, req).await
             })
             .await?;
-        directory_status_from_response(path, response).map_err(|error| error.with_operation_context(&operation))
+        directory_status_from_response(path, response).map_err(|error| {
+            side_effect_response_body_mismatch("CreateDirectory", error).with_operation_context(&operation)
+        })
     }
 
     /// Encodes the explicit delete contract and submits it without transport replay.
@@ -192,8 +194,8 @@ impl MetadataClient {
         .map(|_| ())
     }
 
-    /// Captures inode, content generation, and length for subsequent authorized reads.
-    pub(crate) async fn open_file(&self, path: NamespacePathBuf) -> ClientResult<OpenedFile> {
+    /// Validates a file open and returns its authoritative inode status.
+    pub(crate) async fn open_file(&self, path: NamespacePathBuf) -> ClientResult<FileStatus> {
         let path = path.into_string();
         let operation = self.operation(Operation::OpenFile, Some(path.clone()), self.operation_deadline())?;
         let response = self
@@ -206,21 +208,11 @@ impl MetadataClient {
                 |transport, ctx, req| async move { transport.open_file(ctx, req).await },
             )
             .await?;
-        if response.inode_id == 0 {
-            return Err(invalid_response(
-                "OpenFile",
-                "OpenFileResponseProto.inode_id must be non-zero",
-            ));
+        let status = status_from_proto(path, response.status, "OpenFile")?;
+        if status.kind() != FileType::File {
+            return Err(invalid_response("OpenFile", "status must describe a file"));
         }
-        let generation = response
-            .generation
-            .ok_or_else(|| invalid_response("OpenFile", "OpenFileResponseProto.generation missing"))?;
-        Ok(OpenedFile::new(
-            path,
-            InodeId::new(response.inode_id),
-            ContentGeneration::new(generation),
-            response.file_size,
-        ))
+        Ok(status)
     }
 
     /// Reads an authoritative layout using the bounded read step's identity.
@@ -827,25 +819,27 @@ fn write_session_from_open_response(
     Ok(session)
 }
 
+fn status_from_proto(
+    path: String,
+    status: Option<beryl_proto::metadata::FileStatusProto>,
+    operation: &'static str,
+) -> ClientResult<FileStatus> {
+    let status = status.ok_or_else(|| invalid_response(operation, "status missing"))?;
+    let mut status = FileStatus::try_from(status).map_err(|err| invalid_response(operation, err))?;
+    status.path = Some(path);
+    Ok(status)
+}
+
 fn file_status_from_response(path: String, response: GetStatusResponseProto) -> ClientResult<FileStatus> {
-    let kind = file_type_from_wire("GetStatus", response.kind)?;
-    Ok(FileStatus::new(
-        path,
-        kind,
-        response.len,
-        response.create_time,
-        response.modify_time,
-    ))
+    status_from_proto(path, response.status, "GetStatus")
 }
 
 fn directory_status_from_response(path: String, response: CreateDirectoryResponseProto) -> ClientResult<FileStatus> {
-    Ok(FileStatus::new(
-        path,
-        FileType::Dir,
-        0,
-        response.create_time,
-        response.modify_time,
-    ))
+    let status = status_from_proto(path, response.status, "CreateDirectory")?;
+    if status.kind() != FileType::Dir {
+        return Err(invalid_response("CreateDirectory", "status must describe a directory"));
+    }
+    Ok(status)
 }
 
 /// Converts a successful wire page while enforcing its cursor/EOF invariant.
@@ -874,29 +868,14 @@ fn list_status_page_from_response(path: String, response: ListStatusResponseProt
                     format!("invalid direct-child name: {:?}", entry.name),
                 ));
             }
-            let kind = file_type_from_wire("ListStatus", entry.kind)?;
             let parent = path.trim_end_matches('/');
             let child_path = if parent.is_empty() {
                 format!("/{}", entry.name)
             } else {
                 format!("{parent}/{}", entry.name)
             };
-            Ok(FileStatus::new(
-                child_path,
-                kind,
-                entry.len,
-                entry.create_time,
-                entry.modify_time,
-            ))
+            status_from_proto(child_path, entry.status, "ListStatus")
         })
         .collect::<ClientResult<Vec<_>>>()?;
     Ok(ListStatusPage { entries, next_cursor })
-}
-
-/// Rejects unknown and UNSPECIFIED wire values before they enter the public status model.
-fn file_type_from_wire(operation: &'static str, raw: i32) -> ClientResult<FileType> {
-    let wire =
-        FileTypeProto::try_from(raw).map_err(|_| invalid_response(operation, format!("unknown inode kind: {raw}")))?;
-    wire.try_into()
-        .map_err(|error| invalid_response(operation, format!("invalid inode kind: {error}")))
 }

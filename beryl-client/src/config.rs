@@ -16,7 +16,7 @@ const DEFAULT_METADATA_ENDPOINT: &str = "127.0.0.1:18080";
 const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_ATTEMPTS: usize = 3;
 const DEFAULT_MAX_READ_STEP_BYTES: u32 = 8 * 1024 * 1024;
-const DEFAULT_READ_TO_END_LIMIT: u64 = 64 * 1024 * 1024;
+const DEFAULT_READ_RANGE_LIMIT: u64 = 64 * 1024 * 1024;
 const DEFAULT_LEASE_RENEWAL_THRESHOLD: Duration = Duration::from_secs(30);
 const DEFAULT_METADATA_CONNECTION_LIMIT: usize = 1;
 const DEFAULT_WORKER_CONNECTION_LIMIT: usize = 1;
@@ -27,7 +27,7 @@ const METADATA_ADDRESSES_KEY: &str = "beryl.client.metadata.addresses";
 const OPERATION_TIMEOUT_KEY: &str = "beryl.client.request.timeout";
 const MAX_ATTEMPTS_KEY: &str = "beryl.client.request.max-attempts";
 const MAX_READ_STEP_BYTES_KEY: &str = "beryl.client.read.max-request-bytes";
-const READ_TO_END_LIMIT_KEY: &str = "beryl.client.read.max-buffered-bytes";
+const READ_RANGE_LIMIT_KEY: &str = "beryl.client.read.max-range-bytes";
 const AUTOMATIC_LEASE_RENEWAL_KEY: &str = "beryl.client.write-lease.auto-renew";
 const LEASE_RENEWAL_THRESHOLD_KEY: &str = "beryl.client.write-lease.renew-before-expiry";
 const METADATA_CONNECTION_REUSE_KEY: &str = "beryl.client.metadata.connections.enabled";
@@ -48,7 +48,7 @@ pub struct ClientConfig {
     operation_timeout: Duration,
     max_attempts: usize,
     max_read_step_bytes: u32,
-    read_to_end_limit: u64,
+    read_range_limit: u64,
     automatic_lease_renewal: bool,
     lease_renewal_threshold: Duration,
     metadata_connection_reuse: bool,
@@ -91,7 +91,8 @@ impl ClientConfig {
         &self.metadata_endpoints
     }
 
-    /// Returns the absolute timeout budget for one public client operation.
+    /// Returns the budget for one client operation or one underlying stream read.
+    /// Stream combinators require a caller-controlled total timeout.
     pub fn operation_timeout(&self) -> Duration {
         self.operation_timeout
     }
@@ -106,9 +107,9 @@ impl ClientConfig {
         self.max_read_step_bytes
     }
 
-    /// Returns the maximum owned allocation accepted by `FileReader::read_to_end`.
-    pub fn read_to_end_limit(&self) -> u64 {
-        self.read_to_end_limit
+    /// Returns the maximum result size accepted by `FileReader::read_range`.
+    pub fn read_range_limit(&self) -> u64 {
+        self.read_range_limit
     }
 
     /// Returns whether writer operations automatically renew a near-expiry lease.
@@ -175,7 +176,7 @@ impl ClientConfig {
         }
         validate_positive(MAX_ATTEMPTS_KEY, self.max_attempts)?;
         validate_positive(MAX_READ_STEP_BYTES_KEY, self.max_read_step_bytes)?;
-        validate_positive(READ_TO_END_LIMIT_KEY, self.read_to_end_limit)?;
+        validate_positive(READ_RANGE_LIMIT_KEY, self.read_range_limit)?;
         validate_millisecond_duration(LEASE_RENEWAL_THRESHOLD_KEY, self.lease_renewal_threshold)?;
         validate_positive(METADATA_CONNECTION_LIMIT_KEY, self.metadata_connection_limit)?;
         validate_positive(WORKER_CONNECTION_LIMIT_KEY, self.worker_connection_limit)?;
@@ -217,8 +218,8 @@ impl ClientConfig {
             max_read_step_bytes: flat
                 .bytes_u32_or(MAX_READ_STEP_BYTES_KEY, defaults.max_read_step_bytes)
                 .map_err(config_value_error)?,
-            read_to_end_limit: flat
-                .bytes_u64_or(READ_TO_END_LIMIT_KEY, defaults.read_to_end_limit)
+            read_range_limit: flat
+                .bytes_u64_or(READ_RANGE_LIMIT_KEY, defaults.read_range_limit)
                 .map_err(config_value_error)?,
             automatic_lease_renewal: flat
                 .bool_or(AUTOMATIC_LEASE_RENEWAL_KEY, defaults.automatic_lease_renewal)
@@ -261,7 +262,7 @@ impl ClientConfig {
             operation_timeout: DEFAULT_OPERATION_TIMEOUT,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             max_read_step_bytes: DEFAULT_MAX_READ_STEP_BYTES,
-            read_to_end_limit: DEFAULT_READ_TO_END_LIMIT,
+            read_range_limit: DEFAULT_READ_RANGE_LIMIT,
             automatic_lease_renewal: true,
             lease_renewal_threshold: DEFAULT_LEASE_RENEWAL_THRESHOLD,
             metadata_connection_reuse: true,
@@ -317,9 +318,9 @@ impl ClientConfigBuilder {
         self
     }
 
-    /// Sets the maximum owned allocation accepted by `FileReader::read_to_end`.
-    pub fn read_to_end_limit(mut self, max_bytes: u64) -> Self {
-        self.config.read_to_end_limit = max_bytes;
+    /// Sets the maximum result size accepted by `FileReader::read_range`.
+    pub fn read_range_limit(mut self, max_bytes: u64) -> Self {
+        self.config.read_range_limit = max_bytes;
         self
     }
 
@@ -469,7 +470,7 @@ mod tests {
         flat.set(OPERATION_TIMEOUT_KEY, "12s");
         flat.set(MAX_ATTEMPTS_KEY, 5i64);
         flat.set(MAX_READ_STEP_BYTES_KEY, "4MiB");
-        flat.set(READ_TO_END_LIMIT_KEY, "32MiB");
+        flat.set(READ_RANGE_LIMIT_KEY, "32MiB");
         flat.set(AUTOMATIC_LEASE_RENEWAL_KEY, false);
         flat.set(LEASE_RENEWAL_THRESHOLD_KEY, "8s");
         flat.set(METADATA_CONNECTION_REUSE_KEY, false);
@@ -486,7 +487,7 @@ mod tests {
             .operation_timeout(Duration::from_secs(12))
             .max_attempts(5)
             .max_read_step_bytes(4 * 1024 * 1024)
-            .read_to_end_limit(32 * 1024 * 1024)
+            .read_range_limit(32 * 1024 * 1024)
             .automatic_lease_renewal(false)
             .lease_renewal_threshold(Duration::from_secs(8))
             .metadata_connection_reuse(false)
@@ -512,7 +513,7 @@ mod tests {
             ClientConfig::builder().operation_timeout(Duration::ZERO).build(),
             ClientConfig::builder().max_attempts(0).build(),
             ClientConfig::builder().max_read_step_bytes(0).build(),
-            ClientConfig::builder().read_to_end_limit(0).build(),
+            ClientConfig::builder().read_range_limit(0).build(),
             ClientConfig::builder().lease_renewal_threshold(Duration::ZERO).build(),
             ClientConfig::builder().metadata_connection_limit(0).build(),
             ClientConfig::builder().worker_connection_limit(0).build(),

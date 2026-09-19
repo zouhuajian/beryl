@@ -167,7 +167,7 @@ async fn metadata_signals_exit_cleanly_and_preserve_visible_data() {
             .open("/process-shutdown/visible")
             .await
             .expect("open visible file after restart")
-            .read_to_end()
+            .read_range(..)
             .await
             .expect("read visible file after restart");
         assert_eq!(actual, payload);

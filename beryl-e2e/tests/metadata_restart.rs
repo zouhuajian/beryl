@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use beryl_client::{ClientError, ClientErrorKind, FileStatus};
+use beryl_client::{ClientError, ClientErrorKind};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction};
 use beryl_common::header::RequestHeader;
 use beryl_e2e::data::deterministic_bytes;
@@ -43,13 +43,18 @@ async fn committed_visible_file_survives_metadata_restart() {
         .open(path)
         .await
         .expect("open before restart")
-        .read_to_end()
+        .read_range(..)
         .await;
     assert_eq!(before.expect("read before restart"), payload);
 
     cluster.restart_metadata().await.expect("restart metadata");
 
-    let after = client.open(path).await.expect("open after restart").read_to_end().await;
+    let after = client
+        .open(path)
+        .await
+        .expect("open after restart")
+        .read_range(..)
+        .await;
     assert_eq!(after.expect("read after restart"), payload);
     cluster.shutdown().await.expect("shutdown cluster");
 }
@@ -229,7 +234,7 @@ async fn existing_visible_data_remains_readable_while_active_write_fails_closed(
         .open(visible_path)
         .await
         .expect("open visible after restart")
-        .read_to_end()
+        .read_range(..)
         .await
         .expect("read visible after restart");
     assert_eq!(visible_after, visible);
@@ -429,7 +434,7 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
         .open(path)
         .await
         .expect("open restarted write")
-        .read_to_end()
+        .read_range(..)
         .await
         .expect("read restarted write");
     assert_eq!(read.as_ref(), payload.as_slice());
@@ -578,7 +583,7 @@ async fn tail_takeover_preserves_published_prefix_after_abort_or_metadata_restar
         let mut appender = client.append(path).await.unwrap();
         appender.write_all(suffix.clone()).await.unwrap();
         appender.close().await.unwrap();
-        let actual = client.open(path).await.unwrap().read_to_end().await.unwrap();
+        let actual = client.open(path).await.unwrap().read_range(..).await.unwrap();
         assert_eq!(actual.as_ref(), [prefix.as_ref(), suffix.as_ref()].concat());
         let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
             .await
@@ -654,7 +659,7 @@ async fn overwrite_sync_replay_keeps_the_append_phase_and_invalidates_fresh_read
     assert_metadata_ok(replay.header);
     assert_eq!(replay.generation, published.generation);
     assert!(
-        reader.read_at(0, &mut [0u8; 1]).await.is_err(),
+        reader.read_range(0..1).await.is_err(),
         "new layout invalidates the old generation"
     );
     target.write_offset = 3;
@@ -677,7 +682,7 @@ async fn overwrite_sync_replay_keeps_the_append_phase_and_invalidates_fresh_read
         .into_inner();
     assert_metadata_ok(committed.header);
     assert_eq!(
-        client.open(path).await.unwrap().read_to_end().await.unwrap(),
+        client.open(path).await.unwrap().read_range(..).await.unwrap(),
         b"newtail"[..]
     );
     cluster.shutdown().await.unwrap();
@@ -813,8 +818,8 @@ async fn write_worker_target(target: &LocatedBlockProto, payload: &[u8]) -> Test
 
 async fn assert_no_committed_bytes(cluster: &TestCluster, path: &str) -> TestResult<()> {
     match cluster.client().get_status(path).await {
-        Ok(FileStatus { len, .. }) => {
-            assert_eq!(len, 0, "{path} must not publish incomplete bytes");
+        Ok(status) => {
+            assert_eq!(status.len(), 0, "{path} must not publish incomplete bytes");
         }
         Err(err) => assert_not_found(&err),
     }
@@ -832,7 +837,7 @@ async fn assert_no_metadata_locations(cluster: &TestCluster, path: &str, len: u3
         .await?
         .into_inner();
     assert_metadata_ok(response.header);
-    assert_eq!(response.file_size, 0);
+    assert_eq!(response.status.unwrap().len, 0);
     assert!(response.locations.is_empty(), "{path} returned locations");
     Ok(())
 }

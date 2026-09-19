@@ -25,6 +25,7 @@ parking_lot = { workspace = true }
 metrics = { workspace = true }
 
 [dev-dependencies]
+tokio-util = { workspace = true, features = ["compat"] }
 tokio = { workspace = true, features = ["full", "test-util"] }
 tonic = { workspace = true, features = ["transport"] }
 tokio-stream = { version = "0.1", features = ["net"] }

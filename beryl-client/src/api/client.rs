@@ -122,10 +122,11 @@ impl FsClient {
         self.inner.metadata.rename(src, dst).await
     }
 
-    /// Opens an existing file for reads and returns a file reader.
-    ///
-    /// Existing files use the metadata-stored block capacity; there are no
-    /// public read-open options until they carry real behavior.
+    /// Opens a file using its current inode state, without querying Worker locations.
+    /// Locations are fetched when a non-empty read first needs them.
+    /// The reader fixes the observed inode, generation, and length. Cached locations
+    /// do not guarantee immediate detection of later changes or deletion, and do
+    /// not retain historical data.
     pub async fn open(&self, path: &str) -> ClientResult<FileReader> {
         let path = NamespacePathBuf::parse(path)?;
         let file = self.inner.metadata.open_file(path).await?;

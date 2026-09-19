@@ -29,7 +29,7 @@ use beryl_proto::worker::{
     WriteBlockResponseProto,
 };
 use bytes::Bytes;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use prost::Message;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
@@ -98,6 +98,7 @@ struct MetadataState {
     script: Mutex<MetadataScript>,
     calls: Mutex<Vec<MetadataCall>>,
     allocations: Mutex<Vec<AllocateBlockRequestProto>>,
+    layout_requests: Mutex<Vec<GetBlockLocationsRequestProto>>,
 }
 
 impl MockMetadata {
@@ -107,6 +108,7 @@ impl MockMetadata {
                 script: Mutex::new(script),
                 calls: Mutex::new(Vec::new()),
                 allocations: Mutex::new(Vec::new()),
+                layout_requests: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -117,6 +119,10 @@ impl MockMetadata {
 
     pub(crate) fn allocations(&self) -> Vec<AllocateBlockRequestProto> {
         self.state.allocations.lock().expect("allocation requests").clone()
+    }
+
+    pub(crate) fn layout_requests(&self) -> Vec<GetBlockLocationsRequestProto> {
+        self.state.layout_requests.lock().expect("layout requests").clone()
     }
 
     pub(crate) async fn start(&self) -> RunningServer {
@@ -287,6 +293,11 @@ impl FileSystemServiceProto for MockMetadata {
     ) -> Result<Response<GetBlockLocationsResponseProto>, Status> {
         let request = request.into_inner();
         let header = self.record("GetBlockLocations", request.header.as_ref())?;
+        self.state
+            .layout_requests
+            .lock()
+            .expect("layout requests")
+            .push(request);
         let reply = self
             .state
             .script
@@ -430,7 +441,17 @@ impl FileSystemServiceProto for MockMetadata {
 
 pub(crate) enum ReadReply {
     Data(Bytes),
+    Chunks(Vec<Result<Bytes, Status>>),
+    BlockedEnd {
+        data: Bytes,
+        started: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    },
     RefreshMetadata,
+    BlockedRefresh {
+        started: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    },
 }
 
 pub(crate) enum WriteReply {
@@ -453,6 +474,7 @@ pub(crate) struct MockWorker {
 struct WorkerState {
     script: Mutex<WorkerScript>,
     read_calls: AtomicUsize,
+    read_requests: Mutex<Vec<ReadBlockRequestProto>>,
     write_calls: AtomicUsize,
     write_data_frames: AtomicUsize,
     write_completions: AtomicUsize,
@@ -464,6 +486,7 @@ impl MockWorker {
             state: Arc::new(WorkerState {
                 script: Mutex::new(script),
                 read_calls: AtomicUsize::new(0),
+                read_requests: Mutex::new(Vec::new()),
                 write_calls: AtomicUsize::new(0),
                 write_data_frames: AtomicUsize::new(0),
                 write_completions: AtomicUsize::new(0),
@@ -473,6 +496,10 @@ impl MockWorker {
 
     pub(crate) fn read_calls(&self) -> usize {
         self.state.read_calls.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn read_requests(&self) -> Vec<ReadBlockRequestProto> {
+        self.state.read_requests.lock().expect("read requests").clone()
     }
 
     pub(crate) fn write_calls(&self) -> usize {
@@ -523,6 +550,11 @@ impl WorkerDataService for MockWorker {
     ) -> Result<Response<Self::ReadBlockStream>, Status> {
         self.state.read_calls.fetch_add(1, Ordering::SeqCst);
         let request = request.into_inner();
+        self.state
+            .read_requests
+            .lock()
+            .expect("read requests")
+            .push(request.clone());
         let reply = self
             .state
             .script
@@ -549,7 +581,27 @@ impl WorkerDataService for MockWorker {
                     Ok(ReadBlockChunkProto { data: bytes })
                 }))))
             }
+            ReadReply::Chunks(chunks) => Ok(Response::new(Box::pin(futures::stream::iter(
+                chunks
+                    .into_iter()
+                    .map(|chunk| chunk.map(|data| ReadBlockChunkProto { data })),
+            )))),
+            ReadReply::BlockedEnd { data, started, release } => {
+                let end = futures::stream::once(async move {
+                    let _ = started.send(());
+                    let _ = release.await;
+                })
+                .filter_map(|()| futures::future::ready(None));
+                Ok(Response::new(Box::pin(
+                    futures::stream::iter([Ok(ReadBlockChunkProto { data })]).chain(end),
+                )))
+            }
             ReadReply::RefreshMetadata => Err(worker_refresh_status(request.header.as_ref())),
+            ReadReply::BlockedRefresh { started, release } => {
+                let _ = started.send(());
+                release.await.map_err(|_| Status::cancelled("read gate dropped"))?;
+                Err(worker_refresh_status(request.header.as_ref()))
+            }
         }
     }
 

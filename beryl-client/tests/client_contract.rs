@@ -19,7 +19,9 @@ use beryl_proto::metadata::{
     RenewLeaseResponseProto, SyncWriteResponseProto, WriteHandleProto,
 };
 use bytes::Bytes;
+use futures::io::{AsyncReadExt, AsyncSeekExt};
 use std::collections::VecDeque;
+use std::io::SeekFrom;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use support::{
     MetadataCall, MetadataReply, MetadataScript, MockMetadata, MockWorker, ReadReply, ResponseAuthority, WorkerScript,
@@ -29,6 +31,300 @@ use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::{Code, Status};
 
 const WORKER_RUN_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+#[tokio::test]
+async fn malformed_directory_status_reports_unknown_outcome_without_replaying_creation() {
+    let metadata = MockMetadata::new(MetadataScript {
+        create_directory: VecDeque::from([
+            MetadataReply::success(CreateDirectoryResponseProto::default()),
+            MetadataReply::success(CreateDirectoryResponseProto {
+                status: Some(file_status(2, 0)),
+                ..Default::default()
+            }),
+        ]),
+        ..Default::default()
+    });
+    let server = metadata.start().await;
+    let client = FsClient::new(client_config(server.endpoint(), 3)).unwrap();
+    for create_parent in [false, true] {
+        let before = metadata.calls().len();
+        let error = client
+            .mkdirs_with_options("/directory", MkdirOptions { create_parent })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::InvalidResponse);
+        assert!(error.is_outcome_unknown());
+        assert_eq!(metadata.calls().len(), before + 1);
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn reader_queries_actual_ranges_reuses_locations_and_refreshes_failures() {
+    let worker = MockWorker::new(WorkerScript {
+        reads: VecDeque::from([
+            ReadReply::Data(Bytes::from_static(b"abcdefgh")),
+            ReadReply::Data(Bytes::from_static(b"abcdefgh")),
+            ReadReply::RefreshMetadata,
+            ReadReply::Data(Bytes::from_static(b"abcdefgh")),
+            ReadReply::Data(Bytes::from_static(b"ABCDEFGH")),
+        ]),
+        ..Default::default()
+    });
+    let worker_server = worker.start().await;
+    let tail = block_location(202, 1, 8, 8, worker_server.endpoint());
+    let opened = open_file_response(202, 16);
+    let mut changed = locations_response(202, 16, tail.clone());
+    changed.status.as_mut().unwrap().generation = Some(4);
+    let metadata = MockMetadata::new(MetadataScript {
+        open_file: VecDeque::from([MetadataReply::success(opened)]),
+        get_block_locations: VecDeque::from([
+            MetadataReply::success(locations_response(202, 16, tail.clone())),
+            MetadataReply::success(locations_response(202, 16, tail)),
+            MetadataReply::success(locations_response(
+                202,
+                16,
+                block_location(202, 0, 0, 8, worker_server.endpoint()),
+            )),
+            MetadataReply::success(changed),
+        ]),
+        ..Default::default()
+    });
+    let server = metadata.start().await;
+    let client = FsClient::new(client_config(server.endpoint(), 2)).unwrap();
+    let mut reader = client.open("/file").await.unwrap();
+    assert_eq!(metadata.calls().len(), 1);
+    assert!(calls_for(&metadata.calls(), "GetBlockLocations").is_empty());
+    assert_eq!(reader.status().inode_id().as_raw(), 202);
+    let mut bytes = [0; 3];
+    assert_eq!(reader.read_range(10..13).await.unwrap(), b"cde"[..]);
+    assert_eq!(reader.read_range(13..).await.unwrap(), b"fgh"[..]);
+    assert_eq!(calls_for(&metadata.calls(), "GetBlockLocations").len(), 1);
+    assert_eq!(reader.read_range(9..12).await.unwrap(), b"bcd"[..]);
+    assert_eq!(calls_for(&metadata.calls(), "GetBlockLocations").len(), 2);
+    assert_eq!(reader.read(&mut bytes).await.unwrap(), 3);
+    assert_eq!(&bytes, b"ABC");
+    assert_eq!(reader.position(), 3);
+    let reads = worker.read_calls();
+    let error = reader
+        .read_range(10..13)
+        .await
+        .expect_err("refreshed generation must match open");
+    assert!(error.message().contains("generation mismatch"));
+    assert_eq!(worker.read_calls(), reads, "changed generation must not reach Worker");
+    assert_eq!(reader.position(), 3);
+    let requests = metadata.layout_requests();
+    let ranges: Vec<_> = requests
+        .iter()
+        .map(|request| {
+            assert_eq!(
+                request.target,
+                Some(beryl_proto::metadata::get_block_locations_request_proto::Target::InodeId(202))
+            );
+            let range = request.range.as_ref().unwrap();
+            (range.offset, range.len)
+        })
+        .collect();
+    assert_eq!(ranges, [(10, 1), (9, 1), (0, 1), (10, 1)]);
+    server.shutdown().await;
+    worker_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn successful_worker_retry_preserves_layout() {
+    let data = Bytes::from_static(b"abcdefgh");
+    let worker = MockWorker::new(WorkerScript {
+        reads: VecDeque::from([
+            ReadReply::Data(data.clone()),
+            ReadReply::Chunks(vec![Err(Status::unavailable("transient Worker failure"))]),
+            ReadReply::Data(data.clone()),
+            ReadReply::Data(data),
+        ]),
+        ..Default::default()
+    });
+    let worker_server = worker.start().await;
+    let metadata = MockMetadata::new(MetadataScript {
+        open_file: VecDeque::from([MetadataReply::success(open_file_response(202, 8))]),
+        get_block_locations: VecDeque::from([MetadataReply::success(locations_response(
+            202,
+            8,
+            block_location(202, 0, 0, 8, worker_server.endpoint()),
+        ))]),
+        ..Default::default()
+    });
+    let server = metadata.start().await;
+    let client = FsClient::new(client_config(server.endpoint(), 2)).unwrap();
+    let reader = client.open("/file").await.unwrap();
+    assert_eq!(reader.read_range(0..1).await.unwrap(), b"a"[..]);
+    assert_eq!(reader.read_range(1..2).await.unwrap(), b"b"[..]);
+    assert_eq!(reader.read_range(2..3).await.unwrap(), b"c"[..]);
+    assert_eq!(
+        metadata.layout_requests().len(),
+        1,
+        "successful retry retains its layout"
+    );
+    assert_eq!(worker.read_calls(), 4);
+    server.shutdown().await;
+    worker_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn exhausted_transport_retries_allow_the_next_read_to_find_a_replacement() {
+    let data = Bytes::from_static(b"abcdefgh");
+    let old_worker = MockWorker::new(WorkerScript {
+        reads: VecDeque::from([
+            ReadReply::Data(data.clone()),
+            ReadReply::Chunks(vec![Err(Status::unavailable("old endpoint is unreachable"))]),
+        ]),
+        ..Default::default()
+    });
+    let old_server = old_worker.start().await;
+    let new_worker = MockWorker::new(WorkerScript {
+        reads: VecDeque::from([ReadReply::Data(data)]),
+        ..Default::default()
+    });
+    let new_server = new_worker.start().await;
+    let metadata = MockMetadata::new(MetadataScript {
+        open_file: VecDeque::from([MetadataReply::success(open_file_response(202, 8))]),
+        get_block_locations: [old_server.endpoint(), new_server.endpoint()]
+            .into_iter()
+            .map(|endpoint| MetadataReply::success(locations_response(202, 8, block_location(202, 0, 0, 8, endpoint))))
+            .collect(),
+        ..Default::default()
+    });
+    let server = metadata.start().await;
+    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    let reader = client.open("/file").await.unwrap();
+    assert_eq!(reader.read_range(0..1).await.unwrap(), b"a"[..]);
+    assert_eq!(
+        reader.read_range(1..2).await.unwrap_err().kind(),
+        ClientErrorKind::Unavailable
+    );
+    assert_eq!(reader.read_range(2..3).await.unwrap(), b"c"[..]);
+    assert_eq!(metadata.layout_requests().len(), 2);
+    assert_eq!(old_worker.read_calls(), 2);
+    assert_eq!(new_worker.read_calls(), 1);
+    server.shutdown().await;
+    old_server.shutdown().await;
+    new_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn stale_worker_location_is_evicted_even_on_the_final_attempt() {
+    let data = Bytes::from_static(b"abcdefgh");
+    let worker = MockWorker::new(WorkerScript {
+        reads: VecDeque::from([
+            ReadReply::Data(data.clone()),
+            ReadReply::RefreshMetadata,
+            ReadReply::Data(data),
+        ]),
+        ..Default::default()
+    });
+    let worker_server = worker.start().await;
+    let layout = locations_response(202, 8, block_location(202, 0, 0, 8, worker_server.endpoint()));
+    let metadata = MockMetadata::new(MetadataScript {
+        open_file: VecDeque::from([MetadataReply::success(open_file_response(202, 8))]),
+        get_block_locations: VecDeque::from([MetadataReply::success(layout.clone()), MetadataReply::success(layout)]),
+        ..Default::default()
+    });
+    let server = metadata.start().await;
+    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    let reader = client.open("/file").await.unwrap();
+    assert_eq!(reader.read_range(0..1).await.unwrap(), b"a"[..]);
+    reader
+        .read_range(1..2)
+        .await
+        .expect_err("stale location exhausts the only attempt");
+    assert_eq!(reader.read_range(2..3).await.unwrap(), b"c"[..]);
+    assert_eq!(
+        metadata.layout_requests().len(),
+        2,
+        "next read must query a fresh layout"
+    );
+    server.shutdown().await;
+    worker_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn old_failed_read_preserves_concurrently_replaced_layout() {
+    let (started, waiting) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let worker = MockWorker::new(WorkerScript {
+        reads: VecDeque::from([
+            ReadReply::BlockedRefresh {
+                started,
+                release: released,
+            },
+            ReadReply::Data(Bytes::from_static(b"abcdefgh")),
+            ReadReply::Data(Bytes::from_static(b"abcdefgh")),
+        ]),
+        ..Default::default()
+    });
+    let worker_server = worker.start().await;
+    let metadata = MockMetadata::new(MetadataScript {
+        open_file: VecDeque::from([MetadataReply::success(open_file_response(202, 16))]),
+        get_block_locations: VecDeque::from([
+            MetadataReply::success(locations_response(
+                202,
+                16,
+                block_location(202, 0, 0, 8, worker_server.endpoint()),
+            )),
+            MetadataReply::success(locations_response(
+                202,
+                16,
+                block_location(202, 1, 8, 8, worker_server.endpoint()),
+            )),
+        ]),
+        ..Default::default()
+    });
+    let server = metadata.start().await;
+    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    let reader = client.open("/file").await.unwrap();
+    let old_read = async { reader.read_range(0..1).await };
+    let replace_layout = async {
+        waiting.await.unwrap();
+        assert_eq!(reader.read_range(8..9).await.unwrap(), b"a"[..]);
+        release.send(()).unwrap();
+    };
+    let (failed, ()) = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(old_read, replace_layout) })
+        .await
+        .expect("controlled reads finish");
+    failed.expect_err("old Worker request must fail");
+    assert_eq!(reader.read_range(9..10).await.unwrap(), b"b"[..]);
+    assert_eq!(
+        metadata.layout_requests().len(),
+        2,
+        "the replacement layout must remain cached"
+    );
+    assert_eq!(reader.position(), 0);
+    server.shutdown().await;
+    worker_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn open_rejects_missing_file_state_and_directory_status() {
+    let mut missing = open_file_response(202, 8);
+    missing.status = None;
+    let mut missing_generation = open_file_response(202, 8);
+    missing_generation.status.as_mut().unwrap().generation = None;
+    let mut directory = open_file_response(202, 0);
+    directory.status.as_mut().unwrap().kind = FileTypeProto::FileTypeDir as i32;
+    directory.status.as_mut().unwrap().generation = None;
+    let metadata = MockMetadata::new(MetadataScript {
+        open_file: VecDeque::from([missing, missing_generation, directory].map(MetadataReply::success)),
+        ..Default::default()
+    });
+    let server = metadata.start().await;
+    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    for _ in 0..3 {
+        client
+            .open("/file")
+            .await
+            .expect_err("invalid open response must fail closed");
+    }
+    assert_eq!(metadata.calls().len(), 3);
+    server.shutdown().await;
+}
 
 #[tokio::test]
 async fn list_status_validates_options_and_drains_the_final_page() {
@@ -49,8 +345,7 @@ async fn list_status_validates_options_and_drains_the_final_page() {
             MetadataReply::success(ListStatusResponseProto {
                 entries: vec![DirEntryProto {
                     name: "first".into(),
-                    kind: FileTypeProto::FileTypeFile as i32,
-                    ..Default::default()
+                    status: Some(file_status(1, 0)),
                 }],
                 next_cursor: vec![1],
                 eof: false,
@@ -60,8 +355,7 @@ async fn list_status_validates_options_and_drains_the_final_page() {
             MetadataReply::success(ListStatusResponseProto {
                 entries: vec![DirEntryProto {
                     name: "last".into(),
-                    kind: FileTypeProto::FileTypeFile as i32,
-                    ..Default::default()
+                    status: Some(file_status(1, 0)),
                 }],
                 eof: true,
                 ..Default::default()
@@ -72,9 +366,9 @@ async fn list_status_validates_options_and_drains_the_final_page() {
     let server = metadata.start().await;
     let client = FsClient::new(client_config(server.endpoint(), 1)).expect("client");
     let mut entries = client.list_status("/alpha").await.expect("first page");
-    assert_eq!(entries.next().await.unwrap().unwrap().path(), "/alpha/first");
+    assert_eq!(entries.next().await.unwrap().unwrap().path(), Some("/alpha/first"));
     entries.next().await.expect_err("failed page remains retryable");
-    assert_eq!(entries.next().await.unwrap().unwrap().path(), "/alpha/last");
+    assert_eq!(entries.next().await.unwrap().unwrap().path(), Some("/alpha/last"));
     let calls = metadata.calls().len();
     assert!(entries.next().await.unwrap().is_none());
     assert!(entries.next().await.unwrap().is_none());
@@ -100,7 +394,8 @@ async fn metadata_read_retries_reuse_one_identity_and_deadline() {
     let client = FsClient::new(client_config(server.endpoint(), 3)).expect("client");
 
     let status = client.get_status("/alpha").await.expect("third attempt succeeds");
-    assert_eq!(status.len, 10);
+    assert_eq!(status.len(), 10);
+    assert_eq!(status.path(), Some("/alpha"));
 
     let calls = metadata.calls();
     assert_methods(&calls, &["GetStatus", "GetStatus", "GetStatus"]);
@@ -118,8 +413,13 @@ async fn metadata_mutations_retry_only_when_the_public_operation_is_replayable()
         create_directory: VecDeque::from([
             MetadataReply::status(Status::unavailable("recursive CreateDirectory transport ambiguity")),
             MetadataReply::success(CreateDirectoryResponseProto {
-                create_time: 11,
-                modify_time: 12,
+                status: Some(beryl_proto::metadata::FileStatusProto {
+                    inode_id: 2,
+                    kind: FileTypeProto::FileTypeDir as i32,
+                    create_time: 11,
+                    modify_time: 12,
+                    ..Default::default()
+                }),
                 ..CreateDirectoryResponseProto::default()
             }),
             MetadataReply::status(Status::unavailable("non-recursive CreateDirectory transport ambiguity")),
@@ -263,7 +563,7 @@ async fn reader_replans_without_advancing_position_and_rejects_local_bounds_befo
         .metadata_endpoints([metadata_server.endpoint()])
         .max_attempts(2)
         .max_read_step_bytes(3)
-        .read_to_end_limit(8)
+        .read_range_limit(8)
         .build()
         .expect("reader config");
     let client = FsClient::new(config).expect("client");
@@ -279,9 +579,7 @@ async fn reader_replans_without_advancing_position_and_rejects_local_bounds_befo
     assert_eq!(layout_calls.len(), 2);
     assert_same_identity_and_deadline(&layout_calls);
 
-    let mut positioned = [0u8; 3];
-    assert_eq!(reader.read_at(4, &mut positioned).await.expect("positioned read"), 3);
-    assert_eq!(&positioned, b"efg");
+    assert_eq!(reader.read_range(4..7).await.expect("positioned read"), b"efg"[..]);
     assert_eq!(reader.position(), 3);
 
     let before_cached_read = metadata.calls().len();
@@ -294,19 +592,16 @@ async fn reader_replans_without_advancing_position_and_rejects_local_bounds_befo
 
     let metadata_before_eof = metadata.calls().len();
     let worker_before_eof = worker.read_calls();
-    let error = reader
-        .read_exact_at(8, &mut [0u8; 1])
-        .await
-        .expect_err("exact read beyond EOF");
+    let error = reader.read_range(8..9).await.expect_err("exact read beyond EOF");
     assert_client_error(&error, ClientErrorKind::UnexpectedEof, false, "opened file length");
     assert_eq!(metadata.calls().len(), metadata_before_eof);
     assert_eq!(worker.read_calls(), worker_before_eof);
 
-    let mut oversized = client.open("/oversized").await.expect("open oversized reader");
+    let oversized = client.open("/oversized").await.expect("open oversized reader");
     let metadata_before_bound = metadata.calls().len();
     let worker_before_bound = worker.read_calls();
-    let error = oversized.read_to_end().await.expect_err("read_to_end bound");
-    assert_client_error(&error, ClientErrorKind::InvalidArgument, false, "read_to_end maximum");
+    let error = oversized.read_range(..).await.expect_err("read_range bound");
+    assert_client_error(&error, ClientErrorKind::InvalidArgument, false, "read_range maximum");
     assert_eq!(metadata.calls().len(), metadata_before_bound);
     assert_eq!(worker.read_calls(), worker_before_bound);
 
@@ -602,6 +897,408 @@ async fn allocation_replay_and_worker_capacity_retries_keep_the_same_block() {
     worker_server.shutdown().await;
 }
 
+#[tokio::test]
+async fn empty_ranges_bounds_and_local_seeks_do_not_perform_io() {
+    use std::ops::Bound;
+    let metadata = MockMetadata::new(MetadataScript {
+        open_file: [open_file_response(202, 16), open_file_response(203, 0)]
+            .into_iter()
+            .map(MetadataReply::success)
+            .collect(),
+        ..Default::default()
+    });
+    let server = metadata.start().await;
+    let config = ClientConfig::builder()
+        .metadata_endpoints([server.endpoint()])
+        .read_range_limit(8)
+        .build()
+        .unwrap();
+    let client = FsClient::new(config).unwrap();
+    let mut reader = client.open("/file").await.unwrap();
+    for range in [0..0, 4..4, 16..16] {
+        assert!(reader.read_range(range).await.unwrap().is_empty());
+    }
+    assert_eq!(
+        reader.read_range(..).await.unwrap_err().kind(),
+        ClientErrorKind::InvalidArgument
+    );
+    assert_eq!(
+        reader.read_range(16..17).await.unwrap_err().kind(),
+        ClientErrorKind::UnexpectedEof
+    );
+    assert_eq!(
+        reader
+            .read_range((Bound::Included(4), Bound::Excluded(3)))
+            .await
+            .unwrap_err()
+            .kind(),
+        ClientErrorKind::InvalidArgument
+    );
+    assert_eq!(
+        reader.read_range(..=u64::MAX).await.unwrap_err().kind(),
+        ClientErrorKind::InvalidArgument
+    );
+    assert_eq!(reader.read(&mut []).await.unwrap(), 0);
+    assert_eq!(reader.seek(SeekFrom::End(-3)).await.unwrap(), 13);
+    assert_eq!(
+        reader.seek(SeekFrom::Current(-14)).await.unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(reader.position(), 13);
+    reader.seek(SeekFrom::Start(u64::MAX)).await.unwrap();
+    assert_eq!(
+        reader.seek(SeekFrom::Current(1)).await.unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    let mut byte = [42];
+    assert_eq!(reader.read(&mut byte).await.unwrap(), 0);
+    assert_eq!(byte, [42]);
+    assert_eq!(reader.position(), u64::MAX);
+    let mut empty = client.open("/empty").await.unwrap();
+    assert!(empty.read_range(..).await.unwrap().is_empty());
+    assert_eq!(empty.read(&mut byte).await.unwrap(), 0);
+    assert_eq!(metadata.calls().len(), 2);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn cold_and_warm_streams_deliver_current_block_before_later_failure() {
+    for warm in [false, true] {
+        for operation in ["read_exact", "read_to_end", "read_range"] {
+            let worker = MockWorker::new(WorkerScript {
+                reads: (0..if warm { 2 } else { 1 })
+                    .map(|_| ReadReply::Data(Bytes::from_static(b"abcd")))
+                    .collect(),
+                ..Default::default()
+            });
+            let worker_server = worker.start().await;
+            let metadata = MockMetadata::new(MetadataScript {
+                open_file: VecDeque::from([MetadataReply::success(open_file_response(202, 8))]),
+                get_block_locations: VecDeque::from([
+                    MetadataReply::success(locations_response(
+                        202,
+                        8,
+                        block_location(202, 0, 0, 4, worker_server.endpoint()),
+                    )),
+                    MetadataReply::status(Status::unavailable("later block unavailable")),
+                ]),
+                ..Default::default()
+            });
+            let server = metadata.start().await;
+            let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+            let mut reader = client.open("/file").await.unwrap();
+            if warm {
+                assert_eq!(reader.read_range(..=0).await.unwrap(), b"a"[..]);
+            }
+            let error = if operation == "read_exact" {
+                let mut output = [0; 8];
+                let error = reader.read_exact(&mut output).await.unwrap_err();
+                assert_eq!(&output[..4], b"abcd");
+                assert_eq!(&output[4..], &[0; 4]);
+                error
+            } else if operation == "read_range" {
+                std::io::Error::from(reader.read_range(..).await.unwrap_err())
+            } else {
+                let mut output = Vec::new();
+                let error = reader.read_to_end(&mut output).await.unwrap_err();
+                assert_eq!(output, b"abcd");
+                error
+            };
+            assert_eq!(reader.position(), if operation == "read_range" { 0 } else { 4 });
+            assert_eq!(
+                error.get_ref().unwrap().downcast_ref::<ClientError>().unwrap().kind(),
+                ClientErrorKind::Unavailable
+            );
+            let requests = worker.read_requests();
+            let range = requests.last().unwrap().byte_range.as_ref().unwrap();
+            assert_eq!((range.offset, range.len), (0, 4));
+            assert_eq!(
+                metadata
+                    .layout_requests()
+                    .iter()
+                    .map(|r| (r.range.as_ref().unwrap().offset, r.range.as_ref().unwrap().len))
+                    .collect::<Vec<_>>(),
+                [(0, 1), (4, 1)]
+            );
+            server.shutdown().await;
+            worker_server.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancelled_waits_retain_io_and_bytes_while_seek_and_drop_release_them() {
+    let (started, waiting) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let (seek_started, seek_waiting) = tokio::sync::oneshot::channel();
+    let (mut seek_release, seek_released) = tokio::sync::oneshot::channel();
+    let (drop_started, drop_waiting) = tokio::sync::oneshot::channel();
+    let (mut drop_release, drop_released) = tokio::sync::oneshot::channel();
+    let worker = MockWorker::new(WorkerScript {
+        reads: VecDeque::from([
+            ReadReply::BlockedEnd {
+                data: Bytes::from_static(b"abcd"),
+                started,
+                release: released,
+            },
+            ReadReply::BlockedEnd {
+                data: Bytes::from_static(b"abcd"),
+                started: seek_started,
+                release: seek_released,
+            },
+            ReadReply::Data(Bytes::from_static(b"abcdefgh")),
+            ReadReply::BlockedEnd {
+                data: Bytes::from_static(b"abcd"),
+                started: drop_started,
+                release: drop_released,
+            },
+        ]),
+        ..Default::default()
+    });
+    let worker_server = worker.start().await;
+    let metadata = MockMetadata::new(MetadataScript {
+        open_file: VecDeque::from([MetadataReply::success(open_file_response(202, 8))]),
+        get_block_locations: VecDeque::from([MetadataReply::success(locations_response(
+            202,
+            8,
+            block_location(202, 0, 0, 8, worker_server.endpoint()),
+        ))]),
+        ..Default::default()
+    });
+    let server = metadata.start().await;
+    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    let mut reader = client.open("/file").await.unwrap();
+    let mut output = [42; 4];
+    tokio::select! {
+        result = reader.read(&mut output) => panic!("must wait for normal stream end: {result:?}"),
+        result = waiting => result.unwrap(),
+    }
+    assert_eq!(output, [42; 4]);
+    assert_eq!(reader.position(), 0);
+    assert_eq!(
+        reader.seek(SeekFrom::Current(-1)).await.unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    let mut small = [0; 2];
+    assert!(futures::poll!(reader.read(&mut small)).is_pending());
+    assert_eq!(worker.read_calls(), 1);
+    release.send(()).unwrap();
+    assert_eq!(reader.read(&mut small).await.unwrap(), 2);
+    assert_eq!(&small, b"ab");
+    assert_eq!(reader.position(), 2);
+    assert_eq!(
+        reader.seek(SeekFrom::End(-9)).await.unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    let mut byte = [0];
+    assert_eq!(reader.read(&mut byte).await.unwrap(), 1);
+    assert_eq!(&byte, b"c");
+    assert_eq!(reader.position(), 3);
+    assert_eq!(worker.read_calls(), 1, "remaining owned bytes need no further IO");
+    // One unconsumed byte remains; the following seek must discard it.
+
+    reader.seek(SeekFrom::Start(0)).await.unwrap();
+    tokio::select! {
+        result = reader.read(&mut output) => panic!("must remain pending: {result:?}"),
+        result = seek_waiting => result.unwrap(),
+    }
+    reader.seek(SeekFrom::Start(6)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), seek_release.closed())
+        .await
+        .unwrap();
+    reader.read_exact(&mut small).await.unwrap();
+    assert_eq!(&small, b"gh");
+    assert_eq!(reader.position(), 8);
+    assert_eq!(worker.read_calls(), 3);
+
+    reader.seek(SeekFrom::Start(0)).await.unwrap();
+    tokio::select! {
+        result = reader.read(&mut output) => panic!("must remain pending: {result:?}"),
+        result = drop_waiting => result.unwrap(),
+    }
+    drop(reader);
+    tokio::time::timeout(Duration::from_secs(2), drop_release.closed())
+        .await
+        .unwrap();
+    assert_eq!(
+        metadata.layout_requests().len(),
+        1,
+        "seek is local and preserves layout cache"
+    );
+    server.shutdown().await;
+    worker_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn malformed_worker_streams_never_deliver_data_or_eof() {
+    for (chunks, expected) in [
+        (vec![], ClientErrorKind::InvalidResponse),
+        (vec![Ok(Bytes::from_static(b"abc"))], ClientErrorKind::InvalidResponse),
+        (vec![Ok(Bytes::from_static(b"abcde"))], ClientErrorKind::InvalidResponse),
+        (vec![Ok(Bytes::new())], ClientErrorKind::InvalidResponse),
+        (
+            vec![Ok(Bytes::from_static(b"abcd")), Ok(Bytes::from_static(b"e"))],
+            ClientErrorKind::InvalidResponse,
+        ),
+        (
+            vec![Ok(Bytes::from_static(b"abcd")), Err(Status::cancelled("abnormal end"))],
+            ClientErrorKind::Cancelled,
+        ),
+    ] {
+        let worker = MockWorker::new(WorkerScript {
+            reads: VecDeque::from([ReadReply::Chunks(chunks)]),
+            ..Default::default()
+        });
+        let worker_server = worker.start().await;
+        let metadata = MockMetadata::new(MetadataScript {
+            open_file: VecDeque::from([MetadataReply::success(open_file_response(202, 4))]),
+            get_block_locations: VecDeque::from([MetadataReply::success(locations_response(
+                202,
+                4,
+                block_location(202, 0, 0, 4, worker_server.endpoint()),
+            ))]),
+            ..Default::default()
+        });
+        let server = metadata.start().await;
+        let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+        let mut reader = client.open("/file").await.unwrap();
+        let mut output = [42; 4];
+        let error = reader.read(&mut output).await.unwrap_err();
+        assert_eq!(
+            error.get_ref().unwrap().downcast_ref::<ClientError>().unwrap().kind(),
+            expected
+        );
+        assert!(!matches!(
+            error.kind(),
+            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(output, [42; 4]);
+        assert_eq!(reader.position(), 0);
+        assert_eq!(worker.read_calls(), 1);
+        server.shutdown().await;
+        worker_server.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn complete_range_shares_deadline_across_chunks_and_retries() {
+    let worker = MockWorker::new(WorkerScript {
+        reads: VecDeque::from([
+            ReadReply::Chunks(vec![Ok(Bytes::from_static(b"a")), Ok(Bytes::from_static(b"bc"))]),
+            ReadReply::RefreshMetadata,
+            ReadReply::Data(Bytes::from_static(b"abcd")),
+            ReadReply::Data(Bytes::from_static(b"efgh")),
+            ReadReply::Data(Bytes::from_static(b"efgh")),
+        ]),
+        ..Default::default()
+    });
+    let worker_server = worker.start().await;
+    let metadata = MockMetadata::new(MetadataScript {
+        open_file: VecDeque::from([MetadataReply::success(open_file_response(202, 8))]),
+        get_block_locations: [0, 0, 4]
+            .into_iter()
+            .map(|offset| {
+                MetadataReply::success(locations_response(
+                    202,
+                    8,
+                    block_location(202, (offset / 4) as u32, offset, 4, worker_server.endpoint()),
+                ))
+            })
+            .collect(),
+        ..Default::default()
+    });
+    let server = metadata.start().await;
+    let config = ClientConfig::builder()
+        .metadata_endpoints([server.endpoint()])
+        .max_read_step_bytes(3)
+        .max_attempts(2)
+        .build()
+        .unwrap();
+    let client = FsClient::new(config).unwrap();
+    let reader = client.open("/file").await.unwrap();
+    assert_eq!(reader.read_range(..).await.unwrap(), b"abcdefgh"[..]);
+    assert_eq!(reader.position(), 0);
+    let requests = worker.read_requests();
+    assert_eq!(requests.len(), 5);
+    let deadline = metadata.layout_requests()[0].header.as_ref().unwrap().deadline_ms;
+    for request in &requests {
+        assert_eq!(request.group_name, "root");
+        assert!(request.byte_range.as_ref().unwrap().len <= 3);
+    }
+    for request in metadata.layout_requests() {
+        assert_eq!(request.header.unwrap().deadline_ms, deadline);
+    }
+    server.shutdown().await;
+    worker_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelling_a_wait_does_not_reset_its_deadline() {
+    let (started, waiting) = tokio::sync::oneshot::channel();
+    let (mut release, released) = tokio::sync::oneshot::channel();
+    let worker = MockWorker::new(WorkerScript {
+        reads: VecDeque::from([
+            ReadReply::BlockedEnd {
+                data: Bytes::from_static(b"abcd"),
+                started,
+                release: released,
+            },
+            ReadReply::Data(Bytes::from_static(b"abcd")),
+        ]),
+        ..Default::default()
+    });
+    let worker_server = worker.start().await;
+    let metadata = MockMetadata::new(MetadataScript {
+        open_file: VecDeque::from([MetadataReply::success(open_file_response(202, 4))]),
+        get_block_locations: (0..2)
+            .map(|_| {
+                MetadataReply::success(locations_response(
+                    202,
+                    4,
+                    block_location(202, 0, 0, 4, worker_server.endpoint()),
+                ))
+            })
+            .collect(),
+        ..Default::default()
+    });
+    let server = metadata.start().await;
+    let config = ClientConfig::builder()
+        .metadata_endpoints([server.endpoint()])
+        .operation_timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let client = FsClient::new(config).unwrap();
+    let mut reader = client.open("/file").await.unwrap();
+    let mut output = [42; 4];
+    tokio::select! {
+        result = reader.read(&mut output) => panic!("must remain pending: {result:?}"),
+        result = waiting => result.unwrap(),
+    }
+    let deadline = metadata.layout_requests()[0].header.as_ref().unwrap().deadline_ms as u64;
+    tokio::time::sleep(Duration::from_millis(deadline.saturating_sub(unix_now_ms()) + 25)).await;
+    let error = reader.read(&mut output).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(
+        error.get_ref().unwrap().downcast_ref::<ClientError>().unwrap().kind(),
+        ClientErrorKind::Timeout
+    );
+    assert_eq!(reader.position(), 0);
+    assert_eq!(output, [42; 4]);
+    assert_eq!(worker.read_calls(), 1);
+    tokio::time::timeout(Duration::from_secs(2), release.closed())
+        .await
+        .unwrap();
+    reader.read_exact(&mut output).await.unwrap();
+    assert_eq!(&output, b"abcd");
+    assert_eq!(
+        metadata.layout_requests().len(),
+        2,
+        "deadline exhaustion allows a fresh layout"
+    );
+    server.shutdown().await;
+    worker_server.shutdown().await;
+}
+
 fn client_config(metadata_endpoint: &str, max_attempts: usize) -> ClientConfig {
     ClientConfig::builder()
         .client_name("public-client-contract")
@@ -614,10 +1311,7 @@ fn client_config(metadata_endpoint: &str, max_attempts: usize) -> ClientConfig {
 
 fn status_response(size: u64) -> GetStatusResponseProto {
     GetStatusResponseProto {
-        len: size,
-        create_time: 11,
-        modify_time: 12,
-        kind: FileTypeProto::FileTypeFile as i32,
+        status: Some(file_status(1, size)),
         ..GetStatusResponseProto::default()
     }
 }
@@ -634,9 +1328,7 @@ fn create_response(inode_id: u64, block_size: u32) -> CreateFileResponseProto {
 
 fn open_file_response(inode_id: u64, file_size: u64) -> OpenFileResponseProto {
     OpenFileResponseProto {
-        inode_id,
-        file_size,
-        generation: Some(3),
+        status: Some(file_status(inode_id, file_size)),
         ..OpenFileResponseProto::default()
     }
 }
@@ -647,10 +1339,8 @@ fn locations_response(
     location: FileBlockLocationProto,
 ) -> GetBlockLocationsResponseProto {
     GetBlockLocationsResponseProto {
-        inode_id,
-        file_size,
+        status: Some(file_status(inode_id, file_size)),
         locations: vec![location],
-        generation: Some(3),
         ..GetBlockLocationsResponseProto::default()
     }
 }
@@ -772,4 +1462,15 @@ fn assert_client_error(error: &ClientError, kind: ClientErrorKind, unknown: bool
     assert_eq!(error.kind(), kind);
     assert_eq!(error.is_outcome_unknown(), unknown);
     assert!(error.message().contains(message), "unexpected error: {error:?}");
+}
+
+fn file_status(inode_id: u64, len: u64) -> beryl_proto::metadata::FileStatusProto {
+    beryl_proto::metadata::FileStatusProto {
+        inode_id,
+        len,
+        generation: Some(3),
+        kind: FileTypeProto::FileTypeFile as i32,
+        create_time: 11,
+        modify_time: 12,
+    }
 }

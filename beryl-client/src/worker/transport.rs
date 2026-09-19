@@ -6,7 +6,7 @@
 use super::channel_pool::GrpcWorkerChannelPool;
 use super::protocol::{
     build_read_block_request, build_tonic_request, build_write_block_command, has_structured_worker_error,
-    is_transient_worker_transport_status, parse_worker_data_status, read_block_stream_into,
+    is_transient_worker_transport_status, parse_worker_data_status, read_block_stream,
 };
 use super::{
     duration_until_unix_ms, write_lease_expired_error, BlockWrite, BlockWriteInput, BlockWriteLease, WorkerWriteTarget,
@@ -19,6 +19,7 @@ use crate::runtime::{is_definite_worker_capacity_rejection, AttemptContext};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, WorkerErrorKind};
 use beryl_proto::worker::{WriteBlockRequestProto, WriteBlockResponseProto};
 use beryl_types::{GroupName, WorkerEndpointInfo};
+use bytes::Bytes;
 use futures::{stream, Stream};
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
@@ -355,8 +356,7 @@ impl GrpcWorkerTransport {
         attempt: AttemptContext,
         group_name: GroupName,
         block_read: &PlannedBlockRead,
-        output: &mut [u8],
-    ) -> ClientResult<()> {
+    ) -> ClientResult<Bytes> {
         if block_read.workers.is_empty() {
             return Err(block_location_unavailable_error(format!(
                 "block location unavailable: no worker candidates for block {} file_offset={} len={}",
@@ -367,7 +367,7 @@ impl GrpcWorkerTransport {
         let mut last_location_error = None;
         for worker in self.worker_candidates(&block_read.workers) {
             let mut client = self.channel_pool.worker_data_service_client(worker, "ReadBlock")?;
-            let request = build_read_block_request(&attempt, &group_name, block_read, worker)?;
+            let request = build_read_block_request(&attempt, &group_name, block_read, worker);
             let mut responses = match client.read_block(build_tonic_request(&attempt, request)).await {
                 Ok(response) => response.into_inner(),
                 Err(status) => {
@@ -386,8 +386,8 @@ impl GrpcWorkerTransport {
                     continue;
                 }
             };
-            match read_block_stream_into(&attempt, &mut responses, block_read, output).await {
-                Ok(()) => {}
+            match read_block_stream(&attempt, &mut responses, block_read).await {
+                Ok(bytes) => return Ok(bytes),
                 Err(error) if is_stale_read_location_error(&error) => {
                     self.channel_pool.invalidate_on_worker_run_mismatch(worker, &error);
                     last_location_error = Some(error);
@@ -401,7 +401,6 @@ impl GrpcWorkerTransport {
                 }
                 Err(error) => return Err(error),
             }
-            return Ok(());
         }
         if let Some(error) = last_transport_error {
             return Err(error);
@@ -783,18 +782,18 @@ mod tests {
             let (first, first_shutdown) = start_mock_worker(Arc::clone(&first_state), 1).await;
             let (second, second_shutdown) = start_mock_worker(Arc::clone(&second_state), 2).await;
 
-            let mut output = [0u8; 4];
             let result = grpc_client()
                 .read_block_range(
                     attempt(Operation::Read),
                     group_name(),
                     &planned_read(vec![first, second]),
-                    &mut output,
                 )
                 .await;
             if may_fail_over {
-                result.expect("second Worker satisfies read");
-                assert_eq!(output, *b"data");
+                assert_eq!(
+                    result.expect("second Worker satisfies read"),
+                    Bytes::from_static(b"data")
+                );
             } else {
                 let error = result.expect_err("invalid exact range must fail closed");
                 assert_eq!(error.kind(), ClientErrorKind::InvalidResponse);

@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Worker operation orchestration above the block-local transport boundary.
+//! Client entry points for Metadata-authorized Worker block IO.
 
 use std::fmt;
 
 use super::transport::GrpcWorkerTransport;
 use super::{BlockWrite, WorkerWriteTarget};
 use crate::config::ClientConfig;
-use crate::error::{ClientError, ClientResult};
+use crate::error::ClientResult;
 use crate::planner::PlannedBlockRead;
 use crate::runtime::AttemptContext;
 use beryl_types::{GroupName, LocatedBlock};
+use bytes::Bytes;
 
-/// Owns file-level Worker orchestration while delegating each block-local IO
-/// operation to a transport implementation.
+/// Provides block read and write operations through the Worker transport.
 pub(crate) struct WorkerClient {
     transport: GrpcWorkerTransport,
 }
@@ -27,38 +27,14 @@ impl WorkerClient {
         }
     }
 
-    /// Fills a caller-owned buffer from ordered Metadata-planned block ranges.
-    pub(crate) async fn read_block_ranges_into(
+    /// Returns one owned block range only after exact response completion.
+    pub(crate) async fn read_block_range(
         &self,
         attempt: AttemptContext,
         group_name: GroupName,
-        block_reads: &[PlannedBlockRead],
-        output: &mut [u8],
-    ) -> ClientResult<()> {
-        let total_len = block_reads.iter().try_fold(0usize, |total, block_read| {
-            total
-                .checked_add(block_read.len as usize)
-                .ok_or_else(|| ClientError::invalid_layout("planned read length overflow".to_string()))
-        })?;
-        if total_len != output.len() {
-            return Err(ClientError::invalid_layout(format!(
-                "planned read length {total_len} does not match output length {}",
-                output.len()
-            )));
-        }
-        let mut remaining = output;
-        for block_read in block_reads {
-            block_read
-                .file_offset
-                .checked_add(u64::from(block_read.len))
-                .ok_or_else(|| ClientError::invalid_layout("planned block read end overflow".to_string()))?;
-            let (block_output, tail) = remaining.split_at_mut(block_read.len as usize);
-            self.transport
-                .read_block_range(attempt.clone(), group_name.clone(), block_read, block_output)
-                .await?;
-            remaining = tail;
-        }
-        Ok(())
+        block_read: &PlannedBlockRead,
+    ) -> ClientResult<Bytes> {
+        self.transport.read_block_range(attempt, group_name, block_read).await
     }
 
     /// Opens one Metadata-authorized block RPC and returns only after the

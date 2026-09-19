@@ -43,7 +43,7 @@ async fn metadata_cleanup_commands_remove_only_deleted_file_blocks() {
         .open("/cleanup/second")
         .await
         .expect("open remaining file")
-        .read_to_end()
+        .read_range(..)
         .await
         .expect("read remaining file");
     assert_eq!(remaining, second);
