@@ -21,8 +21,8 @@ use std::collections::{HashMap, HashSet};
 #[derive(Clone, Debug)]
 pub(super) struct CloseWriteIntent {
     pub(super) committed_blocks: Vec<CommittedBlock>,
-    pub(super) final_size: u64,
-    pub(super) expected_file_size: u64,
+    pub(super) final_len: u64,
+    pub(super) expected_file_len: u64,
 }
 
 impl CloseWriteIntent {
@@ -30,9 +30,9 @@ impl CloseWriteIntent {
     fn publication(&self, handle: WriteHandle, generation: ContentGeneration, mode: PublishMode) -> FilePublication {
         FilePublication {
             blocks: self.committed_blocks.clone(),
-            target_size: self.final_size,
+            target_len: self.final_len,
             expected_generation: generation,
-            expected_file_size: self.expected_file_size,
+            expected_file_len: self.expected_file_len,
             lease_epoch: handle.lease_epoch,
             mode,
         }
@@ -41,32 +41,32 @@ impl CloseWriteIntent {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SyncWriteOutput {
-    pub(crate) synced_size: u64,
+    pub(crate) synced_len: u64,
     pub(crate) generation: Option<ContentGeneration>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CloseWriteOutput {
-    pub(crate) committed_size: u64,
+    pub(crate) committed_len: u64,
 }
 
 pub(crate) struct CommitFileArgs {
     pub(crate) handle: WriteHandle,
     pub(crate) committed_blocks: Vec<CommittedBlock>,
-    pub(crate) final_size: u64,
+    pub(crate) final_len: u64,
     pub(crate) freshness: Freshness,
     pub(crate) expected_generation: ContentGeneration,
-    pub(crate) expected_file_size: u64,
+    pub(crate) expected_file_len: u64,
     pub(crate) publish_mode: PublishMode,
 }
 
 pub(crate) struct SyncWriteArgs {
     pub(crate) handle: WriteHandle,
     pub(crate) committed_blocks: Vec<CommittedBlock>,
-    pub(crate) target_size: u64,
+    pub(crate) target_len: u64,
     pub(crate) freshness: Freshness,
     pub(crate) expected_generation: ContentGeneration,
-    pub(crate) expected_file_size: u64,
+    pub(crate) expected_file_len: u64,
     pub(crate) publish_mode: PublishMode,
 }
 
@@ -101,8 +101,8 @@ impl MetadataFileSystem {
                 handle,
                 CloseWriteIntent {
                     committed_blocks: args.committed_blocks,
-                    final_size: args.final_size,
-                    expected_file_size: args.expected_file_size,
+                    final_len: args.final_len,
+                    expected_file_len: args.expected_file_len,
                 },
                 args.freshness,
                 args.expected_generation,
@@ -118,7 +118,7 @@ impl MetadataFileSystem {
                 client_id = %ctx.caller.client.client_id,
                 call_id = %ctx.caller.client.call_id,
                 inode_id = inode_id.as_raw(),
-                final_size = args.final_size,
+                final_len = args.final_len,
                 committed_block_count,
                 committed_bytes,
                 lease_epoch = handle.lease_epoch.as_raw(),
@@ -134,7 +134,7 @@ impl MetadataFileSystem {
                 client_id = %ctx.caller.client.client_id,
                 call_id = %ctx.caller.client.call_id,
                 inode_id = inode_id.as_raw(),
-                final_size = args.final_size,
+                final_len = args.final_len,
                 committed_block_count,
                 committed_bytes,
                 lease_epoch = handle.lease_epoch.as_raw(),
@@ -170,8 +170,8 @@ impl MetadataFileSystem {
             handle,
             CloseWriteIntent {
                 committed_blocks: args.committed_blocks,
-                final_size: args.target_size,
-                expected_file_size: args.expected_file_size,
+                final_len: args.target_len,
+                expected_file_len: args.expected_file_len,
             },
             args.freshness,
             args.expected_generation,
@@ -670,7 +670,7 @@ impl MetadataFileSystem {
         }
         if current.inode_id != expected.inode_id
             || current.mount_id != expected.mount_id
-            || current.base_size != expected.base_size
+            || current.base_len != expected.base_len
             || current.generation != expected.generation
         {
             return Err(self
@@ -745,13 +745,13 @@ impl MetadataFileSystem {
                     .completed_publish_hints(ctx, freshness, mount_id, "SyncWrite")
                     .await?;
                 if let Some(publication) = publication {
-                    if let Err(message) = publication.complete_sync(generation, intent.final_size) {
+                    if let Err(message) = publication.complete_sync(generation, intent.final_len) {
                         return self.failure_from_error(ctx, MetadataError::Internal(message), group_name, mount_epoch);
                     }
                 }
                 return self.success_with_route_epoch(
                     SyncWriteOutput {
-                        synced_size: intent.final_size,
+                        synced_len: intent.final_len,
                         generation: Some(generation),
                     },
                     group_name,
@@ -848,8 +848,8 @@ impl MetadataFileSystem {
 
         let intent = CloseWriteIntent {
             committed_blocks: intent.committed_blocks.clone(),
-            final_size: intent.final_size,
-            expected_file_size: intent.expected_file_size,
+            final_len: intent.final_len,
+            expected_file_len: intent.expected_file_len,
         };
         let blocks = match Self::validate_committed_blocks(&intent, &session) {
             Ok(blocks) => blocks,
@@ -917,9 +917,9 @@ impl MetadataFileSystem {
             inode_id: session.inode_id,
             publication: FilePublication {
                 blocks,
-                target_size: intent.final_size,
+                target_len: intent.final_len,
                 expected_generation,
-                expected_file_size: intent.expected_file_size,
+                expected_file_len: intent.expected_file_len,
                 lease_epoch,
                 mode: publish_mode,
             },
@@ -933,7 +933,7 @@ impl MetadataFileSystem {
 
         self.success_with_route_epoch(
             SyncWriteOutput {
-                synced_size: intent.final_size,
+                synced_len: intent.final_len,
                 generation: Some(generation),
             },
             Some(routed.group_name.clone()),
@@ -964,22 +964,22 @@ impl MetadataFileSystem {
         intent: &CloseWriteIntent,
         session: &WriteSession,
     ) -> MetadataResult<Vec<CommittedBlock>> {
-        if intent.expected_file_size != session.base_size {
+        if intent.expected_file_len != session.base_len {
             return Err(MetadataError::InvalidArgument(
                 "expected file size does not match session".into(),
             ));
         }
-        let count = crate::inode::FileData::block_count(intent.final_size, session.block_size)?;
+        let count = crate::inode::FileData::block_count(intent.final_len, session.block_size)?;
         let capacity = u64::from(session.block_size);
         let start = if session.mode == WriteMode::Overwrite {
             0
-        } else if intent.final_size == session.base_size && intent.committed_blocks.is_empty() {
+        } else if intent.final_len == session.base_len && intent.committed_blocks.is_empty() {
             count
         } else {
-            usize::try_from(session.base_size / capacity)
+            usize::try_from(session.base_len / capacity)
                 .map_err(|_| MetadataError::InvalidArgument("block ordinal overflows".into()))?
         };
-        if (session.mode == WriteMode::Append && intent.final_size < session.base_size)
+        if (session.mode == WriteMode::Append && intent.final_len < session.base_len)
             || start > count
             || intent.committed_blocks.len() != count - start
         {
@@ -998,7 +998,7 @@ impl MetadataFileSystem {
                 .get(&block.block_id)
                 .ok_or_else(|| MetadataError::InvalidArgument("block was not issued to this writer".into()))?;
             let offset = (start + index) as u64 * capacity;
-            let len = (intent.final_size - offset).min(capacity);
+            let len = (intent.final_len - offset).min(capacity);
             if block.block_id.inode_id != session.inode_id
                 || !seen.insert(block.block_id)
                 || target.file_offset != offset
@@ -1048,7 +1048,7 @@ impl MetadataFileSystem {
                 self.session_registry.remove_session_if_epoch(inode_id, lease_epoch);
                 return self.success_with_route_epoch(
                     CloseWriteOutput {
-                        committed_size: intent.final_size,
+                        committed_len: intent.final_len,
                     },
                     group_name,
                     mount_epoch,
@@ -1209,7 +1209,7 @@ impl MetadataFileSystem {
 
         self.success_with_route_epoch(
             CloseWriteOutput {
-                committed_size: intent.final_size,
+                committed_len: intent.final_len,
             },
             Some(routed.group_name.clone()),
             Some(routed.mount_epoch),
@@ -1244,11 +1244,11 @@ mod tests {
         (open, target)
     }
 
-    fn target_intent(target: &LocatedBlock, expected_file_size: u64) -> CloseWriteIntent {
+    fn target_intent(target: &LocatedBlock, expected_file_len: u64) -> CloseWriteIntent {
         CloseWriteIntent {
             committed_blocks: vec![committed_block(target.block_id, 64)],
-            final_size: target.file_offset + 64,
-            expected_file_size,
+            final_len: target.file_offset + 64,
+            expected_file_len,
         }
     }
 
@@ -1291,7 +1291,7 @@ mod tests {
                 inode_id: open.inode_id,
                 lease_epoch: open.lease_epoch,
             },
-            target_intent(&target, open.base_size),
+            target_intent(&target, open.base_len),
             Freshness::default(),
             open.generation,
             PublishMode::ReplaceIfUnchanged,
@@ -1360,8 +1360,8 @@ mod tests {
                     },
                     CloseWriteIntent {
                         committed_blocks: Vec::new(),
-                        final_size: 0,
-                        expected_file_size: 0,
+                        final_len: 0,
+                        expected_file_len: 0,
                     },
                     Freshness::default(),
                     open.generation,
@@ -1411,9 +1411,9 @@ mod tests {
                     inode_id: open.inode_id,
                     publication: crate::inode::FilePublication {
                         blocks: payload.blocks,
-                        target_size: payload.target_size,
+                        target_len: payload.target_len,
                         expected_generation: payload.expected_generation,
-                        expected_file_size: payload.expected_file_size,
+                        expected_file_len: payload.expected_file_len,
                         lease_epoch: payload.lease_epoch,
                         mode: payload.mode,
                     },
@@ -1466,7 +1466,7 @@ mod tests {
                     inode_id: open.inode_id,
                     lease_epoch: open.lease_epoch,
                 },
-                target_intent(&target, open.base_size),
+                target_intent(&target, open.base_len),
                 Freshness::default(),
                 open.generation,
                 PublishMode::ReplaceIfUnchanged,

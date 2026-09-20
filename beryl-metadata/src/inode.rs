@@ -22,9 +22,9 @@ pub(crate) enum PublishMode {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct FilePublication {
     pub(crate) blocks: Vec<CommittedBlock>,
-    pub(crate) target_size: u64,
+    pub(crate) target_len: u64,
     pub(crate) expected_generation: ContentGeneration,
-    pub(crate) expected_file_size: u64,
+    pub(crate) expected_file_len: u64,
     pub(crate) lease_epoch: LeaseEpoch,
     pub(crate) mode: PublishMode,
 }
@@ -40,9 +40,9 @@ pub(crate) struct FileCommit {
     pub(crate) call_id: CallId,
     pub(crate) lease_epoch: LeaseEpoch,
     pub(crate) expected_generation: ContentGeneration,
-    pub(crate) expected_file_size: u64,
+    pub(crate) expected_file_len: u64,
     pub(crate) mode: PublishMode,
-    pub(crate) committed_size: u64,
+    pub(crate) committed_len: u64,
     pub(crate) generation: ContentGeneration,
 }
 
@@ -50,19 +50,19 @@ impl FilePublication {
     /// Locate the changed tail and new blocks from the frozen pre-publication length.
     /// An empty append payload means an exact no-op, including a partial tail.
     pub(crate) fn start_index(&self, file: &FileData) -> MetadataResult<usize> {
-        let count = FileData::block_count(self.target_size, file.block_size)?;
+        let count = FileData::block_count(self.target_len, file.block_size)?;
         let start = match self.mode {
             PublishMode::ReplaceIfUnchanged => 0,
             PublishMode::AppendIfUnchanged => {
-                if self.target_size < self.expected_file_size {
+                if self.target_len < self.expected_file_len {
                     return Err(MetadataError::InvalidArgument(
                         "append cannot shrink visible content".into(),
                     ));
                 }
-                if self.blocks.is_empty() && self.target_size == self.expected_file_size {
+                if self.blocks.is_empty() && self.target_len == self.expected_file_len {
                     count
                 } else {
-                    usize::try_from(self.expected_file_size / u64::from(file.block_size))
+                    usize::try_from(self.expected_file_len / u64::from(file.block_size))
                         .map_err(|_| MetadataError::InvalidArgument("block ordinal overflows".into()))?
                 }
             }
@@ -74,7 +74,7 @@ impl FilePublication {
         }
         for (offset, block) in self.blocks.iter().enumerate() {
             let ordinal = start + offset;
-            let expected_len = Self::visible_block_len(self.target_size, file.block_size, ordinal);
+            let expected_len = Self::visible_block_len(self.target_len, file.block_size, ordinal);
             if block.len != expected_len {
                 return Err(MetadataError::InvalidArgument(
                     "only the final block may be partial".into(),
@@ -92,7 +92,7 @@ impl FilePublication {
     /// a newly captured expected generation or length.
     pub(crate) fn matches_visible(&self, file: &FileData) -> MetadataResult<bool> {
         let start = self.start_index(file)?;
-        Ok(file.len == self.target_size
+        Ok(file.len == self.target_len
             && file.blocks.get(start..).is_some_and(|visible| {
                 visible
                     .iter()
@@ -109,7 +109,7 @@ impl FilePublication {
         let mut blocks = match self.mode {
             PublishMode::ReplaceIfUnchanged => Vec::new(),
             PublishMode::AppendIfUnchanged => {
-                if file.len != self.expected_file_size || start > file.blocks.len() {
+                if file.len != self.expected_file_len || start > file.blocks.len() {
                     return Err(MetadataError::Again(
                         "append base no longer matches visible content".into(),
                     ));
@@ -160,7 +160,7 @@ impl FilePublication {
             return Ok(None);
         }
         if commit.generation != file.generation
-            || commit.committed_size != file.len
+            || commit.committed_len != file.len
             || commit
                 .lease_epoch
                 .checked_next()
@@ -172,9 +172,9 @@ impl FilePublication {
         }
         if commit.lease_epoch != self.lease_epoch
             || commit.expected_generation != self.expected_generation
-            || commit.expected_file_size != self.expected_file_size
+            || commit.expected_file_len != self.expected_file_len
             || commit.mode != self.mode
-            || commit.committed_size != self.target_size
+            || commit.committed_len != self.target_len
             || !self.matches_visible(file)?
         {
             return Err(MetadataError::InvalidArgument(

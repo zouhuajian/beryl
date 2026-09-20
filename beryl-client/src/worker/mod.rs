@@ -15,22 +15,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use beryl_types::{GroupName, LocatedBlock};
+use beryl_types::LocatedBlock;
 use bytes::Bytes;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::error::{ClientError, ClientResult};
 use crate::runtime::OperationContext;
-
-/// Internal worker write target derived from metadata AllocateBlock.
-#[derive(Clone, Debug)]
-pub(crate) struct WorkerWriteTarget {
-    /// Metadata owner group for the target block.
-    pub(crate) group_name: GroupName,
-    /// Metadata AllocateBlock target.
-    pub(crate) target: LocatedBlock,
-}
 
 /// Renewable deadline shared by one `BlockWrite` and its response task.
 ///
@@ -133,8 +124,8 @@ pub(crate) enum BlockWriteInput {
 
 /// One acknowledged Worker `WriteBlock` RPC owned by a sequential file writer.
 ///
-/// Dropping this value aborts the response task. The transport request stream
-/// treats a dropped sender as pending cancellation, never as a successful EOF.
+/// Dropping this value requests cancellation. The bounded response task remains
+/// responsible for observing cleanup; abandonment never becomes successful EOF.
 pub(crate) struct BlockWrite {
     operation: OperationContext,
     target: LocatedBlock,
@@ -198,24 +189,69 @@ impl BlockWrite {
         }
     }
 
-    /// Sends one bounded, nonempty data frame and advances the block cursor only
-    /// after the request channel accepts ownership of the bytes.
-    pub(crate) async fn write(&mut self, data: Bytes) -> ClientResult<()> {
+    /// Reports whether this stream accepted any bytes beyond its opening checkpoint.
+    pub(crate) fn has_data(&self) -> bool {
+        self.written_len > self.target.write_offset
+    }
+
+    /// Reserves bounded stream capacity without borrowing or accepting caller bytes.
+    pub(crate) async fn reserve(&mut self) -> ClientResult<mpsc::OwnedPermit<BlockWriteInput>> {
         self.check_open().await?;
-        let len = u64::try_from(data.len())
-            .map_err(|_| ClientError::invalid_argument("WriteBlock data length does not fit in u64".to_string()))?;
+        let sender = self
+            .requests
+            .as_ref()
+            .ok_or_else(|| ClientError::worker("WriteBlock request stream is closed"))?
+            .clone();
+        let mut lease_updates = self.lease.subscribe();
+        loop {
+            self.lease
+                .ensure_live()
+                .map_err(|error| error.with_operation_context(&self.operation))?;
+            let expires_at_ms = self.lease.expires_at_ms();
+            tokio::select! {
+                biased;
+                changed = lease_updates.changed() => {
+                    if changed.is_err() {
+                        return Err(ClientError::unknown_outcome("worker WriteBlock lost its lease owner")
+                            .with_operation_context(&self.operation));
+                    }
+                }
+                _ = tokio::time::sleep(duration_until_unix_ms(expires_at_ms)) => {}
+                permit = sender.clone().reserve_owned() => {
+                    match permit {
+                        Ok(permit) => {
+                            self.check_open().await?;
+                            return Ok(permit);
+                        }
+                        Err(_) => return match self.await_completion().await? {
+                            Ok(()) => Err(ClientError::unknown_outcome("worker WriteBlock request stream closed before finish")
+                                .with_operation_context(&self.operation)),
+                            Err(error) => Err(error.with_operation_context(&self.operation)),
+                        },
+                    }
+                }
+            }
+        }
+    }
+
+    /// Keeps byte acceptance and block progress atomic with respect to cancellation.
+    pub(crate) fn write_reserved(
+        &mut self,
+        permit: mpsc::OwnedPermit<BlockWriteInput>,
+        data: Bytes,
+    ) -> ClientResult<()> {
+        self.lease
+            .ensure_live()
+            .map_err(|error| error.with_operation_context(&self.operation))?;
+        let len = data.len() as u64;
         if len > self.remaining() {
-            return Err(ClientError::invalid_argument(format!(
-                "WriteBlock data exceeds remaining block capacity: actual={len}, remaining={}",
-                self.remaining()
-            )));
+            return Err(ClientError::invalid_argument(
+                "WriteBlock data exceeds remaining block capacity",
+            ));
         }
         let request = protocol::build_write_block_data(data)?;
-        self.send_before_lease_expiry(BlockWriteInput::Data(request)).await?;
-        self.written_len = self
-            .written_len
-            .checked_add(len)
-            .ok_or_else(|| ClientError::invalid_argument("WriteBlock cursor overflow".to_string()))?;
+        permit.send(BlockWriteInput::Data(request));
+        self.written_len += len;
         Ok(())
     }
 
@@ -223,7 +259,7 @@ impl BlockWrite {
     /// Worker response stream ends normally, which is the Ready boundary.
     pub(crate) async fn finish(mut self) -> ClientResult<(LocatedBlock, u64)> {
         self.check_open().await?;
-        self.send_before_lease_expiry(BlockWriteInput::Finish).await?;
+        self.reserve().await?.send(BlockWriteInput::Finish);
         self.requests.take();
         let result = self.await_completion().await?;
         self.cancellation.take();
@@ -247,61 +283,6 @@ impl BlockWrite {
             return tokio::time::timeout(timeout, completion).await.is_ok();
         }
         true
-    }
-
-    /// Waits for one bounded request slot while synchronously arbitrating every
-    /// lease renewal and the current absolute expiry.
-    async fn send_before_lease_expiry(&mut self, input: BlockWriteInput) -> ClientResult<()> {
-        let accepted = {
-            let sender = self
-                .requests
-                .as_ref()
-                .ok_or_else(|| ClientError::worker("WriteBlock request stream is closed".to_string()))?;
-            let mut lease_updates = self.lease.subscribe();
-            loop {
-                self.lease
-                    .ensure_live()
-                    .map_err(|error| error.with_operation_context(&self.operation))?;
-                let expires_at_ms = self.lease.expires_at_ms();
-                let lease_expiry = tokio::time::sleep(duration_until_unix_ms(expires_at_ms));
-                tokio::pin!(lease_expiry);
-                tokio::select! {
-                    biased;
-                    changed = lease_updates.changed() => {
-                        if changed.is_err() {
-                            return Err(ClientError::unknown_outcome(
-                                "worker WriteBlock lost its lease owner before request send".to_string(),
-                            )
-                            .with_operation_context(&self.operation));
-                        }
-                    }
-                    _ = &mut lease_expiry => {
-                        self.lease
-                            .ensure_live()
-                            .map_err(|error| error.with_operation_context(&self.operation))?;
-                    }
-                    permit = sender.reserve() => {
-                        break match permit {
-                            Ok(permit) => {
-                                permit.send(input);
-                                true
-                            }
-                            Err(_) => false,
-                        };
-                    }
-                }
-            }
-        };
-        if accepted {
-            return Ok(());
-        }
-        match self.await_completion().await? {
-            Ok(()) => Err(ClientError::unknown_outcome(
-                "worker WriteBlock request stream closed before finish".to_string(),
-            )
-            .with_operation_context(&self.operation)),
-            Err(error) => Err(error.with_operation_context(&self.operation)),
-        }
     }
 
     async fn await_completion(&mut self) -> ClientResult<ClientResult<()>> {

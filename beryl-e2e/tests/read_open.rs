@@ -15,7 +15,7 @@ async fn open_status_and_reader_layouts_preserve_inode_state_across_reads_and_re
     let path = "/read-open";
     let payload = Bytes::from(deterministic_bytes(3500));
     let mut writer = client.create(path).await.unwrap();
-    writer.write_all(payload.clone()).await.unwrap();
+    writer.write_all(&payload).await.unwrap();
     writer.close().await.unwrap();
 
     let status = client.get_status(path).await.unwrap();
@@ -64,7 +64,7 @@ async fn open_status_and_reader_layouts_preserve_inode_state_across_reads_and_re
 
     let stale = client.open(path).await.unwrap();
     let mut appender = client.append(path).await.unwrap();
-    appender.write_all(Bytes::from_static(b"suffix")).await.unwrap();
+    appender.write_all(b"suffix").await.unwrap();
     appender.close().await.unwrap();
     let error = stale.read_range(0..1).await.unwrap_err();
     assert_eq!(error.kind(), ClientErrorKind::StaleHandle);

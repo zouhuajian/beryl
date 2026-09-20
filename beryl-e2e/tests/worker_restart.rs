@@ -119,7 +119,7 @@ async fn write_closed_file(cluster: &mut TestCluster, path: &str, payload_len: u
         .expect("create worker restart dir");
     let payload = Bytes::from(deterministic_bytes(payload_len));
     let mut writer = cluster.client().create(path).await?;
-    writer.write_all(payload.clone()).await?;
+    writer.write_all(&payload).await?;
     writer.close().await?;
     cluster.converge_block_reports().await?;
     Ok(payload)

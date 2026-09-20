@@ -8,9 +8,7 @@ use super::protocol::{
     build_read_block_request, build_tonic_request, build_write_block_command, has_structured_worker_error,
     is_transient_worker_transport_status, parse_worker_data_status, read_block_stream,
 };
-use super::{
-    duration_until_unix_ms, write_lease_expired_error, BlockWrite, BlockWriteInput, BlockWriteLease, WorkerWriteTarget,
-};
+use super::{duration_until_unix_ms, write_lease_expired_error, BlockWrite, BlockWriteInput, BlockWriteLease};
 use crate::cache::CacheInvalidationReason;
 use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
@@ -18,7 +16,7 @@ use crate::planner::{block_location_unavailable_error, PlannedBlockRead};
 use crate::runtime::{is_definite_worker_capacity_rejection, AttemptContext};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, WorkerErrorKind};
 use beryl_proto::worker::{WriteBlockRequestProto, WriteBlockResponseProto};
-use beryl_types::{GroupName, WorkerEndpointInfo};
+use beryl_types::{GroupName, LocatedBlock, WorkerEndpointInfo};
 use bytes::Bytes;
 use futures::{stream, Stream};
 use std::sync::Arc;
@@ -117,17 +115,18 @@ impl GrpcWorkerTransport {
     /// Worker acknowledges block-open checkpoint.
     ///
     /// The RPC intentionally has no fixed tonic timeout after the acknowledgement:
-    /// later `write_all`, sync, and close calls apply their own local deadlines,
+    /// bounded write steps, flush, sync, and close apply their own local deadlines,
     /// while the completion task enforces the renewable write-lease expiry.
     async fn open_one_block(
         &self,
         attempt: &AttemptContext,
-        target: &WorkerWriteTarget,
+        group_name: &GroupName,
+        target: &LocatedBlock,
         worker: &WorkerEndpointInfo,
         lease_expires_at_ms: u64,
     ) -> ClientResult<BlockWrite> {
         let mut client = self.channel_pool.worker_data_service_client(worker, "WriteBlock")?;
-        let command = build_write_block_command(attempt, target, worker)?;
+        let command = build_write_block_command(attempt, group_name, target, worker)?;
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
         let (cancellation, cancellation_signal) = watch::channel(false);
         let mut opening_cancellation = OpeningWriteCancellation {
@@ -186,7 +185,7 @@ impl GrpcWorkerTransport {
         ));
         Ok(BlockWrite::new(
             operation,
-            target.target.clone(),
+            target.clone(),
             sender,
             cancellation,
             lease,
@@ -416,15 +415,16 @@ impl GrpcWorkerTransport {
     pub(super) async fn open_write_block(
         &self,
         attempt: AttemptContext,
-        target: WorkerWriteTarget,
+        group_name: GroupName,
+        target: LocatedBlock,
         lease_expires_at_ms: u64,
     ) -> ClientResult<BlockWrite> {
         let worker = self
-            .worker_candidates(&target.target.worker_endpoints)
+            .worker_candidates(&target.workers)
             .into_iter()
             .next()
             .ok_or_else(|| ClientError::worker("worker write has no candidates".to_string()))?;
-        self.open_one_block(&attempt, &target, worker, lease_expires_at_ms)
+        self.open_one_block(&attempt, &group_name, &target, worker, lease_expires_at_ms)
             .await
     }
 }
@@ -448,8 +448,7 @@ mod tests {
     };
     use beryl_types::lease::FencingToken;
     use beryl_types::{
-        BlockId, BlockIndex, ClientId, InodeId, LeaseEpoch, LocatedBlock, Tier, WorkerEndpointInfo, WorkerId,
-        WorkerRunId,
+        BlockId, BlockIndex, ClientId, InodeId, LeaseEpoch, Tier, WorkerEndpointInfo, WorkerId, WorkerRunId,
     };
     use bytes::Bytes;
     use prost::Message;
@@ -705,6 +704,11 @@ mod tests {
         lease_expiry_after(60_000)
     }
 
+    async fn write_frame(block: &mut BlockWrite, data: Bytes) -> ClientResult<()> {
+        let permit = block.reserve().await?;
+        block.write_reserved(permit, data)
+    }
+
     async fn wait_for_count(counter: &AtomicUsize, expected: usize) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while counter.load(Ordering::SeqCst) < expected {
@@ -727,19 +731,16 @@ mod tests {
         }
     }
 
-    fn write_target(workers: Vec<WorkerEndpointInfo>) -> WorkerWriteTarget {
+    fn write_target(workers: Vec<WorkerEndpointInfo>) -> LocatedBlock {
         let block_id = block_id();
-        WorkerWriteTarget {
-            group_name: group_name(),
-            target: LocatedBlock {
-                write_offset: 0,
-                block_id,
-                file_offset: 0,
-                block_size: 4096,
-                worker_endpoints: workers,
-                fencing_token: FencingToken::new(block_id, ClientId::new(7), LeaseEpoch::new(1)),
-                tier: Tier::Mem,
-            },
+        LocatedBlock {
+            write_offset: 0,
+            block_id,
+            file_offset: 0,
+            block_size: 4096,
+            workers,
+            fencing_token: FencingToken::new(block_id, ClientId::new(7), LeaseEpoch::new(1)),
+            tier: Tier::Mem,
         }
     }
 
@@ -821,12 +822,13 @@ mod tests {
         let mut block = grpc_client()
             .open_write_block(
                 attempt(Operation::WriteBlock),
+                group_name(),
                 write_target(vec![first, second]),
                 lease_expiry(),
             )
             .await
             .expect("block-open acknowledgement");
-        let error = match block.write(Bytes::from_static(b"data")).await {
+        let error = match write_frame(&mut block, Bytes::from_static(b"data")).await {
             Ok(()) => block
                 .finish()
                 .await
@@ -850,6 +852,7 @@ mod tests {
         let error = match grpc_client()
             .open_write_block(
                 attempt(Operation::WriteBlock),
+                group_name(),
                 write_target(vec![worker]),
                 lease_expiry(),
             )
@@ -875,6 +878,7 @@ mod tests {
         let error = match grpc_client()
             .open_write_block(
                 attempt(Operation::WriteBlock),
+                group_name(),
                 write_target(vec![worker]),
                 lease_expiry_after(10),
             )
@@ -902,21 +906,23 @@ mod tests {
         let mut block = client
             .open_write_block(
                 attempt(Operation::WriteBlock),
+                group_name(),
                 write_target(vec![worker.clone()]),
                 lease_expiry_after(200),
             )
             .await
             .expect("block-open acknowledgement");
 
-        block.write(Bytes::from_static(b"a")).await.expect("first frame");
+        write_frame(&mut block, Bytes::from_static(b"a"))
+            .await
+            .expect("first frame");
         block
             .update_lease_expiry(lease_expiry_after(1_000))
             .expect("renew before old expiry");
         // Keep the current-thread runtime from polling the completion task until
         // both the old timer and the queued renewal are ready.
         std::thread::sleep(Duration::from_millis(250));
-        block
-            .write(Bytes::from_static(b"b"))
+        write_frame(&mut block, Bytes::from_static(b"b"))
             .await
             .expect("frame after renewal");
         block.finish().await.expect("finish renewed block");
@@ -926,12 +932,15 @@ mod tests {
         let mut expired = client
             .open_write_block(
                 attempt(Operation::WriteBlock),
+                group_name(),
                 write_target(vec![worker]),
                 lease_expiry_after(30),
             )
             .await
             .expect("open block before its lease expires");
-        expired.write(Bytes::from_static(b"c")).await.expect("partial frame");
+        write_frame(&mut expired, Bytes::from_static(b"c"))
+            .await
+            .expect("partial frame");
         std::thread::sleep(Duration::from_millis(50));
         let error = expired
             .update_lease_expiry(lease_expiry_after(1_000))
@@ -955,12 +964,15 @@ mod tests {
         let mut cancelled = client
             .open_write_block(
                 attempt(Operation::WriteBlock),
+                group_name(),
                 write_target(vec![worker.clone()]),
                 lease_expiry(),
             )
             .await
             .expect("open explicitly cancelled block");
-        cancelled.write(Bytes::from_static(b"a")).await.expect("partial frame");
+        write_frame(&mut cancelled, Bytes::from_static(b"a"))
+            .await
+            .expect("partial frame");
         assert!(cancelled.cancel(Duration::from_secs(1)).await);
         wait_for_count(&state.write_cancellations, 1).await;
         assert_eq!(state.write_eofs.load(Ordering::SeqCst), 0);
@@ -968,12 +980,15 @@ mod tests {
         let mut dropped = client
             .open_write_block(
                 attempt(Operation::WriteBlock),
+                group_name(),
                 write_target(vec![worker.clone()]),
                 lease_expiry(),
             )
             .await
             .expect("open dropped block");
-        dropped.write(Bytes::from_static(b"b")).await.expect("partial frame");
+        write_frame(&mut dropped, Bytes::from_static(b"b"))
+            .await
+            .expect("partial frame");
         drop(dropped);
         wait_for_count(&state.write_cancellations, 2).await;
         assert_eq!(state.write_eofs.load(Ordering::SeqCst), 0);
@@ -981,12 +996,15 @@ mod tests {
         let mut expired = client
             .open_write_block(
                 attempt(Operation::WriteBlock),
+                group_name(),
                 write_target(vec![worker.clone()]),
                 lease_expiry_after(30),
             )
             .await
             .expect("open lease-expired block");
-        expired.write(Bytes::from_static(b"c")).await.expect("partial frame");
+        write_frame(&mut expired, Bytes::from_static(b"c"))
+            .await
+            .expect("partial frame");
         tokio::time::sleep(Duration::from_millis(50)).await;
         let error = expired
             .finish()
@@ -1000,12 +1018,15 @@ mod tests {
         let mut finished = client
             .open_write_block(
                 attempt(Operation::WriteBlock),
+                group_name(),
                 write_target(vec![worker]),
                 lease_expiry(),
             )
             .await
             .expect("open normally finished block");
-        finished.write(Bytes::from_static(b"d")).await.expect("final frame");
+        write_frame(&mut finished, Bytes::from_static(b"d"))
+            .await
+            .expect("final frame");
         finished.finish().await.expect("normal finish");
         wait_for_count(&state.write_eofs, 1).await;
         assert_eq!(state.write_cancellations.load(Ordering::SeqCst), 3);

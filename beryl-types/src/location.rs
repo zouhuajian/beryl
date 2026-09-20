@@ -30,7 +30,7 @@ pub struct LocatedBlock {
     pub write_offset: u64,
 
     /// Selected Worker process identities retained unchanged when allocation replays.
-    pub worker_endpoints: Vec<WorkerEndpointInfo>,
+    pub workers: Vec<WorkerEndpointInfo>,
     /// Worker-local storage tier requested for this replica.
     pub tier: Tier,
     pub fencing_token: FencingToken,

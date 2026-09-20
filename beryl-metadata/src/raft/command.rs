@@ -175,9 +175,9 @@ mod tests {
             call_id: CallId::new(),
             publication: FilePublication {
                 blocks,
-                target_size: u64::MAX,
+                target_len: u64::MAX,
                 expected_generation: ContentGeneration::new(u64::MAX),
-                expected_file_size: u64::MAX,
+                expected_file_len: u64::MAX,
                 lease_epoch: LeaseEpoch::new(u64::MAX),
                 mode: PublishMode::ReplaceIfUnchanged,
             },

@@ -32,7 +32,7 @@ async fn committed_visible_file_survives_metadata_restart() {
     let payload = Bytes::from(deterministic_bytes(1_537));
     client.mkdirs("/restart").await.expect("create restart dir");
     let mut writer = client.create(path).await.expect("create file");
-    writer.write_all(payload.clone()).await.expect("write file");
+    writer.write_all(&payload).await.expect("write file");
     writer.close().await.expect("close file");
     cluster
         .converge_block_reports()
@@ -83,10 +83,10 @@ async fn restart_after_empty_create_requires_new_authority_for_noop_close() {
         header: Some(metadata_header(owner_client_id)),
         write_handle: create.write_handle,
         committed_blocks: Vec::new(),
-        final_size: 0,
+        final_len: 0,
         expected_generation: create.generation,
         write_mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
-        expected_file_size: 0,
+        expected_file_len: 0,
     };
     let mut aborted = client
         .create("/restart/create-before-abort")
@@ -161,10 +161,11 @@ async fn restart_after_worker_ready_before_metadata_close_rejects_stale_writer_a
         .await
         .expect("create active writer");
     writer
-        .write_all(Bytes::from(deterministic_bytes(1024)))
+        .write_all(&deterministic_bytes(1024))
         .await
         .expect("write Worker Ready block without metadata close");
 
+    writer.flush().await.expect("Worker Ready before Metadata restart");
     cluster.restart_metadata().await.expect("restart metadata");
 
     let err = writer.renew_lease().await.expect_err("stale writer must fail closed");
@@ -212,10 +213,7 @@ async fn existing_visible_data_remains_readable_while_active_write_fails_closed(
     let visible = Bytes::from_static(b"already-visible");
     let hidden = Bytes::from_static(b"hidden-after-restart");
     let mut visible_writer = client.create(visible_path).await.expect("create visible file");
-    visible_writer
-        .write_all(visible.clone())
-        .await
-        .expect("write visible file");
+    visible_writer.write_all(&visible).await.expect("write visible file");
     visible_writer.close().await.expect("close visible file");
     cluster
         .converge_block_reports()
@@ -224,7 +222,7 @@ async fn existing_visible_data_remains_readable_while_active_write_fails_closed(
 
     let mut active_writer = client.create(active_path).await.expect("create active file");
     active_writer
-        .write_all(hidden)
+        .write_all(&hidden)
         .await
         .expect("write active file without close");
 
@@ -392,11 +390,7 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
     let block_id = target.block_id.expect("block id after restart");
     assert_eq!(block_id.inode_id, new_handle.inode_id);
     assert_eq!(block_id.block_index, 12);
-    let selected_run_id = &target
-        .worker_endpoints
-        .first()
-        .expect("write target has a worker")
-        .worker_run_id;
+    let selected_run_id = &target.workers.first().expect("write target has a worker").worker_run_id;
     assert!(
         cluster
             .current_worker_run_ids()
@@ -416,10 +410,10 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
                 block_id: Some(block_id),
                 len: payload.len() as u64,
             }],
-            final_size: payload.len() as u64,
+            final_len: payload.len() as u64,
             expected_generation: reopened.generation,
             write_mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
-            expected_file_size: reopened.base_size,
+            expected_file_len: reopened.base_len,
         }))
         .await
         .expect("publish restarted target")
@@ -452,10 +446,10 @@ async fn lost_commit_response_is_resolved_after_metadata_restart() {
         header: Some(metadata_header(401)),
         write_handle: Some(active.write_handle),
         committed_blocks: vec![active.committed_block],
-        final_size: b"durable-publish".len() as u64,
+        final_len: b"durable-publish".len() as u64,
         expected_generation: active.expected_generation,
         write_mode: active.write_mode,
-        expected_file_size: active.expected_file_size,
+        expected_file_len: active.expected_file_len,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -495,7 +489,7 @@ async fn lost_commit_response_is_resolved_after_metadata_restart() {
         .expect("resolve completed CommitFile")
         .into_inner();
     assert_metadata_ok(replay.header);
-    assert_eq!(replay.committed_size, b"durable-publish".len() as u64);
+    assert_eq!(replay.committed_len, b"durable-publish".len() as u64);
     cluster.shutdown().await.expect("shutdown cluster");
 }
 
@@ -543,7 +537,7 @@ async fn tail_takeover_preserves_published_prefix_after_abort_or_metadata_restar
         let path = "/tail-takeover";
         let prefix = Bytes::from(vec![b'a'; 317]);
         let mut writer = client.create(path).await.unwrap();
-        writer.write_all(prefix.clone()).await.unwrap();
+        writer.write_all(&prefix).await.unwrap();
         writer.close().await.unwrap();
         let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
             .await
@@ -581,7 +575,7 @@ async fn tail_takeover_preserves_published_prefix_after_abort_or_metadata_restar
         );
         let suffix = Bytes::from(vec![b'b'; 800]);
         let mut appender = client.append(path).await.unwrap();
-        appender.write_all(suffix.clone()).await.unwrap();
+        appender.write_all(&suffix).await.unwrap();
         appender.close().await.unwrap();
         let actual = client.open(path).await.unwrap().read_range(..).await.unwrap();
         assert_eq!(actual.as_ref(), [prefix.as_ref(), suffix.as_ref()].concat());
@@ -619,7 +613,7 @@ async fn overwrite_sync_replay_keeps_the_append_phase_and_invalidates_fresh_read
     let client = cluster.client().clone();
     let path = "/overwrite-sync";
     let mut original = client.create(path).await.unwrap();
-    original.write_all(Bytes::from_static(b"original")).await.unwrap();
+    original.write_all(b"original").await.unwrap();
     original.close().await.unwrap();
     let reader = client.open(path).await.unwrap();
     let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
@@ -635,7 +629,7 @@ async fn overwrite_sync_replay_keeps_the_append_phase_and_invalidates_fresh_read
         .unwrap()
         .into_inner();
     assert_metadata_ok(opened.header);
-    assert_eq!(opened.base_size, 8);
+    assert_eq!(opened.base_len, 8);
     assert!(opened.tail_block.is_none());
     let handle = opened.write_handle.unwrap();
     let mut target = allocate_block(&mut metadata, handle, None, metadata_header(903)).await;
@@ -647,9 +641,9 @@ async fn overwrite_sync_replay_keeps_the_append_phase_and_invalidates_fresh_read
             block_id: target.block_id,
             len: 3,
         }],
-        target_size: 3,
+        target_len: 3,
         expected_generation: opened.generation,
-        expected_file_size: 8,
+        expected_file_len: 8,
         write_mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
     };
     let published = metadata.sync_write(frozen.clone()).await.unwrap().into_inner();
@@ -672,9 +666,9 @@ async fn overwrite_sync_replay_keeps_the_append_phase_and_invalidates_fresh_read
                 block_id: target.block_id,
                 len: 7,
             }],
-            final_size: 7,
+            final_len: 7,
             expected_generation: published.generation.unwrap(),
-            expected_file_size: 3,
+            expected_file_len: 3,
             write_mode: OpenWriteModeProto::OpenWriteModeAppend as i32,
         })
         .await
@@ -692,7 +686,7 @@ struct RawWorkerReadyWrite {
     write_handle: WriteHandleProto,
     committed_block: CommittedBlockProto,
     expected_generation: u64,
-    expected_file_size: u64,
+    expected_file_len: u64,
     write_mode: i32,
 }
 
@@ -714,7 +708,7 @@ async fn raw_create_worker_ready_block(
         .into_inner();
     assert_metadata_ok(create.header);
     let expected_generation = create.generation;
-    let expected_file_size = 0;
+    let expected_file_len = 0;
     let write_mode = OpenWriteModeProto::OpenWriteModeWrite as i32;
     let write_handle = create.write_handle.expect("write handle");
 
@@ -729,23 +723,23 @@ async fn raw_create_worker_ready_block(
         write_handle,
         committed_block,
         expected_generation,
-        expected_file_size,
+        expected_file_len,
         write_mode,
     })
 }
 
 async fn assert_stale_commit_file(cluster: &TestCluster, active: RawWorkerReadyWrite) -> TestResult<()> {
     let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint()).await?;
-    let final_size = active.committed_block.len;
+    let final_len = active.committed_block.len;
     let stale_commit = metadata
         .commit_file(Request::new(CommitFileRequestProto {
             header: Some(metadata_header(401)),
             write_handle: Some(active.write_handle),
             committed_blocks: vec![active.committed_block],
-            final_size,
+            final_len,
             expected_generation: active.expected_generation,
             write_mode: active.write_mode,
-            expected_file_size: active.expected_file_size,
+            expected_file_len: active.expected_file_len,
         }))
         .await?
         .into_inner();
@@ -781,7 +775,7 @@ async fn allocate_block(
 
 async fn write_worker_target(target: &LocatedBlockProto, payload: &[u8]) -> TestResult<()> {
     let worker = target
-        .worker_endpoints
+        .workers
         .first()
         .expect("metadata write target has worker")
         .clone();

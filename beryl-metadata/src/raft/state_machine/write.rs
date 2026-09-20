@@ -156,7 +156,7 @@ impl AppRaftStateMachine {
         if publication.expected_generation.checked_next() == Some(generation) && matches {
             return Ok((inode, generation, false));
         }
-        if generation != publication.expected_generation || file.len != publication.expected_file_size {
+        if generation != publication.expected_generation || file.len != publication.expected_file_len {
             return Err(MetadataError::Again("file publication precondition changed".into()));
         }
         if matches {
@@ -168,7 +168,7 @@ impl AppRaftStateMachine {
             .ok_or_else(|| MetadataError::InvalidArgument("content generation overflow".into()))?;
         let file = inode.file_mut()?;
         file.blocks = blocks;
-        file.len = publication.target_size;
+        file.len = publication.target_len;
         file.generation = generation;
         file.last_commit = None;
         inode.attrs.set_modify_time(proposed_at_ms);
@@ -208,9 +208,9 @@ impl AppRaftStateMachine {
             call_id: operation.1,
             lease_epoch: publication.lease_epoch,
             expected_generation: publication.expected_generation,
-            expected_file_size: publication.expected_file_size,
+            expected_file_len: publication.expected_file_len,
             mode: publication.mode,
-            committed_size: publication.target_size,
+            committed_len: publication.target_len,
             generation: publication.expected_generation,
         };
         let (mut inode, generation, _) = self.prepare_file_publication(inode, publication, proposed_at_ms)?;
@@ -261,8 +261,8 @@ mod tests {
                 .iter()
                 .map(|&(block_id, len)| CommittedBlock { block_id, len })
                 .collect(),
-            target_size: target,
-            expected_file_size: base,
+            target_len: target,
+            expected_file_len: base,
             expected_generation: ContentGeneration::new(generation),
             lease_epoch: LeaseEpoch::new(epoch),
             mode: PublishMode::AppendIfUnchanged,
@@ -348,9 +348,9 @@ mod tests {
                 {
                     match mutation {
                         0 => *call_id = CallId::new(),
-                        1 => publication.target_size += 1,
+                        1 => publication.target_len += 1,
                         2 => publication.expected_generation = ContentGeneration::new(99),
-                        3 => publication.expected_file_size += 1,
+                        3 => publication.expected_file_len += 1,
                         _ => publication.mode = PublishMode::ReplaceIfUnchanged,
                     }
                 }

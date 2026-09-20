@@ -7,19 +7,12 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::config::ClientConfig;
-use crate::error::side_effect_response_body_mismatch;
 use crate::error::{ClientError, ClientErrorKind, ClientResult, RefreshHint};
 use crate::metadata::{GrpcMetadataTransport, MetadataClient};
 use crate::metrics::{self, ClientMetric, ClientMetricLabels};
 use crate::runtime::retry::backoff_delay;
-use crate::runtime::{
-    is_definite_worker_capacity_rejection, AttemptContext, ClientIdentity, MetadataTargets, Operation,
-    OperationContext, OperationDeadline,
-};
-use crate::session::write_session::WriteSession;
-use crate::worker::{BlockWrite, WorkerClient};
-use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, WorkerErrorKind};
-use bytes::Bytes;
+use crate::runtime::{ClientIdentity, MetadataTargets, OperationContext, OperationDeadline};
+use crate::worker::WorkerClient;
 
 /// Shared owner for client configuration, Metadata orchestration, and Worker IO
 /// used by the filesystem facade and open handles.
@@ -49,172 +42,6 @@ impl ClientInner {
         })
     }
 
-    /// Reopens the partial tail or allocates a new block, then crosses the Worker acknowledgement boundary.
-    /// Only an explicit capacity rejection before side effects permits a retry.
-    pub(crate) async fn open_block_write(
-        &self,
-        session: &mut WriteSession,
-        deadline: OperationDeadline,
-    ) -> ClientResult<BlockWrite> {
-        let (allocate_block_operation, allocate_block) = if let Some((group_name, block)) = session.reusable_tail() {
-            (
-                worker_write_context(
-                    self.metadata.client_id(),
-                    self.metadata.client_name(),
-                    Operation::WriteBlock,
-                    session.path(),
-                    deadline.clone(),
-                )?,
-                crate::metadata::model::AllocateBlockResult { group_name, block },
-            )
-        } else {
-            match self
-                .metadata
-                .allocate_block(
-                    session.path(),
-                    session.write_handle(),
-                    session.previous_block_id(),
-                    deadline.clone(),
-                )
-                .await
-            {
-                Ok(allocate_block) => allocate_block,
-                Err(err) => {
-                    mark_session_after_write_error(session, &err);
-                    return Err(self.normalize_outcome_error("AllocateBlock", "metadata", err));
-                }
-            }
-        };
-        if let Err(err) = session.validate_target(&allocate_block.block) {
-            session.mark_unknown_outcome();
-            self.record_metric(
-                ClientMetric::WorkerResponseBodyMismatch,
-                metric_labels("AllocateBlock", "metadata").with_outcome("unknown"),
-            );
-            self.record_metric(
-                ClientMetric::UnknownOutcome,
-                metric_labels("AllocateBlock", "metadata").with_outcome("unknown"),
-            );
-            return Err(side_effect_response_body_mismatch("AllocateBlock", err)
-                .with_operation_context(&allocate_block_operation));
-        }
-        session.record_write_group(allocate_block.group_name.clone())?;
-        let operation = worker_write_context(
-            self.metadata.client_id(),
-            self.metadata.client_name(),
-            Operation::WriteBlock,
-            session.path(),
-            deadline,
-        )?;
-        let lease_expires_at_ms = session.expires_at_ms();
-        for attempt_index in 0..self.config.max_attempts() {
-            let ctx = AttemptContext::for_data(&operation);
-            match self
-                .worker_rpc_with_timeout(
-                    &operation,
-                    self.worker.open_write_block(
-                        ctx,
-                        allocate_block.group_name.clone(),
-                        allocate_block.block.clone(),
-                        lease_expires_at_ms,
-                    ),
-                )
-                .await
-            {
-                Ok(block) => return Ok(block),
-                Err(err) if is_definite_worker_capacity_rejection(&err) => {
-                    let has_next = attempt_index + 1 < self.config.max_attempts();
-                    if !has_next {
-                        return Err(err.with_operation_context(&operation));
-                    }
-                    self.record_metric(
-                        ClientMetric::RetryAttempt,
-                        metric_labels("WriteBlock", "worker").with_error_class("server_retry"),
-                    );
-                    self.sleep_before_retry(attempt_index, &operation).await?;
-                }
-                Err(err) => {
-                    mark_session_after_write_error(session, &err);
-                    return Err(self.normalize_outcome_error("WriteBlock", "worker", err));
-                }
-            }
-        }
-        unreachable!("client retry configuration requires at least one attempt")
-    }
-
-    /// Sends one frame on an acknowledged block RPC under the current public
-    /// write call's deadline, then advances the session cursor.
-    pub(crate) async fn write_block_frame(
-        &self,
-        session: &mut WriteSession,
-        block: &mut BlockWrite,
-        data: Bytes,
-        deadline: &OperationDeadline,
-    ) -> ClientResult<()> {
-        let len = data.len();
-        session
-            .cursor()
-            .checked_add(len as u64)
-            .ok_or_else(|| ClientError::invalid_argument("write cursor overflow".to_string()))?;
-        match self.worker_write_step_with_timeout(deadline, block.write(data)).await {
-            Ok(()) => session.advance_cursor(len),
-            Err(err) => {
-                mark_session_after_write_error(session, &err);
-                Err(self.normalize_outcome_error("WriteBlock", "worker", err))
-            }
-        }
-    }
-
-    /// Half-closes one block request stream and records the block as Ready only
-    /// after the Worker response stream ends normally.
-    pub(crate) async fn finish_block_write(
-        &self,
-        session: &mut WriteSession,
-        block: BlockWrite,
-        deadline: &OperationDeadline,
-    ) -> ClientResult<()> {
-        match self.worker_write_step_with_timeout(deadline, block.finish()).await {
-            Ok((target, written_len)) => {
-                if let Err(err) = session.push_ready_block(target, written_len) {
-                    session.mark_session_invalid();
-                    return Err(err);
-                }
-                Ok(())
-            }
-            Err(err) => {
-                mark_session_after_write_error(session, &err);
-                Err(self.normalize_outcome_error("WriteBlock", "worker", err))
-            }
-        }
-    }
-
-    /// Observes a terminal Worker result that arrived between public writer
-    /// calls before sending more bytes on the same block RPC.
-    pub(crate) async fn check_block_write(
-        &self,
-        session: &mut WriteSession,
-        block: &mut BlockWrite,
-        deadline: &OperationDeadline,
-    ) -> ClientResult<()> {
-        match self.worker_write_step_with_timeout(deadline, block.check_open()).await {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                mark_session_after_write_error(session, &err);
-                Err(self.normalize_outcome_error("WriteBlock", "worker", err))
-            }
-        }
-    }
-
-    /// Waits for local block cancellation only within the current public
-    /// operation; the detached completion task retains its lease bound.
-    pub(crate) async fn cancel_block_write(&self, block: BlockWrite, deadline: &OperationDeadline) -> ClientResult<()> {
-        if block.cancel(deadline.remaining()).await {
-            return Ok(());
-        }
-        self.record_worker_timeout("WriteBlock");
-        Err(timeout_error("worker", "WriteBlock cancellation"))
-    }
-
     /// Runs a worker RPC under the shared public operation deadline.
     pub(crate) async fn worker_rpc_with_timeout<T, Fut>(
         &self,
@@ -240,7 +67,11 @@ impl ClientInner {
 
     /// Bounds one send, status check, or finish step without imposing a fixed
     /// timeout on the multi-call lifetime of the underlying streaming RPC.
-    async fn worker_write_step_with_timeout<T, Fut>(&self, deadline: &OperationDeadline, future: Fut) -> ClientResult<T>
+    pub(crate) async fn worker_write_step_with_timeout<T, Fut>(
+        &self,
+        deadline: &OperationDeadline,
+        future: Fut,
+    ) -> ClientResult<T>
     where
         Fut: Future<Output = ClientResult<T>>,
     {
@@ -319,7 +150,7 @@ impl ClientInner {
         normalized
     }
 
-    fn record_worker_timeout(&self, operation: &'static str) {
+    pub(crate) fn record_worker_timeout(&self, operation: &'static str) {
         self.record_metric(
             ClientMetric::RpcTimeout,
             metric_labels(operation, "worker")
@@ -344,80 +175,11 @@ pub(crate) fn refresh_hint_from_error(err: &ClientError) -> RefreshHint {
     err.refresh_hint().cloned().unwrap_or_default()
 }
 
-/// Marks a write session after a metadata session-level failure.
-pub(crate) fn mark_session_after_metadata_error(session: &mut WriteSession, err: &ClientError) {
-    if err.is_outcome_unknown() {
-        session.mark_unknown_outcome();
-        return;
-    }
-    match err.kind() {
-        ClientErrorKind::SessionExpired => session.mark_session_expired(),
-        ClientErrorKind::Fenced | ClientErrorKind::SessionInvalid => session.mark_session_invalid(),
-        _ => {}
-    }
-    if matches!(
-        err.remote_error().map(|error| &error.recovery),
-        Some(RecoveryAction::RefreshMetadata { .. })
-    ) {
-        session.mark_session_invalid();
-    }
-}
-
 /// Converts a worker timeout into the standard transport-style client error.
 fn timeout_error(target_plane: &str, operation: &str) -> ClientError {
     ClientError::from(tonic::Status::deadline_exceeded(format!(
         "{target_plane} {operation} exceeded the public operation deadline"
     )))
-}
-
-/// Creates the stable operation identity used for worker write attempts.
-fn worker_write_context(
-    client_id: beryl_types::ClientId,
-    client_name: &str,
-    operation: Operation,
-    path: &str,
-    deadline: OperationDeadline,
-) -> ClientResult<OperationContext> {
-    OperationContext::new_named(client_id, client_name, operation, Some(path.to_string()), deadline)
-}
-
-/// Marks a write session after a worker write or add-block failure.
-fn mark_session_after_write_error(session: &mut WriteSession, err: &ClientError) {
-    if has_uncertain_write_effect(err) {
-        session.mark_unknown_outcome();
-    } else if is_session_or_fencing_error(err) || is_write_refresh_error(err) {
-        mark_session_after_metadata_error(session, err);
-    } else {
-        session.mark_session_invalid();
-    }
-}
-
-/// Returns true when a failure leaves worker write side effects uncertain.
-fn has_uncertain_write_effect(err: &ClientError) -> bool {
-    err.is_outcome_unknown() || err.is_retryable_transport() || err.is_invalid_success_response()
-}
-
-/// Returns true when the error invalidates or expires the write session.
-fn is_session_or_fencing_error(err: &ClientError) -> bool {
-    matches!(
-        err.kind(),
-        ClientErrorKind::Fenced | ClientErrorKind::SessionInvalid | ClientErrorKind::SessionExpired
-    )
-}
-
-/// Returns true when a write-path metadata refresh cause invalidates the current session.
-fn is_write_refresh_error(err: &ClientError) -> bool {
-    err.remote_error().is_some_and(|error| {
-        matches!(error.recovery, RecoveryAction::RefreshMetadata { .. })
-            && matches!(
-                error.kind,
-                ErrorKind::Metadata(
-                    MetadataErrorKind::RouteEpochMismatch
-                        | MetadataErrorKind::OwnerGroupMismatch
-                        | MetadataErrorKind::StaleState
-                ) | ErrorKind::Worker(WorkerErrorKind::RunMismatch)
-            )
-    })
 }
 
 /// Normalizes uncertain transport and header failures into unknown outcomes.

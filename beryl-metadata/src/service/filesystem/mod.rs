@@ -847,7 +847,7 @@ mod tests {
             block_id,
             file_offset: 0,
             block_size: 64,
-            worker_endpoints: Vec::new(),
+            workers: Vec::new(),
             fencing_token: FencingToken {
                 block_id,
                 owner: writer,
@@ -916,7 +916,7 @@ mod tests {
         filesystem: &MetadataFileSystem,
         key: &OpenWriteOutput,
         committed_blocks: Vec<CommittedBlock>,
-        final_size: u64,
+        final_len: u64,
     ) -> FsResult<CloseWriteOutput> {
         filesystem
             .close_write_session(
@@ -927,8 +927,8 @@ mod tests {
                 },
                 CloseWriteIntent {
                     committed_blocks,
-                    final_size,
-                    expected_file_size: key.base_size,
+                    final_len,
+                    expected_file_len: key.base_len,
                 },
                 Freshness::default(),
                 key.generation,
@@ -953,19 +953,19 @@ mod tests {
         pub(super) group_name: GroupName,
     }
 
-    pub(super) async fn write_flow_env(base_size: u64) -> WriteFlowEnv {
-        build_write_flow_env(base_size, worker_manager_for_write_targets).await
+    pub(super) async fn write_flow_env(base_len: u64) -> WriteFlowEnv {
+        build_write_flow_env(base_len, worker_manager_for_write_targets).await
     }
 
     async fn build_write_flow_env(
-        base_size: u64,
+        base_len: u64,
         worker_manager: impl FnOnce(&GroupName) -> Arc<WorkerManager>,
     ) -> WriteFlowEnv {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_id = MountId::new(57 + base_size);
-        let group_name = group_name(&format!("g{}", 15 + base_size));
-        let inode_id = InodeId::new(9570 + base_size);
+        let mount_id = MountId::new(57 + base_len);
+        let group_name = group_name(&format!("g{}", 15 + base_len));
+        let inode_id = InodeId::new(9570 + base_len);
         let state_store = Arc::new(MemoryStateStore::new());
         let builder = filesystem_builder_with_mount(mount_id, 9, &group_name)
             .with_state_store(Arc::clone(&state_store) as Arc<dyn StateStore>);
@@ -981,8 +981,8 @@ mod tests {
         let attrs = InodeAttrs::new();
         let mut inode = Inode::new_file(inode_id, attrs, mount_id, 64);
         let file = inode.file_mut().unwrap();
-        file.len = base_size;
-        let count = crate::inode::FileData::block_count(base_size, 64).unwrap();
+        file.len = base_len;
+        let count = crate::inode::FileData::block_count(base_len, 64).unwrap();
         file.blocks = (0..count)
             .map(|index| BlockId::new(inode_id, beryl_types::BlockIndex::new(index as u32)))
             .collect();
@@ -1008,7 +1008,7 @@ mod tests {
         report_seq: u64,
         effective_len: u64,
     ) {
-        let worker = target.worker_endpoints.first().expect("write target worker");
+        let worker = target.workers.first().expect("write target worker");
         let worker_manager = &env.filesystem.worker_manager;
         publish_report_block(
             worker_manager,

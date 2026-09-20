@@ -9,10 +9,11 @@
 //! client and transport, with bounded retry, structured refresh, and
 //! invalid response-header handling. Readers implement futures IO and offer
 //! owned range reads through the same bounded data-plane steps. The current
-//! implementation requires a Tokio runtime; Tokio IO callers can use
-//! `tokio_util::compat`. Public writes use internal write-state
-//! tracking and data-plane adapters. Metadata selects and persists the layout
-//! for new files; existing files reuse that stored block capacity.
+//! implementation requires a Tokio runtime; readers support Tokio IO through
+//! `tokio_util::compat`. Writers expose native async methods: flush confirms
+//! Worker durability, sync publishes visibility, and close commits and ends the
+//! lease. Metadata selects and persists the layout for new files; existing files
+//! reuse that stored block capacity.
 //! Readers reuse one bounded Metadata-authorized layout for sequential and
 //! positioned reads. [`FileWriter::sync`]
 //! publishes durable data while retaining the open write session.

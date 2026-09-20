@@ -347,27 +347,27 @@ impl MetadataClient {
     /// under the same operation identity.
     pub(crate) async fn commit_file(&self, plan: CommitFilePlan) -> ClientResult<CommitFileResponseProto> {
         let operation = plan.operation.clone();
-        let final_size = plan.final_size;
+        let final_len = plan.final_len;
         let req = CommitFileRequestProto {
             header: None,
             write_handle: Some(plan.write_handle.into()),
             committed_blocks: plan.committed_blocks.iter().map(Into::into).collect(),
-            final_size: plan.final_size,
+            final_len: plan.final_len,
             expected_generation: plan.expected_generation.as_raw(),
             write_mode: OpenWriteModeProto::from(plan.write_mode) as i32,
-            expected_file_size: plan.expected_file_size,
+            expected_file_len: plan.expected_file_len,
         };
         let response = self
             .execute_mutation_metadata(operation.clone(), req, |transport, ctx, req| async move {
                 transport.commit_file(ctx, req).await
             })
             .await?;
-        if response.committed_size != final_size {
+        if response.committed_len != final_len {
             return Err(side_effect_response_body_mismatch(
                 "CommitFile",
                 format!(
-                    "committed_size {} does not equal final_size {final_size}",
-                    response.committed_size
+                    "committed_len {} does not equal final_len {final_len}",
+                    response.committed_len
                 ),
             )
             .with_operation_context(&operation));
@@ -423,27 +423,27 @@ impl MetadataClient {
     /// under the same operation identity.
     pub(crate) async fn sync_write(&self, plan: SyncWritePlan) -> ClientResult<ContentGeneration> {
         let operation = plan.operation.clone();
-        let target_size = plan.target_size;
+        let target_len = plan.target_len;
         let req = SyncWriteRequestProto {
             header: None,
             write_handle: Some(plan.write_handle.into()),
             committed_blocks: plan.committed_blocks.iter().map(Into::into).collect(),
-            target_size: plan.target_size,
+            target_len: plan.target_len,
             expected_generation: plan.expected_generation.as_raw(),
             write_mode: OpenWriteModeProto::from(plan.write_mode) as i32,
-            expected_file_size: plan.expected_file_size,
+            expected_file_len: plan.expected_file_len,
         };
         let response = self
             .execute_mutation_metadata(operation.clone(), req, |transport, ctx, req| async move {
                 transport.sync_write(ctx, req).await
             })
             .await?;
-        if response.synced_size != target_size {
+        if response.synced_len != target_len {
             return Err(side_effect_response_body_mismatch(
                 "SyncWrite",
                 format!(
-                    "synced_size {} does not equal target_size {target_size}",
-                    response.synced_size
+                    "synced_len {} does not equal target_len {target_len}",
+                    response.synced_len
                 ),
             )
             .with_operation_context(&operation));
@@ -792,7 +792,7 @@ fn write_session_from_open_response(
         path,
         block_size,
         write_handle,
-        response.base_size,
+        response.base_len,
         response.expires_at_ms,
         ContentGeneration::new(response.generation),
         mode,

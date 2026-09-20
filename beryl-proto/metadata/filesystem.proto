@@ -71,7 +71,7 @@ message LocatedBlockProto {
   // and enforce this bound before the final effective length is known.
   uint64 block_size = 3;
   uint64 write_offset = 4;
-  repeated common.WorkerEndpointInfoProto worker_endpoints = 5;
+  repeated common.WorkerEndpointInfoProto workers = 5;
   common.FencingTokenProto fencing_token = 6;
   // Worker-local storage tier requested for this block replica.
   common.TierProto tier = 7;
@@ -232,7 +232,7 @@ message OpenWriteRequestProto {
 message OpenWriteResponseProto {
   common.ResponseHeaderProto header = 1;
   WriteHandleProto write_handle = 2;
-  uint64 base_size = 3;
+  uint64 base_len = 3;
   uint64 expires_at_ms = 4;
   // Stored capacity of the existing file, independent of current defaults.
   uint32 block_size = 5;
@@ -265,17 +265,17 @@ message CommitFileRequestProto {
   common.RequestHeaderProto header = 1;
   WriteHandleProto write_handle = 2;
   repeated CommittedBlockProto committed_blocks = 3;
-  uint64 final_size = 4;
+  uint64 final_len = 4;
   uint64 expected_generation = 5;
   OpenWriteModeProto write_mode = 6;
-  uint64 expected_file_size = 7;
+  uint64 expected_file_len = 7;
 }
 
 // Success confirms publication, lease revocation, and durable completion evidence.
 // A later content change or close can retire the bounded replay evidence.
 message CommitFileResponseProto {
   common.ResponseHeaderProto header = 1;
-  uint64 committed_size = 2;
+  uint64 committed_len = 2;
 }
 
 message AbortFileWriteRequestProto {
@@ -301,15 +301,15 @@ message SyncWriteRequestProto {
   common.RequestHeaderProto header = 1;
   WriteHandleProto write_handle = 2;
   repeated CommittedBlockProto committed_blocks = 3;
-  uint64 target_size = 4;
+  uint64 target_len = 4;
   uint64 expected_generation = 5;
   OpenWriteModeProto write_mode = 6;
-  uint64 expected_file_size = 7;
+  uint64 expected_file_len = 7;
 }
 
 message SyncWriteResponseProto {
   common.ResponseHeaderProto header = 1;
-  uint64 synced_size = 2;
+  uint64 synced_len = 2;
   optional uint64 generation = 3;
 }
 

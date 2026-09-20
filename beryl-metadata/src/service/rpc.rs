@@ -523,7 +523,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                             }
                             .into()
                         ),
-                        base_size: payload.base_size,
+                        base_len: payload.base_len,
                         expires_at_ms: payload.expires_at_ms,
                         block_size: payload.block_size,
                         generation: payload.generation.as_raw(),
@@ -688,10 +688,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 CommitFileArgs {
                     handle,
                     committed_blocks,
-                    final_size: req.final_size,
+                    final_len: req.final_len,
                     freshness: Self::freshness_from_header(&req.header),
                     expected_generation: ContentGeneration::new(req.expected_generation),
-                    expected_file_size: req.expected_file_size,
+                    expected_file_len: req.expected_file_len,
                     publish_mode,
                 },
             )
@@ -699,7 +699,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         {
             Ok(success) => response_with_header!(
                 CommitFileResponseProto {
-                    committed_size: success.payload.committed_size,
+                    committed_len: success.payload.committed_len,
                     ..Default::default()
                 },
                 ok_header_from_fs_success(&req_ctx, &success)
@@ -830,10 +830,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 SyncWriteArgs {
                     handle,
                     committed_blocks,
-                    target_size: req.target_size,
+                    target_len: req.target_len,
                     freshness: Self::freshness_from_header(&req.header),
                     expected_generation: ContentGeneration::new(req.expected_generation),
-                    expected_file_size: req.expected_file_size,
+                    expected_file_len: req.expected_file_len,
                     publish_mode,
                 },
             )
@@ -841,7 +841,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         {
             Ok(success) => response_with_header!(
                 SyncWriteResponseProto {
-                    synced_size: success.payload.synced_size,
+                    synced_len: success.payload.synced_len,
                     generation: success.payload.generation.map(ContentGeneration::as_raw),
                     ..Default::default()
                 },
@@ -1142,13 +1142,7 @@ mod tests {
         .block
         .expect("write target");
         let reported_block_id = target.block_id.as_ref().expect("target block id");
-        let reported_worker_id = WorkerId::new(
-            target
-                .worker_endpoints
-                .first()
-                .expect("target worker endpoint")
-                .worker_id,
-        );
+        let reported_worker_id = WorkerId::new(target.workers.first().expect("target worker endpoint").worker_id);
         publish_reported_location(
             env,
             reported_worker_id,
@@ -1243,10 +1237,10 @@ mod tests {
             header: header(51),
             write_handle: Some(write_handle),
             committed_blocks: vec![committed],
-            target_size: 128,
+            target_len: 128,
             expected_generation,
             write_mode,
-            expected_file_size: 0,
+            expected_file_len: 0,
         };
 
         let first = FileSystemServiceProto::sync_write(&env.service, Request::new(request.clone()))
@@ -1278,10 +1272,10 @@ mod tests {
             header: header(52),
             write_handle: Some(write_handle),
             committed_blocks: vec![committed],
-            final_size: 128,
+            final_len: 128,
             expected_generation: first_generation,
             write_mode,
-            expected_file_size: 128,
+            expected_file_len: 128,
         };
         let rejected = FileSystemServiceProto::commit_file(&env.service, Request::new(commit.clone()))
             .await
@@ -1300,7 +1294,7 @@ mod tests {
             .expect("transport status must remain OK")
             .into_inner();
         assert_success_header(replay.header);
-        assert_eq!(replay.synced_size, first.synced_size);
+        assert_eq!(replay.synced_len, first.synced_len);
         assert_eq!(replay.generation, Some(first_generation));
 
         let rejected = FileSystemServiceProto::commit_file(
@@ -1343,17 +1337,17 @@ mod tests {
             header: header(30),
             write_handle: Some(write_handle),
             committed_blocks: vec![committed],
-            final_size: 128,
+            final_len: 128,
             expected_generation,
             write_mode,
-            expected_file_size: 0,
+            expected_file_len: 0,
         };
         let first = FileSystemServiceProto::commit_file(&env.service, Request::new(request.clone()))
             .await
             .unwrap()
             .into_inner();
         assert_success_header(first.header);
-        assert_eq!(first.committed_size, 128);
+        assert_eq!(first.committed_len, 128);
         assert!(env.session_registry.get_session(inode_id).is_none());
         let inode = env.storage.get_inode(inode_id).unwrap().unwrap();
         let InodeKind::File(crate::inode::FileData {
@@ -1374,13 +1368,13 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_success_header(replay.header);
-        assert_eq!(replay.committed_size, first.committed_size);
+        assert_eq!(replay.committed_len, first.committed_len);
         for change in 0..5 {
             let mut altered = request.clone();
             match change {
-                0 => altered.final_size += 1,
+                0 => altered.final_len += 1,
                 1 => altered.expected_generation += 1,
-                2 => altered.expected_file_size += 1,
+                2 => altered.expected_file_len += 1,
                 3 => altered.write_mode = OpenWriteModeProto::OpenWriteModeAppend as i32,
                 _ => altered.committed_blocks[0].len -= 1,
             }

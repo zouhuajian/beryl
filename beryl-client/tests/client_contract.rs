@@ -642,7 +642,7 @@ async fn malformed_create_and_allocate_block_successes_fail_closed_before_worker
 
     let mut writer = client.create("/bad-target").await.expect("valid writer");
     let add_error = writer
-        .write_all(Bytes::from_static(b"x"))
+        .write_all(b"x")
         .await
         .expect_err("mismatched AllocateBlock target");
     assert_client_error(
@@ -653,7 +653,7 @@ async fn malformed_create_and_allocate_block_successes_fail_closed_before_worker
     );
     assert_eq!(add_error.operation(), Some("AllocateBlock"));
     let stale = writer
-        .write_all(Bytes::from_static(b"!"))
+        .write_all(b"!")
         .await
         .expect_err("unknown AllocateBlock blocks writes");
     assert_client_error(&stale, ClientErrorKind::StaleHandle, false, "unknown outcome");
@@ -671,7 +671,7 @@ async fn ambiguous_commit_response_can_only_be_recovered_by_the_same_close() {
             ))
         } else {
             MetadataReply::success(CommitFileResponseProto {
-                committed_size: 1,
+                committed_len: 1,
                 ..CommitFileResponseProto::default()
             })
         };
@@ -684,7 +684,7 @@ async fn ambiguous_commit_response_can_only_be_recovered_by_the_same_close() {
                     "receipt no longer available",
                 )),
                 MetadataReply::success(CommitFileResponseProto {
-                    committed_size: 0,
+                    committed_len: 0,
                     ..CommitFileResponseProto::default()
                 }),
             ]),
@@ -698,7 +698,7 @@ async fn ambiguous_commit_response_can_only_be_recovered_by_the_same_close() {
         let (kind, message) = if internal {
             (ClientErrorKind::Internal, "completion failed")
         } else {
-            (ClientErrorKind::InvalidResponse, "committed_size")
+            (ClientErrorKind::InvalidResponse, "committed_len")
         };
         assert_client_error(&error, kind, true, message);
         let error = writer
@@ -731,17 +731,17 @@ async fn malformed_sync_response_blocks_new_writes_until_the_same_sync_resolves(
         })]),
         sync_write: VecDeque::from([
             MetadataReply::success(SyncWriteResponseProto {
-                synced_size: 3,
+                synced_len: 3,
                 generation: None,
                 ..SyncWriteResponseProto::default()
             }),
             MetadataReply::success(SyncWriteResponseProto {
-                synced_size: 4,
+                synced_len: 4,
                 generation: Some(1),
                 ..SyncWriteResponseProto::default()
             }),
             MetadataReply::success(SyncWriteResponseProto {
-                synced_size: 3,
+                synced_len: 3,
                 generation: Some(1),
                 ..SyncWriteResponseProto::default()
             }),
@@ -752,16 +752,13 @@ async fn malformed_sync_response_blocks_new_writes_until_the_same_sync_resolves(
     let metadata_server = metadata.start().await;
     let client = FsClient::new(client_config(metadata_server.endpoint(), 1)).expect("client");
     let mut writer = client.create("/sync").await.expect("writer");
-    writer.write_all(Bytes::from_static(b"abc")).await.expect("write");
+    writer.write_all(b"abc").await.expect("write");
 
-    for expected in ["generation missing", "synced_size"] {
+    for expected in ["generation missing", "synced_len"] {
         let error = writer.sync().await.expect_err("malformed SyncWrite response");
         assert_client_error(&error, ClientErrorKind::InvalidResponse, true, expected);
     }
-    let stale = writer
-        .write_all(Bytes::from_static(b"x"))
-        .await
-        .expect_err("unresolved sync blocks writes");
+    let stale = writer.write_all(b"x").await.expect_err("unresolved sync blocks writes");
     assert_client_error(&stale, ClientErrorKind::StaleHandle, false, "unresolved SyncWrite");
     writer.sync().await.expect("frozen sync retry succeeds");
     writer.abort().await.expect("abort resolved writer");
@@ -793,10 +790,7 @@ async fn malformed_lease_renewal_invalidates_the_writer_for_new_side_effects() {
 
     let error = writer.renew_lease().await.expect_err("invalid renewal response");
     assert_client_error(&error, ClientErrorKind::InvalidResponse, true, "expires_at_ms");
-    let stale = writer
-        .write_all(Bytes::from_static(b"x"))
-        .await
-        .expect_err("unknown renewal blocks writes");
+    let stale = writer.write_all(b"x").await.expect_err("unknown renewal blocks writes");
     assert_client_error(&stale, ClientErrorKind::StaleHandle, false, "unknown outcome");
     assert_methods(&metadata.calls(), &["CreateFile", "RenewLease"]);
     server.shutdown().await;
@@ -821,14 +815,14 @@ async fn worker_failure_after_ack_invalidates_the_writer_and_prevents_commit() {
     let client = FsClient::new(client_config(metadata_server.endpoint(), 1)).expect("client");
     let mut writer = client.create("/worker-failure").await.expect("writer");
 
-    let first = match writer.write_all(Bytes::from_static(b"abc")).await {
+    let first = match writer.write_all(b"abc").await {
         Ok(()) => writer.sync().await.expect_err("sync observes Worker failure"),
         Err(error) => error,
     };
     assert!(first.is_outcome_unknown());
     assert_eq!(first.operation(), Some("WriteBlock"));
     let stale = writer
-        .write_all(Bytes::from_static(b"x"))
+        .write_all(b"x")
         .await
         .expect_err("uncertain Worker write blocks later writes");
     assert_client_error(&stale, ClientErrorKind::StaleHandle, false, "unknown outcome");
@@ -867,22 +861,17 @@ async fn allocation_replay_and_worker_capacity_retries_keep_the_same_block() {
     let client = FsClient::new(client_config(metadata_server.endpoint(), 3)).expect("client");
     let mut writer = client.create("/capacity").await.expect("writer");
 
-    let error = writer
-        .write_all(Bytes::from_static(b"x"))
-        .await
-        .expect_err("capacity attempts exhausted");
+    let error = writer.write_all(b"x").await.expect_err("capacity attempts exhausted");
     assert_client_error(&error, ClientErrorKind::ResourceExhausted, false, "capacity exhausted");
     writer
-        .write_all(Bytes::new())
+        .write_all(&[])
         .await
         .expect("definite pre-side-effect rejection leaves writer open");
     assert_eq!(worker.write_calls(), 3);
     assert_eq!(worker.write_data_frames(), 0);
-    writer
-        .write_all(Bytes::from_static(b"12345678"))
-        .await
-        .expect("capacity recovered");
-    assert_eq!(writer.cursor(), 8);
+    writer.write_all(b"12345678").await.expect("capacity recovered");
+    writer.flush().await.expect("Worker durability");
+    assert_eq!(writer.position(), 8);
     assert_eq!(worker.write_calls(), 4);
     assert_eq!(worker.write_completions(), 1);
     let calls = metadata.calls();
@@ -895,6 +884,473 @@ async fn allocation_replay_and_worker_capacity_retries_keep_the_same_block() {
     }
     metadata_server.shutdown().await;
     worker_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn capacity_retry_deadline_preserves_the_unmodified_write_session() {
+    let worker = MockWorker::new(WorkerScript {
+        writes: (0..10).map(|_| WriteReply::CapacityRejected).collect(),
+        ..Default::default()
+    });
+    let worker_server = worker.start().await;
+    let metadata = MockMetadata::new(MetadataScript {
+        create_file: VecDeque::from([MetadataReply::success(create_response(411, 8))]),
+        allocate_block: VecDeque::from([MetadataReply::success(AllocateBlockResponseProto {
+            block: Some(write_target(411, 0, 0, worker_server.endpoint(), 8)),
+            ..Default::default()
+        })]),
+        commit_file: VecDeque::from([MetadataReply::success(CommitFileResponseProto::default())]),
+        ..Default::default()
+    });
+    let server = metadata.start().await;
+    let config = ClientConfig::builder()
+        .metadata_endpoints([server.endpoint()])
+        .max_attempts(10)
+        .operation_timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let client = FsClient::new(config).unwrap();
+    let mut writer = client.create("/capacity-deadline").await.unwrap();
+    let error = writer.write(b"unaccepted").await.unwrap_err();
+    assert_eq!(error.kind(), ClientErrorKind::Timeout);
+    assert!(!error.is_outcome_unknown());
+    assert_eq!(writer.position(), 0);
+    assert_eq!(worker.write_data_frames(), 0);
+    writer.close().await.expect("a rejected write leaves the lease usable");
+    assert_methods(&metadata.calls(), &["CreateFile", "AllocateBlock", "CommitFile"]);
+    server.shutdown().await;
+    worker_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelled_write_opening_rejects_further_writes_without_accepting_bytes() {
+    for block_metadata in [true, false] {
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let mut metadata_gate = None;
+        let reply = if block_metadata {
+            metadata_gate = Some((started, gate));
+            WriteReply::Success
+        } else {
+            WriteReply::BlockedOpen { started, release: gate }
+        };
+        let worker = MockWorker::new(WorkerScript {
+            writes: VecDeque::from([reply]),
+            ..Default::default()
+        });
+        let worker_server = worker.start().await;
+        let target = AllocateBlockResponseProto {
+            block: Some(write_target(401, 0, 0, worker_server.endpoint(), 8)),
+            ..Default::default()
+        };
+        let allocation = match metadata_gate {
+            Some((started, release)) => MetadataReply::Blocked {
+                body: target,
+                started,
+                release,
+            },
+            None => MetadataReply::success(target),
+        };
+        let metadata = MockMetadata::new(MetadataScript {
+            create_file: VecDeque::from([MetadataReply::success(create_response(401, 8))]),
+            allocate_block: VecDeque::from([allocation]),
+            ..Default::default()
+        });
+        let server = metadata.start().await;
+        let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+        let mut writer = client.create("/cancel-opening").await.unwrap();
+        tokio::select! {
+            result = writer.write(b"old") => panic!("opening must wait: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(2), waiting) => result.unwrap().unwrap(),
+        }
+        assert_eq!(writer.position(), 0);
+        assert_eq!(writer.path(), "/cancel-opening");
+        assert_eq!(writer.write(&[]).await.unwrap(), 0);
+        assert_eq!(worker.write_data_frames(), 0);
+        let _ = release.send(());
+        let error = writer.write(b"new").await.unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::StaleHandle);
+        assert!(error.message().contains("unknown outcome"));
+        assert!(writer.close().await.is_err());
+        assert_eq!(writer.position(), 0);
+        assert_eq!(worker.write_data_frames(), 0);
+        assert_eq!(metadata.allocations().len(), 1);
+        assert!(calls_for(&metadata.calls(), "CommitFile").is_empty());
+        drop(writer);
+        server.shutdown().await;
+        worker_server.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn cancelled_flush_blocks_later_writes_and_publication() {
+    let (started, waiting) = tokio::sync::oneshot::channel();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let worker = MockWorker::new(WorkerScript {
+        writes: VecDeque::from([WriteReply::BlockedFinish { started, release: gate }]),
+        ..Default::default()
+    });
+    let worker_server = worker.start().await;
+    let metadata = MockMetadata::new(MetadataScript {
+        create_file: VecDeque::from([MetadataReply::success(create_response(402, 8))]),
+        allocate_block: VecDeque::from([MetadataReply::success(AllocateBlockResponseProto {
+            block: Some(write_target(402, 0, 0, worker_server.endpoint(), 8)),
+            ..Default::default()
+        })]),
+        ..Default::default()
+    });
+    let server = metadata.start().await;
+    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    let mut writer = client.create("/cancel-flush").await.unwrap();
+    writer.write_all(b"abc").await.unwrap();
+    tokio::select! {
+        result = writer.flush() => panic!("checkpoint must wait: {result:?}"),
+        result = tokio::time::timeout(Duration::from_secs(2), waiting) => result.unwrap().unwrap(),
+    }
+    assert_eq!(writer.position(), 3);
+    assert_eq!(worker.written_data(), b"abc");
+    assert_eq!(worker.write_completions(), 0);
+    let error = writer.write(b"de").await.unwrap_err();
+    assert_eq!(error.kind(), ClientErrorKind::StaleHandle);
+    assert!(writer.flush().await.is_err());
+    assert!(writer.sync().await.is_err());
+    assert!(writer.close().await.is_err());
+    assert_eq!(writer.position(), 3);
+    assert_eq!(worker.write_calls(), 1);
+    assert_methods(&metadata.calls(), &["CreateFile", "AllocateBlock"]);
+    let _ = release.send(());
+    server.shutdown().await;
+    worker_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelled_publications_replay_frozen_requests_and_reject_other_operations() {
+    for method in ["SyncWrite", "CommitFile", "AbortFileWrite"] {
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let mut script = MetadataScript {
+            create_file: VecDeque::from([MetadataReply::success(create_response(403, 8))]),
+            ..Default::default()
+        };
+        match method {
+            "SyncWrite" => script.sync_write.push_back(MetadataReply::Blocked {
+                body: SyncWriteResponseProto {
+                    synced_len: 0,
+                    generation: Some(0),
+                    ..Default::default()
+                },
+                started,
+                release: gate,
+            }),
+            "CommitFile" => script.commit_file.push_back(MetadataReply::Blocked {
+                body: CommitFileResponseProto::default(),
+                started,
+                release: gate,
+            }),
+            _ => script.abort_file_write.push_back(MetadataReply::Blocked {
+                body: AbortFileWriteResponseProto::default(),
+                started,
+                release: gate,
+            }),
+        }
+        match method {
+            "SyncWrite" => script
+                .sync_write
+                .push_back(MetadataReply::success(SyncWriteResponseProto {
+                    synced_len: 0,
+                    generation: Some(0),
+                    ..Default::default()
+                })),
+            "CommitFile" => script
+                .commit_file
+                .push_back(MetadataReply::success(CommitFileResponseProto::default())),
+            _ => script
+                .abort_file_write
+                .push_back(MetadataReply::success(AbortFileWriteResponseProto::default())),
+        }
+        let metadata = MockMetadata::new(script);
+        let server = metadata.start().await;
+        let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+        let mut writer = client.create("/cancel-publication").await.unwrap();
+        tokio::select! {
+            result = writer_barrier(&mut writer, method) => panic!("publication must wait: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(2), waiting) => result.unwrap().unwrap(),
+        }
+        let error = writer.write(b"unrelated").await.unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::StaleHandle);
+        assert!(writer.renew_lease().await.is_err());
+        let _ = release.send(());
+        writer_barrier(&mut writer, method).await.unwrap();
+        let calls = metadata.calls();
+        let attempts = calls_for(&calls, method);
+        assert_eq!(attempts.len(), 2);
+        assert_same_call_id(&attempts);
+        drop(writer);
+        server.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn cancelled_renewal_blocks_further_writes_and_publication() {
+    let (started, waiting) = tokio::sync::oneshot::channel();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let worker = MockWorker::new(WorkerScript {
+        writes: VecDeque::from([WriteReply::Success]),
+        ..Default::default()
+    });
+    let worker_server = worker.start().await;
+    let metadata = MockMetadata::new(MetadataScript {
+        create_file: VecDeque::from([MetadataReply::success(create_response(410, 8))]),
+        allocate_block: VecDeque::from([MetadataReply::success(AllocateBlockResponseProto {
+            block: Some(write_target(410, 0, 0, worker_server.endpoint(), 8)),
+            ..Default::default()
+        })]),
+        renew_lease: VecDeque::from([MetadataReply::Blocked {
+            body: RenewLeaseResponseProto {
+                expires_at_ms: unix_now_ms() + 120_000,
+                ..Default::default()
+            },
+            started,
+            release: gate,
+        }]),
+        ..Default::default()
+    });
+    let server = metadata.start().await;
+    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    let mut writer = client.create("/cancel-renewal").await.unwrap();
+    writer.write_all(b"abc").await.unwrap();
+    tokio::select! {
+        result = writer.renew_lease() => panic!("renewal must wait: {result:?}"),
+        result = tokio::time::timeout(Duration::from_secs(2), waiting) => result.unwrap().unwrap(),
+    }
+    assert_eq!(writer.position(), 3);
+    let error = writer.write(b"d").await.unwrap_err();
+    assert_eq!(error.kind(), ClientErrorKind::StaleHandle);
+    assert!(writer.close().await.is_err());
+    assert_eq!(writer.position(), 3);
+    assert_eq!(worker.write_calls(), 1);
+    assert_eq!(worker.write_completions(), 0);
+    assert_methods(&metadata.calls(), &["CreateFile", "AllocateBlock", "RenewLease"]);
+    let _ = release.send(());
+    server.shutdown().await;
+    worker_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelled_close_retries_frozen_identity_with_a_new_deadline() {
+    let (started, waiting) = tokio::sync::oneshot::channel();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let metadata = MockMetadata::new(MetadataScript {
+        create_file: VecDeque::from([MetadataReply::success(create_response(404, 8))]),
+        commit_file: VecDeque::from([
+            MetadataReply::Blocked {
+                body: CommitFileResponseProto::default(),
+                started,
+                release: gate,
+            },
+            MetadataReply::success(CommitFileResponseProto::default()),
+        ]),
+        ..Default::default()
+    });
+    let server = metadata.start().await;
+    let config = ClientConfig::builder()
+        .metadata_endpoints([server.endpoint()])
+        .max_attempts(1)
+        .operation_timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let client = FsClient::new(config).unwrap();
+    let mut writer = client.create("/close-deadline").await.unwrap();
+    tokio::select! {
+        result = writer.close() => panic!("commit must wait: {result:?}"),
+        result = tokio::time::timeout(Duration::from_secs(2), waiting) => result.unwrap().unwrap(),
+    }
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::time::resume();
+    writer.close().await.expect("explicit retry receives a new deadline");
+    writer.close().await.unwrap();
+    let calls = metadata.calls();
+    let commits = calls_for(&calls, "CommitFile");
+    assert_eq!(commits.len(), 2);
+    assert_same_call_id(&commits);
+    let _ = release.send(());
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_next_block_preserves_exact_accepted_prefix() {
+    let worker = MockWorker::new(WorkerScript {
+        writes: VecDeque::from([WriteReply::Success]),
+        ..Default::default()
+    });
+    let worker_server = worker.start().await;
+    let metadata = MockMetadata::new(MetadataScript {
+        create_file: VecDeque::from([MetadataReply::success(create_response(405, 4))]),
+        allocate_block: [0, 5]
+            .into_iter()
+            .enumerate()
+            .map(|(index, offset)| {
+                MetadataReply::success(AllocateBlockResponseProto {
+                    block: Some(write_target(405, index as u32, offset, worker_server.endpoint(), 4)),
+                    ..Default::default()
+                })
+            })
+            .collect(),
+        ..Default::default()
+    });
+    let server = metadata.start().await;
+    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    let mut writer = client.create("/partial-write").await.unwrap();
+    let error = writer.write_all(b"abcdef").await.unwrap_err();
+    assert_eq!(error.kind(), ClientErrorKind::InvalidResponse);
+    assert!(error.is_outcome_unknown());
+    assert_eq!(writer.position(), 4);
+    assert_eq!(worker.written_data(), b"abcd");
+    assert_eq!(worker.write_completions(), 1);
+    assert_eq!(metadata.allocations().len(), 2);
+    assert!(writer.close().await.is_err());
+    assert!(calls_for(&metadata.calls(), "CommitFile").is_empty());
+    server.shutdown().await;
+    worker_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn dropping_writer_cancels_stream_without_finishing_or_committing() {
+    let worker = MockWorker::new(WorkerScript {
+        writes: VecDeque::from([WriteReply::Success]),
+        ..Default::default()
+    });
+    let worker_server = worker.start().await;
+    let metadata = MockMetadata::new(MetadataScript {
+        create_file: VecDeque::from([MetadataReply::success(create_response(406, 8))]),
+        allocate_block: VecDeque::from([MetadataReply::success(AllocateBlockResponseProto {
+            block: Some(write_target(406, 0, 0, worker_server.endpoint(), 8)),
+            ..Default::default()
+        })]),
+        ..Default::default()
+    });
+    let server = metadata.start().await;
+    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    let mut writer = client.create("/drop-writer").await.unwrap();
+    writer.write_all(b"abc").await.unwrap();
+    drop(writer);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while worker.write_cancellations() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(worker.write_completions(), 0);
+    assert_methods(&metadata.calls(), &["CreateFile", "AllocateBlock"]);
+    server.shutdown().await;
+    worker_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelling_write_all_at_block_boundary_keeps_only_accepted_prefix() {
+    let (started, waiting) = tokio::sync::oneshot::channel();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let worker = MockWorker::new(WorkerScript {
+        writes: VecDeque::from([WriteReply::BlockedFinish { started, release: gate }]),
+        ..Default::default()
+    });
+    let worker_server = worker.start().await;
+    let metadata = MockMetadata::new(MetadataScript {
+        create_file: VecDeque::from([MetadataReply::success(create_response(407, 4))]),
+        allocate_block: VecDeque::from([MetadataReply::success(AllocateBlockResponseProto {
+            block: Some(write_target(407, 0, 0, worker_server.endpoint(), 4)),
+            ..Default::default()
+        })]),
+        ..Default::default()
+    });
+    let server = metadata.start().await;
+    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    let mut writer = client.create("/cancel-write-all").await.unwrap();
+    tokio::select! {
+        result = writer.write_all(b"abcdef") => panic!("block completion must wait: {result:?}"),
+        result = tokio::time::timeout(Duration::from_secs(2), waiting) => result.unwrap().unwrap(),
+    }
+    assert_eq!(writer.position(), 4);
+    assert_eq!(worker.written_data(), b"abcd");
+    let _ = release.send(());
+    assert!(writer.write_all(b"xy").await.is_err());
+    assert!(writer.close().await.is_err());
+    assert_eq!(writer.position(), 4);
+    assert_eq!(worker.written_data(), b"abcd");
+    assert_eq!(metadata.allocations().len(), 1);
+    assert!(calls_for(&metadata.calls(), "CommitFile").is_empty());
+    drop(writer);
+    server.shutdown().await;
+    worker_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn flush_timeout_blocks_later_publication() {
+    let (started, waiting) = tokio::sync::oneshot::channel();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let worker = MockWorker::new(WorkerScript {
+        writes: VecDeque::from([WriteReply::BlockedFinish { started, release: gate }]),
+        ..Default::default()
+    });
+    let worker_server = worker.start().await;
+    let metadata = MockMetadata::new(MetadataScript {
+        create_file: VecDeque::from([MetadataReply::success(create_response(408, 8))]),
+        allocate_block: VecDeque::from([MetadataReply::success(AllocateBlockResponseProto {
+            block: Some(write_target(408, 0, 0, worker_server.endpoint(), 8)),
+            ..Default::default()
+        })]),
+        ..Default::default()
+    });
+    let server = metadata.start().await;
+    let client = FsClient::new(
+        ClientConfig::builder()
+            .metadata_endpoints([server.endpoint()])
+            .max_attempts(1)
+            .operation_timeout(Duration::from_secs(1))
+            .build()
+            .unwrap(),
+    )
+    .unwrap();
+    let mut writer = client.create("/flush-deadline").await.unwrap();
+    writer.write_all(b"abc").await.unwrap();
+    let error = {
+        let flush = writer.flush();
+        tokio::pin!(flush);
+        tokio::select! {
+            result = &mut flush => panic!("checkpoint must wait: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(2), waiting) => result.unwrap().unwrap(),
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let error = tokio::time::timeout(Duration::from_millis(50), flush)
+            .await
+            .expect("checkpoint must respect its deadline")
+            .unwrap_err();
+        tokio::time::resume();
+        error
+    };
+    assert_eq!(error.kind(), ClientErrorKind::Timeout);
+    assert!(error.is_outcome_unknown());
+    assert_eq!(writer.position(), 3);
+    let error = writer.close().await.unwrap_err();
+    assert_eq!(error.kind(), ClientErrorKind::StaleHandle);
+    assert!(error.message().contains("unknown outcome"));
+    assert_methods(&metadata.calls(), &["CreateFile", "AllocateBlock"]);
+    let _ = release.send(());
+    drop(writer);
+    server.shutdown().await;
+    worker_server.shutdown().await;
+}
+
+async fn writer_barrier(writer: &mut beryl_client::FileWriter, method: &str) -> Result<(), ClientError> {
+    match method {
+        "SyncWrite" => writer.sync().await,
+        "CommitFile" => writer.close().await,
+        "AbortFileWrite" => writer.abort().await,
+        _ => unreachable!(),
+    }
 }
 
 #[tokio::test]
@@ -1326,20 +1782,20 @@ fn create_response(inode_id: u64, block_size: u32) -> CreateFileResponseProto {
     }
 }
 
-fn open_file_response(inode_id: u64, file_size: u64) -> OpenFileResponseProto {
+fn open_file_response(inode_id: u64, file_len: u64) -> OpenFileResponseProto {
     OpenFileResponseProto {
-        status: Some(file_status(inode_id, file_size)),
+        status: Some(file_status(inode_id, file_len)),
         ..OpenFileResponseProto::default()
     }
 }
 
 fn locations_response(
     inode_id: u64,
-    file_size: u64,
+    file_len: u64,
     location: FileBlockLocationProto,
 ) -> GetBlockLocationsResponseProto {
     GetBlockLocationsResponseProto {
-        status: Some(file_status(inode_id, file_size)),
+        status: Some(file_status(inode_id, file_len)),
         locations: vec![location],
         ..GetBlockLocationsResponseProto::default()
     }
@@ -1377,7 +1833,7 @@ fn write_target(
 
         block_size,
 
-        worker_endpoints: vec![worker(worker_endpoint)],
+        workers: vec![worker(worker_endpoint)],
         fencing_token: Some(FencingTokenProto {
             block_id: Some(block_id),
             owner: Some(ClientIdProto { high: 0, low: 7 }),

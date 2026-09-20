@@ -1221,9 +1221,9 @@ mod tests {
             call_id: beryl_types::CallId::new(),
             publication: crate::inode::FilePublication {
                 blocks: Vec::new(),
-                target_size: 0,
+                target_len: 0,
                 expected_generation: beryl_types::ContentGeneration::new(0),
-                expected_file_size: 0,
+                expected_file_len: 0,
                 lease_epoch: beryl_types::LeaseEpoch::new(1),
                 mode: crate::inode::PublishMode::ReplaceIfUnchanged,
             },
