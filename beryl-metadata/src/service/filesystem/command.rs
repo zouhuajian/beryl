@@ -169,13 +169,13 @@ impl MetadataFileSystem {
         command: Command,
         mut publication: WritePublication,
     ) -> MetadataResult<ContentGeneration> {
-        let (inode_id, lease_epoch, file_size, closes) = match &command {
+        let (inode_id, lease_epoch, file_len, closes) = match &command {
             Command::CommitFile {
                 inode_id, publication, ..
-            } => (*inode_id, publication.lease_epoch, publication.target_size, true),
+            } => (*inode_id, publication.lease_epoch, publication.target_len, true),
             Command::PublishFile {
                 inode_id, publication, ..
-            } => (*inode_id, publication.lease_epoch, publication.target_size, false),
+            } => (*inode_id, publication.lease_epoch, publication.target_len, false),
             _ => unreachable!("file publication command required"),
         };
         publication.mark_submitted().map_err(MetadataError::Again)?;
@@ -209,7 +209,7 @@ impl MetadataFileSystem {
                         Ok(generation)
                     } else {
                         publication
-                            .complete_sync(generation, file_size)
+                            .complete_sync(generation, file_len)
                             .map(|()| generation)
                             .map_err(MetadataError::Internal)
                     }

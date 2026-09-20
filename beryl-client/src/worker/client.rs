@@ -6,7 +6,7 @@
 use std::fmt;
 
 use super::transport::GrpcWorkerTransport;
-use super::{BlockWrite, WorkerWriteTarget};
+use super::BlockWrite;
 use crate::config::ClientConfig;
 use crate::error::ClientResult;
 use crate::planner::PlannedBlockRead;
@@ -47,7 +47,7 @@ impl WorkerClient {
         lease_expires_at_ms: u64,
     ) -> ClientResult<BlockWrite> {
         self.transport
-            .open_write_block(attempt, WorkerWriteTarget { group_name, target }, lease_expires_at_ms)
+            .open_write_block(attempt, group_name, target, lease_expires_at_ms)
             .await
     }
 }

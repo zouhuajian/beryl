@@ -41,6 +41,11 @@ pub(crate) enum MetadataReply<T> {
     SuccessWithAuthority(T, ResponseAuthority),
     Error(RpcErrorDetail),
     Status(Status),
+    Blocked {
+        body: T,
+        started: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    },
 }
 
 impl<T> MetadataReply<T> {
@@ -175,7 +180,7 @@ fn response_header(
     }
 }
 
-fn metadata_response<T: Default>(
+async fn metadata_response<T: Default>(
     request: &RequestHeaderProto,
     reply: Option<MetadataReply<T>>,
     method: &'static str,
@@ -199,6 +204,16 @@ fn metadata_response<T: Default>(
             Ok(Response::new(body))
         }
         MetadataReply::Status(status) => Err(status),
+        MetadataReply::Blocked {
+            mut body,
+            started,
+            release,
+        } => {
+            let _ = started.send(());
+            release.await.map_err(|_| Status::cancelled("metadata gate dropped"))?;
+            set_header(&mut body, response_header(request, None, ResponseAuthority::default()));
+            Ok(Response::new(body))
+        }
     }
 }
 
@@ -226,7 +241,7 @@ impl FileSystemServiceProto for MockMetadata {
             .expect("metadata script")
             .get_status
             .pop_front();
-        metadata_response(&header, reply, "GetStatus", |body, header| body.header = Some(header))
+        metadata_response(&header, reply, "GetStatus", |body, header| body.header = Some(header)).await
     }
 
     async fn list_status(
@@ -242,7 +257,7 @@ impl FileSystemServiceProto for MockMetadata {
             .expect("metadata script")
             .list_status
             .pop_front();
-        metadata_response(&header, reply, "ListStatus", |body, header| body.header = Some(header))
+        metadata_response(&header, reply, "ListStatus", |body, header| body.header = Some(header)).await
     }
 
     async fn create_directory(
@@ -261,20 +276,21 @@ impl FileSystemServiceProto for MockMetadata {
         metadata_response(&header, reply, "CreateDirectory", |body, header| {
             body.header = Some(header)
         })
+        .await
     }
 
     async fn delete(&self, request: Request<DeleteRequestProto>) -> Result<Response<DeleteResponseProto>, Status> {
         let request = request.into_inner();
         let header = self.record("Delete", request.header.as_ref())?;
         let reply = self.state.script.lock().expect("metadata script").delete.pop_front();
-        metadata_response(&header, reply, "Delete", |body, header| body.header = Some(header))
+        metadata_response(&header, reply, "Delete", |body, header| body.header = Some(header)).await
     }
 
     async fn rename(&self, request: Request<RenameRequestProto>) -> Result<Response<RenameResponseProto>, Status> {
         let request = request.into_inner();
         let header = self.record("Rename", request.header.as_ref())?;
         let reply = self.state.script.lock().expect("metadata script").rename.pop_front();
-        metadata_response(&header, reply, "Rename", |body, header| body.header = Some(header))
+        metadata_response(&header, reply, "Rename", |body, header| body.header = Some(header)).await
     }
 
     async fn open_file(
@@ -284,7 +300,7 @@ impl FileSystemServiceProto for MockMetadata {
         let request = request.into_inner();
         let header = self.record("OpenFile", request.header.as_ref())?;
         let reply = self.state.script.lock().expect("metadata script").open_file.pop_front();
-        metadata_response(&header, reply, "OpenFile", |body, header| body.header = Some(header))
+        metadata_response(&header, reply, "OpenFile", |body, header| body.header = Some(header)).await
     }
 
     async fn get_block_locations(
@@ -308,6 +324,7 @@ impl FileSystemServiceProto for MockMetadata {
         metadata_response(&header, reply, "GetBlockLocations", |body, header| {
             body.header = Some(header)
         })
+        .await
     }
 
     async fn create_file(
@@ -323,7 +340,7 @@ impl FileSystemServiceProto for MockMetadata {
             .expect("metadata script")
             .create_file
             .pop_front();
-        metadata_response(&header, reply, "CreateFile", |body, header| body.header = Some(header))
+        metadata_response(&header, reply, "CreateFile", |body, header| body.header = Some(header)).await
     }
 
     async fn open_write(
@@ -339,7 +356,7 @@ impl FileSystemServiceProto for MockMetadata {
             .expect("metadata script")
             .open_write
             .pop_front();
-        metadata_response(&header, reply, "OpenWrite", |body, header| body.header = Some(header))
+        metadata_response(&header, reply, "OpenWrite", |body, header| body.header = Some(header)).await
     }
 
     async fn allocate_block(
@@ -363,6 +380,7 @@ impl FileSystemServiceProto for MockMetadata {
         metadata_response(&header, reply, "AllocateBlock", |body, header| {
             body.header = Some(header)
         })
+        .await
     }
 
     async fn commit_file(
@@ -378,7 +396,7 @@ impl FileSystemServiceProto for MockMetadata {
             .expect("metadata script")
             .commit_file
             .pop_front();
-        metadata_response(&header, reply, "CommitFile", |body, header| body.header = Some(header))
+        metadata_response(&header, reply, "CommitFile", |body, header| body.header = Some(header)).await
     }
 
     async fn abort_file_write(
@@ -397,6 +415,7 @@ impl FileSystemServiceProto for MockMetadata {
         metadata_response(&header, reply, "AbortFileWrite", |body, header| {
             body.header = Some(header)
         })
+        .await
     }
 
     async fn renew_lease(
@@ -412,7 +431,7 @@ impl FileSystemServiceProto for MockMetadata {
             .expect("metadata script")
             .renew_lease
             .pop_front();
-        metadata_response(&header, reply, "RenewLease", |body, header| body.header = Some(header))
+        metadata_response(&header, reply, "RenewLease", |body, header| body.header = Some(header)).await
     }
 
     async fn sync_write(
@@ -428,14 +447,14 @@ impl FileSystemServiceProto for MockMetadata {
             .expect("metadata script")
             .sync_write
             .pop_front();
-        metadata_response(&header, reply, "SyncWrite", |body, header| body.header = Some(header))
+        metadata_response(&header, reply, "SyncWrite", |body, header| body.header = Some(header)).await
     }
 
     async fn msync(&self, request: Request<MsyncRequestProto>) -> Result<Response<MsyncResponseProto>, Status> {
         let request = request.into_inner();
         let header = self.record("Msync", request.header.as_ref())?;
         let reply = self.state.script.lock().expect("metadata script").msync.pop_front();
-        metadata_response(&header, reply, "Msync", |body, header| body.header = Some(header))
+        metadata_response(&header, reply, "Msync", |body, header| body.header = Some(header)).await
     }
 }
 
@@ -458,6 +477,14 @@ pub(crate) enum WriteReply {
     Success,
     CapacityRejected,
     AckThenUnavailable,
+    BlockedOpen {
+        started: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    },
+    BlockedFinish {
+        started: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    },
 }
 
 #[derive(Default)]
@@ -478,6 +505,8 @@ struct WorkerState {
     write_calls: AtomicUsize,
     write_data_frames: AtomicUsize,
     write_completions: AtomicUsize,
+    write_cancellations: AtomicUsize,
+    written_data: Mutex<Vec<Bytes>>,
 }
 
 impl MockWorker {
@@ -490,6 +519,8 @@ impl MockWorker {
                 write_calls: AtomicUsize::new(0),
                 write_data_frames: AtomicUsize::new(0),
                 write_completions: AtomicUsize::new(0),
+                write_cancellations: AtomicUsize::new(0),
+                written_data: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -512,6 +543,20 @@ impl MockWorker {
 
     pub(crate) fn write_completions(&self) -> usize {
         self.state.write_completions.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn written_data(&self) -> Vec<u8> {
+        self.state
+            .written_data
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|data| data.iter().copied())
+            .collect()
+    }
+
+    pub(crate) fn write_cancellations(&self) -> usize {
+        self.state.write_cancellations.load(Ordering::SeqCst)
     }
 
     pub(crate) async fn start(&self) -> RunningServer {
@@ -638,26 +683,39 @@ impl WorkerDataService for MockWorker {
             .message()
             .await?
             .ok_or_else(|| Status::invalid_argument("WriteBlock missing command"))?;
-        if !matches!(
-            command.payload,
-            Some(beryl_proto::worker::write_block_request_proto::Payload::Command(_))
-        ) {
+        let Some(beryl_proto::worker::write_block_request_proto::Payload::Command(_)) = command.payload else {
             return Err(Status::invalid_argument("WriteBlock first payload must be command"));
-        }
+        };
+        let reply = match reply {
+            WriteReply::BlockedOpen { started, release } => {
+                let _ = started.send(());
+                release
+                    .await
+                    .map_err(|_| Status::cancelled("write opening gate dropped"))?;
+                WriteReply::Success
+            }
+            reply => reply,
+        };
 
         let (responses, response_stream) = tokio::sync::mpsc::channel(2);
         let _ = responses.send(Ok(WriteBlockResponseProto {})).await;
         match reply {
-            WriteReply::Success => {
+            WriteReply::Success | WriteReply::BlockedFinish { .. } => {
+                let finish_gate = match reply {
+                    WriteReply::BlockedFinish { started, release } => Some((started, release)),
+                    _ => None,
+                };
                 let state = Arc::clone(&self.state);
                 tokio::spawn(async move {
                     loop {
                         match requests.message().await {
                             Ok(Some(request)) => match request.payload {
-                                Some(beryl_proto::worker::write_block_request_proto::Payload::Data(_)) => {
+                                Some(beryl_proto::worker::write_block_request_proto::Payload::Data(data)) => {
                                     state.write_data_frames.fetch_add(1, Ordering::SeqCst);
+                                    state.written_data.lock().unwrap().push(data);
                                 }
                                 _ => {
+                                    state.write_cancellations.fetch_add(1, Ordering::SeqCst);
                                     let _ = responses
                                         .send(Err(Status::cancelled("mock Worker received write cancellation")))
                                         .await;
@@ -665,6 +723,13 @@ impl WorkerDataService for MockWorker {
                                 }
                             },
                             Ok(None) => {
+                                if let Some((started, release)) = finish_gate {
+                                    let _ = started.send(());
+                                    tokio::select! {
+                                        _ = release => {},
+                                        _ = responses.closed() => return,
+                                    }
+                                }
                                 state.write_completions.fetch_add(1, Ordering::SeqCst);
                                 break;
                             }
@@ -689,6 +754,7 @@ impl WorkerDataService for MockWorker {
                     .await;
             }
             WriteReply::CapacityRejected => unreachable!("capacity rejection returned before acknowledgement"),
+            WriteReply::BlockedOpen { .. } => unreachable!("opening gate already resolved"),
         }
         Ok(Response::new(Box::pin(ReceiverStream::new(response_stream))))
     }

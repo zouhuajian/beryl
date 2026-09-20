@@ -24,7 +24,7 @@ async fn local_client_crud_roundtrip() {
     let suffix = Bytes::from_static(b"-beryl-append-suffix");
     let expected = [first.as_ref(), suffix.as_ref()].concat();
     let mut writer = client.create(path).await.expect("create through metadata");
-    writer.write_all(first.clone()).await.expect("write through worker");
+    writer.write_all(&first).await.expect("write through worker");
     writer.close().await.expect("close through metadata");
 
     let status = client.get_status(path).await.expect("status after close");
@@ -42,10 +42,7 @@ async fn local_client_crud_roundtrip() {
     assert_eq!(read, first);
 
     let mut appender = client.append(path).await.expect("append through metadata");
-    appender
-        .write_all(suffix.clone())
-        .await
-        .expect("append write through worker");
+    appender.write_all(&suffix).await.expect("append write through worker");
     appender.close().await.expect("append close through metadata");
 
     let read = client
@@ -127,7 +124,7 @@ async fn local_client_crud_roundtrip() {
     let replacement = Bytes::from_static(b"replacement-file");
     let mut replacement_writer = client.create(renamed_path).await.expect("recreate deleted path");
     replacement_writer
-        .write_all(replacement.clone())
+        .write_all(&replacement)
         .await
         .expect("write replacement file");
     replacement_writer
@@ -163,7 +160,7 @@ async fn visibility_sync_then_continue_write_roundtrip() {
     let second = Bytes::from(vec![b'b'; 1024]);
 
     let mut writer = client.create(path).await.expect("create through metadata");
-    writer.write_all(first.clone()).await.expect("write first block");
+    writer.write_all(&first).await.expect("write first block");
     writer
         .sync()
         .await
@@ -179,10 +176,7 @@ async fn visibility_sync_then_continue_write_roundtrip() {
 
     let boundary = 1024 - first.len();
     for chunk in [&second[..200], &second[200..boundary], &second[boundary..]] {
-        writer
-            .write_all(Bytes::copy_from_slice(chunk))
-            .await
-            .expect("write after visibility sync");
+        writer.write_all(chunk).await.expect("write after visibility sync");
         writer.sync().await.expect("publish another tail checkpoint");
     }
     writer
@@ -216,7 +210,7 @@ async fn write_more_than_ten_blocks_roundtrip() {
     for offset in (0..payload.len()).step_by(127) {
         let end = (offset + 127).min(payload.len());
         writer
-            .write_all(payload.slice(offset..end))
+            .write_all(&payload[offset..end])
             .await
             .expect("write small frame across more than ten blocks");
     }

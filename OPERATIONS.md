@@ -52,6 +52,11 @@ sudo -u beryl sh -c '
 Never run `format metadata` against an initialized deployment. Formatting is
 not an upgrade or repair operation.
 
+Metadata storage and snapshots use schema version 6. Older schemas are rejected
+because publication and commit records use different field names. No in-place
+migration is provided; existing deployments must retain their matching binaries
+and data together. Do not reformat existing storage to bypass this check.
+
 ## Start, stop, and restart
 
 Start Metadata first and wait for readiness before starting Worker:

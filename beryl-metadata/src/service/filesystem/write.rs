@@ -40,7 +40,7 @@ pub(crate) struct OpenWriteOutput {
     pub(crate) inode_id: InodeId,
     pub(crate) lease_epoch: LeaseEpoch,
     pub(crate) block_size: u32,
-    pub(crate) base_size: u64,
+    pub(crate) base_len: u64,
     pub(crate) expires_at_ms: u64,
     pub(crate) generation: ContentGeneration,
     pub(crate) tail_block: Option<LocatedBlock>,
@@ -123,7 +123,7 @@ impl MetadataFileSystem {
                 {
                     return Err(invalid());
                 }
-                if !target.worker_endpoints.iter().any(|endpoint| {
+                if !target.workers.iter().any(|endpoint| {
                     endpoint.worker_id == args.worker_id && endpoint.worker_run_id == args.worker_run_id
                 }) {
                     return Err(invalid());
@@ -194,8 +194,8 @@ impl MetadataFileSystem {
                     block_id = %target.block_id,
                     block_index = target.block_id.index.as_raw(),
                     group_id = success.group_name.as_ref().map(|group| group.as_str()),
-                    target_count = target.worker_endpoints.len(),
-                    targets_sample = ?target.worker_endpoints.iter().take(3).map(|endpoint| endpoint.worker_id.as_raw()).collect::<Vec<_>>(),
+                    target_count = target.workers.len(),
+                    targets_sample = ?target.workers.iter().take(3).map(|endpoint| endpoint.worker_id.as_raw()).collect::<Vec<_>>(),
                     inode_id = target.block_id.inode_id.as_raw(),
                     handle_inode_id = handle.inode_id.as_raw(),
                     mount_epoch = success.mount_epoch,
@@ -776,7 +776,7 @@ impl MetadataFileSystem {
                     .map(|location| location.tier)
             })
             .ok_or_else(|| MetadataError::ServiceUnavailable("tail placement has no tier".into()))?;
-        let worker_endpoints = placement
+        let workers = placement
             .workers
             .into_iter()
             .map(|worker| {
@@ -792,7 +792,7 @@ impl MetadataFileSystem {
             block_id,
             file_offset: ordinal as u64 * u64::from(file.block_size),
             block_size: u64::from(file.block_size),
-            worker_endpoints,
+            workers,
             fencing_token: FencingToken::new(block_id, owner, epoch),
             write_offset: len,
 
@@ -989,7 +989,7 @@ impl MetadataFileSystem {
                 mount_epoch,
             );
         }
-        let mut worker_endpoints = Vec::with_capacity(placement.workers.len());
+        let mut workers = Vec::with_capacity(placement.workers.len());
         let mut selected_tier = None;
         for worker in placement.workers {
             selected_tier = selected_tier.or(worker.tier);
@@ -1002,7 +1002,7 @@ impl MetadataFileSystem {
                 Ok(endpoint) => endpoint,
                 Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
             };
-            worker_endpoints.push(endpoint);
+            workers.push(endpoint);
         }
         let Some(tier) = selected_tier else {
             return self.failure_from_error(
@@ -1012,7 +1012,7 @@ impl MetadataFileSystem {
                 mount_epoch,
             );
         };
-        if worker_endpoints.is_empty() {
+        if workers.is_empty() {
             return self.failure_from_error(
                 ctx,
                 MetadataError::ServiceUnavailable("selected placement has no live worker endpoints".to_string()),
@@ -1024,7 +1024,7 @@ impl MetadataFileSystem {
             block_id,
             file_offset,
             block_size: u64::from(block_size),
-            worker_endpoints,
+            workers,
             fencing_token: FencingToken {
                 block_id,
                 owner: open_client_id,
@@ -1070,7 +1070,7 @@ fn open_write_output(session: &WriteSession) -> OpenWriteOutput {
         inode_id: session.inode_id,
         lease_epoch: session.lease_epoch,
         block_size: session.block_size,
-        base_size: session.base_size,
+        base_len: session.base_len,
         expires_at_ms: session.expires_at_ms,
         generation: session.generation,
         tail_block: session

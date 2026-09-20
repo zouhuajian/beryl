@@ -3,7 +3,6 @@
 
 //! Worker data-service wire conversion and response validation helpers.
 
-use super::WorkerWriteTarget;
 use crate::error::{ClientError, ClientResult};
 use crate::planner::PlannedBlockRead;
 use crate::rpc_error::{invalid_header_error, validate_data_header};
@@ -11,7 +10,7 @@ use crate::runtime::AttemptContext;
 use beryl_common::header::{HeaderIdentity, HEADER_WORKER_DATA_ERROR_DETAIL, WORKER_DATA_ERROR_DETAIL_V1};
 use beryl_proto::worker::write_block_request_proto::Payload;
 use beryl_types::range::ByteRange;
-use beryl_types::{validate_block_size, GroupName, WorkerEndpointInfo};
+use beryl_types::{validate_block_size, GroupName, LocatedBlock, WorkerEndpointInfo};
 use bytes::Bytes;
 use prost::Message;
 use std::time::Duration;
@@ -41,11 +40,12 @@ pub(super) fn build_read_block_request(
     }
 }
 
-/// Builds the sole control payload for one block write. Fencing remains a
-/// Metadata concern and is intentionally absent from the Worker wire request.
+/// Builds the control payload carrying Metadata-issued fencing authority for
+/// Worker write authorization.
 pub(super) fn build_write_block_command(
     attempt: &AttemptContext,
-    target: &WorkerWriteTarget,
+    group_name: &GroupName,
+    target: &LocatedBlock,
     worker: &WorkerEndpointInfo,
 ) -> ClientResult<beryl_proto::worker::WriteBlockRequestProto> {
     validate_worker_write_target(target)?;
@@ -53,13 +53,13 @@ pub(super) fn build_write_block_command(
         payload: Some(Payload::Command(Box::new(
             beryl_proto::worker::WriteBlockCommandProto {
                 header: Some(attempt.data_header()),
-                group_name: target.group_name.to_string(),
-                block_id: Some(target.target.block_id.into()),
+                group_name: group_name.to_string(),
+                block_id: Some(target.block_id.into()),
                 worker_run_id: worker.worker_run_id.to_string(),
-                block_size: target.target.block_size,
-                fencing_token: Some(target.target.fencing_token.into()),
-                write_offset: target.target.write_offset,
-                tier: beryl_proto::common::TierProto::from(target.target.tier) as i32,
+                block_size: target.block_size,
+                fencing_token: Some(target.fencing_token.into()),
+                write_offset: target.write_offset,
+                tier: beryl_proto::common::TierProto::from(target.tier) as i32,
             },
         ))),
     })
@@ -224,20 +224,20 @@ pub(super) fn default_frame_size(len: u32) -> u32 {
     len.clamp(1, beryl_proto::DEFAULT_WORKER_DATA_FRAME_SIZE as u32)
 }
 
-fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> {
-    if target.target.block_id.inode_id.as_raw() == 0 {
+fn validate_worker_write_target(target: &LocatedBlock) -> ClientResult<()> {
+    if target.block_id.inode_id.as_raw() == 0 {
         return Err(ClientError::invalid_layout(
             "write target block_id inode_id must be non-zero".to_string(),
         ));
     }
-    validate_block_size(target.target.block_size)
+    validate_block_size(target.block_size)
         .map_err(|error| ClientError::invalid_layout(format!("write target has invalid shape: {error}")))?;
-    if target.target.worker_endpoints.is_empty() {
+    if target.workers.is_empty() {
         return Err(ClientError::invalid_layout(
             "write target has no worker endpoints".to_string(),
         ));
     }
-    if target.target.write_offset >= target.target.block_size {
+    if target.write_offset >= target.block_size {
         return Err(ClientError::invalid_layout(
             "write target offset exceeds capacity".to_string(),
         ));

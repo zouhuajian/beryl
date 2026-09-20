@@ -431,13 +431,13 @@ mod tests {
             worker_net_protocol: 1,
             fault_domain: None,
         };
-        let base_size = serde_json::to_vec(&command).unwrap().len();
+        let base_len = serde_json::to_vec(&command).unwrap().len();
         let Command::RegisterWorkerDescriptor { address, .. } = &mut command else {
             unreachable!("test command variant is fixed")
         };
         *address = "x".repeat(
             encoded_size
-                .checked_sub(base_size)
+                .checked_sub(base_len)
                 .expect("target size must fit command envelope"),
         );
         assert_eq!(serde_json::to_vec(&command).unwrap().len(), encoded_size);

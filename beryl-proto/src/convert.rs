@@ -366,8 +366,8 @@ impl TryFrom<LocatedBlockProto> for LocatedBlock {
     fn try_from(target: LocatedBlockProto) -> Result<Self, Self::Error> {
         validate_block_size(target.block_size)
             .map_err(|err| format!("LocatedBlockProto invalid block shape: {err}"))?;
-        if target.worker_endpoints.is_empty() {
-            return Err("LocatedBlockProto.worker_endpoints must not be empty".to_string());
+        if target.workers.is_empty() {
+            return Err("LocatedBlockProto.workers must not be empty".to_string());
         }
         if target.write_offset >= target.block_size {
             return Err("LocatedBlockProto.write_offset must be below block capacity".to_string());
@@ -381,8 +381,8 @@ impl TryFrom<LocatedBlockProto> for LocatedBlock {
         if fencing_token.epoch.as_raw() == 0 {
             return Err("LocatedBlockProto.fencing_token owner and epoch must be non-zero".to_string());
         }
-        let worker_endpoints = target
-            .worker_endpoints
+        let workers = target
+            .workers
             .into_iter()
             .map(WorkerEndpointInfo::try_from)
             .collect::<Result<Vec<_>, _>>()?;
@@ -391,7 +391,7 @@ impl TryFrom<LocatedBlockProto> for LocatedBlock {
             file_offset: target.file_offset,
             write_offset: target.write_offset,
             block_size: target.block_size,
-            worker_endpoints,
+            workers,
             fencing_token,
 
             tier,
@@ -405,7 +405,7 @@ impl From<&LocatedBlock> for LocatedBlockProto {
             block_id: Some(target.block_id.into()),
             file_offset: target.file_offset,
             write_offset: target.write_offset,
-            worker_endpoints: target.worker_endpoints.iter().map(Into::into).collect(),
+            workers: target.workers.iter().map(Into::into).collect(),
             fencing_token: Some(target.fencing_token.into()),
             block_size: target.block_size,
             tier: TierProto::from(target.tier) as i32,
@@ -419,7 +419,7 @@ impl From<LocatedBlock> for LocatedBlockProto {
             block_id: Some(target.block_id.into()),
             file_offset: target.file_offset,
             write_offset: target.write_offset,
-            worker_endpoints: target.worker_endpoints.into_iter().map(Into::into).collect(),
+            workers: target.workers.into_iter().map(Into::into).collect(),
             fencing_token: Some(target.fencing_token.into()),
             block_size: target.block_size,
             tier: TierProto::from(target.tier) as i32,
@@ -1124,14 +1124,14 @@ mod tests {
             write_offset: 0,
             block_id: Some(block_id.into()),
             file_offset: 128,
-            worker_endpoints: Vec::new(),
+            workers: Vec::new(),
             fencing_token: Some(token.into()),
             block_size: 4096,
             tier: TierProto::TierHdd as i32,
         };
         let err = LocatedBlock::try_from(target.clone()).expect_err("empty target workers must fail");
-        assert!(err.contains("worker_endpoints"));
-        target.worker_endpoints.push(endpoint());
+        assert!(err.contains("workers"));
+        target.workers.push(endpoint());
         let decoded = LocatedBlock::try_from(target.clone()).expect("valid allocated block");
         assert_eq!(LocatedBlockProto::from(decoded), target);
         for invalid_token in [

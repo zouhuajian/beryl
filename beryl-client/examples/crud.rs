@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .collect::<Vec<_>>(),
     );
     let mut writer = client.create(FILE).await?;
-    writer.write_all(payload.clone()).await?;
+    writer.write_all(&payload).await?;
     writer.close().await?;
 
     let status = client.get_status(FILE).await?;

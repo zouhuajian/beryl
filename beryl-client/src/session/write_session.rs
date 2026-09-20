@@ -22,9 +22,9 @@ pub(crate) struct WriteSession {
     generation: ContentGeneration,
     mode: WriteMode,
     write_handle: WriteHandle,
-    base_size: u64,
-    cursor: u64,
-    flush_cursor: u64,
+    base_len: u64,
+    position: u64,
+    durable_position: u64,
     expires_at_ms: u64,
     ready_blocks: Vec<ReadyBlock>,
     write_group: Option<beryl_types::GroupName>,
@@ -38,7 +38,7 @@ impl WriteSession {
         path: String,
         block_size: u32,
         write_handle: WriteHandle,
-        base_size: u64,
+        base_len: u64,
         expires_at_ms: u64,
         generation: ContentGeneration,
         mode: WriteMode,
@@ -56,9 +56,9 @@ impl WriteSession {
             generation,
             mode,
             write_handle,
-            base_size,
-            cursor: if mode == WriteMode::Overwrite { 0 } else { base_size },
-            flush_cursor: if mode == WriteMode::Overwrite { 0 } else { base_size },
+            base_len,
+            position: if mode == WriteMode::Overwrite { 0 } else { base_len },
+            durable_position: if mode == WriteMode::Overwrite { 0 } else { base_len },
             expires_at_ms,
             ready_blocks: Vec::new(),
             write_group: None,
@@ -71,18 +71,18 @@ impl WriteSession {
         &self.path
     }
 
-    /// Current sequential write cursor.
-    pub(crate) fn cursor(&self) -> u64 {
-        self.cursor
+    /// Current sequential write position.
+    pub(crate) fn position(&self) -> u64 {
+        self.position
     }
 
-    /// Advances the SDK-visible cursor after the current Worker request stream
+    /// Advances the SDK-visible position after the current Worker request stream
     /// accepts ownership of bytes.
-    pub(crate) fn advance_cursor(&mut self, len: usize) -> ClientResult<()> {
-        self.cursor = self
-            .cursor
+    pub(crate) fn advance_position(&mut self, len: usize) -> ClientResult<()> {
+        self.position = self
+            .position
             .checked_add(len as u64)
-            .ok_or_else(|| ClientError::invalid_argument("write cursor overflow".to_string()))?;
+            .ok_or_else(|| ClientError::invalid_argument("write position overflow".to_string()))?;
         Ok(())
     }
 
@@ -101,10 +101,10 @@ impl WriteSession {
     /// Validate a metadata write target before opening the worker stream.
     pub(crate) fn validate_target(&mut self, target: &LocatedBlock) -> ClientResult<()> {
         self.ensure_open_for_write()?;
-        if target.file_offset.checked_add(target.write_offset) != Some(self.flush_cursor) {
+        if target.file_offset.checked_add(target.write_offset) != Some(self.durable_position) {
             return Err(ClientError::invalid_layout(format!(
                 "write target file_offset mismatch: expected {}, got {}",
-                self.flush_cursor, target.file_offset
+                self.durable_position, target.file_offset
             )));
         }
         validate_block_size(target.block_size)
@@ -137,7 +137,7 @@ impl WriteSession {
         group: beryl_types::GroupName,
         tail: Option<LocatedBlock>,
     ) -> ClientResult<()> {
-        let needs_tail = self.mode == WriteMode::Append && !self.base_size.is_multiple_of(u64::from(self.block_size));
+        let needs_tail = self.mode == WriteMode::Append && !self.base_len.is_multiple_of(u64::from(self.block_size));
         if needs_tail != tail.is_some() {
             return Err(ClientError::invalid_layout("OpenWrite tail does not match file length"));
         }
@@ -175,17 +175,17 @@ impl WriteSession {
     pub(crate) fn push_ready_block(&mut self, target: LocatedBlock, written_len: u64) -> ClientResult<()> {
         if written_len < target.write_offset
             || written_len > target.block_size
-            || target.file_offset.checked_add(target.write_offset) != Some(self.flush_cursor)
+            || target.file_offset.checked_add(target.write_offset) != Some(self.durable_position)
         {
             return Err(ClientError::invalid_layout(
-                "Worker checkpoint does not match the flush cursor",
+                "Worker checkpoint does not match the durable position",
             ));
         }
         let final_offset = target
             .file_offset
             .checked_add(written_len)
-            .ok_or_else(|| ClientError::invalid_argument("write flush cursor overflow"))?;
-        if final_offset != self.cursor {
+            .ok_or_else(|| ClientError::invalid_argument("write durable position overflow"))?;
+        if final_offset != self.position {
             return Err(ClientError::invalid_layout(
                 "Worker checkpoint does not match accepted bytes",
             ));
@@ -198,7 +198,7 @@ impl WriteSession {
             self.ready_blocks.pop();
         }
         self.ready_blocks.push(ReadyBlock { target, written_len });
-        self.flush_cursor = final_offset;
+        self.durable_position = final_offset;
         Ok(())
     }
 
@@ -207,7 +207,7 @@ impl WriteSession {
         self.ready_blocks
             .iter()
             .filter(|block| {
-                self.mode == WriteMode::Overwrite || block.target.file_offset + block.written_len > self.base_size
+                self.mode == WriteMode::Overwrite || block.target.file_offset + block.written_len > self.base_len
             })
             .map(|block| CommittedBlock {
                 block_id: block.target.block_id,
@@ -225,7 +225,7 @@ impl WriteSession {
         client_id: ClientId,
         client_name: &str,
         committed_blocks: Vec<CommittedBlock>,
-        target_size: u64,
+        target_len: u64,
         deadline: OperationDeadline,
     ) -> ClientResult<SyncWritePlan> {
         match &self.state {
@@ -234,21 +234,21 @@ impl WriteSession {
                     call_id: CallId::new(),
                     write_handle: self.write_handle,
                     committed_blocks,
-                    target_size,
+                    target_len,
                     expected_generation: self.generation,
-                    expected_file_size: self.base_size,
+                    expected_file_len: self.base_len,
                     write_mode: self.mode,
                 });
             }
             WriteSessionState::SyncPending(sync) => {
-                if sync.target_size != target_size || sync.committed_blocks != committed_blocks {
+                if sync.target_len != target_len || sync.committed_blocks != committed_blocks {
                     return Err(ClientError::invalid_argument(
                         "SyncWrite payload changed after sync started",
                     ));
                 }
                 if sync.write_handle != self.write_handle
                     || sync.expected_generation != self.generation
-                    || sync.expected_file_size != self.base_size
+                    || sync.expected_file_len != self.base_len
                     || sync.write_mode != self.mode
                 {
                     return Err(ClientError::invalid_argument(
@@ -273,9 +273,9 @@ impl WriteSession {
             operation,
             write_handle: sync.write_handle,
             committed_blocks: sync.committed_blocks.clone(),
-            target_size: sync.target_size,
+            target_len: sync.target_len,
             expected_generation: sync.expected_generation,
-            expected_file_size: sync.expected_file_size,
+            expected_file_len: sync.expected_file_len,
             write_mode: sync.write_mode,
         })
     }
@@ -286,7 +286,7 @@ impl WriteSession {
         client_id: ClientId,
         client_name: &str,
         committed_blocks: Vec<CommittedBlock>,
-        final_size: u64,
+        final_len: u64,
         deadline: OperationDeadline,
     ) -> ClientResult<CommitFilePlan> {
         match &self.state {
@@ -294,16 +294,15 @@ impl WriteSession {
                 self.state = WriteSessionState::CommitPending(CommitFileState {
                     commit_call_id: CallId::new(),
                     commit_write_handle: self.write_handle,
-                    commit_final_size: final_size,
+                    commit_final_len: final_len,
                     commit_committed_blocks_snapshot: committed_blocks,
                     expected_generation: self.generation,
-                    expected_file_size: self.base_size,
+                    expected_file_len: self.base_len,
                     write_mode: self.mode,
                 });
             }
             WriteSessionState::CommitPending(commit) => {
-                if commit.commit_final_size != final_size || commit.commit_committed_blocks_snapshot != committed_blocks
-                {
+                if commit.commit_final_len != final_len || commit.commit_committed_blocks_snapshot != committed_blocks {
                     return Err(ClientError::invalid_argument(
                         "CommitFile payload changed after commit started",
                     ));
@@ -331,9 +330,9 @@ impl WriteSession {
             operation,
             write_handle: commit.commit_write_handle,
             committed_blocks: commit.commit_committed_blocks_snapshot.clone(),
-            final_size: commit.commit_final_size,
+            final_len: commit.commit_final_len,
             expected_generation: commit.expected_generation,
-            expected_file_size: commit.expected_file_size,
+            expected_file_len: commit.expected_file_len,
             write_mode: commit.write_mode,
         })
     }
@@ -373,18 +372,22 @@ impl WriteSession {
         })
     }
 
+    pub(crate) fn is_closed(&self) -> bool {
+        matches!(self.state, WriteSessionState::Closed)
+    }
+
     /// Mark the session closed after metadata commit succeeds.
     pub(crate) fn mark_closed(&mut self) {
         self.state = WriteSessionState::Closed;
     }
 
     /// Completes the frozen SyncWrite and restores normal writer operations.
-    pub(crate) fn mark_sync_completed(&mut self, generation: ContentGeneration, file_size: u64) -> ClientResult<()> {
+    pub(crate) fn mark_sync_completed(&mut self, generation: ContentGeneration, file_len: u64) -> ClientResult<()> {
         if !matches!(self.state, WriteSessionState::SyncPending(_)) {
             return Err(self.state_error_value());
         }
         self.generation = generation;
-        self.base_size = file_size;
+        self.base_len = file_len;
         self.mode = WriteMode::Append;
         // Published history is no longer needed; retain the tail for reuse or
         // as the predecessor of the next allocation, including after an empty sync.
@@ -564,9 +567,9 @@ struct SyncWriteState {
     call_id: CallId,
     write_handle: WriteHandle,
     committed_blocks: Vec<CommittedBlock>,
-    target_size: u64,
+    target_len: u64,
     expected_generation: ContentGeneration,
-    expected_file_size: u64,
+    expected_file_len: u64,
     write_mode: WriteMode,
 }
 
@@ -574,10 +577,10 @@ struct SyncWriteState {
 struct CommitFileState {
     commit_call_id: CallId,
     commit_write_handle: WriteHandle,
-    commit_final_size: u64,
+    commit_final_len: u64,
     commit_committed_blocks_snapshot: Vec<CommittedBlock>,
     expected_generation: ContentGeneration,
-    expected_file_size: u64,
+    expected_file_len: u64,
     write_mode: WriteMode,
 }
 
@@ -599,9 +602,9 @@ pub(crate) struct SyncWritePlan {
     pub(crate) operation: OperationContext,
     pub(crate) write_handle: WriteHandle,
     pub(crate) committed_blocks: Vec<CommittedBlock>,
-    pub(crate) target_size: u64,
+    pub(crate) target_len: u64,
     pub(crate) expected_generation: ContentGeneration,
-    pub(crate) expected_file_size: u64,
+    pub(crate) expected_file_len: u64,
     pub(crate) write_mode: WriteMode,
 }
 
@@ -611,9 +614,9 @@ pub(crate) struct CommitFilePlan {
     pub(crate) operation: OperationContext,
     pub(crate) write_handle: WriteHandle,
     pub(crate) committed_blocks: Vec<CommittedBlock>,
-    pub(crate) final_size: u64,
+    pub(crate) final_len: u64,
     pub(crate) expected_generation: ContentGeneration,
-    pub(crate) expected_file_size: u64,
+    pub(crate) expected_file_len: u64,
     pub(crate) write_mode: WriteMode,
 }
 
@@ -672,7 +675,7 @@ mod tests {
         assert_eq!(first.operation.call_id(), retry.operation.call_id());
         assert_eq!(first.write_handle, retry.write_handle);
         assert_eq!(first.expected_generation, retry.expected_generation);
-        assert_eq!(retry.final_size, 5);
+        assert_eq!(retry.final_len, 5);
         assert_eq!(retry.committed_blocks, vec![committed_block(302, 0, 5)]);
 
         let mut sync_session = new_session(2_000);
@@ -692,7 +695,7 @@ mod tests {
         sync_session.generation = ContentGeneration::new(0);
         let retry_sync = prepare_sync(&mut sync_session).expect("retry after cancelled future");
         assert_eq!(first_sync.operation.call_id(), retry_sync.operation.call_id());
-        assert_eq!(retry_sync.target_size, first_sync.target_size);
+        assert_eq!(retry_sync.target_len, first_sync.target_len);
         assert_eq!(retry_sync.committed_blocks, first_sync.committed_blocks);
 
         let mut session = new_session(1_000);

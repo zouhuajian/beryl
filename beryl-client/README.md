@@ -119,6 +119,64 @@ let mut bytes = Vec::new();
 tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut bytes).await?;
 ```
 
+`FsClient::create` and `append` return a `FileWriter`. Its native `write`,
+`write_all`, `flush`, `sync`, `close`, `abort`, and `renew_lease` methods all
+return `ClientResult`. No extension trait import is required.
+
+| Operation | Successful completion |
+| --- | --- |
+| `write` / `write_all` | Bytes accepted into the bounded Worker request stream; `position()` advances. |
+| `flush` | All accepted bytes checkpointed durably at the Worker; Metadata visibility stays unchanged. |
+| `sync` | Worker checkpoint complete and Metadata-visible contents published; the lease stays open. |
+| `close` | Final contents published and the lease ended with durable commit evidence. |
+| `abort` | The write session ended; previously synced contents remain visible. |
+
+New blocks are allocated on demand. Append reuses the authorized partial tail.
+Flush finishes the current block stream; later writes reopen its durable tail
+under the same lease. Frequent flushes therefore add authorization RPCs and
+Worker checkpoints. Empty writes perform no IO, and flushing an empty writer
+does not allocate a block. Successful close is idempotent; subsequent nonempty
+writes are rejected.
+
+```rust,no_run
+# async fn write(client: &beryl_client::FsClient) -> Result<(), Box<dyn std::error::Error>> {
+let mut writer = client.create("/file").await?;
+writer.write_all(b"published prefix").await?;
+writer.sync().await?;
+writer.write_all(b" and suffix").await?;
+writer.close().await?;
+# Ok(())
+# }
+```
+
+Each accepted frame copies at most 1 MiB from the caller's slice into owned
+`Bytes`. The request channel has one slot in addition to transport buffers.
+Each `write` accepts bytes only after block preparation and capacity reservation
+complete, then advances the position without another await. A failed or cancelled
+`write_all` can have accepted a prefix; inspect `position()` and do not replay the
+entire input blindly.
+Writing a full block does not itself promise durability; use `flush` to confirm
+it.
+
+Native methods execute directly with one deadline per write step, flush, sync,
+or close. Callers control the total timeout of `write_all`.
+Cancelling pending write preparation, renewal, or a Worker checkpoint
+makes the writer unusable for further writes or publication. Drop that writer;
+Metadata lease expiry and server cleanup resolve any abandoned work.
+
+Once a sync, commit, or abort request has been frozen for Metadata, cancellation
+or an unknown result retains its call identity and exact payload. Retry the same
+method on the same writer; an explicit retry gets a new bounded deadline. Other
+operations cannot replace that unresolved intent. Cancellation during the Worker
+checkpoint before publication does not provide this recovery path.
+
+Automatic lease renewal occurs during writer operations, not in an idle
+background task. `renew_lease` explicitly renews an open session. Dropping a
+writer requests local Worker cancellation without committing or aborting the
+Metadata session; lease expiry and server cleanup retain authority over it.
+Submitted Metadata publications retain their server-side protection independently
+of the caller's wait.
+
 `FsClient::list_status` returns a `ListStatusIterator`. The client fetches one bounded page before returning it, then fetches later pages only as `next` consumes buffered statuses. Listing is non-recursive and weakly consistent across pages because Metadata retains no server-side snapshot.
 
 `FsClient::delete` is non-recursive by default. `delete_with_options` accepts `DeleteOptions` for recursive namespace deletion. Physical reclamation remains asynchronous and uses the Metadata cleanup grace period.

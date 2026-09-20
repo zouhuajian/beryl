@@ -1637,7 +1637,7 @@ impl WorkerManager {
 
         for expected in targets {
             let target = &expected.target;
-            if target.worker_endpoints.is_empty() {
+            if target.workers.is_empty() {
                 return PublishReadyStatus::Conflict(PublishReadyConflict::MissingWriteEndpoint {
                     block_id: target.block_id,
                 });
@@ -1645,7 +1645,7 @@ impl WorkerManager {
 
             let mut conflict = None;
             let mut ready = false;
-            for endpoint in &target.worker_endpoints {
+            for endpoint in &target.workers {
                 let key = WorkerRegistrationKey::new(group_name, endpoint.worker_id);
                 let Some(registration) = registrations.get(&key) else {
                     conflict = Some(PublishReadyConflict::WorkerRunMismatch {
@@ -1841,7 +1841,7 @@ mod tests {
                 block_id,
                 file_offset: 0,
                 block_size: 64,
-                worker_endpoints: vec![WorkerEndpointInfo {
+                workers: vec![WorkerEndpointInfo {
                     worker_id,
                     endpoint: "127.0.0.1:9090".to_string(),
                     worker_run_id: run_id,
@@ -1990,7 +1990,7 @@ mod tests {
         ));
 
         let mut wrong_endpoint = target.clone();
-        wrong_endpoint.target.worker_endpoints[0].endpoint = "127.0.0.1:9191".to_string();
+        wrong_endpoint.target.workers[0].endpoint = "127.0.0.1:9191".to_string();
         assert!(matches!(
             manager.check_publish_ready(&group_name_value, std::slice::from_ref(&wrong_endpoint)),
             PublishReadyStatus::Conflict(PublishReadyConflict::EndpointMismatch { .. })

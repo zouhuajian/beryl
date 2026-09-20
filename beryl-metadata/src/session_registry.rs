@@ -35,7 +35,7 @@ pub struct WriteSession {
     /// Lease epoch (for fencing validation).
     pub lease_epoch: LeaseEpoch,
     /// Base file size at open time (for append-only validation).
-    pub base_size: u64,
+    pub base_len: u64,
     /// Last durable content generation observed by this session.
     pub generation: ContentGeneration,
     /// Session intent: replace visible contents or append after the visible end.
@@ -356,13 +356,13 @@ impl WritePublication {
     }
 
     /// Install the successful SyncWrite generation and release the boundary.
-    pub(crate) fn complete_sync(mut self, generation: ContentGeneration, file_size: u64) -> Result<(), String> {
+    pub(crate) fn complete_sync(mut self, generation: ContentGeneration, file_len: u64) -> Result<(), String> {
         let result = self.registry.complete_sync_publication(
             self.session.inode_id,
             self.session.lease_epoch,
             self.publication_id,
             generation,
-            file_size,
+            file_len,
             current_time_ms(),
         );
         if result.is_ok() {
@@ -933,7 +933,7 @@ impl SessionRegistry {
             inode_id: opening.inode_id,
             mount_id: opening.mount_id,
             lease_epoch: opening.proposed_lease_epoch,
-            base_size: file.len,
+            base_len: file.len,
             generation: file.generation,
             mode: opening.mode,
             open_client_id: opening.open_client_id,
@@ -1005,7 +1005,7 @@ impl SessionRegistry {
             inode_id,
             mount_id: removed.mount_id,
             lease_epoch,
-            base_size: 0,
+            base_len: 0,
             generation,
             mode: WriteMode::Overwrite,
             open_client_id: removed.open_client_id,
@@ -1252,16 +1252,16 @@ impl SessionRegistry {
 
     /// Return the next capacity-aligned target offset for the active session.
     ///
-    /// Targets beginning below `base_size` belong to the already published
+    /// Targets beginning below `base_len` belong to the already published
     /// prefix, including a partial block finalized by a previous SyncWrite.
-    /// An unpublished target begins at or after `base_size` and advances the
+    /// An unpublished target begins at or after `base_len` and advances the
     /// next offset by its full authorized capacity.
     fn next_target_file_offset(session: &WriteSession) -> Result<u64, String> {
         let Some(last) = session.issued_targets.last() else {
             return Ok(if session.mode == WriteMode::Overwrite {
                 0
             } else {
-                session.base_size
+                session.base_len
             });
         };
         last.file_offset
@@ -1504,7 +1504,7 @@ impl SessionRegistry {
         lease_epoch: LeaseEpoch,
         publication_id: WritePublicationId,
         generation: ContentGeneration,
-        file_size: u64,
+        file_len: u64,
         now_ms: u64,
     ) -> Result<(), String> {
         let mut state = self.state.write();
@@ -1518,10 +1518,10 @@ impl SessionRegistry {
             return Err("write publication is no longer current".to_string());
         }
         if session.generation == generation {
-            if session.base_size != file_size {
+            if session.base_len != file_len {
                 return Err(format!(
-                    "replayed SyncWrite size changed: expected {}, got {file_size}",
-                    session.base_size
+                    "replayed SyncWrite size changed: expected {}, got {file_len}",
+                    session.base_len
                 ));
             }
             session.mode = WriteMode::Append;
@@ -1543,14 +1543,14 @@ impl SessionRegistry {
         // suffix prevents stale capacity-based offsets from being replayed.
         let retained_target_count = session
             .issued_targets
-            .partition_point(|target| target.file_offset < file_size);
+            .partition_point(|target| target.file_offset < file_len);
         let removed_target_count = session.issued_targets.len() - retained_target_count;
         session.issued_targets.truncate(retained_target_count);
         session
             .issued_steps
             .retain(|_, target_index| *target_index < retained_target_count);
         session.generation = generation;
-        session.base_size = file_size;
+        session.base_len = file_len;
         session.mode = WriteMode::Append;
         session.active_publication = None;
         state.outstanding_write_targets = state
@@ -2124,7 +2124,7 @@ mod tests {
             block_id,
             file_offset: 0,
             block_size: 64,
-            worker_endpoints: Vec::new(),
+            workers: Vec::new(),
             fencing_token: FencingToken {
                 block_id,
                 owner: ClientId::new(1),

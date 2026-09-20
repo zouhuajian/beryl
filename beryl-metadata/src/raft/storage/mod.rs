@@ -62,7 +62,7 @@ const ROCKSDB_SCHEMA_VERSION_KEY: &[u8] = b"rocksdb_schema_version";
 const STORAGE_IDENTITY_KEY: &[u8] = b"storage_identity";
 const RAFT_STATE_KEY: &[u8] = b"raft_state";
 /// Guards database and snapshot decoding against incompatible persisted metadata encodings.
-pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 5;
+pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 6;
 const NEXT_INODE_ID_KEY: &[u8] = b"next_inode_id";
 const CREATE_FILE_REPLAY_COUNT_KEY: &[u8] = b"create_file_replay_count";
 const CREATE_FILE_REPLAY_PREFIX: &[u8] = b"create_file_replay/";

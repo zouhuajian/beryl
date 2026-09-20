@@ -113,7 +113,7 @@ async fn recursive_delete_stays_hidden_and_reclaims_after_metadata_restart() {
 
 async fn write_file(client: &beryl_client::FsClient, path: &str, payload: Bytes) {
     let mut writer = client.create(path).await.expect("create cleanup test file");
-    writer.write_all(payload).await.expect("write cleanup test file");
+    writer.write_all(&payload).await.expect("write cleanup test file");
     writer.close().await.expect("publish cleanup test file");
 }
 
