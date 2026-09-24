@@ -20,7 +20,7 @@ const DEFAULT_READ_RANGE_LIMIT: u64 = 64 * 1024 * 1024;
 const DEFAULT_LEASE_RENEWAL_THRESHOLD: Duration = Duration::from_secs(30);
 const DEFAULT_METADATA_CONNECTION_LIMIT: usize = 1;
 const DEFAULT_WORKER_CONNECTION_LIMIT: usize = 1;
-pub(crate) const DEFAULT_WORKER_ENDPOINT_COOLDOWN: Duration = Duration::from_secs(1);
+const DEFAULT_WORKER_ENDPOINT_COOLDOWN: Duration = Duration::from_secs(1);
 
 const CLIENT_NAME_KEY: &str = "beryl.client.name";
 const METADATA_ADDRESSES_KEY: &str = "beryl.client.metadata.addresses";
@@ -150,8 +150,8 @@ impl ClientConfig {
         duration_millis(self.lease_renewal_threshold)
     }
 
-    /// Revalidates every correctness and resource bound at runtime construction.
-    pub(crate) fn validate(&self) -> ClientResult<()> {
+    /// Checks correctness and resource bounds before sealing configuration.
+    fn validate(&self) -> ClientResult<()> {
         if self.client_name.trim().is_empty() {
             return Err(invalid_config(CLIENT_NAME_KEY, "must not be blank"));
         }
@@ -380,8 +380,8 @@ impl ClientConfigBuilder {
     }
 }
 
-/// Normalizes and validates one Metadata endpoint without opening a connection.
-pub(crate) fn normalize_metadata_endpoint(endpoint: &str) -> ClientResult<String> {
+/// Validates one Metadata endpoint without opening a connection.
+fn validate_metadata_endpoint(endpoint: &str) -> ClientResult<()> {
     let trimmed = endpoint.trim();
     if trimmed.is_empty() {
         return Err(invalid_config(
@@ -395,23 +395,22 @@ pub(crate) fn normalize_metadata_endpoint(endpoint: &str) -> ClientResult<String
             "must not contain surrounding whitespace",
         ));
     }
-    let endpoint = trimmed;
-    let normalized = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        endpoint.to_string()
-    } else {
-        format!("http://{endpoint}")
-    };
-    tonic::transport::Endpoint::from_shared(normalized.clone()).map_err(|error| {
+    tonic::transport::Endpoint::from_shared(normalize_endpoint(endpoint)).map_err(|error| {
         invalid_config(
             METADATA_ADDRESSES_KEY,
             format!("contains invalid endpoint {endpoint}: {error}"),
         )
     })?;
-    Ok(normalized)
+    Ok(())
 }
 
-fn validate_metadata_endpoint(endpoint: &str) -> ClientResult<()> {
-    normalize_metadata_endpoint(endpoint).map(|_| ())
+/// Adds the default scheme shared by bootstrap and peer-supplied endpoints.
+pub(crate) fn normalize_endpoint(endpoint: &str) -> String {
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    }
 }
 
 fn validate_positive(key: &'static str, value: impl PartialEq + Default) -> ClientResult<()> {
@@ -460,25 +459,27 @@ fn invalid_config(key: &'static str, detail: impl Into<String>) -> ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client_inner::ClientInner;
 
     #[test]
     fn builder_and_flat_loading_share_values_and_ignore_unknown_keys() {
         let mut flat = FlatConfig::new();
-        flat.set(CLIENT_NAME_KEY, "configured-client");
-        flat.set(METADATA_ADDRESSES_KEY, vec!["metadata.internal:18080".to_string()]);
-        flat.set(OPERATION_TIMEOUT_KEY, "12s");
-        flat.set(MAX_ATTEMPTS_KEY, 5i64);
-        flat.set(MAX_READ_STEP_BYTES_KEY, "4MiB");
-        flat.set(READ_RANGE_LIMIT_KEY, "32MiB");
-        flat.set(AUTOMATIC_LEASE_RENEWAL_KEY, false);
-        flat.set(LEASE_RENEWAL_THRESHOLD_KEY, "8s");
-        flat.set(METADATA_CONNECTION_REUSE_KEY, false);
-        flat.set(METADATA_CONNECTION_LIMIT_KEY, 2i64);
-        flat.set(WORKER_CONNECTION_REUSE_KEY, false);
-        flat.set(WORKER_CONNECTION_LIMIT_KEY, 3i64);
-        flat.set(WORKER_ENDPOINT_COOLDOWN_KEY, "4s");
-        flat.set("beryl.future.option", "ignored");
+        flat.insert(CLIENT_NAME_KEY.to_string(), "configured-client".into());
+        flat.insert(
+            METADATA_ADDRESSES_KEY.to_string(),
+            vec!["metadata.internal:18080".to_string()].into(),
+        );
+        flat.insert(OPERATION_TIMEOUT_KEY.to_string(), "12s".into());
+        flat.insert(MAX_ATTEMPTS_KEY.to_string(), 5i64.into());
+        flat.insert(MAX_READ_STEP_BYTES_KEY.to_string(), "4MiB".into());
+        flat.insert(READ_RANGE_LIMIT_KEY.to_string(), "32MiB".into());
+        flat.insert(AUTOMATIC_LEASE_RENEWAL_KEY.to_string(), false.into());
+        flat.insert(LEASE_RENEWAL_THRESHOLD_KEY.to_string(), "8s".into());
+        flat.insert(METADATA_CONNECTION_REUSE_KEY.to_string(), false.into());
+        flat.insert(METADATA_CONNECTION_LIMIT_KEY.to_string(), 2i64.into());
+        flat.insert(WORKER_CONNECTION_REUSE_KEY.to_string(), false.into());
+        flat.insert(WORKER_CONNECTION_LIMIT_KEY.to_string(), 3i64.into());
+        flat.insert(WORKER_ENDPOINT_COOLDOWN_KEY.to_string(), "4s".into());
+        flat.insert("beryl.future.option".to_string(), "ignored".into());
 
         let from_flat = ClientConfig::from_flat(&flat).expect("flat config");
         let from_builder = ClientConfig::builder()
@@ -523,18 +524,5 @@ mod tests {
         assert!(invalid
             .into_iter()
             .all(|result| { result.is_err_and(|error| error.kind() == crate::ClientErrorKind::InvalidConfiguration) }));
-    }
-
-    #[test]
-    fn runtime_construction_revalidates_typed_configuration() {
-        let mut config = ClientConfig::builder().build().expect("config");
-        config.max_read_step_bytes = 0;
-
-        let error = match ClientInner::from_config(config) {
-            Ok(_) => panic!("runtime construction must reject invalid configuration"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error.kind(), crate::ClientErrorKind::InvalidConfiguration);
     }
 }

@@ -99,41 +99,10 @@ impl ClientMetricLabels {
         self.cache = Some(cache);
         self
     }
-
-    /// Attaches the Metadata or Worker target plane.
-    pub(crate) fn with_target_plane(mut self, target_plane: &'static str) -> Self {
-        self.target_plane = Some(target_plane);
-        self
-    }
-
-    /// Attaches a stable operation name without changing the target plane.
-    pub(crate) fn with_operation_name(mut self, operation_name: &'static str) -> Self {
-        self.operation_name = Some(operation_name);
-        self
-    }
-
-    /// Returns true when labels contain no paths, endpoints, or credential-like values.
-    fn has_only_safe_values(&self) -> bool {
-        let values = [
-            self.operation_name,
-            self.error_class,
-            self.target_plane,
-            self.cache,
-            self.outcome,
-        ];
-        values.into_iter().flatten().all(|value| {
-            !value.contains('/')
-                && !value.contains("://")
-                && !value.contains("127.")
-                && !value.contains("localhost")
-                && !value.contains("token")
-        })
-    }
 }
 
 /// Emits one counter through the process-wide metrics facade.
 pub(crate) fn record(metric: ClientMetric, labels: ClientMetricLabels) {
-    debug_assert!(labels.has_only_safe_values());
     let mut metric_labels = Vec::with_capacity(5);
     if let Some(value) = labels.operation_name {
         metric_labels.push(metrics::Label::new("operation", value));
@@ -153,20 +122,39 @@ pub(crate) fn record(metric: ClientMetric, labels: ClientMetricLabels) {
     metrics::counter!(metric.name(), metric_labels).increment(1);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Counts protocol/session facts separately from terminal SDK outcomes.
+pub(crate) fn record_error(operation: &'static str, target_plane: &'static str, error: &crate::error::ClientError) {
+    use crate::error::ClientErrorKind;
+    let metric = match error.kind() {
+        ClientErrorKind::InvalidResponse => ClientMetric::InvalidHeader,
+        ClientErrorKind::Fenced => ClientMetric::FencingMismatch,
+        ClientErrorKind::SessionInvalid => ClientMetric::SessionInvalid,
+        ClientErrorKind::SessionExpired => ClientMetric::SessionExpired,
+        ClientErrorKind::Unsupported => ClientMetric::UnsupportedOperation,
+        _ => return,
+    };
+    record(
+        metric,
+        ClientMetricLabels::default()
+            .with_operation(operation, target_plane)
+            .with_error_class(error.classification_label()),
+    );
+}
 
-    #[test]
-    fn metric_labels_detect_high_cardinality_values() {
-        assert!(ClientMetricLabels::default()
-            .with_operation("ReadBlock", "worker")
-            .with_error_class("retryable_transport")
-            .with_cache("channel_pool")
-            .with_outcome("retry")
-            .has_only_safe_values());
-        assert!(!ClientMetricLabels::default()
-            .with_operation("/user/path", "worker")
-            .has_only_safe_values());
+/// Counts each completed SDK mutation call returning an unknown outcome once.
+/// Internal RPC retries and error propagation do not emit this counter.
+pub(crate) fn record_unknown_outcome(
+    operation: &'static str,
+    target_plane: &'static str,
+    error: &crate::error::ClientError,
+) {
+    if error.is_outcome_unknown() {
+        record(
+            ClientMetric::UnknownOutcome,
+            ClientMetricLabels::default()
+                .with_operation(operation, target_plane)
+                .with_error_class("unknown_outcome")
+                .with_outcome("unknown"),
+        );
     }
 }

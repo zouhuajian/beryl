@@ -1,33 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use beryl_common::error::rpc::RpcErrorDetail;
-use beryl_proto::common::ResponseHeaderProto;
-use beryl_proto::convert::rpc_error_to_proto;
+use beryl_proto::common::{BlockIdProto, RequestHeaderProto, ResponseHeaderProto};
 use beryl_proto::metadata::block_report_request_proto::Batch;
 use beryl_proto::metadata::delta_block_report_entry_proto::Block;
 use beryl_proto::metadata::metadata_worker_service_proto_server::{
     MetadataWorkerServiceProto, MetadataWorkerServiceProtoServer,
 };
 use beryl_proto::metadata::{
-    BlockCleanupCommandProto, BlockReportKindProto, BlockReportRequestProto, BlockReportResponseProto,
-    HeartbeatRequestProto, HeartbeatResponseProto, RegisterWorkerRequestProto, RegisterWorkerResponseProto,
-    ReportedBlockStateProto,
+    BlockReportKindProto, BlockReportRequestProto, BlockReportResponseProto, HeartbeatRequestProto,
+    HeartbeatResponseProto, RegisterWorkerRequestProto, RegisterWorkerResponseProto, ReportedBlockStateProto,
 };
 use beryl_proto::worker::worker_data_service_server::WorkerDataService;
 use beryl_proto::worker::ReadBlockRequestProto;
 use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
 use beryl_types::range::ByteRange;
 use beryl_types::{GroupName, Tier, WorkerRunId};
-use beryl_worker::config::{StoreDirConfig, WorkerConfig, WorkerRegistrationConfig};
+use beryl_worker::config::{BlockCleanupOptions, StoreDirConfig, WorkerConfig, WorkerRegistrationConfig};
 use beryl_worker::control::{
-    BlockCleanupOptions, BlockCleanupRuntime, BlockReportError, BlockReportOptions, HeartbeatSnapshot,
-    MetadataBlockReportLoop, MetadataHeartbeatLoop, Registration, RegistrationDescriptor, RegistrationSet,
+    BlockCleanupRuntime, BlockReportError, BlockReportOutcome, MetadataBlockReportLoop, MetadataHeartbeatLoop,
+    Registration, RegistrationDescriptor, RegistrationState,
 };
-use beryl_worker::net::server::grpc::WorkerDataServiceImpl;
+use beryl_worker::net::WorkerDataServiceImpl;
 use beryl_worker::store::block::{
-    CheckpointBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore, OpenBlockWriteRequest,
-    ReclaimBlockRequest,
+    CheckpointBlockRequest, FullBlockFileStore, LocalBlockStore, OpenBlockWriteRequest, ReclaimBlockRequest,
 };
 use beryl_worker::store::dirs::StoreDirs;
 use beryl_worker::{ReclaimBlockResult, WorkerCore};
@@ -58,33 +54,9 @@ fn group_name() -> GroupName {
     GroupName::parse("root").expect("test group name is valid")
 }
 
-#[derive(Clone)]
-enum MockRegisterReply {
-    Echo,
-}
-
-#[derive(Clone)]
-enum MockHeartbeatReply {
-    Ok {
-        worker_id: u64,
-        worker_run_id: WorkerRunId,
-    },
-    OkWithCleanup {
-        worker_id: u64,
-        worker_run_id: WorkerRunId,
-        cleanup_commands: Vec<BlockCleanupCommandProto>,
-    },
-}
-
-#[derive(Clone)]
 enum MockBlockReportReply {
     Ok,
-    Response {
-        report_kind: i32,
-        baseline_seq: u64,
-        next_batch_seq: u64,
-        baseline_published: bool,
-    },
+    FullProgress(u64),
     AppliedThenStatus(Status),
     Status(Status),
 }
@@ -99,11 +71,9 @@ struct MockFullReportState {
 
 #[derive(Default)]
 struct MockMetadataState {
-    replies: Mutex<VecDeque<MockRegisterReply>>,
-    heartbeat_replies: Mutex<VecDeque<MockHeartbeatReply>>,
+    cleanup_commands: Mutex<Vec<BlockIdProto>>,
     block_report_replies: Mutex<VecDeque<MockBlockReportReply>>,
     requests: Mutex<Vec<RegisterWorkerRequestProto>>,
-    heartbeat_requests: Mutex<Vec<HeartbeatRequestProto>>,
     block_report_requests: Mutex<Vec<BlockReportRequestProto>>,
     full_report: Mutex<MockFullReportState>,
 }
@@ -121,21 +91,11 @@ impl MetadataWorkerServiceProto for MockMetadataWorkerService {
     ) -> Result<Response<RegisterWorkerResponseProto>, Status> {
         let request = request.into_inner();
         self.state.requests.lock().unwrap().push(request.clone());
-        let reply = self
-            .state
-            .replies
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("mock register reply");
-
-        match reply {
-            MockRegisterReply::Echo => Ok(Response::new(RegisterWorkerResponseProto {
-                header: Some(response_header_from_request(&request, None)),
-                worker_id: request.worker_id,
-                accepted_worker_run_id: request.worker_run_id,
-            })),
-        }
+        Ok(Response::new(RegisterWorkerResponseProto {
+            header: Some(response_header(request.header.as_ref().expect("request header"))),
+            worker_id: request.worker_id,
+            accepted_worker_run_id: request.worker_run_id,
+        }))
     }
 
     async fn heartbeat(
@@ -143,41 +103,13 @@ impl MetadataWorkerServiceProto for MockMetadataWorkerService {
         request: Request<HeartbeatRequestProto>,
     ) -> Result<Response<HeartbeatResponseProto>, Status> {
         let request = request.into_inner();
-        self.state.heartbeat_requests.lock().unwrap().push(request.clone());
-        let reply = self
-            .state
-            .heartbeat_replies
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or(MockHeartbeatReply::Ok {
-                worker_id: request.worker_id,
-                worker_run_id: WorkerRunId::parse(&request.worker_run_id).unwrap_or_else(|_| test_worker_run_id()),
-            });
-
-        match reply {
-            MockHeartbeatReply::Ok {
-                worker_id,
-                worker_run_id,
-            } => Ok(Response::new(HeartbeatResponseProto {
-                header: Some(response_header_from_heartbeat_request(&request, None)),
-                worker_id,
-                accepted_worker_run_id: worker_run_id.to_string(),
-                liveness_timeout_ms: 5_000,
-                cleanup_commands: Vec::new(),
-            })),
-            MockHeartbeatReply::OkWithCleanup {
-                worker_id,
-                worker_run_id,
-                cleanup_commands,
-            } => Ok(Response::new(HeartbeatResponseProto {
-                header: Some(response_header_from_heartbeat_request(&request, None)),
-                worker_id,
-                accepted_worker_run_id: worker_run_id.to_string(),
-                liveness_timeout_ms: 5_000,
-                cleanup_commands,
-            })),
-        }
+        Ok(Response::new(HeartbeatResponseProto {
+            header: Some(response_header(request.header.as_ref().expect("request header"))),
+            worker_id: request.worker_id,
+            accepted_worker_run_id: request.worker_run_id,
+            liveness_timeout_ms: 5_000,
+            cleanup_commands: std::mem::take(&mut *self.state.cleanup_commands.lock().unwrap()),
+        }))
     }
 
     async fn block_report(
@@ -198,24 +130,19 @@ impl MetadataWorkerServiceProto for MockMetadataWorkerService {
             MockBlockReportReply::Ok => {
                 let (report_kind, next_batch_seq, baseline_published) = apply_block_report(&self.state, &request);
                 Ok(Response::new(BlockReportResponseProto {
-                    header: Some(response_header_from_block_report_request(&request, None)),
+                    header: Some(response_header(request.header.as_ref().expect("request header"))),
                     report_kind: report_kind as i32,
                     baseline_seq: request.baseline_seq,
                     next_batch_seq,
                     baseline_published,
                 }))
             }
-            MockBlockReportReply::Response {
-                report_kind,
-                baseline_seq,
+            MockBlockReportReply::FullProgress(next_batch_seq) => Ok(Response::new(BlockReportResponseProto {
+                header: Some(response_header(request.header.as_ref().expect("request header"))),
+                report_kind: BlockReportKindProto::BlockReportKindFull as i32,
+                baseline_seq: request.baseline_seq,
                 next_batch_seq,
-                baseline_published,
-            } => Ok(Response::new(BlockReportResponseProto {
-                header: Some(response_header_from_block_report_request(&request, None)),
-                report_kind,
-                baseline_seq,
-                next_batch_seq,
-                baseline_published,
+                baseline_published: false,
             })),
             MockBlockReportReply::AppliedThenStatus(status) => {
                 apply_block_report(&self.state, &request);
@@ -265,72 +192,19 @@ fn apply_block_report(
     }
 }
 
-fn response_header_from_request(
-    request: &RegisterWorkerRequestProto,
-    error: Option<RpcErrorDetail>,
-) -> ResponseHeaderProto {
+fn response_header(header: &RequestHeaderProto) -> ResponseHeaderProto {
     ResponseHeaderProto {
-        client: request.header.as_ref().and_then(|header| header.client.clone()),
-        error: error.as_ref().map(rpc_error_to_proto),
-        state: Vec::new(),
-        group_name: request
-            .header
-            .as_ref()
-            .map(|header| header.group_name.clone())
-            .unwrap_or_default(),
-        mount_epoch: None,
-        route_epoch: None,
+        client: header.client.clone(),
+        error: None,
+        state: None,
+        group_name: header.group_name.clone(),
     }
 }
 
-fn response_header_from_heartbeat_request(
-    request: &HeartbeatRequestProto,
-    error: Option<RpcErrorDetail>,
-) -> ResponseHeaderProto {
-    ResponseHeaderProto {
-        client: request.header.as_ref().and_then(|header| header.client.clone()),
-        error: error.as_ref().map(rpc_error_to_proto),
-        state: Vec::new(),
-        group_name: request
-            .header
-            .as_ref()
-            .map(|header| header.group_name.clone())
-            .unwrap_or_default(),
-        mount_epoch: None,
-        route_epoch: None,
-    }
-}
-
-fn response_header_from_block_report_request(
-    request: &BlockReportRequestProto,
-    error: Option<RpcErrorDetail>,
-) -> ResponseHeaderProto {
-    ResponseHeaderProto {
-        client: request.header.as_ref().and_then(|header| header.client.clone()),
-        error: error.as_ref().map(rpc_error_to_proto),
-        state: Vec::new(),
-        group_name: request
-            .header
-            .as_ref()
-            .map(|header| header.group_name.clone())
-            .unwrap_or_default(),
-        mount_epoch: None,
-        route_epoch: None,
-    }
-}
-
-async fn start_mock_metadata(replies: Vec<MockRegisterReply>) -> (String, Arc<MockMetadataState>, Sender<()>) {
+async fn start_mock_metadata() -> (String, Arc<MockMetadataState>, Sender<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock metadata");
     let addr = listener.local_addr().expect("mock metadata local addr");
-    let state = Arc::new(MockMetadataState {
-        replies: Mutex::new(VecDeque::from(replies)),
-        heartbeat_replies: Mutex::new(VecDeque::new()),
-        block_report_replies: Mutex::new(VecDeque::new()),
-        requests: Mutex::new(Vec::new()),
-        heartbeat_requests: Mutex::new(Vec::new()),
-        block_report_requests: Mutex::new(Vec::new()),
-        full_report: Mutex::new(MockFullReportState::default()),
-    });
+    let state = Arc::new(MockMetadataState::default());
     let service = MockMetadataWorkerService {
         state: Arc::clone(&state),
     };
@@ -356,7 +230,7 @@ async fn start_mock_metadata(replies: Vec<MockRegisterReply>) -> (String, Arc<Mo
 async fn start_mock_metadata_with_block_reports(
     replies: Vec<MockBlockReportReply>,
 ) -> (String, Arc<MockMetadataState>, Sender<()>) {
-    let (endpoint, state, shutdown) = start_mock_metadata(Vec::new()).await;
+    let (endpoint, state, shutdown) = start_mock_metadata().await;
     *state.block_report_replies.lock().unwrap() = VecDeque::from(replies);
     (endpoint, state, shutdown)
 }
@@ -364,24 +238,11 @@ async fn start_mock_metadata_with_block_reports(
 fn test_registration_config(endpoint: String) -> WorkerRegistrationConfig {
     WorkerRegistrationConfig {
         group_name: group_name(),
-        endpoints: vec![endpoint],
+        endpoint,
         request_timeout_ms: 1_000,
         retry_initial_backoff_ms: 1,
         retry_max_backoff_ms: 1,
     }
-}
-
-#[test]
-fn worker_metadata_config_requires_one_leader_endpoint() {
-    let mut config = WorkerRegistrationConfig::default();
-    config.endpoints.clear();
-    assert!(config.validate().is_err());
-
-    config.endpoints = vec![
-        "http://127.0.0.1:18080".to_string(),
-        "http://127.0.0.1:18081".to_string(),
-    ];
-    assert!(config.validate().is_err());
 }
 
 fn test_worker_run_id() -> WorkerRunId {
@@ -395,7 +256,6 @@ fn test_registration_descriptor(worker_run_id: WorkerRunId) -> RegistrationDescr
         worker_run_id,
         endpoint_host: "127.0.0.1".to_string(),
         endpoint_port: 9090,
-        advertised_endpoint: "http://127.0.0.1:9090".to_string(),
     }
 }
 
@@ -406,6 +266,7 @@ fn payload() -> Bytes {
 fn report_store(temp: &TempDir) -> Arc<StoreDirs> {
     Arc::new(
         StoreDirs::open(
+            group_name(),
             BTreeMap::from([(
                 "hdd0".to_string(),
                 StoreDirConfig {
@@ -422,7 +283,7 @@ fn report_store(temp: &TempDir) -> Arc<StoreDirs> {
 }
 
 fn test_worker_core(store: Arc<StoreDirs>) -> Arc<WorkerCore> {
-    Arc::new(WorkerCore::with_local_store(1024, 1024, store))
+    Arc::new(WorkerCore::with_local_store(group_name(), 1024, 1024, store))
 }
 
 fn publish_ready_block_for(
@@ -432,11 +293,8 @@ fn publish_ready_block_for(
     data: Bytes,
     lease_epoch: u64,
 ) {
-    let token = beryl_types::FencingToken::new(
-        block_id,
-        beryl_types::ClientId::new(9),
-        beryl_types::LeaseEpoch::new(lease_epoch),
-    );
+    let token =
+        beryl_types::FencingToken::new(beryl_types::ClientId::new(9), beryl_types::LeaseEpoch::new(lease_epoch));
     store
         .open_block_write(OpenBlockWriteRequest {
             fencing_token: token,
@@ -687,11 +545,11 @@ async fn wait_for_full_report_count(mock: &MockMetadataState, block_id: BlockId,
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_signals_exit_cleanly_and_restart_reports_current_blocks() {
-    let (endpoint, mock, metadata_shutdown) =
-        start_mock_metadata(vec![MockRegisterReply::Echo, MockRegisterReply::Echo]).await;
+    let (endpoint, mock, metadata_shutdown) = start_mock_metadata().await;
     let (_temp, config_path, http_addr, config) = worker_process_config(&endpoint);
     beryl_worker::control::prepare_worker_start(&config).expect("format Worker storage");
     let store = StoreDirs::open(
+        group_name(),
         config.store.dirs.clone(),
         config.store.reserve_space_bytes,
         config.store.check_interval_ms,
@@ -747,25 +605,13 @@ async fn worker_signals_exit_cleanly_and_restart_reports_current_blocks() {
 #[tokio::test]
 async fn heartbeat_cleanup_command_reports_deleting_then_delta_absent() {
     let worker_run_id = test_worker_run_id();
-    let (endpoint, mock, shutdown) = start_mock_metadata(Vec::new()).await;
-    *mock.heartbeat_replies.lock().unwrap() = VecDeque::from([MockHeartbeatReply::OkWithCleanup {
-        worker_id: 42,
-        worker_run_id,
-        cleanup_commands: vec![
-            BlockCleanupCommandProto {
-                block_id: Some(block_id().into()),
-            },
-            BlockCleanupCommandProto {
-                block_id: Some(block_id().into()),
-            },
-        ],
-    }]);
-    let state = Arc::new(RegistrationSet::new());
+    let (endpoint, mock, shutdown) = start_mock_metadata().await;
+    *mock.cleanup_commands.lock().unwrap() = vec![block_id().into(), block_id().into()];
+    let state = Arc::new(RegistrationState::new());
     state.record_registered(Registration {
         group_name: group_name(),
         worker_id: WorkerId::new(42),
         worker_run_id,
-        advertised_endpoint: "http://127.0.0.1:9090".to_string(),
     });
     state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
 
@@ -790,6 +636,7 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_absent() {
         test_registration_descriptor(worker_run_id),
         Arc::clone(&state),
         cleanup,
+        Duration::from_secs(1),
     )
     .expect("heartbeat loop");
     let reporter = MetadataBlockReportLoop::new(
@@ -797,6 +644,8 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_absent() {
         Arc::clone(&state),
         Arc::clone(&store),
         Arc::clone(&core),
+        beryl_types::MAX_REPORT_ENTRIES,
+        Duration::from_secs(1),
     )
     .expect("block reporter");
 
@@ -824,14 +673,14 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_absent() {
         .into_inner();
     reporter.send_full_once().await.expect("publish Ready baseline");
     heartbeat
-        .send_once(HeartbeatSnapshot::default())
+        .send_once(&store.report())
         .await
         .expect("accept cleanup heartbeat");
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let round = reporter.send_delta_once().await.expect("send Deleting delta");
-            if round.accepted_peers > 0
+            if round == BlockReportOutcome::Accepted
                 && latest_delta_has_present_state(&mock, ReportedBlockStateProto::ReportedBlockStateDeleting)
             {
                 break;
@@ -851,7 +700,7 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_absent() {
     assert_eq!(chunks.len(), 1);
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if store.report().expect("store report").dirs[0].block_count == 0 {
+            if store.report().dirs[0].block_count == 0 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -863,7 +712,7 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_absent() {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let round = reporter.send_delta_once().await.expect("send absent Delta entry");
-            if round.accepted_peers > 0 && latest_delta_has_absent(&mock, block_id()) {
+            if round == BlockReportOutcome::Accepted && latest_delta_has_absent(&mock, block_id()) {
                 break;
             }
             tokio::task::yield_now().await;
@@ -911,12 +760,11 @@ fn latest_delta_has_absent(mock: &MockMetadataState, expected_block_id: BlockId)
 async fn block_report_loop_sends_coalesced_present_and_absent_entries_on_store_changes() {
     let worker_run_id = test_worker_run_id();
     let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(Vec::new()).await;
-    let state = Arc::new(RegistrationSet::new());
+    let state = Arc::new(RegistrationState::new());
     state.record_registered(Registration {
         group_name: group_name(),
         worker_id: WorkerId::new(42),
         worker_run_id,
-        advertised_endpoint: "http://127.0.0.1:9090".to_string(),
     });
     state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
     let temp = TempDir::new().expect("tempdir");
@@ -924,12 +772,12 @@ async fn block_report_loop_sends_coalesced_present_and_absent_entries_on_store_c
     let first = BlockId::new(InodeId::new(7), BlockIndex::new(0));
     let second = BlockId::new(InodeId::new(7), BlockIndex::new(1));
     let core = test_worker_core(Arc::clone(&store));
-    let reporter = MetadataBlockReportLoop::with_options_and_delta_flush_interval(
+    let reporter = MetadataBlockReportLoop::new(
         test_registration_config(endpoint),
         Arc::clone(&state),
         Arc::clone(&store),
         Arc::clone(&core),
-        BlockReportOptions::default(),
+        beryl_types::MAX_REPORT_ENTRIES,
         Duration::from_millis(20),
     )
     .expect("block reporter");
@@ -937,7 +785,8 @@ async fn block_report_loop_sends_coalesced_present_and_absent_entries_on_store_c
 
     publish_ready_block_for(store.as_ref(), group_name(), first, payload(), 101);
     publish_ready_block_for(store.as_ref(), group_name(), second, payload(), 102);
-    let reporter_handle = reporter.spawn();
+    let reporter_shutdown = tokio_util::sync::CancellationToken::new();
+    let reporter_handle = reporter.spawn_until_shutdown(reporter_shutdown.clone());
     wait_for_block_report_requests(&mock, 2, Duration::from_millis(500)).await;
 
     {
@@ -972,7 +821,8 @@ async fn block_report_loop_sends_coalesced_present_and_absent_entries_on_store_c
     );
     wait_for_block_report_absent(&mock, first, Duration::from_millis(500)).await;
 
-    reporter_handle.abort();
+    reporter_shutdown.cancel();
+    reporter_handle.await.unwrap();
     shutdown.send(()).ok();
 }
 
@@ -989,12 +839,11 @@ async fn result_unknown_retries_immutable_batches_and_preserves_newer_changes() 
         MockBlockReportReply::Ok,
     ])
     .await;
-    let state = Arc::new(RegistrationSet::new());
+    let state = Arc::new(RegistrationState::new());
     state.record_registered(Registration {
         group_name: group_name(),
         worker_id: WorkerId::new(42),
         worker_run_id,
-        advertised_endpoint: "http://127.0.0.1:9090".to_string(),
     });
     state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
     let temp = TempDir::new().expect("tempdir");
@@ -1006,15 +855,13 @@ async fn result_unknown_retries_immutable_batches_and_preserves_newer_changes() 
     publish_ready_block_for(store.as_ref(), group_name(), first, payload(), 101);
     publish_ready_block_for(store.as_ref(), group_name(), second, payload(), 102);
     publish_ready_block_for(store.as_ref(), group_name(), third, payload(), 103);
-    let reporter = MetadataBlockReportLoop::with_options(
+    let reporter = MetadataBlockReportLoop::new(
         test_registration_config(endpoint),
         Arc::clone(&state),
         Arc::clone(&store),
         test_worker_core(Arc::clone(&store)),
-        BlockReportOptions {
-            full_max_blocks_per_batch: 1,
-            delta_max_entries_per_batch: 1,
-        },
+        1,
+        Duration::from_secs(1),
     )
     .expect("block reporter");
 
@@ -1023,7 +870,7 @@ async fn result_unknown_retries_immutable_batches_and_preserves_newer_changes() 
         .await
         .expect_err("second Full batch result is unknown");
     publish_ready_block_for(store.as_ref(), group_name(), fourth, payload(), 104);
-    assert_eq!(reporter.send_full_once().await.unwrap().accepted_peers, 1);
+    assert_eq!(reporter.send_full_once().await.unwrap(), BlockReportOutcome::Accepted);
     reporter
         .send_delta_once()
         .await
@@ -1035,8 +882,8 @@ async fn result_unknown_retries_immutable_batches_and_preserves_newer_changes() 
         }),
         Ok(ReclaimBlockResult::Deleted { .. })
     ));
-    assert_eq!(reporter.send_delta_once().await.unwrap().accepted_peers, 1);
-    assert_eq!(reporter.send_delta_once().await.unwrap().accepted_peers, 1);
+    assert_eq!(reporter.send_delta_once().await.unwrap(), BlockReportOutcome::Accepted);
+    assert_eq!(reporter.send_delta_once().await.unwrap(), BlockReportOutcome::Accepted);
 
     {
         let requests = mock.block_report_requests.lock().unwrap();
@@ -1083,39 +930,19 @@ async fn result_unknown_retries_immutable_batches_and_preserves_newer_changes() 
 }
 
 #[tokio::test]
-async fn block_report_rejects_responses_that_do_not_confirm_the_request() {
-    let full_kind = BlockReportKindProto::BlockReportKindFull as i32;
-    let delta_kind = BlockReportKindProto::BlockReportKindDelta as i32;
-    let response = |report_kind, baseline_seq, next_batch_seq, baseline_published| MockBlockReportReply::Response {
-        report_kind,
-        baseline_seq,
-        next_batch_seq,
-        baseline_published,
-    };
-    let invalid_full_responses = [
-        (response(i32::MAX, 1, 1, false), "unknown report_kind"),
-        (response(delta_kind, 1, 1, true), "requested report kind"),
-        (response(full_kind, 2, 1, false), "baseline_seq"),
-        (response(full_kind, 1, 0, false), "expected next_batch_seq>=1"),
-        (response(full_kind, 1, 3, false), "invalid next_batch_seq 3"),
+async fn full_report_rejects_acknowledgement_beyond_local_batches() {
+    let replies = vec![
+        MockBlockReportReply::FullProgress(2),
+        MockBlockReportReply::Ok,
+        MockBlockReportReply::Ok,
     ];
-    let mut replies = invalid_full_responses
-        .iter()
-        .map(|(reply, _)| reply.clone())
-        .collect::<Vec<_>>();
-    replies.extend([
-        MockBlockReportReply::Ok,
-        MockBlockReportReply::Ok,
-        response(delta_kind, 1, 1, false),
-    ]);
     let worker_run_id = test_worker_run_id();
     let (endpoint, _mock, shutdown) = start_mock_metadata_with_block_reports(replies).await;
-    let state = Arc::new(RegistrationSet::new());
+    let state = Arc::new(RegistrationState::new());
     state.record_registered(Registration {
         group_name: group_name(),
         worker_id: WorkerId::new(42),
         worker_run_id,
-        advertised_endpoint: "http://127.0.0.1:9090".to_string(),
     });
     state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
     let temp = TempDir::new().expect("tempdir");
@@ -1129,47 +956,22 @@ async fn block_report_rejects_responses_that_do_not_confirm_the_request() {
             lease_epoch,
         );
     }
-    let reporter = MetadataBlockReportLoop::with_options(
+    let reporter = MetadataBlockReportLoop::new(
         test_registration_config(endpoint),
         Arc::clone(&state),
         Arc::clone(&store),
         test_worker_core(Arc::clone(&store)),
-        BlockReportOptions {
-            full_max_blocks_per_batch: 1,
-            delta_max_entries_per_batch: 1,
-        },
+        1,
+        Duration::from_secs(1),
     )
     .expect("block reporter");
 
-    for (_, expected_message) in invalid_full_responses {
-        let error = reporter
-            .send_full_once()
-            .await
-            .expect_err("invalid Full acknowledgement must fail closed");
-        assert!(
-            matches!(&error, BlockReportError::Fatal(_)),
-            "invalid Full acknowledgement must be fatal: {error}"
-        );
-        assert!(
-            error.to_string().contains(expected_message),
-            "unexpected Full acknowledgement error: {error}"
-        );
-    }
-
-    assert_eq!(reporter.send_full_once().await.unwrap().accepted_peers, 1);
-    publish_ready_block_for(
-        store.as_ref(),
-        group_name(),
-        BlockId::new(InodeId::new(7), BlockIndex::new(2)),
-        payload(),
-        103,
-    );
     let error = reporter
-        .send_delta_once()
+        .send_full_once()
         .await
-        .expect_err("Delta acknowledgement without a published baseline must fail closed");
-    assert!(matches!(&error, BlockReportError::Fatal(_)));
-    assert!(error.to_string().contains("published Delta baseline"));
+        .expect_err("out-of-range cursor must fail closed");
+    assert!(matches!(error, BlockReportError::Fatal(_)));
+    assert_eq!(reporter.send_full_once().await.unwrap(), BlockReportOutcome::Accepted);
 
     shutdown.send(()).ok();
 }
@@ -1178,25 +980,24 @@ async fn block_report_rejects_responses_that_do_not_confirm_the_request() {
 async fn startup_deleting_recovery_precedes_first_full_block_report() {
     let worker_run_id = test_worker_run_id();
     let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(Vec::new()).await;
-    let state = Arc::new(RegistrationSet::new());
+    let state = Arc::new(RegistrationState::new());
     state.record_registered(Registration {
         group_name: group_name(),
         worker_id: WorkerId::new(42),
         worker_run_id,
-        advertised_endpoint: "http://127.0.0.1:9090".to_string(),
     });
     state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
 
     let temp = TempDir::new().expect("tempdir");
     let data_root = temp.path().join("hdd0");
     std::fs::create_dir_all(&data_root).unwrap();
-    let raw_store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(data_root));
+    let raw_store = FullBlockFileStore::new(data_root);
     publish_ready_block_for(&raw_store, group_name(), block_id(), payload(), 101);
     let paths = raw_store.paths(&group_name(), block_id());
     // Recreate the durable Deleting checkpoint before either unlink is completed.
     let mut bytes = std::fs::read(&paths.meta_path).unwrap();
     let mut meta = <beryl_proto::worker::BlockMetaPayloadProto as prost::Message>::decode(&bytes[20..]).unwrap();
-    meta.visibility.as_mut().unwrap().block_state = beryl_proto::worker::BlockStateProto::BlockStateDeleting as i32;
+    meta.block_state = beryl_proto::worker::BlockStateProto::BlockStateDeleting as i32;
     let payload = prost::Message::encode_to_vec(&meta);
     bytes.truncate(20);
     bytes[12..20].copy_from_slice(&(payload.len() as u64).to_le_bytes());
@@ -1205,7 +1006,7 @@ async fn startup_deleting_recovery_precedes_first_full_block_report() {
     drop(raw_store);
 
     let store = report_store(&temp);
-    assert_eq!(store.report().expect("store report").dirs[0].block_count, 0);
+    assert_eq!(store.report().dirs[0].block_count, 0);
     assert!(!paths.data_path.exists());
     assert!(!paths.meta_path.exists());
 
@@ -1214,11 +1015,13 @@ async fn startup_deleting_recovery_precedes_first_full_block_report() {
         Arc::clone(&state),
         Arc::clone(&store),
         test_worker_core(Arc::clone(&store)),
+        beryl_types::MAX_REPORT_ENTRIES,
+        Duration::from_secs(1),
     )
     .expect("block reporter");
     let round = reporter.send_full_once().await.expect("first full report");
 
-    assert_eq!(round.accepted_peers, 1);
+    assert_eq!(round, BlockReportOutcome::Accepted);
     let requests = mock.block_report_requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
     let Batch::FullReport(full) = requests[0].batch.as_ref().expect("full report") else {
@@ -1232,7 +1035,7 @@ async fn startup_deleting_recovery_precedes_first_full_block_report() {
 async fn block_report_waits_for_registration_and_heartbeat_readiness() {
     let worker_run_id = test_worker_run_id();
     let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(Vec::new()).await;
-    let state = Arc::new(RegistrationSet::new());
+    let state = Arc::new(RegistrationState::new());
     let temp = TempDir::new().expect("tempdir");
     let store = report_store(&temp);
     publish_ready_block_for(store.as_ref(), group_name(), block_id(), payload(), 101);
@@ -1241,56 +1044,40 @@ async fn block_report_waits_for_registration_and_heartbeat_readiness() {
         Arc::clone(&state),
         Arc::clone(&store),
         test_worker_core(Arc::clone(&store)),
+        beryl_types::MAX_REPORT_ENTRIES,
+        Duration::from_secs(1),
     )
     .expect("block reporter");
 
     let without_registration = reporter.send_full_once().await.expect("skip unregistered");
-    assert_eq!(without_registration.attempted_peers, 0);
+    assert_eq!(without_registration, BlockReportOutcome::Skipped);
     state.record_registered(Registration {
         group_name: group_name(),
         worker_id: WorkerId::new(42),
         worker_run_id,
-        advertised_endpoint: "http://127.0.0.1:9090".to_string(),
     });
     let without_heartbeat = reporter.send_full_once().await.expect("skip not ready");
 
-    assert_eq!(without_heartbeat.attempted_peers, 0);
+    assert_eq!(without_heartbeat, BlockReportOutcome::Skipped);
     assert!(mock.block_report_requests.lock().unwrap().is_empty());
 
     state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
     reporter.send_full_once().await.expect("accept baseline");
-    assert!(reporter.has_delta_baseline(&group_name()));
-    let other_group = GroupName::parse("other").expect("other group");
-    state.record_registered(Registration {
-        group_name: other_group.clone(),
-        worker_id: WorkerId::new(42),
-        worker_run_id,
-        advertised_endpoint: "http://127.0.0.1:9090".to_string(),
-    });
-    state.record_heartbeat_success(&other_group, Duration::from_secs(60));
-    assert!(!reporter.has_delta_baseline(&other_group));
-
+    assert!(reporter.has_delta_baseline());
     let registration = state.registration(&group_name()).expect("registration");
     state.record_registered(registration);
-    assert!(!reporter.has_delta_baseline(&group_name()));
+    assert!(!reporter.has_delta_baseline());
     assert_eq!(
-        reporter
-            .send_delta_once()
-            .await
-            .expect("skip not ready")
-            .attempted_peers,
-        0
+        reporter.send_delta_once().await.expect("skip not ready"),
+        BlockReportOutcome::Skipped
     );
     state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
-    assert!(
-        reporter
-            .send_delta_once()
-            .await
-            .expect("require new baseline")
-            .full_report_required
+    assert_eq!(
+        reporter.send_delta_once().await.expect("require new baseline"),
+        BlockReportOutcome::FullReportRequired
     );
     reporter.send_full_once().await.expect("accept new baseline");
-    assert!(reporter.has_delta_baseline(&group_name()));
+    assert!(reporter.has_delta_baseline());
     let requests = mock.block_report_requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert!(requests[1].baseline_seq > requests[0].baseline_seq);

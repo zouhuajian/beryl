@@ -17,13 +17,13 @@ use tonic::Request;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn low_target_limits_reject_before_raft_and_release_on_abort() {
-    let mut cluster = TestCluster::start_with_write_target_limits(2, 1)
-        .await
-        .expect("start cluster");
-    cluster
-        .start_metadata_process(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
-        .await
-        .expect("start production Metadata runtime with low target limits");
+    let mut cluster = TestCluster::start_with_write_target_limits(
+        std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")),
+        2,
+        1,
+    )
+    .await
+    .expect("start cluster");
     let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
         .await
         .expect("connect Metadata");

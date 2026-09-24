@@ -3,8 +3,9 @@
 
 //! Shared routing and Raft proposal boundary for filesystem writes.
 
-use super::{fs_failure_from_metadata_error, Freshness, FsFailure, MetadataFileSystem, RequestContext};
+use super::{fs_failure_from_metadata_error, FsFailure, MetadataFileSystem, RequestHeader};
 use crate::error::{MetadataError, MetadataResult};
+use crate::mount::MountEntry;
 use crate::observe;
 use crate::raft::{ApplySuccess, Command};
 use crate::session_registry::WritePublication;
@@ -14,98 +15,56 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::debug;
 
-#[derive(Clone, Debug)]
-pub(super) struct RoutedFsWriteCtx {
-    pub(super) mount_id: MountId,
-    /// Durable path anchor copied into path-addressed Raft commands.
-    pub(super) mount_root_inode_id: InodeId,
-    /// Namespace owner group selected from the resolved mount.
-    pub(super) group_name: GroupName,
-    pub(super) mount_epoch: u64,
-}
-
 impl MetadataFileSystem {
     pub(super) fn route_ctx_for_write(
         &self,
-        req_ctx: &RequestContext,
-        parent_inode_ids: &[InodeId],
-        freshness: Freshness,
-    ) -> Result<RoutedFsWriteCtx, FsFailure> {
-        self.route_ctx_for_write_with_error_hints(req_ctx, parent_inode_ids, freshness, None, None)
+        req_ctx: &RequestHeader,
+        parent_inode_id: InodeId,
+    ) -> Result<MountEntry, FsFailure> {
+        self.route_ctx_for_write_with_error_hints(req_ctx, parent_inode_id, None)
     }
 
     pub(super) fn route_ctx_for_write_with_error_hints(
         &self,
-        req_ctx: &RequestContext,
-        parent_inode_ids: &[InodeId],
-        freshness: Freshness,
+        req_ctx: &RequestHeader,
+        parent_inode_id: InodeId,
         error_group_name: Option<GroupName>,
-        error_mount_epoch: Option<u64>,
-    ) -> Result<RoutedFsWriteCtx, FsFailure> {
-        let ctx = match self.route_fs_write_ctx(parent_inode_ids) {
+    ) -> Result<MountEntry, FsFailure> {
+        let ctx = match self.storage.get_inode(parent_inode_id).and_then(|inode| {
+            let inode =
+                inode.ok_or_else(|| MetadataError::NotFound(format!("Parent inode not found: {parent_inode_id}")))?;
+            self.route_fs_write_ctx(inode.mount_id)
+        }) {
             Ok(ctx) => ctx,
             Err(err) => {
-                return Err(fs_failure_from_metadata_error(
-                    req_ctx,
-                    err,
-                    error_group_name,
-                    error_mount_epoch,
-                    None,
-                ));
+                return Err(fs_failure_from_metadata_error(req_ctx, err, error_group_name));
             }
         };
 
-        self.freshness_validator
-            .validate_mount_epoch(req_ctx, freshness, ctx.mount_id)?;
         Ok(ctx)
     }
 
-    pub(super) fn route_fs_write_ctx(&self, parent_inode_ids: &[InodeId]) -> MetadataResult<RoutedFsWriteCtx> {
-        let parent_inode_id = parent_inode_ids
-            .first()
-            .ok_or_else(|| MetadataError::InvalidArgument("No parent inode provided".to_string()))?;
-        let parent_inode = self
-            .read_inode(*parent_inode_id)?
-            .ok_or_else(|| MetadataError::NotFound(format!("Parent inode not found: {}", parent_inode_id)))?;
-
-        let mount_id = parent_inode.mount_id;
-        for other_parent in parent_inode_ids.iter().skip(1) {
-            let inode = self
-                .read_inode(*other_parent)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Parent inode not found: {}", other_parent)))?;
-            if inode.mount_id != mount_id {
-                return Err(MetadataError::CrossMountRename(
-                    "cross-mount operation is not allowed".to_string(),
-                ));
-            }
-        }
-
+    pub(super) fn route_fs_write_ctx(&self, mount_id: MountId) -> MetadataResult<MountEntry> {
         let mount_entry = self
             .mount_table
-            .get_mount(mount_id)?
+            .get_mount(mount_id)
             .ok_or_else(|| MetadataError::NotFound(format!("Mount not found: {:?}", mount_id)))?;
 
         debug!(
             mount_id = %mount_id.as_raw(),
             owner_group_name = %mount_entry.namespace_owner_group_name,
-            mount_epoch = mount_entry.mount_epoch,
             "FS write routed to mount namespace owner group"
         );
 
-        Ok(RoutedFsWriteCtx {
-            mount_id,
-            mount_root_inode_id: mount_entry.root_inode_id,
-            group_name: mount_entry.namespace_owner_group_name,
-            mount_epoch: mount_entry.mount_epoch,
-        })
+        Ok(mount_entry)
     }
 
     /// Propose one filesystem command and record its fully validated outcome.
     ///
     /// The Raft node has already converted committed application rejections to
     /// `MetadataError`. `decode_success` must accept only the exact success
-    /// variant and identity expected by the submitted command, so FS metrics
-    /// cannot report success before that invariant is checked.
+    /// variant expected by the submitted command, so FS metrics cannot report
+    /// success before that invariant is checked.
     pub(super) async fn propose_fs_write_command<T>(
         &self,
         command: Command,
@@ -127,37 +86,12 @@ impl MetadataFileSystem {
         inode_id: InodeId,
         lease_epoch: LeaseEpoch,
     ) -> MetadataResult<BlockId> {
-        let started = Instant::now();
         let command = Command::AllocateBlock { inode_id, lease_epoch };
-        let operation_name = command.operation_name();
-        let response = match self.propose_write_command(command).await {
-            Ok(response) => response,
-            Err(error) => {
-                observe::record_fs_op(
-                    operation_name,
-                    "error",
-                    observe::metadata_error_kind(&error),
-                    started.elapsed().as_secs_f64(),
-                );
-                return Err(error);
-            }
-        };
-        match response {
-            ApplySuccess::BlockAllocated(block_id) if block_id.inode_id == inode_id => {
-                observe::record_fs_op(operation_name, "ok", "none", started.elapsed().as_secs_f64());
-                Ok(block_id)
-            }
-            unexpected => {
-                let error = unexpected_raft_apply_success("AllocateBlock", unexpected);
-                observe::record_fs_op(
-                    operation_name,
-                    "error",
-                    observe::metadata_error_kind(&error),
-                    started.elapsed().as_secs_f64(),
-                );
-                Err(error)
-            }
-        }
+        self.propose_fs_write_command(command, |success| match success {
+            ApplySuccess::BlockAllocated(block_id) => Ok(block_id),
+            unexpected => Err(unexpected_raft_apply_success("AllocateBlock", unexpected)),
+        })
+        .await
     }
 
     /// Keep submitted visibility changes alive independently of the RPC waiter.
@@ -179,26 +113,14 @@ impl MetadataFileSystem {
             _ => unreachable!("file publication command required"),
         };
         publication.mark_submitted().map_err(MetadataError::Again)?;
-        let ended_epoch = lease_epoch.checked_next();
         let operation_name = command.operation_name();
-        let fence = self.propose_write_command(Command::EndWriteLease {
-            proposed_at_ms: crate::raft::proposal_timestamp_ms(),
-            inode_id,
-            lease_epoch,
-        });
+        let fence = self.propose_write_command(Command::EndWriteLease { inode_id, lease_epoch });
         let proposal = self.propose_write_command(command);
         tokio::spawn(async move {
             let started = Instant::now();
             let result = match proposal.await {
-                Ok(ApplySuccess::FileCommitted {
-                    inode_id: returned,
-                    lease_epoch,
-                    generation,
-                }) if closes && returned == inode_id && Some(lease_epoch) == ended_epoch => Ok(generation),
-                Ok(ApplySuccess::FilePublished {
-                    inode_id: returned,
-                    generation,
-                }) if !closes && returned == inode_id => Ok(generation),
+                Ok(ApplySuccess::FileCommitted { generation }) if closes => Ok(generation),
+                Ok(ApplySuccess::FilePublished { generation }) if !closes => Ok(generation),
                 Ok(unexpected) => Err(unexpected_raft_apply_success(operation_name, unexpected)),
                 Err(error) => Err(error),
             };
@@ -217,10 +139,7 @@ impl MetadataFileSystem {
                 Err(error) => {
                     // Transport or apply-worker failure may leave the mutation
                     // queued. Only ordered authority may release its GC pin.
-                    if matches!(fence.await,
-                        Ok(ApplySuccess::WriteLeaseEnded { inode_id: returned, lease_epoch })
-                            if returned == inode_id && Some(lease_epoch) >= ended_epoch)
-                    {
+                    if matches!(fence.await, Ok(ApplySuccess::WriteLeaseEnded)) {
                         publication.complete_commit();
                     }
                     Err(error)
@@ -264,20 +183,4 @@ pub(super) fn unexpected_raft_apply_success(operation_name: &'static str, succes
     MetadataError::Internal(format!(
         "{operation_name} Raft command returned unexpected success: {success:?}"
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{unexpected_raft_apply_success, ApplySuccess, MetadataError};
-
-    #[test]
-    fn mismatched_raft_success_fails_closed() {
-        let error = unexpected_raft_apply_success("CreateFile", ApplySuccess::RaftEntryApplied);
-
-        assert!(matches!(
-            error,
-            MetadataError::Internal(message)
-                if message.contains("CreateFile") && message.contains("unexpected success")
-        ));
-    }
 }

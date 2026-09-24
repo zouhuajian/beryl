@@ -4,13 +4,12 @@
 //! Standard asynchronous streams and bounded owned range reads.
 
 use crate::api::FileStatus;
-use crate::client_inner::{metric_labels, refresh_hint_from_error, ClientInner};
+use crate::client_inner::{metric_labels, ClientInner};
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::ReadLayout;
-use crate::metrics::ClientMetric;
-use crate::planner;
-use crate::runtime::{retry_decision, AttemptContext, Operation, OperationContext, OperationDeadline, RetryDecision};
-use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, WorkerErrorKind};
+use crate::metrics::{self, ClientMetric};
+use crate::runtime::retry::is_stale_read_location_error;
+use crate::runtime::{retry_decision, Operation, OperationContext, OperationDeadline, RetryDecision};
 use bytes::{Buf, Bytes};
 use futures::future::BoxFuture;
 use futures::io::{AsyncRead, AsyncSeek};
@@ -197,7 +196,7 @@ impl AsyncSeek for FileReader {
 impl ReadSource {
     /// Reads at most one block's visible prefix, with the same bounds on cache hits and misses.
     async fn read(&self, offset: u64, len: u32, deadline: OperationDeadline) -> ClientResult<Bytes> {
-        let operation = self.read_operation(deadline)?;
+        let operation = self.read_operation(deadline);
         let mut layout = None;
         for attempt_index in 0..self.inner.config.max_attempts() {
             let mut fetched = false;
@@ -219,11 +218,11 @@ impl ReadSource {
                 };
             }
             let current = layout.as_ref().expect("read layout initialized");
-            let plan = planner::plan_block_read(&self.file, offset, len, current)?;
+            let plan = current.plan_block_read(offset, len)?;
             if fetched {
                 *self.layout.lock() = Some(Arc::clone(current));
             }
-            let ctx = AttemptContext::for_data(&operation);
+            let ctx = operation.clone();
             match self
                 .inner
                 .worker_rpc_with_timeout(
@@ -239,17 +238,15 @@ impl ReadSource {
                     let decision = self.handle_worker_failure(&operation, attempt_index, &error).await;
                     // Retain the layout only while retrying it. A terminal failure
                     // lets a later read discover a replacement endpoint.
-                    if !matches!(decision, Ok(RetryDecision::Retry)) {
+                    if !matches!(decision, Ok(false)) {
                         let mut cached = self.layout.lock();
                         // An old failed request must not evict a concurrent replacement.
                         if cached.as_ref().is_some_and(|cached| Arc::ptr_eq(cached, current)) {
                             *cached = None;
                         }
                     }
-                    match decision? {
-                        RetryDecision::RefreshMetadata(_) => layout = None,
-                        RetryDecision::Retry => {}
-                        _ => return Err(error),
+                    if decision? {
+                        layout = None;
                     }
                 }
             }
@@ -257,37 +254,34 @@ impl ReadSource {
         unreachable!("read attempt loop returns on its final attempt")
     }
 
-    /// Applies bounded read retry policy and returns only an authorized next action.
+    /// Applies bounded retry policy and returns whether to refresh the layout.
     async fn handle_worker_failure(
         &self,
         operation: &OperationContext,
         attempt_index: usize,
         error: &ClientError,
-    ) -> ClientResult<RetryDecision> {
+    ) -> ClientResult<bool> {
         let decision = retry_decision(error, operation.retry_safety());
-        self.inner.record_error_metric("Read", "worker", error);
+        metrics::record_error("Read", "worker", error);
         let has_next = attempt_index + 1 < self.inner.config.max_attempts();
         match (decision, has_next) {
-            (RetryDecision::RefreshMetadata(reason), true) if should_replan_after_worker_error(error) => {
-                self.inner
-                    .metadata
-                    .record_data_refresh(operation, reason, &refresh_hint_from_error(error))?;
-                self.inner.record_metric(
+            (RetryDecision::RefreshMetadata(_), true) if is_stale_read_location_error(error) => {
+                metrics::record(
                     ClientMetric::RetryAttempt,
                     metric_labels("Read", "worker").with_error_class(error.classification_label()),
                 );
-                Ok(decision)
+                Ok(true)
             }
             (RetryDecision::Retry, true) => {
-                self.inner.record_metric(
+                metrics::record(
                     ClientMetric::RetryAttempt,
                     metric_labels("Read", "worker").with_error_class(error.classification_label()),
                 );
                 self.inner.sleep_before_retry(attempt_index, operation).await?;
-                Ok(decision)
+                Ok(false)
             }
             (RetryDecision::Retry | RetryDecision::RefreshMetadata(_), false) => {
-                self.inner.record_metric(
+                metrics::record(
                     ClientMetric::RetryExhausted,
                     metric_labels("Read", "worker").with_error_class(error.classification_label()),
                 );
@@ -298,12 +292,11 @@ impl ReadSource {
     }
 
     /// Creates one stable operation identity for a bounded Worker read step.
-    fn read_operation(&self, deadline: OperationDeadline) -> ClientResult<OperationContext> {
+    fn read_operation(&self, deadline: OperationDeadline) -> OperationContext {
         OperationContext::new_named(
             self.inner.metadata.client_id(),
             self.inner.metadata.client_name(),
             Operation::Read,
-            self.file.path.clone(),
             deadline,
         )
     }
@@ -340,26 +333,10 @@ fn resolve_range(range: impl RangeBounds<u64>, len: u64) -> ClientResult<Range<u
     if start > end {
         return Err(ClientError::invalid_argument("range start exceeds end"));
     }
-    if start > len || end > len {
+    if end > len {
         return Err(ClientError::unexpected_eof("range exceeds opened file length"));
     }
     Ok(start..end)
-}
-
-fn should_replan_after_worker_error(error: &ClientError) -> bool {
-    error.remote_error().is_some_and(|detail| {
-        matches!(detail.recovery, RecoveryAction::RefreshMetadata { .. })
-            && matches!(
-                detail.kind,
-                ErrorKind::Metadata(MetadataErrorKind::StaleState | MetadataErrorKind::RouteEpochMismatch)
-                    | ErrorKind::Worker(
-                        WorkerErrorKind::BlockLocationUnavailable
-                            | WorkerErrorKind::RunMismatch
-                            | WorkerErrorKind::FullReportRequired
-                            | WorkerErrorKind::NotRegistered
-                    )
-            )
-    })
 }
 
 #[cfg(test)]

@@ -3,7 +3,6 @@
 
 //! Background namespace, block, and worker-state convergence.
 
-use super::lost_worker::{LostWorkerCleanupDeps, LostWorkerCleanupService};
 use super::{BlockCleanupCoordinator, DetachedRootReclaimer};
 use crate::raft::AppRaftNode;
 use crate::session_registry::SessionRegistry;
@@ -167,10 +166,8 @@ impl MaintenanceService {
             }));
         }
 
-        let lost_worker = Arc::new(LostWorkerCleanupService::new(LostWorkerCleanupDeps {
-            raft_node: Arc::clone(&self.raft_node),
-            worker_manager: Arc::clone(&self.worker_manager),
-        }));
+        let raft_node = Arc::clone(&self.raft_node);
+        let worker_manager = Arc::clone(&self.worker_manager);
         let scan_interval = self.lost_worker_cleanup_interval;
         let task_shutdown = shutdown.child_token();
         tasks.push(tokio::spawn(async move {
@@ -181,13 +178,180 @@ impl MaintenanceService {
                     _ = task_shutdown.cancelled() => return,
                     _ = interval.tick() => {}
                 }
-                if let Err(error) = lost_worker.run_once().await {
-                    error!(task = "lost_worker_cleanup", %error, "Lost-worker cleanup task failed");
-                }
+                remove_expired_workers(&raft_node, &worker_manager);
             }
         }));
 
         info!(task_count = tasks.len(), "Maintenance service started");
         MaintenanceHandle { shutdown, tasks }
+    }
+}
+
+fn remove_expired_workers(raft_node: &AppRaftNode, worker_manager: &WorkerManager) {
+    if !raft_node.is_leader() {
+        return;
+    }
+
+    let dead_workers = worker_manager.list_expired_worker_runs();
+
+    for (dead_worker, expected_run_id) in dead_workers {
+        if !worker_manager.remove_dead_worker(&dead_worker.group_name, dead_worker.worker_id, expected_run_id) {
+            continue;
+        }
+        info!(
+            group_name = %dead_worker.group_name,
+            worker_id = dead_worker.worker_id.as_raw(),
+            "Removing dead worker"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remove_expired_workers;
+    use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
+    use crate::worker::{BlockReportBlock, BlockReportBlockState, WorkerDescriptor, WorkerManager};
+    use crate::MountTable;
+    use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
+    use beryl_types::{GroupName, Tier, TierFree, WorkerRunId};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::time::Duration;
+
+    fn group_name(raw: &str) -> GroupName {
+        GroupName::parse(raw).unwrap()
+    }
+
+    async fn test_raft(dir: &TempDir, leader: bool) -> Arc<AppRaftNode> {
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::default());
+        let state_machine = AppRaftStateMachine::new(Arc::clone(&storage));
+        let raft_node = Arc::new(AppRaftNode::new(1, storage, state_machine, mount_table).await.unwrap());
+        if leader {
+            raft_node
+                .initialize_single_node("127.0.0.1:0".to_string())
+                .await
+                .unwrap();
+            for _ in 0..100 {
+                if raft_node.is_leader() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(raft_node.is_leader());
+        } else {
+            assert!(!raft_node.is_leader());
+        }
+        raft_node
+    }
+
+    fn worker_run_id(worker_id: WorkerId) -> WorkerRunId {
+        format!("550e8400-e29b-41d4-a716-{:012x}", worker_id.as_raw())
+            .parse()
+            .expect("valid test WorkerRunId")
+    }
+
+    fn live_worker(manager: &WorkerManager, worker_id: WorkerId) {
+        let group_name = group_name("root");
+        let address = format!("127.0.0.1:{}", 9000 + worker_id.as_raw());
+        let run_id = worker_run_id(worker_id);
+        manager.register_worker_run(&group_name, worker_id, address.clone(), run_id);
+        manager
+            .record_heartbeat_with_tier_free(
+                &group_name,
+                worker_id,
+                run_id,
+                1,
+                &address,
+                vec![TierFree {
+                    tier: Tier::Hdd,
+                    free_bytes: 500,
+                }],
+            )
+            .unwrap();
+    }
+
+    fn report_block(block_id: BlockId) -> BlockReportBlock {
+        BlockReportBlock {
+            tier: Some(beryl_types::Tier::Hdd),
+            block_id,
+            lease_epoch: u64::from(block_id.index.as_raw()) + 1,
+            block_state: BlockReportBlockState::Ready,
+            effective_len: 64,
+        }
+    }
+
+    fn persisted_worker(group_name: GroupName, worker_id: WorkerId) -> WorkerDescriptor {
+        WorkerDescriptor {
+            group_name,
+            worker_id,
+            address: "127.0.0.1:9090".to_string(),
+        }
+    }
+
+    fn publish_report(manager: &WorkerManager, worker_id: WorkerId, report_seq: u64, blocks: Vec<BlockId>) {
+        let group_name = group_name("root");
+        let run_id = manager
+            .get_registered_run(&group_name, worker_id)
+            .expect("worker registration");
+        manager
+            .receive_full_block_report(
+                &group_name,
+                worker_id,
+                run_id,
+                report_seq,
+                0,
+                true,
+                blocks.into_iter().map(report_block).collect(),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dead_worker_cleanup_preserves_live_replica() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = test_raft(&dir, true).await;
+        let worker_manager = Arc::new(WorkerManager::new(1_000));
+        let source = WorkerId::new(1);
+        let dead = WorkerId::new(4);
+        let block_id = BlockId::new(InodeId::new(11), BlockIndex::new(0));
+        live_worker(&worker_manager, dead);
+        publish_report(&worker_manager, dead, 1, vec![block_id]);
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        live_worker(&worker_manager, source);
+        publish_report(&worker_manager, source, 1, vec![block_id]);
+
+        remove_expired_workers(&raft_node, &worker_manager);
+        assert!(worker_manager.get_registered_run(&group_name("root"), dead).is_none());
+        assert!(worker_manager
+            .collect_worker_placement_views(&group_name("root"))
+            .iter()
+            .any(|view| view.worker_id == dead && view.worker_run_id.is_none()));
+        assert_eq!(
+            worker_manager.get_block_locations(&group_name("root"), block_id),
+            vec![source]
+        );
+        remove_expired_workers(&raft_node, &worker_manager);
+        assert_eq!(
+            worker_manager.get_block_locations(&group_name("root"), block_id),
+            vec![source]
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_descriptor_without_runtime_is_not_a_dead_worker_after_reload() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = test_raft(&dir, true).await;
+        let worker_manager = Arc::new(WorkerManager::new(1_000));
+        let group_name_value = group_name("root");
+        let worker_id = WorkerId::new(9);
+        worker_manager.load_registered_workers(vec![persisted_worker(group_name_value.clone(), worker_id)]);
+
+        remove_expired_workers(&raft_node, &worker_manager);
+        let views = worker_manager.collect_worker_placement_views(&group_name_value);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].worker_id, worker_id);
+        assert!(views[0].worker_run_id.is_none());
+        assert!(!views[0].lease_valid);
     }
 }

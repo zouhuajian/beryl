@@ -7,10 +7,9 @@
 //! It does NOT write any path indices to storage - it only reads from dentry/inode CFs.
 
 use crate::error::{MetadataError, MetadataResult};
-use crate::mount::{mount_prefix_matches_path, MountEntry, MountTable};
+use crate::mount::{MountEntry, MountTable};
 use crate::raft::RocksDBStorage;
-use beryl_types::ids::{InodeId, MountId};
-use beryl_types::GroupName;
+use beryl_types::ids::InodeId;
 use std::sync::Arc;
 
 /// Maximum accepted UTF-8 path length, measured in bytes before and after normalization.
@@ -20,22 +19,13 @@ pub(crate) const MAX_PATH_COMPONENT_BYTES: usize = 255;
 /// Maximum number of non-empty components in one normalized path.
 pub(crate) const MAX_PATH_COMPONENTS: usize = 256;
 
-/// Mount context: information about the mount point for a resolved path.
-#[derive(Clone, Debug)]
-pub struct MountContext {
-    pub mount_id: MountId,
-    pub mount_epoch: u64,
-    pub owner_group_name: GroupName,
-    pub root_inode_id: InodeId,
-}
-
 /// Provider-neutral facts produced by path resolution.
 ///
 /// Existing-target flows require `inode_id`; parent/create flows require
 /// `parent_inode_id` and `name`. Mount-root resolution has no parent/name.
 #[derive(Clone, Debug)]
 pub struct ResolvedPath {
-    pub mount_ctx: MountContext,
+    pub mount_ctx: MountEntry,
     /// Canonical components below `mount_ctx.root_inode_id`.
     pub relative_components: Vec<String>,
     pub parent_inode_id: Option<InodeId>,
@@ -112,61 +102,18 @@ impl PathResolver {
         Ok(normalized)
     }
 
-    /// Resolve mount: find the longest matching mount prefix.
-    /// Returns (mount_entry, relative_components).
-    fn resolve_mount(&self, path: &str) -> MetadataResult<(MountEntry, Vec<String>)> {
-        let normalized = Self::normalize(path)?;
-
-        // Find longest matching mount prefix
-        let mounts = self.mount_table.list_mounts();
-        let mut best_match: Option<(MountEntry, Vec<String>)> = None;
-        let mut best_prefix_len = 0;
-
-        for mount in mounts {
-            let prefix = &mount.mount_prefix;
-            if mount_prefix_matches_path(prefix, &normalized) {
-                let prefix_len = prefix.len();
-                if prefix_len > best_prefix_len {
-                    // Extract relative path components
-                    let relative = if prefix_len == normalized.len() {
-                        vec![]
-                    } else if normalized.as_bytes()[prefix_len] == b'/' {
-                        // Skip the '/' after prefix
-                        normalized[prefix_len + 1..]
-                            .split('/')
-                            .filter(|s| !s.is_empty())
-                            .map(|s| s.to_string())
-                            .collect()
-                    } else {
-                        // No '/' after prefix (shouldn't happen with normalized paths)
-                        normalized[prefix_len..]
-                            .split('/')
-                            .filter(|s| !s.is_empty())
-                            .map(|s| s.to_string())
-                            .collect()
-                    };
-                    best_match = Some((mount.clone(), relative));
-                    best_prefix_len = prefix_len;
-                }
-            }
-        }
-
-        best_match.ok_or_else(|| MetadataError::NotFound(format!("No mount found for path: {}", normalized)))
-    }
-
-    /// Resolve path to its owning mount and mount-relative components without
-    /// requiring the namespace entries to exist.
-    pub(crate) fn resolve_mount_components(&self, path: &str) -> MetadataResult<(MountContext, Vec<String>)> {
-        let (mount_entry, components) = self.resolve_mount(path)?;
-        Ok((
-            MountContext {
-                mount_id: mount_entry.mount_id,
-                mount_epoch: mount_entry.mount_epoch,
-                owner_group_name: mount_entry.namespace_owner_group_name,
-                root_inode_id: mount_entry.root_inode_id,
-            },
-            components,
-        ))
+    /// Resolve a normalized path within the unified root namespace.
+    pub(crate) fn resolve_mount_components(&self, normalized: &str) -> MetadataResult<(MountEntry, Vec<String>)> {
+        let root = self
+            .mount_table
+            .root()
+            .ok_or_else(|| MetadataError::NotFound("Root mount missing".into()))?;
+        let components = normalized
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        Ok((root, components))
     }
 
     /// Walk the dentry tree and append every visited inode to the bounded ancestor chain.
@@ -201,21 +148,21 @@ impl PathResolver {
     /// populated while the target inode remains optional so create operations
     /// can resolve a path whose final entry does not exist yet.
     pub fn resolve_path(&self, path: &str) -> MetadataResult<ResolvedPath> {
-        let (mount_entry, components) = self.resolve_mount(path)?;
+        self.resolve_normalized_path(&Self::normalize(path)?)
+    }
+
+    /// Resolve a path already validated by `normalize` at filesystem admission.
+    pub(crate) fn resolve_normalized_path(&self, path: &str) -> MetadataResult<ResolvedPath> {
+        let (mount_entry, components) = self.resolve_mount_components(path)?;
 
         if components.is_empty() {
             return Ok(ResolvedPath {
-                mount_ctx: MountContext {
-                    mount_id: mount_entry.mount_id,
-                    mount_epoch: mount_entry.mount_epoch,
-                    owner_group_name: mount_entry.namespace_owner_group_name,
-                    root_inode_id: mount_entry.root_inode_id,
-                },
                 relative_components: Vec::new(),
                 parent_inode_id: None,
                 name: None,
                 inode_id: Some(mount_entry.root_inode_id),
                 ancestor_inode_ids: vec![mount_entry.root_inode_id],
+                mount_ctx: mount_entry,
             });
         }
 
@@ -252,12 +199,7 @@ impl PathResolver {
         }
 
         Ok(ResolvedPath {
-            mount_ctx: MountContext {
-                mount_id: mount_entry.mount_id,
-                mount_epoch: mount_entry.mount_epoch,
-                owner_group_name: mount_entry.namespace_owner_group_name,
-                root_inode_id: mount_entry.root_inode_id,
-            },
+            mount_ctx: mount_entry,
             relative_components: components,
             parent_inode_id: Some(parent_inode_id),
             name: Some(name),
@@ -266,20 +208,15 @@ impl PathResolver {
         })
     }
 
-    /// Resolve two paths for rename operation.
+    /// Resolve two normalized paths for a rename operation.
     /// Returns (src_resolved, dst_resolved).
-    /// If paths are in different mounts, returns error (caller should convert to EXDEV).
-    pub fn resolve_rename(&self, src_path: &str, dst_path: &str) -> MetadataResult<(ResolvedPath, ResolvedPath)> {
-        let src_resolved = self.resolve_path(src_path)?;
-        let dst_resolved = self.resolve_path(dst_path)?;
-
-        // Check if same mount
-        if src_resolved.mount_ctx.mount_id != dst_resolved.mount_ctx.mount_id {
-            return Err(MetadataError::CrossMountRename(format!(
-                "Cross-mount rename not allowed: src_mount={:?}, dst_mount={:?}",
-                src_resolved.mount_ctx.mount_id, dst_resolved.mount_ctx.mount_id
-            )));
-        }
+    pub(crate) fn resolve_rename(
+        &self,
+        src_path: &str,
+        dst_path: &str,
+    ) -> MetadataResult<(ResolvedPath, ResolvedPath)> {
+        let src_resolved = self.resolve_normalized_path(src_path)?;
+        let dst_resolved = self.resolve_normalized_path(dst_path)?;
 
         Ok((src_resolved, dst_resolved))
     }
@@ -305,5 +242,12 @@ mod tests {
         assert_eq!(longest_path.len(), MAX_PATH_BYTES);
         assert!(PathResolver::normalize(&longest_path).is_ok());
         assert!(PathResolver::normalize(&format!("{longest_path}/a")).is_err());
+
+        let relative_overflow = format!("{}/a", &longest_path[1..longest_path.len() - 1]);
+        assert_eq!(relative_overflow.len(), MAX_PATH_BYTES);
+        assert!(matches!(
+            PathResolver::normalize(&relative_overflow),
+            Err(MetadataError::InvalidArgument(message)) if message.starts_with("Normalized path exceeds")
+        ));
     }
 }

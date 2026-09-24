@@ -5,29 +5,22 @@
 
 use super::block::BlockPin;
 use crate::runtime::DataRpcPermit;
-use beryl_types::ids::BlockId;
-use beryl_types::{FencingToken, GroupName};
+use crate::store::block::BlockIdentity;
+use beryl_types::LeaseEpoch;
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-/// Exact worker-local identity of write state owned by one write RPC.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct BlockWriteKey {
-    pub(crate) group_name: GroupName,
-    pub(crate) block_id: BlockId,
-}
-
 struct BlockWriteEntry {
     io: Mutex<BlockWriteIoState>,
-    token: FencingToken,
+    epoch: LeaseEpoch,
     retired: CancellationToken,
 }
 
 impl BlockWriteEntry {
-    fn new(rpc_permit: DataRpcPermit, token: FencingToken, block_pin: BlockPin) -> Self {
+    fn new(rpc_permit: DataRpcPermit, epoch: LeaseEpoch, block_pin: BlockPin) -> Self {
         Self {
             io: Mutex::new(BlockWriteIoState {
                 inflight: 0,
@@ -35,7 +28,7 @@ impl BlockWriteEntry {
                 resources: Some((block_pin, rpc_permit)),
             }),
             retired: CancellationToken::new(),
-            token,
+            epoch,
         }
     }
 
@@ -82,8 +75,8 @@ struct BlockWriteIoState {
 }
 
 struct BlockWriteRegistryState {
-    writes: HashMap<BlockWriteKey, Arc<BlockWriteEntry>>,
-    cleanup_order: VecDeque<BlockWriteKey>,
+    writes: HashMap<BlockIdentity, Arc<BlockWriteEntry>>,
+    cleanup_order: VecDeque<BlockIdentity>,
 }
 
 /// Prevents concurrent RPCs from owning the same block write and retains
@@ -97,7 +90,7 @@ pub(crate) struct BlockWriteRegistry {
 /// without performing filesystem IO from a cancellation path.
 pub(crate) struct BlockWriteRegistration {
     registry: Arc<BlockWriteRegistry>,
-    key: BlockWriteKey,
+    key: BlockIdentity,
     entry: Arc<BlockWriteEntry>,
     completed: bool,
 }
@@ -115,7 +108,7 @@ impl BlockWriteRegistration {
 
     /// Removes exactly this RPC's registry entry after terminal local work.
     pub(crate) fn complete(mut self) {
-        self.registry.complete_registration(&self.key, &self.entry);
+        self.registry.remove_exact(&self.key, &self.entry, false);
         self.completed = true;
     }
 }
@@ -145,7 +138,7 @@ impl Drop for BlockWriteIoGuard {
 /// Exclusive cleanup claim for one retiring write. Dropping the claim after an
 /// error or unwind makes the exact registry entry eligible for a later retry.
 pub(crate) struct RetiringBlockWrite {
-    pub(crate) key: BlockWriteKey,
+    pub(crate) key: BlockIdentity,
     registry: Arc<BlockWriteRegistry>,
     entry: Arc<BlockWriteEntry>,
     claimed: bool,
@@ -153,19 +146,16 @@ pub(crate) struct RetiringBlockWrite {
 
 impl RetiringBlockWrite {
     /// Removes the exact registry entry after its terminal store operation.
-    pub(crate) fn complete(mut self) -> bool {
-        let removed = self.registry.remove_exact(&self.key, &self.entry);
-        if removed {
-            self.claimed = false;
-        }
-        removed
+    pub(crate) fn complete(mut self) {
+        self.registry.remove_exact(&self.key, &self.entry, true);
+        self.claimed = false;
     }
 }
 
 impl Drop for RetiringBlockWrite {
     fn drop(&mut self) {
         if self.claimed {
-            self.registry.release_cleanup_claim(&self.key, &self.entry);
+            self.entry.release_cleanup();
         }
     }
 }
@@ -185,9 +175,9 @@ impl BlockWriteRegistry {
     /// Same-epoch overlap is rejected; persisted tokens fence delayed requests after entries disappear.
     pub(crate) async fn register(
         self: &Arc<Self>,
-        key: BlockWriteKey,
+        key: BlockIdentity,
         rpc_permit: DataRpcPermit,
-        token: FencingToken,
+        epoch: LeaseEpoch,
         block_pin: BlockPin,
     ) -> Option<BlockWriteRegistration> {
         loop {
@@ -197,12 +187,12 @@ impl BlockWriteRegistry {
             {
                 let mut inner = self.inner.lock();
                 if let Some(entry) = inner.writes.get(&key) {
-                    if token.epoch <= entry.token.epoch {
+                    if epoch <= entry.epoch {
                         return None;
                     }
                     entry.retire();
                 } else {
-                    let entry = Arc::new(BlockWriteEntry::new(rpc_permit, token, block_pin));
+                    let entry = Arc::new(BlockWriteEntry::new(rpc_permit, epoch, block_pin));
                     inner.writes.insert(key.clone(), Arc::clone(&entry));
                     inner.cleanup_order.push_back(key.clone());
                     return Some(BlockWriteRegistration {
@@ -218,7 +208,7 @@ impl BlockWriteRegistry {
     }
 
     /// Stops admitting IO before reclamation waits for the block's access pins.
-    pub(crate) fn retire(&self, key: &BlockWriteKey) {
+    pub(crate) fn retire(&self, key: &BlockIdentity) {
         if let Some(entry) = self.inner.lock().writes.get(key) {
             entry.retire();
         }
@@ -231,12 +221,11 @@ impl BlockWriteRegistry {
         let examined = limit.min(inner.cleanup_order.len());
         let mut selected = Vec::with_capacity(examined);
         for _ in 0..examined {
-            let Some(key) = inner.cleanup_order.pop_front() else {
-                break;
-            };
-            let Some(entry) = inner.writes.get(&key).cloned() else {
-                continue;
-            };
+            let key = inner
+                .cleanup_order
+                .pop_front()
+                .expect("cleanup batch is bounded by the queue");
+            let entry = Arc::clone(inner.writes.get(&key).expect("queued write is registered"));
             if entry.retire_and_claim_cleanup(drain) {
                 selected.push(RetiringBlockWrite {
                     key: key.clone(),
@@ -250,33 +239,23 @@ impl BlockWriteRegistry {
         selected
     }
 
-    fn release_cleanup_claim(&self, key: &BlockWriteKey, entry: &Arc<BlockWriteEntry>) {
-        let inner = self.inner.lock();
-        if inner
-            .writes
-            .get(key)
-            .is_some_and(|registered| Arc::ptr_eq(registered, entry))
-        {
-            entry.release_cleanup();
-        }
-    }
-
     pub(crate) fn active_count(&self) -> usize {
         self.inner.lock().writes.len()
     }
 
-    fn complete_registration(&self, key: &BlockWriteKey, entry: &Arc<BlockWriteEntry>) -> bool {
+    fn remove_exact(&self, key: &BlockIdentity, entry: &Arc<BlockWriteEntry>, owns_cleanup: bool) {
         let mut inner = self.inner.lock();
-        if !inner
-            .writes
-            .get(key)
-            .is_some_and(|registered| Arc::ptr_eq(registered, entry))
+        if !owns_cleanup
+            && !inner
+                .writes
+                .get(key)
+                .is_some_and(|registered| Arc::ptr_eq(registered, entry))
         {
-            return false;
+            return;
         }
         let mut io = entry.io.lock();
-        if io.cleanup_running {
-            return false;
+        if io.cleanup_running && !owns_cleanup {
+            return;
         }
         debug_assert_eq!(io.inflight, 0);
         entry.retired.cancel();
@@ -284,50 +263,28 @@ impl BlockWriteRegistry {
         drop(io);
         inner.writes.remove(key);
         self.changed.notify_waiters();
-        if let Some(position) = inner.cleanup_order.iter().position(|queued| queued == key) {
-            inner.cleanup_order.remove(position);
-        }
+        let position = inner
+            .cleanup_order
+            .iter()
+            .position(|queued| queued == key)
+            .expect("registered write is queued for cleanup");
+        inner.cleanup_order.remove(position);
         drop(inner);
         drop(resources);
-        true
-    }
-
-    fn remove_exact(&self, key: &BlockWriteKey, entry: &Arc<BlockWriteEntry>) -> bool {
-        let mut inner = self.inner.lock();
-        if !inner
-            .writes
-            .get(key)
-            .is_some_and(|registered| Arc::ptr_eq(registered, entry))
-        {
-            return false;
-        }
-        let mut io = entry.io.lock();
-        debug_assert_eq!(io.inflight, 0);
-        entry.retired.cancel();
-        let resources = io.resources.take();
-        drop(io);
-        inner.writes.remove(key);
-        self.changed.notify_waiters();
-        if let Some(position) = inner.cleanup_order.iter().position(|queued| queued == key) {
-            inner.cleanup_order.remove(position);
-        }
-        drop(inner);
-        drop(resources);
-        true
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockWriteKey, BlockWriteRegistry};
+    use super::{BlockIdentity, BlockWriteRegistry};
     use crate::runtime::DataRpcPermit;
     use beryl_types::ids::{BlockId, BlockIndex, InodeId};
-    use beryl_types::GroupName;
+    use beryl_types::{GroupName, LeaseEpoch};
     use std::sync::Arc;
     use tokio::sync::Semaphore;
 
-    fn key() -> BlockWriteKey {
-        BlockWriteKey {
+    fn key() -> BlockIdentity {
+        BlockIdentity {
             group_name: GroupName::parse("root").expect("group name"),
             block_id: BlockId::new(InodeId::new(7), BlockIndex::new(3)),
         }
@@ -340,15 +297,12 @@ mod tests {
 
     async fn register(registry: &Arc<BlockWriteRegistry>) -> Option<super::BlockWriteRegistration> {
         let key = key();
-        let pin = crate::runtime::block::BlockManager::default()
-            .pin_block(&key.group_name, key.block_id)
-            .unwrap();
-        let token = beryl_types::FencingToken::new(
-            key.block_id,
-            beryl_types::ClientId::new(9),
-            beryl_types::LeaseEpoch::new(1),
-        );
-        registry.register(key, rpc_permit(), token, pin).await
+        let pin = Arc::new(crate::runtime::block::BlockAccessRegistry::new(
+            GroupName::parse("root").unwrap(),
+        ))
+        .pin_block(&key.group_name, key.block_id)
+        .unwrap();
+        registry.register(key, rpc_permit(), LeaseEpoch::new(1), pin).await
     }
 
     #[tokio::test]
@@ -360,22 +314,26 @@ mod tests {
         drop(registration);
         let candidates = registry.take_cleanup_batch(1, false);
         assert_eq!(candidates.len(), 1);
-        assert!(candidates.into_iter().next().expect("cleanup claim").complete());
+        assert!(registry.take_cleanup_batch(1, false).is_empty());
+        drop(candidates);
+        registry
+            .take_cleanup_batch(1, false)
+            .pop()
+            .expect("retry cleanup claim")
+            .complete();
         assert!(register(&registry).await.is_some());
 
         let registry = Arc::new(BlockWriteRegistry::new());
-        let manager = crate::runtime::block::BlockManager::default();
+        let manager = Arc::new(crate::runtime::block::BlockAccessRegistry::new(
+            GroupName::parse("root").unwrap(),
+        ));
         let slots = Arc::new(Semaphore::new(1));
         let key = key();
         let owner = registry
             .register(
                 key.clone(),
                 DataRpcPermit::new(Arc::clone(&slots).try_acquire_owned().unwrap(), "write"),
-                beryl_types::FencingToken::new(
-                    key.block_id,
-                    beryl_types::ClientId::new(9),
-                    beryl_types::LeaseEpoch::new(1),
-                ),
+                LeaseEpoch::new(1),
                 manager.pin_block(&key.group_name, key.block_id).unwrap(),
             )
             .await
@@ -387,12 +345,16 @@ mod tests {
         assert!(registry.take_cleanup_batch(1, false).is_empty());
         assert_eq!(slots.available_permits(), 0);
         drop(io);
-        assert!(registry.take_cleanup_batch(1, false).pop().unwrap().complete());
+        registry.take_cleanup_batch(1, false).pop().unwrap().complete();
         // The old RPC is retained and never polled or dropped while cleanup releases its resources.
         assert!(futures::poll!(std::pin::pin!(reclaim.wait_for_pins())).is_ready());
         assert_eq!(slots.available_permits(), 1);
         assert!(owner.begin_io().is_none());
         reclaim.complete();
         assert!(manager.pin_block(&key.group_name, key.block_id).is_ok());
+        let replacement = register(&registry).await.expect("replacement owner");
+        owner.complete();
+        assert_eq!(registry.active_count(), 1);
+        replacement.complete();
     }
 }

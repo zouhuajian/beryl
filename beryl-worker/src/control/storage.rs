@@ -12,23 +12,21 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use uuid::Uuid;
 
 use super::identity::{resolve_existing_worker_id, resolve_worker_id};
 
 const WORKER_STORAGE_INFO_FILE: &str = "worker.storage.json";
 const WORKER_STORAGE_INFO_TEMP_SUFFIX: &str = ".tmp";
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct WorkerStorageInfo {
-    pub cluster_id: String,
-    pub worker_id: u64,
-    pub storage_uuid: String,
-    pub format_version: u32,
-    pub created_at_ms: u64,
-    pub software_version: String,
+struct WorkerStorageInfo {
+    cluster_id: String,
+    worker_id: u64,
+    format_version: u32,
+    created_at_ms: u64,
+    software_version: String,
 }
 
 pub fn worker_storage_info_path(config: &WorkerConfig) -> PathBuf {
@@ -58,7 +56,6 @@ pub fn prepare_worker_start(config: &WorkerConfig) -> Result<WorkerId, WorkerErr
     let info = WorkerStorageInfo {
         cluster_id: config.cluster_id.clone(),
         worker_id: worker_id.as_raw(),
-        storage_uuid: Uuid::new_v4().to_string(),
         format_version: FORMAT_VERSION,
         created_at_ms: now_ms(),
         software_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -169,7 +166,7 @@ fn write_info(path: &Path, info: &WorkerStorageInfo) -> Result<(), WorkerError> 
             parent.display()
         ))
     })?;
-    let temp_path = worker_storage_info_temp_path(path)?;
+    let temp_path = worker_storage_info_temp_path(path);
     {
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -205,7 +202,7 @@ fn write_info(path: &Path, info: &WorkerStorageInfo) -> Result<(), WorkerError> 
 }
 
 fn reject_partial_info_marker(path: &Path) -> Result<(), WorkerError> {
-    let temp_path = worker_storage_info_temp_path(path)?;
+    let temp_path = worker_storage_info_temp_path(path);
     if temp_path.try_exists().map_err(|err| {
         WorkerError::Internal(format!(
             "failed to inspect worker storage info temp marker {}: {err}",
@@ -221,13 +218,11 @@ fn reject_partial_info_marker(path: &Path) -> Result<(), WorkerError> {
     Ok(())
 }
 
-fn worker_storage_info_temp_path(path: &Path) -> Result<PathBuf, WorkerError> {
-    let file_name = path.file_name().ok_or_else(|| {
-        WorkerError::InvalidArgument(format!("worker storage info path {} has no file name", path.display()))
-    })?;
+fn worker_storage_info_temp_path(path: &Path) -> PathBuf {
+    let file_name = path.file_name().expect("storage info path has a file name");
     let mut temp_name = OsString::from(file_name);
     temp_name.push(WORKER_STORAGE_INFO_TEMP_SUFFIX);
-    Ok(path.with_file_name(temp_name))
+    path.with_file_name(temp_name)
 }
 
 fn info_parent_dir(path: &Path) -> &Path {

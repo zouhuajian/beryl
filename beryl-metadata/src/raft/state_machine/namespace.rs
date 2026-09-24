@@ -3,11 +3,10 @@
 
 use super::{
     AppMetadataRaftState, AppRaftStateMachine, BootstrapNamespaceState, CreateFileOperationId, CreateFileReplayRecord,
-    DetachedRoot, GroupName, Inode, InodeAllocation, InodeAttrs, InodeId, InodeKind, MetadataError, MetadataResult,
-    MountId, PreparedRename, PreparedRenameOverwrite, PreparedUnlink, RecursiveMkdirEntry, RenameAtomicUpdate,
-    RenameOverwriteCleanup,
+    DetachedRoot, GroupName, Inode, InodeAttrs, InodeId, InodeKind, MetadataError, MetadataResult, MountId,
+    RecursiveMkdirEntry, RenameAtomicUpdate,
 };
-use crate::mount::{DataIoPolicy, MountEntry, MountKind};
+use crate::mount::MountEntry;
 use beryl_types::{ContentGeneration, LeaseEpoch};
 
 impl AppRaftStateMachine {
@@ -27,11 +26,6 @@ impl AppRaftStateMachine {
 
         let root_mount = MountEntry {
             mount_id: MountId::new(1),
-            mount_prefix: crate::mount::ROOT_MOUNT_PREFIX.to_string(),
-            mount_kind: MountKind::Internal,
-            ufs_uri: None,
-            data_io_policy: DataIoPolicy::Allow,
-            mount_epoch: 1,
             namespace_owner_group_name: group_name,
             root_inode_id: crate::mount::ROOT_INODE_ID,
         };
@@ -50,57 +44,46 @@ impl AppRaftStateMachine {
     }
 
     /// Apply Mkdir command.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn apply_mkdir(
         &self,
         parent_inode_id: InodeId,
         name: String,
-        mut attrs: InodeAttrs,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<(InodeId, InodeAttrs)> {
-        let prepared: MetadataResult<(InodeAllocation, Inode, Inode)> = (|| {
-            // Check parent exists and is a directory
-            let parent_inode = self
-                .storage
-                .get_inode(parent_inode_id)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Parent inode not found: {}", parent_inode_id)))?;
-            if !parent_inode.file_type().is_dir() {
-                return Err(MetadataError::NotDir(format!(
-                    "Parent is not a directory: {}",
-                    parent_inode_id
-                )));
-            }
+        // Check parent exists and is a directory
+        let parent_inode = self
+            .storage
+            .get_inode(parent_inode_id)?
+            .ok_or_else(|| MetadataError::NotFound(format!("Parent inode not found: {}", parent_inode_id)))?;
+        if !parent_inode.file_type().is_dir() {
+            return Err(MetadataError::NotDir(format!(
+                "Parent is not a directory: {}",
+                parent_inode_id
+            )));
+        }
 
-            // Check if name already exists
-            if self.storage.get_dentry(parent_inode_id, &name)?.is_some() {
-                return Err(MetadataError::AlreadyExists(format!(
-                    "Directory already exists: {}",
-                    name
-                )));
-            }
+        // Check if name already exists
+        if self.storage.get_dentry(parent_inode_id, &name)?.is_some() {
+            return Err(MetadataError::AlreadyExists(format!(
+                "Directory already exists: {}",
+                name
+            )));
+        }
 
-            // Generate inode ID
-            let allocation = self.storage.prepare_inode_allocation()?;
-            let inode_id = allocation.inode_id;
-            let now_ms = proposed_at_ms;
+        // Generate inode ID
+        let allocation = self.storage.prepare_inode_allocation()?;
+        let inode_id = allocation.inode_id;
+        let mut attrs = InodeAttrs::new();
+        attrs.initialize(proposed_at_ms);
 
-            // Initialize attrs
-            attrs.initialize(now_ms);
+        // Create directory inode (inherit mount_id from parent)
+        let inode = Inode::new_dir(inode_id, attrs, parent_inode.mount_id);
 
-            // Create directory inode (inherit mount_id from parent)
-            let inode = Inode::new_dir(inode_id, attrs, parent_inode.mount_id);
+        // Update parent directory modification time
+        let mut updated_parent = parent_inode;
+        updated_parent.attrs.set_modify_time(proposed_at_ms);
 
-            // Update parent directory modification time
-            let mut parent_attrs = parent_inode.attrs.clone();
-            parent_attrs.set_modify_time(Self::mutation_timestamp(&parent_inode, proposed_at_ms));
-            let mut updated_parent = parent_inode.clone();
-            updated_parent.attrs = parent_attrs;
-
-            Ok((allocation, inode, updated_parent))
-        })();
-
-        let (allocation, inode, updated_parent) = prepared?;
         let result = (inode.inode_id, inode.attrs.clone());
         self.storage
             .create_dir_atomic(allocation, parent_inode_id, &name, &inode, &updated_parent, raft_state)?;
@@ -108,12 +91,10 @@ impl AppRaftStateMachine {
     }
 
     /// Apply one recursive CreateDirectory command as a single authority batch.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn apply_create_directory(
         &self,
         root_inode_id: InodeId,
         components: Vec<String>,
-        attrs: InodeAttrs,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<(InodeId, InodeAttrs)> {
@@ -162,16 +143,15 @@ impl AppRaftStateMachine {
             next_raw = next_raw
                 .checked_add(1)
                 .ok_or_else(|| MetadataError::Internal("inode ID allocator overflow".to_string()))?;
-            let mut child_attrs = attrs.clone();
+            let mut child_attrs = InodeAttrs::new();
             child_attrs.initialize(proposed_at_ms);
 
             let child = Inode::new_dir(inode_id, child_attrs, parent.mount_id);
-            let mut updated_parent = parent.clone();
-            updated_parent
-                .attrs
-                .set_modify_time(Self::mutation_timestamp(&parent, proposed_at_ms));
+            let parent_inode_id = parent.inode_id;
+            let mut updated_parent = parent;
+            updated_parent.attrs.set_modify_time(proposed_at_ms);
             entries.push(RecursiveMkdirEntry {
-                parent_inode_id: parent.inode_id,
+                parent_inode_id,
                 name,
                 inode: child.clone(),
                 updated_parent,
@@ -197,21 +177,16 @@ impl AppRaftStateMachine {
         operation_id: CreateFileOperationId,
         request_deadline_ms: u64,
         session_expires_at_ms: u64,
-        normalized_path: String,
         mount_id: MountId,
-        expected_mount_epoch: u64,
         mount_root_inode_id: InodeId,
         relative_components: Vec<String>,
-        mut attrs: InodeAttrs,
         block_size: u32,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<CreateFileReplayRecord> {
         if let Some(record) = self.storage.get_create_file_replay(operation_id)? {
             if record.request_deadline_ms != request_deadline_ms
-                || record.normalized_path != normalized_path
                 || record.mount_id != mount_id
-                || record.expected_mount_epoch != expected_mount_epoch
                 || record.mount_root_inode_id != mount_root_inode_id
                 || record.relative_components != relative_components
             {
@@ -235,56 +210,38 @@ impl AppRaftStateMachine {
         }
         beryl_types::validate_block_size(u64::from(block_size))
             .map_err(|error| MetadataError::InvalidArgument(format!("invalid CreateFile block_size: {error}")))?;
-        let (parent_inode_id, name, parent_inode) = self.resolve_create_parent(
-            mount_id,
-            expected_mount_epoch,
-            mount_root_inode_id,
-            &relative_components,
-        )?;
+        let (parent_inode_id, name, parent_inode) =
+            self.resolve_create_parent(mount_id, mount_root_inode_id, &relative_components)?;
         if self.storage.get_dentry(parent_inode_id, &name)?.is_some() {
             return Err(MetadataError::AlreadyExists(format!("File already exists: {name}")));
         }
 
-        let prepared: MetadataResult<(InodeAllocation, Inode, Inode)> = (|| {
-            // Generate inode ID
-            let allocation = self.storage.prepare_inode_allocation()?;
-            let inode_id = allocation.inode_id;
-            let now_ms = proposed_at_ms;
+        // Generate inode ID
+        let allocation = self.storage.prepare_inode_allocation()?;
+        let inode_id = allocation.inode_id;
+        let mut attrs = InodeAttrs::new();
+        attrs.initialize(proposed_at_ms);
 
-            // Initialize attrs
-            attrs.initialize(now_ms);
+        // Create the file under its single canonical inode identity.
+        let mut inode = Inode::new_file(inode_id, attrs, parent_inode.mount_id, block_size);
+        let InodeKind::File(crate::inode::FileData { lease_epoch, .. }) = &mut inode.kind else {
+            unreachable!("new file constructor must produce file authority")
+        };
+        *lease_epoch = LeaseEpoch::new(1);
 
-            // Create the file under its single canonical inode identity.
-            let mut inode = Inode::new_file(inode_id, attrs, parent_inode.mount_id, block_size);
-            let InodeKind::File(crate::inode::FileData { lease_epoch, .. }) = &mut inode.kind else {
-                unreachable!("new file constructor must produce file authority")
-            };
-            *lease_epoch = LeaseEpoch::new(1);
+        // Update parent directory modification time
+        let mut updated_parent = parent_inode;
+        updated_parent.attrs.set_modify_time(proposed_at_ms);
 
-            // Update parent directory modification time
-            let mut parent_attrs = parent_inode.attrs.clone();
-            parent_attrs.set_modify_time(Self::mutation_timestamp(&parent_inode, proposed_at_ms));
-            let mut updated_parent = parent_inode.clone();
-            updated_parent.attrs = parent_attrs;
-
-            Ok((allocation, inode, updated_parent))
-        })();
-
-        let (allocation, inode, updated_parent) = prepared?;
         let record = CreateFileReplayRecord {
             operation_id,
             request_deadline_ms,
-            normalized_path,
             parent_inode_id,
-            name: name.clone(),
             inode_id: inode.inode_id,
             mount_id,
-            expected_mount_epoch,
             mount_root_inode_id,
             relative_components,
-            lease_epoch: LeaseEpoch::new(1),
             block_size,
-            generation: ContentGeneration::new(0),
             expires_at_ms: session_expires_at_ms,
         };
         self.storage.create_file_atomic(
@@ -307,18 +264,14 @@ impl AppRaftStateMachine {
                 "replayed CreateFile write session has expired".to_string(),
             ));
         }
-        let (parent_inode_id, name, _) = self.resolve_create_parent(
-            record.mount_id,
-            record.expected_mount_epoch,
-            record.mount_root_inode_id,
-            &record.relative_components,
-        )?;
-        if parent_inode_id != record.parent_inode_id || name != record.name {
+        let (parent_inode_id, name, _) =
+            self.resolve_create_parent(record.mount_id, record.mount_root_inode_id, &record.relative_components)?;
+        if parent_inode_id != record.parent_inode_id {
             return Err(MetadataError::Again(
                 "replayed CreateFile path authority changed".to_string(),
             ));
         }
-        if self.storage.get_dentry(record.parent_inode_id, &record.name)? != Some(record.inode_id) {
+        if self.storage.get_dentry(record.parent_inode_id, &name)? != Some(record.inode_id) {
             return Err(MetadataError::AlreadyExists(
                 "replayed CreateFile target no longer names its original inode".to_string(),
             ));
@@ -327,7 +280,7 @@ impl AppRaftStateMachine {
             .storage
             .get_inode(record.inode_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("CreateFile inode not found: {}", record.inode_id)))?;
-        if inode.inode_id != record.inode_id || inode.mount_id != record.mount_id || !inode.file_type().is_file() {
+        if inode.mount_id != record.mount_id {
             return Err(MetadataError::Internal(
                 "replayed CreateFile inode authority is corrupt".to_string(),
             ));
@@ -337,6 +290,7 @@ impl AppRaftStateMachine {
             generation,
             lease_epoch,
             next_index,
+            block_size,
             ..
         }) = &inode.kind
         else {
@@ -344,18 +298,18 @@ impl AppRaftStateMachine {
                 "replayed CreateFile inode payload is not a file".to_string(),
             ));
         };
-        if *lease_epoch != record.lease_epoch {
+        if *lease_epoch != LeaseEpoch::new(1) {
             return Err(MetadataError::LeaseFenced {
                 expected: *lease_epoch,
-                got: record.lease_epoch,
+                got: LeaseEpoch::new(1),
             });
         }
-        if !blocks.is_empty() || *generation != record.generation || *next_index != 0 || inode.len() != 0 {
+        if !blocks.is_empty() || *generation != ContentGeneration::new(0) || *next_index != 0 || inode.len() != 0 {
             return Err(MetadataError::AlreadyExists(
                 "replayed CreateFile result no longer owns the initial file state".to_string(),
             ));
         }
-        if self.storage.get_block_size(record.inode_id)? != record.block_size {
+        if *block_size != record.block_size {
             return Err(MetadataError::Internal(
                 "replayed CreateFile block_size authority changed".to_string(),
             ));
@@ -367,7 +321,6 @@ impl AppRaftStateMachine {
     fn resolve_create_parent(
         &self,
         mount_id: MountId,
-        expected_mount_epoch: u64,
         mount_root_inode_id: InodeId,
         relative_components: &[String],
     ) -> MetadataResult<(InodeId, String, Inode)> {
@@ -376,7 +329,7 @@ impl AppRaftStateMachine {
             .storage
             .get_mount(mount_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("Mount not found: {mount_id:?}")))?;
-        if mount.mount_epoch != expected_mount_epoch || mount.root_inode_id != mount_root_inode_id {
+        if mount.root_inode_id != mount_root_inode_id {
             return Err(MetadataError::Again(format!(
                 "CreateFile mount precondition changed for {mount_id:?}"
             )));
@@ -385,11 +338,7 @@ impl AppRaftStateMachine {
             .storage
             .get_inode(mount_root_inode_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("Mount root inode not found: {mount_root_inode_id}")))?;
-        if parent.inode_id != mount_root_inode_id
-            || parent.mount_id != mount_id
-            || !parent.file_type().is_dir()
-            || !matches!(&parent.kind, InodeKind::Dir)
-        {
+        if parent.mount_id != mount_id || !parent.file_type().is_dir() {
             return Err(MetadataError::Internal(
                 "CreateFile mount root authority is corrupt".to_string(),
             ));
@@ -408,12 +357,12 @@ impl AppRaftStateMachine {
                 .storage
                 .get_inode(child_inode_id)?
                 .ok_or_else(|| MetadataError::NotFound(format!("Child inode not found: {child_inode_id}")))?;
-            if child.inode_id != child_inode_id || child.mount_id != mount_id {
+            if child.mount_id != mount_id {
                 return Err(MetadataError::Internal(
                     "CreateFile parent path authority is corrupt".to_string(),
                 ));
             }
-            if !child.file_type().is_dir() || !matches!(&child.kind, InodeKind::Dir) {
+            if !child.file_type().is_dir() {
                 return Err(MetadataError::NotDir(format!(
                     "Path component is not a directory: {component}"
                 )));
@@ -433,7 +382,6 @@ impl AppRaftStateMachine {
     pub(super) fn apply_delete(
         &self,
         mount_id: MountId,
-        expected_mount_epoch: u64,
         mount_root_inode_id: InodeId,
         relative_components: Vec<String>,
         expected_inode_id: InodeId,
@@ -442,12 +390,8 @@ impl AppRaftStateMachine {
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
-        let (parent_inode_id, name, child_inode) = self.resolve_delete_target(
-            mount_id,
-            expected_mount_epoch,
-            mount_root_inode_id,
-            &relative_components,
-        )?;
+        let (mut parent_inode, name, child_inode_id, child_inode) =
+            self.resolve_delete_target(mount_id, mount_root_inode_id, &relative_components)?;
         if child_inode.inode_id != expected_inode_id {
             return Err(MetadataError::Again(format!(
                 "delete target changed for {name}: expected {expected_inode_id}, current {}",
@@ -455,98 +399,84 @@ impl AppRaftStateMachine {
             )));
         }
 
-        if child_inode.file_type().is_dir() {
-            if expected_file_lease_epoch.is_some() {
-                return Err(MetadataError::Again(
-                    "delete target lease precondition changed".to_string(),
-                ));
-            }
-            if recursive {
-                self.apply_detach_directory(parent_inode_id, name, child_inode.inode_id, proposed_at_ms, raft_state)
-            } else {
-                self.apply_delete_empty_dir(parent_inode_id, name, proposed_at_ms, raft_state)
-            }
-        } else {
-            let current_file_lease_epoch = match &child_inode.kind {
-                InodeKind::File(crate::inode::FileData { lease_epoch, .. }) => Some(*lease_epoch),
-                _ => None,
-            };
-            if current_file_lease_epoch != expected_file_lease_epoch {
+        let current_file_lease_epoch = match &child_inode.kind {
+            InodeKind::File(crate::inode::FileData { lease_epoch, .. }) => Some(*lease_epoch),
+            InodeKind::Dir => None,
+        };
+        if current_file_lease_epoch != expected_file_lease_epoch {
+            return Err(MetadataError::Again(format!(
+                "delete target lease precondition changed: expected {expected_file_lease_epoch:?}, current {current_file_lease_epoch:?}"
+            )));
+        }
+        parent_inode.attrs.set_modify_time(proposed_at_ms);
+        if child_inode.file_type().is_dir() && recursive {
+            if child_inode_id != child_inode.inode_id {
                 return Err(MetadataError::Again(format!(
-                    "delete target lease precondition changed: expected {expected_file_lease_epoch:?}, current {current_file_lease_epoch:?}"
+                    "delete target changed for {name}: expected {}, current {child_inode_id}",
+                    child_inode.inode_id
                 )));
             }
-            self.apply_unlink(parent_inode_id, name, proposed_at_ms, raft_state)
+            if self.storage.get_detached_root(child_inode_id)?.is_some() {
+                return Err(MetadataError::Internal(format!(
+                    "inode {child_inode_id} is both reachable and already detached"
+                )));
+            }
+            self.storage.detach_directory_atomic(
+                parent_inode.inode_id,
+                &name,
+                child_inode_id,
+                &parent_inode,
+                DetachedRoot {
+                    mount_id: child_inode.mount_id,
+                    detached_at_ms: proposed_at_ms,
+                },
+                raft_state,
+            )?;
+        } else {
+            if child_inode.file_type().is_dir() && !self.storage.is_directory_empty(child_inode_id)? {
+                return Err(MetadataError::DirectoryNotEmpty(format!("Directory not empty: {name}")));
+            }
+            self.storage.unlink_inode_atomic(
+                parent_inode.inode_id,
+                &name,
+                child_inode_id,
+                &parent_inode,
+                raft_state,
+            )?;
         }
+        Ok(())
     }
 
     /// Resolve and validate the exact target named by a replicated Delete command.
     fn resolve_delete_target(
         &self,
         mount_id: MountId,
-        expected_mount_epoch: u64,
         mount_root_inode_id: InodeId,
         relative_components: &[String],
-    ) -> MetadataResult<(InodeId, String, Inode)> {
+    ) -> MetadataResult<(Inode, String, InodeId, Inode)> {
         Self::validate_relative_components("Delete", relative_components)?;
-        let mounts = self.storage.list_mounts()?;
-        let mount = mounts
-            .iter()
-            .find(|entry| entry.mount_id == mount_id)
+        let mount = self
+            .storage
+            .get_mount(mount_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("Mount not found: {mount_id:?}")))?;
-        if mount.mount_epoch != expected_mount_epoch || mount.root_inode_id != mount_root_inode_id {
+        if mount.root_inode_id != mount_root_inode_id {
             return Err(MetadataError::Again(format!(
                 "delete mount precondition changed for {mount_id:?}"
             )));
         }
 
-        let relative_path_bytes = relative_components
-            .iter()
-            .try_fold(relative_components.len().saturating_sub(1), |bytes, component| {
-                bytes.checked_add(component.len())
-            })
-            .ok_or_else(|| MetadataError::InvalidArgument("Delete path length overflow".to_string()))?;
-        let target_path_bytes = if mount.mount_prefix == crate::mount::ROOT_MOUNT_PREFIX {
-            1usize.checked_add(relative_path_bytes)
-        } else {
-            mount
-                .mount_prefix
-                .len()
-                .checked_add(1)
-                .and_then(|bytes| bytes.checked_add(relative_path_bytes))
-        }
-        .ok_or_else(|| MetadataError::InvalidArgument("Delete path length overflow".to_string()))?;
+        let target_path_bytes = relative_components.len() + relative_components.iter().map(String::len).sum::<usize>();
         if target_path_bytes > crate::path_resolver::MAX_PATH_BYTES {
             return Err(MetadataError::InvalidArgument(format!(
                 "Delete path exceeds {} bytes",
                 crate::path_resolver::MAX_PATH_BYTES
             )));
         }
-        let relative_path = relative_components.join("/");
-        let target_path = if mount.mount_prefix == crate::mount::ROOT_MOUNT_PREFIX {
-            format!("/{relative_path}")
-        } else {
-            format!("{}/{relative_path}", mount.mount_prefix)
-        };
-        if mounts.iter().any(|entry| {
-            entry.mount_id != mount_id && crate::mount::mount_prefix_matches_path(&target_path, &entry.mount_prefix)
-        }) {
-            return Err(MetadataError::CrossMountRename(
-                "delete target is a mount root or contains a nested mount".to_string(),
-            ));
-        }
-
         let mut parent = self
             .storage
             .get_inode(mount_root_inode_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("Mount root inode not found: {mount_root_inode_id}")))?;
-        if parent.inode_id != mount_root_inode_id {
-            return Err(MetadataError::Internal(format!(
-                "mount root inode key {mount_root_inode_id} contains inode {}",
-                parent.inode_id
-            )));
-        }
-        if !parent.file_type().is_dir() || !matches!(&parent.kind, InodeKind::Dir) {
+        if !parent.file_type().is_dir() {
             return Err(MetadataError::NotDir(format!(
                 "Mount root is not a directory: {mount_root_inode_id}"
             )));
@@ -568,26 +498,20 @@ impl AppRaftStateMachine {
                 .storage
                 .get_inode(child_inode_id)?
                 .ok_or_else(|| MetadataError::NotFound(format!("Child inode not found: {child_inode_id}")))?;
-            if child.inode_id != child_inode_id {
-                return Err(MetadataError::Internal(format!(
-                    "inode key {child_inode_id} contains inode {}",
-                    child.inode_id
-                )));
-            }
             if child.mount_id != mount_id {
                 return Err(MetadataError::CrossMountRename(
                     "delete path crosses mount authority".to_string(),
                 ));
             }
             if index + 1 == relative_components.len() {
-                if mounts.iter().any(|entry| entry.root_inode_id == child_inode_id) {
+                if mount_root_inode_id == child_inode_id {
                     return Err(MetadataError::InvalidArgument(format!(
                         "Cannot delete mount root inode {child_inode_id}"
                     )));
                 }
-                return Ok((parent.inode_id, component.clone(), child));
+                return Ok((parent, component.clone(), child_inode_id, child));
             }
-            if !child.file_type().is_dir() || !matches!(&child.kind, InodeKind::Dir) {
+            if !child.file_type().is_dir() {
                 return Err(MetadataError::NotDir(format!(
                     "Path component is not a directory: {component}"
                 )));
@@ -627,197 +551,6 @@ impl AppRaftStateMachine {
         Ok(())
     }
 
-    /// Apply Unlink command.
-    pub(super) fn apply_unlink(
-        &self,
-        parent_inode_id: InodeId,
-        name: String,
-        proposed_at_ms: u64,
-        raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<()> {
-        let prepared: MetadataResult<PreparedUnlink> = (|| {
-            // Get dentry
-            let child_inode_id = self
-                .storage
-                .get_dentry(parent_inode_id, &name)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Entry not found: {}", name)))?;
-
-            // Get child inode
-            let child_inode = self
-                .storage
-                .get_inode(child_inode_id)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Child inode not found: {}", child_inode_id)))?;
-
-            // Check it's not a directory
-            if child_inode.file_type().is_dir() {
-                return Err(MetadataError::IsDir(format!("Cannot unlink directory: {}", name)));
-            }
-
-            // Update parent directory modification time
-            let parent_inode = self
-                .storage
-                .get_inode(parent_inode_id)?
-                .ok_or_else(|| MetadataError::Internal("Parent inode disappeared".to_string()))?;
-            let mut parent_attrs = parent_inode.attrs.clone();
-            parent_attrs.set_modify_time(Self::mutation_timestamp(&parent_inode, proposed_at_ms));
-            let mut updated_parent = parent_inode.clone();
-            updated_parent.attrs = parent_attrs;
-
-            match &child_inode.kind {
-                InodeKind::File(crate::inode::FileData { .. }) => {
-                    if child_inode.inode_id != child_inode_id
-                        || self.storage.get_block_size_optional(child_inode_id)?.is_none()
-                    {
-                        return Err(MetadataError::Internal(format!(
-                            "file inode {child_inode_id} has corrupt identity or missing block_size: value_id={}",
-                            child_inode.inode_id
-                        )));
-                    }
-                }
-
-                InodeKind::Dir => return Err(MetadataError::IsDir(format!("Cannot unlink directory: {}", name))),
-            }
-
-            Ok((child_inode_id, updated_parent))
-        })();
-
-        let (child_inode_id, updated_parent) = prepared?;
-        self.storage
-            .unlink_inode_atomic(parent_inode_id, &name, child_inode_id, &updated_parent, raft_state)?;
-        Ok(())
-    }
-
-    /// Apply empty-directory delete command.
-    pub(super) fn apply_delete_empty_dir(
-        &self,
-        parent_inode_id: InodeId,
-        name: String,
-        proposed_at_ms: u64,
-        raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<()> {
-        let prepared: MetadataResult<(InodeId, Inode)> = (|| {
-            // Get dentry
-            let child_inode_id = self
-                .storage
-                .get_dentry(parent_inode_id, &name)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Directory not found: {}", name)))?;
-
-            // Get child inode
-            let child_inode = self
-                .storage
-                .get_inode(child_inode_id)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Child inode not found: {}", child_inode_id)))?;
-
-            // Check it's a directory
-            if !child_inode.file_type().is_dir() {
-                return Err(MetadataError::NotDir(format!("Not a directory: {}", name)));
-            }
-
-            // Check directory is empty
-            if !self.storage.is_directory_empty(child_inode_id)? {
-                return Err(MetadataError::DirectoryNotEmpty(format!(
-                    "Directory not empty: {}",
-                    name
-                )));
-            }
-
-            // Update parent directory modification time
-            let parent_inode = self
-                .storage
-                .get_inode(parent_inode_id)?
-                .ok_or_else(|| MetadataError::Internal("Parent inode disappeared".to_string()))?;
-            let mut parent_attrs = parent_inode.attrs.clone();
-            parent_attrs.set_modify_time(Self::mutation_timestamp(&parent_inode, proposed_at_ms));
-            let mut updated_parent = parent_inode.clone();
-            updated_parent.attrs = parent_attrs;
-
-            Ok((child_inode_id, updated_parent))
-        })();
-
-        let (child_inode_id, updated_parent) = prepared?;
-        self.storage
-            .unlink_inode_atomic(parent_inode_id, &name, child_inode_id, &updated_parent, raft_state)?;
-        Ok(())
-    }
-
-    /// Atomically hide a recursive-delete root and make it reclaimable.
-    pub(super) fn apply_detach_directory(
-        &self,
-        parent_inode_id: InodeId,
-        name: String,
-        root_inode_id: InodeId,
-        proposed_at_ms: u64,
-        raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<()> {
-        let prepared: MetadataResult<(Inode, DetachedRoot)> = (|| {
-            let current_root_inode_id = self
-                .storage
-                .get_dentry(parent_inode_id, &name)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Directory not found: {name}")))?;
-            if current_root_inode_id != root_inode_id {
-                return Err(MetadataError::Again(format!(
-                    "delete target changed for {name}: expected {root_inode_id}, current {current_root_inode_id}"
-                )));
-            }
-            let root_inode = self
-                .storage
-                .get_inode(root_inode_id)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Root inode not found: {root_inode_id}")))?;
-            if !root_inode.file_type().is_dir() || !matches!(&root_inode.kind, InodeKind::Dir) {
-                return Err(MetadataError::NotDir(format!("Not a directory: {name}")));
-            }
-            if root_inode.inode_id != root_inode_id || self.storage.get_block_size_optional(root_inode_id)?.is_some() {
-                return Err(MetadataError::Internal(format!(
-                    "directory inode {root_inode_id} carries file authority"
-                )));
-            }
-            if self.storage.get_detached_root(root_inode_id)?.is_some() {
-                return Err(MetadataError::Internal(format!(
-                    "inode {root_inode_id} is both reachable and already detached"
-                )));
-            }
-
-            let parent_inode = self
-                .storage
-                .get_inode(parent_inode_id)?
-                .ok_or_else(|| MetadataError::Internal("Parent inode disappeared".to_string()))?;
-            if !parent_inode.file_type().is_dir() || !matches!(&parent_inode.kind, InodeKind::Dir) {
-                return Err(MetadataError::NotDir(format!(
-                    "Parent is not a directory: {parent_inode_id}"
-                )));
-            }
-            if parent_inode.mount_id != root_inode.mount_id {
-                return Err(MetadataError::CrossMountRename(
-                    "recursive delete cannot cross mount boundary".to_string(),
-                ));
-            }
-
-            let mut parent_attrs = parent_inode.attrs.clone();
-            parent_attrs.set_modify_time(Self::mutation_timestamp(&parent_inode, proposed_at_ms));
-            let mut updated_parent = parent_inode;
-            updated_parent.attrs = parent_attrs;
-
-            Ok((
-                updated_parent,
-                DetachedRoot {
-                    mount_id: root_inode.mount_id,
-                    detached_at_ms: proposed_at_ms,
-                },
-            ))
-        })();
-
-        let (updated_parent, detached_root) = prepared?;
-        self.storage.detach_directory_atomic(
-            parent_inode_id,
-            &name,
-            root_inode_id,
-            &updated_parent,
-            detached_root,
-            raft_state,
-        )?;
-        Ok(())
-    }
-
     /// Apply Rename command (atomic within mount).
     // Keep the state transition inputs explicit at the apply boundary.
     #[allow(clippy::too_many_arguments)]
@@ -834,50 +567,42 @@ impl AppRaftStateMachine {
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
-        let prepared: MetadataResult<PreparedRename> = (|| {
-            // Get source dentry
-            let src_inode_id = self
-                .storage
-                .get_dentry(src_parent_inode_id, &src_name)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Source not found: {}", src_name)))?;
-            if src_inode_id != expected_src_inode_id {
-                return Err(MetadataError::Again(format!(
-                    "rename source changed for {src_name}: expected {expected_src_inode_id}, current {src_inode_id}"
+        // Get source dentry
+        let src_inode_id = self
+            .storage
+            .get_dentry(src_parent_inode_id, &src_name)?
+            .ok_or_else(|| MetadataError::NotFound(format!("Source not found: {}", src_name)))?;
+        if src_inode_id != expected_src_inode_id {
+            return Err(MetadataError::Again(format!(
+                "rename source changed for {src_name}: expected {expected_src_inode_id}, current {src_inode_id}"
+            )));
+        }
+
+        let current_dst_inode_id = self.storage.get_dentry(dst_parent_inode_id, &dst_name)?;
+        if current_dst_inode_id != expected_dst_inode_id {
+            return Err(MetadataError::Again(format!(
+                "rename destination changed for {dst_name}: expected {expected_dst_inode_id:?}, current {current_dst_inode_id:?}"
+            )));
+        }
+
+        // Get source inode
+        let src_inode = self
+            .storage
+            .get_inode(src_inode_id)?
+            .ok_or_else(|| MetadataError::NotFound(format!("Source inode not found: {}", src_inode_id)))?;
+
+        let mut overwritten_target = None;
+
+        // Check if destination exists
+        if let Some(dst_inode_id) = current_dst_inode_id {
+            // NOREPLACE flag set -> fail when destination exists
+            if flags & 0x1 != 0 {
+                return Err(MetadataError::AlreadyExists(format!(
+                    "Destination exists and RENAME_NOREPLACE set: {}",
+                    dst_name
                 )));
             }
-
-            let current_dst_inode_id = self.storage.get_dentry(dst_parent_inode_id, &dst_name)?;
-            if current_dst_inode_id != expected_dst_inode_id {
-                return Err(MetadataError::Again(format!(
-                    "rename destination changed for {dst_name}: expected {expected_dst_inode_id:?}, current {current_dst_inode_id:?}"
-                )));
-            }
-
-            // Get source inode
-            let src_inode = self
-                .storage
-                .get_inode(src_inode_id)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Source inode not found: {}", src_inode_id)))?;
-
-            let mut overwritten_target = None;
-
-            // Check if destination exists
-            if let Some(dst_inode_id) = current_dst_inode_id {
-                // NOREPLACE flag set -> fail when destination exists
-                if flags & 0x1 != 0 {
-                    return Err(MetadataError::AlreadyExists(format!(
-                        "Destination exists and RENAME_NOREPLACE set: {}",
-                        dst_name
-                    )));
-                }
-                if src_inode_id == dst_inode_id {
-                    return Ok(PreparedRename {
-                        src_inode_id,
-                        overwritten_target: None,
-                        updated_src_parent: None,
-                        updated_dst_parent: None,
-                    });
-                }
+            if src_inode_id != dst_inode_id {
                 // Destination exists - check if it's a directory and empty (if source is directory)
                 let dst_inode = self
                     .storage
@@ -909,102 +634,50 @@ impl AppRaftStateMachine {
                         return Err(MetadataError::IsDir("Cannot overwrite directory with file".to_string()));
                     }
                 }
-                overwritten_target = Some(self.prepare_rename_overwrite_target_cleanup(dst_inode_id, &dst_inode)?);
+                overwritten_target = Some(dst_inode_id);
             }
+        }
 
-            // Update parent directories modification time
-            let (updated_src_parent, updated_dst_parent) = if src_parent_inode_id != dst_parent_inode_id {
-                // Different parents - update both
-                let src_parent = self
-                    .storage
-                    .get_inode(src_parent_inode_id)?
-                    .ok_or_else(|| MetadataError::Internal("Source parent disappeared".to_string()))?;
-                let mut src_attrs = src_parent.attrs.clone();
-                src_attrs.set_modify_time(Self::mutation_timestamp(&src_parent, proposed_at_ms));
-                let mut src_parent = src_parent.clone();
-                src_parent.attrs = src_attrs;
-                let dst_parent = self
-                    .storage
-                    .get_inode(dst_parent_inode_id)?
-                    .ok_or_else(|| MetadataError::Internal("Destination parent disappeared".to_string()))?;
-                let mut dst_attrs = dst_parent.attrs.clone();
-                dst_attrs.set_modify_time(Self::mutation_timestamp(&dst_parent, proposed_at_ms));
-                let mut dst_parent = dst_parent.clone();
-                dst_parent.attrs = dst_attrs;
-                (Some(src_parent), Some(dst_parent))
-            } else {
-                let parent = self
-                    .storage
-                    .get_inode(src_parent_inode_id)?
-                    .ok_or_else(|| MetadataError::Internal("Parent disappeared".to_string()))?;
-                let mut attrs = parent.attrs.clone();
-                attrs.set_modify_time(Self::mutation_timestamp(&parent, proposed_at_ms));
-                let mut parent = parent.clone();
-                parent.attrs = attrs;
-                (Some(parent), None)
-            };
+        // Update parent directories modification time
+        let (updated_src_parent, updated_dst_parent) = if current_dst_inode_id == Some(src_inode_id) {
+            (None, None)
+        } else if src_parent_inode_id != dst_parent_inode_id {
+            // Different parents - update both
+            let mut src_parent = self
+                .storage
+                .get_inode(src_parent_inode_id)?
+                .ok_or_else(|| MetadataError::Internal("Source parent disappeared".to_string()))?;
+            src_parent.attrs.set_modify_time(proposed_at_ms);
+            let mut dst_parent = self
+                .storage
+                .get_inode(dst_parent_inode_id)?
+                .ok_or_else(|| MetadataError::Internal("Destination parent disappeared".to_string()))?;
+            dst_parent.attrs.set_modify_time(proposed_at_ms);
+            (Some(src_parent), Some(dst_parent))
+        } else {
+            let mut parent = self
+                .storage
+                .get_inode(src_parent_inode_id)?
+                .ok_or_else(|| MetadataError::Internal("Parent disappeared".to_string()))?;
+            parent.attrs.set_modify_time(proposed_at_ms);
+            (Some(parent), None)
+        };
 
-            Ok(PreparedRename {
-                src_inode_id,
-                overwritten_target,
-                updated_src_parent,
-                updated_dst_parent,
-            })
-        })();
-
-        let prepared = prepared?;
         self.storage.rename_atomic(
             RenameAtomicUpdate {
                 src_parent_inode_id,
                 src_name: &src_name,
                 dst_parent_inode_id,
                 dst_name: &dst_name,
-                src_inode_id: prepared.src_inode_id,
-                overwritten_target: prepared
-                    .overwritten_target
-                    .as_ref()
-                    .map(|target| RenameOverwriteCleanup {
-                        inode_id: target.inode_id,
-                    }),
-                updated_src_parent: prepared.updated_src_parent.as_ref(),
-                updated_dst_parent: prepared.updated_dst_parent.as_ref(),
+                src_inode_id,
+                overwritten_target,
+                updated_src_parent: updated_src_parent.as_ref(),
+                updated_dst_parent: updated_dst_parent.as_ref(),
             },
             raft_state,
         )?;
 
         Ok(())
-    }
-
-    fn prepare_rename_overwrite_target_cleanup(
-        &self,
-        dst_inode_id: InodeId,
-        dst_inode: &Inode,
-    ) -> MetadataResult<PreparedRenameOverwrite> {
-        match &dst_inode.kind {
-            InodeKind::File(crate::inode::FileData { .. }) => {
-                if dst_inode.inode_id != dst_inode_id || self.storage.get_block_size_optional(dst_inode_id)?.is_none() {
-                    return Err(MetadataError::Internal(format!(
-                        "file inode {dst_inode_id} has corrupt identity or missing block_size: value_id={}",
-                        dst_inode.inode_id
-                    )));
-                }
-                Ok(PreparedRenameOverwrite { inode_id: dst_inode_id })
-            }
-            InodeKind::Dir => {
-                if !self.storage.is_directory_empty(dst_inode_id)? {
-                    return Err(MetadataError::DirectoryNotEmpty(
-                        "Cannot overwrite non-empty directory".to_string(),
-                    ));
-                }
-                if dst_inode.inode_id != dst_inode_id || self.storage.get_block_size_optional(dst_inode_id)?.is_some() {
-                    return Err(MetadataError::Internal(format!(
-                        "directory inode {dst_inode_id} carries invalid file authority: value_id={}",
-                        dst_inode.inode_id
-                    )));
-                }
-                Ok(PreparedRenameOverwrite { inode_id: dst_inode_id })
-            }
-        }
     }
 }
 
@@ -1018,7 +691,7 @@ mod tests {
     fn test_state() -> (TempDir, Arc<RocksDBStorage>, AppRaftStateMachine, InodeId) {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let parent_inode_id = InodeId::new(10);
+        let parent_inode_id = crate::mount::ROOT_INODE_ID;
         storage
             .put_inode(&Inode::new_dir(parent_inode_id, InodeAttrs::new(), MountId::new(1)))
             .unwrap();
@@ -1026,11 +699,6 @@ mod tests {
         storage
             .put_mount(&MountEntry {
                 mount_id: MountId::new(1),
-                mount_prefix: crate::mount::ROOT_MOUNT_PREFIX.to_string(),
-                mount_kind: MountKind::Internal,
-                ufs_uri: None,
-                data_io_policy: DataIoPolicy::Allow,
-                mount_epoch: 1,
                 namespace_owner_group_name: group_name("root"),
                 root_inode_id: parent_inode_id,
             })
@@ -1057,8 +725,7 @@ mod tests {
         Command::Delete {
             proposed_at_ms: 2,
             mount_id: MountId::new(1),
-            expected_mount_epoch: 1,
-            mount_root_inode_id: InodeId::new(10),
+            mount_root_inode_id: crate::mount::ROOT_INODE_ID,
             relative_components,
             expected_inode_id,
             expected_file_lease_epoch: lease_epoch,
@@ -1077,12 +744,9 @@ mod tests {
             operation_id,
             request_deadline_ms: 100,
             session_expires_at_ms: 100,
-            normalized_path: format!("/{}", components.join("/")),
             mount_id: MountId::new(1),
-            expected_mount_epoch: 1,
             mount_root_inode_id,
             relative_components,
-            attrs: InodeAttrs::new(),
             block_size: 4096,
         }
     }
@@ -1178,13 +842,6 @@ mod tests {
             operation_id
         );
 
-        let mut mount = storage.get_mount(MountId::new(1)).unwrap().unwrap();
-        mount.mount_epoch = 2;
-        storage.put_mount(&mount).unwrap();
-        expect_apply_rejection(sm.apply(replay_command.clone()), ApplyRejectionKind::Again);
-        mount.mount_epoch = 1;
-        storage.put_mount(&mount).unwrap();
-
         expect_apply_rejection(
             sm.apply(create_file_command(operation_id, parent_inode_id, &["other"])),
             ApplyRejectionKind::InvalidArgument,
@@ -1214,7 +871,6 @@ mod tests {
                 proposed_at_ms: 1,
                 root_inode_id: parent_inode_id,
                 components: vec!["target".to_string()],
-                attrs: InodeAttrs::new(),
                 recursive: false,
             })
             .unwrap(),
@@ -1224,17 +880,6 @@ mod tests {
             Command::Delete {
                 proposed_at_ms: 2,
                 mount_id: MountId::new(1),
-                expected_mount_epoch: 2,
-                mount_root_inode_id: parent_inode_id,
-                relative_components: vec!["target".to_string()],
-                expected_inode_id: directory,
-                expected_file_lease_epoch: None,
-                recursive: true,
-            },
-            Command::Delete {
-                proposed_at_ms: 2,
-                mount_id: MountId::new(1),
-                expected_mount_epoch: 1,
                 mount_root_inode_id: InodeId::new(11),
                 relative_components: vec!["target".to_string()],
                 expected_inode_id: directory,
@@ -1264,7 +909,6 @@ mod tests {
                 proposed_at_ms: 1,
                 root_inode_id: parent_inode_id,
                 components: vec!["dir".to_string()],
-                attrs: InodeAttrs::new(),
                 recursive: false,
             })
             .unwrap(),
@@ -1277,7 +921,6 @@ mod tests {
         assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), None);
         assert!(storage.get_inode(directory).unwrap().is_some());
         assert!(storage.get_inode(file).unwrap().is_some());
-        assert!(storage.get_block_size(file).is_ok());
         assert_eq!(
             storage.get_detached_root(directory).unwrap(),
             Some(DetachedRoot {
@@ -1295,7 +938,6 @@ mod tests {
                 proposed_at_ms: 1,
                 root_inode_id: parent_inode_id,
                 components: vec!["outer".to_string(), "inner".to_string()],
-                attrs: InodeAttrs::new(),
                 recursive: true,
             })
             .unwrap(),
@@ -1310,42 +952,6 @@ mod tests {
         assert_eq!(storage.get_dentry(outer, "inner").unwrap(), Some(inner));
         assert!(storage.get_detached_root(outer).unwrap().is_some());
         assert!(storage.get_detached_root(inner).unwrap().is_none());
-    }
-
-    #[test]
-    fn recursive_delete_rejects_nested_mount_before_detach() {
-        let (_dir, storage, sm, parent_inode_id) = test_state();
-        let directory = expect_directory_ensured(
-            sm.apply(Command::CreateDirectory {
-                proposed_at_ms: 1,
-                root_inode_id: parent_inode_id,
-                components: vec!["dir".to_string()],
-                attrs: InodeAttrs::new(),
-                recursive: false,
-            })
-            .unwrap(),
-        )
-        .0;
-        storage
-            .put_mount(&MountEntry {
-                mount_id: MountId::new(2),
-                mount_prefix: "/dir/nested".to_string(),
-                mount_kind: MountKind::Internal,
-                ufs_uri: None,
-                data_io_policy: DataIoPolicy::Allow,
-                mount_epoch: 2,
-                namespace_owner_group_name: group_name("root"),
-                root_inode_id: InodeId::new(200),
-            })
-            .unwrap();
-
-        expect_apply_rejection(
-            sm.apply(delete_command("dir", directory, None, true)),
-            ApplyRejectionKind::CrossMountRename,
-        );
-
-        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), Some(directory));
-        assert!(storage.get_detached_root(directory).unwrap().is_none());
     }
 
     #[test]

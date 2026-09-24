@@ -9,7 +9,6 @@
 use beryl_common::error::rpc::{
     ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind,
 };
-use beryl_types::ids::MountId;
 use beryl_types::LeaseEpoch;
 use thiserror::Error;
 
@@ -84,22 +83,6 @@ pub enum MetadataError {
     #[error("leader changed: {0}")]
     LeaderChanged(String),
 
-    /// Epoch mismatch (retryable).
-    #[error("epoch mismatch: expected {expected}, got {got}")]
-    EpochMismatch { expected: u64, got: u64 },
-
-    /// Mount epoch mismatch (retryable).
-    #[error("mount epoch mismatch: expected {expected}, got {got} (mount_id={mount_id:?})")]
-    MountEpochMismatch {
-        expected: u64,
-        got: u64,
-        mount_id: Option<MountId>,
-    },
-
-    /// Routing stale (retryable).
-    #[error("routing stale: {0}")]
-    RoutingStale(String),
-
     /// Stale state: follower last_applied < requested state_id (retryable).
     #[error("stale state: {0}")]
     StaleState(String),
@@ -123,83 +106,44 @@ pub enum MetadataError {
 /// use the same domain facts as other metadata handlers; a POSIX adapter, if
 /// added later, must translate those facts at its own boundary.
 pub fn to_rpc_error(err: MetadataError) -> RpcErrorDetail {
-    match map_shared_rpc_error(err) {
-        Ok(rpc_error) => rpc_error,
-        Err(err) => map_rpc_application_error(err),
-    }
-}
-
-/// Result type for metadata operations.
-pub type MetadataResult<T> = Result<T, MetadataError>;
-
-fn map_shared_rpc_error(err: MetadataError) -> Result<RpcErrorDetail, MetadataError> {
     match err {
-        MetadataError::LeaderChanged(msg) => Ok(RpcErrorDetail::refresh_metadata(
+        MetadataError::LeaderChanged(msg) => RpcErrorDetail::refresh_metadata(
             ErrorKind::Metadata(MetadataErrorKind::NotLeader),
             RefreshHint::default(),
             msg,
-        )),
-        MetadataError::EpochMismatch { expected, got } => Ok(RpcErrorDetail::reopen_write_session(
-            ErrorKind::Metadata(MetadataErrorKind::EpochMismatch),
-            RefreshHint::default(),
-            format!("epoch mismatch: expected {}, got {}", expected, got),
-        )),
-        MetadataError::MountEpochMismatch {
-            expected,
-            got,
-            mount_id,
-        } => Ok(RpcErrorDetail::refresh_metadata(
-            ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
-            RefreshHint::default(),
-            format!(
-                "mount epoch mismatch: expected {}, got {} (mount_id={:?})",
-                expected, got, mount_id
-            ),
-        )),
-        MetadataError::RoutingStale(msg) => Ok(RpcErrorDetail::refresh_metadata(
-            ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
-            RefreshHint::default(),
-            msg,
-        )),
-        MetadataError::StaleState(msg) => Ok(RpcErrorDetail::refresh_metadata(
+        ),
+        MetadataError::StaleState(msg) => RpcErrorDetail::refresh_metadata(
             ErrorKind::Metadata(MetadataErrorKind::StaleState),
             RefreshHint::default(),
             msg,
-        )),
-        MetadataError::FullReportRequired(msg) => Ok(RpcErrorDetail::send_full_block_report(
-            ErrorKind::Worker(WorkerErrorKind::FullReportRequired),
-            msg,
-        )),
-        MetadataError::LeaseFenced { expected, got } => Ok(RpcErrorDetail::reopen_write_session(
+        ),
+        MetadataError::FullReportRequired(msg) => {
+            RpcErrorDetail::send_full_block_report(ErrorKind::Worker(WorkerErrorKind::FullReportRequired), msg)
+        }
+        MetadataError::LeaseFenced { expected, got } => RpcErrorDetail::reopen_write_session(
             ErrorKind::Metadata(MetadataErrorKind::Fencing),
             RefreshHint::default(),
             format!("lease fenced: expected >= {}, got {}", expected, got),
-        )),
-        MetadataError::ServiceUnavailable(msg) => Ok(RpcErrorDetail::retry(
+        ),
+        MetadataError::ServiceUnavailable(msg) => RpcErrorDetail::retry(
             ErrorKind::Internal(InternalErrorKind::NodeUnavailable),
             Some(1000),
             format!("service unavailable: {}", msg),
-        )),
-        MetadataError::WriteSessionLimitExceeded(msg) => Ok(RpcErrorDetail::retry(
+        ),
+        MetadataError::WriteSessionLimitExceeded(msg) => RpcErrorDetail::retry(
             ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted),
             None,
             format!("write-session limit exceeded: {msg}"),
-        )),
-        MetadataError::GlobalWriteTargetLimitExceeded(msg) => Ok(RpcErrorDetail::retry(
+        ),
+        MetadataError::GlobalWriteTargetLimitExceeded(msg) => RpcErrorDetail::retry(
             ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted),
             None,
             format!("global write-target limit exceeded: {msg}"),
-        )),
-        MetadataError::ResourceExhausted(msg) => Ok(RpcErrorDetail::fail(
+        ),
+        MetadataError::ResourceExhausted(msg) => RpcErrorDetail::fail(
             ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted),
             format!("resource exhausted: {}", msg),
-        )),
-        other => Err(other),
-    }
-}
-
-fn map_rpc_application_error(err: MetadataError) -> RpcErrorDetail {
-    match err {
+        ),
         MetadataError::NotFound(msg) => RpcErrorDetail::fail(
             ErrorKind::Metadata(MetadataErrorKind::NotFound),
             format!("not found: {}", msg),
@@ -253,16 +197,8 @@ fn map_rpc_application_error(err: MetadataError) -> RpcErrorDetail {
             ErrorKind::Internal(InternalErrorKind::Internal),
             format!("internal error: {}", msg),
         ),
-        MetadataError::LeaderChanged(_)
-        | MetadataError::EpochMismatch { .. }
-        | MetadataError::MountEpochMismatch { .. }
-        | MetadataError::RoutingStale(_)
-        | MetadataError::StaleState(_)
-        | MetadataError::FullReportRequired(_)
-        | MetadataError::LeaseFenced { .. }
-        | MetadataError::ResourceExhausted(_)
-        | MetadataError::WriteSessionLimitExceeded(_)
-        | MetadataError::GlobalWriteTargetLimitExceeded(_)
-        | MetadataError::ServiceUnavailable(_) => unreachable!("shared metadata errors must be mapped earlier"),
     }
 }
+
+/// Result type for metadata operations.
+pub type MetadataResult<T> = Result<T, MetadataError>;

@@ -20,13 +20,14 @@ use beryl_proto::worker::write_block_request_proto::Payload;
 use beryl_proto::worker::{DataRequestHeaderProto, WriteBlockCommandProto, WriteBlockRequestProto};
 use beryl_types::ClientId;
 use bytes::Bytes;
-use std::path::Path;
 use tokio_stream::iter;
 use tonic::Request;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn committed_visible_file_survives_metadata_restart() {
-    let mut cluster = TestCluster::start().await.expect("start cluster");
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .expect("start cluster");
     let client = cluster.client().clone();
     let path = "/restart/committed";
     let payload = Bytes::from(deterministic_bytes(1_537));
@@ -61,7 +62,9 @@ async fn committed_visible_file_survives_metadata_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_after_empty_create_requires_new_authority_for_noop_close() {
-    let mut cluster = TestCluster::start().await.expect("start cluster");
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .expect("start cluster");
     let client = cluster.client().clone();
     client.mkdirs("/restart").await.expect("create restart dir");
 
@@ -152,7 +155,9 @@ async fn restart_after_empty_create_requires_new_authority_for_noop_close() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_after_worker_ready_before_metadata_close_rejects_stale_writer_and_hides_data() {
-    let mut cluster = TestCluster::start().await.expect("start cluster");
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .expect("start cluster");
     let client = cluster.client().clone();
     client.mkdirs("/restart").await.expect("create restart dir");
 
@@ -181,7 +186,9 @@ async fn restart_after_worker_ready_before_metadata_close_rejects_stale_writer_a
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_after_worker_ready_before_metadata_commit_hides_unpublished_block() {
-    let mut cluster = TestCluster::start().await.expect("start cluster");
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .expect("start cluster");
     let active = raw_create_worker_ready_block(&cluster, "/restart/worker-ready-no-metadata", b"worker-ready")
         .await
         .expect("write Worker Ready block without CommitFile");
@@ -204,7 +211,9 @@ async fn restart_after_worker_ready_before_metadata_commit_hides_unpublished_blo
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn existing_visible_data_remains_readable_while_active_write_fails_closed() {
-    let mut cluster = TestCluster::start().await.expect("start cluster");
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .expect("start cluster");
     let client = cluster.client().clone();
     client.mkdirs("/restart").await.expect("create restart dir");
 
@@ -246,7 +255,9 @@ async fn existing_visible_data_remains_readable_while_active_write_fails_closed(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_replay_survives_restart_and_session_operations_converge() {
-    let mut cluster = TestCluster::start().await.expect("start cluster");
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .expect("start cluster");
     cluster.client().mkdirs("/restart").await.expect("create restart dir");
     let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
         .await
@@ -335,13 +346,11 @@ async fn create_replay_survives_restart_and_session_operations_converge() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
-    let mut cluster = TestCluster::start().await.expect("start cluster");
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .expect("start cluster");
     cluster.start_additional_worker().await.expect("start second worker");
     assert_eq!(cluster.current_worker_run_ids().len(), 2);
-    cluster
-        .start_metadata_process(Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
-        .await
-        .expect("start metadata child process");
     cluster.client().mkdirs("/restart").await.expect("create restart dir");
     let path = "/restart/many-blocks";
     let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
@@ -367,9 +376,9 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
     }
 
     cluster
-        .kill_metadata_process_and_restart()
+        .restart_metadata_process()
         .await
-        .expect("SIGKILL metadata child and restart in-process metadata");
+        .expect("SIGKILL metadata child and restart from durable state");
     let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
         .await
         .expect("reconnect metadata");
@@ -437,7 +446,9 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lost_commit_response_is_resolved_after_metadata_restart() {
-    let mut cluster = TestCluster::start().await.expect("start cluster");
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .expect("start cluster");
     let path = "/restart/durable-publish";
     let active = raw_create_worker_ready_block(&cluster, path, b"durable-publish")
         .await
@@ -532,7 +543,9 @@ impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>> f
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tail_takeover_preserves_published_prefix_after_abort_or_metadata_restart() {
     for restart in [false, true] {
-        let mut cluster = TestCluster::start().await.unwrap();
+        let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+            .await
+            .unwrap();
         let client = cluster.client().clone();
         let path = "/tail-takeover";
         let prefix = Bytes::from(vec![b'a'; 317]);
@@ -609,7 +622,9 @@ async fn tail_takeover_preserves_published_prefix_after_abort_or_metadata_restar
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overwrite_sync_replay_keeps_the_append_phase_and_invalidates_fresh_reads() {
-    let mut cluster = TestCluster::start().await.unwrap();
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .unwrap();
     let client = cluster.client().clone();
     let path = "/overwrite-sync";
     let mut original = client.create(path).await.unwrap();
@@ -846,7 +861,6 @@ fn data_header(client_id: u128) -> DataRequestHeaderProto {
     let header = RequestHeader::new(ClientId::new(client_id));
     DataRequestHeaderProto {
         client: Some((&header.client).into()),
-        trace_context: None,
     }
 }
 

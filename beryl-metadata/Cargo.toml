@@ -12,17 +12,13 @@ beryl-proto = { path = "../beryl-proto" }
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
-futures = { workspace = true }
-async-trait = { workspace = true }
 
 # RPC
 tonic = { workspace = true, features = ["transport"] }
 tonic-health = { workspace = true }
-prost = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 
 # Logging & Observability
 tracing = { workspace = true }
@@ -36,9 +32,6 @@ uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-# Configuration
-serde_yaml = { workspace = true }
-
 # Raft
 openraft = { workspace = true, features = ["serde", "storage-v2"] }
 
@@ -47,18 +40,14 @@ rocksdb = { workspace = true, default-features = false, features = ["snappy"] }
 fs2 = { workspace = true }
 bincode = { workspace = true }
 
-# Hashing (for stable worker identity)
+# Snapshot checksums and file identities
 sha2 = { workspace = true }
-
-# Random number generation (for jitter in storm control)
-rand = { workspace = true }
 
 [[bin]]
 name = "beryl-metadata"
 path = "src/bin/main.rs"
 
 [dev-dependencies]
+futures = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-beryl-client = { path = "../beryl-client" }
 tempfile = { workspace = true }
-tokio-stream = { version = "0.1", features = ["net"] }

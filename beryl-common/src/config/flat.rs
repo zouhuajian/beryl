@@ -23,18 +23,13 @@ impl FlatConfig {
     }
 
     /// Create from a BTreeMap.
-    pub fn from_map(data: BTreeMap<String, Value>) -> Self {
+    pub(super) fn from_map(data: BTreeMap<String, Value>) -> Self {
         Self { data }
     }
 
     /// Insert a key-value pair.
     pub fn insert(&mut self, key: String, value: Value) {
         self.data.insert(key, value);
-    }
-
-    #[inline]
-    pub fn set<V: Into<Value>>(&mut self, key: &str, value: V) {
-        self.insert(key.to_string(), value.into());
     }
 
     /// Get a string value.
@@ -47,7 +42,7 @@ impl FlatConfig {
     }
 
     /// Get an i64 value.
-    pub fn get_i64(&self, key: &str) -> Option<i64> {
+    fn get_i64(&self, key: &str) -> Option<i64> {
         self.data.get(key).and_then(|v| match v {
             Value::Number(n) => n.as_i64(),
             Value::String(s) => s.parse().ok(),
@@ -56,7 +51,7 @@ impl FlatConfig {
     }
 
     /// Get a bool value.
-    pub fn get_bool(&self, key: &str) -> Option<bool> {
+    fn get_bool(&self, key: &str) -> Option<bool> {
         self.data.get(key).and_then(|v| match v {
             Value::Bool(b) => Some(*b),
             Value::String(s) => match s.to_lowercase().as_str() {
@@ -71,7 +66,7 @@ impl FlatConfig {
     /// Get a duration from an integer millisecond value or a value with a unit.
     ///
     /// Supported units are `ms`, `s`, `min`, `h`, and `d`.
-    pub fn get_duration(&self, key: &str) -> Option<Duration> {
+    fn get_duration(&self, key: &str) -> Option<Duration> {
         self.data.get(key).and_then(parse_duration)
     }
 
@@ -168,7 +163,8 @@ impl FlatConfig {
             .get_duration(key)
             .filter(|duration| !duration.is_zero())
             .ok_or_else(|| invalid_config(key, "must be a positive duration"))?;
-        u64::try_from(duration.as_millis()).map_err(|_| invalid_config(key, "is too large"))
+        // Parsing constructs every duration from a checked u64 millisecond count.
+        Ok(duration.as_millis() as u64)
     }
 
     /// Get a byte size that fits u32 or return the provided default when the key is absent.
@@ -188,7 +184,7 @@ impl FlatConfig {
             return Ok(default);
         }
         self.get_bytes(key)
-            .and_then(|bytes| u64::try_from(bytes).ok())
+            .map(|bytes| bytes as u64)
             .ok_or_else(|| invalid_config(key, "must be a size such as 1GiB"))
     }
 
@@ -277,14 +273,14 @@ mod tests {
     #[test]
     fn typed_values_use_defaults_and_parse_supported_units() {
         let mut config = FlatConfig::new();
-        config.set("string", "value");
-        config.set("bool", "yes");
-        config.set("port", 19090i64);
-        config.set("u32", 10i64);
-        config.set("usize", 20i64);
-        config.set("duration", "2s");
-        config.set("bytes-u32", "1MiB");
-        config.set("bytes-u64", "1GiB");
+        config.insert("string".to_string(), "value".into());
+        config.insert("bool".to_string(), "yes".into());
+        config.insert("port".to_string(), 19090i64.into());
+        config.insert("u32".to_string(), 10i64.into());
+        config.insert("usize".to_string(), 20i64.into());
+        config.insert("duration".to_string(), "2s".into());
+        config.insert("bytes-u32".to_string(), "1MiB".into());
+        config.insert("bytes-u64".to_string(), "1GiB".into());
 
         assert_eq!(config.string_or("string", "default").unwrap(), "value");
         assert!(config.bool_or("bool", false).unwrap());
@@ -300,12 +296,12 @@ mod tests {
     #[test]
     fn typed_values_reject_invalid_and_non_positive_input() {
         let mut config = FlatConfig::new();
-        config.set("bool", "sometimes");
-        config.set("port", 0i64);
-        config.set("u32", -1i64);
-        config.set("usize", 0i64);
-        config.set("duration", "0s");
-        config.set("bytes", "large");
+        config.insert("bool".to_string(), "sometimes".into());
+        config.insert("port".to_string(), 0i64.into());
+        config.insert("u32".to_string(), (-1i64).into());
+        config.insert("usize".to_string(), 0i64.into());
+        config.insert("duration".to_string(), "0s".into());
+        config.insert("bytes".to_string(), "large".into());
 
         for result in [
             config.bool_or("bool", true).map(|_| ()),

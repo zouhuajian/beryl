@@ -6,10 +6,10 @@
 use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use beryl_common::config::{format_host_port, load_from_yaml_file, validate_public_host, FlatConfig};
 use beryl_common::error::{CommonError, CommonErrorKind};
-use beryl_common::observe::config::LogConfig;
 use beryl_common::observe::ObservabilityConfig;
 use beryl_types::{GroupName, Tier};
 use serde_yaml::{Mapping, Value};
@@ -17,8 +17,8 @@ use tokio::sync::Semaphore;
 use tonic::transport::Endpoint;
 use tracing::info;
 
-use crate::net::config::{WorkerNetConfig, DEFAULT_GRPC_MAX_CONCURRENT_READS, DEFAULT_GRPC_MAX_CONCURRENT_WRITES};
-use crate::net::protocol::WorkerNetProtocol;
+const DEFAULT_GRPC_MAX_CONCURRENT_READS: usize = 64;
+const DEFAULT_GRPC_MAX_CONCURRENT_WRITES: usize = 32;
 
 const CLUSTER_ID: &str = "beryl.cluster.id";
 const HOST: &str = "beryl.worker.host";
@@ -46,16 +46,22 @@ const BLOCK_CLEANUP_RETRY_INITIAL_BACKOFF: &str = "beryl.worker.block.cleanup.re
 const BLOCK_CLEANUP_RETRY_MAX_BACKOFF: &str = "beryl.worker.block.cleanup.retry.max-backoff";
 const SHUTDOWN_TIMEOUT: &str = "beryl.worker.shutdown.timeout";
 
+/// Process-wide admission limits for Worker data RPCs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerNetConfig {
+    /// Maximum admitted read RPC lifecycles shared by all connections.
+    pub max_concurrent_reads: usize,
+    /// Maximum admitted write RPC lifecycles shared by all connections.
+    pub max_concurrent_writes: usize,
+}
+
 /// Worker-to-Metadata request and retry configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkerRegistrationConfig {
     /// Internal identity for the one supported metadata group.
     pub group_name: GroupName,
     /// The single Metadata leader endpoint supported by the current runtime.
-    ///
-    /// This remains a vector only because the YAML key is a string list; validation
-    /// rejects zero or multiple values before any control-plane task starts.
-    pub endpoints: Vec<String>,
+    pub endpoint: String,
     /// Timeout shared by registration, heartbeat, and block report RPCs.
     pub request_timeout_ms: u64,
     pub retry_initial_backoff_ms: u64,
@@ -66,7 +72,7 @@ impl Default for WorkerRegistrationConfig {
     fn default() -> Self {
         Self {
             group_name: GroupName::parse("root").expect("the supported metadata group is valid"),
-            endpoints: vec!["http://127.0.0.1:18080".to_string()],
+            endpoint: "http://127.0.0.1:18080".to_string(),
             request_timeout_ms: 5_000,
             retry_initial_backoff_ms: 200,
             retry_max_backoff_ms: 5_000,
@@ -107,23 +113,49 @@ impl Default for WorkerStoreConfig {
     }
 }
 
-/// Bounded local execution of Metadata-authorized block cleanup commands.
+/// Bounds local execution of Metadata-authorized block cleanup commands.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkerBlockCleanupConfig {
-    pub queue_capacity: usize,
-    pub concurrency: usize,
-    pub retry_initial_backoff_ms: u64,
-    pub retry_max_backoff_ms: u64,
+pub struct BlockCleanupOptions {
+    /// Maximum number of distinct queued and active cleanup commands.
+    pub max_pending: usize,
+    /// Maximum number of concurrent local reclamation attempts.
+    pub max_concurrent: usize,
+    pub retry_initial_backoff: Duration,
+    pub retry_max_backoff: Duration,
 }
 
-impl Default for WorkerBlockCleanupConfig {
+impl Default for BlockCleanupOptions {
     fn default() -> Self {
         Self {
-            queue_capacity: 1_024,
-            concurrency: 4,
-            retry_initial_backoff_ms: 100,
-            retry_max_backoff_ms: 30_000,
+            max_pending: 1_024,
+            max_concurrent: 4,
+            retry_initial_backoff: Duration::from_millis(100),
+            retry_max_backoff: Duration::from_secs(30),
         }
+    }
+}
+
+impl BlockCleanupOptions {
+    pub(crate) fn validate(&self) -> Result<(), CommonError> {
+        if self.max_pending == 0 {
+            return Err(invalid_config(BLOCK_CLEANUP_QUEUE_CAPACITY, "must be positive"));
+        }
+        if self.max_concurrent == 0 || self.max_concurrent > self.max_pending {
+            return Err(invalid_config(
+                BLOCK_CLEANUP_CONCURRENCY,
+                "must be positive and not exceed the cleanup queue capacity",
+            ));
+        }
+        if self.retry_initial_backoff.is_zero() {
+            return Err(invalid_config(BLOCK_CLEANUP_RETRY_INITIAL_BACKOFF, "must be positive"));
+        }
+        if self.retry_max_backoff < self.retry_initial_backoff {
+            return Err(invalid_config(
+                BLOCK_CLEANUP_RETRY_MAX_BACKOFF,
+                "must not be smaller than the initial backoff",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -138,8 +170,6 @@ pub struct WorkerConfig {
     pub rpc_port: u16,
     pub http_port: u16,
     pub identity_path: PathBuf,
-    /// Derived RPC bind address retained by the network runtime.
-    pub rpc_bind: String,
     /// Default payload size for streamed read responses.
     pub default_frame_size: u32,
     /// Maximum payload size selected for streamed read responses.
@@ -151,7 +181,7 @@ pub struct WorkerConfig {
     /// Maximum delay before retrying or flushing retained Delta changes.
     pub block_report_delta_flush_interval_ms: u64,
     pub block_report_batch_size: usize,
-    pub block_cleanup: WorkerBlockCleanupConfig,
+    pub block_cleanup: BlockCleanupOptions,
     /// Graceful RPC/background drain interval before remaining work is cancelled.
     pub shutdown_timeout_ms: u64,
     pub observability: ObservabilityConfig,
@@ -162,8 +192,8 @@ impl WorkerConfig {
         format_host_port(&self.host, self.rpc_port)
     }
 
-    pub fn rpc_address_parts(&self) -> (String, u32) {
-        (self.host.clone(), u32::from(self.rpc_port))
+    pub fn rpc_bind_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.bind_host, self.rpc_port)
     }
 
     pub fn http_addr(&self) -> SocketAddr {
@@ -174,7 +204,6 @@ impl WorkerConfig {
 impl Default for WorkerConfig {
     fn default() -> Self {
         let bind_host = "0.0.0.0".parse().expect("default bind host is valid");
-        let rpc_bind = SocketAddr::new(bind_host, 19090).to_string();
         Self {
             cluster_id: "local-beryl".to_string(),
             host: "127.0.0.1".to_string(),
@@ -182,28 +211,23 @@ impl Default for WorkerConfig {
             rpc_port: 19090,
             http_port: 19091,
             identity_path: PathBuf::from("data/worker/worker.identity"),
-            rpc_bind: rpc_bind.clone(),
             default_frame_size: 1024 * 1024,
             max_frame_size: 4 * 1024 * 1024,
             store: WorkerStoreConfig::default(),
-            net: WorkerNetConfig::grpc_from_rpc(
-                rpc_bind,
-                DEFAULT_GRPC_MAX_CONCURRENT_READS,
-                DEFAULT_GRPC_MAX_CONCURRENT_WRITES,
-                4 * 1024 * 1024,
-            ),
+            net: WorkerNetConfig {
+                max_concurrent_reads: DEFAULT_GRPC_MAX_CONCURRENT_READS,
+                max_concurrent_writes: DEFAULT_GRPC_MAX_CONCURRENT_WRITES,
+            },
             metadata: WorkerRegistrationConfig::default(),
             heartbeat_interval_ms: 1_000,
             block_report_delta_flush_interval_ms: 1_000,
             block_report_batch_size: 1_000,
-            block_cleanup: WorkerBlockCleanupConfig::default(),
+            block_cleanup: BlockCleanupOptions::default(),
             shutdown_timeout_ms: 30_000,
             observability: ObservabilityConfig {
-                log: LogConfig {
-                    format: "compact".to_string(),
-                    output: "stderr".to_string(),
-                    level: "info".to_string(),
-                },
+                format: "compact".to_string(),
+                output: "stderr".to_string(),
+                level: "info".to_string(),
             },
         }
     }
@@ -245,24 +269,19 @@ impl WorkerConfig {
         let block_report_batch_size =
             flat.positive_usize_or(BLOCK_REPORT_BATCH_SIZE, defaults.block_report_batch_size)?;
         let shutdown_timeout_ms = flat.duration_ms_or(SHUTDOWN_TIMEOUT, defaults.shutdown_timeout_ms)?;
-        let cleanup_defaults = WorkerBlockCleanupConfig::default();
-        let block_cleanup = WorkerBlockCleanupConfig {
-            queue_capacity: flat.positive_usize_or(BLOCK_CLEANUP_QUEUE_CAPACITY, cleanup_defaults.queue_capacity)?,
-            concurrency: flat.positive_usize_or(BLOCK_CLEANUP_CONCURRENCY, cleanup_defaults.concurrency)?,
-            retry_initial_backoff_ms: flat.duration_ms_or(
+        let cleanup_defaults = &defaults.block_cleanup;
+        let block_cleanup = BlockCleanupOptions {
+            max_pending: flat.positive_usize_or(BLOCK_CLEANUP_QUEUE_CAPACITY, cleanup_defaults.max_pending)?,
+            max_concurrent: flat.positive_usize_or(BLOCK_CLEANUP_CONCURRENCY, cleanup_defaults.max_concurrent)?,
+            retry_initial_backoff: Duration::from_millis(flat.duration_ms_or(
                 BLOCK_CLEANUP_RETRY_INITIAL_BACKOFF,
-                cleanup_defaults.retry_initial_backoff_ms,
-            )?,
-            retry_max_backoff_ms: flat
-                .duration_ms_or(BLOCK_CLEANUP_RETRY_MAX_BACKOFF, cleanup_defaults.retry_max_backoff_ms)?,
-        };
-        if block_cleanup.retry_max_backoff_ms < block_cleanup.retry_initial_backoff_ms {
-            return Err(invalid_config(
+                cleanup_defaults.retry_initial_backoff.as_millis() as u64,
+            )?),
+            retry_max_backoff: Duration::from_millis(flat.duration_ms_or(
                 BLOCK_CLEANUP_RETRY_MAX_BACKOFF,
-                "must not be smaller than the initial backoff",
-            ));
-        }
-        let rpc_bind = SocketAddr::new(bind_host, rpc_port).to_string();
+                cleanup_defaults.retry_max_backoff.as_millis() as u64,
+            )?),
+        };
         if rpc_port == http_port {
             return Err(invalid_config(HTTP_PORT, "must differ from the RPC port"));
         }
@@ -274,16 +293,13 @@ impl WorkerConfig {
             rpc_port,
             http_port,
             identity_path,
-            rpc_bind: rpc_bind.clone(),
             default_frame_size,
             max_frame_size,
             store,
-            net: WorkerNetConfig::grpc_from_rpc(
-                rpc_bind,
-                rpc_max_concurrent_reads,
-                rpc_max_concurrent_writes,
-                max_frame_size,
-            ),
+            net: WorkerNetConfig {
+                max_concurrent_reads: rpc_max_concurrent_reads,
+                max_concurrent_writes: rpc_max_concurrent_writes,
+            },
             metadata,
             heartbeat_interval_ms,
             block_report_delta_flush_interval_ms,
@@ -296,10 +312,10 @@ impl WorkerConfig {
 
         info!(
             host = %config.host,
-            rpc_bind = %config.rpc_bind,
+            rpc_bind = %config.rpc_bind_addr(),
             http_bind = %config.http_addr(),
             store_dirs = config.store.dirs.len(),
-            metadata_addresses = ?config.metadata.endpoints,
+            metadata_address = %config.metadata.endpoint,
             "Worker configuration loaded"
         );
         Ok(config)
@@ -332,33 +348,20 @@ impl WorkerConfig {
                 "exceeds the shared block-report protocol maximum",
             ));
         }
-        if self.block_cleanup.concurrency > self.block_cleanup.queue_capacity {
-            return Err(invalid_config(
-                BLOCK_CLEANUP_CONCURRENCY,
-                "must not exceed the cleanup queue capacity",
-            ));
-        }
+        self.block_cleanup.validate()?;
         validate_store_config(self)?;
         self.metadata.validate()?;
-        if self.net.listeners.is_empty() {
-            return Err(invalid_config(RPC_PORT, "must create a Worker RPC listener"));
+        if self.net.max_concurrent_reads == 0 || self.net.max_concurrent_reads > Semaphore::MAX_PERMITS {
+            return Err(invalid_config(
+                RPC_MAX_CONCURRENT_READ_REQUESTS,
+                "must fit the process semaphore capacity",
+            ));
         }
-        for listener in &self.net.listeners {
-            if listener.protocol == WorkerNetProtocol::Grpc && listener.bind.parse::<SocketAddr>().is_err() {
-                return Err(invalid_config(BIND_HOST, "does not form a valid RPC bind address"));
-            }
-            if listener.max_concurrent_reads == 0 || listener.max_concurrent_reads > Semaphore::MAX_PERMITS {
-                return Err(invalid_config(
-                    RPC_MAX_CONCURRENT_READ_REQUESTS,
-                    "must fit the process semaphore capacity",
-                ));
-            }
-            if listener.max_concurrent_writes == 0 || listener.max_concurrent_writes > Semaphore::MAX_PERMITS {
-                return Err(invalid_config(
-                    RPC_MAX_CONCURRENT_WRITE_REQUESTS,
-                    "must fit the process semaphore capacity",
-                ));
-            }
+        if self.net.max_concurrent_writes == 0 || self.net.max_concurrent_writes > Semaphore::MAX_PERMITS {
+            return Err(invalid_config(
+                RPC_MAX_CONCURRENT_WRITE_REQUESTS,
+                "must fit the process semaphore capacity",
+            ));
         }
         Ok(())
     }
@@ -368,32 +371,28 @@ fn parse_metadata_config(
     flat: &FlatConfig,
     defaults: &WorkerRegistrationConfig,
 ) -> Result<WorkerRegistrationConfig, CommonError> {
-    let addresses = if flat.contains_key(METADATA_ADDRESSES) {
-        flat.get_string_list(METADATA_ADDRESSES)
-            .ok_or_else(|| invalid_config(METADATA_ADDRESSES, "must be a list of host:port addresses"))?
+    let endpoint = if flat.contains_key(METADATA_ADDRESSES) {
+        let addresses = flat
+            .get_string_list(METADATA_ADDRESSES)
+            .ok_or_else(|| invalid_config(METADATA_ADDRESSES, "must be a list of host:port addresses"))?;
+        if addresses.len() != 1 || addresses[0].trim().is_empty() {
+            return Err(invalid_config(
+                METADATA_ADDRESSES,
+                "must contain exactly one non-empty Metadata leader address",
+            ));
+        }
+        normalize_endpoint(&addresses[0])
     } else {
-        vec!["127.0.0.1:18080".to_string()]
+        defaults.endpoint.clone()
     };
-    if addresses.is_empty() || addresses.iter().any(|address| address.trim().is_empty()) {
-        return Err(invalid_config(
-            METADATA_ADDRESSES,
-            "must contain at least one non-empty address",
-        ));
-    }
-    let endpoints = addresses
-        .into_iter()
-        .map(|address| normalize_endpoint(&address))
-        .collect();
-    let config = WorkerRegistrationConfig {
-        group_name: GroupName::parse("root").expect("the supported metadata group is valid"),
-        endpoints,
+    Ok(WorkerRegistrationConfig {
+        group_name: defaults.group_name.clone(),
+        endpoint,
         request_timeout_ms: flat.duration_ms_or(METADATA_REQUEST_TIMEOUT, defaults.request_timeout_ms)?,
         retry_initial_backoff_ms: flat
             .duration_ms_or(METADATA_RETRY_INITIAL_BACKOFF, defaults.retry_initial_backoff_ms)?,
         retry_max_backoff_ms: flat.duration_ms_or(METADATA_RETRY_MAX_BACKOFF, defaults.retry_max_backoff_ms)?,
-    };
-    config.validate()?;
-    Ok(config)
+    })
 }
 
 fn normalize_endpoint(address: &str) -> String {
@@ -500,19 +499,10 @@ fn validate_store_config(config: &WorkerConfig) -> Result<(), CommonError> {
 }
 
 impl WorkerRegistrationConfig {
-    pub fn validate(&self) -> Result<(), CommonError> {
-        // TODO: Support Metadata fanout only after worker-run registration and
-        // peer-scoped report recovery are completed end to end.
-        if self.endpoints.len() != 1 {
-            return Err(invalid_config(
-                METADATA_ADDRESSES,
-                "must contain exactly one Metadata leader address",
-            ));
-        }
-        for endpoint in &self.endpoints {
-            Endpoint::from_shared(endpoint.clone())
-                .map_err(|_| invalid_config(METADATA_ADDRESSES, "contains an invalid address"))?;
-        }
+    /// Validates registration settings and returns their parsed Metadata endpoint.
+    pub fn validate(&self) -> Result<Endpoint, CommonError> {
+        let endpoint = Endpoint::from_shared(self.endpoint.clone())
+            .map_err(|_| invalid_config(METADATA_ADDRESSES, "contains an invalid address"))?;
         if self.request_timeout_ms == 0
             || self.retry_initial_backoff_ms == 0
             || self.retry_max_backoff_ms < self.retry_initial_backoff_ms
@@ -522,10 +512,34 @@ impl WorkerRegistrationConfig {
                 "requires positive timeout and ordered retry backoff",
             ));
         }
-        Ok(())
+        Ok(endpoint)
     }
 }
 
 fn invalid_config(key: &'static str, detail: &'static str) -> CommonError {
     CommonError::new(CommonErrorKind::InvalidArgument, format!("{key} {detail}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_addresses_require_one_leader() {
+        let defaults = WorkerRegistrationConfig::default();
+        for addresses in [vec![], vec![""], vec!["127.0.0.1:18080", "127.0.0.1:18081"]] {
+            let mut flat = FlatConfig::new();
+            flat.insert(METADATA_ADDRESSES.to_string(), serde_yaml::to_value(addresses).unwrap());
+            assert!(parse_metadata_config(&flat, &defaults).is_err());
+        }
+        let mut flat = FlatConfig::new();
+        flat.insert(
+            METADATA_ADDRESSES.to_string(),
+            serde_yaml::to_value(["127.0.0.1:18080"]).unwrap(),
+        );
+        assert_eq!(
+            parse_metadata_config(&flat, &defaults).unwrap().endpoint,
+            "http://127.0.0.1:18080"
+        );
+    }
 }

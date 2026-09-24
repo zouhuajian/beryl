@@ -5,8 +5,6 @@ syntax = "proto3";
 
 package common;
 
-import "common/common.proto";
-
 // RPC error model.
 //
 // ErrorKindProto records the failure fact. RecoveryActionProto records the
@@ -39,15 +37,12 @@ enum MetadataErrorKindProto {
   METADATA_ERROR_KIND_CONFLICT = 8;
   METADATA_ERROR_KIND_NOT_LEADER = 9;
   METADATA_ERROR_KIND_STALE_STATE = 10;
-  METADATA_ERROR_KIND_MOUNT_EPOCH_MISMATCH = 11;
-  METADATA_ERROR_KIND_ROUTE_EPOCH_MISMATCH = 12;
-  METADATA_ERROR_KIND_OWNER_GROUP_MISMATCH = 13;
-  METADATA_ERROR_KIND_GROUP_MISMATCH = 14;
-  METADATA_ERROR_KIND_FENCING = 15;
-  METADATA_ERROR_KIND_SESSION_INVALID = 16;
-  METADATA_ERROR_KIND_SESSION_EXPIRED = 17;
-  METADATA_ERROR_KIND_EPOCH_MISMATCH = 18;
-  METADATA_ERROR_KIND_RESOURCE_EXHAUSTED = 19;
+  METADATA_ERROR_KIND_OWNER_GROUP_MISMATCH = 11;
+  METADATA_ERROR_KIND_GROUP_MISMATCH = 12;
+  METADATA_ERROR_KIND_FENCING = 13;
+  METADATA_ERROR_KIND_SESSION_INVALID = 14;
+  METADATA_ERROR_KIND_SESSION_EXPIRED = 15;
+  METADATA_ERROR_KIND_RESOURCE_EXHAUSTED = 16;
 }
 
 enum WorkerErrorKindProto {
@@ -60,13 +55,12 @@ enum WorkerErrorKindProto {
   WORKER_ERROR_KIND_NODE_UNAVAILABLE = 6;
   WORKER_ERROR_KIND_TIMEOUT = 7;
   WORKER_ERROR_KIND_RESOURCE_EXHAUSTED = 8;
-  WORKER_ERROR_KIND_CONFLICT = 9;
-  WORKER_ERROR_KIND_CORRUPT = 10;
-  WORKER_ERROR_KIND_FENCING = 11;
-  WORKER_ERROR_KIND_CANCELLED = 12;
-  WORKER_ERROR_KIND_IO = 13;
+  WORKER_ERROR_KIND_CORRUPT = 9;
+  WORKER_ERROR_KIND_FENCING = 10;
+  WORKER_ERROR_KIND_CANCELLED = 11;
+  WORKER_ERROR_KIND_IO = 12;
   // A worker-owned local block or storage resource is absent.
-  WORKER_ERROR_KIND_NOT_FOUND = 14;
+  WORKER_ERROR_KIND_NOT_FOUND = 13;
 }
 
 enum ProtocolErrorKindProto {
@@ -75,26 +69,20 @@ enum ProtocolErrorKindProto {
   PROTOCOL_ERROR_KIND_INVALID_ARGUMENT = 2;
   PROTOCOL_ERROR_KIND_PERMISSION_DENIED = 3;
   PROTOCOL_ERROR_KIND_UNSUPPORTED = 4;
-  PROTOCOL_ERROR_KIND_CANCELLED = 5;
-  PROTOCOL_ERROR_KIND_CORRUPT = 6;
 }
 
 enum InternalErrorKindProto {
   INTERNAL_ERROR_KIND_UNSPECIFIED = 0;
   INTERNAL_ERROR_KIND_NODE_UNAVAILABLE = 1;
-  INTERNAL_ERROR_KIND_TIMEOUT = 2;
-  INTERNAL_ERROR_KIND_RESOURCE_EXHAUSTED = 3;
-  INTERNAL_ERROR_KIND_CANCELLED = 4;
-  INTERNAL_ERROR_KIND_CORRUPT = 5;
-  INTERNAL_ERROR_KIND_INTERNAL = 6;
+  INTERNAL_ERROR_KIND_INTERNAL = 2;
 }
 
 message RecoveryActionProto {
   oneof action {
     FailRecoveryProto fail = 1;
     RetryRecoveryProto retry = 2;
-    RefreshMetadataRecoveryProto refresh_metadata = 3;
-    ReopenWriteSessionRecoveryProto reopen_write_session = 4;
+    RefreshHintProto refresh_metadata = 3;
+    RefreshHintProto reopen_write_session = 4;
     RegisterWorkerRecoveryProto register_worker = 5;
     SendFullBlockReportRecoveryProto send_full_block_report = 6;
   }
@@ -106,14 +94,6 @@ message RetryRecoveryProto {
   optional uint64 after_ms = 1;
 }
 
-message RefreshMetadataRecoveryProto {
-  RefreshHintProto hint = 1;
-}
-
-message ReopenWriteSessionRecoveryProto {
-  RefreshHintProto hint = 1;
-}
-
 message RegisterWorkerRecoveryProto {}
 
 message SendFullBlockReportRecoveryProto {}
@@ -121,9 +101,4 @@ message SendFullBlockReportRecoveryProto {}
 message RefreshHintProto {
   optional string leader_endpoint = 1;
   optional string group_name = 2;
-  optional uint64 mount_epoch = 3;
-  optional string mount_prefix = 4;
-  optional uint64 route_epoch = 5;
-  repeated WorkerEndpointInfoProto worker_endpoints = 6;
-  bool worker_resolve_required = 7;
 }

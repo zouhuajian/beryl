@@ -35,16 +35,6 @@ impl WorkerRunId {
     pub fn parse(value: &str) -> Result<Self, uuid::Error> {
         Uuid::parse_str(value).map(Self)
     }
-
-    /// Create from a UUID.
-    pub const fn from_uuid(uuid: Uuid) -> Self {
-        Self(uuid)
-    }
-
-    /// Return the inner UUID.
-    pub const fn as_uuid(self) -> Uuid {
-        self.0
-    }
 }
 
 impl Default for WorkerRunId {

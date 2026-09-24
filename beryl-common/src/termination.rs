@@ -93,21 +93,6 @@ impl TerminationSignal {
             _ = self.terminate.recv() => TerminationKind::Terminate,
         }
     }
-
-    /// Starts the process-owned task that drives startup cancellation.
-    pub fn monitor(mut self) -> TerminationMonitor {
-        let cancellation = CancellationToken::new();
-        let task_cancellation = cancellation.clone();
-        let task = tokio::spawn(async move {
-            let signal = self.recv().await;
-            task_cancellation.cancel();
-            signal
-        });
-        TerminationMonitor {
-            cancellation,
-            task: Some(task),
-        }
-    }
 }
 
 /// Installed Ctrl-C receiver for platforms without Unix signal streams.
@@ -128,7 +113,9 @@ impl TerminationSignal {
         }
         TerminationKind::Interrupt
     }
+}
 
+impl TerminationSignal {
     /// Starts the process-owned task that drives startup cancellation.
     pub fn monitor(mut self) -> TerminationMonitor {
         let cancellation = CancellationToken::new();

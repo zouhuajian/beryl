@@ -9,8 +9,7 @@ impl RocksDBStorage {
         &self,
         operation_id: CreateFileOperationId,
     ) -> MetadataResult<Option<CreateFileReplayRecord>> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
+        let db = self.db();
         let cf = Self::cf(db, CF_META)?;
         let key = Self::encode_create_file_replay_key(operation_id);
         let Some(value) = db
@@ -19,14 +18,7 @@ impl RocksDBStorage {
         else {
             return Ok(None);
         };
-        let (record, consumed): (CreateFileReplayRecord, usize) = decode_from_slice(&value, standard())
-            .map_err(|error| MetadataError::Internal(format!("Failed to decode CreateFile replay record: {error}")))?;
-        if consumed != value.len() || record.operation_id != operation_id {
-            return Err(MetadataError::Internal(
-                "CreateFile replay record identity is corrupt".to_string(),
-            ));
-        }
-        Ok(Some(record))
+        Self::decode_create_file_replay(operation_id, &value).map(Some)
     }
 
     /// Load the replay record that temporarily reserves one newly created inode.
@@ -34,8 +26,7 @@ impl RocksDBStorage {
         &self,
         inode_id: InodeId,
     ) -> MetadataResult<Option<CreateFileReplayRecord>> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
+        let db = self.db();
         let cf = Self::cf(db, CF_META)?;
         let key = Self::encode_create_file_replay_inode_key(inode_id);
         let Some(value) = db.get_cf(cf, key).map_err(|error| {
@@ -56,78 +47,15 @@ impl RocksDBStorage {
         Ok(Some(record))
     }
 
-    /// Get the authoritative route epoch used for stale-route validation.
-    pub fn get_route_epoch(&self) -> MetadataResult<RouteEpoch> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf = db
-            .cf_handle(CF_META)
-            .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
-
-        match db.get_cf(cf, b"route_epoch") {
-            Ok(Some(value)) => {
-                let version: u64 = decode_from_slice(&value, standard())
-                    .map_err(|e| MetadataError::Internal(format!("Failed to deserialize route_epoch: {}", e)))?
-                    .0;
-                Ok(RouteEpoch::new(version))
-            }
-            Ok(None) => Ok(RouteEpoch::new(1)), // Default epoch
-            Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
-        }
-    }
-
-    /// Load a validated file capacity; missing files and directories return NotFound.
-    pub fn get_block_size(&self, inode_id: InodeId) -> MetadataResult<u32> {
-        let _generation = self.pin_generation()?;
-        self.get_block_size_optional(inode_id)?
-            .ok_or_else(|| MetadataError::NotFound(format!("Block capacity not found for inode {}", inode_id)))
-    }
-
-    pub(crate) fn get_block_size_optional(&self, inode_id: InodeId) -> MetadataResult<Option<u32>> {
-        self.get_inode(inode_id)?
-            .map(|inode| match inode.kind {
-                crate::inode::InodeKind::File(file) => {
-                    beryl_types::validate_block_size(u64::from(file.block_size))
-                        .map_err(|error| MetadataError::Internal(format!("invalid file block size: {error}")))?;
-                    Ok(Some(file.block_size))
-                }
-                crate::inode::InodeKind::Dir => Ok(None),
-            })
-            .transpose()
-            .map(Option::flatten)
-    }
-
-    fn get_meta_u64_optional(&self, key: &[u8], label: &str) -> MetadataResult<Option<u64>> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf = Self::cf(db, CF_META)?;
-        match db.get_cf(cf, key) {
-            Ok(Some(value)) => decode_from_slice(&value, standard())
-                .map(|decoded: (u64, usize)| Some(decoded.0))
-                .map_err(|error| MetadataError::Internal(format!("Failed to deserialize {label}: {error}"))),
-            Ok(None) => Ok(None),
-            Err(error) => Err(MetadataError::Internal(format!(
-                "RocksDB error reading {label}: {error}"
-            ))),
-        }
-    }
-
     pub(crate) fn bootstrap_namespace_state(
         &self,
         expected_group_name: &GroupName,
     ) -> MetadataResult<BootstrapNamespaceState> {
-        let _generation = self.pin_generation()?;
         let root_inode = self.get_inode(crate::mount::ROOT_INODE_ID)?;
-        let mounts = self.list_mounts()?;
-        let route_epoch = self.get_meta_u64_optional(b"route_epoch", "route_epoch")?;
-        let mount_epoch = self.get_meta_u64_optional(b"mount_epoch", "mount_epoch")?;
+        let mount = self.get_root_mount()?;
         let next_inode = self.get_next_inode_id()?;
-        let namespace_has_any_state = root_inode.is_some()
-            || !mounts.is_empty()
-            || route_epoch.is_some()
-            || mount_epoch.is_some()
-            || next_inode.is_some()
-            || self.max_inode_id()?.is_some();
+        let namespace_has_any_state =
+            root_inode.is_some() || mount.is_some() || next_inode.is_some() || self.max_inode_id()?.is_some();
         if !namespace_has_any_state {
             return Ok(BootstrapNamespaceState::Empty);
         }
@@ -135,25 +63,16 @@ impl RocksDBStorage {
         let matching_inode = root_inode.as_ref().is_some_and(|inode| {
             inode.inode_id == crate::mount::ROOT_INODE_ID
                 && inode.file_type().is_dir()
-                && matches!(inode.kind, crate::inode::InodeKind::Dir)
                 && inode.mount_id == MountId::new(1)
         });
-        let matching_mount = mounts.len() == 1
-            && mounts.first().is_some_and(|mount| {
-                mount.mount_id == MountId::new(1)
-                    && mount.mount_prefix == crate::mount::ROOT_MOUNT_PREFIX
-                    && mount.mount_kind == crate::mount::MountKind::Internal
-                    && mount.ufs_uri.is_none()
-                    && mount.data_io_policy == crate::mount::DataIoPolicy::Allow
-                    && mount.mount_epoch == 1
-                    && mount.namespace_owner_group_name == *expected_group_name
-                    && mount.root_inode_id == crate::mount::ROOT_INODE_ID
-            });
+        let matching_mount = mount.as_ref().is_some_and(|mount| {
+            mount.mount_id == MountId::new(1)
+                && mount.namespace_owner_group_name == *expected_group_name
+                && mount.root_inode_id == crate::mount::ROOT_INODE_ID
+        });
         if matching_inode
             && matching_mount
             && self.max_inode_id()? == Some(crate::mount::ROOT_INODE_ID)
-            && route_epoch == Some(1)
-            && mount_epoch == Some(1)
             && next_inode == Some(InodeId::new(2))
         {
             Ok(BootstrapNamespaceState::Matching)
@@ -164,7 +83,6 @@ impl RocksDBStorage {
 
     /// Read allocator state without consuming an inode ID.
     pub(crate) fn prepare_inode_allocation(&self) -> MetadataResult<InodeAllocation> {
-        let _generation = self.pin_generation()?;
         let inode_id = self.get_next_inode_id()?.ok_or_else(|| {
             MetadataError::Internal(
                 "next_inode_id allocator authority is missing; reformat metadata storage".to_string(),
@@ -180,7 +98,7 @@ impl RocksDBStorage {
                 "next_inode_id allocator exists without inode authority; reformat metadata storage".to_string(),
             )
         })?;
-        if inode_id.as_raw() <= max_inode_id.as_raw() || self.get_inode(inode_id)?.is_some() {
+        if inode_id.as_raw() <= max_inode_id.as_raw() {
             return Err(MetadataError::Internal(format!(
                 "next_inode_id allocator {inode_id} is not ahead of inode authority {max_inode_id}; reformat metadata storage"
             )));
@@ -197,11 +115,8 @@ impl RocksDBStorage {
 
     /// Read the durable next inode ID allocator value.
     pub fn get_next_inode_id(&self) -> MetadataResult<Option<InodeId>> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf_meta = db
-            .cf_handle(CF_META)
-            .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
+        let db = self.db();
+        let cf_meta = Self::cf(db, CF_META)?;
 
         match db.get_cf(cf_meta, NEXT_INODE_ID_KEY) {
             Ok(Some(value)) => {
@@ -215,54 +130,41 @@ impl RocksDBStorage {
         }
     }
 
-    /// Get one mount entry by its authority-local mount ID.
-    pub fn get_mount(&self, mount_id: MountId) -> MetadataResult<Option<MountEntry>> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf = db
-            .cf_handle(CF_MOUNTS)
-            .ok_or_else(|| MetadataError::Internal("Mounts CF not found".to_string()))?;
-        let key = mount_id.as_raw().to_string();
-
-        match db.get_cf(cf, key.as_bytes()) {
-            Ok(Some(value)) => {
-                let entry: MountEntry = decode_from_slice(&value, standard())
-                    .map_err(|e| MetadataError::Internal(format!("Failed to deserialize MountEntry: {}", e)))?
-                    .0;
-                Ok(Some(entry))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
-        }
+    pub(crate) fn get_mount(&self, mount_id: MountId) -> MetadataResult<Option<MountEntry>> {
+        Ok(self.get_root_mount()?.filter(|root| root.mount_id == mount_id))
     }
 
-    /// List all mount entries.
-    pub fn list_mounts(&self) -> MetadataResult<Vec<MountEntry>> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf = db
-            .cf_handle(CF_MOUNTS)
-            .ok_or_else(|| MetadataError::Internal("Mounts CF not found".to_string()))?;
-
-        let mut mounts = Vec::new();
-        let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-
-        for item in iter {
-            let (_, value) = item.map_err(|e| MetadataError::Internal(format!("RocksDB iterator error: {}", e)))?;
-            let entry: MountEntry = decode_from_slice(&value, standard())
-                .map_err(|e| MetadataError::Internal(format!("Failed to deserialize MountEntry: {}", e)))?
-                .0;
-            mounts.push(entry);
+    /// Read the only supported namespace authority, rejecting extra or corrupt records.
+    pub(crate) fn get_root_mount(&self) -> MetadataResult<Option<MountEntry>> {
+        let db = self.db();
+        let cf = Self::cf(db, CF_MOUNTS)?;
+        let mut records = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let Some(record) = records.next() else {
+            return Ok(None);
+        };
+        let (key, value) = record.map_err(|error| MetadataError::Internal(format!("read root mount: {error}")))?;
+        if key.as_ref() != b"1"
+            || records
+                .next()
+                .transpose()
+                .map_err(|error| MetadataError::Internal(format!("read root mount: {error}")))?
+                .is_some()
+        {
+            return Err(MetadataError::Internal("unexpected namespace mount record".into()));
         }
-
-        Ok(mounts)
+        let (entry, consumed): (MountEntry, usize) = decode_from_slice(&value, standard())
+            .map_err(|error| MetadataError::Internal(format!("decode root mount: {error}")))?;
+        if consumed != value.len() {
+            return Err(MetadataError::Internal("root mount has trailing bytes".into()));
+        }
+        entry.validate_root()?;
+        Ok(Some(entry))
     }
 
     /// Get one detached-root authority marker.
     pub(crate) fn get_detached_root(&self, inode_id: InodeId) -> MetadataResult<Option<DetachedRoot>> {
         crate::observe::record_rocksdb_read("detached_root");
-        let generation = self.pin_generation()?;
-        let db = generation.db();
+        let db = self.db();
         let cf = Self::cf(db, CF_DETACHED_ROOTS)?;
         let key = Self::encode_detached_root_key(inode_id);
         match db.get_cf(cf, key) {
@@ -285,8 +187,7 @@ impl RocksDBStorage {
             ));
         }
         crate::observe::record_rocksdb_read("detached_root_scan");
-        let generation = self.pin_generation()?;
-        let db = generation.db();
+        let db = self.db();
         let cf = Self::cf(db, CF_DETACHED_ROOTS)?;
         let mut roots = Vec::with_capacity(max_entries);
         let mut has_more = false;
@@ -304,51 +205,18 @@ impl RocksDBStorage {
         Ok((roots, has_more))
     }
 
-    pub fn prepare_worker_registration(
-        &self,
-        group_name: GroupName,
-        worker_id: WorkerId,
-        address: String,
-        worker_net_protocol: i32,
-        fault_domain: Option<String>,
-    ) -> MetadataResult<WorkerInfo> {
-        let _generation = self.pin_generation()?;
-        if worker_id.as_raw() == 0 {
-            return Err(MetadataError::InvalidArgument(
-                "worker_id must be non-zero for registration".to_string(),
-            ));
-        }
-        Ok(WorkerInfo {
-            group_name,
-            worker_id,
-            address,
-            worker_net_protocol,
-            capacity_total: 0,
-            capacity_used: 0,
-            capacity_available: 0,
-            active_reads: 0,
-            active_writes: 0,
-            health: crate::worker::HealthStatus::Healthy,
-            last_heartbeat: 0,
-            fault_domain,
-        })
-    }
-
     /// List all workers.
-    pub fn list_workers(&self) -> MetadataResult<Vec<WorkerInfo>> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf = db
-            .cf_handle(CF_WORKERS)
-            .ok_or_else(|| MetadataError::Internal("Workers CF not found".to_string()))?;
+    pub fn list_workers(&self) -> MetadataResult<Vec<WorkerDescriptor>> {
+        let db = self.db();
+        let cf = Self::cf(db, CF_WORKERS)?;
 
         let mut workers = Vec::new();
         let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
 
         for item in iter {
             let (_, value) = item.map_err(|e| MetadataError::Internal(format!("RocksDB iterator error: {}", e)))?;
-            let info: WorkerInfo = decode_from_slice(&value, standard())
-                .map_err(|e| MetadataError::Internal(format!("Failed to deserialize WorkerInfo: {}", e)))?
+            let info: WorkerDescriptor = decode_from_slice(&value, standard())
+                .map_err(|e| MetadataError::Internal(format!("Failed to deserialize WorkerDescriptor: {}", e)))?
                 .0;
             workers.push(info);
         }
@@ -359,11 +227,8 @@ impl RocksDBStorage {
     /// Get inode by ID.
     pub fn get_inode(&self, inode_id: InodeId) -> MetadataResult<Option<Inode>> {
         crate::observe::record_rocksdb_read("inode");
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf = db
-            .cf_handle(CF_INODES)
-            .ok_or_else(|| MetadataError::Internal("Inodes CF not found".to_string()))?;
+        let db = self.db();
+        let cf = Self::cf(db, CF_INODES)?;
         let key = Self::encode_inode_key(inode_id);
 
         match db.get_cf(cf, &key) {
@@ -379,11 +244,8 @@ impl RocksDBStorage {
 
     /// Return the largest inode ID currently present in storage.
     pub fn max_inode_id(&self) -> MetadataResult<Option<InodeId>> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf = db
-            .cf_handle(CF_INODES)
-            .ok_or_else(|| MetadataError::Internal("Inodes CF not found".to_string()))?;
+        let db = self.db();
+        let cf = Self::cf(db, CF_INODES)?;
 
         let Some(item) = db.iterator_cf(cf, rocksdb::IteratorMode::End).next() else {
             return Ok(None);
@@ -426,11 +288,8 @@ impl RocksDBStorage {
     /// Get dentry (parent_inode_id, name) -> child_inode_id
     pub fn get_dentry(&self, parent_inode_id: InodeId, name: &str) -> MetadataResult<Option<InodeId>> {
         crate::observe::record_rocksdb_read("dentry");
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf = db
-            .cf_handle(CF_DENTRIES)
-            .ok_or_else(|| MetadataError::Internal("Dentries CF not found".to_string()))?;
+        let db = self.db();
+        let cf = Self::cf(db, CF_DENTRIES)?;
         let key = Self::encode_dentry_key(parent_inode_id, name);
 
         match db.get_cf(cf, &key) {
@@ -453,21 +312,15 @@ impl RocksDBStorage {
 
     /// Read a bounded first page for destructive detached-root reclamation.
     ///
-    /// Unlike user-facing directory listing, malformed keys and values are
-    /// fatal here because skipping one could retire a non-empty root.
+    /// Malformed keys and values are fatal because skipping one could retire
+    /// a non-empty root.
     pub(crate) fn list_dentries_for_reclaim(
         &self,
         parent_inode_id: InodeId,
         max_entries: usize,
     ) -> MetadataResult<(Vec<(String, InodeId)>, bool)> {
-        if max_entries == 0 {
-            return Err(MetadataError::InvalidArgument(
-                "detached-root dentry scan requires a positive entry limit".to_string(),
-            ));
-        }
         crate::observe::record_rocksdb_read("detached_root_dentry_scan");
-        let generation = self.pin_generation()?;
-        let db = generation.db();
+        let db = self.db();
         let cf = Self::cf(db, CF_DENTRIES)?;
         let prefix = Self::encode_dentry_key(parent_inode_id, "");
         let mut entries = Vec::with_capacity(max_entries);
@@ -481,10 +334,10 @@ impl RocksDBStorage {
             if entries.len() == max_entries {
                 return Ok((entries, false));
             }
-            let (decoded_parent, name) = Self::decode_dentry_key(&key).ok_or_else(|| {
+            let (_, name) = Self::decode_dentry_key(&key).ok_or_else(|| {
                 MetadataError::Internal(format!("Malformed dentry key under detached root {parent_inode_id}"))
             })?;
-            if decoded_parent != parent_inode_id || value.len() != 8 {
+            if value.len() != 8 {
                 return Err(MetadataError::Internal(format!(
                     "Malformed dentry under detached root {parent_inode_id}"
                 )));
@@ -513,17 +366,9 @@ impl RocksDBStorage {
         cursor_key: Option<&[u8]>,
         max_entries: usize,
     ) -> MetadataResult<DentryPage> {
-        if max_entries == 0 {
-            return Err(MetadataError::InvalidArgument(
-                "ListStatus page size must be positive".to_string(),
-            ));
-        }
         crate::observe::record_rocksdb_read("dentry_scan");
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf = db
-            .cf_handle(CF_DENTRIES)
-            .ok_or_else(|| MetadataError::Internal("Dentries CF not found".to_string()))?;
+        let db = self.db();
+        let cf = Self::cf(db, CF_DENTRIES)?;
 
         let prefix = Self::encode_dentry_key(parent_inode_id, "");
 
@@ -560,10 +405,10 @@ impl RocksDBStorage {
                 }
             }
 
-            let (decoded_parent, name) = Self::decode_dentry_key(&key).ok_or_else(|| {
+            let (_, name) = Self::decode_dentry_key(&key).ok_or_else(|| {
                 MetadataError::Internal(format!("Malformed dentry key under parent inode {parent_inode_id}"))
             })?;
-            if decoded_parent != parent_inode_id || name.is_empty() || value.len() != 8 {
+            if name.is_empty() || value.len() != 8 {
                 return Err(MetadataError::Internal(format!(
                     "Malformed dentry under parent inode {parent_inode_id}"
                 )));
@@ -584,16 +429,15 @@ impl RocksDBStorage {
                     false
                 };
                 let next_cursor_key = if has_more { Some(key.to_vec()) } else { None };
-                return Ok((entries, next_cursor_key, !has_more));
+                return Ok((entries, next_cursor_key));
             }
         }
-        Ok((entries, None, true))
+        Ok((entries, None))
     }
 
     /// Check if directory is empty (has no dentries).
     pub fn is_directory_empty(&self, parent_inode_id: InodeId) -> MetadataResult<bool> {
-        let _generation = self.pin_generation()?;
-        let (entries, _, _) = self.list_dentries_with_cursor(parent_inode_id, None, 1)?;
+        let (entries, _) = self.list_dentries_with_cursor(parent_inode_id, None, 1)?;
         Ok(entries.is_empty())
     }
 }
@@ -603,6 +447,27 @@ mod tests {
     use super::*;
     use crate::inode::InodeAttrs;
 
+    #[test]
+    fn root_authority_rejects_extra_records_and_invalid_identity() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let storage = RocksDBStorage::create_for_format(directory.path()).unwrap();
+        let mut root = MountEntry {
+            mount_id: crate::mount::ROOT_MOUNT_ID,
+            namespace_owner_group_name: GroupName::parse("root").unwrap(),
+            root_inode_id: crate::mount::ROOT_INODE_ID,
+        };
+        storage.put_mount(&root).unwrap();
+        assert!(storage.get_root_mount().unwrap().is_some());
+        root.root_inode_id = InodeId::new(99);
+        storage.put_mount(&root).unwrap();
+        assert!(storage.get_root_mount().is_err());
+        root.root_inode_id = crate::mount::ROOT_INODE_ID;
+        storage.put_mount(&root).unwrap();
+        root.mount_id = MountId::new(2);
+        storage.put_mount(&root).unwrap();
+        assert!(storage.get_root_mount().is_err());
+    }
+
     use tempfile::TempDir;
 
     impl RocksDBStorage {
@@ -611,9 +476,8 @@ mod tests {
             &self,
             group_name: &GroupName,
             worker_id: WorkerId,
-        ) -> MetadataResult<Option<WorkerInfo>> {
-            let generation = self.pin_generation()?;
-            let db = generation.db();
+        ) -> MetadataResult<Option<WorkerDescriptor>> {
+            let db = self.db();
             let cf = db
                 .cf_handle(CF_WORKERS)
                 .ok_or_else(|| MetadataError::Internal("Workers CF not found".to_string()))?;
@@ -621,8 +485,8 @@ mod tests {
 
             match db.get_cf(cf, key.as_bytes()) {
                 Ok(Some(value)) => {
-                    let info: WorkerInfo = decode_from_slice(&value, standard())
-                        .map_err(|e| MetadataError::Internal(format!("Failed to deserialize WorkerInfo: {}", e)))?
+                    let info: WorkerDescriptor = decode_from_slice(&value, standard())
+                        .map_err(|e| MetadataError::Internal(format!("Failed to deserialize WorkerDescriptor: {}", e)))?
                         .0;
                     Ok(Some(info))
                 }
@@ -650,7 +514,7 @@ mod tests {
 
     fn put_numbered_dentries(storage: &RocksDBStorage, parent_inode_id: InodeId, count: usize) {
         storage
-            .with_pinned_db(|db| {
+            .with_db(|db| {
                 let cf = db
                     .cf_handle(CF_DENTRIES)
                     .ok_or_else(|| MetadataError::Internal("Dentries CF not found".to_string()))?;
@@ -675,7 +539,7 @@ mod tests {
     fn list_dentries_with_cursor_fails_closed_on_malformed_dentry() {
         let (_tmp_dir, storage) = setup_dir_with_entries(InodeId::new(1), &[]);
         storage
-            .with_pinned_db(|db| {
+            .with_db(|db| {
                 let cf = db
                     .cf_handle(CF_DENTRIES)
                     .ok_or_else(|| MetadataError::Internal("Dentries CF not found".to_string()))?;
@@ -695,7 +559,7 @@ mod tests {
     fn list_dentries_with_cursor_fails_closed_on_malformed_dentry_key() {
         let (_tmp_dir, storage) = setup_dir_with_entries(InodeId::new(1), &[]);
         storage
-            .with_pinned_db(|db| {
+            .with_db(|db| {
                 let cf = db
                     .cf_handle(CF_DENTRIES)
                     .ok_or_else(|| MetadataError::Internal("Dentries CF not found".to_string()))?;
@@ -725,7 +589,7 @@ mod tests {
         let mut cursor = None;
         let mut expected_index = 0;
         loop {
-            let (page, next_cursor, eof) = storage
+            let (page, next_cursor) = storage
                 .list_dentries_with_cursor(parent_inode_id, cursor.as_deref(), PAGE_SIZE)
                 .unwrap();
             assert!(!page.is_empty());
@@ -735,8 +599,7 @@ mod tests {
                 assert_eq!(child_inode_id, InodeId::new(expected_index as u64 + 2));
                 expected_index += 1;
             }
-            assert_eq!(next_cursor.is_none(), eof);
-            if eof {
+            if next_cursor.is_none() {
                 break;
             }
             cursor = next_cursor;

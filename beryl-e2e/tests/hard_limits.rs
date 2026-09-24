@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-use std::path::Path;
-
 use beryl_e2e::TestCluster;
 use beryl_proto::common::RequestHeaderProto;
 use beryl_proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
@@ -14,11 +12,9 @@ const METADATA_REQUEST_LIMIT: usize = 4 * 1024 * 1024;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_metadata_services_reject_requests_above_four_mebibytes() {
-    let mut cluster = TestCluster::start().await.expect("start cluster");
-    cluster
-        .start_metadata_process(Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
         .await
-        .expect("start production metadata runtime");
+        .expect("start cluster");
     let endpoint = cluster.metadata_endpoint();
     let mut filesystem = FileSystemServiceProtoClient::connect(endpoint.clone())
         .await

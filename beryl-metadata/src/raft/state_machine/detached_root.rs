@@ -29,7 +29,7 @@ impl AppRaftStateMachine {
         let max_entries = max_entries as usize;
         let max_batch_bytes = max_batch_bytes as usize;
         let mut update = DetachedRootReclaimUpdate::default();
-        let mut logical_batch_bytes = update.logical_batch_bytes(raft_state)?;
+        let mut logical_batch_bytes = DetachedRootReclaimUpdate::raft_state_logical_bytes(raft_state)?;
         if logical_batch_bytes > max_batch_bytes {
             return Err(MetadataError::Internal(format!(
                 "Raft apply state requires {logical_batch_bytes} logical bytes, exceeding detached-root batch budget {max_batch_bytes}"
@@ -38,8 +38,6 @@ impl AppRaftStateMachine {
 
         let mut seen_candidates = BTreeSet::new();
         let mut planned_entry_inode_ids = BTreeSet::new();
-        let mut processed_entries = 0usize;
-        let mut created_roots = 0usize;
 
         'candidates: for root_inode_id in candidate_root_inode_ids {
             if !seen_candidates.insert(root_inode_id) {
@@ -49,12 +47,12 @@ impl AppRaftStateMachine {
                 continue;
             };
             let mount_root_inode_id = self.validate_detached_root(root_inode_id, detached_root)?;
-            let scan_limit = max_entries.saturating_sub(processed_entries).max(1);
+            let scan_limit = max_entries.saturating_sub(update.entries.len()).max(1);
             let (entries, eof) = self.storage.list_dentries_for_reclaim(root_inode_id, scan_limit)?;
             let mut consumed_page = true;
 
             for (name, child_inode_id) in entries {
-                if processed_entries == max_entries {
+                if update.entries.len() == max_entries {
                     consumed_page = false;
                     break;
                 }
@@ -71,9 +69,7 @@ impl AppRaftStateMachine {
                     mount_root_inode_id,
                 )?;
                 let entry_logical_bytes = entry.logical_bytes()?;
-                let next_logical_bytes = logical_batch_bytes
-                    .checked_add(entry_logical_bytes)
-                    .ok_or_else(|| MetadataError::Internal("detached-root logical byte count overflow".to_string()))?;
+                let next_logical_bytes = logical_batch_bytes + entry_logical_bytes;
                 if next_logical_bytes > max_batch_bytes {
                     if update.entries.is_empty() && update.completed_root_inode_ids.is_empty() {
                         return Err(MetadataError::Internal(format!(
@@ -83,17 +79,13 @@ impl AppRaftStateMachine {
                     break 'candidates;
                 }
 
-                created_roots += usize::from(entry.child_detached_root.is_some());
                 update.entries.push(entry);
-                processed_entries += 1;
                 logical_batch_bytes = next_logical_bytes;
             }
 
             if consumed_page && eof {
-                let completion_bytes = DetachedRootReclaimUpdate::completed_root_logical_bytes(root_inode_id)?;
-                let next_logical_bytes = logical_batch_bytes
-                    .checked_add(completion_bytes)
-                    .ok_or_else(|| MetadataError::Internal("detached-root logical byte count overflow".to_string()))?;
+                let completion_bytes = DetachedRootReclaimUpdate::COMPLETED_ROOT_LOGICAL_BYTES;
+                let next_logical_bytes = logical_batch_bytes + completion_bytes;
                 if next_logical_bytes > max_batch_bytes {
                     if update.entries.is_empty() && update.completed_root_inode_ids.is_empty() {
                         return Err(MetadataError::Internal(format!(
@@ -107,21 +99,12 @@ impl AppRaftStateMachine {
             }
         }
 
-        let verified_logical_bytes = update.logical_batch_bytes(raft_state)?;
-        if verified_logical_bytes != logical_batch_bytes {
-            return Err(MetadataError::Internal(format!(
-                "detached-root logical byte accounting diverged: prepared={logical_batch_bytes}, verified={verified_logical_bytes}"
-            )));
-        }
-        let completed_roots = update.completed_root_inode_ids.len();
+        let processed_entries = update.entries.len();
         self.storage.reclaim_detached_roots_atomic(update, raft_state)?;
 
         Ok(DetachedRootReclaimResult {
             processed_entries: u32::try_from(processed_entries)
                 .expect("processed entries are bounded by a u32 protocol limit"),
-            completed_roots: u32::try_from(completed_roots)
-                .expect("candidate roots are bounded by a u32 protocol limit"),
-            created_roots: u32::try_from(created_roots).expect("created roots are bounded by a u32 protocol limit"),
             logical_batch_bytes: u32::try_from(logical_batch_bytes)
                 .expect("logical bytes are bounded by a u32 protocol limit"),
         })
@@ -183,12 +166,6 @@ impl AppRaftStateMachine {
                 detached_root.mount_id
             ))
         })?;
-        if mount.mount_id != detached_root.mount_id {
-            return Err(MetadataError::Internal(format!(
-                "mount key {} contains mount {} while reclaiming inode {root_inode_id}",
-                detached_root.mount_id, mount.mount_id
-            )));
-        }
         if mount.root_inode_id == root_inode_id {
             return Err(MetadataError::Internal(format!(
                 "mount root inode {root_inode_id} cannot be a DetachedRoot"
@@ -347,29 +324,23 @@ mod tests {
 
         let first = reclaim(&state_machine, vec![root_id], 2).unwrap();
         assert_eq!(first.processed_entries, 2);
-        assert_eq!(first.created_roots, 1);
-        assert_eq!(first.completed_roots, 0);
         assert!(first.logical_batch_bytes <= MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES);
         assert_eq!(storage.get_detached_root(child_dir_id).unwrap(), Some(marker));
         assert!(storage.get_inode(file_id).unwrap().is_none());
-        assert!(storage.get_block_size_optional(file_id).unwrap().is_none());
         assert!(storage.get_inode(root_id).unwrap().is_some());
 
         let second = reclaim(&state_machine, vec![root_id], 2).unwrap();
         assert_eq!(second.processed_entries, 1);
-        assert_eq!(second.completed_roots, 1);
         assert!(storage.get_inode(root_id).unwrap().is_none());
         assert!(storage.get_detached_root(root_id).unwrap().is_none());
         assert!(storage.get_inode(second_file_id).unwrap().is_none());
 
         let third = reclaim(&state_machine, vec![child_dir_id], 2).unwrap();
         assert_eq!(third.processed_entries, 0);
-        assert_eq!(third.completed_roots, 1);
         assert!(storage.get_inode(child_dir_id).unwrap().is_none());
 
         let replay = reclaim(&state_machine, vec![root_id, child_dir_id, root_id], 2).unwrap();
         assert_eq!(replay.processed_entries, 0);
-        assert_eq!(replay.completed_roots, 0);
     }
 
     #[test]
@@ -393,7 +364,6 @@ mod tests {
         let state_machine = AppRaftStateMachine::new(Arc::clone(&storage));
         let second = reclaim(&state_machine, vec![root_id], 1).unwrap();
         assert_eq!(second.processed_entries, 1);
-        assert_eq!(second.completed_roots, 1);
         assert!(storage.get_detached_root(root_id).unwrap().is_none());
         assert!(storage.get_inode(root_id).unwrap().is_none());
     }
@@ -450,8 +420,8 @@ mod tests {
         assert!(result.processed_entries < 64);
         assert!(result.logical_batch_bytes <= MIN_RECLAIM_DETACHED_ROOT_BATCH_BYTES);
         assert!(storage.get_detached_root(root_id).unwrap().is_some());
-        let (remaining, _, eof) = storage.list_dentries_with_cursor(root_id, None, 64).unwrap();
-        assert!(eof);
+        let (remaining, next_cursor) = storage.list_dentries_with_cursor(root_id, None, 64).unwrap();
+        assert!(next_cursor.is_none());
         assert_eq!(remaining.len(), 64 - result.processed_entries as usize);
     }
 
@@ -468,13 +438,17 @@ mod tests {
 
         let result = reclaim(
             &state_machine,
-            candidates.into_iter().map(|(inode_id, _)| inode_id).collect(),
+            candidates.iter().map(|(inode_id, _)| *inode_id).collect(),
             MAX_RECLAIM_DETACHED_ROOT_ENTRIES,
         )
         .unwrap();
 
         assert_eq!(result.processed_entries, 0);
-        assert_eq!(result.completed_roots, MAX_RECLAIM_DETACHED_ROOT_CANDIDATES);
+        for (inode_id, _) in &candidates {
+            assert!(storage.get_detached_root(*inode_id).unwrap().is_none());
+            assert!(storage.get_inode(*inode_id).unwrap().is_none());
+        }
+
         assert!(result.logical_batch_bytes <= MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES);
         let (next_candidates, still_has_more) = storage
             .list_detached_roots(MAX_RECLAIM_DETACHED_ROOT_CANDIDATES as usize)

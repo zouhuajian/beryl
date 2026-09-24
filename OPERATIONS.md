@@ -1,8 +1,8 @@
 # Beryl Operations Manual
 
-This manual covers the packaged single-Metadata, single-Worker internal alpha
-on a systemd Linux host. It does not define mixed-version upgrades, Metadata
-HA, replication, or online backup and restore.
+This manual covers the packaged single-Metadata, single-Worker runtime
+on a systemd Linux host. It does not define Metadata HA, replication, or
+online backup and restore.
 
 ## Installed layout
 
@@ -50,12 +50,7 @@ sudo -u beryl sh -c '
 ```
 
 Never run `format metadata` against an initialized deployment. Formatting is
-not an upgrade or repair operation.
-
-Metadata storage and snapshots use schema version 6. Older schemas are rejected
-because publication and commit records use different field names. No in-place
-migration is provided; existing deployments must retain their matching binaries
-and data together. Do not reformat existing storage to bypass this check.
+only for initializing new storage, not repairing existing state.
 
 ## Start, stop, and restart
 
@@ -208,16 +203,7 @@ per-session value cannot exceed the compiled file extent maximum.
 `beryl.file.block-size` sets the logical capacity of newly created files
 (default `64MiB`, maximum `1GiB`). Metadata persists the capacity in each file;
 changing the setting does not resize existing files or their append targets.
-Transport frame sizes are independent of this capacity. Worker data and
-checkpoint encoding is versioned locally in the `BRYL` header.
-
-Metadata storage schema 5 and Worker local format 3 reject older persisted
-encodings. There is no automatic data migration or directory cleanup. Keep old
-data with its matching binaries; use separate fresh storage for a clean installation.
-
-The current alpha supports clean installation and same-version restart only.
-Do not perform an in-place upgrade, downgrade, mixed-version deployment, or
-rollback with these procedures.
+Transport frame sizes are independent of this capacity.
 
 ## Logs
 
@@ -321,10 +307,8 @@ grace period, scan interval, heartbeat delivery, and Worker execution. Monitor
 the Metadata and Worker cleanup metrics instead of deleting block files by
 hand.
 
-Do not copy live RocksDB or Worker block directories as an online backup. The
-current alpha has no supported online backup, restore, or cross-version data
-migration contract. Preserve state only during a controlled same-version
-offline investigation, with both services stopped.
+Do not copy live RocksDB or Worker block directories as an online backup.
+Preserve state for offline investigation with both services stopped.
 
 ## Initial diagnostics
 

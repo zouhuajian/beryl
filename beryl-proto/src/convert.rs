@@ -11,10 +11,9 @@ use crate::common::recovery_action_proto::Action;
 use crate::common::{
     BlockIdProto, ByteRangeProto, CallerContextProto, ClientIdProto, ClientInfoProto, ErrorDetailProto, ErrorKindProto,
     FailRecoveryProto, FencingTokenProto, GroupStateWatermarkProto, InternalErrorKindProto, MetadataErrorKindProto,
-    ProtocolErrorKindProto, RaftLogIdProto, RecoveryActionProto, RefreshHintProto, RefreshMetadataRecoveryProto,
-    RegisterWorkerRecoveryProto, ReopenWriteSessionRecoveryProto, RequestHeaderProto, ResponseHeaderProto,
-    RetryRecoveryProto, SendFullBlockReportRecoveryProto, TierProto, TraceContextProto, WorkerEndpointInfoProto,
-    WorkerErrorKindProto,
+    ProtocolErrorKindProto, RaftLogIdProto, RecoveryActionProto, RefreshHintProto, RegisterWorkerRecoveryProto,
+    RequestHeaderProto, ResponseHeaderProto, RetryRecoveryProto, SendFullBlockReportRecoveryProto, TierProto,
+    TraceContextProto, WorkerEndpointInfoProto, WorkerErrorKindProto,
 };
 use crate::metadata::{
     CommittedBlockProto, FileBlockLocationProto, FileStatusProto, FileTypeProto, LocatedBlockProto, OpenWriteModeProto,
@@ -23,7 +22,7 @@ use crate::metadata::{
 use ::beryl_common::Deadline;
 use ::beryl_common::error::rpc::{
     ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail,
-    WorkerEndpointHint, WorkerErrorKind,
+    WorkerErrorKind,
 };
 use ::beryl_common::header::{CallerContext, ClientInfo, RequestHeader, ResponseHeader, TraceContext};
 use beryl_types::fs::{validate_block_size, validate_effective_len};
@@ -99,9 +98,6 @@ pub fn required_client_id(proto: Option<ClientIdProto>, field_name: &str) -> Res
 
 /// Parse a required call UUID field without choosing caller error policy.
 pub fn require_call_id(value: &str, field_name: &str) -> Result<CallId, String> {
-    if value.is_empty() {
-        return Err(format!("{field_name} must not be empty"));
-    }
     CallId::parse(value).map_err(|err| format!("{field_name} {err}"))
 }
 
@@ -245,7 +241,6 @@ impl TryFrom<WriteHandleProto> for WriteHandle {
 impl From<FencingToken> for FencingTokenProto {
     fn from(token: FencingToken) -> Self {
         FencingTokenProto {
-            block_id: Some(token.block_id.into()),
             owner: Some(token.owner.into()),
             epoch: token.epoch.as_raw(),
         }
@@ -256,9 +251,8 @@ impl TryFrom<FencingTokenProto> for FencingToken {
     type Error = String;
 
     fn try_from(token: FencingTokenProto) -> Result<Self, Self::Error> {
-        let block_id = required_block_id(token.block_id, "block_id in token")?;
         let owner = required_client_id(token.owner, "owner in token")?;
-        Ok(FencingToken::new(block_id, owner, LeaseEpoch::new(token.epoch)))
+        Ok(FencingToken::new(owner, LeaseEpoch::new(token.epoch)))
     }
 }
 
@@ -269,9 +263,6 @@ pub fn required_fencing_token(proto: Option<FencingTokenProto>, field_name: &str
 
 /// Parse a required worker process-run identifier field without choosing caller error policy.
 pub fn require_worker_run_id(value: &str, field_name: &str) -> Result<WorkerRunId, String> {
-    if value.is_empty() {
-        return Err(format!("{field_name} must not be empty"));
-    }
     WorkerRunId::parse(value).map_err(|err| format!("{field_name} invalid: {err}"))
 }
 
@@ -310,33 +301,19 @@ impl TryFrom<WorkerEndpointInfoProto> for WorkerEndpointInfo {
     type Error = String;
 
     fn try_from(endpoint: WorkerEndpointInfoProto) -> Result<Self, Self::Error> {
-        worker_endpoint_info_from_parts(
-            WorkerId::new(endpoint.worker_id),
-            endpoint.endpoint,
-            endpoint.worker_run_id,
-        )
+        if endpoint.worker_id == 0 {
+            return Err("WorkerEndpointInfoProto.worker_id must be non-zero".to_string());
+        }
+        if endpoint.endpoint.is_empty() {
+            return Err("WorkerEndpointInfoProto.endpoint must not be empty".to_string());
+        }
+        let worker_run_id = require_worker_run_id(&endpoint.worker_run_id, "WorkerEndpointInfoProto.worker_run_id")?;
+        Ok(Self {
+            worker_id: WorkerId::new(endpoint.worker_id),
+            endpoint: endpoint.endpoint,
+            worker_run_id,
+        })
     }
-}
-
-/// Build a shared worker endpoint value from raw wire-shaped fields.
-///
-pub fn worker_endpoint_info_from_parts(
-    worker_id: WorkerId,
-    endpoint: String,
-    worker_run_id: String,
-) -> Result<WorkerEndpointInfo, String> {
-    if worker_id.as_raw() == 0 {
-        return Err("WorkerEndpointInfoProto.worker_id must be non-zero".to_string());
-    }
-    if endpoint.is_empty() {
-        return Err("WorkerEndpointInfoProto.endpoint must not be empty".to_string());
-    }
-    let worker_run_id = require_worker_run_id(&worker_run_id, "WorkerEndpointInfoProto.worker_run_id")?;
-    Ok(WorkerEndpointInfo {
-        worker_id,
-        endpoint,
-        worker_run_id,
-    })
 }
 
 impl From<&WorkerEndpointInfo> for WorkerEndpointInfoProto {
@@ -359,7 +336,7 @@ impl From<WorkerEndpointInfo> for WorkerEndpointInfoProto {
     }
 }
 
-/// Validate write locations, block shape, and matching fencing identity at the wire boundary.
+/// Validate block identity, write locations, capacity, and writer fields at the wire boundary.
 impl TryFrom<LocatedBlockProto> for LocatedBlock {
     type Error = String;
 
@@ -375,9 +352,6 @@ impl TryFrom<LocatedBlockProto> for LocatedBlock {
         let tier = parse_known_tier(target.tier).map_err(|err| format!("LocatedBlockProto.tier invalid: {err}"))?;
         let block_id = required_block_id(target.block_id, "LocatedBlockProto.block_id")?;
         let fencing_token = required_fencing_token(target.fencing_token, "LocatedBlockProto.fencing_token")?;
-        if fencing_token.block_id != block_id {
-            return Err("LocatedBlockProto.fencing_token block_id must match block_id".to_string());
-        }
         if fencing_token.epoch.as_raw() == 0 {
             return Err("LocatedBlockProto.fencing_token owner and epoch must be non-zero".to_string());
         }
@@ -459,13 +433,9 @@ impl TryFrom<FileBlockLocationProto> for FileBlockLocation {
     type Error = String;
 
     fn try_from(location: FileBlockLocationProto) -> Result<Self, Self::Error> {
-        if location.len == 0 {
-            return Err("FileBlockLocationProto.len must be non-zero".to_string());
-        }
-
         validate_block_size(location.block_size)
             .map_err(|err| format!("FileBlockLocationProto invalid block shape: {err}"))?;
-        validate_effective_len(location.block_size, location.effective_len)
+        validate_effective_len(location.block_size, location.len)
             .map_err(|err| format!("FileBlockLocationProto invalid block shape: {err}"))?;
         let block_id = required_block_id(location.block_id, "FileBlockLocationProto.block_id")?;
         let workers = location
@@ -480,7 +450,6 @@ impl TryFrom<FileBlockLocationProto> for FileBlockLocation {
             workers,
 
             block_size: location.block_size,
-            effective_len: location.effective_len,
         })
     }
 }
@@ -493,7 +462,6 @@ impl From<&FileBlockLocation> for FileBlockLocationProto {
             len: location.len,
             workers: location.workers.iter().map(Into::into).collect(),
             block_size: location.block_size,
-            effective_len: location.effective_len,
         }
     }
 }
@@ -506,7 +474,6 @@ impl From<FileBlockLocation> for FileBlockLocationProto {
             len: location.len,
             workers: location.workers.into_iter().map(Into::into).collect(),
             block_size: location.block_size,
-            effective_len: location.effective_len,
         }
     }
 }
@@ -602,8 +569,6 @@ impl From<TraceContextProto> for TraceContext {
     fn from(proto: TraceContextProto) -> Self {
         Self {
             traceparent: proto.traceparent.filter(|value| !value.is_empty()),
-            tracestate: proto.tracestate.filter(|value| !value.is_empty()),
-            baggage: proto.baggage.filter(|value| !value.is_empty()),
         }
     }
 }
@@ -612,8 +577,6 @@ impl From<&TraceContext> for TraceContextProto {
     fn from(context: &TraceContext) -> Self {
         Self {
             traceparent: context.traceparent.clone(),
-            tracestate: context.tracestate.clone(),
-            baggage: context.baggage.clone(),
         }
     }
 }
@@ -623,11 +586,7 @@ fn optional_trace_context(proto: Option<TraceContextProto>) -> TraceContext {
 }
 
 fn proto_trace_context(context: &TraceContext) -> Option<TraceContextProto> {
-    if context.traceparent.is_none() && context.tracestate.is_none() && context.baggage.is_none() {
-        None
-    } else {
-        Some(context.into())
-    }
+    if context.is_empty() { None } else { Some(context.into()) }
 }
 
 impl TryFrom<RequestHeaderProto> for RequestHeader {
@@ -638,19 +597,13 @@ impl TryFrom<RequestHeaderProto> for RequestHeader {
         let deadline = Deadline::from_unix_ms(proto.deadline_ms);
         let trace_context = optional_trace_context(proto.trace_context);
         let caller_context = proto.caller_context.map(|cc| CallerContext { context: cc.context });
-        let state = proto
-            .state
-            .into_iter()
-            .map(GroupStateWatermark::try_from)
-            .collect::<Result<Vec<_>, _>>()?;
+        let state = proto.state.map(GroupStateWatermark::try_from).transpose()?;
         Ok(RequestHeader {
             client,
             trace_context,
             group_name: GroupName::parse_optional(&proto.group_name)
                 .map_err(|err| format!("invalid header group_name: {err}"))?,
-            mount_epoch: proto.mount_epoch,
             state,
-            route_epoch: proto.route_epoch,
             deadline,
             caller_context,
         })
@@ -663,9 +616,7 @@ impl From<&RequestHeader> for RequestHeaderProto {
             client: Some((&header.client).into()),
             trace_context: proto_trace_context(&header.trace_context),
             group_name: header.group_name.as_ref().map(ToString::to_string).unwrap_or_default(),
-            mount_epoch: header.mount_epoch,
-            state: header.state.iter().map(GroupStateWatermarkProto::from).collect(),
-            route_epoch: header.route_epoch,
+            state: header.state.as_ref().map(GroupStateWatermarkProto::from),
             deadline_ms: header.deadline.as_unix_ms(),
             caller_context: header.caller_context.as_ref().map(|cc| CallerContextProto {
                 context: cc.context.clone(),
@@ -682,18 +633,12 @@ impl TryFrom<ResponseHeaderProto> for ResponseHeader {
 
         let rpc_error = proto.error.as_ref().map(rpc_error_from_proto);
 
-        let state = proto
-            .state
-            .into_iter()
-            .map(GroupStateWatermark::try_from)
-            .collect::<Result<Vec<_>, _>>()?;
+        let state = proto.state.map(GroupStateWatermark::try_from).transpose()?;
 
         Ok(ResponseHeader {
             client,
             rpc_error,
             state,
-            mount_epoch: proto.mount_epoch,
-            route_epoch: proto.route_epoch,
             group_name: GroupName::parse_optional(&proto.group_name)
                 .map_err(|err| format!("invalid header group_name: {err}"))?,
         })
@@ -707,9 +652,7 @@ impl From<&ResponseHeader> for ResponseHeaderProto {
         ResponseHeaderProto {
             client: Some((&header.client).into()),
             error: error_detail,
-            state: header.state.iter().map(GroupStateWatermarkProto::from).collect(),
-            mount_epoch: header.mount_epoch,
-            route_epoch: header.route_epoch,
+            state: header.state.as_ref().map(GroupStateWatermarkProto::from),
             group_name: header.group_name.as_ref().map(ToString::to_string).unwrap_or_default(),
         }
     }
@@ -732,14 +675,11 @@ fn metadata_kind_proto_to_kind(kind: MetadataErrorKindProto) -> Option<MetadataE
         MetadataErrorKindProto::MetadataErrorKindConflict => MetadataErrorKind::Conflict,
         MetadataErrorKindProto::MetadataErrorKindNotLeader => MetadataErrorKind::NotLeader,
         MetadataErrorKindProto::MetadataErrorKindStaleState => MetadataErrorKind::StaleState,
-        MetadataErrorKindProto::MetadataErrorKindMountEpochMismatch => MetadataErrorKind::MountEpochMismatch,
-        MetadataErrorKindProto::MetadataErrorKindRouteEpochMismatch => MetadataErrorKind::RouteEpochMismatch,
         MetadataErrorKindProto::MetadataErrorKindOwnerGroupMismatch => MetadataErrorKind::OwnerGroupMismatch,
         MetadataErrorKindProto::MetadataErrorKindGroupMismatch => MetadataErrorKind::GroupMismatch,
         MetadataErrorKindProto::MetadataErrorKindFencing => MetadataErrorKind::Fencing,
         MetadataErrorKindProto::MetadataErrorKindSessionInvalid => MetadataErrorKind::SessionInvalid,
         MetadataErrorKindProto::MetadataErrorKindSessionExpired => MetadataErrorKind::SessionExpired,
-        MetadataErrorKindProto::MetadataErrorKindEpochMismatch => MetadataErrorKind::EpochMismatch,
         MetadataErrorKindProto::MetadataErrorKindResourceExhausted => MetadataErrorKind::ResourceExhausted,
     })
 }
@@ -756,14 +696,11 @@ fn metadata_kind_to_proto(kind: MetadataErrorKind) -> MetadataErrorKindProto {
         MetadataErrorKind::Conflict => MetadataErrorKindProto::MetadataErrorKindConflict,
         MetadataErrorKind::NotLeader => MetadataErrorKindProto::MetadataErrorKindNotLeader,
         MetadataErrorKind::StaleState => MetadataErrorKindProto::MetadataErrorKindStaleState,
-        MetadataErrorKind::MountEpochMismatch => MetadataErrorKindProto::MetadataErrorKindMountEpochMismatch,
-        MetadataErrorKind::RouteEpochMismatch => MetadataErrorKindProto::MetadataErrorKindRouteEpochMismatch,
         MetadataErrorKind::OwnerGroupMismatch => MetadataErrorKindProto::MetadataErrorKindOwnerGroupMismatch,
         MetadataErrorKind::GroupMismatch => MetadataErrorKindProto::MetadataErrorKindGroupMismatch,
         MetadataErrorKind::Fencing => MetadataErrorKindProto::MetadataErrorKindFencing,
         MetadataErrorKind::SessionInvalid => MetadataErrorKindProto::MetadataErrorKindSessionInvalid,
         MetadataErrorKind::SessionExpired => MetadataErrorKindProto::MetadataErrorKindSessionExpired,
-        MetadataErrorKind::EpochMismatch => MetadataErrorKindProto::MetadataErrorKindEpochMismatch,
         MetadataErrorKind::ResourceExhausted => MetadataErrorKindProto::MetadataErrorKindResourceExhausted,
     }
 }
@@ -779,7 +716,6 @@ fn worker_kind_proto_to_kind(kind: WorkerErrorKindProto) -> Option<WorkerErrorKi
         WorkerErrorKindProto::WorkerErrorKindNodeUnavailable => WorkerErrorKind::NodeUnavailable,
         WorkerErrorKindProto::WorkerErrorKindTimeout => WorkerErrorKind::Timeout,
         WorkerErrorKindProto::WorkerErrorKindResourceExhausted => WorkerErrorKind::ResourceExhausted,
-        WorkerErrorKindProto::WorkerErrorKindConflict => WorkerErrorKind::Conflict,
         WorkerErrorKindProto::WorkerErrorKindCorrupt => WorkerErrorKind::Corrupt,
         WorkerErrorKindProto::WorkerErrorKindFencing => WorkerErrorKind::Fencing,
         WorkerErrorKindProto::WorkerErrorKindCancelled => WorkerErrorKind::Cancelled,
@@ -798,7 +734,6 @@ fn worker_kind_to_proto(kind: WorkerErrorKind) -> WorkerErrorKindProto {
         WorkerErrorKind::NodeUnavailable => WorkerErrorKindProto::WorkerErrorKindNodeUnavailable,
         WorkerErrorKind::Timeout => WorkerErrorKindProto::WorkerErrorKindTimeout,
         WorkerErrorKind::ResourceExhausted => WorkerErrorKindProto::WorkerErrorKindResourceExhausted,
-        WorkerErrorKind::Conflict => WorkerErrorKindProto::WorkerErrorKindConflict,
         WorkerErrorKind::Corrupt => WorkerErrorKindProto::WorkerErrorKindCorrupt,
         WorkerErrorKind::Fencing => WorkerErrorKindProto::WorkerErrorKindFencing,
         WorkerErrorKind::Cancelled => WorkerErrorKindProto::WorkerErrorKindCancelled,
@@ -814,8 +749,6 @@ fn protocol_kind_proto_to_kind(kind: ProtocolErrorKindProto) -> Option<ProtocolE
         ProtocolErrorKindProto::ProtocolErrorKindInvalidArgument => ProtocolErrorKind::InvalidArgument,
         ProtocolErrorKindProto::ProtocolErrorKindPermissionDenied => ProtocolErrorKind::PermissionDenied,
         ProtocolErrorKindProto::ProtocolErrorKindUnsupported => ProtocolErrorKind::Unsupported,
-        ProtocolErrorKindProto::ProtocolErrorKindCancelled => ProtocolErrorKind::Cancelled,
-        ProtocolErrorKindProto::ProtocolErrorKindCorrupt => ProtocolErrorKind::Corrupt,
     })
 }
 
@@ -825,8 +758,6 @@ fn protocol_kind_to_proto(kind: ProtocolErrorKind) -> ProtocolErrorKindProto {
         ProtocolErrorKind::InvalidArgument => ProtocolErrorKindProto::ProtocolErrorKindInvalidArgument,
         ProtocolErrorKind::PermissionDenied => ProtocolErrorKindProto::ProtocolErrorKindPermissionDenied,
         ProtocolErrorKind::Unsupported => ProtocolErrorKindProto::ProtocolErrorKindUnsupported,
-        ProtocolErrorKind::Cancelled => ProtocolErrorKindProto::ProtocolErrorKindCancelled,
-        ProtocolErrorKind::Corrupt => ProtocolErrorKindProto::ProtocolErrorKindCorrupt,
     }
 }
 
@@ -834,10 +765,6 @@ fn internal_kind_proto_to_kind(kind: InternalErrorKindProto) -> Option<InternalE
     Some(match kind {
         InternalErrorKindProto::InternalErrorKindUnspecified => return None,
         InternalErrorKindProto::InternalErrorKindNodeUnavailable => InternalErrorKind::NodeUnavailable,
-        InternalErrorKindProto::InternalErrorKindTimeout => InternalErrorKind::Timeout,
-        InternalErrorKindProto::InternalErrorKindResourceExhausted => InternalErrorKind::ResourceExhausted,
-        InternalErrorKindProto::InternalErrorKindCancelled => InternalErrorKind::Cancelled,
-        InternalErrorKindProto::InternalErrorKindCorrupt => InternalErrorKind::Corrupt,
         InternalErrorKindProto::InternalErrorKindInternal => InternalErrorKind::Internal,
     })
 }
@@ -845,10 +772,6 @@ fn internal_kind_proto_to_kind(kind: InternalErrorKindProto) -> Option<InternalE
 fn internal_kind_to_proto(kind: InternalErrorKind) -> InternalErrorKindProto {
     match kind {
         InternalErrorKind::NodeUnavailable => InternalErrorKindProto::InternalErrorKindNodeUnavailable,
-        InternalErrorKind::Timeout => InternalErrorKindProto::InternalErrorKindTimeout,
-        InternalErrorKind::ResourceExhausted => InternalErrorKindProto::InternalErrorKindResourceExhausted,
-        InternalErrorKind::Cancelled => InternalErrorKindProto::InternalErrorKindCancelled,
-        InternalErrorKind::Corrupt => InternalErrorKindProto::InternalErrorKindCorrupt,
         InternalErrorKind::Internal => InternalErrorKindProto::InternalErrorKindInternal,
     }
 }
@@ -885,42 +808,17 @@ fn error_kind_to_proto(kind: ErrorKind) -> ErrorKindProto {
     ErrorKindProto { kind: Some(kind) }
 }
 
-fn refresh_hint_proto_to_hint(hint: Option<&RefreshHintProto>) -> RefreshHint {
-    hint.map_or_else(RefreshHint::default, |hint| RefreshHint {
+fn refresh_hint_proto_to_hint(hint: &RefreshHintProto) -> RefreshHint {
+    RefreshHint {
         leader_endpoint: hint.leader_endpoint.clone(),
         group_name: hint.group_name.clone(),
-        mount_epoch: hint.mount_epoch,
-        mount_prefix: hint.mount_prefix.clone(),
-        route_epoch: hint.route_epoch,
-        worker_endpoints: hint
-            .worker_endpoints
-            .iter()
-            .map(|endpoint| WorkerEndpointHint {
-                worker_id: endpoint.worker_id,
-                endpoint: endpoint.endpoint.clone(),
-            })
-            .collect(),
-        worker_resolve_required: hint.worker_resolve_required,
-    })
+    }
 }
 
 fn refresh_hint_to_proto(hint: &RefreshHint) -> RefreshHintProto {
     RefreshHintProto {
         leader_endpoint: hint.leader_endpoint.clone(),
         group_name: hint.group_name.clone(),
-        mount_epoch: hint.mount_epoch,
-        mount_prefix: hint.mount_prefix.clone(),
-        route_epoch: hint.route_epoch,
-        worker_endpoints: hint
-            .worker_endpoints
-            .iter()
-            .map(|endpoint| WorkerEndpointInfoProto {
-                worker_id: endpoint.worker_id,
-                endpoint: endpoint.endpoint.clone(),
-                worker_run_id: String::new(),
-            })
-            .collect(),
-        worker_resolve_required: hint.worker_resolve_required,
     }
 }
 
@@ -930,11 +828,11 @@ fn recovery_proto_to_action(recovery: Option<&RecoveryActionProto>) -> Option<Re
         Some(Action::Retry(retry)) => Some(RecoveryAction::Retry {
             after_ms: retry.after_ms,
         }),
-        Some(Action::RefreshMetadata(refresh)) => Some(RecoveryAction::RefreshMetadata {
-            hint: refresh_hint_proto_to_hint(refresh.hint.as_ref()),
+        Some(Action::RefreshMetadata(hint)) => Some(RecoveryAction::RefreshMetadata {
+            hint: refresh_hint_proto_to_hint(hint),
         }),
-        Some(Action::ReopenWriteSession(reopen)) => Some(RecoveryAction::ReopenWriteSession {
-            hint: refresh_hint_proto_to_hint(reopen.hint.as_ref()),
+        Some(Action::ReopenWriteSession(hint)) => Some(RecoveryAction::ReopenWriteSession {
+            hint: refresh_hint_proto_to_hint(hint),
         }),
         Some(Action::RegisterWorker(_)) => Some(RecoveryAction::RegisterWorker),
         Some(Action::SendFullBlockReport(_)) => Some(RecoveryAction::SendFullBlockReport),
@@ -946,12 +844,8 @@ fn recovery_action_to_proto(action: &RecoveryAction) -> RecoveryActionProto {
     let action = match action {
         RecoveryAction::Fail => Action::Fail(FailRecoveryProto {}),
         RecoveryAction::Retry { after_ms } => Action::Retry(RetryRecoveryProto { after_ms: *after_ms }),
-        RecoveryAction::RefreshMetadata { hint } => Action::RefreshMetadata(RefreshMetadataRecoveryProto {
-            hint: Some(refresh_hint_to_proto(hint)),
-        }),
-        RecoveryAction::ReopenWriteSession { hint } => Action::ReopenWriteSession(ReopenWriteSessionRecoveryProto {
-            hint: Some(refresh_hint_to_proto(hint)),
-        }),
+        RecoveryAction::RefreshMetadata { hint } => Action::RefreshMetadata(refresh_hint_to_proto(hint)),
+        RecoveryAction::ReopenWriteSession { hint } => Action::ReopenWriteSession(refresh_hint_to_proto(hint)),
         RecoveryAction::RegisterWorker => Action::RegisterWorker(RegisterWorkerRecoveryProto {}),
         RecoveryAction::SendFullBlockReport => Action::SendFullBlockReport(SendFullBlockReportRecoveryProto {}),
     };
@@ -1057,13 +951,8 @@ mod tests {
             assert!(parse_write_mode(raw).is_err());
         }
 
-        let token = FencingToken::new(
-            BlockId::new(InodeId::new(42), BlockIndex::new(u32::MAX)),
-            ClientId::new(9),
-            LeaseEpoch::new(17),
-        );
+        let token = FencingToken::new(ClientId::new(9), LeaseEpoch::new(17));
         let wire = FencingTokenProto::from(token);
-        assert_eq!(wire.block_id.unwrap().block_index, u32::MAX);
         assert_eq!(wire.epoch, 17);
         assert_eq!(FencingToken::try_from(wire).unwrap(), token);
     }
@@ -1075,6 +964,30 @@ mod tests {
     }
 
     #[test]
+    fn recovery_hints_survive_wire_roundtrip() {
+        for hint in [
+            RefreshHint::default(),
+            RefreshHint {
+                leader_endpoint: Some("127.0.0.1:19001".into()),
+                group_name: Some("root".into()),
+            },
+        ] {
+            for (kind, recovery) in [
+                (
+                    MetadataErrorKind::NotLeader,
+                    RecoveryAction::RefreshMetadata { hint: hint.clone() },
+                ),
+                (MetadataErrorKind::Fencing, RecoveryAction::ReopenWriteSession { hint }),
+            ] {
+                let error = RpcErrorDetail::new(ErrorKind::Metadata(kind), recovery, "authority changed");
+                let bytes = rpc_error_to_proto(&error).encode_to_vec();
+                let decoded = ErrorDetailProto::decode(bytes.as_slice()).unwrap();
+                assert_eq!(rpc_error_from_proto(&decoded), error);
+            }
+        }
+    }
+
+    #[test]
     fn malformed_rpc_error_details_fail_closed_without_recovery() {
         let kind = |value| ErrorKindProto {
             kind: Some(Kind::Metadata(value)),
@@ -1083,9 +996,7 @@ mod tests {
             action: Some(Action::Retry(RetryRecoveryProto { after_ms: Some(1) })),
         });
         let refresh = Some(RecoveryActionProto {
-            action: Some(Action::RefreshMetadata(RefreshMetadataRecoveryProto {
-                hint: Some(RefreshHintProto::default()),
-            })),
+            action: Some(Action::RefreshMetadata(RefreshHintProto::default())),
         });
         let valid = Some(kind(MetadataErrorKindProto::MetadataErrorKindNotFound as i32));
         for (kind, recovery) in [
@@ -1118,7 +1029,7 @@ mod tests {
             worker_run_id: test_worker_run_id().to_string(),
         };
         let block_id = BlockId::new(InodeId::new(42), BlockIndex::new(3));
-        let token = FencingToken::new(block_id, ClientId::new(9), LeaseEpoch::new(17));
+        let token = FencingToken::new(ClientId::new(9), LeaseEpoch::new(17));
 
         let mut target = LocatedBlockProto {
             write_offset: 0,
@@ -1134,14 +1045,16 @@ mod tests {
         target.workers.push(endpoint());
         let decoded = LocatedBlock::try_from(target.clone()).expect("valid allocated block");
         assert_eq!(LocatedBlockProto::from(decoded), target);
+        for block_id in [None, Some(BlockIdProto::default())] {
+            let invalid = LocatedBlockProto {
+                block_id,
+                ..target.clone()
+            };
+            assert!(LocatedBlock::try_from(invalid).is_err());
+        }
         for invalid_token in [
-            FencingToken::new(block_id, ClientId::new(0), token.epoch),
-            FencingToken::new(block_id, token.owner, LeaseEpoch::new(0)),
-            FencingToken::new(
-                BlockId::new(block_id.inode_id, BlockIndex::new(4)),
-                token.owner,
-                token.epoch,
-            ),
+            FencingToken::new(ClientId::new(0), token.epoch),
+            FencingToken::new(token.owner, LeaseEpoch::new(0)),
         ] {
             let invalid = LocatedBlockProto {
                 fencing_token: Some(invalid_token.into()),
@@ -1166,7 +1079,6 @@ mod tests {
             len: 4096,
             workers: Vec::new(),
             block_size: 4096,
-            effective_len: 4096,
         };
         let decoded_empty =
             FileBlockLocation::try_from(location.clone()).expect("empty read location workers are valid");
@@ -1174,7 +1086,7 @@ mod tests {
         location.workers.push(endpoint());
         let decoded = FileBlockLocation::try_from(location.clone()).expect("valid read location");
         assert_eq!(FileBlockLocationProto::from(decoded), location);
-        for (block_size, effective_len) in [
+        for (block_size, len) in [
             (0, 1),
             (u64::from(beryl_types::MAX_BLOCK_SIZE) + 1, 1),
             (location.block_size, 0),
@@ -1183,13 +1095,12 @@ mod tests {
             let invalid = FileBlockLocationProto {
                 block_size,
 
-                effective_len,
+                len,
                 ..location.clone()
             };
             assert!(FileBlockLocation::try_from(invalid).is_err());
         }
         location.len = 1;
-        location.effective_len = 1;
         let decoded = FileBlockLocation::try_from(location.clone()).expect("valid short tail");
         assert_eq!(FileBlockLocationProto::from(decoded), location);
     }

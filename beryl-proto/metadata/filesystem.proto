@@ -72,6 +72,7 @@ message LocatedBlockProto {
   uint64 block_size = 3;
   uint64 write_offset = 4;
   repeated common.WorkerEndpointInfoProto workers = 5;
+  // Writer fencing scoped to block_id.
   common.FencingTokenProto fencing_token = 6;
   // Worker-local storage tier requested for this block replica.
   common.TierProto tier = 7;
@@ -86,14 +87,13 @@ message CommittedBlockProto {
 message FileBlockLocationProto {
   common.BlockIdProto block_id = 1;
   uint64 file_offset = 2;
+  // Full visible block prefix used by workers to validate reads.
   uint64 len = 3;
   // Metadata-issued read candidates. Empty means the file has this block
   // range but no live reported replica is currently eligible.
   repeated common.WorkerEndpointInfoProto workers = 4;
   // Immutable logical capacity that workers validate before reads.
   uint64 block_size = 5;
-  // Block-local readable prefix expected by metadata for this block.
-  uint64 effective_len = 6;
 }
 
 // ============================================================================
@@ -126,11 +126,9 @@ message ListStatusRequestProto {
 message ListStatusResponseProto {
   common.ResponseHeaderProto header = 1;
   repeated DirEntryProto entries = 2;
-  // On success, an opaque continuation key present exactly when eof is false.
+  // On success, an opaque continuation key. Empty means the current directory
+  // scan has reached its end; a nonempty key requires a nonempty page.
   bytes next_cursor = 3;
-  // True when this page reached the current end of the directory scan. A
-  // successful EOF response has an empty next_cursor.
-  bool eof = 4;
 }
 
 message CreateDirectoryRequestProto {
@@ -322,20 +320,21 @@ message MsyncRequestProto {
 }
 
 message MsyncResponseProto {
+  // A successful response carries a nonempty state watermark in this header.
   common.ResponseHeaderProto header = 1;
-  common.GroupStateWatermarkProto state = 2;
 }
 
 // A Worker checks current write authority once before each data stream.
 message AuthorizeBlockWriteRequestProto {
+  // The group in this header must match the target inode's owner group.
   common.RequestHeaderProto header = 1;
-  string group_name = 2;
-  uint64 worker_id = 3;
-  string worker_run_id = 4;
-  common.FencingTokenProto fencing_token = 5;
-  uint64 write_offset = 6;
-  uint64 block_size = 7;
-  common.TierProto tier = 8;
+  uint64 worker_id = 2;
+  string worker_run_id = 3;
+  common.FencingTokenProto fencing_token = 4;
+  uint64 write_offset = 5;
+  uint64 block_size = 6;
+  common.TierProto tier = 7;
+  common.BlockIdProto block_id = 8;
 }
 message AuthorizeBlockWriteResponseProto {
   common.ResponseHeaderProto header = 1;

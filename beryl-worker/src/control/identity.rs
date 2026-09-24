@@ -14,7 +14,7 @@ use crate::config::WorkerConfig;
 use crate::control::RegistrationError;
 
 /// Resolve the stable WorkerId from the persisted local identity file.
-pub(crate) fn resolve_worker_id(config: &WorkerConfig) -> Result<WorkerId, RegistrationError> {
+pub(super) fn resolve_worker_id(config: &WorkerConfig) -> Result<WorkerId, RegistrationError> {
     load_or_create_identity(&config.identity_path)
 }
 

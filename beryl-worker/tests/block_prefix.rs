@@ -5,7 +5,7 @@
 use beryl_proto::worker::{BlockMetaPayloadProto, BlockStateProto};
 use beryl_types::{BlockId, BlockIndex, ClientId, FencingToken, GroupName, InodeId, LeaseEpoch, Tier};
 use beryl_worker::store::block::{
-    CheckpointBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, OpenBlockWriteRequest, ReclaimBlockRequest,
+    CheckpointBlockRequest, FullBlockFileStore, LocalBlockStore, OpenBlockWriteRequest, ReclaimBlockRequest,
     ReclaimBlockResult,
 };
 use bytes::Bytes;
@@ -15,14 +15,14 @@ use tempfile::TempDir;
 
 fn fixture() -> (TempDir, FullBlockFileStore, OpenBlockWriteRequest) {
     let dir = tempfile::tempdir().unwrap();
-    let store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(dir.path().into()));
+    let store = FullBlockFileStore::new(dir.path().into());
     let block_id = BlockId::new(InodeId::new(7), BlockIndex::new(2));
     let request = OpenBlockWriteRequest {
         group_name: GroupName::parse("root").unwrap(),
         block_id,
         block_size: 16,
         tier: Tier::Ssd,
-        fencing_token: FencingToken::new(block_id, ClientId::generate(), LeaseEpoch::new(1)),
+        fencing_token: FencingToken::new(ClientId::generate(), LeaseEpoch::new(1)),
         write_offset: 0,
         visible_len: 0,
     };
@@ -47,7 +47,7 @@ fn checkpoint(store: &FullBlockFileStore, req: &OpenBlockWriteRequest, data: &'s
             fencing_token: req.fencing_token,
         })
         .unwrap();
-    assert_eq!(meta.source.durable_len, req.write_offset + data.len() as u64);
+    assert_eq!(meta.durable_len, req.write_offset + data.len() as u64);
 }
 
 #[test]
@@ -64,7 +64,7 @@ fn short_streams_resume_and_new_writer_discards_only_unpublished_suffix() {
     let old = req.clone();
     req.fencing_token.epoch = LeaseEpoch::new(2);
     let meta = store.open_block_write(req.clone()).unwrap();
-    assert_eq!(meta.source.durable_len, 4);
+    assert_eq!(meta.durable_len, 4);
     assert_eq!(
         fs::metadata(store.paths(&req.group_name, req.block_id).data_path)
             .unwrap()
@@ -109,6 +109,33 @@ fn persist_meta_image(
 }
 
 #[test]
+fn invalid_write_authority_is_rejected_before_io_and_during_recovery() {
+    let (_dir, store, mut req) = fixture();
+    req.fencing_token.owner = ClientId::new(0);
+    assert!(store.open_block_write(req.clone()).is_err());
+    assert!(!store.paths(&req.group_name, req.block_id).meta_path.exists());
+
+    let corruptions: [fn(&mut BlockMetaPayloadProto); 5] = [
+        |meta| meta.block_state = BlockStateProto::BlockStateUnspecified as i32,
+        |meta| meta.fencing_token = None,
+        |meta| meta.fencing_token.as_mut().unwrap().owner = Some(Default::default()),
+        |meta| meta.block_id.as_mut().unwrap().block_index += 1,
+        |meta| meta.group_name = "other".to_string(),
+    ];
+    for corrupt in corruptions {
+        let (_dir, store, req) = fixture();
+        checkpoint(&store, &req, b"abcd");
+        persist_meta_image(&store, &req, corrupt);
+        let paths = store.paths(&req.group_name, req.block_id);
+        let before = fs::read(&paths.meta_path).unwrap();
+        assert!(store.load_meta(&req.group_name, req.block_id).is_err());
+        assert!(store.recover_blocks().is_err());
+        assert_eq!(fs::read(&paths.meta_path).unwrap(), before);
+        assert_eq!(fs::read(&paths.data_path).unwrap(), b"abcd");
+    }
+}
+
+#[test]
 fn recovery_uses_checkpoint_after_unsynced_io_and_interrupted_takeover() {
     for takeover in [false, true] {
         let (_dir, store, mut req) = fixture();
@@ -118,18 +145,16 @@ fn recovery_uses_checkpoint_after_unsynced_io_and_interrupted_takeover() {
         if takeover {
             // Crash after E2/D4 metadata replacement and before truncation of P10.
             persist_meta_image(&store, &req, |meta| {
-                meta.source.as_mut().unwrap().durable_len = 4;
-                meta.visibility.as_mut().unwrap().fencing_token.as_mut().unwrap().epoch = 2;
+                meta.durable_len = 4;
+                meta.fencing_token.as_mut().unwrap().epoch = 2;
             });
         } else {
             store
                 .write_at(&req.group_name, req.block_id, 10, Bytes::from_static(b"extra"))
                 .unwrap();
         }
-        store.recover_blocks().unwrap();
-        let meta = store.load_meta(&req.group_name, req.block_id).unwrap();
         let expected = if takeover { 4 } else { 10 };
-        assert_eq!(meta.source.durable_len, expected);
+        assert_eq!(store.recover_blocks().unwrap(), (expected, 1));
         assert_eq!(
             fs::metadata(store.paths(&req.group_name, req.block_id).data_path)
                 .unwrap()
@@ -142,7 +167,7 @@ fn recovery_uses_checkpoint_after_unsynced_io_and_interrupted_takeover() {
 
 #[test]
 fn recovery_rejects_short_prefix_and_unknown_versions_without_changing_data() {
-    for version in [None, Some(2u32), Some(u32::MAX)] {
+    for version in [None, Some(3u32), Some(5u32)] {
         let (_dir, store, req) = fixture();
         checkpoint(&store, &req, b"abcd");
         let paths = store.paths(&req.group_name, req.block_id);
@@ -175,14 +200,14 @@ fn deletion_recovers_each_unlink_boundary_and_is_idempotent() {
         let (_dir, store, req) = fixture();
         checkpoint(&store, &req, b"abcd");
         persist_meta_image(&store, &req, |meta| {
-            meta.visibility.as_mut().unwrap().block_state = BlockStateProto::BlockStateDeleting as i32
+            meta.block_state = BlockStateProto::BlockStateDeleting as i32
         });
         let paths = store.paths(&req.group_name, req.block_id);
         if data_removed {
             fs::remove_file(&paths.data_path).unwrap();
         }
         assert!(store.read_at(&req.group_name, req.block_id, 0, 1).is_err());
-        store.recover_blocks().unwrap();
+        assert_eq!(store.recover_blocks().unwrap(), (0, 0));
         assert!(!paths.data_path.exists());
         assert!(!paths.meta_path.exists());
         assert_eq!(

@@ -74,9 +74,6 @@ impl GroupName {
     /// Parses and validates a metadata group name.
     pub fn parse(raw: impl AsRef<str>) -> Result<Self, GroupNameError> {
         let value = raw.as_ref().trim();
-        if value.is_empty() {
-            return Err(GroupNameError::Empty);
-        }
         if value.len() > 63 {
             return Err(GroupNameError::TooLong);
         }
@@ -165,7 +162,7 @@ impl Error for GroupNameError {}
 id_new_uint!(
     /// Mount identity.
     ///
-    /// Identifies a mount point that maps a UFS path to the metadata namespace.
+    /// Identifies the persisted authority of the unified root namespace.
     MountId(u64)
 );
 
@@ -175,28 +172,15 @@ impl Display for MountId {
     }
 }
 
-/// Inode identifier (64-bit).
-///
-/// Inodes are the authoritative identity for filesystem objects.
-/// Each mount has a root inode, and all files and directories have unique inodes.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-#[repr(transparent)]
-pub struct InodeId(pub u64);
+id_new_uint!(
+    /// Inode identifier (64-bit).
+    ///
+    /// Inodes are the authoritative identity for filesystem objects.
+    /// Each mount has a root inode, and all files and directories have unique inodes.
+    InodeId(u64)
+);
 
 impl InodeId {
-    /// Creates a new InodeId from a raw value.
-    #[inline]
-    pub const fn new(v: u64) -> Self {
-        Self(v)
-    }
-
-    /// Returns the inner value.
-    #[inline]
-    pub const fn as_raw(self) -> u64 {
-        self.0
-    }
-
     /// Encodes as fixed-width big-endian bytes (8 bytes).
     /// Used for RocksDB key encoding.
     #[inline]
@@ -211,29 +195,9 @@ impl InodeId {
     }
 }
 
-impl Debug for InodeId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        f.debug_tuple("InodeId").field(&self.0).finish()
-    }
-}
-
 impl Display for InodeId {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{}", self.0)
-    }
-}
-
-impl From<u64> for InodeId {
-    #[inline]
-    fn from(v: u64) -> Self {
-        Self(v)
-    }
-}
-
-impl From<InodeId> for u64 {
-    #[inline]
-    fn from(v: InodeId) -> Self {
-        v.0
     }
 }
 
@@ -308,20 +272,20 @@ impl FromStr for BlockId {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split(':').collect();
-        if parts.len() != 2 {
+        let mut parts = s.split(':');
+        let (Some(inode_id), Some(block_index), None) = (parts.next(), parts.next(), parts.next()) else {
             return Err(format!(
                 "Invalid BlockId format: expected 'inode_id:block_index', got '{}'",
                 s
             ));
-        }
-        let inode_id = parts[0]
+        };
+        let inode_id = inode_id
             .parse::<u64>()
             .map_err(|e| format!("Failed to parse inode_id: {}", e))?;
         if inode_id == 0 {
             return Err("inode_id must be non-zero".to_string());
         }
-        let block_index = parts[1]
+        let block_index = block_index
             .parse::<u32>()
             .map_err(|e| format!("Failed to parse block_index: {}", e))?;
         Ok(BlockId {
@@ -376,17 +340,6 @@ impl ClientId {
     pub const fn is_zero(self) -> bool {
         self.0 == 0
     }
-
-    /// Parse a non-zero client identity from its decimal wire/header value.
-    pub fn parse(value: &str) -> Result<Self, String> {
-        let raw = value
-            .parse::<u128>()
-            .map_err(|err| format!("invalid client_id: {err}"))?;
-        if raw == 0 {
-            return Err("client_id must be non-zero".to_string());
-        }
-        Ok(Self(raw))
-    }
 }
 
 impl Debug for ClientId {
@@ -417,8 +370,6 @@ impl Display for ClientId {
         write!(f, "0x{:032x}", self.0)
     }
 }
-
-// CallId and TxId: UUID-based identifiers for request context
 
 /// Call ID: unique identifier for each RPC call.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

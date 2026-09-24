@@ -4,7 +4,7 @@
 //! Durable block prefixes. Metadata owns visibility; this store owns fsynced bytes.
 
 use super::meta_codec::{decode_meta_payload, encode_meta_payload};
-use crate::error::WorkerError;
+use crate::error::{WorkerError, WorkerResult};
 use beryl_types::fs::validate_block_size;
 use beryl_types::{BlockId, FencingToken, GroupName, Tier};
 use bytes::Bytes;
@@ -13,12 +13,11 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-pub type StoreResult<T> = Result<T, WorkerError>;
 const BLOCK_META_MAGIC: [u8; 4] = *b"BRYL";
 const BLOCK_META_HEADER_LEN: usize = 20;
 // Covers both the raw `.blk` byte interpretation and the atomic `.meta` checkpoint.
 // Changes to either representation require a version change; Metadata does not select it.
-const BLOCK_META_VERSION: u32 = 3;
+const BLOCK_META_VERSION: u32 = 4;
 const MAX_META_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 
 /// Fixed little-endian header for a block metadata file.
@@ -26,49 +25,37 @@ const MAX_META_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 /// Metadata bytes are not checksummed; correctness relies on atomic
 /// replacement, strict decoding, and semantic validation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BlockMetaHeader {
+struct BlockMetaHeader {
     /// Fixed file magic used to identify Beryl block metadata.
-    pub magic: [u8; 4],
+    magic: [u8; 4],
     /// Version of the local data and metadata interpretation.
-    pub version: u32,
+    version: u32,
     /// Fixed header length in bytes.
-    pub header_len: u32,
+    header_len: u32,
     /// Serialized payload length in bytes.
-    pub payload_len: u64,
+    payload_len: u64,
 }
 
 impl BlockMetaHeader {
-    pub const fn encoded_len() -> usize {
-        BLOCK_META_HEADER_LEN
-    }
-
-    fn for_payload(payload_len: usize) -> StoreResult<Self> {
-        let payload_len =
-            u64::try_from(payload_len).map_err(|_| invalid_argument("meta payload length does not fit in u64"))?;
-        let header = Self {
+    fn for_payload(payload_len: usize) -> Self {
+        Self {
             magic: BLOCK_META_MAGIC,
             version: BLOCK_META_VERSION,
             header_len: BLOCK_META_HEADER_LEN as u32,
-            payload_len,
-        };
-        header.validate()?;
-        Ok(header)
+            payload_len: payload_len as u64,
+        }
     }
 
-    fn decode(encoded: &[u8]) -> StoreResult<Self> {
-        if encoded.len() != BLOCK_META_HEADER_LEN {
-            return Err(corrupt("invalid meta header length"));
-        }
-
+    fn decode(encoded: &[u8; BLOCK_META_HEADER_LEN]) -> Self {
         let mut magic = [0u8; 4];
         magic.copy_from_slice(&encoded[0..4]);
 
-        Ok(Self {
+        Self {
             magic,
             version: u32::from_le_bytes(encoded[4..8].try_into().expect("fixed header slice")),
             header_len: u32::from_le_bytes(encoded[8..12].try_into().expect("fixed header slice")),
             payload_len: u64::from_le_bytes(encoded[12..20].try_into().expect("fixed header slice")),
-        })
+        }
     }
 
     fn encode(self) -> [u8; BLOCK_META_HEADER_LEN] {
@@ -80,7 +67,7 @@ impl BlockMetaHeader {
         encoded
     }
 
-    fn validate(self) -> StoreResult<()> {
+    fn validate(self) -> WorkerResult<()> {
         if self.magic != BLOCK_META_MAGIC {
             return Err(corrupt("invalid block meta magic"));
         }
@@ -103,49 +90,28 @@ impl BlockMetaHeader {
 /// Atomic local checkpoint, including writer fencing and the recoverable prefix.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockMetaPayload {
-    pub identity: BlockIdentity,
+    pub group_name: GroupName,
+    pub block_id: BlockId,
     /// Immutable logical capacity authorized by Metadata.
     pub block_size: u64,
-    pub source: BlockSource,
-    pub visibility: BlockVisibility,
+    /// Bytes covered by a completed local checkpoint, possibly ahead of Metadata visibility.
+    pub durable_len: u64,
+    pub block_state: BlockState,
+    pub fencing_token: FencingToken,
     pub tier: Tier,
 }
 
 /// Identity bound to the local storage path; unrelated blocks cannot share a checkpoint.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BlockIdentity {
     pub block_id: BlockId,
     pub group_name: GroupName,
 }
 
-/// Bytes covered by a completed local checkpoint, possibly ahead of Metadata visibility.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BlockSource {
-    pub durable_len: u64,
-}
-
-/// Local lifecycle and writer fencing; file visibility remains Metadata-owned.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BlockVisibility {
-    pub block_state: BlockState,
-    pub fencing_token: FencingToken,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockState {
     Ready,
-    Corrupt,
     Deleting,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FullBlockFileStoreConfig {
-    pub data_root: PathBuf,
-}
-impl FullBlockFileStoreConfig {
-    pub fn new(data_root: PathBuf) -> Self {
-        Self { data_root }
-    }
 }
 
 /// Online Metadata authorization for opening a block at an exact checkpoint.
@@ -179,13 +145,6 @@ pub struct ReclaimBlockRequest {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReclaimBlockState {
-    Ready,
-    Deleting,
-    Absent,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReclaimBlockResult {
     Deleted { effective_len: u64 },
     AlreadyAbsent,
@@ -201,7 +160,7 @@ pub struct BlockPaths {
 /// Filesystem implementation of the durable-prefix and deletion commit points.
 #[derive(Clone, Debug)]
 pub struct FullBlockFileStore {
-    config: FullBlockFileStoreConfig,
+    data_root: PathBuf,
     // Readers and reports must not combine an old D with a newly truncated data file.
     // Clones share this directory-local gate; data frames may still append concurrently.
     checkpoint_access: Arc<RwLock<()>>,
@@ -209,88 +168,16 @@ pub struct FullBlockFileStore {
 
 impl FullBlockFileStore {
     /// Uses a prepared, durably created store root; StoreDirs owns its initialization.
-    pub fn new(config: FullBlockFileStoreConfig) -> Self {
+    pub fn new(data_root: PathBuf) -> Self {
         Self {
-            config,
+            data_root,
             checkpoint_access: Arc::new(RwLock::new(())),
         }
     }
 
-    /// Creates a zero checkpoint or reopens the exact authorized durable prefix.
-    /// New epochs persist the reduced boundary before truncating uncommitted bytes.
-    pub fn open_block_write(&self, req: OpenBlockWriteRequest) -> StoreResult<BlockMetaPayload> {
-        let _checkpoint = self.checkpoint_access.write().expect("checkpoint access poisoned");
-        validate_block_size(req.block_size).map_err(|e| invalid_argument(e.to_string()))?;
-        validate_token(req.fencing_token, req.block_id)?;
-        if req.write_offset >= req.block_size || req.visible_len > req.write_offset {
-            return Err(invalid_argument("invalid authorized write prefix"));
-        }
-        let paths = self.paths(&req.group_name, req.block_id);
-        create_dir_durable(&self.config.data_root, paths.parent_dir()?)?;
-        let mut meta = match self.load_meta(&req.group_name, req.block_id) {
-            Ok(mut meta) => {
-                ensure_readable(&meta)?;
-                if meta.block_size != req.block_size || meta.tier != req.tier {
-                    return Err(corrupt("write authorization changed persisted block capacity or tier"));
-                }
-                let previous = meta.visibility.fencing_token;
-                if req.fencing_token.epoch < previous.epoch
-                    || (req.fencing_token.epoch == previous.epoch && req.fencing_token != previous)
-                {
-                    return Err(fenced("write token is older than the persisted writer"));
-                }
-                if req.visible_len > meta.source.durable_len {
-                    return Err(corrupt("visible prefix exceeds durable local bytes"));
-                }
-                validate_data_prefix(&paths, &meta)?;
-                if req.fencing_token.epoch > previous.epoch {
-                    if req.write_offset != req.visible_len {
-                        return Err(invalid_argument("new writer must start at the visible prefix"));
-                    }
-                    meta.visibility.fencing_token = req.fencing_token;
-                    meta.source.durable_len = req.visible_len;
-                    write_meta(&paths, &meta)?;
-                } else if req.write_offset != meta.source.durable_len {
-                    return Err(invalid_argument("same writer must resume at its durable checkpoint"));
-                }
-                meta
-            }
-            Err(WorkerError::NotFound(_)) => {
-                if req.write_offset != 0 || req.visible_len != 0 || paths.data_path.exists() {
-                    return Err(corrupt("nonempty authorized prefix has no local metadata"));
-                }
-                let meta = BlockMetaPayload {
-                    identity: BlockIdentity {
-                        block_id: req.block_id,
-                        group_name: req.group_name.clone(),
-                    },
-                    block_size: req.block_size,
-                    source: BlockSource { durable_len: 0 },
-                    visibility: BlockVisibility {
-                        block_state: BlockState::Ready,
-                        fencing_token: req.fencing_token,
-                    },
-                    tier: req.tier,
-                };
-                // The durable zero checkpoint identifies an interrupted data-file creation.
-                write_meta(&paths, &meta)?;
-                meta
-            }
-            Err(e) => return Err(e),
-        };
-        restore_prefix(&paths, &mut meta)?;
-        Ok(meta)
-    }
-
-    pub fn load_meta(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<BlockMetaPayload> {
-        let meta = read_meta_file(&self.paths(group_name, block_id).meta_path)?;
-        validate_meta(&meta, group_name, block_id)?;
-        Ok(meta)
-    }
-
     /// Confirms the current metadata directory entry before reporting its durable prefix.
     /// A failed checkpoint rename may be visible in memory without a completed directory fsync.
-    pub fn load_report_meta(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<BlockMetaPayload> {
+    pub fn load_report_meta(&self, group_name: &GroupName, block_id: BlockId) -> WorkerResult<BlockMetaPayload> {
         let _checkpoint = self.checkpoint_access.read().expect("checkpoint access poisoned");
         let paths = self.paths(group_name, block_id);
         let meta = read_report_meta(&paths.meta_path)?;
@@ -298,73 +185,8 @@ impl FullBlockFileStore {
         Ok(meta)
     }
 
-    /// Appends under exclusive stream ownership; the checkpointed prefix is immutable.
-    pub fn write_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, data: Bytes) -> StoreResult<()> {
-        let meta = self.load_meta(group_name, block_id)?;
-        ensure_readable(&meta)?;
-        let end = offset
-            .checked_add(data.len() as u64)
-            .ok_or_else(|| invalid_argument("write range overflow"))?;
-        if data.is_empty() || offset < meta.source.durable_len || end > meta.block_size {
-            return Err(invalid_argument("write crosses the durable prefix or block capacity"));
-        }
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.paths(group_name, block_id).data_path)?;
-        if offset != file.metadata()?.len() {
-            return Err(invalid_argument("write is not at the physical append cursor"));
-        }
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(&data)?;
-        Ok(())
-    }
-
-    /// Orders data fsync before atomic metadata replacement and directory fsync.
-    /// Any failure after IO begins has an unknown outcome and must not be acknowledged.
-    pub fn checkpoint_block(&self, req: CheckpointBlockRequest) -> StoreResult<BlockMetaPayload> {
-        let _checkpoint = self.checkpoint_access.write().expect("checkpoint access poisoned");
-        let paths = self.paths(&req.group_name, req.block_id);
-        let mut meta = self.load_meta(&req.group_name, req.block_id)?;
-        ensure_readable(&meta)?;
-        if meta.visibility.fencing_token != req.fencing_token {
-            return Err(fenced("checkpoint writer was fenced"));
-        }
-        if req.effective_len < meta.source.durable_len || req.effective_len > meta.block_size || req.effective_len == 0
-        {
-            return Err(invalid_argument("invalid checkpoint length"));
-        }
-        let data = OpenOptions::new().read(true).write(true).open(&paths.data_path)?;
-        if data.metadata()?.len() != req.effective_len {
-            return Err(corrupt("checkpoint length differs from written bytes"));
-        }
-        data.sync_all()?;
-        meta.source.durable_len = req.effective_len;
-        write_meta(&paths, &meta)?;
-        Ok(meta)
-    }
-
-    /// Reads within the local durable prefix; the data service separately enforces Metadata's visible range.
-    pub fn read_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, len: u64) -> StoreResult<Bytes> {
-        let _checkpoint = self.checkpoint_access.read().expect("checkpoint access poisoned");
-        let meta = self.load_meta(group_name, block_id)?;
-        ensure_readable(&meta)?;
-        if offset.checked_add(len).is_none_or(|end| end > meta.source.durable_len) {
-            return Err(invalid_argument("read exceeds durable prefix"));
-        }
-        let paths = self.paths(group_name, block_id);
-        validate_data_prefix(&paths, &meta)?;
-        let mut file = File::open(paths.data_path)?;
-        file.seek(SeekFrom::Start(offset))?;
-        let len = usize::try_from(len).map_err(|_| invalid_argument("read length overflow"))?;
-        let mut bytes = vec![0; len];
-        file.read_exact(&mut bytes)
-            .map_err(|e| map_truncated_read_error(e, "durable read is truncated"))?;
-        Ok(Bytes::from(bytes))
-    }
-
-    /// Reports checkpoints without changing physical files while streams are active.
-    pub fn scan_group_blocks(&self, group_name: &GroupName) -> StoreResult<Vec<BlockMetaPayload>> {
+    /// Reports checkpoints in unspecified order without changing active data files.
+    pub fn scan_group_blocks(&self, group_name: &GroupName) -> WorkerResult<Vec<BlockMetaPayload>> {
         let _checkpoint = self.checkpoint_access.read().expect("checkpoint access poisoned");
         let mut result = Vec::new();
         for path in block_files(&self.group_dir(group_name).join("blocks"))? {
@@ -372,65 +194,30 @@ impl FullBlockFileStore {
                 continue;
             }
             let meta = read_report_meta(&path)?;
-            let paths = self.paths(group_name, meta.identity.block_id);
-            validate_meta(&meta, group_name, meta.identity.block_id)?;
+            let paths = self.paths(group_name, meta.block_id);
+            validate_meta(&meta, group_name, meta.block_id)?;
             if paths.meta_path != path {
                 return Err(corrupt("block identity differs from metadata path"));
             }
-            if meta.visibility.block_state == BlockState::Ready {
+            if meta.block_state == BlockState::Ready {
                 validate_data_prefix(&paths, &meta)?;
                 result.push(meta);
             }
         }
-        result.sort_by_key(|m| {
-            (
-                m.identity.block_id.inode_id.as_raw(),
-                m.identity.block_id.index.as_raw(),
-            )
-        });
         Ok(result)
-    }
-
-    pub fn inspect_reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockState> {
-        match self.load_meta(&req.group_name, req.block_id) {
-            Ok(meta) if meta.visibility.block_state == BlockState::Deleting => Ok(ReclaimBlockState::Deleting),
-            Ok(_) => Ok(ReclaimBlockState::Ready),
-            Err(WorkerError::NotFound(_)) => {
-                let paths = self.paths(&req.group_name, req.block_id);
-                if paths.data_path.exists() || paths.temp_meta_path.exists() {
-                    return Err(corrupt("unidentified block artifacts"));
-                }
-                Ok(ReclaimBlockState::Absent)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Persists Deleting before any unlink. The caller retains exclusive block access through completion.
-    pub fn reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockResult> {
-        let _checkpoint = self.checkpoint_access.write().expect("checkpoint access poisoned");
-        if self.inspect_reclaim_block(req)? == ReclaimBlockState::Absent {
-            return Ok(ReclaimBlockResult::AlreadyAbsent);
-        }
-        let paths = self.paths(&req.group_name, req.block_id);
-        let mut meta = self.load_meta(&req.group_name, req.block_id)?;
-        meta.visibility.block_state = BlockState::Deleting;
-        write_meta(&paths, &meta)?;
-        complete_deletion(&paths)?;
-        Ok(ReclaimBlockResult::Deleted {
-            effective_len: meta.source.durable_len,
-        })
     }
 
     /// Restores every exact checkpoint before admission or reporting, and completes interrupted deletions.
     /// Unidentified files and short durable prefixes fail startup closed.
-    pub fn recover_blocks(&self) -> StoreResult<usize> {
+    /// Returns the durable bytes and Ready block count after recovery.
+    pub fn recover_blocks(&self) -> WorkerResult<(u64, u64)> {
         let _checkpoint = self.checkpoint_access.write().expect("checkpoint access poisoned");
-        let groups = self.config.data_root.join("groups");
+        let groups = self.data_root.join("groups");
         if !groups.exists() {
-            return Ok(0);
+            return Ok((0, 0));
         }
-        let mut recovered = 0;
+        let mut used_bytes = 0u64;
+        let mut block_count = 0u64;
         for group in fs::read_dir(groups)? {
             let group = group?;
             if !group.file_type()?.is_dir() {
@@ -456,18 +243,19 @@ impl FullBlockFileStore {
                 .iter()
                 .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("meta"))
             {
-                let mut meta = read_meta_file(path)?;
-                let paths = self.paths(&group_name, meta.identity.block_id);
-                validate_meta(&meta, &group_name, meta.identity.block_id)?;
+                let meta = read_meta_file(path)?;
+                let paths = self.paths(&group_name, meta.block_id);
+                validate_meta(&meta, &group_name, meta.block_id)?;
                 if paths.meta_path != *path {
                     return Err(corrupt("block identity differs from metadata path"));
                 }
-                if meta.visibility.block_state == BlockState::Deleting {
+                if meta.block_state == BlockState::Deleting {
                     complete_deletion(&paths)?;
                 } else {
-                    restore_prefix(&paths, &mut meta)?;
+                    restore_prefix(&paths, &meta)?;
+                    used_bytes = used_bytes.saturating_add(meta.durable_len);
+                    block_count = block_count.saturating_add(1);
                 }
-                recovered += 1;
             }
             for path in block_files(&group.path().join("blocks"))? {
                 match path.extension().and_then(|s| s.to_str()) {
@@ -477,19 +265,9 @@ impl FullBlockFileStore {
                 }
             }
         }
-        Ok(recovered)
+        Ok((used_bytes, block_count))
     }
 
-    /// Discards only the unsynced suffix after a cancelled stream has no remaining IO.
-    pub fn discard_unsynced_suffix(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<()> {
-        let mut meta = match self.load_meta(group_name, block_id) {
-            Ok(meta) => meta,
-            Err(WorkerError::NotFound(_)) => return Ok(()),
-            Err(e) => return Err(e),
-        };
-        ensure_readable(&meta)?;
-        restore_prefix(&self.paths(group_name, block_id), &mut meta)
-    }
     pub fn paths(&self, group_name: &GroupName, block_id: BlockId) -> BlockPaths {
         let (hash_a, hash_b) = block_hash_prefix(block_id);
         let stem = format!("b_{:016x}_{:08x}", block_id.inode_id.as_raw(), block_id.index.as_raw());
@@ -507,89 +285,230 @@ impl FullBlockFileStore {
     }
 
     fn group_dir(&self, group_name: &GroupName) -> PathBuf {
-        self.config.data_root.join("groups").join(group_name.as_str())
+        self.data_root.join("groups").join(group_name.as_str())
     }
 }
 
 impl BlockPaths {
-    fn parent_dir(&self) -> StoreResult<&Path> {
-        self.data_path
-            .parent()
-            .ok_or_else(|| invalid_argument("block has no parent"))
+    fn parent_dir(&self) -> &Path {
+        self.data_path.parent().expect("block path has a parent")
     }
 }
 
 /// IO boundary for the ordered block lifecycle. Callers serialize writers and pin all IO against reclaim.
 pub trait LocalBlockStore {
     /// Validate capacity and fencing, then open exactly the Metadata-authorized prefix.
-    fn open_block_write(&self, req: OpenBlockWriteRequest) -> StoreResult<BlockMetaPayload>;
+    /// The caller must discard the unsynced suffix after failure or cancellation,
+    /// including a failed open, before admitting another writer.
+    fn open_block_write(&self, req: OpenBlockWriteRequest) -> WorkerResult<BlockMetaPayload>;
 
-    fn write_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, data: Bytes) -> StoreResult<()>;
+    fn write_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, data: Bytes) -> WorkerResult<()>;
 
     /// Sync data before atomically publishing its durable prefix and writer token.
-    fn checkpoint_block(&self, req: CheckpointBlockRequest) -> StoreResult<BlockMetaPayload>;
+    fn checkpoint_block(&self, req: CheckpointBlockRequest) -> WorkerResult<BlockMetaPayload>;
 
-    fn read_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, len: u64) -> StoreResult<Bytes>;
+    /// Return exactly `len` bytes, or fail if the local data cannot supply the range.
+    fn read_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, len: u64) -> WorkerResult<Bytes>;
 
     /// Reject unsupported local versions and invalid identity or checkpoint bounds.
-    fn load_meta(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<BlockMetaPayload>;
+    fn load_meta(&self, group_name: &GroupName, block_id: BlockId) -> WorkerResult<BlockMetaPayload>;
 
-    fn reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockResult>;
+    fn reclaim_block(&self, req: &ReclaimBlockRequest) -> WorkerResult<ReclaimBlockResult>;
 
-    fn discard_unsynced_suffix(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<()>;
+    fn discard_unsynced_suffix(&self, group_name: &GroupName, block_id: BlockId) -> WorkerResult<()>;
 }
 
 impl LocalBlockStore for FullBlockFileStore {
-    fn open_block_write(&self, req: OpenBlockWriteRequest) -> StoreResult<BlockMetaPayload> {
-        FullBlockFileStore::open_block_write(self, req)
+    /// Creates a zero checkpoint or reopens the exact authorized durable prefix.
+    /// New epochs persist the reduced boundary before truncating uncommitted bytes.
+    fn open_block_write(&self, req: OpenBlockWriteRequest) -> WorkerResult<BlockMetaPayload> {
+        let _checkpoint = self.checkpoint_access.write().expect("checkpoint access poisoned");
+        validate_block_size(req.block_size).map_err(|e| invalid_argument(e.to_string()))?;
+        if req.fencing_token.owner.is_zero() {
+            return Err(corrupt("invalid persisted writer token"));
+        }
+        validate_token(req.fencing_token)?;
+        if req.write_offset >= req.block_size || req.visible_len > req.write_offset {
+            return Err(invalid_argument("invalid authorized write prefix"));
+        }
+        let paths = self.paths(&req.group_name, req.block_id);
+        create_dir_durable(&self.data_root, paths.parent_dir())?;
+        let meta = match self.load_meta(&req.group_name, req.block_id) {
+            Ok(mut meta) => {
+                ensure_readable(&meta)?;
+                if meta.block_size != req.block_size || meta.tier != req.tier {
+                    return Err(corrupt("write authorization changed persisted block capacity or tier"));
+                }
+                let previous = meta.fencing_token;
+                if req.fencing_token.epoch < previous.epoch
+                    || (req.fencing_token.epoch == previous.epoch && req.fencing_token != previous)
+                {
+                    return Err(fenced("write token is older than the persisted writer"));
+                }
+                if req.visible_len > meta.durable_len {
+                    return Err(corrupt("visible prefix exceeds durable local bytes"));
+                }
+                validate_data_prefix(&paths, &meta)?;
+                if req.fencing_token.epoch > previous.epoch {
+                    if req.write_offset != req.visible_len {
+                        return Err(invalid_argument("new writer must start at the visible prefix"));
+                    }
+                    meta.fencing_token = req.fencing_token;
+                    meta.durable_len = req.visible_len;
+                    write_meta(&paths, &meta)?;
+                } else if req.write_offset != meta.durable_len {
+                    return Err(invalid_argument("same writer must resume at its durable checkpoint"));
+                }
+                meta
+            }
+            Err(WorkerError::NotFound(_)) => {
+                if req.write_offset != 0 || paths.data_path.exists() {
+                    return Err(corrupt("nonempty authorized prefix has no local metadata"));
+                }
+                let meta = BlockMetaPayload {
+                    group_name: req.group_name.clone(),
+                    block_id: req.block_id,
+                    block_size: req.block_size,
+                    durable_len: 0,
+                    block_state: BlockState::Ready,
+                    fencing_token: req.fencing_token,
+                    tier: req.tier,
+                };
+                // The durable zero checkpoint identifies an interrupted data-file creation.
+                write_meta(&paths, &meta)?;
+                meta
+            }
+            Err(e) => return Err(e),
+        };
+        restore_prefix(&paths, &meta)?;
+        Ok(meta)
     }
 
-    fn write_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, data: Bytes) -> StoreResult<()> {
-        FullBlockFileStore::write_at(self, group_name, block_id, offset, data)
+    /// Appends under exclusive stream ownership; the checkpointed prefix is immutable.
+    fn write_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, data: Bytes) -> WorkerResult<()> {
+        let meta = self.load_meta(group_name, block_id)?;
+        ensure_readable(&meta)?;
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| invalid_argument("write range overflow"))?;
+        if data.is_empty() || offset < meta.durable_len || end > meta.block_size {
+            return Err(invalid_argument("write crosses the durable prefix or block capacity"));
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.paths(group_name, block_id).data_path)?;
+        if offset != file.metadata()?.len() {
+            return Err(invalid_argument("write is not at the physical append cursor"));
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(&data)?;
+        Ok(())
     }
 
-    fn checkpoint_block(&self, req: CheckpointBlockRequest) -> StoreResult<BlockMetaPayload> {
-        FullBlockFileStore::checkpoint_block(self, req)
+    /// Orders data fsync before atomic metadata replacement and directory fsync.
+    /// Any failure after IO begins has an unknown outcome and must not be acknowledged.
+    fn checkpoint_block(&self, req: CheckpointBlockRequest) -> WorkerResult<BlockMetaPayload> {
+        let _checkpoint = self.checkpoint_access.write().expect("checkpoint access poisoned");
+        let paths = self.paths(&req.group_name, req.block_id);
+        let mut meta = self.load_meta(&req.group_name, req.block_id)?;
+        ensure_readable(&meta)?;
+        if meta.fencing_token != req.fencing_token {
+            return Err(fenced("checkpoint writer was fenced"));
+        }
+        if req.effective_len < meta.durable_len || req.effective_len > meta.block_size || req.effective_len == 0 {
+            return Err(invalid_argument("invalid checkpoint length"));
+        }
+        let data = OpenOptions::new().read(true).write(true).open(&paths.data_path)?;
+        if data.metadata()?.len() != req.effective_len {
+            return Err(corrupt("checkpoint length differs from written bytes"));
+        }
+        data.sync_all()?;
+        meta.durable_len = req.effective_len;
+        write_meta(&paths, &meta)?;
+        Ok(meta)
     }
 
-    fn read_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, len: u64) -> StoreResult<Bytes> {
-        FullBlockFileStore::read_at(self, group_name, block_id, offset, len)
+    /// Reads within the local durable prefix; the data service separately enforces Metadata's visible range.
+    fn read_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, len: u64) -> WorkerResult<Bytes> {
+        let _checkpoint = self.checkpoint_access.read().expect("checkpoint access poisoned");
+        let meta = self.load_meta(group_name, block_id)?;
+        ensure_readable(&meta)?;
+        if offset.checked_add(len).is_none_or(|end| end > meta.durable_len) {
+            return Err(invalid_argument("read exceeds durable prefix"));
+        }
+        let paths = self.paths(group_name, block_id);
+        validate_data_prefix(&paths, &meta)?;
+        let mut file = File::open(paths.data_path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let len = usize::try_from(len).map_err(|_| invalid_argument("read length overflow"))?;
+        let mut bytes = vec![0; len];
+        file.read_exact(&mut bytes)
+            .map_err(|e| map_truncated_read_error(e, "durable read is truncated"))?;
+        Ok(Bytes::from(bytes))
     }
 
-    fn load_meta(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<BlockMetaPayload> {
-        FullBlockFileStore::load_meta(self, group_name, block_id)
+    fn load_meta(&self, group_name: &GroupName, block_id: BlockId) -> WorkerResult<BlockMetaPayload> {
+        let meta = read_meta_file(&self.paths(group_name, block_id).meta_path)?;
+        validate_meta(&meta, group_name, block_id)?;
+        Ok(meta)
     }
 
-    fn reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockResult> {
-        FullBlockFileStore::reclaim_block(self, req)
+    /// Persists Deleting before any unlink. The caller retains exclusive block access through completion.
+    fn reclaim_block(&self, req: &ReclaimBlockRequest) -> WorkerResult<ReclaimBlockResult> {
+        let _checkpoint = self.checkpoint_access.write().expect("checkpoint access poisoned");
+        let paths = self.paths(&req.group_name, req.block_id);
+        let mut meta = match self.load_meta(&req.group_name, req.block_id) {
+            Ok(meta) => meta,
+            Err(WorkerError::NotFound(_)) => {
+                if paths.data_path.exists() || paths.temp_meta_path.exists() {
+                    return Err(corrupt("unidentified block artifacts"));
+                }
+                return Ok(ReclaimBlockResult::AlreadyAbsent);
+            }
+            Err(error) => return Err(error),
+        };
+        meta.block_state = BlockState::Deleting;
+        write_meta(&paths, &meta)?;
+        complete_deletion(&paths)?;
+        Ok(ReclaimBlockResult::Deleted {
+            effective_len: meta.durable_len,
+        })
     }
 
-    fn discard_unsynced_suffix(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<()> {
-        FullBlockFileStore::discard_unsynced_suffix(self, group_name, block_id)
+    /// Discards only the unsynced suffix after a cancelled stream has no remaining IO.
+    fn discard_unsynced_suffix(&self, group_name: &GroupName, block_id: BlockId) -> WorkerResult<()> {
+        let meta = match self.load_meta(group_name, block_id) {
+            Ok(meta) => meta,
+            Err(WorkerError::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        ensure_readable(&meta)?;
+        restore_prefix(&self.paths(group_name, block_id), &meta)
     }
 }
 
-fn encode_meta(meta: &BlockMetaPayload) -> StoreResult<Vec<u8>> {
+fn encode_meta(meta: &BlockMetaPayload) -> Vec<u8> {
     let payload = encode_meta_payload(meta);
-    let header = BlockMetaHeader::for_payload(payload.len())?;
-    let mut encoded = Vec::with_capacity(BlockMetaHeader::encoded_len() + payload.len());
+    let header = BlockMetaHeader::for_payload(payload.len());
+    let mut encoded = Vec::with_capacity(BLOCK_META_HEADER_LEN + payload.len());
     encoded.extend_from_slice(&header.encode());
     encoded.extend_from_slice(&payload);
-    Ok(encoded)
+    encoded
 }
 
-fn read_meta_file(path: &Path) -> StoreResult<BlockMetaPayload> {
+fn read_meta_file(path: &Path) -> WorkerResult<BlockMetaPayload> {
     let payload = read_meta_payload(path)?;
     decode_meta_payload(&payload)
 }
 
-fn read_meta_payload(path: &Path) -> StoreResult<Vec<u8>> {
+fn read_meta_payload(path: &Path) -> WorkerResult<Vec<u8>> {
     let mut file = File::open(path)?;
     let mut encoded_header = [0u8; BLOCK_META_HEADER_LEN];
     file.read_exact(&mut encoded_header)
         .map_err(|err| map_truncated_read_error(err, "block meta file is shorter than the header"))?;
 
-    let header = BlockMetaHeader::decode(&encoded_header)?;
+    let header = BlockMetaHeader::decode(&encoded_header);
     header.validate()?;
     let payload_len = usize::try_from(header.payload_len).map_err(|_| corrupt("meta payload length is too large"))?;
     let mut payload = vec![0; payload_len];
@@ -613,67 +532,68 @@ fn block_hash_prefix(block_id: BlockId) -> (u8, u8) {
 }
 
 /// Restores P to D only after writer IO is drained; D can be zero for an interrupted creation.
-fn restore_prefix(paths: &BlockPaths, meta: &mut BlockMetaPayload) -> StoreResult<()> {
-    ensure_readable(meta)?;
+fn restore_prefix(paths: &BlockPaths, meta: &BlockMetaPayload) -> WorkerResult<()> {
     // Failed open/checkpoint cleanup can observe a rename whose final fsync failed.
     // Reconfirm the selected D before any irreversible shortening of P.
     File::open(&paths.meta_path)?.sync_all()?;
-    sync_parent_dir(paths.parent_dir()?)?;
+    sync_parent_dir(paths.parent_dir())?;
     let data = OpenOptions::new()
         .read(true)
         .write(true)
-        .create(meta.source.durable_len == 0)
+        .create(meta.durable_len == 0)
         .truncate(false)
         .open(&paths.data_path)
         .map_err(|e| map_truncated_read_error(e, "durable block data is missing"))?;
-    if data.metadata()?.len() < meta.source.durable_len {
+    if data.metadata()?.len() < meta.durable_len {
         return Err(corrupt("data is shorter than durable checkpoint"));
     }
-    data.set_len(meta.source.durable_len)?;
+    data.set_len(meta.durable_len)?;
     data.sync_all()?;
-    sync_parent_dir(paths.parent_dir()?)
+    sync_parent_dir(paths.parent_dir())
 }
 
-fn validate_data_prefix(paths: &BlockPaths, meta: &BlockMetaPayload) -> StoreResult<()> {
+fn validate_data_prefix(paths: &BlockPaths, meta: &BlockMetaPayload) -> WorkerResult<()> {
     match fs::metadata(&paths.data_path) {
-        Ok(data) if data.len() >= meta.source.durable_len => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && meta.source.durable_len == 0 => Ok(()),
+        Ok(data) if data.len() >= meta.durable_len => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && meta.durable_len == 0 => Ok(()),
         _ => Err(corrupt("durable prefix is missing from data file")),
     }
 }
 
-fn validate_token(token: FencingToken, block_id: BlockId) -> StoreResult<()> {
-    if token.block_id != block_id || token.owner.is_zero() || token.epoch.as_raw() == 0 {
+fn validate_token(token: FencingToken) -> WorkerResult<()> {
+    if token.epoch.as_raw() == 0 {
         return Err(corrupt("invalid persisted writer token"));
     }
     Ok(())
 }
 
 /// Check persisted identity and checkpoint bounds before recovery or data access.
-fn validate_meta(meta: &BlockMetaPayload, group_name: &GroupName, block_id: BlockId) -> StoreResult<()> {
-    if &meta.identity.group_name != group_name || meta.identity.block_id != block_id {
+fn validate_meta(meta: &BlockMetaPayload, group_name: &GroupName, block_id: BlockId) -> WorkerResult<()> {
+    if &meta.group_name != group_name || meta.block_id != block_id {
         return Err(corrupt("block metadata identity differs from path"));
     }
-    validate_token(meta.visibility.fencing_token, block_id)?;
+    validate_checkpoint(meta)
+}
 
+fn validate_checkpoint(meta: &BlockMetaPayload) -> WorkerResult<()> {
+    validate_token(meta.fencing_token)?;
     validate_block_size(meta.block_size).map_err(|e| corrupt(e.to_string()))?;
-    if meta.source.durable_len > meta.block_size {
+    if meta.durable_len > meta.block_size {
         return Err(corrupt("checkpoint exceeds block capacity"));
     }
     Ok(())
 }
 
-fn ensure_readable(meta: &BlockMetaPayload) -> StoreResult<()> {
-    if meta.visibility.block_state != BlockState::Ready {
+fn ensure_readable(meta: &BlockMetaPayload) -> WorkerResult<()> {
+    if meta.block_state != BlockState::Ready {
         return Err(corrupt("block is not Ready"));
     }
     Ok(())
 }
 
 /// The rename becomes an acknowledged checkpoint only after its directory is synced.
-fn write_meta(paths: &BlockPaths, meta: &BlockMetaPayload) -> StoreResult<()> {
-    validate_meta(meta, &meta.identity.group_name, meta.identity.block_id)?;
-    let encoded = encode_meta(meta)?;
+fn write_meta(paths: &BlockPaths, meta: &BlockMetaPayload) -> WorkerResult<()> {
+    let encoded = encode_meta(meta);
     let mut temp = OpenOptions::new()
         .write(true)
         .create(true)
@@ -682,18 +602,18 @@ fn write_meta(paths: &BlockPaths, meta: &BlockMetaPayload) -> StoreResult<()> {
     temp.write_all(&encoded)?;
     temp.sync_all()?;
     fs::rename(&paths.temp_meta_path, &paths.meta_path)?;
-    sync_parent_dir(paths.parent_dir()?)
+    sync_parent_dir(paths.parent_dir())
 }
 
-fn complete_deletion(paths: &BlockPaths) -> StoreResult<()> {
+fn complete_deletion(paths: &BlockPaths) -> WorkerResult<()> {
     remove_file_if_exists(&paths.data_path)?;
     remove_file_if_exists(&paths.temp_meta_path)?;
-    sync_parent_dir(paths.parent_dir()?)?;
+    sync_parent_dir(paths.parent_dir())?;
     remove_file_if_exists(&paths.meta_path)?;
-    sync_parent_dir(paths.parent_dir()?)
+    sync_parent_dir(paths.parent_dir())
 }
 
-fn block_files(root: &Path) -> StoreResult<Vec<PathBuf>> {
+fn block_files(root: &Path) -> WorkerResult<Vec<PathBuf>> {
     if !root.try_exists()? {
         return Ok(Vec::new());
     }
@@ -722,8 +642,8 @@ fn block_files(root: &Path) -> StoreResult<Vec<PathBuf>> {
 
 /// Reconfirm every directory entry below the prepared root, including entries
 /// left visible by an earlier mkdir whose parent fsync failed.
-fn create_dir_durable(root: &Path, path: &Path) -> StoreResult<()> {
-    if !root.is_dir() || !path.starts_with(root) {
+fn create_dir_durable(root: &Path, path: &Path) -> WorkerResult<()> {
+    if !root.is_dir() {
         return Err(invalid_argument("block path requires a prepared store root"));
     }
     fs::create_dir_all(path)?;
@@ -733,21 +653,21 @@ fn create_dir_durable(root: &Path, path: &Path) -> StoreResult<()> {
             return Ok(());
         }
     }
-    Err(invalid_argument("block directory is outside its store root"))
+    unreachable!("block directory is constructed below its store root")
 }
 
 /// Report readers hold checkpoint_access, excluding metadata replacement and truncation.
-fn read_report_meta(path: &Path) -> StoreResult<BlockMetaPayload> {
+fn read_report_meta(path: &Path) -> WorkerResult<BlockMetaPayload> {
     let meta = read_meta_file(path)?;
-    sync_parent_dir(path.parent().ok_or_else(|| corrupt("meta path has no parent"))?)?;
+    sync_parent_dir(path.parent().expect("meta path has a parent"))?;
     Ok(meta)
 }
 
-fn sync_parent_dir(parent: &Path) -> StoreResult<()> {
+fn sync_parent_dir(parent: &Path) -> WorkerResult<()> {
     File::open(parent)?.sync_all()?;
     Ok(())
 }
-fn remove_file_if_exists(path: &Path) -> StoreResult<()> {
+fn remove_file_if_exists(path: &Path) -> WorkerResult<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

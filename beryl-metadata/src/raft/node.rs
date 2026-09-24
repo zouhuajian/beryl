@@ -10,7 +10,7 @@ use crate::raft::command::{Command, MAX_COMMAND_BYTES};
 use crate::raft::network::SingleNodeNetworkFactory;
 use crate::raft::response::ApplySuccess;
 use crate::raft::state_machine::AppRaftStateMachine as AppStateMachine;
-use crate::raft::storage::{AppLogStorage, RocksDBStorage, SnapshotInstallTracker, StateMachineStorage};
+use crate::raft::storage::{AppLogStorage, RocksDBStorage, StateMachineStorage};
 use crate::raft::types::{MetadataNode, MetadataRaftTypeConfig};
 use crate::raft::MetadataReadView;
 use beryl_types::RaftLogId;
@@ -27,8 +27,7 @@ pub(crate) type NodeId = <MetadataRaftTypeConfig as RaftTypeConfig>::NodeId;
 /// Raft node wrapper.
 pub(crate) struct AppRaftNode {
     node_id: NodeId,
-    raft: Arc<Raft<MetadataRaftTypeConfig>>,
-    state_machine: Arc<AppStateMachine>,
+    raft: Raft<MetadataRaftTypeConfig>,
     read_view: Arc<MetadataReadView>,
     storage_tasks: TaskTracker,
 }
@@ -38,35 +37,25 @@ impl AppRaftNode {
     pub async fn new(
         node_id: NodeId,
         storage: Arc<RocksDBStorage>,
-        state_machine: Arc<AppStateMachine>,
+        state_machine: AppStateMachine,
         mount_table: Arc<MountTable>,
     ) -> MetadataResult<Self> {
         info!(node_id = node_id, "Initializing Raft node");
 
         let raft_state = storage.load_raft_state()?;
         let raft_state = Arc::new(RwLock::new(raft_state));
-        let read_view = Arc::new(MetadataReadView::new(
-            mount_table,
-            Arc::clone(&raft_state),
-            Arc::clone(&storage),
-        )?);
+        let read_view = Arc::new(MetadataReadView::new(mount_table, Arc::clone(&raft_state)));
 
         // Create RaftLogStorage (storage-v2)
-        let snapshot_install = Arc::new(SnapshotInstallTracker::default());
-        let log_store = AppLogStorage::new(
-            Arc::clone(&storage),
-            Arc::clone(&raft_state),
-            Arc::clone(&snapshot_install),
-        );
+        let log_store = AppLogStorage::new(Arc::clone(&storage), Arc::clone(&raft_state));
 
         // Create RaftStateMachine (storage-v2)
         let storage_tasks = TaskTracker::new();
         let sm_store = StateMachineStorage::new_with_tracker(
             Arc::clone(&storage),
-            Arc::clone(&state_machine),
+            state_machine,
             Arc::clone(&raft_state),
             Arc::clone(&read_view),
-            snapshot_install,
             storage_tasks.token(),
         )?;
 
@@ -104,8 +93,7 @@ impl AppRaftNode {
 
         let node = Self {
             node_id,
-            raft: Arc::new(raft),
-            state_machine,
+            raft,
             read_view,
             storage_tasks,
         };
@@ -125,13 +113,7 @@ impl AppRaftNode {
         }
 
         let mut members = std::collections::BTreeMap::new();
-        members.insert(
-            self.node_id,
-            MetadataNode {
-                node_id: self.node_id,
-                address,
-            },
-        );
+        members.insert(self.node_id, MetadataNode { address });
         self.raft
             .initialize(members)
             .await
@@ -236,14 +218,6 @@ impl AppRaftNode {
         matches!(metrics_guard.state, ServerState::Leader)
     }
 
-    /// Check whether Raft storage has initialized membership.
-    pub async fn is_initialized(&self) -> MetadataResult<bool> {
-        self.raft
-            .is_initialized()
-            .await
-            .map_err(|e| MetadataError::Internal(format!("Failed to check if initialized: {}", e)))
-    }
-
     /// Stop the local Raft runtime and wait for background tasks to exit.
     pub async fn shutdown(&self) -> MetadataResult<()> {
         self.raft
@@ -254,10 +228,6 @@ impl AppRaftNode {
         self.storage_tasks.close();
         self.storage_tasks.wait().await;
         Ok(())
-    }
-
-    pub(crate) fn route_epoch(&self) -> crate::state::RouteEpoch {
-        self.read_view.route_epoch()
     }
 
     /// Get current leader ID (if known).
@@ -273,7 +243,7 @@ impl AppRaftNode {
     /// - linearizable: Read with linearizable guarantee (uses read_index)
     pub async fn read<F, T>(&self, linearizable: bool, f: F) -> MetadataResult<T>
     where
-        F: FnOnce(&AppStateMachine) -> MetadataResult<T>,
+        F: FnOnce() -> MetadataResult<T>,
     {
         if linearizable {
             // Use read_index for linearizable read
@@ -291,7 +261,7 @@ impl AppRaftNode {
             }
         }
 
-        f(self.state_machine.as_ref())
+        f()
     }
 
     /// Get Raft metrics for monitoring.
@@ -301,7 +271,7 @@ impl AppRaftNode {
 
     /// Get membership information from the applied in-memory state.
     pub fn get_membership(&self) -> Option<openraft::Membership<u64, MetadataNode>> {
-        let membership = self.read_view.raft_state().membership.membership().clone();
+        let membership = self.read_view.membership();
         let has_nodes = membership.nodes().next().is_some();
         has_nodes.then_some(membership)
     }
@@ -341,7 +311,6 @@ mod tests {
     use super::*;
     use crate::mount::MountTable;
     use crate::raft::storage::RocksDBStorage;
-    use crate::state::{RaftStateStore, RouteEpoch, StateStore};
     use beryl_types::{GroupName, WorkerId};
     use tempfile::TempDir;
 
@@ -353,8 +322,8 @@ mod tests {
         let node = AppRaftNode::new(
             1,
             Arc::clone(&storage),
-            Arc::new(AppStateMachine::new(Arc::clone(&storage))),
-            Arc::new(MountTable::new()),
+            AppStateMachine::new(Arc::clone(&storage)),
+            Arc::new(MountTable::default()),
         )
         .await
         .unwrap();
@@ -374,19 +343,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn applied_and_route_epoch_reads_do_not_hit_rocksdb() {
+    async fn applied_state_reads_do_not_hit_rocksdb() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        storage.put_route_epoch(RouteEpoch::new(7)).unwrap();
-        let mount_table = Arc::new(MountTable::new());
-        let state_machine = Arc::new(AppStateMachine::new(Arc::clone(&storage)));
+        let mount_table = Arc::new(MountTable::default());
+        let state_machine = AppStateMachine::new(Arc::clone(&storage));
         let node = Arc::new(
             AppRaftNode::new(1, Arc::clone(&storage), state_machine, mount_table)
                 .await
                 .unwrap(),
         );
         node.initialize_single_node("127.0.0.1:0".to_string()).await.unwrap();
-        let route_store = RaftStateStore::new(Arc::clone(&node));
 
         for _ in 0..100 {
             if node.get_last_applied_state_id().is_some() && node.get_membership().is_some() {
@@ -396,40 +363,27 @@ mod tests {
         }
         let expected_applied = node.get_last_applied_state_id().expect("applied state");
         let expected_membership = node.get_membership().expect("membership");
-        let expected_membership_nodes = node.get_membership_nodes();
         let expected_committed = node.committed_index();
 
         storage
-            .with_pinned_db(|db| {
+            .with_db(|db| {
                 let cf = db.cf_handle("raft_state").unwrap();
                 db.put_cf(cf, b"raft_state", b"invalid raft state")
-                    .map_err(|error| crate::MetadataError::Internal(error.to_string()))
-            })
-            .unwrap();
-        storage
-            .with_pinned_db(|db| {
-                let cf = db.cf_handle("meta").unwrap();
-                db.put_cf(cf, b"route_epoch", b"invalid route epoch")
                     .map_err(|error| crate::MetadataError::Internal(error.to_string()))
             })
             .unwrap();
 
         assert_eq!(node.get_last_applied_state_id(), Some(expected_applied));
         assert_eq!(node.get_membership(), Some(expected_membership));
-        assert_eq!(node.get_membership_nodes(), expected_membership_nodes);
         assert_eq!(node.committed_index(), expected_committed);
-        assert_eq!(route_store.get_route_epoch().await.unwrap(), RouteEpoch::new(7));
         node.shutdown().await.unwrap();
     }
 
     fn register_worker_command_with_encoded_size(worker_id: WorkerId, encoded_size: usize) -> Command {
         let mut command = Command::RegisterWorkerDescriptor {
-            proposed_at_ms: 1,
             group_name: GroupName::parse("root").unwrap(),
             worker_id,
             address: String::new(),
-            worker_net_protocol: 1,
-            fault_domain: None,
         };
         let base_len = serde_json::to_vec(&command).unwrap().len();
         let Command::RegisterWorkerDescriptor { address, .. } = &mut command else {
@@ -448,8 +402,8 @@ mod tests {
     async fn command_at_limit_is_admitted_and_larger_command_is_rejected_before_raft_log_admission() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_table = Arc::new(MountTable::new());
-        let state_machine = Arc::new(AppStateMachine::new(Arc::clone(&storage)));
+        let mount_table = Arc::new(MountTable::default());
+        let state_machine = AppStateMachine::new(Arc::clone(&storage));
         let node = Arc::new(
             AppRaftNode::new(1, Arc::clone(&storage), state_machine, mount_table)
                 .await
@@ -485,26 +439,5 @@ mod tests {
         assert_eq!(node.get_last_applied_state_id(), applied_after_limit);
         assert_eq!(node.committed_index(), committed_after_limit);
         node.shutdown().await.unwrap();
-    }
-
-    impl AppRaftNode {
-        /// Get all node IDs from membership (leader and followers).
-        pub fn get_membership_nodes(&self) -> (Option<u64>, Vec<u64>) {
-            let metrics = self.raft.metrics();
-            let metrics_guard = metrics.borrow();
-            let leader_id = metrics_guard.current_leader;
-
-            let follower_ids = self
-                .read_view
-                .raft_state()
-                .membership
-                .membership()
-                .nodes()
-                .map(|(node_id, _)| *node_id)
-                .filter(|node_id| Some(*node_id) != leader_id)
-                .collect();
-
-            (leader_id, follower_ids)
-        }
     }
 }

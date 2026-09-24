@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use beryl_client::FsClient;
-use beryl_metadata::worker::WorkerManager;
-use beryl_types::{GroupName, WorkerId};
-use beryl_worker::control::{HeartbeatSnapshot, MetadataBlockReportLoop, MetadataHeartbeatLoop, RegistrationSet};
+use beryl_types::GroupName;
+use beryl_worker::control::{
+    BlockReportOutcome, HeartbeatOutcome, MetadataBlockReportLoop, MetadataHeartbeatLoop, RegistrationState,
+};
 use beryl_worker::store::dirs::StoreDirs;
 use tokio::time::{sleep, timeout, Instant};
 
@@ -73,68 +74,45 @@ pub async fn wait_for_metadata_filesystem(client: &FsClient) -> TestResult<()> {
 }
 
 pub async fn wait_for_worker_registration(
-    registration_state: &RegistrationSet,
-    worker_manager: &WorkerManager,
+    registration_state: &RegistrationState,
     group_name: &GroupName,
-    worker_id: WorkerId,
 ) -> TestResult<()> {
     ReadinessCheck::startup("worker registration")
-        .wait_for(|| {
-            registration_state.is_registered(group_name)
-                && worker_manager.get_registration(group_name, worker_id).is_some()
-        })
+        .wait_for(|| registration_state.is_registered(group_name))
         .await
 }
 
 pub async fn wait_for_worker_heartbeat(
-    registration_state: &RegistrationSet,
-    worker_manager: &WorkerManager,
+    registration_state: &RegistrationState,
     group_name: &GroupName,
-    worker_id: WorkerId,
 ) -> TestResult<()> {
     ReadinessCheck::startup("worker heartbeat readiness")
-        .wait_for(|| registration_state.is_ready(group_name) && worker_manager.is_worker_live(group_name, worker_id))
+        .wait_for(|| registration_state.is_ready(group_name))
         .await
 }
 
 pub async fn send_heartbeat(heartbeat: &MetadataHeartbeatLoop, block_store: &StoreDirs) -> TestResult<()> {
-    let round = heartbeat
-        .send_once(HeartbeatSnapshot::from(block_store.report()?))
-        .await?;
-    if round.accepted_peers == 0 || round.needs_register || round.worker_run_mismatch {
+    let round = heartbeat.send_once(&block_store.report()).await?;
+    if round != HeartbeatOutcome::Accepted {
         return Err(format!("heartbeat not accepted: {round:?}").into());
     }
     Ok(())
 }
 
+/// A successful EOF report is acknowledged only after Metadata publishes the baseline.
 pub async fn converge_block_reports(
     heartbeat: &MetadataHeartbeatLoop,
     block_report: &MetadataBlockReportLoop,
     block_store: &StoreDirs,
-    registration_state: &RegistrationSet,
-    worker_manager: &WorkerManager,
-    group_name: &GroupName,
-    worker_id: WorkerId,
 ) -> TestResult<()> {
     send_heartbeat(heartbeat, block_store).await?;
     let round = block_report.send_full_once().await?;
-    if round.accepted_peers == 0 || round.needs_register || round.worker_run_mismatch {
+    if round != BlockReportOutcome::Accepted {
         return Err(format!("full block report did not converge: {round:?}").into());
     }
-    let ready_blocks = block_store.scan_group_blocks(group_name)?;
-    ReadinessCheck::startup("block report convergence")
-        .wait_for(|| {
-            registration_state.is_ready(group_name)
-                && worker_manager.is_worker_live(group_name, worker_id)
-                && ready_blocks.iter().all(|block| {
-                    worker_manager
-                        .get_block_locations(group_name, block.identity.block_id)
-                        .contains(&worker_id)
-                })
-        })
-        .await
+    Ok(())
 }
 
-pub fn shared_registration_state() -> Arc<RegistrationSet> {
-    Arc::new(RegistrationSet::new())
+pub fn shared_registration_state() -> Arc<RegistrationState> {
+    Arc::new(RegistrationState::new())
 }

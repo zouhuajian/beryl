@@ -627,10 +627,6 @@ mod tests {
             force: force.clone(),
         };
         executor.execute(std::future::pending::<()>());
-        while tasks.is_empty() {
-            tokio::task::yield_now().await;
-        }
-
         force.cancel();
         tasks.close();
         tokio::time::timeout(Duration::from_secs(1), tasks.wait())

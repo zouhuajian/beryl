@@ -5,19 +5,16 @@
 //!
 //! Keyspace schema:
 //! - mounts/{mount_id} -> MountEntry (serialized)
-//! - route_epoch -> u64
-//! - mount_epoch -> u64
 //!
 //! FS schema:
 //! - inodes/{inode_id_be_fixed_width} -> Inode (serialized)
 //!   - key: "inode/" + 8 bytes BE (u64)
-//!   - value: Inode (bincode)
+//!   - value: Inode (JSON)
 //! - dentries/{parent_inode_id_be_fixed_width}/{name_bytes} -> child_inode_id_be_fixed_width
 //!   - key: "dentry/" + 8 bytes BE (parent_inode_id) + name_bytes (UTF-8, no null terminator)
 //!   - value: 8 bytes BE (child_inode_id)
 //!   - Note: Fixed-width encoding enables efficient iteration and comparison
 
-mod generation;
 mod log_store;
 mod query;
 mod schema;
@@ -30,30 +27,27 @@ use crate::inode::Inode;
 use crate::mount::MountEntry;
 use crate::raft::AppMetadataRaftState;
 use crate::session_registry::CreateFileOperationId;
-use crate::state::RouteEpoch;
-use crate::worker::WorkerInfo;
+use crate::worker::WorkerDescriptor;
 use beryl_types::ids::{InodeId, MountId, WorkerId};
-use beryl_types::{CallId, ClientId, ContentGeneration, GroupName, LeaseEpoch};
+use beryl_types::{CallId, ClientId, GroupName};
 use bincode::config::standard;
 use bincode::serde::{decode_from_slice, encode_to_vec};
-pub(crate) use generation::{GenerationHandle, GenerationWriteGuard, PinnedGeneration, StagedGeneration};
 pub(crate) use log_store::AppLogStorage;
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, WriteOptions, DB};
 use serde::{Deserialize, Serialize};
-pub(crate) use snapshot::{SnapshotFile, SnapshotInstallTracker};
+pub(crate) use snapshot::SnapshotFile;
 pub(crate) use state_machine_store::StateMachineStorage;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use uuid::Uuid;
 
-type DentryPage = (Vec<(String, InodeId)>, Option<Vec<u8>>, bool);
+type DentryPage = (Vec<(String, InodeId)>, Option<Vec<u8>>);
 
 /// Column family names for RocksDB.
 const CF_MOUNTS: &str = "mounts";
 const CF_WORKERS: &str = "workers";
 /// Raft column families
-const CF_META: &str = "meta"; // route_epoch, mount_epoch, file layouts, etc.
+const CF_META: &str = "meta"; // Storage identity, inode allocation, and CreateFile replay records.
 const CF_RAFT_LOG: &str = "raft_log"; // Raft log entries
 const CF_RAFT_STATE: &str = "raft_state"; // Raft state (hard_state, membership)
 const CF_RAFT_SNAPSHOT: &str = "raft_snapshot"; // Raft snapshots
@@ -61,8 +55,8 @@ const CF_RAFT_SNAPSHOT: &str = "raft_snapshot"; // Raft snapshots
 const ROCKSDB_SCHEMA_VERSION_KEY: &[u8] = b"rocksdb_schema_version";
 const STORAGE_IDENTITY_KEY: &[u8] = b"storage_identity";
 const RAFT_STATE_KEY: &[u8] = b"raft_state";
-/// Guards database and snapshot decoding against incompatible persisted metadata encodings.
-pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 6;
+/// Guards database decoding against incompatible persisted metadata encodings.
+pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 7;
 const NEXT_INODE_ID_KEY: &[u8] = b"next_inode_id";
 const CREATE_FILE_REPLAY_COUNT_KEY: &[u8] = b"create_file_replay_count";
 const CREATE_FILE_REPLAY_PREFIX: &[u8] = b"create_file_replay/";
@@ -99,7 +93,7 @@ const CURRENT_CFS: &[&str] = &[
     CF_DETACHED_ROOTS,
 ];
 
-/// Column families that hold replicated state to be snapshotted/restored.
+/// Column families that hold durable state included in local snapshots.
 pub const STATE_CFS: &[&str] = &[
     CF_MOUNTS,
     CF_WORKERS,
@@ -116,8 +110,6 @@ pub(crate) struct StorageIdentity {
     pub cluster_id: String,
     pub group_name: GroupName,
     pub node_id: u64,
-    pub bootstrap_client_id: String,
-    pub bootstrap_call_id: String,
     pub bootstrap_proposed_at_ms: u64,
 }
 
@@ -144,17 +136,12 @@ pub(crate) struct InodeAllocation {
 pub(crate) struct CreateFileReplayRecord {
     pub(crate) operation_id: CreateFileOperationId,
     pub(crate) request_deadline_ms: u64,
-    pub(crate) normalized_path: String,
     pub(crate) parent_inode_id: InodeId,
-    pub(crate) name: String,
     pub(crate) inode_id: InodeId,
     pub(crate) mount_id: MountId,
-    pub(crate) expected_mount_epoch: u64,
     pub(crate) mount_root_inode_id: InodeId,
     pub(crate) relative_components: Vec<String>,
-    pub(crate) lease_epoch: LeaseEpoch,
     pub(crate) block_size: u32,
-    pub(crate) generation: ContentGeneration,
     pub(crate) expires_at_ms: u64,
 }
 
@@ -173,11 +160,6 @@ pub(crate) enum BootstrapNamespaceState {
     Conflicting,
 }
 
-/// Overwritten rename target state that must be removed with the namespace move.
-pub(crate) struct RenameOverwriteCleanup {
-    pub inode_id: InodeId,
-}
-
 /// Namespace rename writes that must commit as one RocksDB batch.
 pub(crate) struct RenameAtomicUpdate<'a> {
     pub src_parent_inode_id: InodeId,
@@ -185,7 +167,7 @@ pub(crate) struct RenameAtomicUpdate<'a> {
     pub dst_parent_inode_id: InodeId,
     pub dst_name: &'a str,
     pub src_inode_id: InodeId,
-    pub overwritten_target: Option<RenameOverwriteCleanup>,
+    pub overwritten_target: Option<InodeId>,
     pub updated_src_parent: Option<&'a Inode>,
     pub updated_dst_parent: Option<&'a Inode>,
 }
@@ -207,14 +189,9 @@ impl DetachedRootReclaimEntry {
         let mut bytes = RocksDBStorage::encode_dentry_key(self.parent_inode_id, &self.name).len();
         if let Some(detached_root) = self.child_detached_root {
             let encoded = RocksDBStorage::encode_detached_root(&detached_root)?;
-            bytes = bytes
-                .checked_add(RocksDBStorage::encode_detached_root_key(self.inode_id).len())
-                .and_then(|value| value.checked_add(encoded.len()))
-                .ok_or_else(|| MetadataError::Internal("detached-root logical byte count overflow".to_string()))?;
+            bytes += RocksDBStorage::encode_detached_root_key(self.inode_id).len() + encoded.len();
         } else {
-            bytes = bytes
-                .checked_add(RocksDBStorage::encode_inode_key(self.inode_id).len())
-                .ok_or_else(|| MetadataError::Internal("detached-root logical byte count overflow".to_string()))?;
+            bytes += RocksDBStorage::encode_inode_key(self.inode_id).len();
         }
         Ok(bytes)
     }
@@ -231,41 +208,20 @@ pub(crate) struct DetachedRootReclaimUpdate {
 }
 
 impl DetachedRootReclaimUpdate {
-    pub(crate) fn completed_root_logical_bytes(inode_id: InodeId) -> MetadataResult<usize> {
-        RocksDBStorage::encode_inode_key(inode_id)
-            .len()
-            .checked_add(RocksDBStorage::encode_detached_root_key(inode_id).len())
-            .ok_or_else(|| MetadataError::Internal("detached-root logical byte count overflow".to_string()))
-    }
+    pub(crate) const COMPLETED_ROOT_LOGICAL_BYTES: usize = b"inode/".len() + 8 + 8;
 
-    /// Return the replicated batch's deterministic logical key/value byte size.
-    ///
-    /// RocksDB implementation overhead is deliberately excluded because it is
-    /// not a stable protocol value. The Raft apply-state write is included.
-    pub(crate) fn logical_batch_bytes(&self, raft_state: &AppMetadataRaftState) -> MetadataResult<usize> {
+    /// Include the apply-state write in the replicated logical byte budget.
+    pub(crate) fn raft_state_logical_bytes(raft_state: &AppMetadataRaftState) -> MetadataResult<usize> {
         let encoded_state = serde_json::to_vec(raft_state)
             .map_err(|error| MetadataError::Internal(format!("Failed to serialize Raft state: {error}")))?;
-        let mut bytes = RAFT_STATE_KEY
-            .len()
-            .checked_add(encoded_state.len())
-            .ok_or_else(|| MetadataError::Internal("detached-root logical byte count overflow".to_string()))?;
-        for entry in &self.entries {
-            bytes = bytes
-                .checked_add(entry.logical_bytes()?)
-                .ok_or_else(|| MetadataError::Internal("detached-root logical byte count overflow".to_string()))?;
-        }
-        for inode_id in &self.completed_root_inode_ids {
-            bytes = bytes
-                .checked_add(Self::completed_root_logical_bytes(*inode_id)?)
-                .ok_or_else(|| MetadataError::Internal("detached-root logical byte count overflow".to_string()))?;
-        }
-        Ok(bytes)
+        Ok(RAFT_STATE_KEY.len() + encoded_state.len())
     }
 }
 
 /// RocksDB storage backend.
 pub(crate) struct RocksDBStorage {
-    generations: GenerationHandle,
+    db: DB,
+    snapshot_dir: PathBuf,
 }
 
 impl RocksDBStorage {
@@ -325,6 +281,20 @@ impl RocksDBStorage {
             )));
         }
         Ok(detached_root)
+    }
+
+    fn decode_create_file_replay(
+        operation_id: CreateFileOperationId,
+        value: &[u8],
+    ) -> MetadataResult<CreateFileReplayRecord> {
+        let (record, consumed): (CreateFileReplayRecord, usize) = decode_from_slice(value, standard())
+            .map_err(|error| MetadataError::Internal(format!("Failed to decode CreateFile replay record: {error}")))?;
+        if consumed != value.len() || record.operation_id != operation_id {
+            return Err(MetadataError::Internal(
+                "CreateFile replay record identity is corrupt".to_string(),
+            ));
+        }
+        Ok(record)
     }
 
     fn encode_create_file_operation_bytes(operation_id: CreateFileOperationId) -> [u8; 32] {

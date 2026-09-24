@@ -9,7 +9,7 @@
 //! - Tracing spans
 //! - Mock transport and UFS operations
 
-use beryl_common::observe::config::{LogConfig, ObservabilityConfig, ServiceInfo};
+use beryl_common::observe::config::{ObservabilityConfig, ServiceInfo};
 use beryl_common::observe::init_observability;
 use beryl_common::service_http::spawn_service_http;
 use std::sync::Arc;
@@ -19,11 +19,9 @@ use tokio::time::sleep;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ObservabilityConfig {
-        log: LogConfig {
-            level: "info,beryl_common=info,tonic=warn,tower=warn,h2=warn".to_string(),
-            format: "json".to_string(),
-            output: "stdout".to_string(),
-        },
+        level: "info,beryl_common=info,tonic=warn,tower=warn,h2=warn".to_string(),
+        format: "json".to_string(),
+        output: "stdout".to_string(),
     };
 
     let service_info = ServiceInfo {

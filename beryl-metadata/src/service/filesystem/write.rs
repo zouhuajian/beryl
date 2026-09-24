@@ -5,27 +5,28 @@
 
 use super::command::unexpected_raft_apply_success;
 use super::{
-    missing_resolved_target_error, validate_active_write_block_size, worker_endpoint_from_parts, AdmissionFailure,
-    Freshness, FsResult, FsSuccess, MetadataFileSystem, RequestContext, WriteHandle, SUPPORTED_REPLICA_COUNT,
+    missing_resolved_target_error, FsFailure, FsResult, FsSuccess, MetadataFileSystem, RequestHeader, WriteHandle,
 };
 use crate::error::MetadataError;
 use crate::observe;
 use crate::path_resolver::{PathResolver, ResolvedPath};
-use crate::placement::{PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus};
+use crate::placement::{plan_placement, PlacementOp, PlacementRequest, PlacementStatus};
 use crate::raft::{ApplySuccess, Command};
 use crate::session_registry::{
     BeginAllocateBlock, BeginAllocateBlockError, BeginSessionError, BeginSessionInput, CompleteWriteTargetError,
-    SessionRegistry, WriteOpeningError, WriteSession, WriteSessionError, WriteTargetLimit,
+    WriteOpeningError, WriteSession, WriteSessionError, WriteTargetLimit,
 };
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind};
 use beryl_common::header::CallerContextFields;
 use beryl_types::ids::{BlockId, InodeId};
 use beryl_types::lease::FencingToken;
-use beryl_types::{ContentGeneration, GroupName, LeaseEpoch, LocatedBlock, Tier, WorkerId, WorkerRunId, WriteMode};
+use beryl_types::{
+    ContentGeneration, LeaseEpoch, LocatedBlock, Tier, WorkerEndpointInfo, WorkerId, WorkerRunId, WriteMode,
+};
 
 /// Exact stream facts checked against the active session and durable inode authority.
 pub(crate) struct AuthorizeBlockWriteArgs {
-    pub group_name: GroupName,
+    pub block_id: BlockId,
     pub worker_id: WorkerId,
     pub worker_run_id: WorkerRunId,
     pub fencing_token: FencingToken,
@@ -46,32 +47,10 @@ pub(crate) struct OpenWriteOutput {
     pub(crate) tail_block: Option<LocatedBlock>,
 }
 
-/// Block registered in the active allocation chain before RPC success is returned.
-#[derive(Clone, Debug)]
-pub(crate) struct AllocateBlockOutput {
-    pub(crate) block: LocatedBlock,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct RenewLeaseOutput {
-    pub(crate) expires_at_ms: u64,
-}
-
 /// Caller-supplied allocation predecessor under a write handle and freshness fence.
 pub(crate) struct AllocateBlockArgs {
     pub(crate) handle: WriteHandle,
     pub(crate) previous_block_id: Option<BlockId>,
-    pub(crate) freshness: Freshness,
-}
-
-pub(crate) struct AbortFileWriteArgs {
-    pub(crate) handle: WriteHandle,
-    pub(crate) freshness: Freshness,
-}
-
-pub(crate) struct RenewLeaseArgs {
-    pub(crate) handle: WriteHandle,
-    pub(crate) freshness: Freshness,
 }
 
 impl MetadataFileSystem {
@@ -79,16 +58,14 @@ impl MetadataFileSystem {
     /// A linearizable read prevents an old leader from issuing a new write authorization.
     pub(crate) async fn authorize_block_write(
         &self,
-        ctx: &RequestContext,
+        ctx: &RequestHeader,
         args: AuthorizeBlockWriteArgs,
     ) -> FsResult<u64> {
-        let inode_id = args.fencing_token.block_id.inode_id;
-        if let Some(failure) = self.session_write_admission_failure(ctx, inode_id) {
-            return self.failure_from_admission(failure);
-        }
+        let inode_id = args.block_id.inode_id;
+        self.check_session_write_admission(ctx, inode_id)?;
         let result = async {
             let raft = &self.raft_node;
-            raft.read(true, |_| {
+            raft.read(true, || {
                 let invalid = || MetadataError::PermissionDenied("block writer is no longer authorized".into());
                 let session = self.session_registry.get_session(inode_id).ok_or_else(invalid)?;
                 self.session_registry
@@ -99,21 +76,18 @@ impl MetadataFileSystem {
                     return Err(invalid());
                 }
                 let inode = self.storage.get_inode(inode_id)?.ok_or_else(invalid)?;
-                let mount = self.mount_table.get_mount(inode.mount_id)?.ok_or_else(invalid)?;
-                if mount.namespace_owner_group_name != args.group_name
-                    || ctx.caller.group_name.as_ref() != Some(&args.group_name)
-                {
+                let mount = self.mount_table.get_mount(inode.mount_id).ok_or_else(invalid)?;
+                if ctx.group_name.as_ref() != Some(&mount.namespace_owner_group_name) {
                     return Err(invalid());
                 }
                 let file = inode.file()?;
-                file.validate(inode_id)?;
                 if file.lease_epoch != session.lease_epoch {
                     return Err(invalid());
                 }
                 let target = session
                     .issued_targets
                     .iter()
-                    .find(|target| target.block_id == args.fencing_token.block_id)
+                    .find(|target| target.block_id == args.block_id)
                     .ok_or_else(invalid)?;
                 if target.fencing_token != args.fencing_token
                     || target.block_size != args.block_size
@@ -130,7 +104,7 @@ impl MetadataFileSystem {
                 }
                 let manager = &self.worker_manager;
                 if !manager
-                    .collect_worker_placement_views(&args.group_name)
+                    .collect_worker_placement_views(&mount.namespace_owner_group_name)
                     .iter()
                     .any(|worker| {
                         worker.worker_id == args.worker_id
@@ -140,11 +114,7 @@ impl MetadataFileSystem {
                 {
                     return Err(invalid());
                 }
-                let visible_len = match file
-                    .blocks
-                    .iter()
-                    .position(|block| *block == args.fencing_token.block_id)
-                {
+                let visible_len = match file.blocks.iter().position(|block| *block == args.block_id) {
                     Some(ordinal) => file.block_len(ordinal),
                     None => 0,
                 };
@@ -157,40 +127,28 @@ impl MetadataFileSystem {
         }
         .await;
         match result {
-            Ok(visible_len) => self.success(visible_len, Some(args.group_name), None),
-            Err(error) => self.failure_from_error(ctx, error, Some(args.group_name), None),
+            Ok(visible_len) => self.success(visible_len, ctx.group_name.clone()),
+            Err(error) => Err(self.failure_from_error(ctx, error, ctx.group_name.clone())),
         }
     }
 
     /// Admit one allocation or replay without changing file visibility.
-    pub(crate) async fn allocate_block(
-        &self,
-        ctx: &RequestContext,
-        args: AllocateBlockArgs,
-    ) -> FsResult<AllocateBlockOutput> {
-        if let Some(failure) = self.session_write_admission_failure(ctx, args.handle.inode_id) {
-            return self.failure_from_admission(failure);
-        }
+    pub(crate) async fn allocate_block(&self, ctx: &RequestHeader, args: AllocateBlockArgs) -> FsResult<LocatedBlock> {
+        self.check_session_write_admission(ctx, args.handle.inode_id)?;
         let handle = args.handle;
         let result = self
-            .allocate_block_session(
-                ctx,
-                handle.inode_id,
-                handle.lease_epoch,
-                args.previous_block_id,
-                args.freshness,
-            )
+            .allocate_block_session(ctx, handle.inode_id, handle.lease_epoch, args.previous_block_id)
             .await;
         match &result {
             Ok(success) => {
-                let target = &success.payload.block;
+                let target = &success.payload;
                 tracing::info!(
                     target: "metadata.block",
                     op = "AllocateBlock",
                     result = "ok",
                     error_code = "none",
-                    client_id = %ctx.caller.client.client_id,
-                    call_id = %ctx.caller.client.call_id,
+                    client_id = %ctx.client.client_id,
+                    call_id = %ctx.client.call_id,
                     block_id = %target.block_id,
                     block_index = target.block_id.index.as_raw(),
                     group_id = success.group_name.as_ref().map(|group| group.as_str()),
@@ -198,8 +156,6 @@ impl MetadataFileSystem {
                     targets_sample = ?target.workers.iter().take(3).map(|endpoint| endpoint.worker_id.as_raw()).collect::<Vec<_>>(),
                     inode_id = target.block_id.inode_id.as_raw(),
                     handle_inode_id = handle.inode_id.as_raw(),
-                    mount_epoch = success.mount_epoch,
-                    route_epoch = success.route_epoch,
                     "AllocateBlock succeeded"
                 );
             }
@@ -208,38 +164,29 @@ impl MetadataFileSystem {
                 op = "AllocateBlock",
                 result = "rejected",
                 error_code = crate::observe::rpc_error_kind(&failure.error),
-                client_id = %ctx.caller.client.client_id,
-                call_id = %ctx.caller.client.call_id,
+                client_id = %ctx.client.client_id,
+                call_id = %ctx.client.call_id,
                 handle_inode_id = handle.inode_id.as_raw(),
                 lease_epoch = handle.lease_epoch.as_raw(),
-                mount_epoch = failure.mount_epoch,
-                route_epoch = failure.route_epoch,
                 "AllocateBlock rejected"
             ),
         }
         result
     }
 
-    pub(crate) async fn abort_file_write(&self, ctx: &RequestContext, args: AbortFileWriteArgs) -> FsResult<()> {
-        if let Some(failure) = self.session_write_admission_failure(ctx, args.handle.inode_id) {
-            return self.failure_from_admission(failure);
-        }
-        let handle = args.handle;
-        let result = self
-            .abort_session(ctx, handle.inode_id, handle.lease_epoch, args.freshness)
-            .await;
+    pub(crate) async fn abort_file_write(&self, ctx: &RequestHeader, handle: WriteHandle) -> FsResult<()> {
+        self.check_session_write_admission(ctx, handle.inode_id)?;
+        let result = self.abort_session(ctx, handle.inode_id, handle.lease_epoch).await;
         match &result {
-            Ok(success) => tracing::info!(
+            Ok(_) => tracing::info!(
                 target: "metadata.state",
                 op = "AbortFileWrite",
                 result = "completed",
                 error_code = "none",
-                client_id = %ctx.caller.client.client_id,
-                call_id = %ctx.caller.client.call_id,
+                client_id = %ctx.client.client_id,
+                call_id = %ctx.client.call_id,
                 inode_id = handle.inode_id.as_raw(),
                 lease_epoch = handle.lease_epoch.as_raw(),
-                mount_epoch = success.mount_epoch,
-                route_epoch = success.route_epoch,
                 "AbortFileWrite completed"
             ),
             Err(failure) => tracing::warn!(
@@ -247,12 +194,10 @@ impl MetadataFileSystem {
                 op = "AbortFileWrite",
                 result = "rejected",
                 error_code = crate::observe::rpc_error_kind(&failure.error),
-                client_id = %ctx.caller.client.client_id,
-                call_id = %ctx.caller.client.call_id,
+                client_id = %ctx.client.client_id,
+                call_id = %ctx.client.call_id,
                 inode_id = handle.inode_id.as_raw(),
                 lease_epoch = handle.lease_epoch.as_raw(),
-                mount_epoch = failure.mount_epoch,
-                route_epoch = failure.route_epoch,
                 "AbortFileWrite rejected"
             ),
         }
@@ -263,27 +208,20 @@ impl MetadataFileSystem {
     ///
     /// The shared topology guard keeps ownership validation and every session
     /// expiry index update within one namespace admission interval.
-    pub(crate) async fn renew_lease(&self, ctx: &RequestContext, args: RenewLeaseArgs) -> FsResult<RenewLeaseOutput> {
-        if let Some(failure) = self.session_write_admission_failure(ctx, args.handle.inode_id) {
-            return self.failure_from_admission(failure);
-        }
+    pub(crate) async fn renew_lease(&self, ctx: &RequestHeader, handle: WriteHandle) -> FsResult<u64> {
+        self.check_session_write_admission(ctx, handle.inode_id)?;
         let _topology_guard = self.namespace_topology.read().await;
-        let handle = args.handle;
-        let result = self
-            .renew_session(ctx, handle.inode_id, handle.lease_epoch, args.freshness)
-            .await;
+        let result = self.renew_session(ctx, handle.inode_id, handle.lease_epoch).await;
         match &result {
-            Ok(success) => tracing::info!(
+            Ok(_) => tracing::info!(
                 target: "metadata.state",
                 op = "RenewLease",
                 result = "completed",
                 error_code = "none",
-                client_id = %ctx.caller.client.client_id,
-                call_id = %ctx.caller.client.call_id,
+                client_id = %ctx.client.client_id,
+                call_id = %ctx.client.call_id,
                 inode_id = handle.inode_id.as_raw(),
                 lease_epoch = handle.lease_epoch.as_raw(),
-                mount_epoch = success.mount_epoch,
-                route_epoch = success.route_epoch,
                 "RenewLease completed"
             ),
             Err(failure) => tracing::warn!(
@@ -291,12 +229,10 @@ impl MetadataFileSystem {
                 op = "RenewLease",
                 result = "rejected",
                 error_code = crate::observe::rpc_error_kind(&failure.error),
-                client_id = %ctx.caller.client.client_id,
-                call_id = %ctx.caller.client.call_id,
+                client_id = %ctx.client.client_id,
+                call_id = %ctx.client.call_id,
                 inode_id = handle.inode_id.as_raw(),
                 lease_epoch = handle.lease_epoch.as_raw(),
-                mount_epoch = failure.mount_epoch,
-                route_epoch = failure.route_epoch,
                 "RenewLease rejected"
             ),
         }
@@ -304,40 +240,33 @@ impl MetadataFileSystem {
     }
 
     /// Resolve data-write admission from lightweight session identity only.
-    pub(super) fn session_write_admission_failure(
+    pub(super) fn check_session_write_admission(
         &self,
-        ctx: &RequestContext,
+        ctx: &RequestHeader,
         inode_id: InodeId,
-    ) -> Option<AdmissionFailure> {
+    ) -> Result<(), FsFailure> {
         if let Some(session) = self.session_registry.get_session_identity(inode_id) {
-            self.admission.check_data_write(ctx, session.mount_id).err()
+            self.check_data_write(ctx, session.mount_id)
         } else {
-            self.admission.check_meta_write(ctx).err()
+            self.check_meta_write(ctx)
         }
     }
 }
 
 impl MetadataFileSystem {
-    async fn abort_session(
-        &self,
-        ctx: &RequestContext,
-        inode_id: InodeId,
-        lease_epoch: LeaseEpoch,
-        freshness: Freshness,
-    ) -> FsResult<()> {
+    async fn abort_session(&self, ctx: &RequestHeader, inode_id: InodeId, lease_epoch: LeaseEpoch) -> FsResult<()> {
         let mount_id = match self.session_registry.get_session_identity(inode_id) {
             Some(session) => {
-                if session.open_client_id != ctx.caller.client.client_id {
-                    return self.session_terminal_failure(
+                if session.open_client_id != ctx.client.client_id {
+                    return Err(self.session_terminal_failure(
                         ctx,
                         ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                         format!("AbortFileWrite client does not own inode_id={inode_id}"),
                         None,
-                        None,
-                    );
+                    ));
                 }
                 if lease_epoch != session.lease_epoch {
-                    return self.session_terminal_failure(
+                    return Err(self.session_terminal_failure(
                         ctx,
                         ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                         format!(
@@ -345,8 +274,7 @@ impl MetadataFileSystem {
                             session.lease_epoch
                         ),
                         None,
-                        None,
-                    );
+                    ));
                 }
                 session.mount_id
             }
@@ -355,97 +283,64 @@ impl MetadataFileSystem {
                 // from its durable replay record even though local session state is gone.
                 let replay = match self.storage.get_create_file_replay_for_inode(inode_id) {
                     Ok(Some(replay))
-                        if replay.operation_id.client_id == ctx.caller.client.client_id
-                            && replay.lease_epoch == lease_epoch =>
+                        if replay.operation_id.client_id == ctx.client.client_id
+                            && lease_epoch == LeaseEpoch::new(1) =>
                     {
                         replay
                     }
-                    Ok(Some(_)) | Ok(None) => return self.success((), None, None),
-                    Err(error) => return self.failure_from_error(ctx, error, None, None),
+                    Ok(Some(_)) | Ok(None) => return self.success((), None),
+                    Err(error) => return Err(self.failure_from_error(ctx, error, None)),
                 };
                 replay.mount_id
             }
         };
 
-        let (group_name, mount_epoch) = match self.freshness_validator.validate_mount_epoch(ctx, freshness, mount_id) {
-            Ok(hints) => hints,
-            Err(err) => return Err(err),
-        };
-        let route_epoch = match self
-            .freshness_validator
-            .validate_route_epoch(ctx, freshness, group_name.clone(), mount_epoch, "AbortFileWrite")
-            .await
-        {
-            Ok(route_epoch) => route_epoch,
-            Err(err) => return Err(err),
-        };
+        let group_name = self.mount_owner(mount_id);
+        self.check_leader(ctx, group_name.clone()).await?;
 
-        let next_epoch = lease_epoch.checked_next();
         match self
             .propose_fs_write_command(
-                Command::EndWriteLease {
-                    proposed_at_ms: crate::raft::proposal_timestamp_ms(),
-                    inode_id,
-                    lease_epoch,
-                },
+                Command::EndWriteLease { inode_id, lease_epoch },
                 move |success| match success {
-                    ApplySuccess::WriteLeaseEnded {
-                        inode_id: returned_inode_id,
-                        lease_epoch: ended_epoch,
-                    } if returned_inode_id == inode_id && Some(ended_epoch) == next_epoch => Ok(()),
+                    ApplySuccess::WriteLeaseEnded => Ok(()),
                     unexpected => Err(unexpected_raft_apply_success("EndWriteLease", unexpected)),
                 },
             )
             .await
         {
             Ok(()) => {}
-            Err(err) => return self.failure_from_error(ctx, err, group_name, mount_epoch),
+            Err(err) => return Err(self.failure_from_error(ctx, err, group_name)),
         }
         self.session_registry.remove_session_if_epoch(inode_id, lease_epoch);
 
-        self.success_with_route_epoch((), group_name, mount_epoch, route_epoch)
+        self.success((), group_name)
     }
 
-    async fn renew_session(
-        &self,
-        ctx: &RequestContext,
-        inode_id: InodeId,
-        lease_epoch: LeaseEpoch,
-        freshness: Freshness,
-    ) -> FsResult<RenewLeaseOutput> {
+    async fn renew_session(&self, ctx: &RequestHeader, inode_id: InodeId, lease_epoch: LeaseEpoch) -> FsResult<u64> {
         let session = match self.session_registry.get_session_identity(inode_id) {
             Some(session) => session,
             None => {
-                return self.session_terminal_failure(
+                return Err(self.session_terminal_failure(
                     ctx,
                     ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                     format!("write session not found for inode_id={inode_id}",),
                     None,
-                    None,
-                );
+                ));
             }
         };
-        if session.open_client_id != ctx.caller.client.client_id {
-            return self.session_terminal_failure(
+        if session.open_client_id != ctx.client.client_id {
+            return Err(self.session_terminal_failure(
                 ctx,
                 ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                 format!("RenewLease client does not own inode_id={inode_id}"),
                 None,
-                None,
-            );
+            ));
         }
 
-        let (group_name, mount_epoch) =
-            match self
-                .freshness_validator
-                .validate_mount_epoch(ctx, freshness, session.mount_id)
-            {
-                Ok(hints) => hints,
-                Err(err) => return Err(err),
-            };
+        let group_name = self.mount_owner(session.mount_id);
 
         if lease_epoch != session.lease_epoch {
-            return self.session_terminal_failure(
+            return Err(self.session_terminal_failure(
                 ctx,
                 ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                 format!(
@@ -453,41 +348,34 @@ impl MetadataFileSystem {
                     session.lease_epoch, lease_epoch
                 ),
                 group_name,
-                mount_epoch,
-            );
+            ));
         }
 
-        let expires_at_ms =
-            match self
-                .session_registry
-                .renew_session(inode_id, lease_epoch, ctx.caller.client.client_id)
-            {
-                Ok(expires_at_ms) => expires_at_ms,
-                Err(WriteSessionError::Expired) => {
-                    return self.session_terminal_failure(
-                        ctx,
-                        ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
-                        format!("lease renewal rejected for inode_id={inode_id}; write lease expired",),
-                        group_name,
-                        mount_epoch,
-                    );
-                }
-                Err(error) => {
-                    return self.session_terminal_failure(
-                        ctx,
-                        ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
-                        format!("write session renewal rejected for inode_id={inode_id}: {error:?}"),
-                        group_name,
-                        mount_epoch,
-                    );
-                }
-            };
-
-        let route_epoch = match self.freshness_validator.authoritative_route_epoch().await {
-            Ok(route_epoch) => Some(route_epoch),
-            Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
+        let expires_at_ms = match self
+            .session_registry
+            .renew_session(inode_id, lease_epoch, ctx.client.client_id)
+        {
+            Ok(expires_at_ms) => expires_at_ms,
+            Err(WriteSessionError::Expired) => {
+                return Err(self.session_terminal_failure(
+                    ctx,
+                    ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
+                    format!("lease renewal rejected for inode_id={inode_id}; write lease expired",),
+                    group_name,
+                ));
+            }
+            Err(error) => {
+                return Err(self.session_terminal_failure(
+                    ctx,
+                    ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                    format!("write session renewal rejected for inode_id={inode_id}: {error:?}"),
+                    group_name,
+                ));
+            }
         };
-        self.success_with_route_epoch(RenewLeaseOutput { expires_at_ms }, group_name, mount_epoch, route_epoch)
+
+        self.check_leader(ctx, group_name.clone()).await?;
+        self.success(expires_at_ms, group_name)
     }
 
     /// Install an opening, persist its fencing epoch, and atomically activate it.
@@ -496,88 +384,41 @@ impl MetadataFileSystem {
     /// captured while namespace topology is stable.
     pub(super) async fn open_write_inode(
         &self,
-        ctx: &RequestContext,
+        ctx: &RequestHeader,
         normalized_path: String,
         inode_id: InodeId,
         ancestor_inode_ids: Vec<InodeId>,
         mode: WriteMode,
-        freshness: Freshness,
     ) -> FsResult<OpenWriteOutput> {
-        let caller_ctx = &ctx.caller;
-
-        if let Err(message) = SessionRegistry::validate_ancestor_chain(inode_id, &ancestor_inode_ids) {
-            return self.failure_from_error(ctx, MetadataError::Internal(message), None, None);
-        }
-
-        let inode = match self.read_inode(inode_id) {
+        let inode = match self.storage.get_inode(inode_id) {
             Ok(Some(inode)) => inode,
             Ok(None) => {
-                return self.failure_from_error(
+                return Err(self.failure_from_error(
                     ctx,
                     MetadataError::NotFound(format!("Inode not found: {}", inode_id)),
                     None,
-                    None,
-                );
+                ));
             }
             Err(err) => {
-                return self.failure_from_error(ctx, err, None, None);
+                return Err(self.failure_from_error(ctx, err, None));
             }
         };
 
-        if inode.inode_id != inode_id {
-            return self.failure_from_error(
-                ctx,
-                MetadataError::Internal(format!(
-                    "inode authority is corrupt for OpenWrite: key={inode_id}, value_id={}, kind={:?}, payload={:?}",
-                    inode.inode_id,
-                    inode.file_type(),
-                    inode.file_type()
-                )),
-                None,
-                None,
-            );
-        }
         if !inode.file_type().is_file() {
-            return self.failure_from_error(
+            return Err(self.failure_from_error(
                 ctx,
                 MetadataError::IsDir(format!("Inode is not a file: {}", inode_id)),
                 None,
-                None,
-            );
+            ));
         }
 
-        let (group_name, mount_epoch) =
-            match self
-                .freshness_validator
-                .validate_mount_epoch(ctx, freshness, inode.mount_id)
-            {
-                Ok(hints) => hints,
-                Err(err) => return Err(err),
-            };
+        let group_name = self.mount_owner(inode.mount_id);
 
-        let route_epoch = match self
-            .freshness_validator
-            .validate_route_epoch(ctx, freshness, group_name.clone(), mount_epoch, "OpenWrite")
-            .await
-        {
-            Ok(route_epoch) => route_epoch,
-            Err(err) => return Err(err),
-        };
+        self.check_leader(ctx, group_name.clone()).await?;
 
-        let block_size = match self.storage.get_block_size(inode_id) {
-            Ok(block_size) => block_size,
-            Err(err) => {
-                return self.failure_from_error(ctx, err, group_name, mount_epoch);
-            }
-        };
-        if let Err(err) = validate_active_write_block_size(block_size) {
-            return self.failure_from_error(ctx, err, group_name, mount_epoch);
-        }
-
-        let base_epoch = match inode.file() {
-            Ok(file) => file.lease_epoch,
-            Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
-        };
+        let file = inode.file().expect("file kind checked above");
+        let block_size = file.block_size;
+        let base_epoch = file.lease_epoch;
 
         let opening = match self.session_registry.begin_session(BeginSessionInput {
             normalized_path,
@@ -585,23 +426,22 @@ impl MetadataFileSystem {
             mount_id: inode.mount_id,
             current_lease_epoch: base_epoch,
             mode,
-            open_client_id: caller_ctx.client.client_id,
+            open_client_id: ctx.client.client_id,
             block_size,
             ancestor_inode_ids,
         }) {
             Ok(opening) => opening,
             Err(BeginSessionError::Busy) => {
-                return self.failure_from_error(
+                return Err(self.failure_from_error(
                     ctx,
                     MetadataError::Busy(format!(
                         "File already has an opening or active write session: {inode_id}"
                     )),
                     group_name,
-                    mount_epoch,
-                );
+                ));
             }
             Err(BeginSessionError::LimitExceeded(rejection)) => {
-                return self.failure_from_error(
+                return Err(self.failure_from_error(
                     ctx,
                     MetadataError::WriteSessionLimitExceeded(format!(
                         "{} limit {} reached",
@@ -609,32 +449,28 @@ impl MetadataFileSystem {
                         rejection.maximum
                     )),
                     group_name,
-                    mount_epoch,
-                );
+                ));
             }
             Err(BeginSessionError::LeaseEpochExhausted) => {
-                return self.failure_from_error(
+                return Err(self.failure_from_error(
                     ctx,
                     MetadataError::ResourceExhausted(format!("write lease epoch exhausted for inode {inode_id}")),
                     group_name,
-                    mount_epoch,
-                );
+                ));
             }
             Err(BeginSessionError::OpeningIdExhausted) => {
-                return self.failure_from_error(
+                return Err(self.failure_from_error(
                     ctx,
                     MetadataError::ResourceExhausted("leader-local write opening identity exhausted".to_string()),
                     group_name,
-                    mount_epoch,
-                );
+                ));
             }
             Err(BeginSessionError::InvalidAncestorChain) => {
-                return self.failure_from_error(
+                return Err(self.failure_from_error(
                     ctx,
                     MetadataError::Internal("validated write session ancestor chain was rejected".to_string()),
                     group_name,
-                    mount_epoch,
-                );
+                ));
             }
         };
         let lease_epoch = opening.proposed_lease_epoch();
@@ -647,10 +483,7 @@ impl MetadataFileSystem {
                     expected_lease_epoch: base_epoch,
                 },
                 move |success| match success {
-                    ApplySuccess::WriteLeaseAcquired {
-                        inode_id: returned_inode_id,
-                        lease_epoch: returned_lease_epoch,
-                    } if returned_inode_id == inode_id && returned_lease_epoch == lease_epoch => Ok(()),
+                    ApplySuccess::WriteLeaseAcquired => Ok(()),
                     unexpected => Err(unexpected_raft_apply_success("AcquireWriteLease", unexpected)),
                 },
             )
@@ -658,18 +491,19 @@ impl MetadataFileSystem {
         match lease_result {
             Ok(()) => {}
             Err(err) => {
-                return self.failure_from_error(ctx, err, group_name, mount_epoch);
+                return Err(self.failure_from_error(ctx, err, group_name));
             }
         }
 
         // AcquireWriteLease may have ordered behind an earlier publication. Capture
         // the visible file only after its new durable epoch has been installed.
         let snapshot = match self
-            .read_inode(inode_id)
+            .storage
+            .get_inode(inode_id)
             .and_then(|inode| inode.ok_or_else(|| MetadataError::NotFound("opened file disappeared".into())))
         {
             Ok(inode) => inode,
-            Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
+            Err(error) => return Err(self.failure_from_error(ctx, error, group_name)),
         };
         let file = match snapshot.file().and_then(|file| {
             file.validate(inode_id)?;
@@ -677,59 +511,45 @@ impl MetadataFileSystem {
         }) {
             Ok(file) if file.lease_epoch == lease_epoch => file,
             Ok(_) => {
-                return self.session_terminal_failure(
+                return Err(self.session_terminal_failure(
                     ctx,
                     ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                     "opened writer was fenced",
                     group_name,
-                    mount_epoch,
-                )
+                ))
             }
-            Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
+            Err(error) => return Err(self.failure_from_error(ctx, error, group_name)),
         };
         let tail_block = if mode == WriteMode::Append && file.len % u64::from(file.block_size) != 0 {
-            let group =
-                self.require_worker_lookup_group(ctx, group_name.clone(), mount_epoch, route_epoch, "OpenWrite")?;
-            match self.locate_append_tail(&group, file, ctx.caller.client.client_id, lease_epoch) {
+            let group = self.require_worker_lookup_group(ctx, group_name.clone(), "OpenWrite")?;
+            match self.locate_append_tail(&group, file, ctx.client.client_id, lease_epoch) {
                 Ok(tail) => Some(tail),
-                Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
+                Err(error) => return Err(self.failure_from_error(ctx, error, group_name)),
             }
         } else {
             None
         };
-        let session = match opening.activate(lease_epoch, file, tail_block) {
+        let session = match opening.activate(file, tail_block) {
             Err(WriteOpeningError::TargetLimit) => {
-                return self.failure_from_error(
+                return Err(self.failure_from_error(
                     ctx,
                     MetadataError::GlobalWriteTargetLimitExceeded("opening a tail exceeds the target limit".into()),
                     group_name,
-                    mount_epoch,
-                )
+                ))
             }
 
             Ok(result) => result,
             Err(WriteOpeningError::Expired | WriteOpeningError::NotCurrent) => {
-                return self.session_terminal_failure(
+                return Err(self.session_terminal_failure(
                     ctx,
                     ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
                     format!("write opening expired before activation for inode_id={inode_id}"),
                     group_name,
-                    mount_epoch,
-                );
-            }
-            Err(WriteOpeningError::LeaseEpochMismatch { expected, got }) => {
-                return self.failure_from_error(
-                    ctx,
-                    MetadataError::Internal(format!(
-                        "write opening epoch mismatch after Raft apply for inode_id={inode_id}: expected {expected}, got {got}"
-                    )),
-                    group_name,
-                    mount_epoch,
-                );
+                ));
             }
         };
 
-        self.success_with_route_epoch(open_write_output(&session), group_name, mount_epoch, route_epoch)
+        self.success(open_write_output(&session), group_name)
     }
 
     /// Resolves the existing tail on a live replica without allocating a new block identity.
@@ -744,7 +564,7 @@ impl MetadataFileSystem {
             .blocks
             .len()
             .checked_sub(1)
-            .ok_or_else(|| MetadataError::Internal("partial file has no tail".into()))?;
+            .expect("validated partial file must have a tail");
         let block_id = file.blocks[ordinal];
         let len = file.block_len(ordinal);
         let manager = &self.worker_manager;
@@ -755,45 +575,28 @@ impl MetadataFileSystem {
             visible_len: len,
             block_size: file.block_size,
             caller: None,
-            existing: manager.reported_block_locations(group_name, block_id),
-            exclude_workers: Vec::new(),
-            target_replicas: SUPPORTED_REPLICA_COUNT,
+            existing: &manager.reported_block_locations(group_name, block_id),
         };
-        let placement = PlacementPlanner.plan(&request, &manager.collect_worker_placement_views(group_name));
+        let placement = plan_placement(&request, &manager.collect_worker_placement_views(group_name));
         if placement.status != PlacementStatus::Ok {
             return Err(MetadataError::ServiceUnavailable(placement.failure_message(&request)));
         }
-        let tier = placement
-            .workers
-            .first()
-            .and_then(|worker| {
-                request
-                    .existing
-                    .iter()
-                    .find(|location| {
-                        location.worker_id == worker.worker_id && location.worker_run_id == worker.worker_run_id
-                    })
-                    .map(|location| location.tier)
-            })
-            .ok_or_else(|| MetadataError::ServiceUnavailable("tail placement has no tier".into()))?;
+        let tier = placement.workers[0].tier;
         let workers = placement
             .workers
             .into_iter()
-            .map(|worker| {
-                worker_endpoint_from_parts(
-                    worker.worker_id,
-                    worker.endpoint,
-                    worker.worker_net_protocol,
-                    worker.worker_run_id,
-                )
+            .map(|worker| WorkerEndpointInfo {
+                worker_id: worker.worker_id,
+                endpoint: worker.endpoint,
+                worker_run_id: worker.worker_run_id,
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect();
         Ok(LocatedBlock {
             block_id,
             file_offset: ordinal as u64 * u64::from(file.block_size),
             block_size: u64::from(file.block_size),
             workers,
-            fencing_token: FencingToken::new(block_id, owner, epoch),
+            fencing_token: FencingToken::new(owner, epoch),
             write_offset: len,
 
             tier,
@@ -807,53 +610,36 @@ impl MetadataFileSystem {
     /// No Worker data is created and no file contents are published by this method.
     pub(super) async fn allocate_block_session(
         &self,
-        ctx: &RequestContext,
+        ctx: &RequestHeader,
         inode_id: InodeId,
         lease_epoch: LeaseEpoch,
         previous_block_id: Option<BlockId>,
-        freshness: Freshness,
-    ) -> FsResult<AllocateBlockOutput> {
+    ) -> FsResult<LocatedBlock> {
         let session = match self.session_registry.get_session_identity(inode_id) {
             Some(session) => session,
             None => {
-                return self.session_terminal_failure(
+                return Err(self.session_terminal_failure(
                     ctx,
                     ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                     format!("write session not found for inode_id={inode_id}"),
                     None,
-                    None,
-                );
+                ));
             }
         };
-        if session.open_client_id != ctx.caller.client.client_id {
-            return self.session_terminal_failure(
+        if session.open_client_id != ctx.client.client_id {
+            return Err(self.session_terminal_failure(
                 ctx,
                 ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                 format!("AllocateBlock client does not own inode_id={inode_id}"),
                 None,
-                None,
-            );
+            ));
         }
 
-        let (group_name, mount_epoch) =
-            match self
-                .freshness_validator
-                .validate_mount_epoch(ctx, freshness, session.mount_id)
-            {
-                Ok(hints) => hints,
-                Err(err) => return Err(err),
-            };
-        let route_epoch = match self
-            .freshness_validator
-            .validate_route_epoch(ctx, freshness, group_name.clone(), mount_epoch, "AllocateBlock")
-            .await
-        {
-            Ok(route_epoch) => route_epoch,
-            Err(err) => return Err(err),
-        };
+        let group_name = self.mount_owner(session.mount_id);
+        self.check_leader(ctx, group_name.clone()).await?;
 
         if lease_epoch != session.lease_epoch {
-            return self.session_terminal_failure(
+            return Err(self.session_terminal_failure(
                 ctx,
                 ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                 format!(
@@ -861,80 +647,57 @@ impl MetadataFileSystem {
                     session.lease_epoch, lease_epoch
                 ),
                 group_name,
-                mount_epoch,
-            );
+            ));
         }
         if self.session_registry.validate_session(inode_id, lease_epoch).is_err() {
-            return self.session_terminal_failure(
+            return Err(self.session_terminal_failure(
                 ctx,
                 ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
                 format!("lease validation rejected for inode_id={inode_id}; reopen before AllocateBlock"),
                 group_name,
-                mount_epoch,
-            );
+            ));
         }
 
         let reservation = match self
             .session_registry
             .begin_allocate_block(inode_id, lease_epoch, previous_block_id)
         {
-            Ok(BeginAllocateBlock::Replay(target)) => {
-                return self.success_with_route_epoch(
-                    AllocateBlockOutput { block: target },
-                    group_name,
-                    mount_epoch,
-                    route_epoch,
-                )
-            }
+            Ok(BeginAllocateBlock::Replay(target)) => return self.success(target, group_name),
             Ok(BeginAllocateBlock::Reserved(reservation)) => reservation,
             Err(BeginAllocateBlockError::Session(message)) => {
-                return self.session_terminal_failure(
+                return Err(self.session_terminal_failure(
                     ctx,
                     ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
                     format!("AllocateBlock session is no longer current for inode_id={inode_id}: {message}"),
                     group_name,
-                    mount_epoch,
-                )
-            }
-            Err(BeginAllocateBlockError::Internal(message)) => {
-                return self.failure_from_error(
-                    ctx,
-                    MetadataError::Internal(format!(
-                        "AllocateBlock replay state is inconsistent for inode_id={inode_id}: {message}"
-                    )),
-                    group_name,
-                    mount_epoch,
-                )
+                ))
             }
             Err(BeginAllocateBlockError::InvalidArgument(message)) => {
-                return self.failure_from_error(
+                return Err(self.failure_from_error(
                     ctx,
                     MetadataError::InvalidArgument(format!(
                         "AllocateBlock rejected for inode_id={inode_id}: {message}"
                     )),
                     group_name,
-                    mount_epoch,
-                )
+                ))
             }
             Err(BeginAllocateBlockError::Pending) => {
-                return self.failure_from_error(
+                return Err(self.failure_from_error(
                     ctx,
                     MetadataError::Again(format!(
                         "AllocateBlock is already pending for inode_id={inode_id} and predecessor={previous_block_id:?}"
                     )),
                     group_name,
-                    mount_epoch,
-                )
+                ))
             }
             Err(BeginAllocateBlockError::PublicationInProgress) => {
-                return self.failure_from_error(
+                return Err(self.failure_from_error(
                     ctx,
                     MetadataError::Again(format!(
                         "AllocateBlock cannot allocate inode_id={inode_id} while file publication is in progress"
                     )),
                     group_name,
-                    mount_epoch,
-                )
+                ))
             }
             Err(BeginAllocateBlockError::LimitExceeded(exceeded)) => {
                 let error = match exceeded.limit {
@@ -947,7 +710,7 @@ impl MetadataFileSystem {
                         exceeded.maximum
                     )),
                 };
-                return self.failure_from_error(ctx, error, group_name, mount_epoch);
+                return Err(self.failure_from_error(ctx, error, group_name));
             }
         };
         let block_size = reservation.block_size();
@@ -955,12 +718,11 @@ impl MetadataFileSystem {
         let open_client_id = reservation.open_client_id();
         let block_id = match self.propose_block_allocation(inode_id, lease_epoch).await {
             Ok(block_id) => block_id,
-            Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
+            Err(error) => return Err(self.failure_from_error(ctx, error, group_name)),
         };
 
         let worker_manager = &self.worker_manager;
-        let placement_group_name =
-            self.require_worker_lookup_group(ctx, group_name.clone(), mount_epoch, route_epoch, "AllocateBlock")?;
+        let placement_group_name = self.require_worker_lookup_group(ctx, group_name.clone(), "AllocateBlock")?;
         let placement_views = worker_manager.collect_worker_placement_views(&placement_group_name);
         let placement_request = PlacementRequest {
             group_name: placement_group_name,
@@ -969,64 +731,38 @@ impl MetadataFileSystem {
             visible_len: 0,
             block_size,
             caller: ctx
-                .caller
                 .caller_context
                 .as_ref()
                 .map(CallerContextFields::from_caller_context),
-            existing: Vec::new(),
-            exclude_workers: Vec::new(),
-            target_replicas: SUPPORTED_REPLICA_COUNT,
+            existing: &[],
         };
-        let placement = PlacementPlanner.plan(&placement_request, &placement_views);
+        let placement = plan_placement(&placement_request, &placement_views);
         if placement.status != PlacementStatus::Ok {
-            return self.failure_from_error(
+            return Err(self.failure_from_error(
                 ctx,
                 MetadataError::ServiceUnavailable(format!(
                     "Failed to select write placement: {}",
                     placement.failure_message(&placement_request)
                 )),
                 group_name,
-                mount_epoch,
-            );
+            ));
         }
-        let mut workers = Vec::with_capacity(placement.workers.len());
-        let mut selected_tier = None;
-        for worker in placement.workers {
-            selected_tier = selected_tier.or(worker.tier);
-            let endpoint = match worker_endpoint_from_parts(
-                worker.worker_id,
-                worker.endpoint,
-                worker.worker_net_protocol,
-                worker.worker_run_id,
-            ) {
-                Ok(endpoint) => endpoint,
-                Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
-            };
-            workers.push(endpoint);
-        }
-        let Some(tier) = selected_tier else {
-            return self.failure_from_error(
-                ctx,
-                MetadataError::ServiceUnavailable("selected write placement is missing storage tier".to_string()),
-                group_name,
-                mount_epoch,
-            );
-        };
-        if workers.is_empty() {
-            return self.failure_from_error(
-                ctx,
-                MetadataError::ServiceUnavailable("selected placement has no live worker endpoints".to_string()),
-                group_name,
-                mount_epoch,
-            );
-        }
+        let tier = placement.workers[0].tier;
+        let workers = placement
+            .workers
+            .into_iter()
+            .map(|worker| WorkerEndpointInfo {
+                worker_id: worker.worker_id,
+                endpoint: worker.endpoint,
+                worker_run_id: worker.worker_run_id,
+            })
+            .collect();
         let target = LocatedBlock {
             block_id,
             file_offset,
             block_size: u64::from(block_size),
             workers,
             fencing_token: FencingToken {
-                block_id,
                 owner: open_client_id,
                 epoch: lease_epoch,
             },
@@ -1037,31 +773,15 @@ impl MetadataFileSystem {
         let target = match reservation.complete(target) {
             Ok(target) => target,
             Err(CompleteWriteTargetError::NotCurrent) => {
-                return self.session_terminal_failure(
+                return Err(self.session_terminal_failure(
                     ctx,
                     ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
                     format!("write session expired before AllocateBlock completed for inode_id={inode_id}"),
                     group_name,
-                    mount_epoch,
-                )
-            }
-            Err(CompleteWriteTargetError::InvalidTarget(message)) => {
-                return self.failure_from_error(
-                    ctx,
-                    MetadataError::InvalidArgument(format!(
-                        "AllocateBlock rejected for inode_id={inode_id}: {message}"
-                    )),
-                    group_name,
-                    mount_epoch,
-                )
+                ))
             }
         };
-        self.success_with_route_epoch(
-            AllocateBlockOutput { block: target },
-            group_name,
-            mount_epoch,
-            route_epoch,
-        )
+        self.success(target, group_name)
     }
 }
 
@@ -1084,12 +804,11 @@ fn open_write_output(session: &WriteSession) -> OpenWriteOutput {
 pub(crate) struct OpenWriteArgs {
     pub(crate) path: String,
     pub(crate) mode: WriteMode,
-    pub(crate) freshness: Freshness,
 }
 
 impl MetadataFileSystem {
     /// Open a path for writing under shared namespace-topology admission.
-    pub(crate) async fn open_write(&self, ctx: &RequestContext, args: OpenWriteArgs) -> FsResult<OpenWriteOutput> {
+    pub(crate) async fn open_write(&self, ctx: &RequestHeader, args: OpenWriteArgs) -> FsResult<OpenWriteOutput> {
         let path = args.path.clone();
         let result = self.open_write_inner(ctx, args).await;
         match &result {
@@ -1100,14 +819,11 @@ impl MetadataFileSystem {
                     op = "OpenWrite",
                     result = "opened",
                     error_code = "none",
-                    client_id = %ctx.caller.client.client_id,
-                    call_id = %ctx.caller.client.call_id,
+                    client_id = %ctx.client.client_id,
+                    call_id = %ctx.client.call_id,
                     path = %path,
                     inode_id = payload.inode_id.as_raw(),
-                    inode_id = payload.inode_id.as_raw(),
                     lease_epoch = payload.lease_epoch.as_raw(),
-                    mount_epoch = success.mount_epoch,
-                    route_epoch = success.route_epoch,
                     "OpenWrite opened"
                 );
             }
@@ -1116,8 +832,8 @@ impl MetadataFileSystem {
                 op = "OpenWrite",
                 result = "rejected",
                 error_code = observe::rpc_error_kind(&failure.error),
-                client_id = %ctx.caller.client.client_id,
-                call_id = %ctx.caller.client.call_id,
+                client_id = %ctx.client.client_id,
+                call_id = %ctx.client.call_id,
                 path = %path,
                 "OpenWrite rejected"
             ),
@@ -1129,29 +845,25 @@ impl MetadataFileSystem {
     ///
     /// The shared guard spans resolution, Raft fencing-epoch acquisition, session
     /// creation, and the final topology safety predicate.
-    async fn open_write_inner(&self, ctx: &RequestContext, args: OpenWriteArgs) -> FsResult<OpenWriteOutput> {
-        if let Err(failure) = self.admission.check_meta_write(ctx) {
-            return self.failure_from_admission(failure);
-        }
+    async fn open_write_inner(&self, ctx: &RequestHeader, args: OpenWriteArgs) -> FsResult<OpenWriteOutput> {
+        self.check_meta_write(ctx)?;
         let _topology_guard = self.namespace_topology.read().await;
         let open_path = match PathResolver::normalize(&args.path) {
             Ok(path) => path,
-            Err(err) => return self.failure_from_path_error(ctx, &args.path, err),
+            Err(err) => return Err(self.failure_from_path_error(ctx, &args.path, err)),
         };
-        let resolved = match self.path_resolver.resolve_path(&open_path) {
+        let resolved = match self.path_resolver.resolve_normalized_path(&open_path) {
             Ok(resolved) => resolved,
-            Err(err) => return self.failure_from_path_error(ctx, &args.path, err),
+            Err(err) => return Err(self.failure_from_path_error(ctx, &args.path, err)),
         };
         let Some(inode_id) = resolved.inode_id else {
-            return self.failure_from_resolved_path_error(
+            return Err(self.failure_from_resolved_path_error(
                 ctx,
                 missing_resolved_target_error(&resolved),
                 Some(&resolved.mount_ctx),
-            );
+            ));
         };
-        if let Err(failure) = self.admission.check_data_write(ctx, resolved.mount_ctx.mount_id) {
-            return self.failure_from_admission(failure);
-        }
+        self.check_data_write(ctx, resolved.mount_ctx.mount_id)?;
         let opened = self
             .open_write_inode(
                 ctx,
@@ -1159,7 +871,6 @@ impl MetadataFileSystem {
                 inode_id,
                 resolved.ancestor_inode_ids.clone(),
                 args.mode,
-                args.freshness,
             )
             .await?;
 
@@ -1173,29 +884,30 @@ impl MetadataFileSystem {
     /// the matching active session epoch and returns `EAGAIN`.
     fn finish_open_write(
         &self,
-        ctx: &RequestContext,
+        ctx: &RequestHeader,
         open_path: &str,
         resolved: &ResolvedPath,
         opened: FsSuccess<OpenWriteOutput>,
     ) -> FsResult<OpenWriteOutput> {
         let inode_id = opened.payload.inode_id;
-        let topology_unchanged = self.path_resolver.resolve_path(open_path).is_ok_and(|current| {
-            current.mount_ctx.mount_id == resolved.mount_ctx.mount_id
-                && current.mount_ctx.mount_epoch == resolved.mount_ctx.mount_epoch
-                && current.mount_ctx.owner_group_name == resolved.mount_ctx.owner_group_name
-                && current.mount_ctx.root_inode_id == resolved.mount_ctx.root_inode_id
-                && current.inode_id == Some(inode_id)
-                && current.ancestor_inode_ids == resolved.ancestor_inode_ids
-        });
+        let topology_unchanged = self
+            .path_resolver
+            .resolve_normalized_path(open_path)
+            .is_ok_and(|current| {
+                current.mount_ctx.mount_id == resolved.mount_ctx.mount_id
+                    && current.mount_ctx.namespace_owner_group_name == resolved.mount_ctx.namespace_owner_group_name
+                    && current.mount_ctx.root_inode_id == resolved.mount_ctx.root_inode_id
+                    && current.inode_id == Some(inode_id)
+                    && current.ancestor_inode_ids == resolved.ancestor_inode_ids
+            });
         if !topology_unchanged {
             self.session_registry
                 .remove_session_if_epoch(opened.payload.inode_id, opened.payload.lease_epoch);
-            return self.failure_from_error(
+            return Err(self.failure_from_error(
                 ctx,
                 MetadataError::Again("namespace topology changed during OpenWrite".to_string()),
                 opened.group_name,
-                opened.mount_epoch,
-            );
+            ));
         }
 
         Ok(opened)
@@ -1208,21 +920,15 @@ mod tests {
     use crate::inode::InodeKind;
     use crate::raft::Command;
     use crate::service::filesystem::tests::*;
+    use crate::session_registry::SessionRegistry;
     use beryl_common::header::RequestHeader;
     use beryl_types::ClientId;
-
-    fn request_context_for(client_id: ClientId) -> RequestContext {
-        RequestContext {
-            caller: RequestHeader::new(client_id),
-            route_epoch: None,
-        }
-    }
 
     #[tokio::test]
     async fn session_limit_plus_one_rejects_before_raft_proposal() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_id = MountId::new(49);
+        let mount_id = MountId::new(1);
         let first_inode_id = InodeId::new(490);
         let second_inode_id = InodeId::new(491);
         let third_inode_id = InodeId::new(492);
@@ -1232,7 +938,7 @@ mod tests {
                 .unwrap();
         }
 
-        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name("g6"));
+        let builder = filesystem_builder_with_mount(mount_id, &group_name("g6"));
         let mount_table = builder.mount_table();
         let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
         let session_registry = Arc::new(SessionRegistry::new(2, 1, 100, 100, 60_000));
@@ -1247,12 +953,11 @@ mod tests {
 
         filesystem
             .open_write_inode(
-                &request_context_for(first_client),
+                &RequestHeader::new(first_client),
                 "/first".to_string(),
                 first_inode_id,
                 vec![first_inode_id],
                 WriteMode::Overwrite,
-                Freshness::default(),
             )
             .await
             .expect("first client session");
@@ -1261,12 +966,11 @@ mod tests {
         let applied_before_per_client_rejection = filesystem.raft_node().get_last_applied_state_id();
         let per_client_rejection = filesystem
             .open_write_inode(
-                &request_context_for(first_client),
+                &RequestHeader::new(first_client),
                 "/second".to_string(),
                 second_inode_id,
                 vec![second_inode_id],
                 WriteMode::Overwrite,
-                Freshness::default(),
             )
             .await
             .expect_err("per-client limit plus one must fail");
@@ -1282,12 +986,11 @@ mod tests {
         );
         filesystem
             .open_write_inode(
-                &request_context_for(other_client),
+                &RequestHeader::new(other_client),
                 "/second".to_string(),
                 second_inode_id,
                 vec![second_inode_id],
                 WriteMode::Overwrite,
-                Freshness::default(),
             )
             .await
             .expect("another client uses remaining global capacity");
@@ -1296,12 +999,11 @@ mod tests {
         let applied_before_global_rejection = filesystem.raft_node().get_last_applied_state_id();
         let global_rejection = filesystem
             .open_write_inode(
-                &request_context_for(ClientId::new(9)),
+                &RequestHeader::new(ClientId::new(9)),
                 "/third".to_string(),
                 third_inode_id,
                 vec![third_inode_id],
                 WriteMode::Overwrite,
-                Freshness::default(),
             )
             .await
             .expect_err("global limit plus one must fail");
@@ -1321,11 +1023,11 @@ mod tests {
     async fn open_write_rejects_a_path_moved_by_an_already_admitted_rename() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_id = MountId::new(68);
+        let mount_id = MountId::new(1);
         let old_parent_inode_id = InodeId::new(680);
         let new_parent_inode_id = InodeId::new(681);
         let file_inode_id = InodeId::new(682);
-        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name("g20"));
+        let builder = filesystem_builder_with_mount(mount_id, &group_name("g20"));
         let mount_table = builder.mount_table();
         let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
         let filesystem = builder
@@ -1355,7 +1057,6 @@ mod tests {
                 file_inode_id,
                 resolved.ancestor_inode_ids.clone(),
                 WriteMode::Overwrite,
-                Freshness::default(),
             )
             .await
             .expect("AcquireWriteLease");
@@ -1394,14 +1095,14 @@ mod tests {
     async fn open_write_uses_inode_identity_and_duplicate_fails_without_advancing_epoch() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_id = MountId::new(51);
+        let mount_id = MountId::new(1);
         let group_name_value = group_name("g9");
         let inode_id = InodeId::new(510);
         storage
             .put_inode(&Inode::new_file(inode_id, InodeAttrs::new(), mount_id, 4096))
             .unwrap();
 
-        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
+        let builder = filesystem_builder_with_mount(mount_id, &group_name_value);
         let mount_table = builder.mount_table();
         let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
         let filesystem = builder
@@ -1418,7 +1119,6 @@ mod tests {
                 inode_id,
                 vec![inode_id],
                 WriteMode::Overwrite,
-                Freshness::default(),
             )
             .await
             .expect("open_write should succeed");
@@ -1448,7 +1148,6 @@ mod tests {
                 inode_id,
                 vec![inode_id],
                 WriteMode::Overwrite,
-                Freshness::default(),
             )
             .await
             .expect_err("a duplicate OpenWrite must fail closed while the lease is active");
@@ -1464,7 +1163,7 @@ mod tests {
     async fn allocation_failures_release_capacity_without_reusing_durable_indices() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_id = MountId::new(55);
+        let mount_id = MountId::new(1);
         let group_name_value = group_name("g10");
         let inode_id = InodeId::new(550);
         storage
@@ -1472,7 +1171,7 @@ mod tests {
             .unwrap();
 
         let worker_manager = Arc::new(WorkerManager::new(60_000));
-        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name_value);
+        let builder = filesystem_builder_with_mount(mount_id, &group_name_value);
         let mount_table = builder.mount_table();
         let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
         let filesystem = builder
@@ -1488,7 +1187,6 @@ mod tests {
                 inode_id,
                 vec![inode_id],
                 WriteMode::Overwrite,
-                Freshness::default(),
             )
             .await
             .expect("OpenWrite");
@@ -1504,7 +1202,7 @@ mod tests {
             BeginAllocateBlock::Replay(_) => panic!("first allocation must reserve"),
         };
         let duplicate = filesystem
-            .allocate_block_session(&request_context(), inode_id, lease_epoch, None, Freshness::default())
+            .allocate_block_session(&request_context(), inode_id, lease_epoch, None)
             .await
             .expect_err("pending duplicate must fail before Raft");
         assert_retry(&duplicate.error, ErrorKind::Metadata(MetadataErrorKind::Conflict));
@@ -1512,7 +1210,7 @@ mod tests {
         drop(reservation);
 
         filesystem
-            .allocate_block_session(&request_context(), inode_id, lease_epoch, None, Freshness::default())
+            .allocate_block_session(&request_context(), inode_id, lease_epoch, None)
             .await
             .expect_err("placement without a live worker fails after durable allocation");
         assert_eq!(next_index(), 1);
@@ -1526,18 +1224,16 @@ mod tests {
         );
         record_worker_heartbeat(&worker_manager, &group_name_value, worker_id, 1024 * 1024);
         let block = filesystem
-            .allocate_block_session(&request_context(), inode_id, lease_epoch, None, Freshness::default())
+            .allocate_block_session(&request_context(), inode_id, lease_epoch, None)
             .await
             .expect("placement recovery releases the failed reservation")
-            .payload
-            .block;
+            .payload;
         assert_eq!(block.block_id.index, BlockIndex::new(1));
         let replay = filesystem
-            .allocate_block_session(&request_context(), inode_id, lease_epoch, None, Freshness::default())
+            .allocate_block_session(&request_context(), inode_id, lease_epoch, None)
             .await
             .unwrap()
-            .payload
-            .block;
+            .payload;
         assert_eq!(replay, block);
         assert_eq!(next_index(), 2);
         assert_eq!(

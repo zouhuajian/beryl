@@ -43,10 +43,11 @@ message ByteRangeProto {
   uint32 len = 2;
 }
 
-/// Fencing token for write operations.
-/// Aligns with types::lease::FencingToken { block_id: BlockId, owner: ClientId, epoch: LeaseEpoch }.
+/// Writer identity and fencing epoch scoped by the enclosing block identity.
+/// Owner and epoch alone do not identify an object or prove current authority.
 message FencingTokenProto {
-  BlockIdProto block_id = 1;
+  reserved 1;
+  reserved "block_id";
   ClientIdProto owner = 2;
   uint64 epoch = 3;
 }

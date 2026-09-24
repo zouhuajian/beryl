@@ -17,34 +17,28 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::StoreDirConfig;
-use crate::error::WorkerError;
+use crate::error::{WorkerError, WorkerResult};
 use crate::report::BlockReportChangeTracker;
 use crate::store::block::{
-    BlockMetaPayload, CheckpointBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
-    OpenBlockWriteRequest, ReclaimBlockRequest, ReclaimBlockResult, StoreResult,
+    BlockMetaPayload, CheckpointBlockRequest, FullBlockFileStore, LocalBlockStore, OpenBlockWriteRequest,
+    ReclaimBlockRequest, ReclaimBlockResult,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoreDirReport {
     pub id: String,
-    pub path: PathBuf,
     pub tier: Tier,
     pub capacity_bytes: u64,
     pub used_bytes: u64,
-    pub pending_bytes: u64,
     pub block_count: u64,
-    pub fs_total_bytes: u64,
-    pub fs_free_bytes: u64,
     pub free_bytes: u64,
     pub writable: bool,
-    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoreReport {
     pub total_bytes: u64,
     pub used_bytes: u64,
-    pub pending_bytes: u64,
     pub free_bytes: u64,
     pub tier_free: Vec<TierFree>,
     pub dirs: Vec<StoreDirReport>,
@@ -80,7 +74,6 @@ struct StoreDirState {
     capacity_bytes: u64,
     store: FullBlockFileStore,
     mount_key: u64,
-    fs_total_bytes: u64,
     fs_free_bytes: u64,
     error: Option<String>,
     last_check: Instant,
@@ -88,7 +81,6 @@ struct StoreDirState {
     pending_bytes: u64,
     block_count: u64,
     pending_blocks: HashMap<(GroupName, BlockId), BlockReservation>,
-    writable: bool,
 }
 
 /// Capacity retained for one stream, including its previous accounted checkpoint.
@@ -99,11 +91,13 @@ struct BlockReservation {
 }
 
 impl StoreDirs {
+    /// Locks and recovers all configured directories, tracking changes for `group_name`.
     pub fn open(
+        group_name: GroupName,
         configs: BTreeMap<String, StoreDirConfig>,
         reserve_space_bytes: u64,
         check_interval_ms: u64,
-    ) -> StoreResult<Self> {
+    ) -> WorkerResult<Self> {
         if configs.is_empty() {
             return Err(WorkerError::InvalidArgument(
                 "beryl.worker.storage.dirs must be non-empty".to_string(),
@@ -121,18 +115,13 @@ impl StoreDirs {
             init_store_path(&config.path)?;
             let ownership_lock = acquire_store_ownership_lock(&config.path)?;
             probe_store_path(&config.path)?;
-            let (fs_total_bytes, fs_free_bytes) = fs_stats(&config.path)?;
+            let fs_free_bytes = fs_free_bytes(&config.path)?;
             let mount_key = mount_key(&config.path)?;
-            let store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(config.path.clone()));
-            let recovered_unpublished = store.recover_blocks()?;
-            if recovered_unpublished > 0 {
-                info!(
-                    store_dir = %id,
-                    recovered_unpublished,
-                    "Worker startup recovered durable block checkpoints"
-                );
+            let store = FullBlockFileStore::new(config.path.clone());
+            let (used_bytes, block_count) = store.recover_blocks()?;
+            if block_count > 0 {
+                info!(store_dir = %id, block_count, "Worker startup recovered durable block checkpoints");
             }
-            let (used_bytes, block_count) = scan_store_usage(&store, &config.path)?;
             dirs.push(StoreDirState {
                 id,
                 path: config.path,
@@ -140,7 +129,6 @@ impl StoreDirs {
                 capacity_bytes: config.capacity_bytes,
                 store,
                 mount_key,
-                fs_total_bytes,
                 fs_free_bytes,
                 error: None,
                 last_check: Instant::now(),
@@ -148,7 +136,6 @@ impl StoreDirs {
                 pending_bytes: 0,
                 block_count,
                 pending_blocks: HashMap::new(),
-                writable: true,
             });
             ownership_locks.push(ownership_lock);
         }
@@ -161,18 +148,18 @@ impl StoreDirs {
             _ownership_locks: ownership_locks,
             reserve_bytes: reserve_space_bytes,
             check_interval: Duration::from_millis(check_interval_ms),
-            block_report_changes: BlockReportChangeTracker::default(),
+            block_report_changes: BlockReportChangeTracker::new(group_name),
         })
     }
 
-    pub fn report(&self) -> StoreResult<StoreReport> {
+    pub fn report(&self) -> StoreReport {
         let mut inner = self.inner.lock().expect("store dir state poisoned");
         self.refresh_due(&mut inner);
-        Ok(build_report(&inner, self.reserve_bytes))
+        build_report(&inner, self.reserve_bytes)
     }
 
     /// Returns only metadata whose directory entry has been confirmed durable.
-    pub fn load_report_meta(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<BlockMetaPayload> {
+    pub fn load_report_meta(&self, group_name: &GroupName, block_id: BlockId) -> WorkerResult<BlockMetaPayload> {
         let stores: Vec<_> = self
             .inner
             .lock()
@@ -191,7 +178,8 @@ impl StoreDirs {
         Err(WorkerError::NotFound(format!("block metadata not found: {block_id}")))
     }
 
-    pub fn scan_group_blocks(&self, group_name: &GroupName) -> StoreResult<Vec<BlockMetaPayload>> {
+    /// Returns Ready checkpoints in unspecified order.
+    pub fn scan_group_blocks(&self, group_name: &GroupName) -> WorkerResult<Vec<BlockMetaPayload>> {
         let stores: Vec<_> = self
             .inner
             .lock()
@@ -204,12 +192,6 @@ impl StoreDirs {
         for store in stores {
             blocks.extend(store.scan_group_blocks(group_name)?);
         }
-        blocks.sort_by_key(|meta| {
-            (
-                meta.identity.block_id.inode_id.as_raw(),
-                meta.identity.block_id.index.as_raw(),
-            )
-        });
         Ok(blocks)
     }
 
@@ -229,19 +211,15 @@ impl StoreDirs {
                 continue;
             }
             let now = Instant::now();
-            match fs_stats(&dir.path).and_then(|(total, free)| {
+            match fs_free_bytes(&dir.path).and_then(|free| {
                 probe_store_path(&dir.path)?;
-                Ok((total, free))
+                Ok(free)
             }) {
-                Ok((total, free)) => {
-                    dir.fs_total_bytes = total;
+                Ok(free) => {
                     dir.fs_free_bytes = free;
-                    dir.writable = true;
                     dir.error = None;
                 }
                 Err(err) => {
-                    dir.writable = false;
-                    dir.fs_total_bytes = 0;
                     dir.fs_free_bytes = 0;
                     let error = format!("{}: {err}", dir.path.display());
                     warn!(
@@ -258,10 +236,10 @@ impl StoreDirs {
     }
 
     /// Reserves only the remaining capacity in the directory already owning a tail.
-    fn reserve_dir(&self, req: &OpenBlockWriteRequest) -> StoreResult<(usize, FullBlockFileStore)> {
+    fn reserve_dir(&self, req: &OpenBlockWriteRequest) -> WorkerResult<FullBlockFileStore> {
         let existing = self.find_reclaim_store(&req.group_name, req.block_id)?;
         let previous_len = match &existing {
-            Some((_, store)) => Some(store.load_meta(&req.group_name, req.block_id)?.source.durable_len),
+            Some((_, store)) => Some(store.load_meta(&req.group_name, req.block_id)?.durable_len),
             None => None,
         };
         let bytes = req
@@ -292,54 +270,33 @@ impl StoreDirs {
         let selected = candidates[*cursor % candidates.len()];
         *cursor = cursor.saturating_add(1);
         let key = (req.group_name.clone(), req.block_id);
-        if inner.dirs.iter().any(|dir| dir.pending_blocks.contains_key(&key)) {
-            return Err(WorkerError::InvalidArgument(
-                "block already has a capacity reservation".into(),
-            ));
-        }
         let dir = &mut inner.dirs[selected];
-        dir.pending_bytes = dir
-            .pending_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| WorkerError::Corrupt("pending byte overflow".into()))?;
+        dir.pending_bytes += bytes;
         dir.pending_blocks.insert(key, BlockReservation { bytes, previous_len });
-        Ok((selected, dir.store.clone()))
+        Ok(dir.store.clone())
     }
 
-    fn release_pending(&self, dir_index: usize, group_name: &GroupName, block_id: BlockId) -> StoreResult<bool> {
+    fn release_pending(&self, dir_index: usize, group_name: &GroupName, block_id: BlockId) -> WorkerResult<()> {
         let mut inner = self.inner.lock().expect("store dir state poisoned");
         release_pending_locked(&mut inner.dirs[dir_index], group_name, block_id)
     }
 
     /// Resolves the exact directory that owns one live pending reservation.
-    fn find_pending_store(
-        &self,
-        group_name: &GroupName,
-        block_id: BlockId,
-    ) -> StoreResult<Option<(usize, FullBlockFileStore)>> {
+    fn find_pending_store(&self, group_name: &GroupName, block_id: BlockId) -> Option<(usize, FullBlockFileStore)> {
         let inner = self.inner.lock().expect("store dir state poisoned");
         let key = (group_name.clone(), block_id);
-        let mut found = None;
-        for (idx, dir) in inner.dirs.iter().enumerate() {
-            if !dir.pending_blocks.contains_key(&key) {
-                continue;
-            }
-            if found.is_some() {
-                return Err(WorkerError::Corrupt(format!(
-                    "pending block exists in multiple worker store dirs: group_name={}, block_id={}",
-                    group_name, block_id
-                )));
-            }
-            found = Some((idx, dir.store.clone()));
-        }
-        Ok(found)
+        inner
+            .dirs
+            .iter()
+            .enumerate()
+            .find_map(|(idx, dir)| dir.pending_blocks.contains_key(&key).then(|| (idx, dir.store.clone())))
     }
 
-    fn find_final_store(&self, group_name: &GroupName, block_id: BlockId) -> Option<(usize, FullBlockFileStore)> {
+    fn find_final_store(&self, group_name: &GroupName, block_id: BlockId) -> Option<FullBlockFileStore> {
         let inner = self.inner.lock().expect("store dir state poisoned");
-        inner.dirs.iter().enumerate().find_map(|(idx, dir)| {
+        inner.dirs.iter().find_map(|dir| {
             let paths = dir.store.paths(group_name, block_id);
-            (paths.meta_path.exists() || paths.data_path.exists()).then(|| (idx, dir.store.clone()))
+            (paths.meta_path.exists() || paths.data_path.exists()).then(|| dir.store.clone())
         })
     }
 
@@ -347,7 +304,7 @@ impl StoreDirs {
         &self,
         group_name: &GroupName,
         block_id: BlockId,
-    ) -> StoreResult<Option<(usize, FullBlockFileStore)>> {
+    ) -> WorkerResult<Option<(usize, FullBlockFileStore)>> {
         let inner = self.inner.lock().expect("store dir state poisoned");
         let mut found = None;
         for (idx, dir) in inner.dirs.iter().enumerate() {
@@ -368,36 +325,13 @@ impl StoreDirs {
 }
 
 impl LocalBlockStore for StoreDirs {
-    fn open_block_write(&self, req: OpenBlockWriteRequest) -> StoreResult<BlockMetaPayload> {
-        let group_name = req.group_name.clone();
-        let block_id = req.block_id;
-        let (dir_index, store) = self.reserve_dir(&req)?;
-        match store.open_block_write(req) {
-            Ok(meta) => Ok(meta),
-            Err(err) => match store.discard_unsynced_suffix(&group_name, block_id) {
-                Ok(()) => {
-                    self.release_pending(dir_index, &group_name, block_id)?;
-                    Err(err)
-                }
-                Err(cleanup_error) => {
-                    tracing::warn!(
-                        group_name = %group_name,
-                        block_id = %block_id,
-                        create_error = %err,
-                        cleanup_error = %cleanup_error,
-                        "failed block-open checkpoint retained pending capacity for retry"
-                    );
-                    Err(cleanup_error)
-                }
-            },
-        }
+    fn open_block_write(&self, req: OpenBlockWriteRequest) -> WorkerResult<BlockMetaPayload> {
+        let store = self.reserve_dir(&req)?;
+        store.open_block_write(req)
     }
 
-    fn write_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, data: Bytes) -> StoreResult<()> {
-        if let Some((_, store)) = self.find_final_store(group_name, block_id) {
-            return store.write_at(group_name, block_id, offset, data);
-        }
-        let Some((_, store)) = self.find_pending_store(group_name, block_id)? else {
+    fn write_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, data: Bytes) -> WorkerResult<()> {
+        let Some((_, store)) = self.find_pending_store(group_name, block_id) else {
             return Err(WorkerError::NotFound(format!(
                 "pending block write not found: group_name={}, block_id={}",
                 group_name, block_id
@@ -406,10 +340,10 @@ impl LocalBlockStore for StoreDirs {
         store.write_at(group_name, block_id, offset, data)
     }
 
-    fn checkpoint_block(&self, req: CheckpointBlockRequest) -> StoreResult<BlockMetaPayload> {
+    fn checkpoint_block(&self, req: CheckpointBlockRequest) -> WorkerResult<BlockMetaPayload> {
         let group_name = req.group_name.clone();
         let block_id = req.block_id;
-        let Some((dir_index, store)) = self.find_pending_store(&group_name, block_id)? else {
+        let Some((dir_index, store)) = self.find_pending_store(&group_name, block_id) else {
             return Err(WorkerError::NotFound(format!(
                 "pending block write not found: group_name={}, block_id={}",
                 group_name, block_id
@@ -418,17 +352,12 @@ impl LocalBlockStore for StoreDirs {
         let meta = store.checkpoint_block(req)?;
         self.block_report_changes.record(&group_name, block_id);
         let mut inner = self.inner.lock().expect("store dir state poisoned");
-        if !release_pending_locked(&mut inner.dirs[dir_index], &group_name, block_id)? {
-            return Err(WorkerError::Corrupt(format!(
-                "published block lost its pending reservation: group_name={}, block_id={}",
-                group_name, block_id
-            )));
-        }
+        release_pending_locked(&mut inner.dirs[dir_index], &group_name, block_id)?;
         Ok(meta)
     }
 
-    fn read_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, len: u64) -> StoreResult<Bytes> {
-        let Some((_, store)) = self.find_final_store(group_name, block_id) else {
+    fn read_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, len: u64) -> WorkerResult<Bytes> {
+        let Some(store) = self.find_final_store(group_name, block_id) else {
             return Err(WorkerError::NotFound(format!(
                 "ready block not found: group_name={}, block_id={}",
                 group_name, block_id
@@ -437,8 +366,8 @@ impl LocalBlockStore for StoreDirs {
         store.read_at(group_name, block_id, offset, len)
     }
 
-    fn load_meta(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<BlockMetaPayload> {
-        let Some((_, store)) = self.find_final_store(group_name, block_id) else {
+    fn load_meta(&self, group_name: &GroupName, block_id: BlockId) -> WorkerResult<BlockMetaPayload> {
+        let Some(store) = self.find_final_store(group_name, block_id) else {
             return Err(WorkerError::NotFound(format!(
                 "block metadata not found: group_name={}, block_id={}",
                 group_name, block_id
@@ -447,7 +376,7 @@ impl LocalBlockStore for StoreDirs {
         store.load_meta(group_name, block_id)
     }
 
-    fn reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockResult> {
+    fn reclaim_block(&self, req: &ReclaimBlockRequest) -> WorkerResult<ReclaimBlockResult> {
         let Some((dir_index, store)) = self.find_reclaim_store(&req.group_name, req.block_id)? else {
             return Ok(ReclaimBlockResult::AlreadyAbsent);
         };
@@ -465,7 +394,7 @@ impl LocalBlockStore for StoreDirs {
                 // may fail after both names vanish; settle this deletion once while
                 // preserving the error and leaving the exact command retryable.
                 if !paths.meta_path.try_exists()? && !paths.data_path.try_exists()? {
-                    before.map(|meta| meta.source.durable_len)
+                    before.map(|meta| meta.durable_len)
                 } else {
                     None
                 }
@@ -482,9 +411,9 @@ impl LocalBlockStore for StoreDirs {
         result
     }
 
-    fn discard_unsynced_suffix(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<()> {
+    fn discard_unsynced_suffix(&self, group_name: &GroupName, block_id: BlockId) -> WorkerResult<()> {
         let store = self
-            .find_pending_store(group_name, block_id)?
+            .find_pending_store(group_name, block_id)
             .or(self.find_reclaim_store(group_name, block_id)?);
         let Some((dir_index, store)) = store else {
             return Ok(());
@@ -512,8 +441,8 @@ fn build_report(inner: &StoreDirsState, reserve_bytes: u64) -> StoreReport {
             .capacity_bytes
             .saturating_sub(dir.used_bytes)
             .saturating_sub(dir.pending_bytes);
-        let free_bytes = if dir.writable {
-            let pending_mount = pending_by_mount.get(&dir.mount_key).copied().unwrap_or(0);
+        let free_bytes = if dir.error.is_none() {
+            let pending_mount = pending_by_mount[&dir.mount_key];
             let fs_left = dir
                 .fs_free_bytes
                 .saturating_sub(reserve_bytes)
@@ -529,7 +458,7 @@ fn build_report(inner: &StoreDirsState, reserve_bytes: u64) -> StoreReport {
         } else {
             0
         };
-        if dir.writable {
+        if dir.error.is_none() {
             free_by_tier
                 .entry(dir.tier)
                 .and_modify(|value| *value = (*value).max(free_bytes))
@@ -537,23 +466,18 @@ fn build_report(inner: &StoreDirsState, reserve_bytes: u64) -> StoreReport {
         }
         reports.push(StoreDirReport {
             id: dir.id.clone(),
-            path: dir.path.clone(),
             tier: dir.tier,
             capacity_bytes: dir.capacity_bytes,
             used_bytes: dir.used_bytes,
-            pending_bytes: dir.pending_bytes,
             block_count: dir.block_count,
-            fs_total_bytes: dir.fs_total_bytes,
-            fs_free_bytes: dir.fs_free_bytes,
             free_bytes,
-            writable: dir.writable,
-            error: dir.error.clone(),
+            writable: dir.error.is_none(),
         });
     }
 
     let free_bytes = mount_capacity_left
         .into_iter()
-        .map(|(mount, capacity_left)| capacity_left.min(mount_left.get(&mount).copied().unwrap_or(0)))
+        .map(|(mount, capacity_left)| capacity_left.min(mount_left[&mount]))
         .fold(0u64, u64::saturating_add);
     let mut tier_free: Vec<_> = free_by_tier
         .into_iter()
@@ -567,11 +491,6 @@ fn build_report(inner: &StoreDirsState, reserve_bytes: u64) -> StoreReport {
             .map(|dir| dir.capacity_bytes)
             .fold(0, u64::saturating_add),
         used_bytes: inner.dirs.iter().map(|dir| dir.used_bytes).fold(0, u64::saturating_add),
-        pending_bytes: inner
-            .dirs
-            .iter()
-            .map(|dir| dir.pending_bytes)
-            .fold(0, u64::saturating_add),
         free_bytes,
         tier_free,
         dirs: reports,
@@ -587,21 +506,19 @@ fn tier_report_rank(tier: Tier) -> u8 {
     }
 }
 
-fn release_pending_locked(dir: &mut StoreDirState, group_name: &GroupName, block_id: BlockId) -> StoreResult<bool> {
+fn release_pending_locked(dir: &mut StoreDirState, group_name: &GroupName, block_id: BlockId) -> WorkerResult<()> {
     let key = (group_name.clone(), block_id);
     if let Some(reservation) = dir.pending_blocks.get(&key).copied() {
         let bytes = reservation.bytes;
         let actual_len = match dir.store.load_meta(group_name, block_id) {
-            Ok(meta) => Some(meta.source.durable_len),
+            Ok(meta) => Some(meta.durable_len),
             Err(WorkerError::NotFound(_)) => None,
             Err(e) => return Err(e),
         };
-        let remaining = dir.pending_bytes.checked_sub(bytes).ok_or_else(|| {
-            WorkerError::Corrupt(format!(
-                "store dir pending byte accounting underflow: group_name={}, block_id={}, pending_bytes={}, reserved_bytes={}",
-                group_name, block_id, dir.pending_bytes, bytes
-            ))
-        })?;
+        let remaining = dir
+            .pending_bytes
+            .checked_sub(bytes)
+            .expect("pending reservation is accounted for");
         dir.used_bytes = dir
             .used_bytes
             .saturating_sub(reservation.previous_len.unwrap_or(0))
@@ -612,12 +529,11 @@ fn release_pending_locked(dir: &mut StoreDirState, group_name: &GroupName, block
             .saturating_add(u64::from(actual_len.is_some()));
         dir.pending_blocks.remove(&key);
         dir.pending_bytes = remaining;
-        return Ok(true);
     }
-    Ok(false)
+    Ok(())
 }
 
-fn init_store_path(path: &Path) -> StoreResult<()> {
+fn init_store_path(path: &Path) -> WorkerResult<()> {
     fs::create_dir_all(path)?;
     if !path.is_dir() {
         return Err(WorkerError::InvalidArgument(format!(
@@ -639,7 +555,7 @@ fn init_store_path(path: &Path) -> StoreResult<()> {
 }
 
 /// Acquires the process-lifetime ownership fence for one configured store.
-fn acquire_store_ownership_lock(path: &Path) -> StoreResult<File> {
+fn acquire_store_ownership_lock(path: &Path) -> WorkerResult<File> {
     let lock_path = path.join(".beryl-worker.lock");
     let file = OpenOptions::new()
         .create(true)
@@ -656,7 +572,7 @@ fn acquire_store_ownership_lock(path: &Path) -> StoreResult<File> {
     Ok(file)
 }
 
-fn probe_store_path(path: &Path) -> StoreResult<()> {
+fn probe_store_path(path: &Path) -> WorkerResult<()> {
     let probe = path.join(format!(".beryl-probe-{}", Uuid::new_v4()));
     {
         let mut file = OpenOptions::new().write(true).create_new(true).open(&probe)?;
@@ -668,31 +584,8 @@ fn probe_store_path(path: &Path) -> StoreResult<()> {
     Ok(())
 }
 
-fn scan_store_usage(store: &FullBlockFileStore, path: &Path) -> StoreResult<(u64, u64)> {
-    let groups = path.join("groups");
-    if !groups.exists() {
-        return Ok((0, 0));
-    }
-    let mut used = 0u64;
-    let mut block_count = 0u64;
-    for entry in fs::read_dir(groups)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let Some(name) = entry.file_name().to_str().and_then(|name| GroupName::parse(name).ok()) else {
-            continue;
-        };
-        for meta in store.scan_group_blocks(&name)? {
-            used = used.saturating_add(meta.source.durable_len);
-            block_count = block_count.saturating_add(1);
-        }
-    }
-    Ok((used, block_count))
-}
-
 #[cfg(unix)]
-fn fs_stats(path: &Path) -> StoreResult<(u64, u64)> {
+fn fs_free_bytes(path: &Path) -> WorkerResult<u64> {
     use std::mem::MaybeUninit;
     use std::os::unix::ffi::OsStrExt;
 
@@ -707,25 +600,24 @@ fn fs_stats(path: &Path) -> StoreResult<(u64, u64)> {
     // SAFETY: statvfs returned success and initialized stat.
     let stat = unsafe { stat.assume_init() };
     let fragment_size = stat.f_frsize.max(1);
-    let total = Into::<u64>::into(stat.f_blocks).saturating_mul(fragment_size);
     let free = Into::<u64>::into(stat.f_bavail).saturating_mul(fragment_size);
-    Ok((total, free))
+    Ok(free)
 }
 
 #[cfg(not(unix))]
-fn fs_stats(_path: &Path) -> StoreResult<(u64, u64)> {
-    Ok((u64::MAX, u64::MAX))
+fn fs_free_bytes(_path: &Path) -> WorkerResult<u64> {
+    Ok(u64::MAX)
 }
 
 #[cfg(unix)]
-fn mount_key(path: &Path) -> StoreResult<u64> {
+fn mount_key(path: &Path) -> WorkerResult<u64> {
     use std::os::unix::fs::MetadataExt;
 
     Ok(fs::metadata(path)?.dev())
 }
 
 #[cfg(not(unix))]
-fn mount_key(path: &Path) -> StoreResult<u64> {
+fn mount_key(path: &Path) -> WorkerResult<u64> {
     use std::hash::{Hash, Hasher};
 
     let canonical = fs::canonicalize(path)?;

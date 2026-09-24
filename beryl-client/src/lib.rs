@@ -22,12 +22,10 @@
 #![deny(missing_docs)]
 
 mod api;
-mod cache;
 mod client_inner;
 mod config;
 mod error;
 mod metrics;
-mod planner;
 mod rpc_error;
 mod runtime;
 mod session;

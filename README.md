@@ -41,19 +41,10 @@ Beryl is a Rust-based distributed storage/cache layer for big data and AI worklo
 - The Rust native client is the client interface used today.
 - Reads and writes currently go through metadata-authorized worker storage.
 - Worker registration, heartbeat, and full block-report convergence are active runtime paths.
-- `route_epoch`, `mount_epoch`, and `GroupStateWatermark` are active freshness checks.
+- `GroupStateWatermark` tracks metadata freshness; lease epochs, content generations, and Worker run IDs fence writes and data access.
 - UFS-backed IO and external backend adapters are not implemented.
 - Multi-group metadata is future work.
 - The internal writable namespace is rooted at `/`; `/local` has no special namespace semantics.
-
-## Internal Alpha Contract
-
-- The first internal release target is `v0.1.0-alpha.1`.
-- Metadata, Worker, and the Rust Client must come from the same release artifact.
-- The first alpha requires clean Metadata and Worker storage. Untagged development data is not migrated or supported.
-- Same-version stop, start, restart, and recovery are supported.
-- Mixed-version clusters, upgrade, downgrade, rollback, and cross-version storage compatibility are not supported.
-- The released runtime is the current single-Metadata resident-storage path; it does not provide UFS read-through, Metadata HA, or replication.
 
 ## What Works Today
 
@@ -159,8 +150,7 @@ the package-internal role binaries with explicit `start`/`format` and
 
 The client reads `conf/client.yaml`.
 
-Run the Rust Client CRUD example from the same checkout or release tag as the
-running Metadata and Worker:
+With Metadata and Worker running, run the Rust Client CRUD example:
 
 ```bash
 cargo run --locked -p beryl-client --example crud -- conf/client.yaml

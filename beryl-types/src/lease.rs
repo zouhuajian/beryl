@@ -3,7 +3,7 @@
 
 //! Shared lease fencing values, independent of session lifetime and renewal policy.
 
-use crate::ids::{BlockId, ClientId, InodeId};
+use crate::ids::{ClientId, InodeId};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter, Result};
 
@@ -50,14 +50,13 @@ pub struct WriteHandle {
     pub lease_epoch: LeaseEpoch,
 }
 
-/// Metadata-issued block writer identity.
+/// Writer identity and fencing epoch within an explicitly identified inode.
 ///
-/// This value binds a block and client to the inode's lease epoch. Metadata
-/// validates the durable fencing authority; possession alone is not authority.
+/// The enclosing request or checkpoint carries the block identity. Compare
+/// tokens only within that scope; owner and epoch are not globally unique.
+/// Metadata validates durable fencing authority; possession alone is not authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FencingToken {
-    /// Exact block authorized for this writer.
-    pub block_id: BlockId,
     /// Client runtime that owns the write session.
     pub owner: ClientId,
     /// Durable inode fencing epoch under which the target was issued.
@@ -65,8 +64,8 @@ pub struct FencingToken {
 }
 
 impl FencingToken {
-    /// Binds an authorized block and owner to their lease epoch.
-    pub const fn new(block_id: BlockId, owner: ClientId, epoch: LeaseEpoch) -> Self {
-        Self { block_id, owner, epoch }
+    /// Identifies the writer under the enclosing object's inode lease.
+    pub const fn new(owner: ClientId, epoch: LeaseEpoch) -> Self {
+        Self { owner, epoch }
     }
 }

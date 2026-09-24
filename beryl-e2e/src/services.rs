@@ -5,14 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{path::Path, process::Stdio};
 
-use beryl_metadata::runtime::{MetadataAuthority, Readiness};
-use beryl_metadata::service::MetadataFileSystemServiceImpl;
-use beryl_metadata::worker::MetadataWorkerServiceImpl;
-use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProtoServer;
-use beryl_proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProtoServer;
 use beryl_proto::worker::worker_data_service_server::WorkerDataServiceServer;
-use beryl_worker::control::RegistrationSet;
-use beryl_worker::net::server::grpc::WorkerDataServiceImpl;
+use beryl_worker::control::RegistrationState;
+use beryl_worker::net::WorkerDataServiceImpl;
 use beryl_worker::WorkerCore;
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
@@ -29,54 +24,6 @@ use crate::TestResult;
 /// This intentionally exceeds the configured 200 ms RPC/background drain so
 /// Metadata still has time to explicitly close and await its Raft authority.
 const PROCESS_STOP_BUDGET: Duration = Duration::from_secs(5);
-
-pub struct MetadataServiceInstance {
-    handle: ServerHandle,
-    readiness: Option<Readiness>,
-    authority: Option<MetadataAuthority>,
-}
-
-impl MetadataServiceInstance {
-    pub fn start(
-        listener: TcpListener,
-        filesystem: MetadataFileSystemServiceImpl,
-        worker: MetadataWorkerServiceImpl,
-        readiness: Readiness,
-        authority: MetadataAuthority,
-    ) -> Self {
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            Server::builder()
-                .add_service(FileSystemServiceProtoServer::new(filesystem))
-                .add_service(MetadataWorkerServiceProtoServer::new(worker))
-                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
-                    let _ = shutdown_rx.await;
-                })
-                .await?;
-            Ok(())
-        });
-        Self {
-            handle: ServerHandle::new(shutdown_tx, task),
-            readiness: Some(readiness),
-            authority: Some(authority),
-        }
-    }
-
-    pub async fn shutdown(&mut self) -> TestResult<()> {
-        drop(self.readiness.take());
-        self.handle.shutdown().await?;
-        if let Some(authority) = self.authority.take() {
-            authority.shutdown().await?;
-        }
-        Ok(())
-    }
-
-    pub fn abort(&mut self) {
-        self.handle.abort();
-        self.readiness.take();
-        self.authority.take();
-    }
-}
 
 pub struct MetadataProcessInstance {
     child: Child,
@@ -140,7 +87,7 @@ impl WorkerServiceInstance {
     pub fn start(
         listener: TcpListener,
         core: Arc<WorkerCore>,
-        registration_state: Arc<RegistrationSet>,
+        registration_state: Arc<RegistrationState>,
         metadata: beryl_worker::config::WorkerRegistrationConfig,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();

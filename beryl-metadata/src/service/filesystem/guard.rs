@@ -3,143 +3,66 @@
 
 //! Admission and freshness guards for filesystem requests.
 
-use super::{fs_failure_from_metadata_error, refresh_metadata_fs_failure, Freshness, FsFailure, RequestContext};
-use crate::data_io::DataIoOp;
-use crate::error::{to_rpc_error, MetadataError, MetadataResult};
-use crate::mount::{DataIoPolicy, MountTable};
+use super::{
+    fs_failure_from_metadata_error, refresh_metadata_fs_failure, FsFailure, MetadataFileSystem, RequestHeader,
+};
+use crate::error::{to_rpc_error, MetadataError};
 use crate::raft::AppRaftNode;
-use crate::readiness::RootReadinessGate;
-use crate::state::StateStore;
-use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RefreshHint, RpcErrorDetail};
+use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint, RpcErrorDetail};
 use beryl_types::ids::MountId;
 use beryl_types::{GroupName, RaftLogId};
-use std::sync::Arc;
 
-#[derive(Clone, Debug)]
-pub struct AdmissionFailure {
-    pub err: Box<RpcErrorDetail>,
-    pub group_name: Option<GroupName>,
-    pub mount_epoch: Option<u64>,
-}
-
-impl AdmissionFailure {
-    fn new(err: RpcErrorDetail) -> Self {
-        Self {
-            err: Box::new(err),
-            group_name: None,
-            mount_epoch: None,
-        }
-    }
-
-    fn from_rpc_metadata_error(err: MetadataError) -> Self {
-        Self::new(to_rpc_error(err))
-    }
-
-    fn with_mount(mut self, group_name: Option<GroupName>, mount_epoch: Option<u64>) -> Self {
-        self.group_name = group_name;
-        self.mount_epoch = mount_epoch;
-        self
-    }
-}
-
-#[derive(Clone)]
-pub struct AdmissionGuard {
-    readiness_gate: Option<Arc<RootReadinessGate>>,
-    raft_node: Arc<AppRaftNode>,
-    mount_table: Arc<MountTable>,
-}
-
-impl AdmissionGuard {
-    pub fn new(
-        mount_table: Arc<MountTable>,
-        readiness_gate: Option<Arc<RootReadinessGate>>,
-        raft_node: Arc<AppRaftNode>,
-    ) -> Self {
-        Self {
-            readiness_gate,
-            raft_node,
-            mount_table,
-        }
-    }
-
-    pub fn check_meta_read(&self) -> Result<(), AdmissionFailure> {
-        self.check_readiness()
-    }
-
-    pub fn check_meta_write(&self, ctx: &RequestContext) -> Result<(), AdmissionFailure> {
+impl MetadataFileSystem {
+    pub(super) fn check_meta_write(&self, ctx: &RequestHeader) -> Result<(), FsFailure> {
         self.check_readiness()?;
         self.check_leadership(ctx)
     }
 
-    pub fn check_data_read(&self, mount_id: MountId) -> Result<(), AdmissionFailure> {
+    pub(super) fn check_data_read(&self, mount_id: MountId) -> Result<(), FsFailure> {
         self.check_readiness()?;
-        self.check_data_io_policy(mount_id, DataIoOp::Read)
+        self.check_mount(mount_id)
     }
 
-    pub fn check_data_write(&self, ctx: &RequestContext, mount_id: MountId) -> Result<(), AdmissionFailure> {
+    pub(super) fn check_data_write(&self, ctx: &RequestHeader, mount_id: MountId) -> Result<(), FsFailure> {
         self.check_readiness()?;
         self.check_leadership(ctx)?;
-        self.check_data_io_policy(mount_id, DataIoOp::Write)
+        self.check_mount(mount_id)
     }
 
-    fn check_readiness(&self) -> Result<(), AdmissionFailure> {
-        let Some(gate) = self.readiness_gate.as_ref() else {
-            return Ok(());
-        };
-        if gate.is_ready() {
+    pub(super) fn check_readiness(&self) -> Result<(), FsFailure> {
+        if self.readiness_gate.is_ready() {
             return Ok(());
         }
-        Err(AdmissionFailure::from_rpc_metadata_error(
-            MetadataError::ServiceUnavailable("root mount not ready".to_string()),
+        Err(FsFailure::new(
+            to_rpc_error(MetadataError::ServiceUnavailable("root mount not ready".to_string())),
+            None,
         ))
     }
 
-    fn check_leadership(&self, ctx: &RequestContext) -> Result<(), AdmissionFailure> {
+    fn check_leadership(&self, ctx: &RequestHeader) -> Result<(), FsFailure> {
         let raft_node = &self.raft_node;
         if raft_node.is_leader() {
             Ok(())
         } else {
             let hint = RefreshHint {
                 leader_endpoint: leader_endpoint(raft_node),
-                group_name: ctx.caller.group_name.as_ref().map(ToString::to_string),
-                ..Default::default()
+                group_name: ctx.group_name.as_ref().map(ToString::to_string),
             };
-            Err(AdmissionFailure::new(RpcErrorDetail::refresh_metadata(
-                ErrorKind::Metadata(MetadataErrorKind::NotLeader),
-                hint,
-                "not leader",
-            )))
+            Err(FsFailure::new(
+                RpcErrorDetail::refresh_metadata(ErrorKind::Metadata(MetadataErrorKind::NotLeader), hint, "not leader"),
+                None,
+            ))
         }
     }
 
-    fn check_data_io_policy(&self, mount_id: MountId, op: DataIoOp) -> Result<(), AdmissionFailure> {
-        let mount_entry = self
-            .mount_table
-            .get_mount(mount_id)
-            .map_err(AdmissionFailure::from_rpc_metadata_error)?
-            .ok_or_else(|| {
-                AdmissionFailure::from_rpc_metadata_error(MetadataError::NotFound(format!(
-                    "Mount not found: {:?}",
-                    mount_id
-                )))
-            })?;
-
-        if mount_entry.data_io_policy != DataIoPolicy::Forbid {
-            return Ok(());
-        }
-
-        let err = RpcErrorDetail::fail(
-            ErrorKind::Protocol(ProtocolErrorKind::Unsupported),
-            format!(
-                "MountDataIoForbidden: op={} mount_prefix={}",
-                op.as_str(),
-                mount_entry.mount_prefix
-            ),
-        );
-        Err(AdmissionFailure::new(err).with_mount(
-            Some(mount_entry.namespace_owner_group_name),
-            Some(mount_entry.mount_epoch),
-        ))
+    fn check_mount(&self, mount_id: MountId) -> Result<(), FsFailure> {
+        self.mount_table.get_mount(mount_id).ok_or_else(|| {
+            FsFailure::new(
+                to_rpc_error(MetadataError::NotFound(format!("Mount not found: {mount_id:?}"))),
+                None,
+            )
+        })?;
+        Ok(())
     }
 }
 
@@ -150,143 +73,49 @@ fn leader_endpoint(raft_node: &AppRaftNode) -> Option<String> {
     Some(leader_node.address.clone())
 }
 
-#[derive(Clone)]
-pub(super) struct FreshnessValidator {
-    state_store: Arc<dyn StateStore>,
-    mount_table: Arc<MountTable>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum StaleStateStatus {
-    Ready,
-    UnknownLastApplied,
-}
-
-impl FreshnessValidator {
-    pub(super) fn new(state_store: Arc<dyn StateStore>, mount_table: Arc<MountTable>) -> Self {
-        Self {
-            state_store,
-            mount_table,
-        }
+impl MetadataFileSystem {
+    pub(super) fn mount_owner(&self, mount_id: MountId) -> Option<GroupName> {
+        self.mount_table
+            .get_mount(mount_id)
+            .map(|mount| mount.namespace_owner_group_name)
     }
 
-    pub(super) async fn authoritative_route_epoch(&self) -> MetadataResult<u64> {
-        self.state_store.get_route_epoch().await.map(|epoch| epoch.as_u64())
-    }
-
-    pub(super) fn mount_hints_for_mount(&self, mount_id: MountId) -> (Option<GroupName>, Option<u64>) {
-        match self.mount_table.get_mount(mount_id) {
-            Ok(Some(mount_entry)) => (
-                Some(mount_entry.namespace_owner_group_name),
-                Some(mount_entry.mount_epoch),
-            ),
-            _ => (None, None),
-        }
-    }
-
-    pub(super) fn validate_mount_epoch(
+    pub(super) async fn check_leader(
         &self,
-        ctx: &RequestContext,
-        freshness: Freshness,
-        mount_id: MountId,
-    ) -> Result<(Option<GroupName>, Option<u64>), FsFailure> {
-        let (group_name, mount_epoch) = self.mount_hints_for_mount(mount_id);
-        if let (Some(client_mount_epoch), Some(server_mount_epoch)) =
-            (freshness.mount_epoch.or(ctx.caller.mount_epoch), mount_epoch)
-        {
-            if client_mount_epoch != server_mount_epoch {
-                return Err(refresh_metadata_fs_failure(
-                    ctx,
-                    ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
-                    format!(
-                        "mount_epoch mismatch: client={}, server={}; {}",
-                        client_mount_epoch,
-                        server_mount_epoch,
-                        Self::replay_hint("request")
-                    ),
-                    group_name.clone(),
-                    Some(server_mount_epoch),
-                    None,
-                    Some(RefreshHint {
-                        group_name: group_name.as_ref().map(ToString::to_string),
-                        mount_epoch: Some(server_mount_epoch),
-                        ..Default::default()
-                    }),
-                ));
-            }
-        }
-        Ok((group_name, mount_epoch))
-    }
-
-    pub(super) async fn validate_route_epoch(
-        &self,
-        ctx: &RequestContext,
-        freshness: Freshness,
+        ctx: &RequestHeader,
         group_name: Option<GroupName>,
-        mount_epoch: Option<u64>,
-        intent: &str,
-    ) -> Result<Option<u64>, FsFailure> {
-        let client_route_epoch = freshness.route_epoch.or(ctx.route_epoch);
-
-        let server_route_epoch = match self.state_store.get_route_epoch().await {
-            Ok(v) => v.as_u64(),
-            Err(err) => {
-                return Err(fs_failure_from_metadata_error(
-                    ctx,
-                    err,
-                    group_name.clone(),
-                    mount_epoch,
-                    None,
-                ));
-            }
-        };
-
-        if let Some(client_route_epoch) = client_route_epoch {
-            if client_route_epoch != server_route_epoch {
-                return Err(refresh_metadata_fs_failure(
-                    ctx,
-                    ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
-                    format!(
-                        "route_epoch mismatch: client={}, server={}; refresh route and replay {}",
-                        client_route_epoch, server_route_epoch, intent
-                    ),
-                    group_name.clone(),
-                    mount_epoch,
-                    Some(server_route_epoch),
-                    Some(RefreshHint {
-                        group_name: group_name.as_ref().map(ToString::to_string),
-                        route_epoch: Some(server_route_epoch),
-                        mount_epoch,
-                        ..Default::default()
-                    }),
-                ));
-            }
-        }
-
-        Ok(Some(server_route_epoch))
+    ) -> Result<(), FsFailure> {
+        self.raft_node
+            .read(false, || Ok(()))
+            .await
+            .map_err(|error| fs_failure_from_metadata_error(ctx, error, group_name))
     }
 
     pub(super) fn validate_stale_state(
         &self,
-        ctx: &RequestContext,
+        ctx: &RequestHeader,
         last_applied: Option<RaftLogId>,
         group_name: Option<GroupName>,
-        mount_epoch: Option<u64>,
-    ) -> Result<StaleStateStatus, FsFailure> {
+    ) -> Result<(), FsFailure> {
         let Some(group_name) = group_name else {
-            return Ok(StaleStateStatus::Ready);
+            return Ok(());
         };
         let required_state_id = ctx
-            .caller
             .state
-            .iter()
-            .find(|watermark| watermark.group_name == group_name)
+            .as_ref()
+            .filter(|watermark| watermark.group_name == group_name)
             .map(|watermark| watermark.state_id);
         let Some(required_state_id) = required_state_id else {
-            return Ok(StaleStateStatus::Ready);
+            return Ok(());
         };
         let Some(last_applied) = last_applied else {
-            return Ok(StaleStateStatus::UnknownLastApplied);
+            return Err(refresh_metadata_fs_failure(
+                ctx,
+                ErrorKind::Metadata(MetadataErrorKind::StaleState),
+                "local applied state is unavailable for read freshness validation",
+                Some(group_name),
+                None,
+            ));
         };
         if !last_applied.has_reached(&required_state_id) {
             return Err(refresh_metadata_fs_failure(
@@ -297,181 +126,87 @@ impl FreshnessValidator {
                     last_applied, required_state_id
                 ),
                 Some(group_name),
-                mount_epoch,
-                None,
                 None,
             ));
         }
-        Ok(StaleStateStatus::Ready)
-    }
-
-    fn replay_hint(intent: &str) -> String {
-        format!("refresh metadata and reopen write handle, then replay {}", intent)
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    mod admission {
-        use super::super::*;
-        use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
-        use crate::readiness::RootReadinessGate;
-        use beryl_common::error::rpc::InternalErrorKind;
-        use beryl_common::error::rpc::{ErrorKind, RecoveryAction};
-        use beryl_common::header::RequestHeader;
-        use tempfile::TempDir;
-
-        fn request_context(client_id: u128) -> RequestContext {
-            let caller = RequestHeader::new(beryl_types::ClientId::new(client_id));
-            RequestContext {
-                caller,
-                route_epoch: None,
-            }
-        }
-
-        #[tokio::test]
-        async fn readiness_guard_blocks_when_not_ready() {
-            let mount_table = Arc::new(MountTable::new());
-            let gate = Arc::new(RootReadinessGate::new(None));
-            let dir = TempDir::new().unwrap();
-            let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-            let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
-            let raft_node = Arc::new(
-                AppRaftNode::new(1, storage, state_machine, Arc::clone(&mount_table))
-                    .await
-                    .unwrap(),
-            );
-            let chain = AdmissionGuard::new(mount_table, Some(Arc::clone(&gate)), Arc::clone(&raft_node));
-
-            let err = chain.check_meta_read().unwrap_err();
-            assert_eq!(err.err.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
-            assert_eq!(err.err.recovery, RecoveryAction::Retry { after_ms: Some(1000) });
-            assert!(!gate.is_ready());
-            raft_node.shutdown().await.unwrap();
-        }
-
-        #[tokio::test]
-        async fn leadership_guard_returns_not_leader_for_nonleader_raft_node() {
-            let dir = TempDir::new().unwrap();
-            let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-            let mount_table = Arc::new(MountTable::new());
-            let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
-            let raft_node = Arc::new(
-                AppRaftNode::new(1, storage, state_machine, Arc::clone(&mount_table))
-                    .await
-                    .unwrap(),
-            );
-            assert!(!raft_node.is_leader());
-            let chain = AdmissionGuard::new(mount_table, None, Arc::clone(&raft_node));
-
-            let err = chain.check_meta_write(&request_context(2)).unwrap_err();
-
-            assert_eq!(err.err.kind, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
-            assert!(matches!(err.err.recovery, RecoveryAction::RefreshMetadata { .. }));
-            raft_node.shutdown().await.unwrap();
-        }
-    }
-
     use super::*;
-    use crate::error::MetadataError;
-    use crate::state::RouteEpoch;
+    use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
+    use crate::service::filesystem::tests::*;
+    use beryl_common::error::rpc::{InternalErrorKind, RecoveryAction};
+    use std::sync::Arc;
+    use tempfile::TempDir;
 
-    struct FailingStateStore;
-
-    #[async_trait::async_trait]
-    impl StateStore for FailingStateStore {
-        async fn get_route_epoch(&self) -> MetadataResult<RouteEpoch> {
-            Err(MetadataError::Internal("route epoch unavailable".to_string()))
-        }
+    #[tokio::test]
+    async fn readiness_guard_blocks_after_shutdown() {
+        let filesystem = filesystem_builder_with_mount(MountId::new(1), &group_name("root"))
+            .build()
+            .await;
+        filesystem.readiness_gate.begin_shutdown();
+        let err = filesystem.open_file(&request_context(), "/").await.unwrap_err();
+        assert_eq!(err.error.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
+        assert_eq!(err.error.recovery, RecoveryAction::Retry { after_ms: Some(1000) });
+        filesystem.raft_node().shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn authoritative_route_epoch_propagates_state_store_failure() {
-        let validator = FreshnessValidator::new(Arc::new(FailingStateStore), Arc::new(MountTable::new()));
-
-        let error = validator.authoritative_route_epoch().await.unwrap_err();
-
-        assert!(matches!(error, MetadataError::Internal(_)));
-    }
-    use crate::service::filesystem::tests::*;
-
-    #[test]
-    fn freshness_validator_rejects_mount_epoch_with_replay_hint() {
-        let mount_id = MountId::new(12);
-        let group_name_value = group_name("g4");
-        let mount_table = Arc::new(MountTable::new());
-        mount_table
-            .upsert(MountEntry {
-                mount_id,
-                mount_prefix: "/data".to_string(),
-                mount_kind: MountKind::Internal,
-                ufs_uri: None,
-                data_io_policy: DataIoPolicy::Allow,
-                mount_epoch: 9,
-                namespace_owner_group_name: group_name_value.clone(),
-                root_inode_id: ROOT_INODE_ID,
-            })
-            .unwrap();
-        let validator = FreshnessValidator::new(Arc::new(MemoryStateStore::new()), mount_table);
-        let ctx = request_context();
-
-        let failure = validator
-            .validate_mount_epoch(
-                &ctx,
-                Freshness {
-                    mount_epoch: Some(4),
-                    route_epoch: None,
-                },
-                mount_id,
-            )
-            .unwrap_err();
-
-        assert_refresh_metadata(
-            &failure.error,
-            ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
+    async fn leadership_guard_returns_not_leader_for_nonleader_raft_node() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let builder = filesystem_builder_with_mount(MountId::new(1), &group_name("root"));
+        let state_machine = AppRaftStateMachine::new(Arc::clone(&storage));
+        let raft_node = Arc::new(
+            AppRaftNode::new(1, Arc::clone(&storage), state_machine, builder.mount_table())
+                .await
+                .unwrap(),
         );
-        assert_eq!(
-            failure.error.message,
-            "mount_epoch mismatch: client=4, server=9; refresh metadata and reopen write handle, then replay request"
-        );
-        let hint = refresh_hint(&failure.error);
-        assert_eq!(hint.group_name, Some(group_name_value.to_string()));
-        assert_eq!(hint.mount_epoch, Some(9));
-        assert_eq!(failure.group_name, Some(group_name_value.clone()));
-        assert_eq!(failure.mount_epoch, Some(9));
+        let filesystem = builder
+            .with_storage(storage)
+            .with_raft_node(Arc::clone(&raft_node))
+            .build()
+            .await;
+        let ctx = RequestHeader::new(beryl_types::ClientId::new(2)).with_group_name(group_name("requested"));
+        let err = filesystem.check_meta_write(&ctx).unwrap_err();
+        assert_eq!(err.error.kind, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
+        assert!(matches!(
+            &err.error.recovery,
+            RecoveryAction::RefreshMetadata { hint } if hint.group_name.as_deref() == Some("requested")
+        ));
+        let header = crate::service::wire::header_from_fs_failure(&ctx, &err);
+        assert!(header.group_name.is_empty());
+        assert!(header.state.is_none());
+        let failure = filesystem.check_leader(&ctx, ctx.group_name.clone()).await.unwrap_err();
+        assert_eq!(failure.error.kind, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
+        raft_node.shutdown().await.unwrap();
     }
 
-    #[test]
-    fn freshness_validator_rejects_stale_state_watermark() {
+    #[tokio::test]
+    async fn freshness_validator_rejects_stale_state_watermark() {
         let group_name_value = group_name("g4");
-        let validator = FreshnessValidator::new(Arc::new(MemoryStateStore::new()), Arc::new(MountTable::new()));
+        let filesystem = filesystem_builder_with_mount(MountId::new(1), &group_name_value)
+            .build()
+            .await;
         let mut ctx = request_context();
-        ctx.caller.state = vec![beryl_types::GroupStateWatermark::new(
+        ctx.state = Some(GroupStateWatermark::new(
             group_name_value.clone(),
-            beryl_types::RaftLogId::new(1, 7, 12),
-        )];
-
-        let failure = validator
-            .validate_stale_state(
-                &ctx,
-                Some(beryl_types::RaftLogId::new(1, 7, 10)),
-                Some(group_name_value.clone()),
-                Some(9),
-            )
+            RaftLogId::new(1, 7, 12),
+        ));
+        let failure = filesystem
+            .validate_stale_state(&ctx, Some(RaftLogId::new(1, 7, 10)), Some(group_name_value.clone()))
             .unwrap_err();
-
         assert_refresh_metadata(&failure.error, ErrorKind::Metadata(MetadataErrorKind::StaleState));
-        assert_eq!(
-        failure.error.message,
-        "Stale state: last_applied=RaftLogId { term: 1, leader_node_id: 7, index: 10 } < required=RaftLogId { term: 1, leader_node_id: 7, index: 12 }"
-    );
         assert_eq!(failure.group_name, Some(group_name_value.clone()));
-        assert_eq!(failure.mount_epoch, Some(9));
-        assert!(failure.state.is_empty());
-
-        let unknown = validator
-            .validate_stale_state(&ctx, None, Some(group_name_value.clone()), Some(9))
-            .expect("missing last_applied should preserve existing precheck fallback");
-        assert_eq!(unknown, StaleStateStatus::UnknownLastApplied);
+        assert!(crate::service::wire::header_from_fs_failure(&ctx, &failure)
+            .state
+            .is_none());
+        let failure = filesystem
+            .validate_stale_state(&ctx, None, Some(group_name_value))
+            .expect_err("reads require known applied state to satisfy a client watermark");
+        assert_refresh_metadata(&failure.error, ErrorKind::Metadata(MetadataErrorKind::StaleState));
     }
 }

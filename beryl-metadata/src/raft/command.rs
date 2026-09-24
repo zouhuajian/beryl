@@ -4,7 +4,6 @@
 //! Metadata authority commands replicated through Raft.
 
 use crate::inode::FilePublication;
-use crate::inode::InodeAttrs;
 pub(crate) use crate::inode::PublishMode;
 use crate::session_registry::CreateFileOperationId;
 use beryl_types::ids::{InodeId, MountId, WorkerId};
@@ -38,7 +37,6 @@ pub(crate) enum Command {
         proposed_at_ms: u64,
         root_inode_id: InodeId,
         components: Vec<String>,
-        attrs: InodeAttrs,
         recursive: bool,
     },
     CreateFile {
@@ -46,12 +44,9 @@ pub(crate) enum Command {
         operation_id: CreateFileOperationId,
         request_deadline_ms: u64,
         session_expires_at_ms: u64,
-        normalized_path: String,
         mount_id: MountId,
-        expected_mount_epoch: u64,
         mount_root_inode_id: InodeId,
         relative_components: Vec<String>,
-        attrs: InodeAttrs,
         block_size: u32,
     },
     /// Delete one exact mount-relative target after revalidating its path.
@@ -61,7 +56,6 @@ pub(crate) enum Command {
     Delete {
         proposed_at_ms: u64,
         mount_id: MountId,
-        expected_mount_epoch: u64,
         mount_root_inode_id: InodeId,
         relative_components: Vec<String>,
         expected_inode_id: InodeId,
@@ -89,7 +83,6 @@ pub(crate) enum Command {
         lease_epoch: LeaseEpoch,
     },
     EndWriteLease {
-        proposed_at_ms: u64,
         inode_id: InodeId,
         lease_epoch: LeaseEpoch,
     },
@@ -107,12 +100,9 @@ pub(crate) enum Command {
         publication: FilePublication,
     },
     RegisterWorkerDescriptor {
-        proposed_at_ms: u64,
         group_name: GroupName,
         worker_id: WorkerId,
         address: String,
-        worker_net_protocol: i32,
-        fault_domain: Option<String>,
     },
     /// Reclaim a bounded amount of namespace authority from detached roots.
     ///

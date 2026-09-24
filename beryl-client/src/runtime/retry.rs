@@ -3,7 +3,7 @@
 
 //! Pure retry decisions from operation safety and validated failure evidence.
 
-use beryl_common::error::rpc::{ErrorKind, RecoveryAction};
+use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, WorkerErrorKind};
 
 use crate::error::ClientError;
 
@@ -52,5 +52,21 @@ pub(crate) fn is_definite_worker_capacity_rejection(error: &ClientError) -> bool
 /// Exponential delay shared by bounded Metadata and Worker retries.
 pub(crate) fn backoff_delay(retry_index: usize) -> std::time::Duration {
     let shift = retry_index.min(20) as u32;
-    std::time::Duration::from_millis(100u64.saturating_mul(1u64 << shift).min(2_000))
+    std::time::Duration::from_millis((100u64 * (1u64 << shift)).min(2_000))
+}
+
+pub(crate) fn is_stale_read_location_error(error: &ClientError) -> bool {
+    error.remote_error().is_some_and(|detail| {
+        matches!(detail.recovery, RecoveryAction::RefreshMetadata { .. })
+            && matches!(
+                detail.kind,
+                ErrorKind::Metadata(MetadataErrorKind::StaleState)
+                    | ErrorKind::Worker(
+                        WorkerErrorKind::BlockLocationUnavailable
+                            | WorkerErrorKind::RunMismatch
+                            | WorkerErrorKind::FullReportRequired
+                            | WorkerErrorKind::NotRegistered
+                    )
+            )
+    })
 }

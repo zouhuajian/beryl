@@ -7,30 +7,30 @@ use crate::error::WorkerError;
 use crate::store::dirs::StoreReport;
 use beryl_common::error::rpc::{ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, WorkerErrorKind};
 
-pub(crate) const WORKER_UP: &str = "worker_up";
-pub(crate) const WORKER_BUILD_INFO: &str = "worker_build_info";
-pub(crate) const WORKER_REGISTERED: &str = "worker_registered";
-pub(crate) const WORKER_METADATA_RPC_TOTAL: &str = "worker_metadata_rpc_total";
-pub(crate) const WORKER_METADATA_RPC_DURATION_SECONDS: &str = "worker_metadata_rpc_duration_seconds";
-pub(crate) const WORKER_HEARTBEAT_SENT_TOTAL: &str = "worker_heartbeat_sent_total";
-pub(crate) const WORKER_BLOCK_REPORT_SENT_TOTAL: &str = "worker_block_report_sent_total";
-pub(crate) const WORKER_BLOCK_REPORT_DURATION_SECONDS: &str = "worker_block_report_duration_seconds";
-pub(crate) const WORKER_STORE_CAPACITY_BYTES: &str = "worker_store_capacity_bytes";
-pub(crate) const WORKER_STORE_WRITABLE: &str = "worker_store_writable";
-pub(crate) const WORKER_STORE_BLOCKS: &str = "worker_store_blocks";
-pub(crate) const WORKER_STORE_IO_BYTES: &str = "worker_store_io_bytes";
-pub(crate) const WORKER_STORE_IO_DURATION_SECONDS: &str = "worker_store_io_duration_seconds";
-pub(crate) const WORKER_DATA_RPC_TOTAL: &str = "worker_data_rpc_total";
-pub(crate) const WORKER_DATA_RPC_DURATION_SECONDS: &str = "worker_data_rpc_duration_seconds";
-pub(crate) const WORKER_STREAM_OPEN_TOTAL: &str = "worker_stream_open_total";
-pub(crate) const WORKER_STREAM_INFLIGHT: &str = "worker_stream_inflight";
-pub(crate) const WORKER_DATA_RPC_CAPACITY_REJECTIONS_TOTAL: &str = "worker_data_rpc_capacity_rejections_total";
-pub(crate) const WORKER_STREAM_FRAME_BYTES: &str = "worker_stream_frame_bytes";
-pub(crate) const WORKER_STREAM_FRAMES_TOTAL: &str = "worker_stream_frames_total";
-pub(crate) const WORKER_CLEANUP_QUEUE_DEPTH: &str = "worker_cleanup_queue_depth";
-pub(crate) const WORKER_CLEANUP_RECLAIMING_COUNT: &str = "worker_cleanup_reclaiming_count";
-pub(crate) const WORKER_CLEANUP_ENQUEUE_TOTAL: &str = "worker_cleanup_enqueue_total";
-pub(crate) const WORKER_CLEANUP_RESULT_TOTAL: &str = "worker_cleanup_result_total";
+const WORKER_UP: &str = "worker_up";
+const WORKER_BUILD_INFO: &str = "worker_build_info";
+const WORKER_REGISTERED: &str = "worker_registered";
+const WORKER_METADATA_RPC_TOTAL: &str = "worker_metadata_rpc_total";
+const WORKER_METADATA_RPC_DURATION_SECONDS: &str = "worker_metadata_rpc_duration_seconds";
+const WORKER_HEARTBEAT_SENT_TOTAL: &str = "worker_heartbeat_sent_total";
+const WORKER_BLOCK_REPORT_SENT_TOTAL: &str = "worker_block_report_sent_total";
+const WORKER_BLOCK_REPORT_DURATION_SECONDS: &str = "worker_block_report_duration_seconds";
+const WORKER_STORE_CAPACITY_BYTES: &str = "worker_store_capacity_bytes";
+const WORKER_STORE_WRITABLE: &str = "worker_store_writable";
+const WORKER_STORE_BLOCKS: &str = "worker_store_blocks";
+const WORKER_STORE_IO_BYTES: &str = "worker_store_io_bytes";
+const WORKER_STORE_IO_DURATION_SECONDS: &str = "worker_store_io_duration_seconds";
+const WORKER_DATA_RPC_TOTAL: &str = "worker_data_rpc_total";
+const WORKER_DATA_RPC_DURATION_SECONDS: &str = "worker_data_rpc_duration_seconds";
+const WORKER_STREAM_OPEN_TOTAL: &str = "worker_stream_open_total";
+const WORKER_STREAM_INFLIGHT: &str = "worker_stream_inflight";
+const WORKER_DATA_RPC_CAPACITY_REJECTIONS_TOTAL: &str = "worker_data_rpc_capacity_rejections_total";
+const WORKER_STREAM_FRAME_BYTES: &str = "worker_stream_frame_bytes";
+const WORKER_STREAM_FRAMES_TOTAL: &str = "worker_stream_frames_total";
+const WORKER_CLEANUP_QUEUE_DEPTH: &str = "worker_cleanup_queue_depth";
+const WORKER_CLEANUP_RECLAIMING_COUNT: &str = "worker_cleanup_reclaiming_count";
+const WORKER_CLEANUP_ENQUEUE_TOTAL: &str = "worker_cleanup_enqueue_total";
+const WORKER_CLEANUP_RESULT_TOTAL: &str = "worker_cleanup_result_total";
 
 pub fn record_worker_started(service: &str, version: &str) {
     metrics::gauge!(WORKER_UP).set(1.0);
@@ -105,7 +105,7 @@ pub(crate) fn record_cleanup_result(result: &str) {
     metrics::counter!(WORKER_CLEANUP_RESULT_TOTAL, "result" => result.to_string()).increment(1);
 }
 
-pub(crate) fn record_store_capacity(dir_id: &str, kind: &str, bytes: u64) {
+fn record_store_capacity(dir_id: &str, kind: &str, bytes: u64) {
     metrics::gauge!(
         WORKER_STORE_CAPACITY_BYTES,
         "dir_id" => dir_id.to_string(),
@@ -114,11 +114,11 @@ pub(crate) fn record_store_capacity(dir_id: &str, kind: &str, bytes: u64) {
     .set(bytes as f64);
 }
 
-pub(crate) fn record_store_writable(dir_id: &str, writable: bool) {
+fn record_store_writable(dir_id: &str, writable: bool) {
     metrics::gauge!(WORKER_STORE_WRITABLE, "dir_id" => dir_id.to_string()).set(if writable { 1.0 } else { 0.0 });
 }
 
-pub(crate) fn record_store_blocks(dir_id: &str, count: u64) {
+fn record_store_blocks(dir_id: &str, count: u64) {
     metrics::gauge!(WORKER_STORE_BLOCKS, "dir_id" => dir_id.to_string()).set(count as f64);
 }
 
@@ -215,10 +215,8 @@ pub(crate) fn worker_error_kind(error: &WorkerError) -> &'static str {
 
 fn error_kind_label(kind: ErrorKind) -> &'static str {
     match kind {
-        ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader) => "invalid_header",
-        ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument) => "invalid_argument",
-        ErrorKind::Protocol(ProtocolErrorKind::PermissionDenied) => "permission_denied",
-        ErrorKind::Protocol(ProtocolErrorKind::Unsupported) => "unsupported",
+        ErrorKind::Protocol(kind) => protocol_error_kind(kind),
+        ErrorKind::Worker(kind) => rpc_worker_error_kind(kind),
         ErrorKind::Metadata(MetadataErrorKind::NotFound) => "not_found",
         ErrorKind::Metadata(MetadataErrorKind::AlreadyExists) => "already_exists",
         ErrorKind::Metadata(MetadataErrorKind::NotDirectory) => "not_directory",
@@ -229,27 +227,13 @@ fn error_kind_label(kind: ErrorKind) -> &'static str {
         ErrorKind::Metadata(MetadataErrorKind::Conflict) => "conflict",
         ErrorKind::Metadata(MetadataErrorKind::NotLeader) => "not_leader",
         ErrorKind::Metadata(MetadataErrorKind::StaleState) => "stale_state",
-        ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch) => "mount_epoch_mismatch",
-        ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch) => "route_epoch_mismatch",
         ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch) => "owner_group_mismatch",
         ErrorKind::Metadata(MetadataErrorKind::GroupMismatch) => "group_mismatch",
-        ErrorKind::Worker(WorkerErrorKind::NotRegistered) => "worker_not_registered",
-        ErrorKind::Worker(WorkerErrorKind::RunMismatch) => "worker_run_mismatch",
-        ErrorKind::Worker(WorkerErrorKind::DescriptorMismatch) => "worker_descriptor_mismatch",
-        ErrorKind::Worker(WorkerErrorKind::FullReportRequired) => "full_report_required",
-        ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable) => "block_location_unavailable",
         ErrorKind::Metadata(MetadataErrorKind::Fencing) => "fencing",
         ErrorKind::Metadata(MetadataErrorKind::SessionInvalid) => "session_invalid",
         ErrorKind::Metadata(MetadataErrorKind::SessionExpired) => "session_expired",
-        ErrorKind::Metadata(MetadataErrorKind::EpochMismatch) => "epoch_mismatch",
         ErrorKind::Internal(InternalErrorKind::NodeUnavailable) => "node_unavailable",
-        ErrorKind::Internal(InternalErrorKind::Timeout) => "timeout",
-        ErrorKind::Internal(InternalErrorKind::ResourceExhausted) => "resource_exhausted",
-        ErrorKind::Internal(InternalErrorKind::Cancelled) => "cancelled",
-        ErrorKind::Internal(InternalErrorKind::Corrupt) => "corrupt",
         ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted) => "resource_exhausted",
-        ErrorKind::Worker(kind) => rpc_worker_error_kind(kind),
-        ErrorKind::Protocol(kind) => protocol_error_kind(kind),
         ErrorKind::Internal(_) => "internal",
     }
 }
@@ -264,7 +248,6 @@ fn rpc_worker_error_kind(kind: WorkerErrorKind) -> &'static str {
         WorkerErrorKind::NodeUnavailable => "worker_node_unavailable",
         WorkerErrorKind::Timeout => "worker_timeout",
         WorkerErrorKind::ResourceExhausted => "worker_resource_exhausted",
-        WorkerErrorKind::Conflict => "worker_conflict",
         WorkerErrorKind::Corrupt => "worker_corrupt",
         WorkerErrorKind::Fencing => "worker_fencing",
         WorkerErrorKind::Cancelled => "worker_cancelled",
@@ -279,7 +262,5 @@ fn protocol_error_kind(kind: ProtocolErrorKind) -> &'static str {
         ProtocolErrorKind::InvalidArgument => "invalid_argument",
         ProtocolErrorKind::PermissionDenied => "permission_denied",
         ProtocolErrorKind::Unsupported => "unsupported",
-        ProtocolErrorKind::Cancelled => "cancelled",
-        ProtocolErrorKind::Corrupt => "corrupt",
     }
 }

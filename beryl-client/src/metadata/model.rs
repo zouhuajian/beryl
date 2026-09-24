@@ -4,24 +4,20 @@
 //! Client-domain metadata result types.
 
 use crate::api::FileStatus;
-use crate::error::{ClientError, ClientResult};
+use crate::error::{ClientError, ClientResult, RefreshHint as ClientRefreshHint};
+use beryl_common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind};
 use beryl_proto::metadata::{FileBlockLocationProto, FileStatusProto};
-use beryl_types::{FileBlockLocation, GroupName, GroupStateWatermark, LocatedBlock};
+use beryl_types::{BlockId, FileBlockLocation, GroupName, GroupStateWatermark, LocatedBlock, WorkerEndpointInfo};
 
 /// Server-authorized metadata state learned from one validated successful response.
 ///
-/// Every watermark is scoped to `group_name`. Epochs are scoped later to the
-/// operation path because the response header does not carry a mount prefix.
+/// Every watermark is scoped to `group_name`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MetadataAuthorityUpdate {
     /// Metadata group that authorized this response.
     pub(crate) group_name: GroupName,
-    /// Applied state-machine watermarks authorized by the group leader.
-    pub(crate) state: Vec<GroupStateWatermark>,
-    /// Current mount epoch for the operation path, when supplied.
-    pub(crate) mount_epoch: Option<u64>,
-    /// Current route epoch for the operation path, when supplied.
-    pub(crate) route_epoch: Option<u64>,
+    /// Applied state-machine watermark authorized by the group leader.
+    pub(crate) state: Option<GroupStateWatermark>,
 }
 
 /// Couples a response body with the authority state validated from its header.
@@ -38,7 +34,7 @@ pub(crate) struct ValidatedMetadataResponse<T> {
 pub(crate) struct ListStatusPage {
     /// Fully qualified child statuses returned by Metadata.
     pub(crate) entries: Vec<FileStatus>,
-    /// Opaque continuation cursor, present exactly when `eof` is false.
+    /// Opaque continuation cursor; `None` means the directory scan reached its end.
     pub(crate) next_cursor: Option<Vec<u8>>,
 }
 
@@ -62,7 +58,40 @@ pub(crate) struct ReadLayout {
     locations: Vec<FileBlockLocation>,
 }
 
+/// A block-local worker read planned from metadata block locations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PlannedBlockRead {
+    pub(crate) len: u32,
+    pub(crate) block_id: BlockId,
+    pub(crate) block_offset: u64,
+    pub(crate) block_size: u64,
+    pub(crate) effective_len: u64,
+    pub(crate) workers: Vec<WorkerEndpointInfo>,
+}
+
 impl ReadLayout {
+    /// Plans the current block's prefix from a layout validated against the opened file.
+    pub(crate) fn plan_block_read(&self, offset: u64, max_len: u32) -> ClientResult<PlannedBlockRead> {
+        let location = self
+            .location_at(offset)
+            .ok_or_else(|| ClientError::invalid_layout("layout gap at requested offset"))?;
+        let end = location.file_offset + location.len;
+        if location.workers.is_empty() {
+            return Err(block_location_unavailable_error(format!(
+                "block location unavailable for {}",
+                location.block_id
+            )));
+        }
+        Ok(PlannedBlockRead {
+            len: u64::from(max_len).min(end - offset) as u32,
+            block_id: location.block_id,
+            block_offset: offset - location.file_offset,
+            block_size: location.block_size,
+            effective_len: location.len,
+            workers: location.workers.clone(),
+        })
+    }
+
     /// Checks the opened authority before this immutable layout enters a reader cache.
     pub(crate) fn validate_file(&self, file: &FileStatus) -> ClientResult<()> {
         if self.status.inode_id != file.inode_id() {
@@ -119,11 +148,6 @@ impl ReadLayout {
                     "block inode_id does not match layout inode",
                 ));
             }
-            if location.len != location.effective_len {
-                return Err(ClientError::invalid_layout(
-                    "location length differs from visible block prefix",
-                ));
-            }
             if previous_end.is_some_and(|previous| previous > location.file_offset) {
                 return Err(ClientError::invalid_layout("layout overlap"));
             }
@@ -135,6 +159,15 @@ impl ReadLayout {
             locations,
         })
     }
+}
+
+fn block_location_unavailable_error(message: impl Into<String>) -> ClientError {
+    let rpc_error = RpcErrorDetail::refresh_metadata(
+        ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
+        RefreshHint::default(),
+        message,
+    );
+    ClientError::from_remote(rpc_error, ClientRefreshHint::default())
 }
 
 /// Validated allocation result paired with the Metadata owner group for Worker IO.
@@ -149,7 +182,7 @@ pub(crate) struct AllocateBlockResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beryl_types::{BlockId, BlockIndex, ContentGeneration, FileType, InodeId};
+    use beryl_types::{BlockIndex, ContentGeneration, FileType, InodeId, WorkerId};
 
     fn file() -> FileStatus {
         FileStatus {
@@ -169,7 +202,6 @@ mod tests {
             file_offset,
             len,
             block_size: 4096,
-            effective_len: len,
             workers: Vec::new(),
         }
     }
@@ -188,11 +220,7 @@ mod tests {
                 ..valid.clone()
             }],
             vec![FileBlockLocationProto {
-                effective_len: 3,
-                ..valid.clone()
-            }],
-            vec![FileBlockLocationProto {
-                effective_len: 4097,
+                len: 4097,
                 ..valid.clone()
             }],
             vec![valid; beryl_types::MAX_FILE_BLOCKS + 1],
@@ -239,5 +267,35 @@ mod tests {
                 .validate_file(&opened)
                 .expect_err("new layout must match the opened authority");
         }
+    }
+
+    #[test]
+    fn block_plan_respects_range_and_worker_availability() {
+        let mut location = location(10, 0, 8);
+        location.workers.push(
+            WorkerEndpointInfo {
+                worker_id: WorkerId::new(1),
+                endpoint: "127.0.0.1:19101".into(),
+                worker_run_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
+            }
+            .into(),
+        );
+        let mut layout = ReadLayout::from_response(
+            GroupName::parse("root").unwrap(),
+            Some((&file()).into()),
+            vec![location],
+        )
+        .unwrap();
+        let plan = layout.plan_block_read(3, 10).unwrap();
+        assert_eq!((plan.block_offset, plan.len), (3, 5));
+        assert_eq!(plan.block_id.index.as_raw(), 4, "block index is not file offset");
+        assert_eq!(layout.plan_block_read(3, 2).unwrap().len, 2);
+        assert!(layout.plan_block_read(8, 4).is_err());
+        layout.locations[0].workers.clear();
+        let error = layout.plan_block_read(0, 4).unwrap_err();
+        assert_eq!(
+            error.remote_error().unwrap().kind,
+            ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable)
+        );
     }
 }

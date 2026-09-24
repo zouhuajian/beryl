@@ -13,7 +13,7 @@ use futures::io::AsyncReadExt;
 
 const DIRECTORY: &str = "/examples";
 const FILE: &str = "/examples/rust-client-crud.bin";
-const BLOCK_SIZE: u32 = 1024;
+const PAYLOAD_SIZE: usize = 2065;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -21,12 +21,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("conf/client.yaml"));
-    let client = FsClient::new(ClientConfig::load(config_path)?)?;
+    let client = FsClient::new(ClientConfig::load(config_path)?);
 
     client.mkdirs(DIRECTORY).await?;
 
     let payload = Bytes::from(
-        (0..2 * BLOCK_SIZE as usize + 17)
+        (0..PAYLOAD_SIZE)
             .map(|index| ((index * 31 + 17) % 251) as u8)
             .collect::<Vec<_>>(),
     );

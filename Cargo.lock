@@ -286,9 +286,6 @@ dependencies = [
 name = "beryl-metadata"
 version = "0.1.0-alpha.1"
 dependencies = [
- "anyhow",
- "async-trait",
- "beryl-client",
  "beryl-common",
  "beryl-proto",
  "beryl-types",
@@ -300,17 +297,13 @@ dependencies = [
  "metrics-exporter-prometheus",
  "openraft",
  "parking_lot",
- "prost",
- "rand 0.8.5",
  "rocksdb",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
- "tokio-stream",
  "tokio-util",
  "tonic",
  "tonic-health",
@@ -365,7 +358,6 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 

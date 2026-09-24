@@ -42,6 +42,5 @@ pub(crate) struct AppMetadataRaftState {
 /// Node information for metadata service.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub(crate) struct MetadataNode {
-    pub node_id: u64,
     pub address: String,
 }

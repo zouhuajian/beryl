@@ -4,10 +4,9 @@
 use super::{
     decode_from_slice, encode_to_vec, standard, worker_key, AppMetadataRaftState, ColumnFamily, CreateFileReplayRecord,
     DetachedRoot, DetachedRootReclaimUpdate, Inode, InodeAllocation, InodeId, Instant, MetadataError, MetadataResult,
-    MountEntry, RecursiveMkdirEntry, RenameAtomicUpdate, RocksDBStorage, RouteEpoch, WorkerInfo, WriteBatch,
-    CF_DENTRIES, CF_DETACHED_ROOTS, CF_INODES, CF_META, CF_MOUNTS, CF_RAFT_STATE, CF_WORKERS,
-    CREATE_FILE_REPLAY_COUNT_KEY, CREATE_FILE_REPLAY_EXPIRY_PREFIX, DB, MAX_CREATE_FILE_REPLAY_RECORDS,
-    NEXT_INODE_ID_KEY, RAFT_STATE_KEY,
+    MountEntry, RecursiveMkdirEntry, RenameAtomicUpdate, RocksDBStorage, WorkerDescriptor, WriteBatch, CF_DENTRIES,
+    CF_DETACHED_ROOTS, CF_INODES, CF_META, CF_MOUNTS, CF_RAFT_STATE, CF_WORKERS, CREATE_FILE_REPLAY_COUNT_KEY,
+    CREATE_FILE_REPLAY_EXPIRY_PREFIX, DB, MAX_CREATE_FILE_REPLAY_RECORDS, NEXT_INODE_ID_KEY, RAFT_STATE_KEY,
 };
 use rocksdb::{Direction, IteratorMode};
 
@@ -17,8 +16,7 @@ impl RocksDBStorage {
         mut batch: WriteBatch,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
+        let db = self.db();
         let cf_raft_state = Self::cf(db, CF_RAFT_STATE)?;
         let state_data = serde_json::to_vec(raft_state)
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize Raft state: {e}")))?;
@@ -42,20 +40,6 @@ impl RocksDBStorage {
         Ok(())
     }
 
-    fn batch_put_route_epoch(batch: &mut WriteBatch, cf: &ColumnFamily, epoch: RouteEpoch) -> MetadataResult<()> {
-        let value = encode_to_vec(epoch.as_u64(), standard())
-            .map_err(|e| MetadataError::Internal(format!("Failed to serialize route_epoch: {}", e)))?;
-        batch.put_cf(cf, b"route_epoch", value);
-        Ok(())
-    }
-
-    fn batch_put_mount_epoch(batch: &mut WriteBatch, cf: &ColumnFamily, epoch: u64) -> MetadataResult<()> {
-        let value = encode_to_vec(epoch, standard())
-            .map_err(|e| MetadataError::Internal(format!("Failed to serialize mount_epoch: {}", e)))?;
-        batch.put_cf(cf, b"mount_epoch", value);
-        Ok(())
-    }
-
     fn batch_put_inode_allocation(
         batch: &mut WriteBatch,
         cf_meta: &ColumnFamily,
@@ -67,72 +51,20 @@ impl RocksDBStorage {
         Ok(())
     }
 
-    fn validate_inode_allocation_targets(
-        db: &DB,
-        allocation: InodeAllocation,
-        target_inode_ids: &[InodeId],
-    ) -> MetadataResult<()> {
-        if target_inode_ids.is_empty() || allocation.inode_id.as_raw() < 2 {
-            return Err(MetadataError::Internal(
-                "inode allocation has no valid target".to_string(),
-            ));
-        }
-        let cf_meta = Self::cf(db, CF_META)?;
-        let persisted = db
-            .get_cf(cf_meta, NEXT_INODE_ID_KEY)
-            .map_err(|error| MetadataError::Internal(format!("Failed to read next_inode_id: {error}")))?
-            .ok_or_else(|| MetadataError::Internal("next_inode_id allocator authority is missing".to_string()))?;
-        let persisted: u64 = decode_from_slice(&persisted, standard())
-            .map_err(|error| MetadataError::Internal(format!("Failed to deserialize next_inode_id: {error}")))?
-            .0;
-        if persisted != allocation.inode_id.as_raw() {
-            return Err(MetadataError::Internal(format!(
-                "inode allocation {} does not match durable next_inode_id {persisted}",
-                allocation.inode_id
-            )));
-        }
-
-        let cf_inodes = Self::cf(db, CF_INODES)?;
-        let mut expected_raw = allocation.inode_id.as_raw();
-        for inode_id in target_inode_ids {
-            if inode_id.as_raw() != expected_raw {
-                return Err(MetadataError::Internal(format!(
-                    "inode allocation target {inode_id} is not the expected inode {expected_raw}"
-                )));
-            }
-            if db
-                .get_cf(cf_inodes, Self::encode_inode_key(*inode_id))
-                .map_err(|error| MetadataError::Internal(format!("Failed to read inode {inode_id}: {error}")))?
-                .is_some()
-            {
-                return Err(MetadataError::Internal(format!(
-                    "inode allocation target already exists: {inode_id}"
-                )));
-            }
-            expected_raw = expected_raw
-                .checked_add(1)
-                .ok_or_else(|| MetadataError::Internal("inode ID allocator overflow".to_string()))?;
-        }
-        if allocation.next_inode_id.as_raw() != expected_raw {
-            return Err(MetadataError::Internal(format!(
-                "inode allocation next value {} does not match expected {expected_raw}",
-                allocation.next_inode_id
-            )));
-        }
-        Ok(())
-    }
-
-    fn batch_put_worker(batch: &mut WriteBatch, cf: &ColumnFamily, info: &WorkerInfo) -> MetadataResult<()> {
+    fn batch_put_worker(batch: &mut WriteBatch, cf: &ColumnFamily, info: &WorkerDescriptor) -> MetadataResult<()> {
         let key = worker_key(&info.group_name, info.worker_id);
         let value = encode_to_vec(info, standard())
-            .map_err(|e| MetadataError::Internal(format!("Failed to serialize WorkerInfo: {}", e)))?;
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize WorkerDescriptor: {}", e)))?;
         batch.put_cf(cf, key.as_bytes(), value);
         Ok(())
     }
 
-    pub fn register_worker_atomic(&self, info: &WorkerInfo, raft_state: &AppMetadataRaftState) -> MetadataResult<()> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
+    pub fn register_worker_atomic(
+        &self,
+        info: &WorkerDescriptor,
+        raft_state: &AppMetadataRaftState,
+    ) -> MetadataResult<()> {
+        let db = self.db();
         let cf_workers = Self::cf(db, CF_WORKERS)?;
         if info.worker_id.as_raw() == 0 {
             return Err(MetadataError::InvalidArgument(
@@ -155,8 +87,7 @@ impl RocksDBStorage {
 
     /// Atomically persist a single inode update with apply tracking.
     pub fn put_inode_atomic(&self, inode: &Inode, raft_state: &AppMetadataRaftState) -> MetadataResult<()> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
+        let db = self.db();
         let cf_inodes = Self::cf(db, CF_INODES)?;
         let mut batch = WriteBatch::default();
         Self::batch_put_inode(&mut batch, cf_inodes, inode)?;
@@ -169,16 +100,13 @@ impl RocksDBStorage {
         root_mount: &MountEntry,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
+        let db = self.db();
         let cf_inodes = Self::cf(db, CF_INODES)?;
         let cf_mounts = Self::cf(db, CF_MOUNTS)?;
         let cf_meta = Self::cf(db, CF_META)?;
         let mut batch = WriteBatch::default();
         Self::batch_put_inode(&mut batch, cf_inodes, root_inode)?;
         Self::batch_put_mount(&mut batch, cf_mounts, root_mount)?;
-        Self::batch_put_route_epoch(&mut batch, cf_meta, RouteEpoch::new(1))?;
-        Self::batch_put_mount_epoch(&mut batch, cf_meta, 1)?;
         batch.put_cf(
             cf_meta,
             NEXT_INODE_ID_KEY,
@@ -188,15 +116,14 @@ impl RocksDBStorage {
         self.commit_authority_batch(batch, raft_state)
     }
 
-    fn create_file_batch(
+    fn create_entry_batch(
         &self,
         parent_inode_id: InodeId,
         name: &str,
         inode: &Inode,
         updated_parent: &Inode,
     ) -> MetadataResult<WriteBatch> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
+        let db = self.db();
         let cf_inodes = Self::cf(db, CF_INODES)?;
         let cf_dentries = Self::cf(db, CF_DENTRIES)?;
 
@@ -222,15 +149,6 @@ impl RocksDBStorage {
     ) -> MetadataResult<()> {
         let replay_key = Self::encode_create_file_replay_key(record.operation_id);
         let replay_inode_key = Self::encode_create_file_replay_inode_key(record.inode_id);
-        if db
-            .get_cf(cf_meta, &replay_key)
-            .map_err(|error| MetadataError::Internal(format!("Failed to check CreateFile replay identity: {error}")))?
-            .is_some()
-        {
-            return Err(MetadataError::Internal(
-                "new CreateFile mutation attempted to overwrite a replay record".to_string(),
-            ));
-        }
         if db
             .get_cf(cf_meta, &replay_inode_key)
             .map_err(|error| {
@@ -291,15 +209,7 @@ impl RocksDBStorage {
                     MetadataError::Internal(format!("Failed to verify expired CreateFile replay record: {error}"))
                 })?
                 .ok_or_else(|| MetadataError::Internal("CreateFile replay expiry index has no record".to_string()))?;
-            let (expired_record, consumed): (CreateFileReplayRecord, usize) =
-                decode_from_slice(&expired_replay_value, standard()).map_err(|error| {
-                    MetadataError::Internal(format!("Failed to decode expired CreateFile replay record: {error}"))
-                })?;
-            if consumed != expired_replay_value.len() || expired_record.operation_id != expired_operation_id {
-                return Err(MetadataError::Internal(
-                    "CreateFile replay expiry index has a corrupt record".to_string(),
-                ));
-            }
+            let expired_record = Self::decode_create_file_replay(expired_operation_id, &expired_replay_value)?;
             let expired_inode_key = Self::encode_create_file_replay_inode_key(expired_record.inode_id);
             let indexed_operation = db
                 .get_cf(cf_meta, &expired_inode_key)
@@ -352,38 +262,12 @@ impl RocksDBStorage {
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        Self::validate_inode_allocation_targets(db, allocation, std::slice::from_ref(&inode.inode_id))?;
-        let mut batch = self.create_file_batch(parent_inode_id, name, inode, updated_parent)?;
+        let db = self.db();
+        let mut batch = self.create_entry_batch(parent_inode_id, name, inode, updated_parent)?;
         let cf_meta = Self::cf(db, CF_META)?;
         Self::batch_put_inode_allocation(&mut batch, cf_meta, allocation)?;
         Self::batch_put_create_file_replay(db, cf_meta, &mut batch, replay_record, proposed_at_ms)?;
         self.commit_authority_batch(batch, raft_state)
-    }
-
-    fn create_dir_batch(
-        &self,
-        parent_inode_id: InodeId,
-        name: &str,
-        inode: &Inode,
-        updated_parent: &Inode,
-    ) -> MetadataResult<WriteBatch> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf_inodes = Self::cf(db, CF_INODES)?;
-        let cf_dentries = Self::cf(db, CF_DENTRIES)?;
-
-        let mut batch = WriteBatch::default();
-        Self::batch_put_inode(&mut batch, cf_inodes, inode)?;
-        Self::batch_put_inode(&mut batch, cf_inodes, updated_parent)?;
-        batch.put_cf(
-            cf_dentries,
-            Self::encode_dentry_key(parent_inode_id, name),
-            inode.inode_id.to_be_bytes(),
-        );
-
-        Ok(batch)
     }
 
     /// Atomically persist mkdir mutation with apply tracking.
@@ -397,10 +281,8 @@ impl RocksDBStorage {
         updated_parent: &Inode,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        Self::validate_inode_allocation_targets(db, allocation, std::slice::from_ref(&inode.inode_id))?;
-        let mut batch = self.create_dir_batch(parent_inode_id, name, inode, updated_parent)?;
+        let db = self.db();
+        let mut batch = self.create_entry_batch(parent_inode_id, name, inode, updated_parent)?;
         let cf_meta = Self::cf(db, CF_META)?;
         Self::batch_put_inode_allocation(&mut batch, cf_meta, allocation)?;
         self.commit_authority_batch(batch, raft_state)
@@ -413,13 +295,10 @@ impl RocksDBStorage {
         entries: &[RecursiveMkdirEntry],
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
+        let db = self.db();
         let cf_inodes = Self::cf(db, CF_INODES)?;
         let cf_dentries = Self::cf(db, CF_DENTRIES)?;
         let cf_meta = Self::cf(db, CF_META)?;
-        let target_inode_ids: Vec<_> = entries.iter().map(|entry| entry.inode.inode_id).collect();
-        Self::validate_inode_allocation_targets(db, allocation, &target_inode_ids)?;
         let mut batch = WriteBatch::default();
         for entry in entries {
             Self::batch_put_inode(&mut batch, cf_inodes, &entry.inode)?;
@@ -441,8 +320,7 @@ impl RocksDBStorage {
         inode_id: InodeId,
         updated_parent: &Inode,
     ) -> MetadataResult<WriteBatch> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
+        let db = self.db();
         let cf_inodes = Self::cf(db, CF_INODES)?;
         let cf_dentries = Self::cf(db, CF_DENTRIES)?;
 
@@ -463,7 +341,6 @@ impl RocksDBStorage {
         updated_parent: &Inode,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
-        let _generation = self.pin_generation()?;
         let batch = self.delete_dentry_inode_batch(parent_inode_id, name, inode_id, updated_parent)?;
         self.commit_authority_batch(batch, raft_state)
     }
@@ -483,8 +360,7 @@ impl RocksDBStorage {
         detached_root: DetachedRoot,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
+        let db = self.db();
         let cf_inodes = Self::cf(db, CF_INODES)?;
         let cf_dentries = Self::cf(db, CF_DENTRIES)?;
         let cf_detached_roots = Self::cf(db, CF_DETACHED_ROOTS)?;
@@ -507,8 +383,7 @@ impl RocksDBStorage {
         update: DetachedRootReclaimUpdate,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
+        let db = self.db();
         let cf_inodes = Self::cf(db, CF_INODES)?;
         let cf_dentries = Self::cf(db, CF_DENTRIES)?;
         let cf_detached_roots = Self::cf(db, CF_DETACHED_ROOTS)?;
@@ -536,19 +411,14 @@ impl RocksDBStorage {
     }
 
     fn rename_batch(&self, update: RenameAtomicUpdate<'_>) -> MetadataResult<WriteBatch> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
+        let db = self.db();
         let cf_inodes = Self::cf(db, CF_INODES)?;
         let cf_dentries = Self::cf(db, CF_DENTRIES)?;
 
         let mut batch = WriteBatch::default();
 
-        if let Some(cleanup) = update.overwritten_target {
-            batch.delete_cf(cf_inodes, Self::encode_inode_key(cleanup.inode_id));
-            batch.delete_cf(
-                cf_dentries,
-                Self::encode_dentry_key(update.dst_parent_inode_id, update.dst_name),
-            );
+        if let Some(inode_id) = update.overwritten_target {
+            batch.delete_cf(cf_inodes, Self::encode_inode_key(inode_id));
         }
 
         batch.delete_cf(
@@ -577,7 +447,6 @@ impl RocksDBStorage {
         update: RenameAtomicUpdate<'_>,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
-        let _generation = self.pin_generation()?;
         let batch = self.rename_batch(update)?;
         self.commit_authority_batch(batch, raft_state)
     }
@@ -589,31 +458,13 @@ mod tests {
     use crate::inode::InodeAttrs;
     use crate::session_registry::CreateFileOperationId;
 
-    use beryl_types::{CallId, ClientId, ContentGeneration, LeaseEpoch, MountId};
-    use openraft::{LeaderId, LogId};
+    use beryl_types::{CallId, ClientId, MountId};
     use tempfile::TempDir;
     use uuid::Uuid;
 
     impl RocksDBStorage {
-        /// Persist the authoritative route epoch used for stale-route validation.
-        pub fn put_route_epoch(&self, epoch: RouteEpoch) -> MetadataResult<()> {
-            let generation = self.pin_generation()?;
-            let db = generation.db();
-            let cf = db
-                .cf_handle(CF_META)
-                .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
-            let value = encode_to_vec(epoch.as_u64(), standard())
-                .map_err(|e| MetadataError::Internal(format!("Failed to serialize route_epoch: {}", e)))?;
-
-            db.put_cf(cf, b"route_epoch", value)
-                .map_err(|e| MetadataError::Internal(format!("RocksDB error: {}", e)))?;
-            Ok(())
-        }
-
-        /// Put mount entry.
         pub fn put_mount(&self, entry: &MountEntry) -> MetadataResult<()> {
-            let generation = self.pin_generation()?;
-            let db = generation.db();
+            let db = self.db();
             let cf = db
                 .cf_handle(CF_MOUNTS)
                 .ok_or_else(|| MetadataError::Internal("Mounts CF not found".to_string()))?;
@@ -626,18 +477,9 @@ mod tests {
             Ok(())
         }
 
-        pub(crate) fn delete_mount(&self, mount_id: MountId) -> MetadataResult<()> {
-            let generation = self.pin_generation()?;
-            let db = generation.db();
-            let cf = Self::cf(db, CF_MOUNTS)?;
-            db.delete_cf(cf, format!("{}", mount_id.as_raw()).as_bytes())
-                .map_err(|error| MetadataError::Internal(format!("delete test mount: {error}")))
-        }
-
         /// Persist the durable next inode ID allocator value.
         pub fn set_next_inode_id(&self, next_inode_id: InodeId) -> MetadataResult<()> {
-            let generation = self.pin_generation()?;
-            let db = generation.db();
+            let db = self.db();
             let cf_meta = db
                 .cf_handle(CF_META)
                 .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
@@ -651,8 +493,7 @@ mod tests {
 
         /// Seed detached-root authority for state-machine and snapshot tests.
         pub(crate) fn put_detached_root(&self, inode_id: InodeId, detached_root: DetachedRoot) -> MetadataResult<()> {
-            let generation = self.pin_generation()?;
-            let db = generation.db();
+            let db = self.db();
             let cf = Self::cf(db, CF_DETACHED_ROOTS)?;
             db.put_cf(
                 cf,
@@ -669,8 +510,7 @@ mod tests {
             count: usize,
             detached_root: DetachedRoot,
         ) -> MetadataResult<()> {
-            let generation = self.pin_generation()?;
-            let db = generation.db();
+            let db = self.db();
             let cf_inodes = Self::cf(db, CF_INODES)?;
             let cf_detached_roots = Self::cf(db, CF_DETACHED_ROOTS)?;
             let encoded_marker = Self::encode_detached_root(&detached_root)?;
@@ -691,25 +531,8 @@ mod tests {
                 .map_err(|error| MetadataError::Internal(format!("RocksDB error: {error}")))
         }
 
-        /// Put mount epoch.
-        pub fn put_mount_epoch(&self, epoch: u64) -> MetadataResult<()> {
-            let generation = self.pin_generation()?;
-            let db = generation.db();
-            let cf = db
-                .cf_handle(CF_META)
-                .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
-            let value = encode_to_vec(epoch, standard())
-                .map_err(|e| MetadataError::Internal(format!("Failed to serialize mount_epoch: {}", e)))?;
-
-            db.put_cf(cf, b"mount_epoch", value)
-                .map_err(|e| MetadataError::Internal(format!("RocksDB error: {}", e)))?;
-            Ok(())
-        }
-
-        /// Put inode.
         pub fn put_inode(&self, inode: &Inode) -> MetadataResult<()> {
-            let generation = self.pin_generation()?;
-            let db = generation.db();
+            let db = self.db();
             let cf = db
                 .cf_handle(CF_INODES)
                 .ok_or_else(|| MetadataError::Internal("Inodes CF not found".to_string()))?;
@@ -722,29 +545,9 @@ mod tests {
             Ok(())
         }
 
-        /// Seed a semantically corrupt key/value identity pair for state-machine tests.
-        pub(crate) fn put_inode_at_storage_key(
-            &self,
-            storage_key_inode_id: InodeId,
-            inode: &Inode,
-        ) -> MetadataResult<()> {
-            let generation = self.pin_generation()?;
-            let db = generation.db();
-            let cf = db
-                .cf_handle(CF_INODES)
-                .ok_or_else(|| MetadataError::Internal("Inodes CF not found".to_string()))?;
-            let key = Self::encode_inode_key(storage_key_inode_id);
-            let value = serde_json::to_vec(inode)
-                .map_err(|error| MetadataError::Internal(format!("Failed to serialize Inode: {error}")))?;
-
-            db.put_cf(cf, key, value)
-                .map_err(|error| MetadataError::Internal(format!("RocksDB error: {error}")))
-        }
-
         /// Put dentry.
         pub fn put_dentry(&self, parent_inode_id: InodeId, name: &str, child_inode_id: InodeId) -> MetadataResult<()> {
-            let generation = self.pin_generation()?;
-            let db = generation.db();
+            let db = self.db();
             let cf = db
                 .cf_handle(CF_DENTRIES)
                 .ok_or_else(|| MetadataError::Internal("Dentries CF not found".to_string()))?;
@@ -765,24 +568,18 @@ mod tests {
                 call_id: CallId::from_uuid(Uuid::from_u128(operation)),
             },
             request_deadline_ms: expires_at_ms,
-            normalized_path: format!("/{name}"),
             parent_inode_id: InodeId::new(10),
-            name: name.clone(),
             inode_id: InodeId::new(inode_id),
             mount_id: MountId::new(1),
-            expected_mount_epoch: 1,
             mount_root_inode_id: InodeId::new(10),
             relative_components: vec![name],
-            lease_epoch: LeaseEpoch::new(1),
             block_size: 4096,
-            generation: ContentGeneration::new(0),
             expires_at_ms,
         }
     }
 
     fn seed_full_replay_table(storage: &RocksDBStorage, record: &CreateFileReplayRecord) {
-        let generation = storage.pin_generation().unwrap();
-        let db = generation.db();
+        let db = storage.db();
         let cf_meta = RocksDBStorage::cf(db, CF_META).unwrap();
         let mut batch = WriteBatch::default();
         batch.put_cf(
@@ -809,8 +606,7 @@ mod tests {
     }
 
     fn replay_count(storage: &RocksDBStorage) -> u64 {
-        let generation = storage.pin_generation().unwrap();
-        let db = generation.db();
+        let db = storage.db();
         let cf_meta = RocksDBStorage::cf(db, CF_META).unwrap();
         let value = db
             .get_cf(cf_meta, CREATE_FILE_REPLAY_COUNT_KEY)
@@ -835,7 +631,7 @@ mod tests {
             .create_file_atomic(
                 allocation,
                 parent_inode_id,
-                &rejected.name,
+                rejected.relative_components.last().unwrap(),
                 &Inode::new_file(allocation.inode_id, InodeAttrs::new(), MountId::new(1), 4096),
                 &parent,
                 &rejected,
@@ -850,7 +646,12 @@ mod tests {
             Some(retained)
         );
         assert!(storage.get_create_file_replay(rejected.operation_id).unwrap().is_none());
-        assert_eq!(storage.get_dentry(parent_inode_id, &rejected.name).unwrap(), None);
+        assert_eq!(
+            storage
+                .get_dentry(parent_inode_id, rejected.relative_components.last().unwrap())
+                .unwrap(),
+            None
+        );
         assert_eq!(storage.get_next_inode_id().unwrap(), Some(InodeId::new(11)));
 
         let expired_dir = TempDir::new().unwrap();
@@ -866,7 +667,7 @@ mod tests {
             .create_file_atomic(
                 allocation,
                 parent_inode_id,
-                &replacement.name,
+                replacement.relative_components.last().unwrap(),
                 &Inode::new_file(allocation.inode_id, InodeAttrs::new(), MountId::new(1), 4096),
                 &parent,
                 &replacement,
@@ -892,51 +693,21 @@ mod tests {
             Some(replacement.clone())
         );
         assert_eq!(
-            storage.get_dentry(parent_inode_id, &replacement.name).unwrap(),
+            storage
+                .get_dentry(parent_inode_id, replacement.relative_components.last().unwrap())
+                .unwrap(),
             Some(replacement.inode_id)
         );
         assert_eq!(
-            storage.get_block_size_optional(replacement.inode_id).unwrap(),
-            Some(replacement.block_size)
+            storage
+                .get_inode(replacement.inode_id)
+                .unwrap()
+                .unwrap()
+                .file()
+                .unwrap()
+                .block_size,
+            replacement.block_size
         );
         assert_eq!(storage.get_next_inode_id().unwrap(), Some(InodeId::new(12)));
-    }
-
-    #[test]
-    fn create_file_atomic_rejects_a_target_installed_after_allocation_preparation() {
-        let temp_dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
-        let parent_inode_id = InodeId::new(10);
-        let parent = Inode::new_dir(parent_inode_id, InodeAttrs::new(), MountId::new(1));
-        storage.put_inode(&parent).unwrap();
-        storage.set_next_inode_id(InodeId::new(11)).unwrap();
-        let allocation = storage.prepare_inode_allocation().unwrap();
-        let existing = Inode::new_file(allocation.inode_id, InodeAttrs::new(), MountId::new(1), 4096);
-        storage.put_inode(&existing).unwrap();
-        let applied_before = storage.load_raft_state().unwrap();
-        let rejected_applied_state = AppMetadataRaftState {
-            last_applied_log_id: Some(LogId::new(LeaderId::new(9, 1), 901)),
-            ..AppMetadataRaftState::default()
-        };
-        let replay_record = replay_record(1, allocation.inode_id.as_raw(), 100);
-
-        let error = storage
-            .create_file_atomic(
-                allocation,
-                parent_inode_id,
-                &replay_record.name,
-                &Inode::new_file(allocation.inode_id, InodeAttrs::new(), MountId::new(1), 4096),
-                &parent,
-                &replay_record,
-                1,
-                &rejected_applied_state,
-            )
-            .unwrap_err();
-
-        assert!(error.to_string().contains("already exists"));
-        assert_eq!(storage.load_raft_state().unwrap(), applied_before);
-        assert_eq!(storage.get_inode(allocation.inode_id).unwrap(), Some(existing));
-        assert_eq!(storage.get_dentry(parent_inode_id, &replay_record.name).unwrap(), None);
-        assert_eq!(storage.get_next_inode_id().unwrap(), Some(allocation.inode_id));
     }
 }

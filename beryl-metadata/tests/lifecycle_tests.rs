@@ -2,14 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
 use beryl_metadata::config::MetadataConfig;
-use beryl_metadata::lifecycle::{
-    format_metadata_storage, metadata_marker_path, prepare_metadata_start, FormatState, MetadataStorageMarker,
-};
+use beryl_metadata::lifecycle::{format_metadata_storage, metadata_marker_path, FormatState, MetadataStorageMarker};
 use tempfile::TempDir;
 
-fn write_config(dir: &TempDir, group_name: &str, raft_mode: &str) -> std::path::PathBuf {
+fn write_config(dir: &TempDir) -> std::path::PathBuf {
     let storage_dir = dir.path().join("metadata");
-    let config_path = dir.path().join(format!("{group_name}-{raft_mode}-metadata.yaml"));
+    let config_path = dir.path().join("metadata.yaml");
     std::fs::write(
         &config_path,
         format!(
@@ -21,7 +19,6 @@ beryl.metadata.bind-host: "127.0.0.1"
 beryl.metadata.rpc.port: 18080
 beryl.metadata.http.port: 18081
 beryl.metadata.startup.timeout: 2s
-beryl.metadata.startup.warn-after: 10ms
 beryl.logging.format: compact
 beryl.logging.output: stderr
 beryl.logging.level: "info,beryl_metadata=info,beryl_worker=info,beryl_common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"
@@ -40,19 +37,17 @@ fn marker_for(config: &MetadataConfig, state: FormatState) -> MetadataStorageMar
         group_name: config.authority.group_name.clone(),
         node_id: config.raft.node_id,
         storage_uuid: "test-storage".to_string(),
-        format_version: 1,
+        format_version: 2,
         created_at_ms: 1,
         software_version: "test".to_string(),
-        bootstrap_client_id: "42".to_string(),
-        bootstrap_call_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
         bootstrap_proposed_at_ms: 1,
     }
 }
 
 #[tokio::test]
-async fn metadata_format_resumes_matching_formatting_marker_with_stable_bootstrap_identity() {
+async fn metadata_format_resumes_matching_formatting_marker_with_stable_storage_identity() {
     let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "root", "single");
+    let config_path = write_config(&dir);
     let config = MetadataConfig::load(&config_path).unwrap();
     std::fs::create_dir_all(&config.storage_dir).unwrap();
     let formatting = marker_for(&config, FormatState::Formatting);
@@ -66,15 +61,13 @@ async fn metadata_format_resumes_matching_formatting_marker_with_stable_bootstra
 
     assert_eq!(ready.state, FormatState::Ready);
     assert_eq!(ready.storage_uuid, formatting.storage_uuid);
-    assert_eq!(ready.bootstrap_client_id, formatting.bootstrap_client_id);
-    assert_eq!(ready.bootstrap_call_id, formatting.bootstrap_call_id);
     assert_eq!(ready.bootstrap_proposed_at_ms, formatting.bootstrap_proposed_at_ms);
 }
 
 #[tokio::test]
 async fn metadata_format_recovers_synced_unpublished_marker_temp() {
     let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "root", "single");
+    let config_path = write_config(&dir);
     let config = MetadataConfig::load(&config_path).unwrap();
     std::fs::create_dir_all(&config.storage_dir).unwrap();
     let formatting = marker_for(&config, FormatState::Formatting);
@@ -89,14 +82,13 @@ async fn metadata_format_recovers_synced_unpublished_marker_temp() {
 
     assert_eq!(ready.state, FormatState::Ready);
     assert_eq!(ready.storage_uuid, formatting.storage_uuid);
-    assert_eq!(ready.bootstrap_call_id, formatting.bootstrap_call_id);
     assert!(!marker_path.with_extension("json.tmp").exists());
 }
 
 #[tokio::test]
 async fn metadata_start_rejects_formatting_marker_without_mutating_storage() {
     let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "root", "single");
+    let config_path = write_config(&dir);
     let config = MetadataConfig::load(&config_path).unwrap();
     std::fs::create_dir_all(&config.storage_dir).unwrap();
     let formatting = marker_for(&config, FormatState::Formatting);
@@ -106,17 +98,23 @@ async fn metadata_start_rejects_formatting_marker_without_mutating_storage() {
     )
     .unwrap();
 
-    let error = prepare_metadata_start(&config).await.unwrap_err();
+    let error = beryl_metadata::runtime::MetadataServer::build(
+        std::sync::Arc::new(config.clone()),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .err()
+    .expect("startup must fail");
 
     assert!(error.to_string().contains("format is incomplete"));
-    assert!(!config.storage_dir.join("CURRENT").exists());
+    assert!(!config.storage_dir.join("db").exists());
 }
 
 #[tokio::test]
 async fn metadata_start_rejects_non_current_marker_versions_without_rewriting_them() {
-    for unsupported_version in [0, 2, u32::MAX] {
+    for unsupported_version in [0, 1, 3, u32::MAX] {
         let dir = TempDir::new().unwrap();
-        let config_path = write_config(&dir, "root", "single");
+        let config_path = write_config(&dir);
         let config = MetadataConfig::load(&config_path).unwrap();
         format_metadata_storage(&config).await.unwrap();
         let marker_path = metadata_marker_path(&config);
@@ -125,16 +123,20 @@ async fn metadata_start_rejects_non_current_marker_versions_without_rewriting_th
         let unsupported_marker = serde_json::to_vec_pretty(&marker).unwrap();
         std::fs::write(&marker_path, &unsupported_marker).unwrap();
 
-        let err = prepare_metadata_start(&config)
-            .await
-            .expect_err("a non-current metadata marker must fail fast");
+        let err = beryl_metadata::runtime::MetadataServer::build(
+            std::sync::Arc::new(config.clone()),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .err()
+        .expect("a non-current metadata marker must fail fast");
         let message = err.to_string();
 
         assert!(
             message.contains(&format!("format_version={unsupported_version}")),
             "{message}"
         );
-        assert!(message.contains("expected 1"), "{message}");
+        assert!(message.contains("expected 2"), "{message}");
         assert!(message.contains("reformat metadata storage"), "{message}");
         assert_eq!(std::fs::read(&marker_path).unwrap(), unsupported_marker);
     }

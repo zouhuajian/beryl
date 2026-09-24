@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
 use beryl_worker::config::WorkerConfig;
-use beryl_worker::control::{prepare_worker_start, worker_storage_info_path, MetadataRegistrar};
+use beryl_worker::control::{prepare_worker_start, worker_storage_info_path};
 use tempfile::TempDir;
 
 fn worker_storage_info_temp_path_for_test(config: &WorkerConfig) -> std::path::PathBuf {
@@ -11,14 +11,7 @@ fn worker_storage_info_temp_path_for_test(config: &WorkerConfig) -> std::path::P
     info_path.with_file_name(format!("{file_name}.tmp"))
 }
 
-fn prepare_start_descriptor(config: &WorkerConfig) -> Result<(), String> {
-    let worker_id = prepare_worker_start(config).map_err(|err| err.to_string())?;
-    MetadataRegistrar::descriptor_from_config(config, worker_id)
-        .map(|_| ())
-        .map_err(|err| err.to_string())
-}
-
-fn write_config(dir: &TempDir, cluster_id: &str, _group_name: &str) -> std::path::PathBuf {
+fn write_config(dir: &TempDir, cluster_id: &str) -> std::path::PathBuf {
     let worker_dir = dir.path().join("worker");
     let store_dir = worker_dir.join("hdd0");
     let identity_path = worker_dir.join("worker.identity");
@@ -56,7 +49,7 @@ beryl.logging.level: "info,beryl_metadata=info,beryl_worker=info,beryl_common=in
 #[test]
 fn worker_start_refuses_worker_id_mismatch_without_rewriting_storage() {
     let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "cluster-a", "root");
+    let config_path = write_config(&dir, "cluster-a");
     let config = WorkerConfig::load(&config_path).unwrap();
     prepare_worker_start(&config).unwrap();
     let mut info: serde_json::Value =
@@ -67,7 +60,7 @@ fn worker_start_refuses_worker_id_mismatch_without_rewriting_storage() {
     std::fs::write(worker_storage_info_path(&config), &info_payload).unwrap();
     let identity_before = std::fs::read(&config.identity_path).unwrap();
 
-    let err = prepare_start_descriptor(&config).unwrap_err();
+    let err = prepare_worker_start(&config).unwrap_err().to_string();
 
     assert!(err.contains("worker storage info mismatch"));
     assert!(err.contains("worker_id"));
@@ -78,7 +71,7 @@ fn worker_start_refuses_worker_id_mismatch_without_rewriting_storage() {
 #[test]
 fn worker_start_refuses_partial_storage_info_temp_without_final_marker() {
     let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "cluster-a", "root");
+    let config_path = write_config(&dir, "cluster-a");
     let config = WorkerConfig::load(&config_path).unwrap();
     let info_path = worker_storage_info_path(&config);
     let temp_path = worker_storage_info_temp_path_for_test(&config);
@@ -97,9 +90,9 @@ fn worker_start_refuses_partial_storage_info_temp_without_final_marker() {
 
 #[test]
 fn worker_start_rejects_non_current_storage_versions_without_rewriting_them() {
-    for unsupported_version in [0, 1, 3, u32::MAX] {
+    for unsupported_version in [2, 4] {
         let dir = TempDir::new().unwrap();
-        let config_path = write_config(&dir, "cluster-a", "root");
+        let config_path = write_config(&dir, "cluster-a");
         let config = WorkerConfig::load(&config_path).unwrap();
         let worker_id = prepare_worker_start(&config).unwrap();
         let info_path = worker_storage_info_path(&config);
@@ -107,7 +100,6 @@ fn worker_start_rejects_non_current_storage_versions_without_rewriting_them() {
             r#"{{
   "cluster_id": "cluster-a",
   "worker_id": {},
-  "storage_uuid": "storage-a",
   "format_version": {},
   "created_at_ms": 1,
   "software_version": "test"
@@ -124,7 +116,7 @@ fn worker_start_rejects_non_current_storage_versions_without_rewriting_them() {
             message.contains(&format!("format_version={unsupported_version}")),
             "{message}"
         );
-        assert!(message.contains("expected 2"), "{message}");
+        assert!(message.contains("expected 3"), "{message}");
         assert_eq!(std::fs::read(&info_path).unwrap(), unsupported_info.as_bytes());
     }
 }
@@ -132,7 +124,7 @@ fn worker_start_rejects_non_current_storage_versions_without_rewriting_them() {
 #[test]
 fn worker_start_refuses_non_empty_unknown_store_dirs_without_creating_identity() {
     let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "cluster-a", "root");
+    let config_path = write_config(&dir, "cluster-a");
     let config = WorkerConfig::load(&config_path).unwrap();
     let store_dir = &config.store.dirs["hdd0"].path;
     std::fs::create_dir_all(store_dir).unwrap();
