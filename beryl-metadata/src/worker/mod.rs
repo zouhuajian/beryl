@@ -11,9 +11,6 @@
 mod manager;
 mod service;
 
-pub use manager::{
-    BlockReportBlock, BlockReportBlockState, HealthStatus, ReplicaKey, WorkerDescriptor, WorkerInfo, WorkerLiveState,
-    WorkerManager,
-};
+pub use manager::{BlockReportBlock, BlockReportBlockState, ReplicaKey, WorkerDescriptor, WorkerManager};
 pub(crate) use manager::{PublishReadyConflict, PublishReadyStatus, PublishReadyTarget, ReadyReplicaCursor};
 pub use service::MetadataWorkerServiceImpl;

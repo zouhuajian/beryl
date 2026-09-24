@@ -26,7 +26,6 @@ pub(crate) const METADATA_RAFT_LOG_DURABLE_WRITE_DURATION_SECONDS: &str =
 pub(crate) const METADATA_RAFT_SNAPSHOT_BYTES_TOTAL: &str = "metadata_raft_snapshot_bytes_total";
 pub(crate) const METADATA_RAFT_SNAPSHOT_DURATION_SECONDS: &str = "metadata_raft_snapshot_duration_seconds";
 pub(crate) const METADATA_RAFT_STORAGE_CLEANUP_TOTAL: &str = "metadata_raft_storage_cleanup_total";
-pub(crate) const METADATA_RAFT_ACTIVE_GENERATION: &str = "metadata_raft_active_generation";
 pub(crate) const METADATA_RAFT_AUTHORITY_COMMIT_DURATION_SECONDS: &str =
     "metadata_raft_authority_commit_duration_seconds";
 pub(crate) const METADATA_RPC_REQUESTS_TOTAL: &str = "metadata_rpc_requests_total";
@@ -193,10 +192,6 @@ pub(crate) fn record_raft_snapshot(
 
 pub(crate) fn record_raft_storage_cleanup(kind: &'static str, count: usize) {
     metrics::counter!(METADATA_RAFT_STORAGE_CLEANUP_TOTAL, "kind" => kind).increment(count as u64);
-}
-
-pub(crate) fn record_raft_active_generation(generation: u64) {
-    metrics::gauge!(METADATA_RAFT_ACTIVE_GENERATION).set(generation as f64);
 }
 
 pub(crate) fn record_raft_authority_commit(status: &'static str, duration_seconds: f64) {
@@ -373,9 +368,6 @@ pub(crate) fn metadata_error_kind(error: &MetadataError) -> &'static str {
         MetadataError::GlobalWriteTargetLimitExceeded(_) => "global_write_target_limit_exceeded",
         MetadataError::LeaseFenced { .. } => "lease_fenced",
         MetadataError::LeaderChanged(_) => "not_leader",
-        MetadataError::EpochMismatch { .. } => "epoch_mismatch",
-        MetadataError::MountEpochMismatch { .. } => "mount_epoch_mismatch",
-        MetadataError::RoutingStale(_) => "route_epoch_mismatch",
         MetadataError::StaleState(_) => "stale_state",
         MetadataError::FullReportRequired(_) => "full_report_required",
         MetadataError::Internal(_) => "internal",
@@ -389,10 +381,6 @@ pub(crate) fn rpc_error_kind(error: &RpcErrorDetail) -> &'static str {
 
 fn error_kind_label(kind: ErrorKind) -> &'static str {
     match kind {
-        ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader) => "invalid_header",
-        ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument) => "invalid_argument",
-        ErrorKind::Protocol(ProtocolErrorKind::PermissionDenied) => "permission_denied",
-        ErrorKind::Protocol(ProtocolErrorKind::Unsupported) => "unsupported",
         ErrorKind::Metadata(MetadataErrorKind::NotFound) => "not_found",
         ErrorKind::Metadata(MetadataErrorKind::AlreadyExists) => "already_exists",
         ErrorKind::Metadata(MetadataErrorKind::NotDirectory) => "not_directory",
@@ -403,24 +391,12 @@ fn error_kind_label(kind: ErrorKind) -> &'static str {
         ErrorKind::Metadata(MetadataErrorKind::Conflict) => "conflict",
         ErrorKind::Metadata(MetadataErrorKind::NotLeader) => "not_leader",
         ErrorKind::Metadata(MetadataErrorKind::StaleState) => "stale_state",
-        ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch) => "mount_epoch_mismatch",
-        ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch) => "route_epoch_mismatch",
         ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch) => "owner_group_mismatch",
         ErrorKind::Metadata(MetadataErrorKind::GroupMismatch) => "group_mismatch",
-        ErrorKind::Worker(WorkerErrorKind::NotRegistered) => "worker_not_registered",
-        ErrorKind::Worker(WorkerErrorKind::RunMismatch) => "worker_run_mismatch",
-        ErrorKind::Worker(WorkerErrorKind::DescriptorMismatch) => "worker_descriptor_mismatch",
-        ErrorKind::Worker(WorkerErrorKind::FullReportRequired) => "full_report_required",
-        ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable) => "block_location_unavailable",
         ErrorKind::Metadata(MetadataErrorKind::Fencing) => "fencing",
         ErrorKind::Metadata(MetadataErrorKind::SessionInvalid) => "session_invalid",
         ErrorKind::Metadata(MetadataErrorKind::SessionExpired) => "session_expired",
-        ErrorKind::Metadata(MetadataErrorKind::EpochMismatch) => "epoch_mismatch",
         ErrorKind::Internal(InternalErrorKind::NodeUnavailable) => "node_unavailable",
-        ErrorKind::Internal(InternalErrorKind::Timeout) => "timeout",
-        ErrorKind::Internal(InternalErrorKind::ResourceExhausted) => "resource_exhausted",
-        ErrorKind::Internal(InternalErrorKind::Cancelled) => "cancelled",
-        ErrorKind::Internal(InternalErrorKind::Corrupt) => "corrupt",
         ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted) => "resource_exhausted",
         ErrorKind::Worker(kind) => worker_error_kind(kind),
         ErrorKind::Protocol(kind) => protocol_error_kind(kind),
@@ -438,7 +414,6 @@ fn worker_error_kind(kind: WorkerErrorKind) -> &'static str {
         WorkerErrorKind::NodeUnavailable => "worker_node_unavailable",
         WorkerErrorKind::Timeout => "worker_timeout",
         WorkerErrorKind::ResourceExhausted => "worker_resource_exhausted",
-        WorkerErrorKind::Conflict => "worker_conflict",
         WorkerErrorKind::Corrupt => "worker_corrupt",
         WorkerErrorKind::Fencing => "worker_fencing",
         WorkerErrorKind::Cancelled => "worker_cancelled",
@@ -453,7 +428,5 @@ fn protocol_error_kind(kind: ProtocolErrorKind) -> &'static str {
         ProtocolErrorKind::InvalidArgument => "invalid_argument",
         ProtocolErrorKind::PermissionDenied => "permission_denied",
         ProtocolErrorKind::Unsupported => "unsupported",
-        ProtocolErrorKind::Cancelled => "cancelled",
-        ProtocolErrorKind::Corrupt => "corrupt",
     }
 }

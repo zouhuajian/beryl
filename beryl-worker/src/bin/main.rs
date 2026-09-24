@@ -17,8 +17,8 @@ use beryl_common::termination::{TerminationMonitor, TerminationSignal};
 use beryl_worker::{
     config::WorkerConfig,
     control::{
-        prepare_worker_start, BlockCleanupOptions, BlockCleanupRuntime, BlockReportOptions, MetadataBlockReportLoop,
-        MetadataHeartbeatLoop, MetadataRegistrar, RegistrationSet,
+        prepare_worker_start, BlockCleanupRuntime, MetadataBlockReportLoop, MetadataHeartbeatLoop, MetadataRegistrar,
+        RegistrationState,
     },
     net, observe,
     store::dirs::StoreDirs,
@@ -133,7 +133,7 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
 
     info!(
         event = "worker_data_service_starting",
-        rpc_bind = %config.rpc_bind,
+        rpc_bind = %config.rpc_bind_addr(),
         rpc_address = %config.rpc_address(),
         http_bind = %config.http_addr(),
         default_frame_size = config.default_frame_size,
@@ -141,22 +141,12 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
         store_dirs = config.store.dirs.len(),
         store_reserve_space_bytes = config.store.reserve_space_bytes,
         store_check_interval_ms = config.store.check_interval_ms,
-        net_listeners = config.net.listeners.len(),
+        max_concurrent_reads = config.net.max_concurrent_reads,
+        max_concurrent_writes = config.net.max_concurrent_writes,
         "starting worker data service"
     );
-    for listener in &config.net.listeners {
-        info!(
-            event = "worker_net_listener_configured",
-            protocol = %listener.protocol,
-            bind = %listener.bind,
-            max_concurrent_reads = listener.max_concurrent_reads,
-            max_concurrent_writes = listener.max_concurrent_writes,
-            max_frame_size = listener.max_frame_size,
-            "Configured worker net listener"
-        );
-    }
 
-    let registration_state = Arc::new(RegistrationSet::new());
+    let registration_state = Arc::new(RegistrationState::new());
     let readiness_state = Arc::clone(&registration_state);
     let readiness_group = config.metadata.group_name.clone();
     let http = spawn_service_http(
@@ -172,14 +162,7 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
         signal_result?;
         return Ok(());
     }
-    let descriptor = match MetadataRegistrar::descriptor_from_config(&config, worker_id) {
-        Ok(descriptor) => descriptor,
-        Err(error) => {
-            registration_state.begin_shutdown();
-            shutdown_worker_start(http, None, config.shutdown_timeout_ms).await?;
-            return Err(error).context("Failed to build worker registration descriptor");
-        }
-    };
+    let descriptor = MetadataRegistrar::descriptor_from_config(&config, worker_id);
     let heartbeat_descriptor = descriptor.clone();
     let registrar = match MetadataRegistrar::new(config.metadata.clone(), descriptor, Arc::clone(&registration_state)) {
         Ok(registrar) => Arc::new(registrar),
@@ -191,6 +174,7 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
     };
 
     let block_store = match StoreDirs::open(
+        config.metadata.group_name.clone(),
         config.store.dirs.clone(),
         config.store.reserve_space_bytes,
         config.store.check_interval_ms,
@@ -210,6 +194,7 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
         return Ok(());
     }
     let core = Arc::new(WorkerCore::with_local_store(
+        config.metadata.group_name.clone(),
         config.default_frame_size,
         config.max_frame_size,
         block_store.clone(),
@@ -217,12 +202,7 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
     let cleanup = match BlockCleanupRuntime::start(
         Arc::clone(&core),
         Arc::clone(&registration_state),
-        BlockCleanupOptions {
-            max_pending: config.block_cleanup.queue_capacity,
-            max_concurrent: config.block_cleanup.concurrency,
-            retry_initial_backoff: Duration::from_millis(config.block_cleanup.retry_initial_backoff_ms),
-            retry_max_backoff: Duration::from_millis(config.block_cleanup.retry_max_backoff_ms),
-        },
+        config.block_cleanup.clone(),
     ) {
         Ok(cleanup) => cleanup,
         Err(error) => {
@@ -231,7 +211,7 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
             return Err(error).context("Failed to create worker block cleanup executor");
         }
     };
-    let heartbeat = match MetadataHeartbeatLoop::with_interval(
+    let heartbeat = match MetadataHeartbeatLoop::new(
         config.metadata.clone(),
         heartbeat_descriptor,
         Arc::clone(&registration_state),
@@ -245,15 +225,12 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
             return Err(error).context("Failed to create worker metadata heartbeat loop");
         }
     };
-    let block_report = match MetadataBlockReportLoop::with_options_and_delta_flush_interval(
+    let block_report = match MetadataBlockReportLoop::new(
         config.metadata.clone(),
         Arc::clone(&registration_state),
         Arc::clone(&block_store),
         Arc::clone(&core),
-        BlockReportOptions {
-            full_max_blocks_per_batch: config.block_report_batch_size,
-            delta_max_entries_per_batch: config.block_report_batch_size,
-        },
+        config.block_report_batch_size,
         Duration::from_millis(config.block_report_delta_flush_interval_ms),
     ) {
         Ok(block_report) => block_report,
@@ -295,7 +272,8 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
         "Worker metadata registration completed"
     );
 
-    let mut rpc = match net::server::spawn_worker_data_with_registration(
+    let mut rpc = match net::spawn_worker_data_with_registration(
+        config.rpc_bind_addr(),
         &config.net,
         Arc::clone(&core),
         Arc::clone(&registration_state),
@@ -356,17 +334,17 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
         http_result,
     ) = tokio::join!(
         rpc_and_writes,
-        stop_task_until(Some(heartbeat_handle), deadline),
-        stop_task_until(Some(block_report_handle), deadline),
-        stop_task_until(Some(write_cleanup_handle), deadline),
+        stop_task_until(heartbeat_handle, deadline),
+        stop_task_until(block_report_handle, deadline),
+        stop_task_until(write_cleanup_handle, deadline),
         cleanup.shutdown_until(deadline),
         http.shutdown_until(deadline),
     );
 
     let rpc_forced = rpc_result.as_ref().copied().unwrap_or(false);
-    let heartbeat_forced = heartbeat_result.as_ref().is_ok_and(|result| result.1);
-    let block_report_forced = block_report_result.as_ref().is_ok_and(|result| result.1);
-    let write_cleanup_forced = write_cleanup_result.as_ref().is_ok_and(|result| result.1);
+    let heartbeat_forced = heartbeat_result.as_ref().copied().unwrap_or(false);
+    let block_report_forced = block_report_result.as_ref().copied().unwrap_or(false);
+    let write_cleanup_forced = write_cleanup_result.as_ref().copied().unwrap_or(false);
     let cleanup_forced = cleanup_result.as_ref().copied().unwrap_or(false);
     let http_forced = http_result.as_ref().copied().unwrap_or(false);
     if rpc_forced
@@ -437,17 +415,14 @@ async fn shutdown_worker_start(
 }
 
 /// Gracefully drains an owned task, then explicitly aborts and awaits it.
-async fn stop_task_until<T>(task: Option<JoinHandle<T>>, deadline: Instant) -> Result<(Option<T>, bool), JoinError> {
-    let Some(mut task) = task else {
-        return Ok((None, false));
-    };
+async fn stop_task_until(mut task: JoinHandle<()>, deadline: Instant) -> Result<bool, JoinError> {
     match tokio::time::timeout_at(deadline, &mut task).await {
-        Ok(result) => result.map(|output| (Some(output), false)),
+        Ok(result) => result.map(|()| false),
         Err(_) => {
             task.abort();
             match task.await {
-                Ok(output) => Ok((Some(output), true)),
-                Err(error) if error.is_cancelled() => Ok((None, true)),
+                Ok(()) => Ok(true),
+                Err(error) if error.is_cancelled() => Ok(true),
                 Err(error) => Err(error),
             }
         }

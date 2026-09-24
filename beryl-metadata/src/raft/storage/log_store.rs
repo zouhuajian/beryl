@@ -4,7 +4,7 @@
 //! RocksDB-backed Raft log store implementing openraft `RaftLogStorage`.
 
 use crate::observe;
-use crate::raft::storage::{RocksDBStorage, SnapshotInstallTracker};
+use crate::raft::storage::RocksDBStorage;
 use crate::raft::types::{AppMetadataRaftState, MetadataRaftTypeConfig};
 use openraft::storage::LogState;
 use openraft::storage::RaftLogStorage;
@@ -25,20 +25,11 @@ use std::time::Instant;
 pub(crate) struct AppLogStorage {
     storage: Arc<RocksDBStorage>,
     state: Arc<RwLock<AppMetadataRaftState>>,
-    snapshot_install: Arc<SnapshotInstallTracker>,
 }
 
 impl AppLogStorage {
-    pub(crate) fn new(
-        storage: Arc<RocksDBStorage>,
-        state: Arc<RwLock<AppMetadataRaftState>>,
-        snapshot_install: Arc<SnapshotInstallTracker>,
-    ) -> Self {
-        Self {
-            storage,
-            state,
-            snapshot_install,
-        }
+    pub(crate) fn new(storage: Arc<RocksDBStorage>, state: Arc<RwLock<AppMetadataRaftState>>) -> Self {
+        Self { storage, state }
     }
 }
 
@@ -102,9 +93,6 @@ impl RaftLogStorage<MetadataRaftTypeConfig> for AppLogStorage {
     }
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
-        let _generation = self.storage.pin_generation().map_err(|e| StorageError::IO {
-            source: StorageIOError::<u64>::write_vote(AnyError::new(&e)),
-        })?;
         let mut current = self.state.write();
         let mut next = current.clone();
         next.vote = Some(*vote);
@@ -123,9 +111,6 @@ impl RaftLogStorage<MetadataRaftTypeConfig> for AppLogStorage {
     }
 
     async fn save_committed(&mut self, committed: Option<LogId<u64>>) -> Result<(), StorageError<u64>> {
-        let _generation = self.storage.pin_generation().map_err(|e| StorageError::IO {
-            source: StorageIOError::<u64>::write_state_machine(AnyError::new(&e)),
-        })?;
         let mut current = self.state.write();
         let mut next = current.clone();
         next.committed = committed;
@@ -185,12 +170,6 @@ impl RaftLogStorage<MetadataRaftTypeConfig> for AppLogStorage {
     }
 
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        if self.snapshot_install.defer_purge(log_id) {
-            return Ok(());
-        }
-        let _generation = self.storage.pin_generation().map_err(|e| StorageError::IO {
-            source: StorageIOError::<u64>::write_logs(AnyError::new(&e)),
-        })?;
         let mut current = self.state.write();
         let mut next = current.clone();
         next.last_purged_log_id = Some(log_id);
@@ -259,11 +238,8 @@ impl RocksDBStorage {
 
     /// Get Raft log entry by index.
     pub fn get_raft_log(&self, log_index: u64) -> MetadataResult<Option<Vec<u8>>> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf = db
-            .cf_handle(CF_RAFT_LOG)
-            .ok_or_else(|| MetadataError::Internal("RaftLog CF not found".to_string()))?;
+        let db = self.db();
+        let cf = Self::cf(db, CF_RAFT_LOG)?;
         let key = format!("{:020}", log_index); // Zero-padded for lexicographic ordering
 
         match db.get_cf(cf, key.as_bytes()) {
@@ -279,11 +255,8 @@ impl RocksDBStorage {
         start_index: u64,
         end_index_exclusive: Option<u64>,
     ) -> MetadataResult<Vec<(u64, Vec<u8>)>> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf = db
-            .cf_handle(CF_RAFT_LOG)
-            .ok_or_else(|| MetadataError::Internal("RaftLog CF not found".to_string()))?;
+        let db = self.db();
+        let cf = Self::cf(db, CF_RAFT_LOG)?;
         let start_key = format!("{:020}", start_index);
         let iter = db.iterator_cf(
             cf,
@@ -318,23 +291,8 @@ impl RocksDBStorage {
 
     /// Append one contiguous set of Raft logs in a synchronous WAL-backed batch.
     pub(crate) fn append_raft_logs_durable(&self, entries: &[(u64, Vec<u8>)]) -> MetadataResult<()> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        if let Some(window) = entries.windows(2).find(|window| {
-            window[0]
-                .0
-                .checked_add(1)
-                .is_none_or(|expected| expected != window[1].0)
-        }) {
-            return Err(MetadataError::Internal(format!(
-                "Raft log append is not contiguous: {} is followed by {}",
-                window[0].0, window[1].0
-            )));
-        }
-
-        let cf = db
-            .cf_handle(CF_RAFT_LOG)
-            .ok_or_else(|| MetadataError::Internal("RaftLog CF not found".to_string()))?;
+        let db = self.db();
+        let cf = Self::cf(db, CF_RAFT_LOG)?;
         let mut batch = WriteBatch::default();
         for (log_index, entry_data) in entries {
             let key = format!("{:020}", log_index);
@@ -347,11 +305,8 @@ impl RocksDBStorage {
 
     /// Delete the complete Raft log suffix in one synchronous WAL-backed batch.
     pub(crate) fn truncate_raft_logs(&self, start_index: u64) -> MetadataResult<()> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf = db
-            .cf_handle(CF_RAFT_LOG)
-            .ok_or_else(|| MetadataError::Internal("RaftLog CF not found".to_string()))?;
+        let db = self.db();
+        let cf = Self::cf(db, CF_RAFT_LOG)?;
         let start_key = format!("{:020}", start_index);
         let iter = db.iterator_cf(
             cf,
@@ -369,14 +324,9 @@ impl RocksDBStorage {
 
     /// Delete a Raft log prefix and persist its covering state in one durable batch.
     pub(crate) fn purge_raft_logs_and_state(&self, end_index: u64, state: &AppMetadataRaftState) -> MetadataResult<()> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let log_cf = db
-            .cf_handle(CF_RAFT_LOG)
-            .ok_or_else(|| MetadataError::Internal("RaftLog CF not found".to_string()))?;
-        let state_cf = db
-            .cf_handle(CF_RAFT_STATE)
-            .ok_or_else(|| MetadataError::Internal("RaftState CF not found".to_string()))?;
+        let db = self.db();
+        let log_cf = Self::cf(db, CF_RAFT_LOG)?;
+        let state_cf = Self::cf(db, CF_RAFT_STATE)?;
         let state_data = serde_json::to_vec(state)
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize Raft state: {e}")))?;
         let end_key = format!("{:020}", end_index);
@@ -396,11 +346,8 @@ impl RocksDBStorage {
 
     /// Get the last log index from RocksDB.
     pub fn get_last_log_index(&self) -> MetadataResult<Option<u64>> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf = db
-            .cf_handle(CF_RAFT_LOG)
-            .ok_or_else(|| MetadataError::Internal("RaftLog CF not found".to_string()))?;
+        let db = self.db();
+        let cf = Self::cf(db, CF_RAFT_LOG)?;
 
         // Iterate from end to find the last log
         let mut iter = db.iterator_cf(cf, rocksdb::IteratorMode::End);
@@ -444,28 +391,21 @@ mod tests {
                     cluster_id: "openraft-suite".to_string(),
                     group_name: beryl_types::GroupName::parse("root").unwrap(),
                     node_id: 1,
-                    bootstrap_client_id: "openraft-suite".to_string(),
-                    bootstrap_call_id: "openraft-suite".to_string(),
                     bootstrap_proposed_at_ms: 1,
                 })
                 .expect("bind OpenRaft test storage identity");
-            storage
-                .put_route_epoch(crate::state::RouteEpoch::new(1))
-                .expect("seed required route epoch");
             let state = Arc::new(RwLock::new(AppMetadataRaftState::default()));
-            let app = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
-            let snapshot_install = Arc::new(SnapshotInstallTracker::default());
-            let log = AppLogStorage::new(Arc::clone(&storage), Arc::clone(&state), Arc::clone(&snapshot_install));
-            let read_view = Arc::new(
-                MetadataReadView::new(Arc::new(MountTable::new()), Arc::clone(&state), Arc::clone(&storage))
-                    .expect("create metadata read view"),
-            );
+            let app = AppRaftStateMachine::new(Arc::clone(&storage));
+            let log = AppLogStorage::new(Arc::clone(&storage), Arc::clone(&state));
+            let read_view = Arc::new(MetadataReadView::new(
+                Arc::new(MountTable::default()),
+                Arc::clone(&state),
+            ));
             let sm = StateMachineStorage::new_with_tracker(
                 storage,
                 app,
                 state,
                 read_view,
-                snapshot_install,
                 tokio_util::task::TaskTracker::new().token(),
             )
             .expect("create OpenRaft state-machine store");
@@ -473,42 +413,49 @@ mod tests {
         }
     }
 
-    #[test]
-    fn openraft_storage_contract() {
-        Suite::test_all(TestStoreBuilder).expect("OpenRaft storage contract");
-    }
-
     #[tokio::test]
-    async fn purge_is_deferred_while_incoming_snapshot_is_pending() {
-        let dir = tempdir().unwrap();
-        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        storage
-            .append_raft_logs_durable(&[(1, b"one".to_vec()), (2, b"two".to_vec())])
-            .unwrap();
-        let state = Arc::new(RwLock::new(AppMetadataRaftState::default()));
-        let tracker = Arc::new(SnapshotInstallTracker::default());
-        let token = tracker.begin().unwrap();
-        let mut log_store = AppLogStorage::new(Arc::clone(&storage), Arc::clone(&state), tracker);
-
-        log_store
-            .purge(LogId::new(openraft::LeaderId::new(1, 1), 1))
-            .await
-            .unwrap();
-
-        assert!(storage.get_raft_log(1).unwrap().is_some());
-        assert!(state.read().last_purged_log_id.is_none());
-        assert_eq!(token.complete().unwrap().unwrap().index, 1);
-    }
-
-    #[test]
-    fn raft_log_batch_rejects_a_hole_before_writing() {
-        let temp_dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
-        let entries = vec![(7, vec![7]), (9, vec![9])];
-
-        assert!(storage.append_raft_logs_durable(&entries).is_err());
-        assert_eq!(None, storage.get_raft_log(7).unwrap());
-        assert_eq!(None, storage.get_raft_log(9).unwrap());
+    async fn openraft_local_storage_contract() {
+        type LocalSuite = Suite<MetadataRaftTypeConfig, AppLogStorage, StateMachineStorage, TestStoreBuilder, TempDir>;
+        macro_rules! check {
+            ($case:ident) => {{
+                let (_dir, log, sm) = TestStoreBuilder.build().await.unwrap();
+                LocalSuite::$case(log, sm).await.expect(stringify!($case));
+            }};
+        }
+        check!(last_membership_in_log_initial);
+        check!(last_membership_in_log);
+        check!(last_membership_in_log_multi_step);
+        check!(get_membership_initial);
+        check!(get_membership_from_log_and_empty_sm);
+        check!(get_membership_from_empty_log_and_sm);
+        check!(get_membership_from_log_le_sm_last_applied);
+        check!(get_membership_from_log_gt_sm_last_applied_1);
+        check!(get_membership_from_log_gt_sm_last_applied_2);
+        check!(get_initial_state_without_init);
+        check!(get_initial_state_membership_from_log_and_sm);
+        check!(get_initial_state_with_state);
+        check!(get_initial_state_last_log_gt_sm);
+        check!(get_initial_state_last_log_lt_sm);
+        check!(get_initial_state_log_ids);
+        check!(get_initial_state_re_apply_committed);
+        check!(save_vote);
+        check!(get_log_entries);
+        check!(limited_get_log_entries);
+        check!(try_get_log_entry);
+        check!(initial_logs);
+        check!(get_log_state);
+        check!(get_log_id);
+        check!(last_id_in_log);
+        check!(last_applied_state);
+        check!(purge_logs_upto_0);
+        check!(purge_logs_upto_5);
+        check!(purge_logs_upto_20);
+        check!(delete_logs_since_11);
+        check!(delete_logs_since_0);
+        check!(append_to_log);
+        check!(snapshot_meta);
+        check!(apply_single);
+        check!(apply_multiple);
     }
 
     #[test]

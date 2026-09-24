@@ -18,7 +18,7 @@
 //! - `MetadataFileSystemServiceImpl`: implements the external
 //!   `FileSystemService` path-based metadata/control-plane API.
 //! - `MetadataWorkerServiceImpl`: handles worker registration, heartbeat, block
-//!   reports, task acknowledgements, and current worker RPC surfaces.
+//!   reports and cleanup-command dispatch.
 //!
 //! Metadata does not perform data-plane IO. Clients read and write data
 //! directly through workers; this crate only maintains or returns metadata and
@@ -37,18 +37,16 @@
 //!
 //! - **RocksDB** stores authoritative metadata state and Raft-backed replicated
 //!   state.
-//! - **Raft** commits metadata mutations at authority boundaries.
-//! - **RaftStateStore** is the production route-epoch `StateStore`
-//!   implementation.
+//! - **Raft** commits metadata mutations at authority boundaries and supplies
+//!   leader-fenced route freshness reads.
 //!
 //! ## Freshness and Current Limitations
 //!
 //! `GroupStateWatermark` carries state-machine applied `RaftLogId` freshness.
-//! `route_epoch` and `mount_epoch` remain separate metadata freshness domains.
-//! These fields are active correctness checks for the current single-group
-//! runtime; they do not mean multi-group metadata is supported. Product
-//! boundaries are summarized in `docs/freshness-and-ownership.md` and the
-//! crate README.
+//! The root mount has a fixed identity and owner. Lease epochs, content
+//! generations, and Worker run IDs fence their respective mutable authority.
+//! Reads remain leader-gated, and publication rechecks authority after waiting
+//! for Worker Ready evidence.
 //!
 //! Raft adapters and raw authority storage are intentionally not part of the
 //! crate API:
@@ -57,47 +55,22 @@
 //! use beryl_metadata::raft::RocksDBStorage;
 //! ```
 //!
-//! Derived routing state cannot be mutated through the crate API:
-//!
-//! ```compile_fail
-//! use beryl_metadata::mount::{DataIoPolicy, MountKind};
-//! use beryl_metadata::MountTable;
-//! use beryl_types::ids::InodeId;
-//! use beryl_types::GroupName;
-//!
-//! let table = MountTable::new();
-//! table.create_mount(
-//!     "/bypass".to_string(),
-//!     MountKind::Internal,
-//!     None,
-//!     DataIoPolicy::Allow,
-//!     GroupName::parse("root").unwrap(),
-//!     InodeId::new(1),
-//! );
-//! ```
-
 pub mod config;
-pub(crate) mod data_io;
 pub(crate) mod error;
 pub(crate) mod inode;
 pub mod lifecycle;
-pub mod maintenance;
-pub(crate) mod metrics;
-pub mod mount;
+pub(crate) mod maintenance;
+pub(crate) mod mount;
 pub(crate) mod observe;
 pub(crate) mod path_resolver;
-pub mod placement;
+pub(crate) mod placement;
 pub(crate) mod raft;
-pub mod readiness;
+pub(crate) mod readiness;
 pub mod runtime;
-pub mod service;
+pub(crate) mod service;
 pub(crate) mod session_registry;
-pub mod state;
-pub mod worker;
+pub(crate) mod worker;
 
 pub use config::MetadataConfig;
 pub use error::{MetadataError, MetadataResult};
-pub use metrics::MetadataMetrics;
-pub use mount::MountTable;
-pub use readiness::{RootReadinessConfig, RootReadinessGate};
-pub use state::{RouteEpoch, StateStore};
+pub(crate) use mount::MountTable;

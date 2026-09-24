@@ -11,20 +11,41 @@ use beryl_types::GroupName;
 
 use crate::error::{ClientError, RefreshHint};
 
-/// Validates a Metadata response header before its body is consumed.
-pub(crate) fn validate_header(header: &ResponseHeader) -> Result<(), ClientError> {
-    let Some(rpc_error) = header.rpc_error.clone() else {
-        return Ok(());
+/// Maps an already decoded Metadata failure and its authority hints.
+pub(crate) fn metadata_error(
+    header: &ResponseHeader,
+    rpc_error: beryl_common::error::rpc::RpcErrorDetail,
+) -> ClientError {
+    let rpc_hint = recovery_hint(&rpc_error.recovery);
+    let group_name = match rpc_hint
+        .and_then(|hint| hint.group_name.as_deref())
+        .map(GroupName::parse)
+        .transpose()
+    {
+        Ok(group) => group,
+        Err(error) => {
+            return ClientError::malformed_response(format!(
+                "metadata error response invalid recovery group_name: {error}"
+            ))
+        }
     };
-    let hint = refresh_hint_from_rpc_error_and_header(recovery_hint(&rpc_error.recovery), header);
-    Err(ClientError::from_remote(rpc_error, hint))
+    if let (Some(header_group), Some(hinted_group)) = (&header.group_name, &group_name) {
+        if header_group != hinted_group {
+            return ClientError::malformed_response(format!(
+                "metadata error response group_name conflicts with recovery hint: header={header_group}, hint={hinted_group}"
+            ));
+        }
+    }
+    let hint = RefreshHint {
+        leader_endpoint: rpc_hint.and_then(|hint| hint.leader_endpoint.clone()),
+        group_name: group_name.or_else(|| header.group_name.clone()),
+    };
+    ClientError::from_remote(rpc_error, hint)
 }
 
-/// Validates an optional Worker data response header before its payload is consumed.
-pub(crate) fn validate_data_header(
-    header: Option<&beryl_proto::worker::DataResponseHeaderProto>,
-) -> Result<(), ClientError> {
-    let Some(error) = header.and_then(|header| header.error.as_ref()) else {
+/// Extracts a structured failure after Worker header identity validation.
+pub(crate) fn validate_data_header(header: &beryl_proto::worker::DataResponseHeaderProto) -> Result<(), ClientError> {
+    let Some(error) = header.error.as_ref() else {
         return Ok(());
     };
     let rpc_error = rpc_error_from_proto(error);
@@ -32,27 +53,11 @@ pub(crate) fn validate_data_header(
     Err(ClientError::from_remote(rpc_error, hint))
 }
 
-/// Constructs a terminal protocol error for a malformed validated response.
-pub(crate) fn invalid_header_error(message: impl Into<String>) -> ClientError {
-    ClientError::malformed_response(message)
-}
-
 fn recovery_hint(recovery: &RecoveryAction) -> Option<&beryl_common::error::rpc::RefreshHint> {
     match recovery {
         RecoveryAction::RefreshMetadata { hint } | RecoveryAction::ReopenWriteSession { hint } => Some(hint),
         _ => None,
     }
-}
-
-fn refresh_hint_from_rpc_error_and_header(
-    rpc_hint: Option<&beryl_common::error::rpc::RefreshHint>,
-    header: &ResponseHeader,
-) -> RefreshHint {
-    let mut hint = refresh_hint_from_rpc_error(rpc_hint);
-    hint.group_name = hint.group_name.or_else(|| header.group_name.clone());
-    hint.route_epoch = hint.route_epoch.or(header.route_epoch);
-    hint.mount_epoch = hint.mount_epoch.or(header.mount_epoch);
-    hint
 }
 
 fn refresh_hint_from_rpc_error(rpc_hint: Option<&beryl_common::error::rpc::RefreshHint>) -> RefreshHint {
@@ -65,8 +70,5 @@ fn refresh_hint_from_rpc_error(rpc_hint: Option<&beryl_common::error::rpc::Refre
             .group_name
             .as_deref()
             .and_then(|group_name| GroupName::parse(group_name).ok()),
-        mount_prefix: rpc_hint.mount_prefix.clone(),
-        route_epoch: rpc_hint.route_epoch,
-        mount_epoch: rpc_hint.mount_epoch,
     }
 }

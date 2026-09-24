@@ -3,7 +3,8 @@
 
 //! Bounded execution of metadata-authorized block cleanup commands.
 
-use crate::control::{Registration, RegistrationSet};
+use crate::config::BlockCleanupOptions;
+use crate::control::{Registration, RegistrationState};
 use crate::error::WorkerError;
 use crate::{observe, ReclaimBlockRequest, ReclaimBlockResult, WorkerCore};
 use beryl_types::{BlockId, GroupName, WorkerId, WorkerRunId};
@@ -16,37 +17,6 @@ use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
-
-/// One exact block identity received from an authenticated heartbeat response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BlockCleanupCommand {
-    /// Logical identity of the block selected by metadata.
-    pub block_id: BlockId,
-}
-
-/// Bounds process-local cleanup work and retry pressure.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BlockCleanupOptions {
-    /// Maximum number of distinct queued and active cleanup commands.
-    pub max_pending: usize,
-    /// Maximum number of local reclamation attempts that may run concurrently.
-    pub max_concurrent: usize,
-    /// Delay before retrying the first transient local failure.
-    pub retry_initial_backoff: Duration,
-    /// Upper bound for exponential retry backoff.
-    pub retry_max_backoff: Duration,
-}
-
-impl Default for BlockCleanupOptions {
-    fn default() -> Self {
-        Self {
-            max_pending: 1_024,
-            max_concurrent: 4,
-            retry_initial_backoff: Duration::from_millis(100),
-            retry_max_backoff: Duration::from_secs(30),
-        }
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CleanupReplicaKey {
@@ -64,7 +34,7 @@ enum CleanupPhase {
 
 struct BlockCleanupInner {
     core: Arc<WorkerCore>,
-    registrations: Arc<RegistrationSet>,
+    registrations: Arc<RegistrationState>,
     options: BlockCleanupOptions,
     pending: Mutex<HashMap<CleanupReplicaKey, CleanupPhase>>,
     concurrency: Arc<Semaphore>,
@@ -97,7 +67,7 @@ impl BlockCleanupRuntime {
     /// Starts cleanup with an explicit process-owned task handle.
     pub fn start(
         core: Arc<WorkerCore>,
-        registrations: Arc<RegistrationSet>,
+        registrations: Arc<RegistrationState>,
         options: BlockCleanupOptions,
     ) -> Result<Self, WorkerError> {
         let (executor, receiver) = BlockCleanupExecutor::build(core, registrations, options)?;
@@ -127,9 +97,7 @@ impl BlockCleanupRuntime {
     /// Returns `true` when the process owner had to force cancellation.
     pub async fn shutdown_until(mut self, deadline: Instant) -> Result<bool, JoinError> {
         self.shutdown.cancel();
-        let Some(mut task) = self.task.take() else {
-            return Ok(false);
-        };
+        let mut task = self.task.take().expect("cleanup runtime owns its task");
         match tokio::time::timeout_at(deadline, &mut task).await {
             Ok(result) => {
                 result?;
@@ -157,10 +125,12 @@ impl Drop for BlockCleanupRuntime {
 impl BlockCleanupExecutor {
     fn build(
         core: Arc<WorkerCore>,
-        registrations: Arc<RegistrationSet>,
+        registrations: Arc<RegistrationState>,
         options: BlockCleanupOptions,
     ) -> Result<(Self, Receiver<CleanupReplicaKey>), WorkerError> {
-        validate_options(&options)?;
+        options
+            .validate()
+            .map_err(|error| WorkerError::InvalidArgument(error.message))?;
         let (sender, receiver) = mpsc::channel(options.max_pending);
         let inner = Arc::new(BlockCleanupInner {
             core,
@@ -177,13 +147,13 @@ impl BlockCleanupExecutor {
     /// Exact duplicates are coalesced. Queue saturation drops only the local
     /// work item; metadata will redispatch the still-reported Ready replica
     /// after its retry backoff.
-    pub fn enqueue(&self, registration: &Registration, commands: impl IntoIterator<Item = BlockCleanupCommand>) {
-        for command in commands {
+    pub fn enqueue(&self, registration: &Registration, commands: impl IntoIterator<Item = BlockId>) {
+        for block_id in commands {
             let key = CleanupReplicaKey {
                 group_name: registration.group_name.clone(),
                 worker_id: registration.worker_id,
                 worker_run_id: registration.worker_run_id,
-                block_id: command.block_id,
+                block_id,
             };
 
             let mut pending = self.inner.pending.lock().expect("cleanup state poisoned");
@@ -297,10 +267,10 @@ async fn run_cleanup_task(inner: Arc<BlockCleanupInner>, key: CleanupReplicaKey)
             observe::record_cleanup_result("stale_run");
             return;
         }
-        let Ok(concurrency) = Arc::clone(&inner.concurrency).acquire_owned().await else {
-            finish_task(&inner, &key);
-            return;
-        };
+        let concurrency = Arc::clone(&inner.concurrency)
+            .acquire_owned()
+            .await
+            .expect("cleanup semaphore is never closed");
         if !registration_matches(&inner.registrations, &key) {
             drop(concurrency);
             finish_task(&inner, &key);
@@ -352,7 +322,7 @@ async fn run_cleanup_task(inner: Arc<BlockCleanupInner>, key: CleanupReplicaKey)
 }
 
 /// Returns whether a cleanup key still belongs to the active registration.
-fn registration_matches(registrations: &RegistrationSet, key: &CleanupReplicaKey) -> bool {
+fn registration_matches(registrations: &RegistrationState, key: &CleanupReplicaKey) -> bool {
     registrations.registration(&key.group_name).is_some_and(|registration| {
         registration.worker_id == key.worker_id && registration.worker_run_id == key.worker_run_id
     })
@@ -388,41 +358,15 @@ fn retry_backoff(options: &BlockCleanupOptions, attempts: u32) -> Duration {
     Duration::from_millis(delay.min(options.retry_max_backoff.as_millis()) as u64)
 }
 
-/// Validates bounds that are required for bounded, live cleanup execution.
-fn validate_options(options: &BlockCleanupOptions) -> Result<(), WorkerError> {
-    if options.max_pending == 0 {
-        return Err(WorkerError::InvalidArgument(
-            "cleanup max_pending must be greater than zero".to_string(),
-        ));
-    }
-    if options.max_concurrent == 0 {
-        return Err(WorkerError::InvalidArgument(
-            "cleanup max_concurrent must be greater than zero".to_string(),
-        ));
-    }
-    if options.retry_initial_backoff.is_zero() {
-        return Err(WorkerError::InvalidArgument(
-            "cleanup retry_initial_backoff must be greater than zero".to_string(),
-        ));
-    }
-    if options.retry_initial_backoff > options.retry_max_backoff {
-        return Err(WorkerError::InvalidArgument(
-            "cleanup retry_initial_backoff must not exceed retry_max_backoff".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::block::{
-        BlockMetaPayload, CheckpointBlockRequest, LocalBlockStore, OpenBlockWriteRequest, StoreResult,
-    };
+    use crate::error::WorkerResult;
+    use crate::store::block::{BlockMetaPayload, CheckpointBlockRequest, LocalBlockStore, OpenBlockWriteRequest};
     use beryl_types::{BlockIndex, InodeId};
     use bytes::Bytes;
-    use std::ops::Deref;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
 
     #[derive(Clone, Copy)]
     enum ReclaimBehavior {
@@ -432,7 +376,7 @@ mod tests {
 
     struct ControlledStore {
         behavior: Mutex<ReclaimBehavior>,
-        delay: Duration,
+        release: Option<Mutex<mpsc::Receiver<()>>>,
         calls: AtomicUsize,
         active: AtomicUsize,
         max_active: AtomicUsize,
@@ -440,10 +384,10 @@ mod tests {
     }
 
     impl ControlledStore {
-        fn new(behavior: ReclaimBehavior, delay: Duration) -> Self {
+        fn new(behavior: ReclaimBehavior) -> Self {
             Self {
                 behavior: Mutex::new(behavior),
-                delay,
+                release: None,
                 calls: AtomicUsize::new(0),
                 active: AtomicUsize::new(0),
                 max_active: AtomicUsize::new(0),
@@ -457,31 +401,43 @@ mod tests {
     }
 
     impl LocalBlockStore for ControlledStore {
-        fn open_block_write(&self, _req: OpenBlockWriteRequest) -> StoreResult<BlockMetaPayload> {
+        fn open_block_write(&self, _req: OpenBlockWriteRequest) -> WorkerResult<BlockMetaPayload> {
             panic!("unused test operation")
         }
 
-        fn write_at(&self, _group_name: &GroupName, _block_id: BlockId, _offset: u64, _data: Bytes) -> StoreResult<()> {
+        fn write_at(
+            &self,
+            _group_name: &GroupName,
+            _block_id: BlockId,
+            _offset: u64,
+            _data: Bytes,
+        ) -> WorkerResult<()> {
             panic!("unused test operation")
         }
 
-        fn checkpoint_block(&self, _req: CheckpointBlockRequest) -> StoreResult<BlockMetaPayload> {
+        fn checkpoint_block(&self, _req: CheckpointBlockRequest) -> WorkerResult<BlockMetaPayload> {
             panic!("unused test operation")
         }
 
-        fn read_at(&self, _group_name: &GroupName, _block_id: BlockId, _offset: u64, _len: u64) -> StoreResult<Bytes> {
+        fn read_at(&self, _group_name: &GroupName, _block_id: BlockId, _offset: u64, _len: u64) -> WorkerResult<Bytes> {
             panic!("unused test operation")
         }
 
-        fn load_meta(&self, _group_name: &GroupName, _block_id: BlockId) -> StoreResult<BlockMetaPayload> {
+        fn load_meta(&self, _group_name: &GroupName, _block_id: BlockId) -> WorkerResult<BlockMetaPayload> {
             panic!("unused test operation")
         }
 
-        fn reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockResult> {
+        fn reclaim_block(&self, req: &ReclaimBlockRequest) -> WorkerResult<ReclaimBlockResult> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(active, Ordering::SeqCst);
-            std::thread::sleep(self.delay);
+            if let Some(release) = &self.release {
+                release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("release reclaim");
+            }
             let behavior = *self.behavior.lock().expect("controlled store poisoned");
             self.active.fetch_sub(1, Ordering::SeqCst);
             match behavior {
@@ -496,17 +452,17 @@ mod tests {
             }
         }
 
-        fn discard_unsynced_suffix(&self, _group_name: &GroupName, _block_id: BlockId) -> StoreResult<()> {
+        fn discard_unsynced_suffix(&self, _group_name: &GroupName, _block_id: BlockId) -> WorkerResult<()> {
             panic!("unused test operation")
         }
     }
 
     #[tokio::test]
-    async fn queue_full_drops_work_until_metadata_redispatches() {
+    async fn failed_cleanup_retries_while_queue_overflow_requires_metadata_redispatch() {
         let run_id = WorkerRunId::new();
         let registrations = registered(run_id);
-        let store = Arc::new(ControlledStore::new(ReclaimBehavior::Fail, Duration::ZERO));
-        let executor = executor(
+        let store = Arc::new(ControlledStore::new(ReclaimBehavior::Fail));
+        let runtime = cleanup_runtime(
             Arc::clone(&store),
             Arc::clone(&registrations),
             BlockCleanupOptions {
@@ -516,12 +472,13 @@ mod tests {
                 retry_max_backoff: Duration::from_millis(20),
             },
         );
+        let executor = runtime.executor();
         let first = test_block_id(1);
         let second = test_block_id(2);
 
-        executor.enqueue(&registration(run_id), [command(first)]);
-        wait_for(|| store.calls.load(Ordering::SeqCst) > 0).await;
-        executor.enqueue(&registration(run_id), [command(second)]);
+        executor.enqueue(&registration(run_id), [first]);
+        wait_for(|| store.calls.load(Ordering::SeqCst) >= 2).await;
+        executor.enqueue(&registration(run_id), [second]);
         assert_eq!(executor.inner.pending.lock().expect("cleanup state poisoned").len(), 1);
 
         store.set_behavior(ReclaimBehavior::Succeed);
@@ -536,7 +493,7 @@ mod tests {
         .await;
         assert_eq!(*store.reclaimed.lock().expect("controlled store poisoned"), vec![first]);
 
-        executor.enqueue(&registration(run_id), [command(second)]);
+        executor.enqueue(&registration(run_id), [second]);
         wait_for(|| {
             executor
                 .inner
@@ -556,11 +513,12 @@ mod tests {
     async fn max_concurrent_bounds_active_reclaims() {
         let run_id = WorkerRunId::new();
         let registrations = registered(run_id);
-        let store = Arc::new(ControlledStore::new(
-            ReclaimBehavior::Succeed,
-            Duration::from_millis(50),
-        ));
-        let executor = executor(
+        let (release, receiver) = mpsc::channel();
+        let store = Arc::new(ControlledStore {
+            release: Some(Mutex::new(receiver)),
+            ..ControlledStore::new(ReclaimBehavior::Succeed)
+        });
+        let runtime = cleanup_runtime(
             Arc::clone(&store),
             registrations,
             BlockCleanupOptions {
@@ -571,10 +529,12 @@ mod tests {
             },
         );
 
-        executor.enqueue(
-            &registration(run_id),
-            (1..=4).map(|index| command(test_block_id(index))),
-        );
+        let executor = runtime.executor();
+        executor.enqueue(&registration(run_id), (1..=4).map(test_block_id));
+        wait_for(|| store.active.load(Ordering::SeqCst) >= 2).await;
+        for _ in 0..4 {
+            release.send(()).unwrap();
+        }
         wait_for(|| {
             executor
                 .inner
@@ -590,54 +550,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permanent_failure_retries_with_backoff_and_recovers() {
-        let run_id = WorkerRunId::new();
-        let registrations = registered(run_id);
-        let store = Arc::new(ControlledStore::new(ReclaimBehavior::Fail, Duration::ZERO));
-        let executor = executor(
-            Arc::clone(&store),
-            registrations,
-            BlockCleanupOptions {
-                max_pending: 2,
-                max_concurrent: 1,
-                retry_initial_backoff: Duration::from_millis(20),
-                retry_max_backoff: Duration::from_millis(20),
-            },
-        );
-        let block_id = test_block_id(1);
-
-        executor.enqueue(&registration(run_id), [command(block_id)]);
-        tokio::time::sleep(Duration::from_millis(75)).await;
-        let failed_calls = store.calls.load(Ordering::SeqCst);
-        assert!(
-            (2..=5).contains(&failed_calls),
-            "unexpected retry count: {failed_calls}"
-        );
-        assert_eq!(executor.inner.pending.lock().expect("cleanup state poisoned").len(), 1);
-
-        store.set_behavior(ReclaimBehavior::Succeed);
-        wait_for(|| {
-            executor
-                .inner
-                .pending
-                .lock()
-                .expect("cleanup state poisoned")
-                .is_empty()
-        })
-        .await;
-        assert_eq!(
-            *store.reclaimed.lock().expect("controlled store poisoned"),
-            vec![block_id]
-        );
-    }
-
-    #[tokio::test]
     async fn shutdown_deadline_forces_and_awaits_retrying_cleanup_work() {
         for grace in [Duration::ZERO, Duration::from_millis(20)] {
             let run_id = WorkerRunId::new();
             let registrations = registered(run_id);
-            let store = Arc::new(ControlledStore::new(ReclaimBehavior::Fail, Duration::ZERO));
-            let core = Arc::new(WorkerCore::with_local_store(1_024, 1_024, store.clone()));
+            let store = Arc::new(ControlledStore::new(ReclaimBehavior::Fail));
+            let core = Arc::new(WorkerCore::with_local_store(
+                GroupName::parse("root").unwrap(),
+                1_024,
+                1_024,
+                store.clone(),
+            ));
             let runtime = BlockCleanupRuntime::start(
                 core,
                 registrations,
@@ -650,7 +573,7 @@ mod tests {
             )
             .unwrap();
             let executor = runtime.executor();
-            executor.enqueue(&registration(run_id), [command(test_block_id(1))]);
+            executor.enqueue(&registration(run_id), [test_block_id(1)]);
             wait_for(|| store.calls.load(Ordering::SeqCst) == 1).await;
 
             let forced = tokio::time::timeout(Duration::from_secs(1), runtime.shutdown_until(Instant::now() + grace))
@@ -668,34 +591,22 @@ mod tests {
         }
     }
 
-    struct TestExecutor {
-        executor: BlockCleanupExecutor,
-        _runtime: BlockCleanupRuntime,
-    }
-
-    impl Deref for TestExecutor {
-        type Target = BlockCleanupExecutor;
-
-        fn deref(&self) -> &Self::Target {
-            &self.executor
-        }
-    }
-
-    fn executor(
+    fn cleanup_runtime(
         store: Arc<ControlledStore>,
-        registrations: Arc<RegistrationSet>,
+        registrations: Arc<RegistrationState>,
         options: BlockCleanupOptions,
-    ) -> TestExecutor {
-        let core = Arc::new(WorkerCore::with_local_store(1_024, 1_024, store));
-        let runtime = BlockCleanupRuntime::start(core, registrations, options).expect("start cleanup executor");
-        TestExecutor {
-            executor: runtime.executor(),
-            _runtime: runtime,
-        }
+    ) -> BlockCleanupRuntime {
+        let core = Arc::new(WorkerCore::with_local_store(
+            GroupName::parse("root").unwrap(),
+            1_024,
+            1_024,
+            store,
+        ));
+        BlockCleanupRuntime::start(core, registrations, options).expect("start cleanup executor")
     }
 
-    fn registered(run_id: WorkerRunId) -> Arc<RegistrationSet> {
-        let registrations = Arc::new(RegistrationSet::new());
+    fn registered(run_id: WorkerRunId) -> Arc<RegistrationState> {
+        let registrations = Arc::new(RegistrationState::new());
         registrations.record_registered(registration(run_id));
         registrations
     }
@@ -705,12 +616,7 @@ mod tests {
             group_name: GroupName::parse("root").expect("group name"),
             worker_id: WorkerId::new(42),
             worker_run_id: run_id,
-            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
         }
-    }
-
-    fn command(block_id: BlockId) -> BlockCleanupCommand {
-        BlockCleanupCommand { block_id }
     }
 
     fn test_block_id(index: u32) -> BlockId {

@@ -6,7 +6,36 @@ syntax = "proto3";
 package worker;
 
 import "common/common.proto";
-import "worker/data_header.proto";
+import "common/header.proto";
+import "common/errors.proto";
+
+// ============================================================================
+// Data-Plane Request/Response Headers
+// ============================================================================
+
+// DataRequestHeaderProto is carried by low-frequency worker data-plane control
+// operations such as ReadBlock and the first WriteBlock command.
+//
+// Hot-path stream frames intentionally do not carry this header. Stream
+// Layout and target identity facts appear only in the first WriteBlock command.
+message DataRequestHeaderProto {
+  /// Client information (call_id, client_id, client_name).
+  common.ClientInfoProto client = 1;
+}
+
+/// Response header for data-plane operations.
+/// Recoverable business or protocol errors use common.ErrorDetailProto and may
+/// be returned with gRPC OK.
+/// ReadBlock errors encode this header in non-OK status details and identify
+/// its version with the beryl-worker-data-error-detail metadata marker.
+/// Transport or framework errors may still use non-OK gRPC status.
+message DataResponseHeaderProto {
+  /// Client information (call_id, client_id, client_name).
+  common.ClientInfoProto client = 1;
+
+  /// RPC error detail. Unset means success.
+  optional common.ErrorDetailProto error = 2;
+}
 
 // ============================================================================
 // Worker Data Service: block-local stream and sync API
@@ -62,6 +91,7 @@ message WriteBlockCommandProto {
   common.BlockIdProto block_id = 3;
   string worker_run_id = 4;
   uint64 block_size = 5;
+  // Writer fencing scoped to block_id.
   common.FencingTokenProto fencing_token = 6;
   uint64 write_offset = 7;
   common.TierProto tier = 8;

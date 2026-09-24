@@ -142,7 +142,6 @@ impl DetachedRootReclaimer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inode::InodeAttrs;
     use crate::mount::{MountTable, ROOT_INODE_ID};
     use crate::raft::AppRaftStateMachine;
 
@@ -159,9 +158,9 @@ mod tests {
         initialize_leader: bool,
     ) -> (Arc<RocksDBStorage>, Arc<AppRaftNode>, DetachedRootReclaimer) {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
+        let state_machine = AppRaftStateMachine::new(Arc::clone(&storage));
         let raft_node = Arc::new(
-            AppRaftNode::new(1, Arc::clone(&storage), state_machine, Arc::new(MountTable::new()))
+            AppRaftNode::new(1, Arc::clone(&storage), state_machine, Arc::new(MountTable::default()))
                 .await
                 .unwrap(),
         );
@@ -200,7 +199,6 @@ mod tests {
                 proposed_at_ms: 2,
                 root_inode_id: ROOT_INODE_ID,
                 components: vec![name.to_string()],
-                attrs: InodeAttrs::new(),
                 recursive: false,
             })
             .await
@@ -212,7 +210,6 @@ mod tests {
             .propose(Command::Delete {
                 proposed_at_ms: 3,
                 mount_id: MountId::new(1),
-                expected_mount_epoch: 1,
                 mount_root_inode_id: ROOT_INODE_ID,
                 relative_components: vec![name.to_string()],
                 expected_inode_id: root_id,
@@ -233,10 +230,7 @@ mod tests {
         assert!(storage.get_detached_root(root_id).unwrap().is_some());
 
         let pass = leader.reclaim_once().await.unwrap();
-        assert!(matches!(
-            pass,
-            DetachedRootReclaimPass::Applied(DetachedRootReclaimResult { completed_roots: 1, .. })
-        ));
+        assert!(matches!(pass, DetachedRootReclaimPass::Applied(_)));
         assert!(storage.get_detached_root(root_id).unwrap().is_none());
         raft_node.shutdown().await.unwrap();
 

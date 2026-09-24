@@ -15,71 +15,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 use tokio::sync::watch::{Receiver, Sender};
 
-pub(super) const WORKER_NET_PROTOCOL_GRPC: i32 = 1;
-
-pub(super) fn worker_net_protocol_label(worker_net_protocol: i32) -> &'static str {
-    if worker_net_protocol == WORKER_NET_PROTOCOL_GRPC {
-        "grpc"
-    } else {
-        "unknown"
-    }
-}
-
 /// Worker descriptor (low-frequency, authoritative, persisted in Raft).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerDescriptor {
     pub group_name: GroupName,
     pub worker_id: WorkerId,
     pub address: String,
-    /// Worker network protocol wire value. Current runtime accepts gRPC only.
-    pub worker_net_protocol: i32,
-    pub fault_domain: Option<String>,
 }
 
 /// Worker runtime (high-frequency, soft-state, memory-only with TTL).
 #[derive(Clone, Debug)]
 pub struct WorkerRuntime {
-    pub worker_run_id: WorkerRunId,
     pub heartbeat_seq: u64,
     pub last_seen_at: Instant,
-    pub last_seen_ms: u64, // Unix timestamp in milliseconds
     pub tier_free: Vec<TierFree>,
-}
-
-/// Worker information persisted by RocksDB storage.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WorkerInfo {
-    pub group_name: GroupName,
-    pub worker_id: WorkerId,
-    pub address: String,
-    /// Worker network protocol wire value. Current runtime accepts gRPC only.
-    pub worker_net_protocol: i32,
-    pub capacity_total: u64,
-    pub capacity_used: u64,
-    pub capacity_available: u64,
-    pub active_reads: u32,
-    pub active_writes: u32,
-    pub health: HealthStatus,
-    pub last_heartbeat: u64, // Unix timestamp in seconds
-    pub fault_domain: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum HealthStatus {
-    Healthy,
-    Degraded,
-    Unhealthy,
-}
-
-impl From<i32> for HealthStatus {
-    fn from(v: i32) -> Self {
-        match v {
-            1 => HealthStatus::Healthy,
-            2 => HealthStatus::Degraded,
-            3 => HealthStatus::Unhealthy,
-            _ => HealthStatus::Healthy,
-        }
-    }
 }
 
 /// Block locations keyed by metadata group and block identity.
@@ -150,25 +99,11 @@ pub(crate) struct ReadyReplicaPage {
     pub next_cursor: Option<ReadyReplicaCursor>,
 }
 
-/// Live startup registration state for the current metadata process.
+/// Durable descriptor address and the run accepted by this metadata process.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkerRegistrationState {
-    pub group_name: GroupName,
-    pub worker_id: WorkerId,
-    pub worker_run_id: WorkerRunId,
-    pub address: String,
-    pub worker_net_protocol: i32,
-    pub fault_domain: Option<String>,
-}
-
-/// Worker liveness view updated only by group-scoped heartbeat.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkerLiveState {
-    pub group_name: GroupName,
-    pub worker_id: WorkerId,
-    pub worker_run_id: WorkerRunId,
-    pub heartbeat_seq: u64,
-    pub last_seen_ms: u64,
+struct WorkerRegistrationState {
+    worker_run_id: Option<WorkerRunId>,
+    address: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,11 +148,11 @@ pub enum BlockReportChange {
     Remove(BlockId),
 }
 
-/// Observable index changes and acknowledgement state from one accepted batch.
+/// Index change counts and acknowledgement state from one accepted batch.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BlockReportApplyResult {
-    pub added_blocks: Vec<BlockId>,
-    pub removed_blocks: Vec<BlockId>,
+    pub added_count: usize,
+    pub removed_count: usize,
     pub next_batch_seq: u64,
     pub baseline_published: bool,
 }
@@ -280,9 +215,6 @@ pub(crate) struct PublishReadyTarget {
 /// Deterministic worker evidence that cannot authorize file publication.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PublishReadyConflict {
-    MissingWriteEndpoint {
-        block_id: BlockId,
-    },
     WorkerRunMismatch {
         block_id: BlockId,
         worker_id: WorkerId,
@@ -346,37 +278,12 @@ fn remove_worker_ready_locations(
 }
 
 /// Removes one Worker report and every index entry derived from its active baseline.
-fn remove_worker_report(
-    observations: &mut BlockReportObservationState,
-    key: &WorkerRegistrationKey,
-) -> Option<WorkerBlockReportRuntime> {
-    let report = observations.reports.remove(key)?;
-    if let Some(active) = &report.active {
-        remove_worker_ready_locations(&mut observations.locations, key, active.ready_blocks.iter().copied());
+fn remove_worker_report(observations: &mut BlockReportObservationState, key: &WorkerRegistrationKey) {
+    if let Some(report) = observations.reports.remove(key) {
+        if let Some(active) = report.active {
+            remove_worker_ready_locations(&mut observations.locations, key, active.ready_blocks.into_iter());
+        }
     }
-    Some(report)
-}
-
-fn validate_same_run_descriptor(
-    group_name: &GroupName,
-    worker_id: WorkerId,
-    existing: &WorkerRegistrationState,
-    address: &str,
-    worker_net_protocol: i32,
-) -> MetadataResult<()> {
-    if existing.address == address && existing.worker_net_protocol == worker_net_protocol {
-        return Ok(());
-    }
-    Err(MetadataError::InvalidArgument(format!(
-        "worker descriptor mismatch for group_name={}, worker_id={}, worker_run_id={}: registered endpoint {} protocol {}, requested endpoint {} protocol {}",
-        group_name,
-        worker_id.as_raw(),
-        existing.worker_run_id,
-        existing.address,
-        worker_net_protocol_label(existing.worker_net_protocol),
-        address,
-        worker_net_protocol_label(worker_net_protocol)
-    )))
 }
 
 fn endpoint_host(endpoint: &str) -> Option<String> {
@@ -392,9 +299,7 @@ fn endpoint_host(endpoint: &str) -> Option<String> {
 
 /// Worker manager.
 pub struct WorkerManager {
-    /// Worker descriptors (authoritative, from Raft state).
-    descriptors: RwLock<HashMap<WorkerRegistrationKey, WorkerDescriptor>>,
-    /// Accepted worker process runs for this metadata process, learned through Raft apply.
+    /// Durable addresses with an optional process-local run accepted after Raft apply.
     registrations: RwLock<HashMap<WorkerRegistrationKey, WorkerRegistrationState>>,
     /// Worker runtime (soft-state, memory-only, updated by heartbeat).
     runtime: RwLock<HashMap<WorkerRegistrationKey, WorkerRuntime>>,
@@ -415,7 +320,6 @@ impl WorkerManager {
     pub fn new(heartbeat_timeout_ms: u32) -> Self {
         let (publication_observation, _) = watch::channel(0);
         Self {
-            descriptors: RwLock::new(HashMap::new()),
             registrations: RwLock::new(HashMap::new()),
             runtime: RwLock::new(HashMap::new()),
             heartbeat_rejections: RwLock::new(HashMap::new()),
@@ -439,87 +343,43 @@ impl WorkerManager {
         Duration::from_millis(u64::from(self.heartbeat_timeout_ms))
     }
 
-    /// Drops live registration and reconstructable report state on metadata restart.
-    pub fn reset_worker_soft_state(&self) {
-        let mut registrations = self.registrations.write();
-        let mut runtime = self.runtime.write();
-        let mut observations = self.block_report_observations.write();
-        registrations.clear();
-        runtime.clear();
-        observations.reports.clear();
-        observations.locations.clear();
-        drop(observations);
-        drop(runtime);
-        drop(registrations);
-        self.heartbeat_rejections.write().clear();
-        self.notify_publication_observation_changed();
-    }
-
-    /// Upsert worker descriptor (called from Raft apply).
-    pub fn upsert_descriptor(&self, descriptor: WorkerDescriptor) -> MetadataResult<()> {
-        let mut descriptors = self.descriptors.write();
-        descriptors.insert(
-            WorkerRegistrationKey::new(&descriptor.group_name, descriptor.worker_id),
-            descriptor,
-        );
-        drop(descriptors);
-        self.notify_publication_observation_changed();
-        Ok(())
-    }
-
     /// Load persisted descriptors from replicated storage.
     ///
     /// WorkerRunId is intentionally not reconstructed here. Startup
-    /// registration state is live-only, so reload/snapshot recovery fails closed
+    /// registration state is live-only, so restart fails closed
     /// until the worker registers again through Raft apply.
-    pub fn load_registered_workers(&self, workers: Vec<WorkerInfo>) -> MetadataResult<()> {
-        let mut descriptors = self.descriptors.write();
+    pub fn load_registered_workers(&self, workers: Vec<WorkerDescriptor>) {
         let mut registrations = self.registrations.write();
         let mut runtime = self.runtime.write();
         let mut heartbeat_rejections = self.heartbeat_rejections.write();
         let mut observations = self.block_report_observations.write();
-        descriptors.clear();
         registrations.clear();
         observations.reports.clear();
         observations.locations.clear();
         runtime.clear();
         heartbeat_rejections.clear();
-        for worker in workers {
-            let descriptor = WorkerDescriptor {
-                group_name: worker.group_name,
-                worker_id: worker.worker_id,
-                address: worker.address,
-                worker_net_protocol: worker.worker_net_protocol,
-                fault_domain: worker.fault_domain,
-            };
-            descriptors.insert(
+        for descriptor in workers {
+            registrations.insert(
                 WorkerRegistrationKey::new(&descriptor.group_name, descriptor.worker_id),
-                descriptor,
+                WorkerRegistrationState {
+                    address: descriptor.address,
+                    worker_run_id: None,
+                },
             );
         }
         drop(observations);
         drop(heartbeat_rejections);
         drop(runtime);
         drop(registrations);
-        drop(descriptors);
         self.notify_publication_observation_changed();
-        Ok(())
     }
 
-    /// Get a worker descriptor scoped to one metadata group.
-    pub fn get_descriptor(&self, group_name: &GroupName, worker_id: WorkerId) -> Option<WorkerDescriptor> {
-        let descriptors = self.descriptors.read();
-        descriptors
-            .get(&WorkerRegistrationKey::new(group_name, worker_id))
-            .cloned()
-    }
-
-    /// Get live startup registration state scoped to one metadata group.
-    pub fn get_registration(&self, group_name: &GroupName, worker_id: WorkerId) -> Option<WorkerRegistrationState> {
+    /// Get the accepted process run scoped to one metadata group.
+    pub fn get_registered_run(&self, group_name: &GroupName, worker_id: WorkerId) -> Option<WorkerRunId> {
         let registrations = self.registrations.read();
         registrations
             .get(&WorkerRegistrationKey::new(group_name, worker_id))
-            .cloned()
+            .and_then(|registration| registration.worker_run_id)
     }
 
     /// Runtime preflight rejects a live different-run endpoint conflict before Raft proposal.
@@ -529,7 +389,6 @@ impl WorkerManager {
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
         address: &str,
-        worker_net_protocol: i32,
     ) -> MetadataResult<()> {
         self.expire_liveness();
         let key = WorkerRegistrationKey::new(group_name, worker_id);
@@ -538,54 +397,22 @@ impl WorkerManager {
             registrations.get(&key).cloned()
         };
         if let Some(existing) = existing {
-            let same_run = existing.worker_run_id == worker_run_id;
-            let endpoint_changed = existing.address != address || existing.worker_net_protocol != worker_net_protocol;
-            if same_run {
-                validate_same_run_descriptor(group_name, worker_id, &existing, address, worker_net_protocol)?;
+            let Some(existing_run) = existing.worker_run_id else {
+                return Ok(());
+            };
+            let same_run = existing_run == worker_run_id;
+            let endpoint_changed = existing.address != address;
+            if same_run && endpoint_changed {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "worker descriptor mismatch for group_name={}, worker_id={}, worker_run_id={}: registered endpoint {}, requested endpoint {}",
+                    group_name, worker_id.as_raw(), worker_run_id, existing.address, address,
+                )));
             }
             if !same_run && endpoint_changed && self.is_worker_live(group_name, worker_id) {
                 return Err(MetadataError::ActiveWorkerConflict(format!(
-                    "worker_id {} in group_name {} is live at {} protocol {} with worker_run_id {}, rejected registration from {} protocol {} with worker_run_id {}",
-                    worker_id.as_raw(),
-                    group_name,
-                    existing.address,
-                    worker_net_protocol_label(existing.worker_net_protocol),
-                    existing.worker_run_id,
-                    address,
-                    worker_net_protocol_label(worker_net_protocol),
-                    worker_run_id
+                    "worker_id {} in group_name {} is live at {} with worker_run_id {}, rejected registration from {} with worker_run_id {}",
+                    worker_id.as_raw(), group_name, existing.address, existing_run, address, worker_run_id
                 )));
-            }
-        }
-        Ok(())
-    }
-
-    /// Deterministic apply validation for a registration command already in the Raft log.
-    pub fn validate_worker_registration_for_apply(
-        &self,
-        group_name: &GroupName,
-        worker_id: WorkerId,
-        worker_run_id: WorkerRunId,
-        address: &str,
-        worker_net_protocol: i32,
-    ) -> MetadataResult<()> {
-        if worker_id.as_raw() == 0 {
-            return Err(MetadataError::InvalidArgument(
-                "worker_id must be non-zero for registration".to_string(),
-            ));
-        }
-        let key = WorkerRegistrationKey::new(group_name, worker_id);
-        if let Some(existing) = self.registrations.read().get(&key) {
-            if &existing.group_name != group_name || existing.worker_id != worker_id {
-                return Err(MetadataError::Internal(format!(
-                    "worker registration key mismatch for group_name={}, worker_id={}",
-                    group_name,
-                    worker_id.as_raw()
-                )));
-            }
-            if existing.worker_run_id == worker_run_id {
-                validate_same_run_descriptor(group_name, worker_id, existing, address, worker_net_protocol)?;
-                return Ok(());
             }
         }
         Ok(())
@@ -597,45 +424,21 @@ impl WorkerManager {
         group_name: &GroupName,
         worker_id: WorkerId,
         address: String,
-        worker_net_protocol: i32,
         worker_run_id: WorkerRunId,
-        fault_domain: Option<String>,
-    ) -> MetadataResult<()> {
-        self.validate_worker_registration_for_apply(
-            group_name,
-            worker_id,
-            worker_run_id,
-            &address,
-            worker_net_protocol,
-        )?;
+    ) {
         let key = WorkerRegistrationKey::new(group_name, worker_id);
-        let descriptor_address = address.clone();
-        let descriptor_fault_domain = fault_domain.clone();
-        let descriptor = WorkerDescriptor {
-            group_name: group_name.clone(),
-            worker_id,
-            address: descriptor_address,
-            worker_net_protocol,
-            fault_domain: descriptor_fault_domain,
-        };
-        self.upsert_descriptor(descriptor)?;
-
         let mut registrations = self.registrations.write();
         let mut runtime = self.runtime.write();
         let mut observations = self.block_report_observations.write();
         let same_registered_run = registrations
             .get(&key)
-            .map(|registration| registration.worker_run_id == worker_run_id)
+            .map(|registration| registration.worker_run_id == Some(worker_run_id))
             .unwrap_or(false);
         registrations.insert(
             key.clone(),
             WorkerRegistrationState {
-                group_name: group_name.clone(),
-                worker_id,
-                worker_run_id,
+                worker_run_id: Some(worker_run_id),
                 address,
-                worker_net_protocol,
-                fault_domain,
             },
         );
         if !same_registered_run {
@@ -647,7 +450,6 @@ impl WorkerManager {
         drop(registrations);
         self.heartbeat_rejections.write().remove(&key);
         self.notify_publication_observation_changed();
-        Ok(())
     }
 
     /// Stages one ordered Full batch and atomically publishes the final baseline.
@@ -672,7 +474,7 @@ impl WorkerManager {
         let registrations = self.registrations.read();
         if !registrations
             .get(&key)
-            .is_some_and(|registration| registration.worker_run_id == worker_run_id)
+            .is_some_and(|registration| registration.worker_run_id == Some(worker_run_id))
         {
             return Err(MetadataError::StaleState(format!(
                 "worker_run_id mismatch for group_name={}, worker_id={}",
@@ -688,13 +490,6 @@ impl WorkerManager {
             active: None,
             staging: None,
         });
-        if report.worker_run_id != worker_run_id {
-            return Err(MetadataError::StaleState(format!(
-                "worker_run_id mismatch for group_name={}, worker_id={}",
-                group_name,
-                worker_id.as_raw()
-            )));
-        }
 
         if report
             .active
@@ -728,7 +523,7 @@ impl WorkerManager {
         }
 
         let starting_new_baseline = !continuing_staging;
-        let mut removed_blocks = Vec::new();
+        let mut removed_count = 0;
         if starting_new_baseline {
             if batch_seq != 0 {
                 return Err(MetadataError::FullReportRequired(format!(
@@ -738,7 +533,7 @@ impl WorkerManager {
                 )));
             }
             if let Some(active) = report.active.take() {
-                removed_blocks = active.ready_blocks.iter().copied().collect();
+                removed_count = active.ready_blocks.len();
                 remove_worker_ready_locations(locations, &key, active.ready_blocks.iter().copied());
             }
             report.staging = Some(StagingFullBlockReport {
@@ -752,7 +547,7 @@ impl WorkerManager {
         let staging = report.staging.as_mut().expect("full staging must exist");
         if batch_seq < staging.next_batch_seq {
             return Ok(BlockReportApplyResult {
-                removed_blocks,
+                removed_count,
                 next_batch_seq: staging.next_batch_seq,
                 ..BlockReportApplyResult::default()
             });
@@ -789,11 +584,11 @@ impl WorkerManager {
             let next_batch_seq = staging.next_batch_seq;
             drop(observations);
             drop(registrations);
-            if !removed_blocks.is_empty() {
+            if removed_count > 0 {
                 self.notify_publication_observation_changed();
             }
             return Ok(BlockReportApplyResult {
-                removed_blocks,
+                removed_count,
                 next_batch_seq,
                 ..BlockReportApplyResult::default()
             });
@@ -801,11 +596,12 @@ impl WorkerManager {
 
         let staging = report.staging.take().expect("full staging must exist");
         let ready_blocks = ready_block_ids(staging.blocks.values());
+        let added_count = ready_blocks.len();
         add_worker_ready_locations(locations, &key, ready_blocks.iter().copied());
         report.active = Some(ActiveBlockReport {
             baseline_seq,
             blocks: staging.blocks,
-            ready_blocks: ready_blocks.clone(),
+            ready_blocks,
             next_delta_batch_seq: 0,
         });
         drop(observations);
@@ -819,8 +615,8 @@ impl WorkerManager {
             "Worker full block report converged"
         );
         Ok(BlockReportApplyResult {
-            added_blocks: ready_blocks.into_iter().collect(),
-            removed_blocks,
+            added_count,
+            removed_count,
             baseline_published: true,
             ..BlockReportApplyResult::default()
         })
@@ -846,7 +642,7 @@ impl WorkerManager {
         let registrations = self.registrations.read();
         if !registrations
             .get(&key)
-            .is_some_and(|registration| registration.worker_run_id == worker_run_id)
+            .is_some_and(|registration| registration.worker_run_id == Some(worker_run_id))
         {
             return Err(MetadataError::StaleState(format!(
                 "worker_run_id mismatch for group_name={}, worker_id={}",
@@ -863,13 +659,6 @@ impl WorkerManager {
                 worker_id.as_raw()
             ))
         })?;
-        if report.worker_run_id != worker_run_id {
-            return Err(MetadataError::StaleState(format!(
-                "worker_run_id mismatch for group_name={}, worker_id={}",
-                group_name,
-                worker_id.as_raw()
-            )));
-        }
         let Some(current_baseline_seq) = report.active.as_ref().map(|active| active.baseline_seq) else {
             return Err(MetadataError::FullReportRequired(format!(
                 "full report required for current baseline: group_name={}, worker_id={}",
@@ -935,8 +724,8 @@ impl WorkerManager {
             }
         }
 
-        let mut added_blocks = Vec::new();
-        let mut removed_blocks = Vec::new();
+        let mut added_count = 0;
+        let mut removed_count = 0;
         for change in changes {
             let block_id = match &change {
                 BlockReportChange::Upsert(block) => block.block_id,
@@ -959,12 +748,12 @@ impl WorkerManager {
                 (false, true) => {
                     active.ready_blocks.insert(block_id);
                     add_worker_ready_locations(locations, &key, std::iter::once(block_id));
-                    added_blocks.push(block_id);
+                    added_count += 1;
                 }
                 (true, false) => {
                     active.ready_blocks.remove(&block_id);
                     remove_worker_ready_locations(locations, &key, std::iter::once(block_id));
-                    removed_blocks.push(block_id);
+                    removed_count += 1;
                 }
                 _ => {}
             }
@@ -974,8 +763,8 @@ impl WorkerManager {
         drop(registrations);
         self.notify_publication_observation_changed();
         Ok(BlockReportApplyResult {
-            added_blocks,
-            removed_blocks,
+            added_count,
+            removed_count,
             next_batch_seq,
             ..BlockReportApplyResult::default()
         })
@@ -988,14 +777,14 @@ impl WorkerManager {
         worker_run_id: WorkerRunId,
     ) -> MetadataResult<()> {
         self.expire_liveness();
-        let registration = self.get_registration(group_name, worker_id).ok_or_else(|| {
+        let registered_run = self.get_registered_run(group_name, worker_id).ok_or_else(|| {
             MetadataError::NotFound(format!(
                 "worker not registered for group_name={}, worker_id={}",
                 group_name,
                 worker_id.as_raw()
             ))
         })?;
-        if registration.worker_run_id != worker_run_id {
+        if registered_run != worker_run_id {
             return Err(MetadataError::StaleState(format!(
                 "worker_run_id mismatch for group_name={}, worker_id={}",
                 group_name,
@@ -1059,7 +848,7 @@ impl WorkerManager {
         self.heartbeat_rejections.write().remove(key);
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Accept a heartbeat and return its receipt time in Unix milliseconds.
     pub fn record_heartbeat_with_tier_free(
         &self,
         group_name: &GroupName,
@@ -1067,38 +856,30 @@ impl WorkerManager {
         worker_run_id: WorkerRunId,
         heartbeat_seq: u64,
         advertised_endpoint: &str,
-        worker_net_protocol: i32,
         tier_free: Vec<TierFree>,
-    ) -> MetadataResult<WorkerLiveState> {
+    ) -> MetadataResult<u64> {
         let key = WorkerRegistrationKey::new(group_name, worker_id);
-        let descriptor = {
-            let descriptors = self.descriptors.read();
-            descriptors.get(&key).cloned().ok_or_else(|| {
+        // Keep the accepted run registered until its heartbeat update completes.
+        let registrations = self.registrations.read();
+        let registration = registrations
+            .get(&key)
+            .filter(|registration| registration.worker_run_id.is_some())
+            .ok_or_else(|| {
                 MetadataError::NotFound(format!(
-                    "worker descriptor not found for group_name={}, worker_id={}",
+                    "live worker registration not found for group_name={}, worker_id={}",
                     group_name,
                     worker_id.as_raw()
                 ))
-            })?
-        };
-        // Keep the accepted run registered until its heartbeat update completes.
-        let registrations = self.registrations.read();
-        let registration = registrations.get(&key).ok_or_else(|| {
-            MetadataError::NotFound(format!(
-                "live worker registration not found for group_name={}, worker_id={}",
-                group_name,
-                worker_id.as_raw()
-            ))
-        })?;
+            })?;
 
-        if registration.worker_run_id != worker_run_id {
+        if registration.worker_run_id != Some(worker_run_id) {
             return Err(MetadataError::StaleState(format!(
                 "worker_run_id mismatch for group_name={}, worker_id={}",
                 group_name,
                 worker_id.as_raw()
             )));
         }
-        if descriptor.address != advertised_endpoint || descriptor.worker_net_protocol != worker_net_protocol {
+        if registration.address != advertised_endpoint {
             return Err(MetadataError::InvalidArgument(format!(
                 "worker descriptor mismatch for group_name={}, worker_id={}",
                 group_name,
@@ -1116,25 +897,14 @@ impl WorkerManager {
         {
             runtime.remove(&key);
         }
-        let live_state = match runtime.get_mut(&key) {
+        match runtime.get_mut(&key) {
             Some(existing) if heartbeat_seq <= existing.heartbeat_seq => {
                 existing.last_seen_at = now;
-                existing.last_seen_ms = now_ms;
-                existing.worker_run_id = worker_run_id;
-                WorkerLiveState {
-                    group_name: group_name.clone(),
-                    worker_id,
-                    worker_run_id,
-                    heartbeat_seq: existing.heartbeat_seq,
-                    last_seen_ms: existing.last_seen_ms,
-                }
             }
             existing => {
                 let worker_runtime = WorkerRuntime {
-                    worker_run_id,
                     heartbeat_seq,
                     last_seen_at: now,
-                    last_seen_ms: now_ms,
                     tier_free,
                 };
                 match existing {
@@ -1143,13 +913,6 @@ impl WorkerManager {
                         runtime.insert(key.clone(), worker_runtime);
                     }
                 }
-                WorkerLiveState {
-                    group_name: group_name.clone(),
-                    worker_id,
-                    worker_run_id,
-                    heartbeat_seq,
-                    last_seen_ms: now_ms,
-                }
             }
         };
         drop(runtime);
@@ -1157,76 +920,64 @@ impl WorkerManager {
         self.clear_heartbeat_rejection(&key);
         self.notify_publication_observation_changed();
 
-        Ok(live_state)
+        Ok(now_ms)
     }
 
     /// Expire heartbeat liveness.
-    pub fn expire_liveness(&self) -> Vec<(GroupName, WorkerId)> {
+    pub fn expire_liveness(&self) {
         let now = Instant::now();
         let timeout = self.heartbeat_timeout();
-        let mut expired = Vec::new();
-
-        {
+        let expired = {
             let mut runtime = self.runtime.write();
-            runtime.retain(|key, runtime| {
-                let is_live = now.duration_since(runtime.last_seen_at) < timeout;
-                if !is_live {
-                    expired.push((key.group_name.clone(), key.worker_id));
-                }
-                is_live
-            });
-        }
+            let previous_len = runtime.len();
+            runtime.retain(|_, runtime| now.duration_since(runtime.last_seen_at) < timeout);
+            runtime.len() != previous_len
+        };
 
-        if !expired.is_empty() {
+        if expired {
             self.notify_publication_observation_changed();
         }
-        expired
     }
 
     /// Remove soft state only if the candidate run is still current and has no live heartbeat.
-    /// The persisted descriptor is retained.
-    pub fn remove_dead_worker(
+    /// Retain the persisted descriptor.
+    pub(crate) fn remove_dead_worker(
         &self,
         group_name: &GroupName,
         worker_id: WorkerId,
         expected_run_id: WorkerRunId,
-    ) -> (bool, Vec<BlockId>) {
+    ) -> bool {
         let key = WorkerRegistrationKey::new(group_name, worker_id);
-        let mut affected_blocks = HashSet::new();
 
         // Registration, heartbeat, and report mutation use this same lock order.
         let mut registrations = self.registrations.write();
         if !registrations
             .get(&key)
-            .is_some_and(|registration| registration.worker_run_id == expected_run_id)
+            .is_some_and(|registration| registration.worker_run_id == Some(expected_run_id))
         {
-            return (false, Vec::new());
+            return false;
         }
         let mut runtime = self.runtime.write();
         let now = Instant::now();
-        if runtime.get(&key).is_some_and(|runtime| {
-            runtime.worker_run_id != expected_run_id
-                || now.duration_since(runtime.last_seen_at) < self.heartbeat_timeout()
-        }) {
-            return (false, Vec::new());
+        if runtime
+            .get(&key)
+            .is_some_and(|runtime| now.duration_since(runtime.last_seen_at) < self.heartbeat_timeout())
+        {
+            return false;
         }
         let mut observations = self.block_report_observations.write();
-        registrations.remove(&key);
+        registrations
+            .get_mut(&key)
+            .expect("validated worker registration")
+            .worker_run_id = None;
         runtime.remove(&key);
-        let removed_report = remove_worker_report(&mut observations, &key);
-        if let Some(report) = &removed_report {
-            if let Some(active) = &report.active {
-                affected_blocks.extend(active.ready_blocks.iter().copied());
-            }
-        }
+        remove_worker_report(&mut observations, &key);
         drop(observations);
         drop(runtime);
         drop(registrations);
 
-        let mut affected_blocks: Vec<_> = affected_blocks.into_iter().collect();
-        affected_blocks.sort_by_key(|block_id| (block_id.inode_id.as_raw(), block_id.index.as_raw()));
         self.notify_publication_observation_changed();
-        (true, affected_blocks)
+        true
     }
 
     /// Snapshot expired registrations with the run identity required for conditional removal.
@@ -1242,11 +993,11 @@ impl WorkerManager {
                     .get(*key)
                     .is_none_or(|runtime| now.duration_since(runtime.last_seen_at) >= timeout)
             })
-            .map(|(key, registration)| (key.clone(), registration.worker_run_id))
+            .filter_map(|(key, registration)| registration.worker_run_id.map(|run| (key.clone(), run)))
             .collect()
     }
 
-    /// List all live workers (based on runtime last_seen_ms), preserving group identity.
+    /// List all live workers (based on runtime last_seen_at), preserving group identity.
     pub fn list_live_workers(&self) -> Vec<WorkerRegistrationKey> {
         let runtime = self.runtime.read();
         let now = Instant::now();
@@ -1259,26 +1010,7 @@ impl WorkerManager {
             .collect()
     }
 
-    /// List current in-memory worker run registrations for runtime scans.
-    pub fn list_registered_workers(&self) -> Vec<WorkerRegistrationKey> {
-        let registrations = self.registrations.read();
-        registrations.keys().cloned().collect()
-    }
-
-    /// List live workers scoped to one metadata group.
-    pub fn list_live_workers_in_group(&self, group_name: &GroupName) -> Vec<WorkerId> {
-        let runtime = self.runtime.read();
-        let now = Instant::now();
-        let timeout = self.heartbeat_timeout();
-
-        runtime
-            .iter()
-            .filter(|(key, r)| &key.group_name == group_name && now.duration_since(r.last_seen_at) < timeout)
-            .map(|(key, _)| key.worker_id)
-            .collect()
-    }
-
-    /// Check if worker is live (based on runtime last_seen_ms).
+    /// Check if worker is live (based on runtime last_seen_at).
     pub fn is_worker_live(&self, group_name: &GroupName, worker_id: WorkerId) -> bool {
         let runtime = self.runtime.read();
         let now = Instant::now();
@@ -1293,58 +1025,29 @@ impl WorkerManager {
 
     /// Build the placement worker view from group-scoped registration and heartbeat state.
     pub fn collect_worker_placement_views(&self, group_name: &GroupName) -> Vec<WorkerPlacementView> {
-        let descriptors = self.descriptors.read();
         let registrations = self.registrations.read();
         let runtime = self.runtime.read();
         let now = Instant::now();
         let timeout = self.heartbeat_timeout();
 
         let mut views = Vec::new();
-        for (key, descriptor) in descriptors.iter().filter(|(key, _)| &key.group_name == group_name) {
-            let registration = registrations.get(key);
+        for (key, registration) in registrations.iter().filter(|(key, _)| &key.group_name == group_name) {
             let live = runtime.get(key);
-            let registered = registration.is_some();
-            let lease_valid = registered
+            let lease_valid = registration.worker_run_id.is_some()
                 && live
                     .map(|runtime| now.duration_since(runtime.last_seen_at) < timeout)
                     .unwrap_or(false);
             views.push(WorkerPlacementView {
-                group_name: key.group_name.clone(),
                 worker_id: key.worker_id,
-                worker_run_id: registration.map(|registration| registration.worker_run_id),
-                endpoint: descriptor.address.clone(),
-                worker_net_protocol: descriptor.worker_net_protocol,
-                registered,
+                worker_run_id: registration.worker_run_id,
+                endpoint: registration.address.clone(),
                 lease_valid,
-                ip: endpoint_host(&descriptor.address),
-                host: endpoint_host(&descriptor.address),
-                az: None,
-                rack: descriptor.fault_domain.clone(),
-                region: None,
+                host: endpoint_host(&registration.address),
                 tier_free: live.map(|runtime| runtime.tier_free.clone()).unwrap_or_default(),
             });
         }
         views.sort_by_key(|view| view.worker_id.as_raw());
         views
-    }
-
-    /// Get block locations for one metadata group (only live workers in that group).
-    pub fn get_block_locations(&self, group_name: &GroupName, block_id: BlockId) -> Vec<WorkerId> {
-        let live_workers = self.list_live_workers_in_group(group_name);
-        let live_set: HashSet<WorkerId> = live_workers.into_iter().collect();
-        let observations = self.block_report_observations.read();
-
-        observations
-            .locations
-            .get(&BlockLocationKey::new(group_name, block_id))
-            .map(|workers| {
-                workers
-                    .iter()
-                    .filter(|key| &key.group_name == group_name && live_set.contains(&key.worker_id))
-                    .map(|key| key.worker_id)
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     /// Return ready block-report locations with the report's worker run id.
@@ -1356,35 +1059,28 @@ impl WorkerManager {
 
         let mut reported = Vec::with_capacity(worker_keys.len());
         for key in worker_keys {
-            if &key.group_name != group_name {
-                continue;
-            }
-            let Some(report) = observations.reports.get(key) else {
-                continue;
-            };
+            let report = observations
+                .reports
+                .get(key)
+                .expect("location index must identify a report");
             let worker_run_id = report.worker_run_id;
-            let Some(active) = &report.active else {
-                continue;
-            };
-            let Some(block) = active.blocks.get(&block_id) else {
-                continue;
-            };
-            if block.block_state != BlockReportBlockState::Ready {
-                continue;
-            }
-            let Some(tier) = block.tier else {
-                continue;
-            };
+            let active = report
+                .active
+                .as_ref()
+                .expect("location index must identify an active report");
+            let block = active
+                .blocks
+                .get(&block_id)
+                .expect("location index must identify a block");
+            debug_assert_eq!(block.block_state, BlockReportBlockState::Ready);
+            let tier = block.tier.expect("Ready report has a validated tier");
             reported.push(ReportedBlockLocation {
                 tier,
-                group_name: group_name.clone(),
-                block_id,
                 durable_len: block.effective_len,
                 worker_id: key.worker_id,
                 worker_run_id,
             });
         }
-        reported.sort_by_key(|location| location.worker_id.as_raw());
         reported
     }
 
@@ -1406,9 +1102,9 @@ impl WorkerManager {
     /// Copies one bounded, stably ordered page from published Ready reports.
     ///
     /// Report changes may defer keys inserted at or before the cursor until the
-    /// next complete cycle. Registration and report guards are held together so
-    /// one page never pairs different Worker runs. The work budget counts each
-    /// emitted block and each visited worker that cannot emit a block, keeping
+    /// next complete cycle. Registration replacement removes reports under the
+    /// observation lock, so a page contains only current-run reports. The work
+    /// budget counts each emitted block and each worker that cannot emit a block, keeping
     /// scans bounded even when reports are not Ready.
     pub(crate) fn list_ready_replica_page(
         &self,
@@ -1423,22 +1119,8 @@ impl WorkerManager {
             ));
         }
 
-        if cursor.is_some_and(|cursor| {
-            cursor.worker_id > scan_end_worker_id
-                || (cursor.worker_id == scan_end_worker_id && cursor.block_id.is_none())
-        }) {
-            return Ok(ReadyReplicaPage {
-                replicas: Vec::new(),
-                next_cursor: None,
-            });
-        }
-        if cursor.is_some_and(|cursor| cursor.block_id.is_some() && cursor.worker_end_block_id.is_none()) {
-            return Err(MetadataError::Internal(
-                "ready replica cursor is missing its worker block end".to_string(),
-            ));
-        }
+        debug_assert!(!cursor.is_some_and(|cursor| cursor.block_id.is_some() && cursor.worker_end_block_id.is_none()));
 
-        let registrations = self.registrations.read();
         let observations = self.block_report_observations.read();
         let reports = &observations.reports;
         let start_worker_id = cursor
@@ -1461,13 +1143,8 @@ impl WorkerManager {
             let is_end_worker = worker_key.worker_id == scan_end_worker_id;
 
             let report_run_id = report.worker_run_id;
-            let current_run = registrations
-                .get(worker_key)
-                .map(|registration| registration.worker_run_id);
             let active = report.active.as_ref();
-            if !current_run.is_some_and(|run_id| run_id == report_run_id)
-                || active.is_none_or(|active| active.ready_blocks.is_empty())
-            {
+            if active.is_none_or(|active| active.ready_blocks.is_empty()) {
                 visited += 1;
                 if is_end_worker {
                     return Ok(ReadyReplicaPage {
@@ -1499,22 +1176,10 @@ impl WorkerManager {
             let lower_bound = after_block.map(Excluded).unwrap_or(Unbounded);
             let replicas_before_worker = replicas.len();
             for block_id in active.ready_blocks.range((lower_bound, Included(worker_end_block_id))) {
-                let Some(block) = active.blocks.get(block_id) else {
-                    return Err(MetadataError::Internal(format!(
-                        "Ready block index is missing report state for group_name={}, worker_id={}, block_id={}",
-                        group_name,
-                        worker_key.worker_id.as_raw(),
-                        block_id
-                    )));
-                };
-                if block.block_state != BlockReportBlockState::Ready {
-                    return Err(MetadataError::Internal(format!(
-                        "Ready block index contains non-Ready report state for group_name={}, worker_id={}, block_id={}",
-                        group_name,
-                        worker_key.worker_id.as_raw(),
-                        block_id
-                    )));
-                }
+                debug_assert!(active
+                    .blocks
+                    .get(block_id)
+                    .is_some_and(|block| block.block_state == BlockReportBlockState::Ready));
                 replicas.push(ReplicaKey {
                     group_name: group_name.clone(),
                     worker_id: worker_key.worker_id,
@@ -1591,16 +1256,13 @@ impl WorkerManager {
         let Some(registration) = registrations.get(&worker_key) else {
             return false;
         };
-        if registration.worker_run_id != replica.worker_run_id {
+        if registration.worker_run_id != Some(replica.worker_run_id) {
             return false;
         }
 
         let Some(report) = observations.reports.get(&worker_key) else {
             return false;
         };
-        if report.worker_run_id != replica.worker_run_id {
-            return false;
-        }
         let Some(active) = &report.active else {
             return false;
         };
@@ -1620,7 +1282,7 @@ impl WorkerManager {
     /// Check all newly visible write targets against one current worker view.
     ///
     /// This observation never becomes durable authority. Registration,
-    /// heartbeat, descriptor, and full-report guards remain held together while
+    /// heartbeat and full-report guards remain held together while
     /// every target is checked, and callers must recheck after every wakeup and
     /// immediately before proposing the visibility-changing Raft command.
     pub(crate) fn check_publish_ready(
@@ -1628,7 +1290,6 @@ impl WorkerManager {
         group_name: &GroupName,
         targets: &[PublishReadyTarget],
     ) -> PublishReadyStatus {
-        let descriptors = self.descriptors.read();
         let registrations = self.registrations.read();
         let runtime = self.runtime.read();
         let observations = self.block_report_observations.read();
@@ -1637,11 +1298,6 @@ impl WorkerManager {
 
         for expected in targets {
             let target = &expected.target;
-            if target.workers.is_empty() {
-                return PublishReadyStatus::Conflict(PublishReadyConflict::MissingWriteEndpoint {
-                    block_id: target.block_id,
-                });
-            }
 
             let mut conflict = None;
             let mut ready = false;
@@ -1656,22 +1312,17 @@ impl WorkerManager {
                     });
                     continue;
                 };
-                if registration.worker_run_id != endpoint.worker_run_id {
+                if registration.worker_run_id != Some(endpoint.worker_run_id) {
                     conflict = Some(PublishReadyConflict::WorkerRunMismatch {
                         block_id: target.block_id,
                         worker_id: endpoint.worker_id,
                         expected: endpoint.worker_run_id,
-                        current: Some(registration.worker_run_id),
+                        current: registration.worker_run_id,
                     });
                     continue;
                 }
 
-                let endpoint_matches = descriptors.get(&key).is_some_and(|descriptor| {
-                    descriptor.address == endpoint.endpoint
-                        && descriptor.worker_net_protocol == WORKER_NET_PROTOCOL_GRPC
-                }) && registration.address == endpoint.endpoint
-                    && registration.worker_net_protocol == WORKER_NET_PROTOCOL_GRPC;
-                if !endpoint_matches {
+                if registration.address != endpoint.endpoint {
                     conflict = Some(PublishReadyConflict::EndpointMismatch {
                         block_id: target.block_id,
                         worker_id: endpoint.worker_id,
@@ -1682,18 +1333,13 @@ impl WorkerManager {
                 let Some(worker_runtime) = runtime.get(&key) else {
                     continue;
                 };
-                if worker_runtime.worker_run_id != endpoint.worker_run_id
-                    || now.duration_since(worker_runtime.last_seen_at) >= timeout
-                {
+                if now.duration_since(worker_runtime.last_seen_at) >= timeout {
                     continue;
                 }
 
                 let Some(report) = observations.reports.get(&key) else {
                     continue;
                 };
-                if report.worker_run_id != endpoint.worker_run_id {
-                    continue;
-                }
                 let Some(active) = &report.active else {
                     continue;
                 };
@@ -1746,11 +1392,10 @@ impl WorkerManager {
 
 #[cfg(test)]
 mod tests {
-    //! Tests for worker manager and registration.
 
     use super::{
         BlockReportBlock, BlockReportBlockState, BlockReportChange, PublishReadyConflict, PublishReadyStatus,
-        PublishReadyTarget, WorkerLiveState, WorkerManager, WorkerRegistrationKey,
+        PublishReadyTarget, WorkerManager, WorkerRegistrationKey,
     };
     use crate::error::MetadataError;
     use crate::MetadataResult;
@@ -1759,6 +1404,16 @@ mod tests {
     use beryl_types::{ClientId, GroupName, LocatedBlock, Tier, TierFree, WorkerEndpointInfo, WorkerRunId};
     use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
+
+    impl WorkerManager {
+        pub(crate) fn get_block_locations(&self, group: &GroupName, block: BlockId) -> Vec<WorkerId> {
+            self.reported_block_locations(group, block)
+                .into_iter()
+                .filter(|location| self.is_worker_live(group, location.worker_id))
+                .map(|location| location.worker_id)
+                .collect()
+        }
+    }
 
     fn group_name(raw: &str) -> GroupName {
         GroupName::parse(raw).unwrap()
@@ -1798,9 +1453,12 @@ mod tests {
         worker_run_id: WorkerRunId,
         heartbeat_seq: u64,
         free_bytes: u64,
-    ) -> MetadataResult<WorkerLiveState> {
+    ) -> MetadataResult<u64> {
         let descriptor = manager
-            .get_descriptor(group_name, worker_id)
+            .registrations
+            .read()
+            .get(&WorkerRegistrationKey::new(group_name, worker_id))
+            .cloned()
             .expect("worker descriptor should be registered");
         manager.record_heartbeat_with_tier_free(
             group_name,
@@ -1808,7 +1466,6 @@ mod tests {
             worker_run_id,
             heartbeat_seq,
             &descriptor.address,
-            descriptor.worker_net_protocol,
             vec![TierFree {
                 tier: Tier::Hdd,
                 free_bytes,
@@ -1822,9 +1479,7 @@ mod tests {
         worker_id: WorkerId,
         run_id: WorkerRunId,
     ) {
-        manager
-            .register_worker_run(group_name, worker_id, "127.0.0.1:9090".to_string(), 1, run_id, None)
-            .unwrap();
+        manager.register_worker_run(group_name, worker_id, "127.0.0.1:9090".to_string(), run_id);
         record_heartbeat(manager, group_name, worker_id, run_id, 1, 900).unwrap();
     }
 
@@ -1847,7 +1502,6 @@ mod tests {
                     worker_run_id: run_id,
                 }],
                 fencing_token: FencingToken {
-                    block_id,
                     owner: ClientId::new(7),
                     epoch: LeaseEpoch::new(lease_epoch),
                 },
@@ -1997,16 +1651,12 @@ mod tests {
         ));
 
         let replacement_run: WorkerRunId = "550e8400-e29b-41d4-a716-446655440101".parse().unwrap();
-        manager
-            .register_worker_run(
-                &group_name_value,
-                worker_id,
-                "127.0.0.1:9090".to_string(),
-                1,
-                replacement_run,
-                None,
-            )
-            .unwrap();
+        manager.register_worker_run(
+            &group_name_value,
+            worker_id,
+            "127.0.0.1:9090".to_string(),
+            replacement_run,
+        );
         assert!(matches!(
             manager.check_publish_ready(&group_name_value, std::slice::from_ref(&target)),
             PublishReadyStatus::Conflict(PublishReadyConflict::WorkerRunMismatch { .. })
@@ -2147,6 +1797,7 @@ mod tests {
             .unwrap();
         assert_eq!(first_batch.next_batch_seq, 1);
         assert!(!first_batch.baseline_published);
+        assert_eq!((first_batch.added_count, first_batch.removed_count), (0, 1));
         assert_eq!(
             manager.get_block_locations(&group_name_value, report_block(0).block_id),
             vec![second_worker]
@@ -2159,10 +1810,12 @@ mod tests {
             .receive_full_block_report(&group_name_value, worker_id, run_id, 8, 0, false, vec![report_block(1)])
             .unwrap();
         assert_eq!(replay.next_batch_seq, 1);
+        assert_eq!((replay.added_count, replay.removed_count), (0, 0));
         let published = manager
             .receive_full_block_report(&group_name_value, worker_id, run_id, 8, 1, true, vec![report_block(2)])
             .unwrap();
         assert!(published.baseline_published);
+        assert_eq!((published.added_count, published.removed_count), (2, 0));
         assert_eq!(
             manager.get_block_locations(&group_name_value, report_block(1).block_id),
             vec![worker_id]
@@ -2286,22 +1939,15 @@ mod tests {
             vec![worker_id]
         );
 
-        manager
-            .register_worker_run(
-                &group_name_value,
-                worker_id,
-                "127.0.0.1:9090".to_string(),
-                1,
-                second_run_id,
-                None,
-            )
-            .unwrap();
+        manager.register_worker_run(
+            &group_name_value,
+            worker_id,
+            "127.0.0.1:9090".to_string(),
+            second_run_id,
+        );
 
         assert_eq!(
-            manager
-                .get_registration(&group_name_value, worker_id)
-                .unwrap()
-                .worker_run_id,
+            manager.get_registered_run(&group_name_value, worker_id).unwrap(),
             second_run_id
         );
         assert!(!manager.is_worker_live(&group_name_value, worker_id));
@@ -2353,15 +1999,9 @@ mod tests {
 
         let (candidate, expected_run_id) = manager.list_expired_worker_runs().pop().unwrap();
         record_heartbeat(&manager, &group, worker_id, run_id, 2, 900).unwrap();
-        assert_eq!(
-            manager.remove_dead_worker(&candidate.group_name, candidate.worker_id, expected_run_id),
-            (false, Vec::new())
-        );
+        assert!(!manager.remove_dead_worker(&candidate.group_name, candidate.worker_id, expected_run_id));
 
-        assert_eq!(
-            manager.get_registration(&group, worker_id).unwrap().worker_run_id,
-            run_id
-        );
+        assert_eq!(manager.get_registered_run(&group, worker_id).unwrap(), run_id);
         assert!(manager.is_worker_live(&group, worker_id));
         assert_eq!(
             manager.get_block_locations(&group, report_block(0).block_id),
@@ -2376,22 +2016,12 @@ mod tests {
         let worker_id = WorkerId::new(1);
         let first_run = report_run_id();
         let second_run = "550e8400-e29b-41d4-a716-446655440101".parse().unwrap();
-        manager
-            .register_worker_run(&group, worker_id, "127.0.0.1:9090".into(), 1, first_run, None)
-            .unwrap();
+        manager.register_worker_run(&group, worker_id, "127.0.0.1:9090".into(), first_run);
         let (candidate, expected_run_id) = manager.list_expired_worker_runs().pop().unwrap();
 
-        manager
-            .register_worker_run(&group, worker_id, "127.0.0.1:9090".into(), 1, second_run, None)
-            .unwrap();
-        assert_eq!(
-            manager.remove_dead_worker(&candidate.group_name, candidate.worker_id, expected_run_id),
-            (false, Vec::new())
-        );
-        assert_eq!(
-            manager.get_registration(&group, worker_id).unwrap().worker_run_id,
-            second_run
-        );
+        manager.register_worker_run(&group, worker_id, "127.0.0.1:9090".into(), second_run);
+        assert!(!manager.remove_dead_worker(&candidate.group_name, candidate.worker_id, expected_run_id));
+        assert_eq!(manager.get_registered_run(&group, worker_id).unwrap(), second_run);
     }
 
     #[test]
@@ -2401,22 +2031,19 @@ mod tests {
         let worker_id = WorkerId::new(1);
         let run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440040".parse().unwrap();
 
-        manager
-            .register_worker_run(
-                &group_name_value,
-                worker_id,
-                "127.0.0.1:9090".to_string(),
-                1,
-                run_id,
-                Some("rack-a".to_string()),
-            )
-            .unwrap();
+        manager.register_worker_run(&group_name_value, worker_id, "127.0.0.1:9090".to_string(), run_id);
 
-        let first = record_heartbeat(&manager, &group_name_value, worker_id, run_id, 10, 900).unwrap();
-        assert_eq!(first.heartbeat_seq, 10);
+        record_heartbeat(&manager, &group_name_value, worker_id, run_id, 10, 900).unwrap();
+        assert_eq!(
+            manager.runtime.read()[&WorkerRegistrationKey::new(&group_name_value, worker_id)].heartbeat_seq,
+            10
+        );
 
-        let stale = record_heartbeat(&manager, &group_name_value, worker_id, run_id, 9, 1_000).unwrap();
-        assert_eq!(stale.heartbeat_seq, 10);
+        record_heartbeat(&manager, &group_name_value, worker_id, run_id, 9, 1_000).unwrap();
+        assert_eq!(
+            manager.runtime.read()[&WorkerRegistrationKey::new(&group_name_value, worker_id)].heartbeat_seq,
+            10
+        );
 
         let mut runtime = manager.runtime.write();
         let worker = runtime
@@ -2432,8 +2059,11 @@ mod tests {
         worker.last_seen_at = Instant::now() - Duration::from_secs(61);
         drop(runtime);
 
-        let renewed = record_heartbeat(&manager, &group_name_value, worker_id, run_id, 9, 1_000).unwrap();
-        assert_eq!(renewed.heartbeat_seq, 9);
+        record_heartbeat(&manager, &group_name_value, worker_id, run_id, 9, 1_000).unwrap();
+        assert_eq!(
+            manager.runtime.read()[&WorkerRegistrationKey::new(&group_name_value, worker_id)].heartbeat_seq,
+            9
+        );
         let views = manager.collect_worker_placement_views(&group_name_value);
         assert!(views[0].lease_valid);
         assert_eq!(

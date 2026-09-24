@@ -9,7 +9,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "metadata/filesystem.proto",
         "metadata/worker.proto",
         "worker/data.proto",
-        "worker/data_header.proto",
         "worker/block_meta.proto",
     ];
     for proto in &protos {

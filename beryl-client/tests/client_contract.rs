@@ -6,7 +6,9 @@ mod support;
 use beryl_client::{
     ClientConfig, ClientError, ClientErrorKind, DeleteOptions, FsClient, ListStatusOptions, MkdirOptions,
 };
-use beryl_common::error::rpc::{ErrorKind, InternalErrorKind, MetadataErrorKind, RefreshHint, RpcErrorDetail};
+use beryl_common::error::rpc::{
+    ErrorKind, InternalErrorKind, MetadataErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind,
+};
 use beryl_common::header::{HEADER_PRE_HANDLER_REJECTION, PRE_HANDLER_REJECTION_RPC_CONCURRENCY};
 use beryl_proto::common::{
     BlockIdProto, ClientIdProto, FencingTokenProto, GroupStateWatermarkProto, RaftLogIdProto, TierProto,
@@ -32,8 +34,10 @@ use tonic::{Code, Status};
 
 const WORKER_RUN_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn malformed_directory_status_reports_unknown_outcome_without_replaying_creation() {
+    let recorder = OutcomeRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
     let metadata = MockMetadata::new(MetadataScript {
         create_directory: VecDeque::from([
             MetadataReply::success(CreateDirectoryResponseProto::default()),
@@ -45,7 +49,7 @@ async fn malformed_directory_status_reports_unknown_outcome_without_replaying_cr
         ..Default::default()
     });
     let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 3)).unwrap();
+    let client = FsClient::new(client_config(server.endpoint(), 3));
     for create_parent in [false, true] {
         let before = metadata.calls().len();
         let error = client
@@ -55,6 +59,7 @@ async fn malformed_directory_status_reports_unknown_outcome_without_replaying_cr
         assert_eq!(error.kind(), ClientErrorKind::InvalidResponse);
         assert!(error.is_outcome_unknown());
         assert_eq!(metadata.calls().len(), before + 1);
+        assert_eq!(recorder.count(), before as u64 + 1);
     }
     server.shutdown().await;
 }
@@ -65,7 +70,7 @@ async fn reader_queries_actual_ranges_reuses_locations_and_refreshes_failures() 
         reads: VecDeque::from([
             ReadReply::Data(Bytes::from_static(b"abcdefgh")),
             ReadReply::Data(Bytes::from_static(b"abcdefgh")),
-            ReadReply::RefreshMetadata,
+            ReadReply::RefreshMetadata(WorkerErrorKind::BlockLocationUnavailable),
             ReadReply::Data(Bytes::from_static(b"abcdefgh")),
             ReadReply::Data(Bytes::from_static(b"ABCDEFGH")),
         ]),
@@ -91,7 +96,7 @@ async fn reader_queries_actual_ranges_reuses_locations_and_refreshes_failures() 
         ..Default::default()
     });
     let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 2)).unwrap();
+    let client = FsClient::new(client_config(server.endpoint(), 2));
     let mut reader = client.open("/file").await.unwrap();
     assert_eq!(metadata.calls().len(), 1);
     assert!(calls_for(&metadata.calls(), "GetBlockLocations").is_empty());
@@ -153,7 +158,7 @@ async fn successful_worker_retry_preserves_layout() {
         ..Default::default()
     });
     let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 2)).unwrap();
+    let client = FsClient::new(client_config(server.endpoint(), 2));
     let reader = client.open("/file").await.unwrap();
     assert_eq!(reader.read_range(0..1).await.unwrap(), b"a"[..]);
     assert_eq!(reader.read_range(1..2).await.unwrap(), b"b"[..]);
@@ -193,7 +198,7 @@ async fn exhausted_transport_retries_allow_the_next_read_to_find_a_replacement()
         ..Default::default()
     });
     let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    let client = FsClient::new(client_config(server.endpoint(), 1));
     let reader = client.open("/file").await.unwrap();
     assert_eq!(reader.read_range(0..1).await.unwrap(), b"a"[..]);
     assert_eq!(
@@ -215,7 +220,7 @@ async fn stale_worker_location_is_evicted_even_on_the_final_attempt() {
     let worker = MockWorker::new(WorkerScript {
         reads: VecDeque::from([
             ReadReply::Data(data.clone()),
-            ReadReply::RefreshMetadata,
+            ReadReply::RefreshMetadata(WorkerErrorKind::RunMismatch),
             ReadReply::Data(data),
         ]),
         ..Default::default()
@@ -228,7 +233,7 @@ async fn stale_worker_location_is_evicted_even_on_the_final_attempt() {
         ..Default::default()
     });
     let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    let client = FsClient::new(client_config(server.endpoint(), 1));
     let reader = client.open("/file").await.unwrap();
     assert_eq!(reader.read_range(0..1).await.unwrap(), b"a"[..]);
     reader
@@ -278,7 +283,7 @@ async fn old_failed_read_preserves_concurrently_replaced_layout() {
         ..Default::default()
     });
     let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    let client = FsClient::new(client_config(server.endpoint(), 1));
     let reader = client.open("/file").await.unwrap();
     let old_read = async { reader.read_range(0..1).await };
     let replace_layout = async {
@@ -315,7 +320,7 @@ async fn open_rejects_missing_file_state_and_directory_status() {
         ..Default::default()
     });
     let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    let client = FsClient::new(client_config(server.endpoint(), 1));
     for _ in 0..3 {
         client
             .open("/file")
@@ -328,7 +333,7 @@ async fn open_rejects_missing_file_state_and_directory_status() {
 
 #[tokio::test]
 async fn list_status_validates_options_and_drains_the_final_page() {
-    let client = FsClient::new(client_config("127.0.0.1:1", 1)).expect("client");
+    let client = FsClient::new(client_config("127.0.0.1:1", 1));
 
     let error = match client
         .list_status_with_options("/alpha", ListStatusOptions { page_size: Some(0) })
@@ -348,7 +353,6 @@ async fn list_status_validates_options_and_drains_the_final_page() {
                     status: Some(file_status(1, 0)),
                 }],
                 next_cursor: vec![1],
-                eof: false,
                 ..Default::default()
             }),
             MetadataReply::status(Status::unavailable("page request failed")),
@@ -357,14 +361,13 @@ async fn list_status_validates_options_and_drains_the_final_page() {
                     name: "last".into(),
                     status: Some(file_status(1, 0)),
                 }],
-                eof: true,
                 ..Default::default()
             }),
         ]),
         ..MetadataScript::default()
     });
     let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 1)).expect("client");
+    let client = FsClient::new(client_config(server.endpoint(), 1));
     let mut entries = client.list_status("/alpha").await.expect("first page");
     assert_eq!(entries.next().await.unwrap().unwrap().path(), Some("/alpha/first"));
     entries.next().await.expect_err("failed page remains retryable");
@@ -391,7 +394,7 @@ async fn metadata_read_retries_reuse_one_identity_and_deadline() {
         ..MetadataScript::default()
     });
     let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 3)).expect("client");
+    let client = FsClient::new(client_config(server.endpoint(), 3));
 
     let status = client.get_status("/alpha").await.expect("third attempt succeeds");
     assert_eq!(status.len(), 10);
@@ -403,8 +406,10 @@ async fn metadata_read_retries_reuse_one_identity_and_deadline() {
     server.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn metadata_mutations_retry_only_when_the_public_operation_is_replayable() {
+    let recorder = OutcomeRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
     let metadata = MockMetadata::new(MetadataScript {
         create_file: VecDeque::from([
             MetadataReply::status(Status::unavailable("CreateFile transport ambiguity")),
@@ -432,13 +437,18 @@ async fn metadata_mutations_retry_only_when_the_public_operation_is_replayable()
         ..MetadataScript::default()
     });
     let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 3)).expect("client");
+    let client = FsClient::new(client_config(server.endpoint(), 3));
 
     let _writer = client.create("/created").await.expect("CreateFile safely replays");
     client
         .mkdirs("/parent/child")
         .await
         .expect("recursive mkdirs safely replays");
+    assert_eq!(
+        recorder.count(),
+        0,
+        "successful internal retries have no unknown outcome"
+    );
 
     let append = client
         .append("/created")
@@ -460,6 +470,7 @@ async fn metadata_mutations_retry_only_when_the_public_operation_is_replayable()
         .await
         .expect_err("Rename ambiguity fails closed");
     assert!(rename.is_outcome_unknown());
+    assert_eq!(recorder.count(), 4, "one event per failed SDK call");
 
     let calls = metadata.calls();
     let create_calls = calls_for(&calls, "CreateFile");
@@ -489,27 +500,25 @@ async fn stale_metadata_refreshes_with_a_child_call_and_carries_new_authority() 
             MetadataReply::SuccessWithAuthority(
                 status_response(10),
                 ResponseAuthority {
-                    state: vec![state_nine.clone()],
-                    mount_epoch: Some(31),
-                    route_epoch: Some(41),
+                    state: Some(state_nine),
                 },
             ),
             MetadataReply::success(status_response(10)),
         ]),
-        msync: VecDeque::from([MetadataReply::success(MsyncResponseProto {
-            state: Some(state_one),
-            ..MsyncResponseProto::default()
-        })]),
+        msync: VecDeque::from([MetadataReply::SuccessWithAuthority(
+            MsyncResponseProto::default(),
+            ResponseAuthority { state: Some(state_one) },
+        )]),
         ..MetadataScript::default()
     });
     let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 2)).expect("client");
+    let client = FsClient::new(client_config(server.endpoint(), 2));
 
     client.get_status("/alpha").await.expect("refresh retry succeeds");
     client
-        .get_status("/alpha")
+        .get_status("/beta")
         .await
-        .expect("next operation carries authority");
+        .expect("another path carries root authority");
 
     let calls = metadata.calls();
     assert_methods(&calls, &["GetStatus", "Msync", "GetStatus", "GetStatus"]);
@@ -517,17 +526,54 @@ async fn stale_metadata_refreshes_with_a_child_call_and_carries_new_authority() 
     assert_ne!(call_id(&calls[0]), call_id(&calls[1]));
     assert_eq!(calls[0].header.deadline_ms, calls[1].header.deadline_ms);
     assert_eq!(calls[0].header.deadline_ms, calls[2].header.deadline_ms);
-    assert!(calls[0].header.state.is_empty());
+    assert!(calls[0].header.state.is_none());
     assert_eq!(
-        calls[2].header.state[0].state_id.as_ref().map(|state| state.index),
+        calls[2]
+            .header
+            .state
+            .as_ref()
+            .unwrap()
+            .state_id
+            .map(|state| state.index),
         Some(1)
     );
-    assert_eq!(calls[3].header.mount_epoch, Some(31));
-    assert_eq!(calls[3].header.route_epoch, Some(41));
+
     assert_eq!(
-        calls[3].header.state[0].state_id.as_ref().map(|state| state.index),
+        calls[3]
+            .header
+            .state
+            .as_ref()
+            .unwrap()
+            .state_id
+            .map(|state| state.index),
         Some(9)
     );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn msync_without_a_watermark_stops_the_stale_metadata_retry() {
+    let metadata = MockMetadata::new(MetadataScript {
+        get_status: VecDeque::from([
+            MetadataReply::error(RpcErrorDetail::refresh_metadata(
+                ErrorKind::Metadata(MetadataErrorKind::StaleState),
+                RefreshHint::default(),
+                "scripted stale state",
+            )),
+            MetadataReply::success(status_response(10)),
+        ]),
+        msync: VecDeque::from([MetadataReply::success(MsyncResponseProto::default())]),
+        ..MetadataScript::default()
+    });
+    let server = metadata.start().await;
+    let client = FsClient::new(client_config(server.endpoint(), 2));
+
+    let error = client.get_status("/alpha").await.expect_err("Msync needs authority");
+    assert_eq!(error.kind(), ClientErrorKind::InvalidResponse);
+    assert_methods(&metadata.calls(), &["GetStatus", "Msync"]);
+
+    client.get_status("/beta").await.expect("independent operation");
+    assert!(metadata.calls()[2].header.state.is_none());
     server.shutdown().await;
 }
 
@@ -535,7 +581,7 @@ async fn stale_metadata_refreshes_with_a_child_call_and_carries_new_authority() 
 async fn reader_replans_without_advancing_position_and_rejects_local_bounds_before_io() {
     let worker = MockWorker::new(WorkerScript {
         reads: VecDeque::from([
-            ReadReply::RefreshMetadata,
+            ReadReply::RefreshMetadata(WorkerErrorKind::RunMismatch),
             ReadReply::Data(Bytes::from_static(b"abcdefgh")),
             ReadReply::Data(Bytes::from_static(b"abcdefgh")),
             ReadReply::Data(Bytes::from_static(b"abcdefgh")),
@@ -566,7 +612,7 @@ async fn reader_replans_without_advancing_position_and_rejects_local_bounds_befo
         .read_range_limit(8)
         .build()
         .expect("reader config");
-    let client = FsClient::new(config).expect("client");
+    let client = FsClient::new(config);
 
     let mut reader = client.open("/alpha").await.expect("open reader");
     let mut sequential = [0u8; 4];
@@ -628,7 +674,7 @@ async fn malformed_create_and_allocate_block_successes_fail_closed_before_worker
         ..MetadataScript::default()
     });
     let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 1)).expect("client");
+    let client = FsClient::new(client_config(server.endpoint(), 1));
 
     for field in [
         "block_size must be non-zero",
@@ -661,9 +707,11 @@ async fn malformed_create_and_allocate_block_successes_fail_closed_before_worker
     server.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn ambiguous_commit_response_can_only_be_recovered_by_the_same_close() {
     for internal in [false, true] {
+        let recorder = OutcomeRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let first_reply = if internal {
             MetadataReply::error(RpcErrorDetail::fail(
                 ErrorKind::Internal(InternalErrorKind::Internal),
@@ -691,7 +739,7 @@ async fn ambiguous_commit_response_can_only_be_recovered_by_the_same_close() {
             ..MetadataScript::default()
         });
         let server = metadata.start().await;
-        let client = FsClient::new(client_config(server.endpoint(), 1)).expect("client");
+        let client = FsClient::new(client_config(server.endpoint(), 1));
         let mut writer = client.create("/commit").await.expect("writer");
 
         let error = writer.close().await.expect_err("unconfirmed commit");
@@ -701,12 +749,15 @@ async fn ambiguous_commit_response_can_only_be_recovered_by_the_same_close() {
             (ClientErrorKind::InvalidResponse, "committed_len")
         };
         assert_client_error(&error, kind, true, message);
+        assert_eq!(recorder.count(), 1);
         let error = writer
             .close()
             .await
             .expect_err("missing evidence cannot erase prior ambiguity");
         assert!(error.is_outcome_unknown());
+        assert_eq!(recorder.count(), 2);
         writer.close().await.expect("frozen close retry succeeds");
+        assert_eq!(recorder.count(), 2, "successful resolution adds no unknown event");
 
         let metadata_calls = metadata.calls();
         let calls = calls_for(&metadata_calls, "CommitFile");
@@ -716,8 +767,10 @@ async fn ambiguous_commit_response_can_only_be_recovered_by_the_same_close() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn malformed_sync_response_blocks_new_writes_until_the_same_sync_resolves() {
+    let recorder = OutcomeRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
     let worker = MockWorker::new(WorkerScript {
         writes: VecDeque::from([WriteReply::Success]),
         ..WorkerScript::default()
@@ -750,7 +803,7 @@ async fn malformed_sync_response_blocks_new_writes_until_the_same_sync_resolves(
         ..MetadataScript::default()
     });
     let metadata_server = metadata.start().await;
-    let client = FsClient::new(client_config(metadata_server.endpoint(), 1)).expect("client");
+    let client = FsClient::new(client_config(metadata_server.endpoint(), 1));
     let mut writer = client.create("/sync").await.expect("writer");
     writer.write_all(b"abc").await.expect("write");
 
@@ -762,6 +815,7 @@ async fn malformed_sync_response_blocks_new_writes_until_the_same_sync_resolves(
     assert_client_error(&stale, ClientErrorKind::StaleHandle, false, "unresolved SyncWrite");
     writer.sync().await.expect("frozen sync retry succeeds");
     writer.abort().await.expect("abort resolved writer");
+    assert_eq!(recorder.count(), 2, "each malformed publication is counted once");
 
     let metadata_calls = metadata.calls();
     let calls = calls_for(&metadata_calls, "SyncWrite");
@@ -785,7 +839,7 @@ async fn malformed_lease_renewal_invalidates_the_writer_for_new_side_effects() {
         ..MetadataScript::default()
     });
     let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 1)).expect("client");
+    let client = FsClient::new(client_config(server.endpoint(), 1));
     let mut writer = client.create("/renew").await.expect("writer");
 
     let error = writer.renew_lease().await.expect_err("invalid renewal response");
@@ -812,7 +866,7 @@ async fn worker_failure_after_ack_invalidates_the_writer_and_prevents_commit() {
         ..MetadataScript::default()
     });
     let metadata_server = metadata.start().await;
-    let client = FsClient::new(client_config(metadata_server.endpoint(), 1)).expect("client");
+    let client = FsClient::new(client_config(metadata_server.endpoint(), 1));
     let mut writer = client.create("/worker-failure").await.expect("writer");
 
     let first = match writer.write_all(b"abc").await {
@@ -858,15 +912,11 @@ async fn allocation_replay_and_worker_capacity_retries_keep_the_same_block() {
         ..MetadataScript::default()
     });
     let metadata_server = metadata.start().await;
-    let client = FsClient::new(client_config(metadata_server.endpoint(), 3)).expect("client");
+    let client = FsClient::new(client_config(metadata_server.endpoint(), 3));
     let mut writer = client.create("/capacity").await.expect("writer");
 
     let error = writer.write_all(b"x").await.expect_err("capacity attempts exhausted");
     assert_client_error(&error, ClientErrorKind::ResourceExhausted, false, "capacity exhausted");
-    writer
-        .write_all(&[])
-        .await
-        .expect("definite pre-side-effect rejection leaves writer open");
     assert_eq!(worker.write_calls(), 3);
     assert_eq!(worker.write_data_frames(), 0);
     writer.write_all(b"12345678").await.expect("capacity recovered");
@@ -909,7 +959,7 @@ async fn capacity_retry_deadline_preserves_the_unmodified_write_session() {
         .operation_timeout(Duration::from_secs(1))
         .build()
         .unwrap();
-    let client = FsClient::new(config).unwrap();
+    let client = FsClient::new(config);
     let mut writer = client.create("/capacity-deadline").await.unwrap();
     let error = writer.write(b"unaccepted").await.unwrap_err();
     assert_eq!(error.kind(), ClientErrorKind::Timeout);
@@ -957,7 +1007,7 @@ async fn cancelled_write_opening_rejects_further_writes_without_accepting_bytes(
             ..Default::default()
         });
         let server = metadata.start().await;
-        let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+        let client = FsClient::new(client_config(server.endpoint(), 1));
         let mut writer = client.create("/cancel-opening").await.unwrap();
         tokio::select! {
             result = writer.write(b"old") => panic!("opening must wait: {result:?}"),
@@ -1000,7 +1050,7 @@ async fn cancelled_flush_blocks_later_writes_and_publication() {
         ..Default::default()
     });
     let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    let client = FsClient::new(client_config(server.endpoint(), 1));
     let mut writer = client.create("/cancel-flush").await.unwrap();
     writer.write_all(b"abc").await.unwrap();
     tokio::select! {
@@ -1070,7 +1120,7 @@ async fn cancelled_publications_replay_frozen_requests_and_reject_other_operatio
         }
         let metadata = MockMetadata::new(script);
         let server = metadata.start().await;
-        let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+        let client = FsClient::new(client_config(server.endpoint(), 1));
         let mut writer = client.create("/cancel-publication").await.unwrap();
         tokio::select! {
             result = writer_barrier(&mut writer, method) => panic!("publication must wait: {result:?}"),
@@ -1116,7 +1166,7 @@ async fn cancelled_renewal_blocks_further_writes_and_publication() {
         ..Default::default()
     });
     let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    let client = FsClient::new(client_config(server.endpoint(), 1));
     let mut writer = client.create("/cancel-renewal").await.unwrap();
     writer.write_all(b"abc").await.unwrap();
     tokio::select! {
@@ -1159,7 +1209,7 @@ async fn cancelled_close_retries_frozen_identity_with_a_new_deadline() {
         .operation_timeout(Duration::from_secs(1))
         .build()
         .unwrap();
-    let client = FsClient::new(config).unwrap();
+    let client = FsClient::new(config);
     let mut writer = client.create("/close-deadline").await.unwrap();
     tokio::select! {
         result = writer.close() => panic!("commit must wait: {result:?}"),
@@ -1200,7 +1250,7 @@ async fn failed_next_block_preserves_exact_accepted_prefix() {
         ..Default::default()
     });
     let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    let client = FsClient::new(client_config(server.endpoint(), 1));
     let mut writer = client.create("/partial-write").await.unwrap();
     let error = writer.write_all(b"abcdef").await.unwrap_err();
     assert_eq!(error.kind(), ClientErrorKind::InvalidResponse);
@@ -1231,7 +1281,7 @@ async fn dropping_writer_cancels_stream_without_finishing_or_committing() {
         ..Default::default()
     });
     let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    let client = FsClient::new(client_config(server.endpoint(), 1));
     let mut writer = client.create("/drop-writer").await.unwrap();
     writer.write_all(b"abc").await.unwrap();
     drop(writer);
@@ -1266,7 +1316,7 @@ async fn cancelling_write_all_at_block_boundary_keeps_only_accepted_prefix() {
         ..Default::default()
     });
     let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    let client = FsClient::new(client_config(server.endpoint(), 1));
     let mut writer = client.create("/cancel-write-all").await.unwrap();
     tokio::select! {
         result = writer.write_all(b"abcdef") => panic!("block completion must wait: {result:?}"),
@@ -1311,8 +1361,7 @@ async fn flush_timeout_blocks_later_publication() {
             .operation_timeout(Duration::from_secs(1))
             .build()
             .unwrap(),
-    )
-    .unwrap();
+    );
     let mut writer = client.create("/flush-deadline").await.unwrap();
     writer.write_all(b"abc").await.unwrap();
     let error = {
@@ -1369,7 +1418,7 @@ async fn empty_ranges_bounds_and_local_seeks_do_not_perform_io() {
         .read_range_limit(8)
         .build()
         .unwrap();
-    let client = FsClient::new(config).unwrap();
+    let client = FsClient::new(config);
     let mut reader = client.open("/file").await.unwrap();
     for range in [0..0, 4..4, 16..16] {
         assert!(reader.read_range(range).await.unwrap().is_empty());
@@ -1441,7 +1490,7 @@ async fn cold_and_warm_streams_deliver_current_block_before_later_failure() {
                 ..Default::default()
             });
             let server = metadata.start().await;
-            let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+            let client = FsClient::new(client_config(server.endpoint(), 1));
             let mut reader = client.open("/file").await.unwrap();
             if warm {
                 assert_eq!(reader.read_range(..=0).await.unwrap(), b"a"[..]);
@@ -1522,7 +1571,7 @@ async fn cancelled_waits_retain_io_and_bytes_while_seek_and_drop_release_them() 
         ..Default::default()
     });
     let server = metadata.start().await;
-    let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+    let client = FsClient::new(client_config(server.endpoint(), 1));
     let mut reader = client.open("/file").await.unwrap();
     let mut output = [42; 4];
     tokio::select! {
@@ -1616,7 +1665,7 @@ async fn malformed_worker_streams_never_deliver_data_or_eof() {
             ..Default::default()
         });
         let server = metadata.start().await;
-        let client = FsClient::new(client_config(server.endpoint(), 1)).unwrap();
+        let client = FsClient::new(client_config(server.endpoint(), 1));
         let mut reader = client.open("/file").await.unwrap();
         let mut output = [42; 4];
         let error = reader.read(&mut output).await.unwrap_err();
@@ -1641,7 +1690,7 @@ async fn complete_range_shares_deadline_across_chunks_and_retries() {
     let worker = MockWorker::new(WorkerScript {
         reads: VecDeque::from([
             ReadReply::Chunks(vec![Ok(Bytes::from_static(b"a")), Ok(Bytes::from_static(b"bc"))]),
-            ReadReply::RefreshMetadata,
+            ReadReply::RefreshMetadata(WorkerErrorKind::RunMismatch),
             ReadReply::Data(Bytes::from_static(b"abcd")),
             ReadReply::Data(Bytes::from_static(b"efgh")),
             ReadReply::Data(Bytes::from_static(b"efgh")),
@@ -1670,7 +1719,7 @@ async fn complete_range_shares_deadline_across_chunks_and_retries() {
         .max_attempts(2)
         .build()
         .unwrap();
-    let client = FsClient::new(config).unwrap();
+    let client = FsClient::new(config);
     let reader = client.open("/file").await.unwrap();
     assert_eq!(reader.read_range(..).await.unwrap(), b"abcdefgh"[..]);
     assert_eq!(reader.position(), 0);
@@ -1723,7 +1772,7 @@ async fn cancelling_a_wait_does_not_reset_its_deadline() {
         .operation_timeout(Duration::from_secs(1))
         .build()
         .unwrap();
-    let client = FsClient::new(config).unwrap();
+    let client = FsClient::new(config);
     let mut reader = client.open("/file").await.unwrap();
     let mut output = [42; 4];
     tokio::select! {
@@ -1814,7 +1863,6 @@ fn block_location(
         len,
         workers: vec![worker(worker_endpoint)],
         block_size: 64 * 1024 * 1024,
-        effective_len: len,
     }
 }
 
@@ -1835,7 +1883,6 @@ fn write_target(
 
         workers: vec![worker(worker_endpoint)],
         fencing_token: Some(FencingTokenProto {
-            block_id: Some(block_id),
             owner: Some(ClientIdProto { high: 0, low: 7 }),
             epoch: 1,
         }),
@@ -1928,5 +1975,39 @@ fn file_status(inode_id: u64, len: u64) -> beryl_proto::metadata::FileStatusProt
         kind: FileTypeProto::FileTypeFile as i32,
         create_time: 11,
         modify_time: 12,
+    }
+}
+
+/// Thread-local capture for tests running on a current-thread Tokio runtime.
+#[derive(Default)]
+struct OutcomeRecorder {
+    unknown: std::sync::Arc<metrics::atomics::AtomicU64>,
+}
+
+impl OutcomeRecorder {
+    fn count(&self) -> u64 {
+        self.unknown.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl metrics::Recorder for OutcomeRecorder {
+    fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+    fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+    fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        if key.name() == "beryl_client_unknown_outcomes_total" {
+            metrics::Counter::from_arc(std::sync::Arc::clone(&self.unknown))
+        } else {
+            metrics::Counter::noop()
+        }
+    }
+
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+
+    fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+        metrics::Histogram::noop()
     }
 }

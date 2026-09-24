@@ -8,32 +8,21 @@ package worker;
 import "common/common.proto";
 
 message BlockMetaPayloadProto {
-  BlockIdentityProto identity = 1;
+  common.BlockIdProto block_id = 1;
   // Immutable logical capacity; the enclosing local header versions this encoding.
   uint64 block_size = 2;
-  BlockSourceProto source = 3;
-  BlockVisibilityProto visibility = 4;
+  uint64 durable_len = 3;
+  BlockStateProto block_state = 4;
   // Worker-local tier where this replica was materialized.
   common.TierProto tier = 5;
-}
+  // Persisted writer fencing scoped to block_id.
+  common.FencingTokenProto fencing_token = 6;
+  string group_name = 7;
 
-message BlockIdentityProto {
-  common.BlockIdProto block_id = 1;
-  string group_name = 2;
-}
-
-message BlockSourceProto {
-  uint64 durable_len = 1;
-}
-
-message BlockVisibilityProto {
-  BlockStateProto block_state = 1;
-  common.FencingTokenProto fencing_token = 2;
 }
 
 enum BlockStateProto {
   BLOCK_STATE_UNSPECIFIED = 0;
   BLOCK_STATE_READY = 1;
-  BLOCK_STATE_CORRUPT = 2;
-  BLOCK_STATE_DELETING = 3;
+  BLOCK_STATE_DELETING = 2;
 }

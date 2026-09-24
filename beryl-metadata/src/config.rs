@@ -7,11 +7,9 @@ use crate::raft::{
     MAX_RECLAIM_DETACHED_ROOT_BATCH_BYTES, MAX_RECLAIM_DETACHED_ROOT_CANDIDATES, MAX_RECLAIM_DETACHED_ROOT_ENTRIES,
     MIN_RECLAIM_DETACHED_ROOT_BATCH_BYTES,
 };
-use crate::readiness::RootReadinessConfig;
 use beryl_common::config::{format_host_port, load_from_yaml_file, validate_public_host, FlatConfig};
 use beryl_common::error::{CommonError, CommonErrorKind};
 use beryl_common::grpc_server::MAX_GRPC_CONCURRENT_REQUESTS;
-use beryl_common::observe::config::LogConfig;
 use beryl_common::observe::ObservabilityConfig;
 use beryl_types::{GroupName, MAX_FILE_BLOCKS};
 use std::net::{IpAddr, SocketAddr};
@@ -47,11 +45,7 @@ const NAMESPACE_DELETE_MAX_ENTRIES: &str = "beryl.metadata.namespace.delete.batc
 const NAMESPACE_DELETE_MAX_SIZE: &str = "beryl.metadata.namespace.delete.batch.max-size";
 const NAMESPACE_DELETE_RETRY_INITIAL_BACKOFF: &str = "beryl.metadata.namespace.delete.retry.initial-backoff";
 const NAMESPACE_DELETE_RETRY_MAX_BACKOFF: &str = "beryl.metadata.namespace.delete.retry.max-backoff";
-const STARTUP_INITIAL_BACKOFF: &str = "beryl.metadata.startup.retry.initial-backoff";
-const STARTUP_MAX_BACKOFF: &str = "beryl.metadata.startup.retry.max-backoff";
-const STARTUP_WARN_AFTER: &str = "beryl.metadata.startup.warn-after";
 const STARTUP_TIMEOUT: &str = "beryl.metadata.startup.timeout";
-const STARTUP_FAIL_FAST: &str = "beryl.metadata.startup.fail-fast";
 const WRITE_LEASE_TIMEOUT: &str = "beryl.metadata.write-lease.timeout";
 const SHUTDOWN_TIMEOUT: &str = "beryl.metadata.shutdown.timeout";
 const WORKER_TIMEOUT: &str = "beryl.metadata.worker.liveness.timeout";
@@ -154,10 +148,11 @@ impl MetadataConfig {
     }
 }
 
-/// Startup/readiness configuration.
+/// Initial leader election configuration.
 #[derive(Clone, Debug)]
 pub struct StartupConfig {
-    pub root_readiness: RootReadinessConfig,
+    /// Deadline for electing the initial single-node leader during format.
+    pub timeout_ms: u64,
 }
 
 /// Server-owned page-size policy for one public `ListStatus` response.
@@ -354,17 +349,13 @@ impl Default for MetadataConfig {
             block_cleanup: BlockCleanupConfig::default(),
             namespace_delete: NamespaceDeleteConfig::default(),
             worker_liveness: WorkerLivenessConfig::default(),
-            startup: StartupConfig {
-                root_readiness: RootReadinessConfig::default(),
-            },
+            startup: StartupConfig { timeout_ms: 120_000 },
             write_lease_timeout_ms: 60_000,
             shutdown_timeout_ms: 30_000,
             observability: ObservabilityConfig {
-                log: LogConfig {
-                    format: "compact".to_string(),
-                    output: "stderr".to_string(),
-                    level: "info".to_string(),
-                },
+                format: "compact".to_string(),
+                output: "stderr".to_string(),
+                level: "info".to_string(),
             },
         }
     }
@@ -460,7 +451,6 @@ impl MetadataConfig {
                 .duration_ms_or(BLOCK_CLEANUP_RETRY_MAX_BACKOFF, cleanup_defaults.retry_max_backoff_ms)?,
         };
         ensure_backoff_order(
-            BLOCK_CLEANUP_RETRY_INITIAL_BACKOFF,
             block_cleanup.retry_initial_backoff_ms,
             BLOCK_CLEANUP_RETRY_MAX_BACKOFF,
             block_cleanup.retry_max_backoff_ms,
@@ -488,29 +478,9 @@ impl MetadataConfig {
                 .map_err(|_| invalid_config(WORKER_TIMEOUT, "exceeds the heartbeat protocol maximum"))?,
             scan_interval_ms: flat.duration_ms_or(WORKER_SCAN_INTERVAL, worker_defaults.scan_interval_ms)?,
         };
-        let readiness_defaults = RootReadinessConfig::default();
         let startup = StartupConfig {
-            root_readiness: RootReadinessConfig {
-                initial_backoff_ms: flat
-                    .duration_ms_or(STARTUP_INITIAL_BACKOFF, readiness_defaults.initial_backoff_ms)?,
-                max_backoff_ms: flat.duration_ms_or(STARTUP_MAX_BACKOFF, readiness_defaults.max_backoff_ms)?,
-                warn_after_ms: flat.duration_ms_or(STARTUP_WARN_AFTER, readiness_defaults.warn_after_ms)?,
-                timeout_ms: flat.duration_ms_or(STARTUP_TIMEOUT, readiness_defaults.timeout_ms)?,
-                fail_fast: flat.bool_or(STARTUP_FAIL_FAST, readiness_defaults.fail_fast)?,
-            },
+            timeout_ms: flat.duration_ms_or(STARTUP_TIMEOUT, defaults.startup.timeout_ms)?,
         };
-        ensure_backoff_order(
-            STARTUP_INITIAL_BACKOFF,
-            startup.root_readiness.initial_backoff_ms,
-            STARTUP_MAX_BACKOFF,
-            startup.root_readiness.max_backoff_ms,
-        )?;
-        if startup.root_readiness.warn_after_ms > startup.root_readiness.timeout_ms {
-            return Err(invalid_config(
-                STARTUP_WARN_AFTER,
-                "must not exceed the startup timeout",
-            ));
-        }
         let write_lease_timeout_ms = flat.duration_ms_or(WRITE_LEASE_TIMEOUT, defaults.write_lease_timeout_ms)?;
         let shutdown_timeout_ms = flat.duration_ms_or(SHUTDOWN_TIMEOUT, defaults.shutdown_timeout_ms)?;
 
@@ -612,19 +582,13 @@ fn validate_namespace_delete(config: &NamespaceDeleteConfig) -> Result<(), Commo
         ));
     }
     ensure_backoff_order(
-        NAMESPACE_DELETE_RETRY_INITIAL_BACKOFF,
         config.retry_initial_backoff_ms,
         NAMESPACE_DELETE_RETRY_MAX_BACKOFF,
         config.retry_max_backoff_ms,
     )
 }
 
-fn ensure_backoff_order(
-    _initial_key: &'static str,
-    initial: u64,
-    max_key: &'static str,
-    max: u64,
-) -> Result<(), CommonError> {
+fn ensure_backoff_order(initial: u64, max_key: &'static str, max: u64) -> Result<(), CommonError> {
     if max < initial {
         return Err(invalid_config(max_key, "must not be smaller than the initial backoff"));
     }
@@ -641,80 +605,80 @@ mod tests {
 
     fn base_flat() -> FlatConfig {
         let mut flat = FlatConfig::new();
-        flat.set("beryl.logging.format", "compact");
-        flat.set("beryl.logging.output", "stderr");
-        flat.set("beryl.logging.level", "info");
+        flat.insert("beryl.logging.format".to_string(), "compact".into());
+        flat.insert("beryl.logging.output".to_string(), "stderr".into());
+        flat.insert("beryl.logging.level".to_string(), "info".into());
         flat
     }
 
     #[test]
     fn active_safety_bounds_are_enforced() {
         let mut flat = base_flat();
-        flat.set(LIST_MAX_PAGE_SIZE, 20_000i64);
+        flat.insert(LIST_MAX_PAGE_SIZE.to_string(), 20_000i64.into());
         assert!(MetadataConfig::from_flat(flat).is_err());
 
         let mut flat = base_flat();
-        flat.set(NAMESPACE_DELETE_MAX_SIZE, "2MiB");
+        flat.insert(NAMESPACE_DELETE_MAX_SIZE.to_string(), "2MiB".into());
         assert!(MetadataConfig::from_flat(flat).is_err());
 
         for host in [" metadata-01", "http://metadata-01", "metadata-01:18080"] {
             let mut flat = base_flat();
-            flat.set(HOST, host);
+            flat.insert(HOST.to_string(), host.into());
             assert!(MetadataConfig::from_flat(flat).is_err());
         }
 
         let mut flat = base_flat();
-        flat.set(RPC_MAX_CONCURRENT_REQUESTS, 8i64);
-        flat.set(RPC_MAX_CONCURRENT_REQUESTS_PER_CONNECTION, 9i64);
+        flat.insert(RPC_MAX_CONCURRENT_REQUESTS.to_string(), 8i64.into());
+        flat.insert(RPC_MAX_CONCURRENT_REQUESTS_PER_CONNECTION.to_string(), 9i64.into());
         assert!(MetadataConfig::from_flat(flat).is_err());
 
         let mut flat = base_flat();
-        flat.set(RPC_MAX_CONCURRENT_REQUESTS, 8i64);
-        flat.set(RPC_RESERVED_CONTROL_REQUESTS, 8i64);
+        flat.insert(RPC_MAX_CONCURRENT_REQUESTS.to_string(), 8i64.into());
+        flat.insert(RPC_RESERVED_CONTROL_REQUESTS.to_string(), 8i64.into());
         assert!(MetadataConfig::from_flat(flat).is_err());
 
         let mut flat = base_flat();
-        flat.set(RPC_RESERVED_CONTROL_REQUESTS, 0i64);
+        flat.insert(RPC_RESERVED_CONTROL_REQUESTS.to_string(), 0i64.into());
         assert!(MetadataConfig::from_flat(flat).is_err());
 
         let mut flat = base_flat();
-        flat.set(
-            RPC_MAX_CONCURRENT_REQUESTS,
-            i64::try_from(MAX_GRPC_CONCURRENT_REQUESTS).unwrap(),
+        flat.insert(
+            RPC_MAX_CONCURRENT_REQUESTS.to_string(),
+            i64::try_from(MAX_GRPC_CONCURRENT_REQUESTS).unwrap().into(),
         );
         assert!(MetadataConfig::from_flat(flat).is_ok());
 
         let mut flat = base_flat();
-        flat.set(
-            RPC_MAX_CONCURRENT_REQUESTS,
-            i64::try_from(MAX_GRPC_CONCURRENT_REQUESTS + 1).unwrap(),
+        flat.insert(
+            RPC_MAX_CONCURRENT_REQUESTS.to_string(),
+            i64::try_from(MAX_GRPC_CONCURRENT_REQUESTS + 1).unwrap().into(),
         );
         assert!(MetadataConfig::from_flat(flat).is_err());
 
         let mut flat = base_flat();
-        flat.set(WRITE_SESSION_MAX_ACTIVE, 8i64);
-        flat.set(WRITE_SESSION_MAX_ACTIVE_PER_CLIENT, 9i64);
+        flat.insert(WRITE_SESSION_MAX_ACTIVE.to_string(), 8i64.into());
+        flat.insert(WRITE_SESSION_MAX_ACTIVE_PER_CLIENT.to_string(), 9i64.into());
         assert!(MetadataConfig::from_flat(flat).is_err());
 
         let mut flat = base_flat();
-        flat.set(WRITE_TARGET_MAX_OUTSTANDING, 8i64);
-        flat.set(WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION, 9i64);
+        flat.insert(WRITE_TARGET_MAX_OUTSTANDING.to_string(), 8i64.into());
+        flat.insert(WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION.to_string(), 9i64.into());
         assert!(MetadataConfig::from_flat(flat).is_err());
 
         let mut flat = base_flat();
-        flat.set(
-            WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION,
-            i64::try_from(MAX_FILE_BLOCKS + 1).unwrap(),
+        flat.insert(
+            WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION.to_string(),
+            i64::try_from(MAX_FILE_BLOCKS + 1).unwrap().into(),
         );
         assert!(MetadataConfig::from_flat(flat).is_err());
 
         for value in ["0", "1025MiB"] {
             let mut flat = base_flat();
-            flat.set(FILE_BLOCK_SIZE, value);
+            flat.insert(FILE_BLOCK_SIZE.to_string(), value.into());
             assert!(MetadataConfig::from_flat(flat).is_err());
         }
         let mut flat = base_flat();
-        flat.set(FILE_BLOCK_SIZE, "8MiB");
+        flat.insert(FILE_BLOCK_SIZE.to_string(), "8MiB".into());
         assert_eq!(
             MetadataConfig::from_flat(flat).unwrap().file_block_size,
             8 * 1024 * 1024

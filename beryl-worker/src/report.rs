@@ -16,7 +16,7 @@ pub(crate) struct DirtyBlock {
 }
 
 #[derive(Debug, Default)]
-struct GroupChanges {
+struct BlockChanges {
     revision: u64,
     dirty: HashMap<BlockId, u64>,
     continuity_lost: bool,
@@ -28,30 +28,43 @@ struct GroupChanges {
 /// coalesced or missed wake-up cannot discard a local lifecycle transition.
 /// Overflow fails closed by marking incremental continuity as lost, which
 /// forces the reporter to establish a new full baseline.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct BlockReportChangeTracker {
-    groups: Mutex<HashMap<GroupName, GroupChanges>>,
+    pub(crate) group_name: GroupName,
+    changes: Mutex<BlockChanges>,
     changed: Notify,
 }
 
 impl BlockReportChangeTracker {
-    /// Records a change only after its reportable local state becomes visible.
+    pub(crate) fn new(group_name: GroupName) -> Self {
+        Self {
+            group_name,
+            changes: Mutex::new(BlockChanges::default()),
+            changed: Notify::new(),
+        }
+    }
+
+    /// Records committed changes for the configured reporting group.
+    /// Other groups can remain on disk but do not belong to this report stream.
     pub(crate) fn record(&self, group_name: &GroupName, block_id: BlockId) {
-        let mut groups = self.groups.lock().expect("block report change state poisoned");
-        let changes = groups.entry(group_name.clone()).or_default();
+        if group_name != &self.group_name {
+            return;
+        }
+        let mut changes = self.changes.lock().expect("block report change state poisoned");
         changes.revision = changes
             .revision
             .checked_add(1)
             .expect("block report change revision overflow");
         if !changes.continuity_lost {
             if changes.dirty.contains_key(&block_id) || changes.dirty.len() < MAX_REPORT_ENTRIES {
-                changes.dirty.insert(block_id, changes.revision);
+                let revision = changes.revision;
+                changes.dirty.insert(block_id, revision);
             } else {
                 changes.dirty.clear();
                 changes.continuity_lost = true;
             }
         }
-        drop(groups);
+        drop(changes);
         self.changed.notify_one();
     }
 
@@ -60,9 +73,8 @@ impl BlockReportChangeTracker {
     /// Earlier dirty identities can be discarded because the subsequent full
     /// scan observes every local mutation committed before this cut. Changes
     /// racing with the scan receive a newer revision and remain for Delta.
-    pub(crate) fn begin_full_snapshot(&self, group_name: &GroupName) -> u64 {
-        let mut groups = self.groups.lock().expect("block report change state poisoned");
-        let changes = groups.entry(group_name.clone()).or_default();
+    pub(crate) fn begin_full_snapshot(&self) -> u64 {
+        let mut changes = self.changes.lock().expect("block report change state poisoned");
         let revision = changes.revision;
         changes.dirty.clear();
         changes.continuity_lost = false;
@@ -70,29 +82,22 @@ impl BlockReportChangeTracker {
     }
 
     /// Returns the bounded dirty view without removing unacknowledged entries.
-    pub(crate) fn snapshot(&self, group_name: &GroupName) -> Result<Vec<DirtyBlock>, ()> {
-        let groups = self.groups.lock().expect("block report change state poisoned");
-        let Some(changes) = groups.get(group_name) else {
-            return Ok(Vec::new());
-        };
+    pub(crate) fn snapshot(&self) -> Result<Vec<DirtyBlock>, ()> {
+        let changes = self.changes.lock().expect("block report change state poisoned");
         if changes.continuity_lost {
             return Err(());
         }
-        let mut dirty = changes
+        let dirty = changes
             .dirty
             .iter()
             .map(|(&block_id, &revision)| DirtyBlock { block_id, revision })
             .collect::<Vec<_>>();
-        dirty.sort_by_key(|entry| (entry.block_id.inode_id.as_raw(), entry.block_id.index.as_raw()));
         Ok(dirty)
     }
 
     /// Removes only revisions covered by an acknowledged immutable batch.
-    pub(crate) fn acknowledge(&self, group_name: &GroupName, acknowledged: &[DirtyBlock]) {
-        let mut groups = self.groups.lock().expect("block report change state poisoned");
-        let Some(changes) = groups.get_mut(group_name) else {
-            return;
-        };
+    pub(crate) fn acknowledge(&self, acknowledged: &[DirtyBlock]) {
+        let mut changes = self.changes.lock().expect("block report change state poisoned");
         for entry in acknowledged {
             if changes
                 .dirty
@@ -105,11 +110,8 @@ impl BlockReportChangeTracker {
     }
 
     /// Completes a full snapshot while retaining changes newer than its cut.
-    pub(crate) fn acknowledge_full(&self, group_name: &GroupName, snapshot_revision: u64) -> bool {
-        let mut groups = self.groups.lock().expect("block report change state poisoned");
-        let Some(changes) = groups.get_mut(group_name) else {
-            return true;
-        };
+    pub(crate) fn acknowledge_full(&self, snapshot_revision: u64) -> bool {
+        let mut changes = self.changes.lock().expect("block report change state poisoned");
         changes.dirty.retain(|_, revision| *revision > snapshot_revision);
         !changes.continuity_lost
     }
@@ -131,25 +133,27 @@ mod tests {
 
     #[test]
     fn acknowledgement_preserves_newer_changes_and_full_recovers_overflow() {
-        let tracker = BlockReportChangeTracker::default();
         let group = GroupName::parse("root").unwrap();
+        let tracker = BlockReportChangeTracker::new(group.clone());
+        tracker.record(&GroupName::parse("other").unwrap(), block_id(0));
+        assert!(tracker.snapshot().unwrap().is_empty());
         tracker.record(&group, block_id(0));
-        let first = tracker.snapshot(&group).unwrap();
+        let first = tracker.snapshot().unwrap();
         tracker.record(&group, block_id(0));
 
-        tracker.acknowledge(&group, &first);
-        assert_eq!(tracker.snapshot(&group).unwrap().len(), 1);
+        tracker.acknowledge(&first);
+        assert_eq!(tracker.snapshot().unwrap().len(), 1);
 
         for index in 1..=MAX_REPORT_ENTRIES {
             tracker.record(&group, block_id(index));
         }
-        assert!(tracker.snapshot(&group).is_err());
+        assert!(tracker.snapshot().is_err());
 
-        let full_cut = tracker.begin_full_snapshot(&group);
+        let full_cut = tracker.begin_full_snapshot();
         tracker.record(&group, block_id(MAX_REPORT_ENTRIES + 1));
-        assert!(tracker.acknowledge_full(&group, full_cut));
+        assert!(tracker.acknowledge_full(full_cut));
         assert_eq!(
-            tracker.snapshot(&group).unwrap(),
+            tracker.snapshot().unwrap(),
             vec![DirtyBlock {
                 block_id: block_id(MAX_REPORT_ENTRIES + 1),
                 revision: full_cut + 1,

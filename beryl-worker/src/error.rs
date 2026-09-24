@@ -12,6 +12,8 @@ use beryl_common::error::rpc::{
 use thiserror::Error;
 use tonic::Status;
 
+pub type WorkerResult<T> = Result<T, WorkerError>;
+
 /// Worker error types.
 #[derive(Error, Debug, Clone)]
 pub enum WorkerError {
@@ -61,14 +63,6 @@ pub enum WorkerError {
 }
 
 impl WorkerError {
-    /// Check if this error is retryable.
-    pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            WorkerError::Timeout(_) | WorkerError::ResourceExhausted(_) | WorkerError::Unavailable(_)
-        )
-    }
-
     /// Convert to gRPC Status (without modifying proto).
     pub fn to_status(&self) -> Status {
         let code = self.to_grpc_code();
@@ -91,18 +85,6 @@ impl WorkerError {
             WorkerError::PermissionDenied(_) => tonic::Code::PermissionDenied,
             WorkerError::Internal(_) => tonic::Code::Internal,
         }
-    }
-}
-
-impl From<WorkerError> for Status {
-    fn from(err: WorkerError) -> Self {
-        err.to_status()
-    }
-}
-
-impl From<anyhow::Error> for WorkerError {
-    fn from(err: anyhow::Error) -> Self {
-        WorkerError::Internal(err.to_string())
     }
 }
 

@@ -33,6 +33,7 @@ pub struct LocatedBlock {
     pub workers: Vec<WorkerEndpointInfo>,
     /// Worker-local storage tier requested for this replica.
     pub tier: Tier,
+    /// Writer fencing scoped to this block's inode.
     pub fencing_token: FencingToken,
 }
 
@@ -49,12 +50,11 @@ pub struct CommittedBlock {
 pub struct FileBlockLocation {
     pub block_id: BlockId,
     pub file_offset: u64,
+    /// Visible block prefix; locations cover the full readable block.
     pub len: u64,
 
     /// Immutable logical capacity from the file inode.
     pub block_size: u64,
-    /// Block-local readable prefix expected by metadata.
-    pub effective_len: u64,
 
     /// Metadata-issued read candidates. Empty means the authoritative layout has
     /// this block range but no live reported replica is currently eligible.

@@ -2,15 +2,26 @@
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
 use beryl_client::{ClientResult, FileType, ListStatusOptions, MkdirOptions};
+use beryl_common::error::rpc::{ErrorKind, ProtocolErrorKind};
+use beryl_common::header::RequestHeader;
 use beryl_e2e::data::deterministic_bytes;
 use beryl_e2e::TestCluster;
+use beryl_proto::common::BlockIdProto;
+use beryl_proto::convert::rpc_error_from_proto;
+use beryl_proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
+use beryl_proto::metadata::{
+    AllocateBlockRequestProto, AuthorizeBlockWriteRequestProto, CreateFileRequestProto, MsyncRequestProto,
+};
+use beryl_types::{ClientId, GroupName, GroupStateWatermark};
 use bytes::Bytes;
 use futures::io::AsyncReadExt;
 use std::fmt::Debug;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_client_crud_roundtrip() {
-    let mut cluster = TestCluster::start().await.expect("start hermetic local cluster");
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .expect("start hermetic local cluster");
     let client = cluster.client();
     let dir = "/e2e";
     let path = "/e2e/file";
@@ -153,7 +164,9 @@ async fn local_client_crud_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn visibility_sync_then_continue_write_roundtrip() {
-    let mut cluster = TestCluster::start().await.expect("start hermetic local cluster");
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .expect("start hermetic local cluster");
     let client = cluster.client();
     let path = "/sync-continue";
     let first = Bytes::from(vec![b'a'; 317]);
@@ -201,7 +214,9 @@ async fn visibility_sync_then_continue_write_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_more_than_ten_blocks_roundtrip() {
-    let mut cluster = TestCluster::start().await.expect("start hermetic local cluster");
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .expect("start hermetic local cluster");
     let client = cluster.client();
     let path = "/many-blocks";
     let payload = Bytes::from(deterministic_bytes(12 * 1024 + 17));
@@ -230,6 +245,117 @@ async fn write_more_than_ten_blocks_roundtrip() {
     cluster.shutdown().await.expect("local cluster shutdown");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_headers_carry_write_authority_and_freshness() {
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .expect("start cluster");
+    let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
+        .await
+        .expect("connect Metadata");
+    let header = RequestHeader::new(ClientId::new(701)).with_group_name(GroupName::parse("root").unwrap());
+    let created = metadata
+        .create_file(CreateFileRequestProto {
+            header: Some((&header).into()),
+            path: "/header-authority".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(created.header.unwrap().error.is_none());
+    let allocated = metadata
+        .allocate_block(AllocateBlockRequestProto {
+            header: Some((&child_header(&header)).into()),
+            write_handle: created.write_handle,
+            previous_block_id: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let allocated_header = allocated.header.unwrap();
+    assert!(allocated_header.error.is_none());
+    let target = allocated.block.unwrap();
+    let worker = &target.workers[0];
+    let block_id = target.block_id.unwrap();
+
+    let other = metadata
+        .create_file(CreateFileRequestProto {
+            header: Some((&child_header(&header)).into()),
+            path: "/header-authority-other".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(other.header.unwrap().error.is_none());
+    let other_handle = other.write_handle.unwrap();
+    assert_eq!(other_handle.write_lease_epoch, target.fencing_token.unwrap().epoch);
+
+    // Matching writer fields cannot authorize an unissued block in either inode.
+    for (group, requested_block_id, allowed) in [
+        (None, block_id, false),
+        (Some("other"), block_id, false),
+        (Some("root"), block_id, true),
+        (
+            Some("root"),
+            BlockIdProto {
+                block_index: block_id.block_index + 1,
+                ..block_id
+            },
+            false,
+        ),
+        (
+            Some("root"),
+            BlockIdProto {
+                inode_id: other_handle.inode_id,
+                ..block_id
+            },
+            false,
+        ),
+    ] {
+        let mut request_header = child_header(&header);
+        request_header.group_name = group.map(|group| GroupName::parse(group).unwrap());
+        let response = metadata
+            .authorize_block_write(AuthorizeBlockWriteRequestProto {
+                header: Some((&request_header).into()),
+                block_id: Some(requested_block_id),
+                worker_id: worker.worker_id,
+                worker_run_id: worker.worker_run_id.clone(),
+                fencing_token: target.fencing_token,
+                write_offset: target.write_offset,
+                block_size: target.block_size,
+                tier: target.tier,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let response_header = response.header.unwrap();
+        if allowed {
+            assert!(response_header.error.is_none());
+            assert_eq!(response_header.group_name, "root");
+            assert_eq!(response.visible_len, 0);
+        } else {
+            let error = rpc_error_from_proto(&response_header.error.expect("matching scope and issued block required"));
+            assert_eq!(error.kind, ErrorKind::Protocol(ProtocolErrorKind::PermissionDenied));
+        }
+    }
+
+    let response = metadata
+        .msync(MsyncRequestProto {
+            header: Some((&child_header(&header)).into()),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let response_header = response.header.unwrap();
+    assert!(response_header.error.is_none());
+    assert_eq!(response_header.group_name, "root");
+    let state = GroupStateWatermark::try_from(response_header.state.unwrap()).unwrap();
+    assert_eq!(state.group_name.as_str(), "root");
+    let allocated_state = GroupStateWatermark::try_from(allocated_header.state.unwrap()).unwrap();
+    assert!(state.state_id >= allocated_state.state_id);
+    cluster.shutdown().await.expect("shutdown cluster");
+}
+
 fn assert_not_found<T: Debug>(result: ClientResult<T>, context: &str) {
     let err = result.expect_err(context);
     let message = err.to_string().to_ascii_lowercase();
@@ -237,4 +363,10 @@ fn assert_not_found<T: Debug>(result: ClientResult<T>, context: &str) {
         message.contains("not found") || message.contains("enoent"),
         "{context} should fail with not-found style error, got {err}"
     );
+}
+
+fn child_header(header: &RequestHeader) -> RequestHeader {
+    let mut child = header.clone();
+    child.client.call_id = beryl_types::CallId::new();
+    child
 }

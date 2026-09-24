@@ -18,7 +18,9 @@ use tonic::Request;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_locations_before_full_report_convergence_are_unavailable_then_recover() {
-    let mut cluster = TestCluster::start().await.expect("start cluster");
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .expect("start cluster");
     let client = cluster.client().clone();
     let path = "/worker-restart/pre-convergence";
     let payload = write_closed_file(&mut cluster, path, 1_537)
@@ -46,7 +48,9 @@ async fn read_locations_before_full_report_convergence_are_unavailable_then_reco
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_old_worker_run_is_rejected_after_restart() {
-    let mut cluster = TestCluster::start().await.expect("start cluster");
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .expect("start cluster");
     let path = "/worker-restart/stale-run";
     let payload = write_closed_file(&mut cluster, path, 1_537)
         .await
@@ -75,7 +79,9 @@ async fn stale_old_worker_run_is_rejected_after_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_block_file_is_readable_after_worker_restart_full_report_convergence() {
-    let mut cluster = TestCluster::start().await.expect("start cluster");
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .expect("start cluster");
     let client = cluster.client().clone();
     let path = "/worker-restart/multi-block";
     let payload = write_closed_file(&mut cluster, path, 5_123)
@@ -187,7 +193,7 @@ async fn assert_stale_worker_run_rejected(
             frame_size: 1024,
             worker_run_id: stale_run_id.to_string(),
             block_size: location.block_size,
-            effective_len: location.effective_len,
+            effective_len: location.len,
         }))
         .await
     {
@@ -252,6 +258,5 @@ fn data_header(client_id: u128) -> DataRequestHeaderProto {
     let header = RequestHeader::new(ClientId::new(client_id));
     DataRequestHeaderProto {
         client: Some((&header.client).into()),
-        trace_context: None,
     }
 }

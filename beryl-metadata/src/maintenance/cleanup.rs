@@ -40,8 +40,6 @@ enum CleanupDecision {
 struct CleanupEntry {
     /// First complete cycle that classified this replica as reclaimable.
     first_seen: Instant,
-    /// Earliest dispatch time; later observations do not extend this deadline.
-    not_before: Instant,
     /// Earliest redispatch time after the previous heartbeat command.
     next_attempt_at: Instant,
     /// Number of commands selected for this replica in the current process.
@@ -55,8 +53,8 @@ impl CleanupEntry {
     ///
     /// A candidate must have passed a complete scan in the current term, its
     /// grace deadline, and its retry deadline.
-    fn is_due(&self, term: u64, now: Instant) -> bool {
-        self.verified_term == term && now >= self.not_before && now >= self.next_attempt_at
+    fn is_due(&self, term: u64, now: Instant, grace: Duration) -> bool {
+        self.verified_term == term && now >= self.first_seen + grace && now >= self.next_attempt_at
     }
 }
 
@@ -75,8 +73,8 @@ struct CleanupScanCycle {
     next_cursor: Option<ReadyReplicaCursor>,
     /// Existing candidates re-observed as reclaimable during this cycle.
     seen_existing: HashSet<ReplicaKey>,
-    /// Reclaimable replicas first observed during this cycle.
-    pending_new: HashSet<ReplicaKey>,
+    /// Exclusive pagination visits each replica at most once per cycle.
+    pending_new: Vec<ReplicaKey>,
 }
 
 impl CleanupScanCycle {
@@ -87,7 +85,7 @@ impl CleanupScanCycle {
             scan_end_worker_id,
             next_cursor: None,
             seen_existing: HashSet::new(),
-            pending_new: HashSet::new(),
+            pending_new: Vec::new(),
         }
     }
 }
@@ -102,13 +100,6 @@ struct CleanupState {
     entries: HashMap<ReplicaKey, CleanupEntry>,
     /// Provisional state for the cycle currently traversing Ready reports.
     active_cycle: Option<CleanupScanCycle>,
-}
-
-/// One exact worker-local block replica selected for cleanup.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct BlockCleanupCommand {
-    /// Exact block identity to reclaim on the addressed worker.
-    pub block_id: BlockId,
 }
 
 /// Produces a stable order for equally attempted cleanup candidates.
@@ -197,7 +188,7 @@ impl BlockCleanupCoordinator {
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
         now: Instant,
-    ) -> Vec<BlockCleanupCommand> {
+    ) -> Vec<BlockId> {
         if !self.enabled || group_name != &self.group_name {
             return Vec::new();
         }
@@ -213,7 +204,7 @@ impl BlockCleanupCoordinator {
                 &key.group_name == group_name
                     && key.worker_id == worker_id
                     && key.worker_run_id == worker_run_id
-                    && entry.is_due(term, now)
+                    && entry.is_due(term, now, self.reclaim_grace)
             })
             .map(|(key, entry)| (entry.attempts, key.clone()))
             .collect();
@@ -263,14 +254,14 @@ impl BlockCleanupCoordinator {
             let Some(entry) = state.entries.get_mut(&key) else {
                 continue;
             };
-            if !entry.is_due(term, now) {
+            if !entry.is_due(term, now, self.reclaim_grace) {
                 continue;
             }
 
             let retry = entry.attempts > 0;
             entry.attempts = entry.attempts.saturating_add(1);
             entry.next_attempt_at = now + self.retry_backoff(entry.attempts);
-            commands.push(BlockCleanupCommand { block_id: key.block_id });
+            commands.push(key.block_id);
             drop(state);
 
             observe::record_cleanup_command();
@@ -303,9 +294,6 @@ impl BlockCleanupCoordinator {
     /// verification and absence-based retirement are committed only after the
     /// listing reaches EOF in the same leader term.
     pub(crate) async fn scan_once(&self) -> MetadataResult<()> {
-        if !self.enabled {
-            return Ok(());
-        }
         let Some(scan_term) = self.current_leader_term() else {
             self.state.lock().active_cycle = None;
             observe::record_cleanup_scan("not_leader");
@@ -314,7 +302,7 @@ impl BlockCleanupCoordinator {
         };
 
         // A read barrier orders authority reads but does not freeze leadership.
-        if let Err(error) = self.raft_node.read(true, |_| Ok(())).await {
+        if let Err(error) = self.raft_node.read(true, || Ok(())).await {
             let mut state = self.state.lock();
             state.entries.clear();
             state.active_cycle = None;
@@ -447,30 +435,23 @@ impl BlockCleanupCoordinator {
             .active_cycle
             .take()
             .unwrap_or_else(|| CleanupScanCycle::new(scan_term, scan_end_worker_id));
-        if cycle.leader_term != scan_term || cycle.scan_end_worker_id != scan_end_worker_id {
-            return false;
-        }
 
         for (replica, decision) in classified {
             match decision {
                 CleanupDecision::Keep => {
                     state.entries.remove(&replica);
-                    cycle.pending_new.remove(&replica);
                     observe::record_cleanup_decision("keep");
                 }
                 CleanupDecision::Wait => {
                     state.entries.remove(&replica);
-                    cycle.pending_new.remove(&replica);
                     observe::record_cleanup_decision("wait");
                 }
                 CleanupDecision::Reclaimable => {
                     observe::record_cleanup_decision("reclaimable");
                     if state.entries.contains_key(&replica) {
                         cycle.seen_existing.insert(replica);
-                    } else if cycle.pending_new.contains(&replica) {
-                        continue;
                     } else if state.entries.len() + cycle.pending_new.len() < self.max_candidates {
-                        cycle.pending_new.insert(replica);
+                        cycle.pending_new.push(replica);
                     } else {
                         observe::record_cleanup_anomaly("candidate_limit");
                     }
@@ -489,7 +470,15 @@ impl BlockCleanupCoordinator {
             entry.verified_term = scan_term;
         }
         for replica in cycle.pending_new {
-            self.observe_candidate(&mut state.entries, replica, scan_term, now);
+            state.entries.insert(
+                replica,
+                CleanupEntry {
+                    first_seen: now,
+                    next_attempt_at: now,
+                    attempts: 0,
+                    verified_term: scan_term,
+                },
+            );
         }
         true
     }
@@ -539,7 +528,6 @@ impl BlockCleanupCoordinator {
                 inode_id = inode_id.as_raw(),
                 inode_inode_id = inode.inode_id.as_raw(),
                 inode_kind = ?inode.file_type(),
-                payload_kind = ?inode.file_type(),
                 "Waiting to classify a reported replica because its inode authority is inconsistent"
             );
             return Ok(CleanupDecision::Wait);
@@ -581,37 +569,6 @@ impl BlockCleanupCoordinator {
         Ok(CleanupDecision::Reclaimable)
     }
 
-    /// Creates or renews a bounded candidate without resetting its grace period.
-    ///
-    /// Existing candidates retain their first observation time, but their
-    /// verification advances only after a complete scan cycle.
-    fn observe_candidate(
-        &self,
-        entries: &mut HashMap<ReplicaKey, CleanupEntry>,
-        replica: ReplicaKey,
-        term: u64,
-        now: Instant,
-    ) {
-        if let Some(entry) = entries.get_mut(&replica) {
-            entry.verified_term = term;
-            return;
-        }
-        if entries.len() >= self.max_candidates {
-            observe::record_cleanup_anomaly("candidate_limit");
-            return;
-        }
-        entries.insert(
-            replica,
-            CleanupEntry {
-                first_seen: now,
-                not_before: now + self.reclaim_grace,
-                next_attempt_at: now,
-                attempts: 0,
-                verified_term: term,
-            },
-        );
-    }
-
     /// Returns total, ready, and oldest-age metrics for candidate observations.
     ///
     /// A candidate is ready only after its grace period and a complete scan in
@@ -623,7 +580,7 @@ impl BlockCleanupCoordinator {
             state
                 .entries
                 .values()
-                .filter(|entry| entry.verified_term == term && now >= entry.not_before)
+                .filter(|entry| entry.verified_term == term && now >= entry.first_seen + self.reclaim_grace)
                 .count()
         } else {
             0
@@ -675,9 +632,9 @@ mod tests {
     }
 
     async fn test_raft(storage: Arc<RocksDBStorage>, leader: bool) -> Arc<AppRaftNode> {
-        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
+        let state_machine = AppRaftStateMachine::new(Arc::clone(&storage));
         let raft_node = Arc::new(
-            AppRaftNode::new(1, storage, state_machine, Arc::new(MountTable::new()))
+            AppRaftNode::new(1, storage, state_machine, Arc::new(MountTable::default()))
                 .await
                 .unwrap(),
         );
@@ -758,9 +715,7 @@ mod tests {
             lease_epoch: LeaseEpoch::new(1),
             last_commit: None,
         };
-        opening
-            .activate(LeaseEpoch::new(1), &file, None)
-            .expect("session created");
+        opening.activate(&file, None).expect("session created");
     }
 
     fn publish_report(manager: &WorkerManager, replicas: &[ReplicaKey]) {
@@ -781,9 +736,7 @@ mod tests {
             .all(|replica| replica.worker_id == worker_id && replica.worker_run_id == run_id));
         let group_name = group_name();
         let address = format!("127.0.0.1:{}", 19_000 + worker_id.as_raw());
-        manager
-            .register_worker_run(&group_name, worker_id, address.clone(), 1, run_id, None)
-            .unwrap();
+        manager.register_worker_run(&group_name, worker_id, address.clone(), run_id);
         manager
             .record_heartbeat_with_tier_free(
                 &group_name,
@@ -791,7 +744,6 @@ mod tests {
                 run_id,
                 report_seq,
                 &address,
-                1,
                 vec![TierFree {
                     tier: Tier::Hdd,
                     free_bytes: 900,
@@ -850,9 +802,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (coordinator, storage, _worker_manager, sessions) = coordinator(&dir, cleanup_config(), false).await;
 
-        let detached = replica(10, 0);
-        assert_eq!(coordinator.classify(&detached).unwrap(), CleanupDecision::Reclaimable);
-
         let missing_inode = replica(11, 0);
         assert_eq!(
             coordinator.classify(&missing_inode).unwrap(),
@@ -905,9 +854,7 @@ mod tests {
             let state = coordinator.state.lock();
             let entries = &state.entries;
             assert_eq!(entries.len(), 2);
-            assert!(entries
-                .values()
-                .all(|entry| entry.verified_term == 7 && first_seen < entry.not_before));
+            assert!(entries.values().all(|entry| entry.verified_term == 7));
             assert!(entries.values().all(|entry| entry.verified_term != 8));
         }
         let after_grace = first_seen + grace;
@@ -931,7 +878,6 @@ mod tests {
         let entry = entries.get(&remains_detached).expect("detached candidate remains");
         assert_eq!(entry.first_seen, first_seen);
         assert_eq!(entry.verified_term, 8);
-        assert!(after_grace >= entry.not_before);
         drop(state);
         assert_eq!(coordinator.candidate_metrics(8, after_grace, true).1, 1);
         assert_eq!(coordinator.candidate_metrics(8, after_grace, false).1, 0);
@@ -950,11 +896,18 @@ mod tests {
         publish_report(&worker_manager, &[first.clone(), second.clone()]);
         coordinator.scan_once().await.unwrap();
         {
+            let mut state = coordinator.state.lock();
+            assert!(state.entries.is_empty());
+            // A retained page from an earlier leadership term must restart at admission.
+            state.active_cycle.as_mut().unwrap().leader_term -= 1;
+        }
+
+        coordinator.scan_once().await.unwrap();
+        {
             let state = coordinator.state.lock();
             assert!(state.entries.is_empty());
             assert!(state.active_cycle.is_some());
         }
-
         coordinator.scan_once().await.unwrap();
         let state = coordinator.state.lock();
         assert_eq!(state.entries.len(), 1);
@@ -1026,33 +979,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leader_term_change_discards_a_partial_cycle() {
-        let dir = TempDir::new().unwrap();
-        let (coordinator, _storage, _worker_manager, _sessions) = coordinator(&dir, cleanup_config(), false).await;
-        let candidate = replica(72, 0);
-        let cursor = ReadyReplicaCursor {
-            worker_id: candidate.worker_id,
-            block_id: Some(candidate.block_id),
-            worker_end_block_id: Some(candidate.block_id),
-        };
-        let now = Instant::now();
-
-        assert!(!coordinator.apply_scan_page(
-            vec![(candidate.clone(), CleanupDecision::Reclaimable)],
-            7,
-            Some(candidate.worker_id),
-            Some(cursor),
-            now,
-        ));
-        assert!(coordinator.state.lock().active_cycle.is_some());
-
-        assert!(!coordinator.apply_scan_page(Vec::new(), 8, Some(candidate.worker_id), None, now));
-        let state = coordinator.state.lock();
-        assert!(state.active_cycle.is_none());
-        assert!(state.entries.is_empty());
-    }
-
-    #[tokio::test]
     async fn cleanup_dispatch_revalidates_session_and_inode_authority() {
         let dir = TempDir::new().unwrap();
         let mut config = cleanup_config();
@@ -1097,7 +1023,7 @@ mod tests {
         sessions.remove_session_if_epoch(became_visible.block_id.inode_id, LeaseEpoch::new(1));
 
         storage
-            .with_pinned_db(|db| {
+            .with_db(|db| {
                 let cf = db.cf_handle("inodes").unwrap();
                 let mut key = b"inode/".to_vec();
                 key.extend_from_slice(&authority_unreadable.block_id.inode_id.to_be_bytes());
@@ -1142,8 +1068,8 @@ mod tests {
             now,
         );
         assert_eq!(first.len(), 2);
-        assert_eq!(first[0].block_id, candidates[1].block_id);
-        assert_eq!(first[1].block_id, candidates[2].block_id);
+        assert_eq!(first[0], candidates[1].block_id);
+        assert_eq!(first[1], candidates[2].block_id);
 
         let second = coordinator.commands_for_heartbeat(
             &group_name(),
@@ -1152,7 +1078,7 @@ mod tests {
             now + coordinator.retry_initial_backoff,
         );
         assert_eq!(second.len(), 2);
-        assert_eq!(second[0].block_id, candidates[0].block_id);
+        assert_eq!(second[0], candidates[0].block_id);
 
         workers
             .receive_full_block_report(
@@ -1199,16 +1125,12 @@ mod tests {
         coordinator.scan_once().await.unwrap();
 
         let replacement_run: WorkerRunId = "550e8400-e29b-41d4-a716-446655440399".parse().unwrap();
-        workers
-            .register_worker_run(
-                &group_name(),
-                candidates[0].worker_id,
-                "127.0.0.1:19001".to_string(),
-                1,
-                replacement_run,
-                None,
-            )
-            .unwrap();
+        workers.register_worker_run(
+            &group_name(),
+            candidates[0].worker_id,
+            "127.0.0.1:19001".to_string(),
+            replacement_run,
+        );
         assert!(coordinator
             .commands_for_heartbeat(
                 &group_name(),

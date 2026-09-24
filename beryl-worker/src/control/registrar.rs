@@ -8,8 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use beryl_common::error::rpc::{RecoveryAction, RpcErrorDetail};
-use beryl_common::header::RequestHeader;
-use beryl_proto::common::{EndpointProto, RequestHeaderProto};
+use beryl_proto::common::EndpointProto;
 use beryl_proto::convert::{require_worker_run_id, rpc_error_from_proto};
 use beryl_proto::metadata::metadata_worker_service_proto_client::MetadataWorkerServiceProtoClient;
 use beryl_proto::metadata::{RegisterWorkerRequestProto, RegisterWorkerResponseProto};
@@ -21,8 +20,7 @@ use tonic::Code;
 use tracing::{info, warn};
 
 use crate::config::{WorkerConfig, WorkerRegistrationConfig};
-use crate::control::{ControlIdentity, ControlOp, Registration, RegistrationSet};
-use crate::net::protocol::WorkerNetProtocol;
+use crate::control::{ControlIdentity, ControlOp, Registration, RegistrationState};
 
 /// Worker descriptor sent to metadata during startup registration.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,7 +30,6 @@ pub struct RegistrationDescriptor {
     pub worker_run_id: WorkerRunId,
     pub endpoint_host: String,
     pub endpoint_port: u32,
-    pub advertised_endpoint: String,
 }
 
 #[derive(Debug, Error)]
@@ -51,7 +48,7 @@ pub enum RegistrationError {
 pub struct MetadataRegistrar {
     config: WorkerRegistrationConfig,
     descriptor: RegistrationDescriptor,
-    state: Arc<RegistrationSet>,
+    state: Arc<RegistrationState>,
     endpoint: Endpoint,
     control_identity: ControlIdentity,
 }
@@ -60,20 +57,11 @@ impl MetadataRegistrar {
     pub fn new(
         config: WorkerRegistrationConfig,
         descriptor: RegistrationDescriptor,
-        state: Arc<RegistrationSet>,
+        state: Arc<RegistrationState>,
     ) -> Result<Self, RegistrationError> {
-        config
+        let endpoint = config
             .validate()
             .map_err(|err| RegistrationError::InvalidConfig(err.message))?;
-        let registration_endpoint = config
-            .endpoints
-            .first()
-            .ok_or_else(|| {
-                RegistrationError::InvalidConfig("beryl.worker.metadata.addresses must not be empty".into())
-            })?
-            .clone();
-        let endpoint = Endpoint::from_shared(registration_endpoint)
-            .map_err(|err| RegistrationError::InvalidConfig(format!("beryl.worker.metadata.addresses: {err}")))?;
         Ok(Self {
             config,
             descriptor,
@@ -83,28 +71,14 @@ impl MetadataRegistrar {
         })
     }
 
-    pub fn descriptor_from_config(
-        config: &WorkerConfig,
-        worker_id: WorkerId,
-    ) -> Result<RegistrationDescriptor, RegistrationError> {
-        config
-            .net
-            .listeners
-            .iter()
-            .find(|listener| listener.protocol == WorkerNetProtocol::Grpc)
-            .ok_or_else(|| {
-                RegistrationError::InvalidConfig("worker registration requires a gRPC data listener".into())
-            })?;
-        let (endpoint_host, endpoint_port) = config.rpc_address_parts();
-
-        Ok(RegistrationDescriptor {
+    pub fn descriptor_from_config(config: &WorkerConfig, worker_id: WorkerId) -> RegistrationDescriptor {
+        RegistrationDescriptor {
             group_name: config.metadata.group_name.clone(),
             worker_id,
             worker_run_id: WorkerRunId::new(),
-            endpoint_host,
-            endpoint_port,
-            advertised_endpoint: config.rpc_address(),
-        })
+            endpoint_host: config.host.clone(),
+            endpoint_port: u32::from(config.rpc_port),
+        }
     }
 
     pub async fn register_once(&self) -> Result<Registration, RegistrationError> {
@@ -117,7 +91,7 @@ impl MetadataRegistrar {
         let channel = self.connect(timeout).await?;
         let mut client = MetadataWorkerServiceProtoClient::new(channel);
         let request = self.build_request(op);
-        let tonic_request = tonic::Request::new(request.clone());
+        let tonic_request = tonic::Request::new(request);
         let response = time::timeout(timeout, client.register_worker(tonic_request))
             .await
             .map_err(|_| RegistrationError::Retryable("metadata register request timed out".to_string()))?
@@ -174,7 +148,7 @@ impl MetadataRegistrar {
 
     fn build_request(&self, op: &ControlOp) -> RegisterWorkerRequestProto {
         RegisterWorkerRequestProto {
-            header: Some(registration_request_header(&self.descriptor.group_name, op)),
+            header: Some(op.request_header(&self.descriptor.group_name)),
             worker_id: self.descriptor.worker_id.as_raw(),
             worker_run_id: self.descriptor.worker_run_id.to_string(),
             advertised_endpoint: Some(EndpointProto {
@@ -198,7 +172,9 @@ impl MetadataRegistrar {
                 header.group_name, self.descriptor.group_name
             )));
         }
-        classify_header(response.header)?;
+        if let Some(error) = header.error.as_ref() {
+            return Err(classify_rpc_error(rpc_error_from_proto(error)));
+        }
         if response.worker_id != self.descriptor.worker_id.as_raw() {
             return Err(RegistrationError::Fatal(
                 "metadata register response did not confirm worker_id".to_string(),
@@ -219,34 +195,18 @@ impl MetadataRegistrar {
             group_name: self.descriptor.group_name.clone(),
             worker_id: self.descriptor.worker_id,
             worker_run_id: accepted_worker_run_id,
-            advertised_endpoint: self.descriptor.advertised_endpoint.clone(),
         })
     }
 }
 
-fn registration_request_header(group_name: &GroupName, op: &ControlOp) -> RequestHeaderProto {
-    let mut header = RequestHeader::new(op.client_id).with_group_name(group_name.clone());
-    header.client.call_id = op.call_id;
-    (&header).into()
-}
-
-fn classify_header(header: Option<beryl_proto::common::ResponseHeaderProto>) -> Result<(), RegistrationError> {
-    let header = header
-        .ok_or_else(|| RegistrationError::Fatal("metadata register response missing ResponseHeader".to_string()))?;
-    let Some(error) = header.error.as_ref() else {
-        return Ok(());
-    };
-    classify_rpc_error(rpc_error_from_proto(error))
-}
-
-fn classify_rpc_error(error: RpcErrorDetail) -> Result<(), RegistrationError> {
+fn classify_rpc_error(error: RpcErrorDetail) -> RegistrationError {
     match error.recovery {
         RecoveryAction::Retry { .. } | RecoveryAction::RefreshMetadata { .. } | RecoveryAction::RegisterWorker => {
-            Err(RegistrationError::Retryable(error.message))
+            RegistrationError::Retryable(error.message)
         }
-        RecoveryAction::Fail | RecoveryAction::ReopenWriteSession { .. } | RecoveryAction::SendFullBlockReport => Err(
-            RegistrationError::Fatal(format!("fatal metadata registration error: {}", error.message)),
-        ),
+        RecoveryAction::Fail | RecoveryAction::ReopenWriteSession { .. } | RecoveryAction::SendFullBlockReport => {
+            RegistrationError::Fatal(format!("fatal metadata registration error: {}", error.message))
+        }
     }
 }
 

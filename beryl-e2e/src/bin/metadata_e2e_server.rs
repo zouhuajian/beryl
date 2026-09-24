@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Standalone Metadata process used by crash-durability integration tests.
+//! Metadata process used by runtime and crash-durability integration tests.
 
 use std::sync::Arc;
 

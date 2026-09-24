@@ -5,7 +5,9 @@ use beryl_e2e::TestCluster;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_flush_sync_and_close_preserve_publication_boundaries() {
-    let mut cluster = TestCluster::start().await.unwrap();
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .unwrap();
     let client = cluster.client();
     let path = "/stream-write";
     let mut writer = client.create(path).await.unwrap();
@@ -36,6 +38,8 @@ async fn write_flush_sync_and_close_preserve_publication_boundaries() {
         published
     );
 
+    // Empty publication must preserve the reusable tail and allocation predecessor.
+    writer.sync().await.unwrap();
     writer.write_all(b"tail").await.unwrap();
     writer.flush().await.unwrap();
     assert_eq!(client.get_status(path).await.unwrap().len(), published.len() as u64);
@@ -54,7 +58,9 @@ async fn write_flush_sync_and_close_preserve_publication_boundaries() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abort_preserves_published_prefix_after_worker_only_flush() {
-    let mut cluster = TestCluster::start().await.unwrap();
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .unwrap();
     let client = cluster.client();
     let path = "/abort-flushed-tail";
     let mut writer = client.create(path).await.unwrap();
@@ -82,7 +88,9 @@ async fn abort_preserves_published_prefix_after_worker_only_flush() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_flush_does_not_allocate_a_block_and_close_ends_the_lease() {
-    let mut cluster = TestCluster::start().await.unwrap();
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .unwrap();
     let client = cluster.client();
     let mut writer = client.create("/empty-stream").await.unwrap();
     writer.write_all(&[]).await.unwrap();

@@ -28,5 +28,5 @@ impl Drop for DataRpcPermit {
     }
 }
 
-pub mod block;
+pub(crate) mod block;
 pub(crate) mod write;

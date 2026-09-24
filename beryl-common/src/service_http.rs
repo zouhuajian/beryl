@@ -39,9 +39,7 @@ impl ServiceHttpHandle {
     /// panics remain errors; cancellation initiated here is expected.
     pub async fn shutdown_until(mut self, deadline: Instant) -> Result<bool, tokio::task::JoinError> {
         self.shutdown.cancel();
-        let Some(mut task) = self.task.take() else {
-            return Ok(false);
-        };
+        let mut task = self.task.take().expect("HTTP listener task is owned");
         match tokio::time::timeout_at(deadline, &mut task).await {
             Ok(result) => {
                 result?;

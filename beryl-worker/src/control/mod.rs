@@ -3,22 +3,24 @@
 
 //! Worker control-plane startup registration.
 
+use beryl_common::header::RequestHeader;
+use beryl_proto::common::RequestHeaderProto;
 use beryl_types::{CallId, ClientId};
 
 mod block_report;
 mod cleanup;
 mod heartbeat;
-pub(crate) mod identity;
+mod identity;
 mod registrar;
 mod registration;
 mod storage;
 
-pub use block_report::{BlockReportError, BlockReportOptions, BlockReportRound, MetadataBlockReportLoop};
-pub use cleanup::{BlockCleanupCommand, BlockCleanupExecutor, BlockCleanupOptions, BlockCleanupRuntime};
-pub use heartbeat::{HeartbeatError, HeartbeatRound, HeartbeatSnapshot, MetadataHeartbeatLoop};
+pub use block_report::{BlockReportError, BlockReportOutcome, MetadataBlockReportLoop};
+pub use cleanup::{BlockCleanupExecutor, BlockCleanupRuntime};
+pub use heartbeat::{HeartbeatError, HeartbeatOutcome, MetadataHeartbeatLoop};
 pub use registrar::{MetadataRegistrar, RegistrationDescriptor, RegistrationError};
-pub use registration::{Registration, RegistrationSet};
-pub use storage::{prepare_worker_start, worker_storage_info_path, WorkerStorageInfo};
+pub use registration::{Registration, RegistrationState};
+pub use storage::{prepare_worker_start, worker_storage_info_path};
 
 #[derive(Clone, Copy, Debug)]
 struct ControlIdentity {
@@ -45,4 +47,12 @@ impl ControlIdentity {
 struct ControlOp {
     client_id: ClientId,
     call_id: CallId,
+}
+
+impl ControlOp {
+    fn request_header(&self, group_name: &beryl_types::GroupName) -> RequestHeaderProto {
+        let mut header = RequestHeader::new(self.client_id).with_group_name(group_name.clone());
+        header.client.call_id = self.call_id;
+        (&header).into()
+    }
 }

@@ -49,8 +49,8 @@ pub(crate) struct FileCommit {
 impl FilePublication {
     /// Locate the changed tail and new blocks from the frozen pre-publication length.
     /// An empty append payload means an exact no-op, including a partial tail.
-    pub(crate) fn start_index(&self, file: &FileData) -> MetadataResult<usize> {
-        let count = FileData::block_count(self.target_len, file.block_size)?;
+    pub(crate) fn start_index(&self, block_size: u32) -> MetadataResult<usize> {
+        let count = FileData::block_count(self.target_len, block_size)?;
         let start = match self.mode {
             PublishMode::ReplaceIfUnchanged => 0,
             PublishMode::AppendIfUnchanged => {
@@ -62,7 +62,7 @@ impl FilePublication {
                 if self.blocks.is_empty() && self.target_len == self.expected_file_len {
                     count
                 } else {
-                    usize::try_from(self.expected_file_len / u64::from(file.block_size))
+                    usize::try_from(self.expected_file_len / u64::from(block_size))
                         .map_err(|_| MetadataError::InvalidArgument("block ordinal overflows".into()))?
                 }
             }
@@ -74,7 +74,7 @@ impl FilePublication {
         }
         for (offset, block) in self.blocks.iter().enumerate() {
             let ordinal = start + offset;
-            let expected_len = Self::visible_block_len(self.target_len, file.block_size, ordinal);
+            let expected_len = Self::visible_block_len(self.target_len, block_size, ordinal);
             if block.len != expected_len {
                 return Err(MetadataError::InvalidArgument(
                     "only the final block may be partial".into(),
@@ -89,31 +89,30 @@ impl FilePublication {
     }
 
     /// Compare a frozen publication with the current visible suffix, never with
-    /// a newly captured expected generation or length.
-    pub(crate) fn matches_visible(&self, file: &FileData) -> MetadataResult<bool> {
-        let start = self.start_index(file)?;
-        Ok(file.len == self.target_len
+    /// a newly captured expected generation or length. `start` must come from
+    /// `start_index` for this publication and file.
+    pub(crate) fn matches_visible(&self, file: &FileData, start: usize) -> bool {
+        file.len == self.target_len
             && file.blocks.get(start..).is_some_and(|visible| {
                 visible
                     .iter()
                     .copied()
                     .eq(self.blocks.iter().map(|block| block.block_id))
-            }))
+            })
     }
 
     /// Build the complete fixed-block layout while preserving every published byte.
-    /// The caller separately checks generation and writer authority at Raft apply.
-    pub(crate) fn merged_blocks(&self, inode_id: InodeId, file: &FileData) -> MetadataResult<Vec<BlockId>> {
-        file.validate(inode_id)?;
-        let start = self.start_index(file)?;
+    /// The caller supplies the validated `start_index` and separately checks
+    /// generation and writer authority at Raft apply.
+    pub(crate) fn merged_blocks(
+        &self,
+        inode_id: InodeId,
+        file: &FileData,
+        start: usize,
+    ) -> MetadataResult<Vec<BlockId>> {
         let mut blocks = match self.mode {
             PublishMode::ReplaceIfUnchanged => Vec::new(),
             PublishMode::AppendIfUnchanged => {
-                if file.len != self.expected_file_len || start > file.blocks.len() {
-                    return Err(MetadataError::Again(
-                        "append base no longer matches visible content".into(),
-                    ));
-                }
                 if start < file.blocks.len()
                     && self.blocks.first().map(|block| block.block_id) != file.blocks.get(start).copied()
                 {
@@ -175,7 +174,7 @@ impl FilePublication {
             || commit.expected_file_len != self.expected_file_len
             || commit.mode != self.mode
             || commit.committed_len != self.target_len
-            || !self.matches_visible(file)?
+            || !self.matches_visible(file, self.start_index(file.block_size)?)
         {
             return Err(MetadataError::InvalidArgument(
                 "CommitFile payload changed for a completed operation".into(),

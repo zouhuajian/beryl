@@ -10,8 +10,6 @@
 //! It defines shared domain identifiers, file and block layouts, byte ranges,
 //! block locations, write authority, worker identities, storage tiers, and freshness watermarks.
 
-extern crate core;
-
 pub mod fs;
 pub mod ids;
 pub mod lease;

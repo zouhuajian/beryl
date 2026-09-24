@@ -3,16 +3,18 @@
 
 //! Worker core domain types and data-plane facade.
 
-use crate::error::WorkerError;
+use crate::error::{WorkerError, WorkerResult};
 use crate::observe;
 use crate::report::BlockReportChangeTracker;
-use crate::runtime::block::{BlockManager, BlockPin, ReclaimingBlock};
-use crate::runtime::write::{BlockWriteIoGuard, BlockWriteKey, BlockWriteRegistration, BlockWriteRegistry};
+use crate::runtime::block::{BlockAccessRegistry, BlockPin};
+use crate::runtime::write::{BlockWriteIoGuard, BlockWriteRegistration, BlockWriteRegistry};
 use crate::runtime::DataRpcPermit;
 use crate::store::block::{
-    CheckpointBlockRequest, LocalBlockStore, OpenBlockWriteRequest, ReclaimBlockRequest, ReclaimBlockResult,
+    BlockIdentity, BlockState, CheckpointBlockRequest, LocalBlockStore, OpenBlockWriteRequest, ReclaimBlockRequest,
+    ReclaimBlockResult,
 };
-use beryl_types::fs::{validate_block_size, BlockLengthError};
+use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
+use beryl_types::fs::validate_block_size;
 use beryl_types::ids::BlockId;
 use beryl_types::range::ByteRange;
 use beryl_types::{FencingToken, GroupName, Tier, WorkerRunId};
@@ -21,8 +23,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
-
-pub type WorkerCoreResult<T> = Result<T, WorkerError>;
 
 const WRITE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_WRITE_CLEANUPS_PER_PASS: usize = 64;
@@ -94,33 +94,29 @@ impl ActiveBlockWrite {
 /// Data-plane lifecycle boundary used by the gRPC service.
 #[derive(Clone)]
 pub struct WorkerCore {
-    block_manager: BlockManager,
+    default_frame_size: u32,
+    max_frame_size: u32,
+    block_access: Arc<BlockAccessRegistry>,
     block_store: Arc<dyn LocalBlockStore + Send + Sync>,
     block_writes: Arc<BlockWriteRegistry>,
 }
 
 impl WorkerCore {
-    /// Creates a Worker data core around the configured local-store boundary.
+    /// Creates a Worker data core and tracks reclaim reports for `group_name`.
+    /// The report loop must use the same group as this core and its store.
     pub fn with_local_store(
+        group_name: GroupName,
         default_frame_size: u32,
         max_frame_size: u32,
         block_store: Arc<dyn LocalBlockStore + Send + Sync>,
     ) -> Self {
         Self {
-            block_manager: BlockManager::new(default_frame_size, max_frame_size),
+            default_frame_size,
+            max_frame_size,
+            block_access: Arc::new(BlockAccessRegistry::new(group_name)),
             block_store,
             block_writes: Arc::new(BlockWriteRegistry::new()),
         }
-    }
-
-    /// Returns the frame size used when a read request does not specify one.
-    pub fn default_frame_size(&self) -> u32 {
-        self.block_manager.default_frame_size()
-    }
-
-    /// Returns the largest read response payload selected by Worker.
-    pub fn max_frame_size(&self) -> u32 {
-        self.block_manager.max_frame_size()
     }
 
     /// Validates one metadata-authorized range and binds its pin to an RPC-owned read.
@@ -128,27 +124,21 @@ impl WorkerCore {
         &self,
         req: ReadBlockRequest,
         rpc_permit: Arc<DataRpcPermit>,
-    ) -> WorkerCoreResult<ActiveBlockRead> {
+    ) -> WorkerResult<ActiveBlockRead> {
         let frame_size = self.negotiate_read_frame_size(req.frame_size)?;
-        self.block_manager.validate_read_request(&req)?;
-        let read_pin = self.block_manager.pin_block(&req.group_name, req.block_id)?;
+        let end_offset = validate_read_request(&req)?;
+        let read_pin = self.block_access.pin_block(&req.group_name, req.block_id)?;
         let validation_pin = read_pin.clone();
         let validation_rpc_permit = Arc::clone(&rpc_permit);
-        let block_manager = self.block_manager.clone();
         let block_store = Arc::clone(&self.block_store);
         let validation_request = req.clone();
         tokio::task::spawn_blocking(move || {
             let _pin = validation_pin;
             let _rpc_permit = validation_rpc_permit;
-            block_manager.validate_read(block_store.as_ref(), &validation_request)
+            validate_read(block_store.as_ref(), &validation_request)
         })
         .await
         .map_err(|error| WorkerError::Internal(format!("block read validation task failed: {error}")))??;
-        let end_offset = req
-            .byte_range
-            .offset
-            .checked_add(u64::from(req.byte_range.len))
-            .ok_or_else(|| WorkerError::InvalidArgument("byte range offset overflow".to_string()))?;
         Ok(ActiveBlockRead {
             group_name: req.group_name,
             block_id: req.block_id,
@@ -161,9 +151,9 @@ impl WorkerCore {
     }
 
     /// Pins pending online authorization so a delayed success cannot resurrect a reclaimed block.
-    pub(crate) fn pin_write_authorization(&self, req: &WriteBlockRequest) -> WorkerCoreResult<BlockPin> {
+    pub(crate) fn pin_write_authorization(&self, req: &WriteBlockRequest) -> WorkerResult<BlockPin> {
         validate_write_block_request(req)?;
-        self.block_manager.pin_block(&req.group_name, req.block_id)
+        self.block_access.pin_block(&req.group_name, req.block_id)
     }
 
     /// Creates write state and transfers the RPC permit to its cleanup-owned entry.
@@ -176,16 +166,15 @@ impl WorkerCore {
         rpc_permit: DataRpcPermit,
         block_pin: BlockPin,
         visible_len: u64,
-    ) -> WorkerCoreResult<ActiveBlockWrite> {
-        validate_write_block_request(&req)?;
-        let key = BlockWriteKey {
+    ) -> WorkerResult<ActiveBlockWrite> {
+        let key = BlockIdentity {
             group_name: req.group_name.clone(),
             block_id: req.block_id,
         };
         let authorization_pin = block_pin.clone();
         let registration = self
             .block_writes
-            .register(key, rpc_permit, req.fencing_token, block_pin)
+            .register(key, rpc_permit, req.fencing_token.epoch, block_pin)
             .await
             .ok_or_else(|| {
                 WorkerError::ResourceExhausted(format!(
@@ -259,7 +248,7 @@ impl WorkerCore {
     }
 
     /// Appends one ordered, nonempty data message at the RPC-owned cursor.
-    pub(crate) async fn write_block_data(&self, write: &mut ActiveBlockWrite, data: Bytes) -> WorkerCoreResult<()> {
+    pub(crate) async fn write_block_data(&self, write: &mut ActiveBlockWrite, data: Bytes) -> WorkerResult<()> {
         if data.is_empty() {
             return Err(WorkerError::InvalidArgument(
                 "WriteBlock data must be nonempty".to_string(),
@@ -272,12 +261,8 @@ impl WorkerCore {
                 beryl_proto::MAX_WORKER_DATA_FRAME_SIZE
             )));
         }
-        let len = u64::try_from(data.len())
-            .map_err(|_| WorkerError::InvalidArgument("write data length does not fit in u64".to_string()))?;
-        let end_offset = write
-            .next_offset
-            .checked_add(len)
-            .ok_or_else(|| WorkerError::InvalidArgument("write cursor overflow".to_string()))?;
+        let len = data.len() as u64;
+        let end_offset = write.next_offset + len;
         if end_offset > write.block_size {
             return Err(WorkerError::InvalidArgument(format!(
                 "write exceeds block_size: end_offset={end_offset}, block_size={}",
@@ -318,8 +303,12 @@ impl WorkerCore {
 
     /// Publishes the complete staged prefix as durable local `Ready` state.
     /// Normal RPC completion is emitted only after this method succeeds.
-    pub(crate) async fn finish_block_write(&self, write: &mut ActiveBlockWrite) -> WorkerCoreResult<()> {
-        validate_effective_len(write.block_size, write.next_offset)?;
+    pub(crate) async fn finish_block_write(&self, write: &mut ActiveBlockWrite) -> WorkerResult<()> {
+        if write.next_offset == 0 {
+            return Err(WorkerError::InvalidArgument(
+                "WriteBlock requires at least one data byte".to_string(),
+            ));
+        }
         let block_store = Arc::clone(&self.block_store);
         let group_name = write.group_name.clone();
         let block_id = write.block_id;
@@ -347,8 +336,8 @@ impl WorkerCore {
             block_id = %write.block_id,
             inode_id = write.block_id.inode_id.as_raw(),
             worker_run_id = %write.worker_run_id,
-            lease_epoch = %meta.visibility.fencing_token.epoch,
-            committed_length = meta.source.durable_len,
+            lease_epoch = %meta.fencing_token.epoch,
+            committed_length = meta.durable_len,
             "Block write completed"
         );
         write
@@ -361,7 +350,7 @@ impl WorkerCore {
 
     /// Releases one failed RPC's uncheckpointed suffix before returning a protocol error.
     /// If cleanup itself fails, dropping the registration leaves it for retry.
-    pub(crate) async fn abort_block_write(&self, mut write: ActiveBlockWrite) -> WorkerCoreResult<()> {
+    pub(crate) async fn abort_block_write(&self, mut write: ActiveBlockWrite) -> WorkerResult<()> {
         let block_store = Arc::clone(&self.block_store);
         let group_name = write.group_name.clone();
         let block_id = write.block_id;
@@ -422,21 +411,20 @@ impl WorkerCore {
 
     /// Moves a whole claimed batch into one blocking job so cancellation of
     /// the async waiter cannot strand claims or detach unowned cleanup IO.
-    async fn cleanup_block_write_batch(&self, drain: bool) -> usize {
+    async fn cleanup_block_write_batch(&self, drain: bool) {
         let candidates = self.block_writes.take_cleanup_batch(MAX_WRITE_CLEANUPS_PER_PASS, drain);
         if candidates.is_empty() {
-            return 0;
+            return;
         }
         let block_store = Arc::clone(&self.block_store);
         let cleanup = tokio::task::spawn_blocking(move || {
-            let mut completed = 0;
             for candidate in candidates {
                 let group_name = candidate.key.group_name.clone();
                 let block_id = candidate.key.block_id;
                 let result = block_store.discard_unsynced_suffix(&group_name, block_id);
                 match result {
                     Ok(()) => {
-                        completed += usize::from(candidate.complete());
+                        candidate.complete();
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -451,26 +439,21 @@ impl WorkerCore {
                     }
                 }
             }
-            completed
         });
-        match cleanup.await {
-            Ok(completed) => completed,
-            Err(error) => {
-                tracing::warn!(
-                    target: "worker.state",
-                    op = "CleanupBlockWriteBatch",
-                    error = %error,
-                    "Block write cleanup batch task failed"
-                );
-                0
-            }
+        if let Err(error) = cleanup.await {
+            tracing::warn!(
+                target: "worker.state",
+                op = "CleanupBlockWriteBatch",
+                error = %error,
+                "Block write cleanup batch task failed"
+            );
         }
     }
 
     /// Reclaims one exact metadata-authorized block identity.
-    pub async fn reclaim_block(&self, req: ReclaimBlockRequest) -> WorkerCoreResult<ReclaimBlockResult> {
-        let permit = self.block_manager.begin_reclaim(&req.group_name, req.block_id)?;
-        self.block_writes.retire(&BlockWriteKey {
+    pub async fn reclaim_block(&self, req: ReclaimBlockRequest) -> WorkerResult<ReclaimBlockResult> {
+        let permit = self.block_access.begin_reclaim(&req.group_name, req.block_id)?;
+        self.block_writes.retire(&BlockIdentity {
             group_name: req.group_name.clone(),
             block_id: req.block_id,
         });
@@ -485,33 +468,31 @@ impl WorkerCore {
         .map_err(|error| WorkerError::Internal(format!("block reclaim task failed: {error}")))?
     }
 
-    pub(crate) fn reclaiming_blocks(&self, group_name: &GroupName) -> Vec<ReclaimingBlock> {
-        self.block_manager.reclaiming_blocks(group_name)
+    pub(crate) fn reclaiming_blocks(&self, group_name: &GroupName) -> Vec<BlockId> {
+        self.block_access.reclaiming_blocks(group_name)
     }
 
     /// Returns the reportable deleting state for one exact block.
-    pub(crate) fn reclaiming_block(&self, group_name: &GroupName, block_id: BlockId) -> Option<ReclaimingBlock> {
-        self.block_manager.reclaiming_block(group_name, block_id)
+    pub(crate) fn is_reclaiming(&self, group_name: &GroupName, block_id: BlockId) -> bool {
+        self.block_access.is_reclaiming(group_name, block_id)
     }
 
     /// Returns retained runtime lifecycle changes for incremental reporting.
     pub(crate) fn block_report_changes(&self) -> &BlockReportChangeTracker {
-        self.block_manager.block_report_changes()
+        self.block_access.block_report_changes()
     }
 
     /// Waits for a coalesced runtime block-report wake-up.
     pub(crate) async fn wait_for_block_report_change(&self) {
-        self.block_manager.wait_for_block_report_change().await;
+        self.block_access.block_report_changes().wait().await;
     }
 
     /// Reads the next exact chunk without executing filesystem work on Tokio workers.
-    pub(crate) async fn read_block_chunk(&self, read: &mut ActiveBlockRead) -> WorkerCoreResult<Option<Bytes>> {
+    pub(crate) async fn read_block_chunk(&self, read: &mut ActiveBlockRead) -> WorkerResult<Option<Bytes>> {
         if read.next_offset >= read.end_offset {
             return Ok(None);
         }
         let read_len = (read.end_offset - read.next_offset).min(u64::from(read.frame_size));
-        let expected_len = usize::try_from(read_len)
-            .map_err(|_| WorkerError::InvalidArgument("read length does not fit in usize".to_string()))?;
         let block_store = Arc::clone(&self.block_store);
         let group_name = read.group_name.clone();
         let block_id = read.block_id;
@@ -548,29 +529,17 @@ impl WorkerCore {
                 return Err(error);
             }
         };
-        if data.len() != expected_len {
-            return Err(WorkerError::Corrupt(format!(
-                "block read returned {} bytes, expected {expected_len}",
-                data.len()
-            )));
-        }
-        read.next_offset = read
-            .next_offset
-            .checked_add(
-                u64::try_from(data.len())
-                    .map_err(|_| WorkerError::InvalidArgument("read chunk length does not fit in u64".to_string()))?,
-            )
-            .ok_or_else(|| WorkerError::InvalidArgument("read cursor overflow".to_string()))?;
+        read.next_offset += read_len;
         Ok(Some(data))
     }
 
-    fn negotiate_read_frame_size(&self, requested_frame_size: u32) -> WorkerCoreResult<u32> {
+    fn negotiate_read_frame_size(&self, requested_frame_size: u32) -> WorkerResult<u32> {
         let frame_size = if requested_frame_size == 0 {
-            self.default_frame_size()
+            self.default_frame_size
         } else {
             requested_frame_size
         }
-        .min(self.max_frame_size());
+        .min(self.max_frame_size);
         if frame_size == 0 {
             return Err(WorkerError::InvalidArgument(
                 "frame_size must be greater than zero after negotiation".to_string(),
@@ -580,12 +549,66 @@ impl WorkerCore {
     }
 }
 
-fn validate_write_block_request(req: &WriteBlockRequest) -> WorkerCoreResult<()> {
-    if req.fencing_token.block_id != req.block_id
-        || req.fencing_token.owner.is_zero()
-        || req.fencing_token.epoch.as_raw() == 0
-        || req.write_offset >= req.block_size
-    {
+fn validate_read(store: &(dyn LocalBlockStore + Send + Sync), req: &ReadBlockRequest) -> WorkerResult<()> {
+    let meta = match store.load_meta(&req.group_name, req.block_id) {
+        Ok(meta) => meta,
+        Err(WorkerError::NotFound(message)) => {
+            return Err(WorkerError::RefreshMetadata {
+                kind: ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
+                message: format!("local block is not available for read: {message}"),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    if meta.block_state != BlockState::Ready {
+        return Err(WorkerError::RefreshMetadata {
+            kind: ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
+            message: format!(
+                "local block is not Ready: group_name={}, block_id={}, state={:?}",
+                req.group_name, req.block_id, meta.block_state
+            ),
+        });
+    }
+
+    if req.block_size != meta.block_size || req.effective_len > meta.durable_len {
+        return Err(WorkerError::RefreshMetadata {
+            kind: ErrorKind::Metadata(MetadataErrorKind::StaleState),
+            message: format!(
+                "block layout mismatch: group_name={}, block_id={}, requested_block_size={}, local_block_size={}, requested_effective_len={}, local_effective_len={}",
+                req.group_name,
+                req.block_id,
+                req.block_size,
+                meta.block_size,
+                req.effective_len,
+                meta.durable_len
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_read_request(req: &ReadBlockRequest) -> WorkerResult<u64> {
+    validate_block_size(req.block_size).map_err(|err| WorkerError::InvalidArgument(err.to_string()))?;
+    beryl_types::fs::validate_effective_len(req.block_size, req.effective_len)
+        .map_err(|err| WorkerError::InvalidArgument(err.to_string()))?;
+
+    let range_end = req
+        .byte_range
+        .offset
+        .checked_add(u64::from(req.byte_range.len))
+        .ok_or_else(|| WorkerError::InvalidArgument("byte range offset overflow".to_string()))?;
+    if range_end > req.effective_len {
+        return Err(WorkerError::InvalidArgument(format!(
+            "byte range exceeds expected block length: offset={}, len={}, effective_len={}",
+            req.byte_range.offset, req.byte_range.len, req.effective_len
+        )));
+    }
+    Ok(range_end)
+}
+
+fn validate_write_block_request(req: &WriteBlockRequest) -> WorkerResult<()> {
+    if req.fencing_token.epoch.as_raw() == 0 || req.write_offset >= req.block_size {
         return Err(WorkerError::InvalidArgument(
             "invalid block writer token or offset".into(),
         ));
@@ -594,41 +617,30 @@ fn validate_write_block_request(req: &WriteBlockRequest) -> WorkerCoreResult<()>
     Ok(())
 }
 
-fn validate_effective_len(block_size: u64, effective_len: u64) -> WorkerCoreResult<()> {
-    beryl_types::fs::validate_effective_len(block_size, effective_len).map_err(|error| match error {
-        BlockLengthError::ZeroEffectiveLen => {
-            WorkerError::InvalidArgument("WriteBlock requires at least one data byte".to_string())
-        }
-        BlockLengthError::EffectiveLenExceedsBlock => WorkerError::InvalidArgument(format!(
-            "effective_len exceeds block_size: effective_len={effective_len}, block_size={block_size}"
-        )),
-    })
-}
-
-fn begin_write_io(registration: &BlockWriteRegistration) -> WorkerCoreResult<BlockWriteIoGuard> {
+fn begin_write_io(registration: &BlockWriteRegistration) -> WorkerResult<BlockWriteIoGuard> {
     registration
         .begin_io()
         .ok_or_else(|| WorkerError::Cancelled("block write is retiring".to_string()))
 }
 
-fn begin_active_write_io(write: &ActiveBlockWrite) -> WorkerCoreResult<BlockWriteIoGuard> {
+fn begin_active_write_io(write: &ActiveBlockWrite) -> WorkerResult<BlockWriteIoGuard> {
     begin_write_io(
         write
             .registration
             .as_ref()
-            .ok_or_else(|| WorkerError::Internal("active block write is missing its registration".to_string()))?,
+            .expect("active block write owns its registration"),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{ReadBlockRequest, WorkerCore, WriteBlockRequest};
-    use crate::error::WorkerError;
+    use crate::error::{WorkerError, WorkerResult};
     use crate::runtime::DataRpcPermit;
     use crate::store::block::{BlockMetaPayload, BlockState};
     use crate::store::block::{
-        CheckpointBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore, OpenBlockWriteRequest,
-        ReclaimBlockRequest, ReclaimBlockResult, StoreResult,
+        CheckpointBlockRequest, FullBlockFileStore, LocalBlockStore, OpenBlockWriteRequest, ReclaimBlockRequest,
+        ReclaimBlockResult,
     };
     use beryl_common::error::rpc::{ErrorKind, WorkerErrorKind};
     use beryl_types::ids::{BlockId, BlockIndex, InodeId};
@@ -661,7 +673,6 @@ mod tests {
             block_id: block_id(),
             worker_run_id: WorkerRunId::new(),
             fencing_token: beryl_types::FencingToken::new(
-                block_id(),
                 beryl_types::ClientId::new(9),
                 beryl_types::LeaseEpoch::new(LEASE_EPOCH),
             ),
@@ -671,19 +682,12 @@ mod tests {
         }
     }
 
-    fn write_request_for(block_id: BlockId) -> WriteBlockRequest {
-        let mut req = write_request();
-        req.block_id = block_id;
-        req.fencing_token.block_id = block_id;
-        req
-    }
-
     impl WorkerCore {
         async fn begin_test_write(
             &self,
             req: WriteBlockRequest,
             permit: DataRpcPermit,
-        ) -> super::WorkerCoreResult<super::ActiveBlockWrite> {
+        ) -> WorkerResult<super::ActiveBlockWrite> {
             let pin = self.pin_write_authorization(&req)?;
             self.begin_block_write(req, permit, pin, 0).await
         }
@@ -703,10 +707,8 @@ mod tests {
 
     fn core_with_store() -> (TempDir, Arc<FullBlockFileStore>, WorkerCore) {
         let temp = TempDir::new().expect("tempdir");
-        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
-            temp.path().to_path_buf(),
-        )));
-        let core = WorkerCore::with_local_store(512, 2048, store.clone());
+        let store = Arc::new(FullBlockFileStore::new(temp.path().to_path_buf()));
+        let core = WorkerCore::with_local_store(group_name(), 512, 2048, store.clone());
         (temp, store, core)
     }
 
@@ -714,7 +716,6 @@ mod tests {
     enum BlockingOperation {
         Abort,
         Create,
-        PanicFirstAbort,
         Publish,
         Write,
         Read,
@@ -746,39 +747,36 @@ mod tests {
     }
 
     impl LocalBlockStore for BlockingStore {
-        fn open_block_write(&self, req: OpenBlockWriteRequest) -> StoreResult<BlockMetaPayload> {
+        fn open_block_write(&self, req: OpenBlockWriteRequest) -> WorkerResult<BlockMetaPayload> {
             self.block_once(BlockingOperation::Create);
             self.inner.open_block_write(req)
         }
 
-        fn write_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, data: Bytes) -> StoreResult<()> {
+        fn write_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, data: Bytes) -> WorkerResult<()> {
             self.block_once(BlockingOperation::Write);
             self.inner.write_at(group_name, block_id, offset, data)
         }
 
-        fn checkpoint_block(&self, req: CheckpointBlockRequest) -> StoreResult<BlockMetaPayload> {
+        fn checkpoint_block(&self, req: CheckpointBlockRequest) -> WorkerResult<BlockMetaPayload> {
             self.block_once(BlockingOperation::Publish);
             self.inner.checkpoint_block(req)
         }
 
-        fn read_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, len: u64) -> StoreResult<Bytes> {
+        fn read_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, len: u64) -> WorkerResult<Bytes> {
             self.block_once(BlockingOperation::Read);
             self.inner.read_at(group_name, block_id, offset, len)
         }
 
-        fn load_meta(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<BlockMetaPayload> {
+        fn load_meta(&self, group_name: &GroupName, block_id: BlockId) -> WorkerResult<BlockMetaPayload> {
             self.inner.load_meta(group_name, block_id)
         }
 
-        fn reclaim_block(&self, req: &ReclaimBlockRequest) -> StoreResult<ReclaimBlockResult> {
+        fn reclaim_block(&self, req: &ReclaimBlockRequest) -> WorkerResult<ReclaimBlockResult> {
             self.inner.reclaim_block(req)
         }
 
-        fn discard_unsynced_suffix(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<()> {
-            let call = self.abort_calls.fetch_add(1, Ordering::SeqCst);
-            if self.operation == BlockingOperation::PanicFirstAbort && call == 0 {
-                panic!("injected abort panic");
-            }
+        fn discard_unsynced_suffix(&self, group_name: &GroupName, block_id: BlockId) -> WorkerResult<()> {
+            self.abort_calls.fetch_add(1, Ordering::SeqCst);
             self.block_once(BlockingOperation::Abort);
             self.inner.discard_unsynced_suffix(group_name, block_id)
         }
@@ -795,9 +793,7 @@ mod tests {
 
     fn blocking_core(operation: BlockingOperation) -> BlockingCoreFixture {
         let temp = TempDir::new().expect("tempdir");
-        let inner = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
-            temp.path().to_path_buf(),
-        )));
+        let inner = Arc::new(FullBlockFileStore::new(temp.path().to_path_buf()));
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let abort_calls = Arc::new(AtomicUsize::new(0));
@@ -808,7 +804,7 @@ mod tests {
             release: Mutex::new(release_rx),
             abort_calls: Arc::clone(&abort_calls),
         });
-        let core = Arc::new(WorkerCore::with_local_store(512, 2048, store));
+        let core = Arc::new(WorkerCore::with_local_store(group_name(), 512, 2048, store));
         BlockingCoreFixture {
             _temp: temp,
             store: inner,
@@ -832,7 +828,32 @@ mod tests {
 
     #[tokio::test]
     async fn failed_or_cancelled_write_is_cleaned_and_can_be_reused() {
-        let (_temp, _store, core) = core_with_store();
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            crate::store::dirs::StoreDirs::open(
+                group_name(),
+                [(
+                    "hdd0".to_string(),
+                    crate::config::StoreDirConfig {
+                        path: temp.path().join("hdd0"),
+                        tier: Tier::Hdd,
+                        capacity_bytes: BLOCK_SIZE,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                0,
+                30_000,
+            )
+            .unwrap(),
+        );
+        let core = WorkerCore::with_local_store(group_name(), 512, 2048, store.clone());
+        let mut request = write_request();
+        request.write_offset = 1;
+        assert!(matches!(
+            core.begin_test_write(request, write_rpc_permit()).await,
+            Err(WorkerError::Corrupt(_))
+        ));
         let mut write = core
             .begin_test_write(write_request(), write_rpc_permit())
             .await
@@ -852,6 +873,7 @@ mod tests {
             .await
             .expect("reuse block");
         core.abort_block_write(reused).await.expect("abort reuse");
+        assert_eq!(store.report().free_bytes, BLOCK_SIZE);
     }
 
     #[tokio::test]
@@ -936,7 +958,7 @@ mod tests {
                 .await
         );
         let meta = store.load_meta(&group_name(), block_id()).expect("ready metadata");
-        assert_eq!(meta.visibility.block_state, BlockState::Ready);
+        assert_eq!(meta.block_state, BlockState::Ready);
         assert_eq!(store.read_at(&group_name(), block_id(), 0, 5).unwrap(), b"ready"[..]);
     }
 
@@ -1038,47 +1060,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_panic_releases_the_whole_claimed_batch_for_retry() {
-        let BlockingCoreFixture {
-            _temp,
-            store: _store,
-            core,
-            started: _started,
-            release: _release,
-            abort_calls: _,
-        } = blocking_core(BlockingOperation::PanicFirstAbort);
-        let other_block_id = BlockId::new(InodeId::new(7), BlockIndex::new(4));
-        let first = core
-            .begin_test_write(write_request(), write_rpc_permit())
-            .await
-            .expect("first write");
-        let second = core
-            .begin_test_write(write_request_for(other_block_id), write_rpc_permit())
-            .await
-            .expect("second write");
-        drop((first, second));
-
-        assert_eq!(core.cleanup_block_write_batch(false).await, 0);
-        assert!(
-            !core
-                .drain_block_writes_until(Instant::now() + Duration::from_secs(1))
-                .await,
-            "all claims in the panicked batch must be retryable"
-        );
-
-        let first = core
-            .begin_test_write(write_request(), write_rpc_permit())
-            .await
-            .expect("reuse first block");
-        core.abort_block_write(first).await.expect("abort first reuse");
-        let second = core
-            .begin_test_write(write_request_for(other_block_id), write_rpc_permit())
-            .await
-            .expect("reuse second block");
-        core.abort_block_write(second).await.expect("abort second reuse");
-    }
-
-    #[tokio::test]
     async fn block_write_rejects_empty_and_capacity_overflow() {
         let (_temp, _store, core) = core_with_store();
         let mut request = write_request();
@@ -1117,7 +1098,7 @@ mod tests {
             release: Mutex::new(release_rx),
             abort_calls: Arc::new(AtomicUsize::new(0)),
         });
-        let core = Arc::new(WorkerCore::with_local_store(512, 2048, blocking_store));
+        let core = Arc::new(WorkerCore::with_local_store(group_name(), 512, 2048, blocking_store));
         let read_slots = Arc::new(Semaphore::new(1));
         let rpc_permit = Arc::new(rpc_permit(Arc::clone(&read_slots), "read"));
         let mut read = core
@@ -1197,16 +1178,15 @@ mod tests {
         let takeover = core.begin_test_write(next, write_rpc_permit());
         tokio::pin!(takeover);
         assert!(futures::poll!(&mut takeover).is_pending());
-        assert_eq!(
-            core.cleanup_block_write_batch(false).await,
-            0,
+        core.cleanup_block_write_batch(false).await;
+        assert!(
+            futures::poll!(&mut takeover).is_pending(),
             "actual IO pins old ownership"
         );
         assert_eq!(
             store
                 .load_meta(&group_name(), block_id())
                 .unwrap()
-                .visibility
                 .fencing_token
                 .epoch
                 .as_raw(),
@@ -1218,7 +1198,7 @@ mod tests {
             .write_block_data(&mut old, Bytes::from_static(b"late"))
             .await
             .is_err());
-        assert_eq!(core.cleanup_block_write_batch(false).await, 1);
+        core.cleanup_block_write_batch(false).await;
         let mut new = takeover.await.unwrap();
         assert!(
             core.finish_block_write(&mut old).await.is_err(),
@@ -1247,7 +1227,7 @@ mod tests {
             .begin_block_write(request, write_rpc_permit(), pending_authorization, 0)
             .await
             .is_err());
-        assert_eq!(core.cleanup_block_write_batch(false).await, 1);
+        core.cleanup_block_write_batch(false).await;
         assert_eq!(reclaim.await.unwrap(), ReclaimBlockResult::AlreadyAbsent);
         assert!(matches!(
             store.load_meta(&group_name(), block_id()),

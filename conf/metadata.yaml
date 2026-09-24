@@ -52,12 +52,8 @@ beryl.metadata.block.cleanup.batch-size: 32
 beryl.metadata.block.cleanup.retry.initial-backoff: 1s
 beryl.metadata.block.cleanup.retry.max-backoff: 1min
 
-# -------------------- Startup --------------------
-beryl.metadata.startup.retry.initial-backoff: 200ms
-beryl.metadata.startup.retry.max-backoff: 5s
-beryl.metadata.startup.warn-after: 1min
+# -------------------- Format leader election --------------------
 beryl.metadata.startup.timeout: 2min
-beryl.metadata.startup.fail-fast: false
 
 # -------------------- Shutdown --------------------
 beryl.metadata.shutdown.timeout: 30s

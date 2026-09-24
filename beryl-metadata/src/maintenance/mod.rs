@@ -5,7 +5,6 @@
 
 mod cleanup;
 mod detached_root;
-mod lost_worker;
 mod service;
 
 pub(crate) use cleanup::BlockCleanupCoordinator;

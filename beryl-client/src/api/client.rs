@@ -15,22 +15,16 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct FsClient {
     /// Shared client owner reused by this facade and the handles it opens.
-    pub(crate) inner: Arc<ClientInner>,
+    inner: Arc<ClientInner>,
 }
 
 impl FsClient {
-    /// Creates a filesystem client after revalidating the sealed configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ClientErrorKind::InvalidConfiguration`](crate::ClientErrorKind::InvalidConfiguration)
-    /// if any sealed value violates the runtime configuration invariants. It
-    /// also returns an error if the client identity, root Metadata route, or
-    /// transport ownership cannot be constructed.
-    pub fn new(config: ClientConfig) -> ClientResult<Self> {
-        Ok(Self {
-            inner: Arc::new(ClientInner::from_config(config)?),
-        })
+    /// Creates a filesystem client from validated, immutable configuration.
+    /// Connections are opened lazily by RPC operations.
+    pub fn new(config: ClientConfig) -> Self {
+        Self {
+            inner: Arc::new(ClientInner::from_config(config)),
+        }
     }
 
     /// Returns the immutable configuration used by this client.
@@ -92,7 +86,11 @@ impl FsClient {
     /// transport outcome is reported as unknown instead of being replayed.
     pub async fn mkdirs_with_options(&self, path: &str, options: MkdirOptions) -> ClientResult<FileStatus> {
         let path = NamespacePathBuf::parse(path)?;
-        self.inner.metadata.mkdirs(path, options.create_parent).await
+        self.inner
+            .metadata
+            .mkdirs(path, options.create_parent)
+            .await
+            .inspect_err(|error| crate::metrics::record_unknown_outcome("CreateDirectory", "metadata", error))
     }
 
     /// Delete a file or directory through the metadata client.
@@ -110,7 +108,11 @@ impl FsClient {
     /// Ambiguous transport outcomes are reported as unknown and are not replayed.
     pub async fn delete_with_options(&self, path: &str, options: DeleteOptions) -> ClientResult<()> {
         let path = NamespacePathBuf::parse(path)?;
-        self.inner.metadata.delete(path, options).await
+        self.inner
+            .metadata
+            .delete(path, options)
+            .await
+            .inspect_err(|error| crate::metrics::record_unknown_outcome("Delete", "metadata", error))
     }
 
     /// Renames a namespace entry through Metadata.
@@ -119,7 +121,11 @@ impl FsClient {
     pub async fn rename(&self, src: &str, dst: &str) -> ClientResult<()> {
         let src = NamespacePathBuf::parse(src)?;
         let dst = NamespacePathBuf::parse(dst)?;
-        self.inner.metadata.rename(src, dst).await
+        self.inner
+            .metadata
+            .rename(src, dst)
+            .await
+            .inspect_err(|error| crate::metrics::record_unknown_outcome("Rename", "metadata", error))
     }
 
     /// Opens a file using its current inode state, without querying Worker locations.
@@ -136,8 +142,12 @@ impl FsClient {
     /// Atomically creates a file and obtains its initial write session.
     pub async fn create(&self, path: &str) -> ClientResult<FileWriter> {
         let path = NamespacePathBuf::parse(path)?;
-        let response = self.inner.metadata.create_file(path).await?;
-        Ok(FileWriter::new(Arc::clone(&self.inner), response))
+        self.inner
+            .metadata
+            .create_file(path)
+            .await
+            .map(|session| FileWriter::new(Arc::clone(&self.inner), session))
+            .inspect_err(|error| crate::metrics::record_unknown_outcome("CreateFile", "metadata", error))
     }
 
     /// Opens an append write session for an existing file.
@@ -146,8 +156,12 @@ impl FsClient {
     /// layout override.
     pub async fn append(&self, path: &str) -> ClientResult<FileWriter> {
         let path = NamespacePathBuf::parse(path)?;
-        let response = self.inner.metadata.open_append(path).await?;
-        Ok(FileWriter::new(Arc::clone(&self.inner), response))
+        self.inner
+            .metadata
+            .open_append(path)
+            .await
+            .map(|session| FileWriter::new(Arc::clone(&self.inner), session))
+            .inspect_err(|error| crate::metrics::record_unknown_outcome("OpenWrite", "metadata", error))
     }
 }
 

@@ -6,7 +6,7 @@
 use crate::error::MetadataError;
 use crate::inode::InodeAttrs;
 use crate::mount::MountEntry;
-use beryl_types::ids::{BlockId, InodeId, WorkerId};
+use beryl_types::ids::{BlockId, InodeId};
 use beryl_types::{ContentGeneration, LeaseEpoch};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -43,25 +43,18 @@ pub(crate) enum ApplySuccess {
     DeleteApplied,
     /// The exact namespace rename mutation committed.
     RenameApplied,
-    /// Durable write-lease authority advanced to this epoch.
-    WriteLeaseAcquired { inode_id: InodeId, lease_epoch: LeaseEpoch },
+    /// Durable write-lease authority advanced to the requested successor.
+    WriteLeaseAcquired,
     /// Durable block ordinal allocated for one active write lease.
     BlockAllocated(BlockId),
-    /// Durable write-lease authority ended at this fencing epoch.
-    WriteLeaseEnded { inode_id: InodeId, lease_epoch: LeaseEpoch },
+    /// The requested lease was durably fenced by its immediate successor.
+    WriteLeaseEnded,
     /// File visibility committed at this content generation.
-    FilePublished {
-        inode_id: InodeId,
-        generation: ContentGeneration,
-    },
+    FilePublished { generation: ContentGeneration },
     /// Content, ended writer epoch, and exact completion evidence committed together.
-    FileCommitted {
-        inode_id: InodeId,
-        generation: ContentGeneration,
-        lease_epoch: LeaseEpoch,
-    },
+    FileCommitted { generation: ContentGeneration },
     /// Durable worker descriptor accepted by the authority state.
-    WorkerUpserted(WorkerId),
+    WorkerUpserted,
     /// Bounded progress made by one internal detached-root mutation.
     DetachedRootsReclaimed(DetachedRootReclaimResult),
     /// OpenRaft blank or membership entry durably applied without an application command.
@@ -72,8 +65,6 @@ pub(crate) enum ApplySuccess {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct DetachedRootReclaimResult {
     pub(crate) processed_entries: u32,
-    pub(crate) completed_roots: u32,
-    pub(crate) created_roots: u32,
     pub(crate) logical_batch_bytes: u32,
 }
 
@@ -87,10 +78,6 @@ pub(crate) enum ApplyRejectionKind {
     IsDir,
     DirectoryNotEmpty,
     CrossMountRename,
-    PermissionDenied,
-    NotSupported,
-    Busy,
-    ActiveWorkerConflict,
     Again,
     ResourceExhausted,
     LeaseFenced { expected: LeaseEpoch, got: LeaseEpoch },
@@ -139,22 +126,6 @@ impl ApplyRejection {
                 kind: ApplyRejectionKind::CrossMountRename,
                 message,
             },
-            MetadataError::PermissionDenied(message) => Self {
-                kind: ApplyRejectionKind::PermissionDenied,
-                message,
-            },
-            MetadataError::NotSupported(message) => Self {
-                kind: ApplyRejectionKind::NotSupported,
-                message,
-            },
-            MetadataError::Busy(message) => Self {
-                kind: ApplyRejectionKind::Busy,
-                message,
-            },
-            MetadataError::ActiveWorkerConflict(message) => Self {
-                kind: ApplyRejectionKind::ActiveWorkerConflict,
-                message,
-            },
             MetadataError::Again(message) => Self {
                 kind: ApplyRejectionKind::Again,
                 message,
@@ -168,13 +139,14 @@ impl ApplyRejection {
                 message: format!("lease fenced: expected epoch >= {expected}, got {got}"),
             },
             fatal @ (MetadataError::LeaderChanged(_)
-            | MetadataError::EpochMismatch { .. }
-            | MetadataError::MountEpochMismatch { .. }
-            | MetadataError::RoutingStale(_)
             | MetadataError::StaleState(_)
             | MetadataError::FullReportRequired(_)
             | MetadataError::WriteSessionLimitExceeded(_)
             | MetadataError::GlobalWriteTargetLimitExceeded(_)
+            | MetadataError::PermissionDenied(_)
+            | MetadataError::NotSupported(_)
+            | MetadataError::Busy(_)
+            | MetadataError::ActiveWorkerConflict(_)
             | MetadataError::Internal(_)
             | MetadataError::ServiceUnavailable(_)) => return Err(FatalApplyError(fatal)),
         };
@@ -191,10 +163,6 @@ impl ApplyRejection {
             ApplyRejectionKind::IsDir => MetadataError::IsDir(self.message),
             ApplyRejectionKind::DirectoryNotEmpty => MetadataError::DirectoryNotEmpty(self.message),
             ApplyRejectionKind::CrossMountRename => MetadataError::CrossMountRename(self.message),
-            ApplyRejectionKind::PermissionDenied => MetadataError::PermissionDenied(self.message),
-            ApplyRejectionKind::NotSupported => MetadataError::NotSupported(self.message),
-            ApplyRejectionKind::Busy => MetadataError::Busy(self.message),
-            ApplyRejectionKind::ActiveWorkerConflict => MetadataError::ActiveWorkerConflict(self.message),
             ApplyRejectionKind::Again => MetadataError::Again(self.message),
             ApplyRejectionKind::ResourceExhausted => MetadataError::ResourceExhausted(self.message),
             ApplyRejectionKind::LeaseFenced { expected, got } => MetadataError::LeaseFenced { expected, got },

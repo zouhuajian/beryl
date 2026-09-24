@@ -3,13 +3,11 @@
 
 //! Worker-to-metadata full and incremental block reporting.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use beryl_common::error::rpc::{ErrorKind, RecoveryAction, RpcErrorDetail, WorkerErrorKind};
-use beryl_common::header::RequestHeader;
-use beryl_proto::common::RequestHeaderProto;
 use beryl_proto::convert::rpc_error_from_proto;
 use beryl_proto::metadata::metadata_worker_service_proto_client::MetadataWorkerServiceProtoClient;
 use beryl_proto::metadata::{
@@ -26,31 +24,13 @@ use tonic::Code;
 use tracing::{debug, warn};
 
 use crate::config::WorkerRegistrationConfig;
-use crate::control::{ControlIdentity, ControlOp, Registration, RegistrationSet};
+use crate::control::{ControlIdentity, ControlOp, Registration, RegistrationState};
 use crate::error::WorkerError;
 use crate::observe;
 use crate::report::DirtyBlock;
 use crate::store::block::{BlockMetaPayload, BlockState};
 use crate::store::dirs::StoreDirs;
 use crate::WorkerCore;
-
-/// Worker-side batching policy constrained by the shared report protocol cap.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BlockReportOptions {
-    /// Maximum block entries sent in one Full batch.
-    pub full_max_blocks_per_batch: usize,
-    /// Maximum changed identities sent in one Delta batch.
-    pub delta_max_entries_per_batch: usize,
-}
-
-impl Default for BlockReportOptions {
-    fn default() -> Self {
-        Self {
-            full_max_blocks_per_batch: MAX_REPORT_ENTRIES,
-            delta_max_entries_per_batch: MAX_REPORT_ENTRIES,
-        }
-    }
-}
 
 /// Configuration, retryable transport, and fatal protocol failures from reporting.
 #[derive(Debug, Error)]
@@ -63,14 +43,14 @@ pub enum BlockReportError {
     Fatal(String),
 }
 
-/// Outcome summary for one Full or Delta submission attempt.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BlockReportRound {
-    pub attempted_peers: usize,
-    pub accepted_peers: usize,
-    pub full_report_required: bool,
-    pub needs_register: bool,
-    pub worker_run_mismatch: bool,
+/// Result of one report submission to the configured Metadata leader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockReportOutcome {
+    Skipped,
+    Accepted,
+    FullReportRequired,
+    NeedRegister,
+    WorkerRunMismatch,
 }
 
 /// Immutable Full snapshot retained across every result-unknown retry.
@@ -88,8 +68,8 @@ struct FullReportInFlight {
 #[derive(Clone, Copy, Debug)]
 struct TrackedBlockChange {
     block_id: BlockId,
-    store: Option<DirtyBlock>,
-    runtime: Option<DirtyBlock>,
+    store_revision: Option<u64>,
+    runtime_revision: Option<u64>,
 }
 
 /// Immutable Delta request retained until Metadata acknowledges its sequence.
@@ -125,46 +105,27 @@ struct ReportRuntime {
 /// periodic Full report while the current baseline remains continuous.
 pub struct MetadataBlockReportLoop {
     config: WorkerRegistrationConfig,
-    state: Arc<RegistrationSet>,
+    state: Arc<RegistrationState>,
     endpoint: Endpoint,
     store: Arc<StoreDirs>,
     core: Arc<WorkerCore>,
-    options: BlockReportOptions,
+    batch_size: usize,
     delta_flush_interval: Duration,
     control_identity: ControlIdentity,
     report: Mutex<ReportRuntime>,
 }
 
 impl MetadataBlockReportLoop {
+    /// Builds a reporter with an explicit retry and Delta flush cadence.
     pub fn new(
         config: WorkerRegistrationConfig,
-        state: Arc<RegistrationSet>,
+        state: Arc<RegistrationState>,
         store: Arc<StoreDirs>,
         core: Arc<WorkerCore>,
-    ) -> Result<Self, BlockReportError> {
-        Self::with_options(config, state, store, core, BlockReportOptions::default())
-    }
-
-    pub fn with_options(
-        config: WorkerRegistrationConfig,
-        state: Arc<RegistrationSet>,
-        store: Arc<StoreDirs>,
-        core: Arc<WorkerCore>,
-        options: BlockReportOptions,
-    ) -> Result<Self, BlockReportError> {
-        Self::with_options_and_delta_flush_interval(config, state, store, core, options, Duration::from_secs(1))
-    }
-
-    /// Builds a reporter with an explicit retry and Delta flush cadence.
-    pub fn with_options_and_delta_flush_interval(
-        config: WorkerRegistrationConfig,
-        state: Arc<RegistrationSet>,
-        store: Arc<StoreDirs>,
-        core: Arc<WorkerCore>,
-        options: BlockReportOptions,
+        batch_size: usize,
         delta_flush_interval: Duration,
     ) -> Result<Self, BlockReportError> {
-        config
+        let endpoint = config
             .validate()
             .map_err(|err| BlockReportError::InvalidConfig(err.message))?;
         if delta_flush_interval.is_zero() {
@@ -172,11 +133,14 @@ impl MetadataBlockReportLoop {
                 "block report Delta flush interval must be greater than zero".to_string(),
             ));
         }
-        validate_batch_limit("full_max_blocks_per_batch", options.full_max_blocks_per_batch)?;
-        validate_batch_limit("delta_max_entries_per_batch", options.delta_max_entries_per_batch)?;
-
-        let endpoint = Endpoint::from_shared(config.endpoints[0].clone())
-            .map_err(|err| BlockReportError::InvalidConfig(format!("beryl.worker.metadata.addresses: {err}")))?;
+        validate_batch_limit(batch_size)?;
+        if store.block_report_changes().group_name != config.group_name
+            || core.block_report_changes().group_name != config.group_name
+        {
+            return Err(BlockReportError::InvalidConfig(
+                "block report sources must track the configured group".into(),
+            ));
+        }
 
         Ok(Self {
             config,
@@ -184,15 +148,11 @@ impl MetadataBlockReportLoop {
             endpoint,
             store,
             core,
-            options,
+            batch_size,
             delta_flush_interval,
             control_identity: ControlIdentity::new_local(),
             report: Mutex::new(ReportRuntime::default()),
         })
-    }
-
-    pub fn spawn(self) -> tokio::task::JoinHandle<()> {
-        self.spawn_until_shutdown(CancellationToken::new())
     }
 
     /// Starts block reporting under the process shutdown token.
@@ -201,11 +161,8 @@ impl MetadataBlockReportLoop {
     }
 
     /// Returns whether the current registration owns an accepted Full baseline.
-    pub fn has_delta_baseline(&self, group_name: &GroupName) -> bool {
-        if group_name != &self.config.group_name {
-            return false;
-        }
-        let Some((_, registration_epoch)) = self.state.ready_registration(group_name) else {
+    pub fn has_delta_baseline(&self) -> bool {
+        let Some((_, registration_epoch)) = self.state.ready_registration(&self.config.group_name) else {
             return false;
         };
         let report = self.report.lock().expect("block report state poisoned");
@@ -213,30 +170,21 @@ impl MetadataBlockReportLoop {
     }
 
     /// Sends or exactly retries one Full snapshot for the current registration.
-    pub async fn send_full_once(&self) -> Result<BlockReportRound, BlockReportError> {
+    pub async fn send_full_once(&self) -> Result<BlockReportOutcome, BlockReportError> {
         let Some((registration, registration_epoch)) = self.ready_registration() else {
-            return Ok(BlockReportRound::default());
+            return Ok(BlockReportOutcome::Skipped);
         };
-        let full = self.prepare_full_report(&registration.group_name, registration_epoch)?;
-        let mut round = BlockReportRound {
-            attempted_peers: 1,
-            ..BlockReportRound::default()
-        };
+        let full = self.prepare_full_report(registration_epoch)?;
         let started = Instant::now();
-        match self
-            .send_full_to_peer(self.endpoint.clone(), &registration, &full)
-            .await
-        {
-            Ok(BlockReportPeerOutcome::FullAccepted { .. }) => {
+        match self.send_full(&registration, &full).await {
+            Ok(BlockReportReply::FullAccepted { .. }) => {
                 let duration = started.elapsed().as_secs_f64();
                 observe::record_metadata_rpc("block_report", "ok", "none", duration);
                 observe::record_block_report_sent("full", "ok", "none", duration);
-                round.accepted_peers = 1;
-                self.accept_full_report(&registration.group_name, registration_epoch, full.baseline_seq);
+                self.accept_full_report(registration_epoch, full.baseline_seq);
+                Ok(BlockReportOutcome::Accepted)
             }
-            Ok(outcome) => {
-                self.record_structured_outcome(&registration.group_name, outcome, &mut round, "full", started);
-            }
+            Ok(outcome) => Ok(self.record_structured_outcome(&registration.group_name, outcome, "full", started)),
             Err(error) => {
                 observe::record_metadata_rpc(
                     "block_report",
@@ -245,52 +193,34 @@ impl MetadataBlockReportLoop {
                     started.elapsed().as_secs_f64(),
                 );
                 debug!(%error, "Worker full block report endpoint attempt failed");
-                return Err(error);
+                Err(error)
             }
         }
-        Ok(round)
     }
 
     /// Sends or exactly retries one bounded Delta batch for the current baseline.
-    pub async fn send_delta_once(&self) -> Result<BlockReportRound, BlockReportError> {
+    pub async fn send_delta_once(&self) -> Result<BlockReportOutcome, BlockReportError> {
         let Some((registration, registration_epoch)) = self.ready_registration() else {
-            return Ok(BlockReportRound::default());
+            return Ok(BlockReportOutcome::Skipped);
         };
         let delta = match self.prepare_delta_report(&registration.group_name, registration_epoch)? {
-            DeltaPreparation::NoChanges => return Ok(BlockReportRound::default()),
+            DeltaPreparation::NoChanges => return Ok(BlockReportOutcome::Skipped),
             DeltaPreparation::FullRequired => {
-                return Ok(BlockReportRound {
-                    full_report_required: true,
-                    ..BlockReportRound::default()
-                });
+                return Ok(BlockReportOutcome::FullReportRequired);
             }
             DeltaPreparation::Ready(delta) => delta,
         };
 
-        let mut round = BlockReportRound {
-            attempted_peers: 1,
-            ..BlockReportRound::default()
-        };
         let started = Instant::now();
-        match self
-            .send_delta_to_peer(self.endpoint.clone(), &registration, &delta)
-            .await
-        {
-            Ok(BlockReportPeerOutcome::DeltaAccepted { next_batch_seq }) => {
+        match self.send_delta(&registration, &delta).await {
+            Ok(BlockReportReply::DeltaAccepted { next_batch_seq }) => {
                 let duration = started.elapsed().as_secs_f64();
                 observe::record_metadata_rpc("block_report", "ok", "none", duration);
                 observe::record_block_report_sent("delta", "ok", "none", duration);
-                round.accepted_peers = 1;
-                self.accept_delta_report(
-                    &registration.group_name,
-                    registration_epoch,
-                    delta.batch_seq,
-                    next_batch_seq,
-                )?;
+                self.accept_delta_report(registration_epoch, delta.batch_seq, next_batch_seq)?;
+                Ok(BlockReportOutcome::Accepted)
             }
-            Ok(outcome) => {
-                self.record_structured_outcome(&registration.group_name, outcome, &mut round, "delta", started);
-            }
+            Ok(outcome) => Ok(self.record_structured_outcome(&registration.group_name, outcome, "delta", started)),
             Err(error) => {
                 observe::record_metadata_rpc(
                     "block_report",
@@ -299,10 +229,9 @@ impl MetadataBlockReportLoop {
                     started.elapsed().as_secs_f64(),
                 );
                 debug!(%error, "Worker delta block report endpoint attempt failed");
-                return Err(error);
+                Err(error)
             }
         }
-        Ok(round)
     }
 
     fn ready_registration(&self) -> Option<(Registration, u64)> {
@@ -310,25 +239,21 @@ impl MetadataBlockReportLoop {
     }
 
     /// Builds a Full snapshot once and retains it unchanged until acknowledgement.
-    fn prepare_full_report(
-        &self,
-        group_name: &GroupName,
-        registration_epoch: u64,
-    ) -> Result<Arc<FullReportInFlight>, BlockReportError> {
+    fn prepare_full_report(&self, registration_epoch: u64) -> Result<Arc<FullReportInFlight>, BlockReportError> {
         let mut report = self.report.lock().expect("block report state poisoned");
         bind_registration(&mut report, registration_epoch);
         if let Some(full) = &report.full_inflight {
             return Ok(Arc::clone(full));
         }
 
-        let store_snapshot_revision = self.store.block_report_changes().begin_full_snapshot(group_name);
-        let runtime_snapshot_revision = self.core.block_report_changes().begin_full_snapshot(group_name);
+        let store_snapshot_revision = self.store.block_report_changes().begin_full_snapshot();
+        let runtime_snapshot_revision = self.core.block_report_changes().begin_full_snapshot();
         let blocks = self.scan_report_blocks()?;
         report.next_baseline_seq = report
             .next_baseline_seq
             .checked_add(1)
             .ok_or_else(|| BlockReportError::Fatal("block report baseline sequence overflow".to_string()))?;
-        let batch_count = blocks.len().max(1).div_ceil(self.options.full_max_blocks_per_batch);
+        let batch_count = blocks.len().max(1).div_ceil(self.batch_size);
         let full = Arc::new(FullReportInFlight {
             registration_epoch,
             baseline_seq: report.next_baseline_seq,
@@ -359,21 +284,21 @@ impl MetadataBlockReportLoop {
             return Ok(DeltaPreparation::FullRequired);
         };
 
-        let store_dirty = match self.store.block_report_changes().snapshot(group_name) {
+        let store_dirty = match self.store.block_report_changes().snapshot() {
             Ok(dirty) => dirty,
             Err(()) => {
                 reset_baseline(&mut report);
                 return Ok(DeltaPreparation::FullRequired);
             }
         };
-        let runtime_dirty = match self.core.block_report_changes().snapshot(group_name) {
+        let runtime_dirty = match self.core.block_report_changes().snapshot() {
             Ok(dirty) => dirty,
             Err(()) => {
                 reset_baseline(&mut report);
                 return Ok(DeltaPreparation::FullRequired);
             }
         };
-        let tracked = merge_dirty_changes(store_dirty, runtime_dirty, self.options.delta_max_entries_per_batch);
+        let tracked = merge_dirty_changes(store_dirty, runtime_dirty, self.batch_size);
         if tracked.is_empty() {
             return Ok(DeltaPreparation::NoChanges);
         }
@@ -400,7 +325,7 @@ impl MetadataBlockReportLoop {
         group_name: &GroupName,
         block_id: BlockId,
     ) -> Result<DeltaBlockReportEntryProto, BlockReportError> {
-        if self.core.reclaiming_block(group_name, block_id).is_some() {
+        if self.core.is_reclaiming(group_name, block_id) {
             return Ok(present_entry(ReportedBlockProto {
                 block_id: Some(block_id.into()),
                 lease_epoch: 0,
@@ -426,17 +351,15 @@ impl MetadataBlockReportLoop {
             .store
             .scan_group_blocks(&self.config.group_name)
             .map_err(|err| BlockReportError::Retryable(format!("scan local block report group failed: {err}")))?;
-        let mut blocks = HashMap::with_capacity(metas.len());
+        let mut blocks = BTreeMap::new();
         for meta in metas {
-            let block = meta_to_report_block(meta);
-            let id = block_id(&block).expect("local block report entry has an id");
-            blocks.insert(id, block);
+            blocks.insert(meta.block_id, meta_to_report_block(meta));
         }
-        for reclaiming in self.core.reclaiming_blocks(&self.config.group_name) {
+        for block_id in self.core.reclaiming_blocks(&self.config.group_name) {
             blocks.insert(
-                reclaiming.block_id,
+                block_id,
                 ReportedBlockProto {
-                    block_id: Some(reclaiming.block_id.into()),
+                    block_id: Some(block_id.into()),
                     lease_epoch: 0,
                     tier: 0,
                     state: ReportedBlockStateProto::ReportedBlockStateDeleting as i32,
@@ -444,13 +367,11 @@ impl MetadataBlockReportLoop {
                 },
             );
         }
-        let mut blocks = blocks.into_values().collect::<Vec<_>>();
-        blocks.sort_by_key(|block| block_id(block).expect("local block report entry has an id"));
-        Ok(blocks)
+        Ok(blocks.into_values().collect())
     }
 
     /// Commits a Full acknowledgement only if it still names the in-flight snapshot.
-    fn accept_full_report(&self, group_name: &GroupName, registration_epoch: u64, baseline_seq: u64) {
+    fn accept_full_report(&self, registration_epoch: u64, baseline_seq: u64) {
         let mut report = self.report.lock().expect("block report state poisoned");
         let Some(full) = report.full_inflight.as_ref() else {
             return;
@@ -461,11 +382,11 @@ impl MetadataBlockReportLoop {
         let store_continuous = self
             .store
             .block_report_changes()
-            .acknowledge_full(group_name, full.store_snapshot_revision);
+            .acknowledge_full(full.store_snapshot_revision);
         let runtime_continuous = self
             .core
             .block_report_changes()
-            .acknowledge_full(group_name, full.runtime_snapshot_revision);
+            .acknowledge_full(full.runtime_snapshot_revision);
         report.full_inflight = None;
         report.delta_inflight = None;
         if store_continuous && runtime_continuous {
@@ -479,7 +400,6 @@ impl MetadataBlockReportLoop {
     /// Advances Delta state only after the exact in-flight batch is acknowledged.
     fn accept_delta_report(
         &self,
-        group_name: &GroupName,
         registration_epoch: u64,
         batch_seq: u64,
         next_batch_seq: u64,
@@ -500,14 +420,28 @@ impl MetadataBlockReportLoop {
             return Ok(());
         }
 
-        let store_ack = delta.tracked.iter().filter_map(|entry| entry.store).collect::<Vec<_>>();
+        let store_ack = delta
+            .tracked
+            .iter()
+            .filter_map(|entry| {
+                entry.store_revision.map(|revision| DirtyBlock {
+                    block_id: entry.block_id,
+                    revision,
+                })
+            })
+            .collect::<Vec<_>>();
         let runtime_ack = delta
             .tracked
             .iter()
-            .filter_map(|entry| entry.runtime)
+            .filter_map(|entry| {
+                entry.runtime_revision.map(|revision| DirtyBlock {
+                    block_id: entry.block_id,
+                    revision,
+                })
+            })
             .collect::<Vec<_>>();
-        self.store.block_report_changes().acknowledge(group_name, &store_ack);
-        self.core.block_report_changes().acknowledge(group_name, &runtime_ack);
+        self.store.block_report_changes().acknowledge(&store_ack);
+        self.core.block_report_changes().acknowledge(&runtime_ack);
         report.delta_inflight = None;
         report.next_delta_batch_seq = next_batch_seq;
         Ok(())
@@ -521,45 +455,41 @@ impl MetadataBlockReportLoop {
     fn record_structured_outcome(
         &self,
         group_name: &GroupName,
-        outcome: BlockReportPeerOutcome,
-        round: &mut BlockReportRound,
+        outcome: BlockReportReply,
         report_kind: &'static str,
         started: Instant,
-    ) {
-        let error_kind = match outcome {
-            BlockReportPeerOutcome::FullReportRequired => {
-                round.full_report_required = true;
+    ) -> BlockReportOutcome {
+        let (result, error_kind) = match outcome {
+            BlockReportReply::FullReportRequired => {
                 self.reset_baseline();
-                "full_report_required"
+                (BlockReportOutcome::FullReportRequired, "full_report_required")
             }
-            BlockReportPeerOutcome::NeedRegister => {
-                round.needs_register = true;
+            BlockReportReply::NeedRegister => {
                 self.state.mark_needs_register(group_name);
                 self.reset_baseline();
-                "need_register"
+                (BlockReportOutcome::NeedRegister, "need_register")
             }
-            BlockReportPeerOutcome::WorkerRunMismatch => {
-                round.worker_run_mismatch = true;
+            BlockReportReply::WorkerRunMismatch => {
                 self.state.mark_needs_register(group_name);
                 self.reset_baseline();
-                "worker_run_mismatch"
+                (BlockReportOutcome::WorkerRunMismatch, "worker_run_mismatch")
             }
-            BlockReportPeerOutcome::FullAccepted { .. } | BlockReportPeerOutcome::DeltaAccepted { .. } => {
+            BlockReportReply::FullAccepted { .. } | BlockReportReply::DeltaAccepted { .. } => {
                 unreachable!("accepted outcomes are handled by the caller")
             }
         };
         observe::record_metadata_rpc("block_report", "error", error_kind, started.elapsed().as_secs_f64());
         observe::record_block_report_sent(report_kind, "error", error_kind, started.elapsed().as_secs_f64());
+        result
     }
 
-    async fn send_full_to_peer(
+    async fn send_full(
         &self,
-        endpoint: Endpoint,
         registration: &Registration,
         full: &FullReportInFlight,
-    ) -> Result<BlockReportPeerOutcome, BlockReportError> {
+    ) -> Result<BlockReportReply, BlockReportError> {
         let timeout = Duration::from_millis(self.config.request_timeout_ms);
-        let channel = time::timeout(timeout, endpoint.connect())
+        let channel = time::timeout(timeout, self.endpoint.connect())
             .await
             .map_err(|_| BlockReportError::Retryable("metadata block report connect timed out".to_string()))?
             .map_err(|err| BlockReportError::Retryable(format!("metadata block report endpoint unavailable: {err}")))?;
@@ -568,25 +498,19 @@ impl MetadataBlockReportLoop {
         let batch_count = full.batch_ops.len();
         let mut batch_seq = 0usize;
         loop {
-            let start = batch_seq
-                .checked_mul(self.options.full_max_blocks_per_batch)
-                .ok_or_else(|| BlockReportError::Fatal("full report batch offset overflow".to_string()))?;
-            let end = start
-                .saturating_add(self.options.full_max_blocks_per_batch)
-                .min(full.blocks.len());
-            let blocks = full.blocks.get(start..end).ok_or_else(|| {
-                BlockReportError::Fatal("full report acknowledgement selected an invalid batch".to_string())
-            })?;
+            let start = batch_seq * self.batch_size;
+            let end = (start + self.batch_size).min(full.blocks.len());
+            let blocks = &full.blocks[start..end];
             let final_batch = batch_seq + 1 == batch_count;
             let outcome = self
                 .send_full_batch(&mut client, registration, full, batch_seq, blocks, final_batch)
                 .await?;
             match outcome {
-                BlockReportPeerOutcome::FullAccepted {
+                BlockReportReply::FullAccepted {
                     baseline_published: true,
                     ..
                 } => return Ok(outcome),
-                BlockReportPeerOutcome::FullAccepted {
+                BlockReportReply::FullAccepted {
                     next_batch_seq,
                     baseline_published: false,
                 } => {
@@ -595,7 +519,7 @@ impl MetadataBlockReportLoop {
                             "metadata full report acknowledgement exceeds local batch range".to_string(),
                         )
                     })?;
-                    if next_batch_seq <= batch_seq || next_batch_seq >= batch_count {
+                    if next_batch_seq >= batch_count {
                         return Err(BlockReportError::Fatal(format!(
                             "metadata full report acknowledgement selected invalid next_batch_seq {next_batch_seq} after batch {batch_seq} of {batch_count}"
                         )));
@@ -615,49 +539,49 @@ impl MetadataBlockReportLoop {
         batch_seq: usize,
         blocks: &[ReportedBlockProto],
         final_batch: bool,
-    ) -> Result<BlockReportPeerOutcome, BlockReportError> {
+    ) -> Result<BlockReportReply, BlockReportError> {
         let timeout = Duration::from_millis(self.config.request_timeout_ms);
-        let op = full
-            .batch_ops
-            .get(batch_seq)
-            .ok_or_else(|| BlockReportError::Fatal("full report batch identity is missing".to_string()))?;
+        let op = &full.batch_ops[batch_seq];
         let request = BlockReportRequestProto {
-            header: Some(block_report_request_header(&registration.group_name, op)),
+            header: Some(op.request_header(&registration.group_name)),
             worker_id: registration.worker_id.as_raw(),
             worker_run_id: registration.worker_run_id.to_string(),
             baseline_seq: full.baseline_seq,
             batch: Some(block_report_request_proto::Batch::FullReport(
                 FullBlockReportBatchProto {
-                    batch_seq: u64::try_from(batch_seq)
-                        .map_err(|_| BlockReportError::Fatal("full report batch index overflow".to_string()))?,
+                    batch_seq: batch_seq as u64,
                     final_batch,
                     blocks: blocks.to_vec(),
                 },
             )),
         };
-        let tonic_request = tonic::Request::new(request.clone());
+        let tonic_request = tonic::Request::new(request);
         let response = time::timeout(timeout, client.block_report(tonic_request))
             .await
             .map_err(|_| BlockReportError::Retryable("metadata full block report timed out".to_string()))?
             .map_err(classify_status)?
             .into_inner();
-        classify_block_report_response(&request, response)
+        classify_block_report_response(
+            &registration.group_name,
+            full.baseline_seq,
+            Some((batch_seq as u64, final_batch)),
+            response,
+        )
     }
 
-    async fn send_delta_to_peer(
+    async fn send_delta(
         &self,
-        endpoint: Endpoint,
         registration: &Registration,
         delta: &DeltaReportInFlight,
-    ) -> Result<BlockReportPeerOutcome, BlockReportError> {
+    ) -> Result<BlockReportReply, BlockReportError> {
         let timeout = Duration::from_millis(self.config.request_timeout_ms);
-        let channel = time::timeout(timeout, endpoint.connect())
+        let channel = time::timeout(timeout, self.endpoint.connect())
             .await
             .map_err(|_| BlockReportError::Retryable("metadata delta report connect timed out".to_string()))?
             .map_err(|err| BlockReportError::Retryable(format!("metadata delta report endpoint unavailable: {err}")))?;
         let mut client = MetadataWorkerServiceProtoClient::new(channel);
         let request = BlockReportRequestProto {
-            header: Some(block_report_request_header(&registration.group_name, &delta.op)),
+            header: Some(delta.op.request_header(&registration.group_name)),
             worker_id: registration.worker_id.as_raw(),
             worker_run_id: registration.worker_run_id.to_string(),
             baseline_seq: delta.baseline_seq,
@@ -668,13 +592,13 @@ impl MetadataBlockReportLoop {
                 },
             )),
         };
-        let tonic_request = tonic::Request::new(request.clone());
+        let tonic_request = tonic::Request::new(request);
         let response = time::timeout(timeout, client.block_report(tonic_request))
             .await
             .map_err(|_| BlockReportError::Retryable("metadata delta block report timed out".to_string()))?
             .map_err(classify_status)?
             .into_inner();
-        classify_block_report_response(&request, response)
+        classify_block_report_response(&registration.group_name, delta.baseline_seq, None, response)
     }
 
     /// Flushes retained changes and retries in-flight requests until shutdown.
@@ -689,9 +613,9 @@ impl MetadataBlockReportLoop {
                 _ = self.core.wait_for_block_report_change() => {}
             }
             let report = async {
-                if self.has_delta_baseline(&self.config.group_name) {
+                if self.has_delta_baseline() {
                     match self.send_delta_once().await {
-                        Ok(round) if round.full_report_required => {
+                        Ok(BlockReportOutcome::FullReportRequired) => {
                             if let Err(error) = self.send_full_once().await {
                                 warn!(%error, "Worker full block report recovery failed");
                             }
@@ -718,7 +642,7 @@ enum DeltaPreparation {
     Ready(Arc<DeltaReportInFlight>),
 }
 
-enum BlockReportPeerOutcome {
+enum BlockReportReply {
     FullAccepted {
         next_batch_seq: u64,
         baseline_published: bool,
@@ -731,15 +655,15 @@ enum BlockReportPeerOutcome {
     WorkerRunMismatch,
 }
 
-fn validate_batch_limit(name: &str, value: usize) -> Result<(), BlockReportError> {
+fn validate_batch_limit(value: usize) -> Result<(), BlockReportError> {
     if value == 0 {
-        return Err(BlockReportError::InvalidConfig(format!(
-            "{name} must be greater than zero"
-        )));
+        return Err(BlockReportError::InvalidConfig(
+            "block report batch_size must be greater than zero".to_string(),
+        ));
     }
     if value > MAX_REPORT_ENTRIES {
         return Err(BlockReportError::InvalidConfig(format!(
-            "{name} {value} exceeds maximum {MAX_REPORT_ENTRIES}"
+            "block report batch_size {value} exceeds maximum {MAX_REPORT_ENTRIES}"
         )));
     }
     Ok(())
@@ -770,20 +694,20 @@ fn merge_dirty_changes(store: Vec<DirtyBlock>, runtime: Vec<DirtyBlock>, limit: 
             .entry(entry.block_id)
             .or_insert(TrackedBlockChange {
                 block_id: entry.block_id,
-                store: None,
-                runtime: None,
+                store_revision: None,
+                runtime_revision: None,
             })
-            .store = Some(entry);
+            .store_revision = Some(entry.revision);
     }
     for entry in runtime {
         merged
             .entry(entry.block_id)
             .or_insert(TrackedBlockChange {
                 block_id: entry.block_id,
-                store: None,
-                runtime: None,
+                store_revision: None,
+                runtime_revision: None,
             })
-            .runtime = Some(entry);
+            .runtime_revision = Some(entry.revision);
     }
     merged.into_values().take(limit).collect()
 }
@@ -795,25 +719,18 @@ fn present_entry(block: ReportedBlockProto) -> DeltaBlockReportEntryProto {
 }
 
 fn meta_to_report_block(meta: BlockMetaPayload) -> ReportedBlockProto {
-    let block_state = match meta.visibility.block_state {
+    let block_state = match meta.block_state {
         BlockState::Ready => ReportedBlockStateProto::ReportedBlockStateReady,
-        BlockState::Corrupt => ReportedBlockStateProto::ReportedBlockStateCorrupt,
         BlockState::Deleting => ReportedBlockStateProto::ReportedBlockStateDeleting,
     };
-    let block_id = meta.identity.block_id;
+    let block_id = meta.block_id;
     ReportedBlockProto {
         block_id: Some(block_id.into()),
-        lease_epoch: meta.visibility.fencing_token.epoch.as_raw(),
+        lease_epoch: meta.fencing_token.epoch.as_raw(),
         tier: beryl_proto::common::TierProto::from(meta.tier) as i32,
         state: block_state as i32,
-        effective_len: meta.source.durable_len,
+        effective_len: meta.durable_len,
     }
-}
-
-fn block_id(block: &ReportedBlockProto) -> Option<BlockId> {
-    block.block_id.map(|block_id| {
-        BlockId::try_from(block_id).unwrap_or_else(|error| panic!("stored BlockId must be valid: {error}"))
-    })
 }
 
 fn block_report_error_kind(error: &BlockReportError) -> &'static str {
@@ -826,26 +743,23 @@ fn block_report_error_kind(error: &BlockReportError) -> &'static str {
 
 /// Validates that Metadata confirmed the exact report kind and baseline progress.
 fn classify_block_report_response(
-    request: &BlockReportRequestProto,
+    request_group_name: &GroupName,
+    baseline_seq: u64,
+    full_batch: Option<(u64, bool)>,
     response: BlockReportResponseProto,
-) -> Result<BlockReportPeerOutcome, BlockReportError> {
-    let response_group_name = response
+) -> Result<BlockReportReply, BlockReportError> {
+    let header = response
         .header
         .as_ref()
-        .map(|header| header.group_name.as_str())
         .ok_or_else(|| BlockReportError::Fatal("metadata block report response missing ResponseHeader".to_string()))?;
-    let request_group_name = request
-        .header
-        .as_ref()
-        .map(|header| header.group_name.as_str())
-        .ok_or_else(|| BlockReportError::Fatal("metadata block report request missing RequestHeader".to_string()))?;
-    if response_group_name != request_group_name {
+    let response_group_name = header.group_name.as_str();
+    if response_group_name != request_group_name.as_str() {
         return Err(BlockReportError::Fatal(format!(
             "metadata block report response confirmed group_name {response_group_name}, expected {request_group_name}"
         )));
     }
-    if let Some(outcome) = classify_header(response.header.as_ref())? {
-        return Ok(outcome);
+    if let Some(error) = header.error.as_ref() {
+        return classify_rpc_error(rpc_error_from_proto(error));
     }
     let report_kind = BlockReportKindProto::try_from(response.report_kind).map_err(|_| {
         BlockReportError::Fatal(format!(
@@ -853,20 +767,19 @@ fn classify_block_report_response(
             response.report_kind
         ))
     })?;
-    if response.baseline_seq != request.baseline_seq {
+    if response.baseline_seq != baseline_seq {
         return Err(BlockReportError::Fatal(format!(
             "metadata block report response confirmed baseline_seq {}, expected {}",
-            response.baseline_seq, request.baseline_seq
+            response.baseline_seq, baseline_seq
         )));
     }
-    match (request.batch.as_ref(), report_kind) {
-        (Some(block_report_request_proto::Batch::FullReport(full)), BlockReportKindProto::BlockReportKindFull) => {
-            let expected_next = full
-                .batch_seq
+    match (full_batch, report_kind) {
+        (Some((batch_seq, final_batch)), BlockReportKindProto::BlockReportKindFull) => {
+            let expected_next = batch_seq
                 .checked_add(1)
                 .ok_or_else(|| BlockReportError::Fatal("full report batch sequence overflow".to_string()))?;
-            if response.baseline_published || (!full.final_batch && response.next_batch_seq >= expected_next) {
-                Ok(BlockReportPeerOutcome::FullAccepted {
+            if response.baseline_published || (!final_batch && response.next_batch_seq >= expected_next) {
+                Ok(BlockReportReply::FullAccepted {
                     next_batch_seq: response.next_batch_seq,
                     baseline_published: response.baseline_published,
                 })
@@ -876,14 +789,12 @@ fn classify_block_report_response(
                     response.next_batch_seq,
                     response.baseline_published,
                     expected_next,
-                    if full.final_batch { " and a published baseline" } else { "" }
+                    if final_batch { " and a published baseline" } else { "" }
                 )))
             }
         }
-        (Some(block_report_request_proto::Batch::DeltaReport(_)), BlockReportKindProto::BlockReportKindDelta)
-            if response.baseline_published =>
-        {
-            Ok(BlockReportPeerOutcome::DeltaAccepted {
+        (None, BlockReportKindProto::BlockReportKindDelta) if response.baseline_published => {
+            Ok(BlockReportReply::DeltaAccepted {
                 next_batch_seq: response.next_batch_seq,
             })
         }
@@ -894,24 +805,13 @@ fn classify_block_report_response(
     }
 }
 
-fn classify_header(
-    header: Option<&beryl_proto::common::ResponseHeaderProto>,
-) -> Result<Option<BlockReportPeerOutcome>, BlockReportError> {
-    let header = header
-        .ok_or_else(|| BlockReportError::Fatal("metadata block report response missing ResponseHeader".to_string()))?;
-    let Some(error) = header.error.as_ref() else {
-        return Ok(None);
-    };
-    classify_rpc_error(rpc_error_from_proto(error)).map(Some)
-}
-
-fn classify_rpc_error(error: RpcErrorDetail) -> Result<BlockReportPeerOutcome, BlockReportError> {
+fn classify_rpc_error(error: RpcErrorDetail) -> Result<BlockReportReply, BlockReportError> {
     match error.recovery {
-        RecoveryAction::SendFullBlockReport => Ok(BlockReportPeerOutcome::FullReportRequired),
+        RecoveryAction::SendFullBlockReport => Ok(BlockReportReply::FullReportRequired),
         RecoveryAction::RegisterWorker if error.kind == ErrorKind::Worker(WorkerErrorKind::RunMismatch) => {
-            Ok(BlockReportPeerOutcome::WorkerRunMismatch)
+            Ok(BlockReportReply::WorkerRunMismatch)
         }
-        RecoveryAction::RegisterWorker => Ok(BlockReportPeerOutcome::NeedRegister),
+        RecoveryAction::RegisterWorker => Ok(BlockReportReply::NeedRegister),
         RecoveryAction::Retry { .. } | RecoveryAction::RefreshMetadata { .. } => {
             Err(BlockReportError::Retryable(error.message))
         }
@@ -931,8 +831,44 @@ fn classify_status(status: tonic::Status) -> BlockReportError {
     }
 }
 
-fn block_report_request_header(group_name: &GroupName, op: &ControlOp) -> RequestHeaderProto {
-    let mut header = RequestHeader::new(op.client_id).with_group_name(group_name.clone());
-    header.client.call_id = op.call_id;
-    (&header).into()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beryl_proto::common::ResponseHeaderProto;
+
+    #[test]
+    fn acknowledgements_must_confirm_requested_report_and_progress() {
+        let group_name = GroupName::parse("root").unwrap();
+        let full = BlockReportKindProto::BlockReportKindFull as i32;
+        let delta = BlockReportKindProto::BlockReportKindDelta as i32;
+        for (full_batch, kind, baseline, next, published, accepted) in [
+            (Some((0, false)), i32::MAX, 1, 1, false, false),
+            (Some((0, false)), delta, 1, 1, true, false),
+            (Some((0, false)), full, 2, 1, false, false),
+            (Some((0, false)), full, 1, 0, false, false),
+            (Some((0, true)), full, 1, 1, false, false),
+            (None, delta, 1, 1, false, false),
+            (Some((0, false)), full, 1, 1, false, true),
+            (Some((0, false)), full, 1, 2, false, true),
+            (Some((0, true)), full, 1, 0, true, true),
+            (None, delta, 1, 1, true, true),
+        ] {
+            let response = BlockReportResponseProto {
+                header: Some(ResponseHeaderProto {
+                    group_name: group_name.to_string(),
+                    ..Default::default()
+                }),
+                report_kind: kind,
+                baseline_seq: baseline,
+                next_batch_seq: next,
+                baseline_published: published,
+            };
+            let result = classify_block_report_response(&group_name, 1, full_batch, response);
+            if accepted {
+                assert!(result.is_ok(), "{:?}", result.err());
+            } else {
+                assert!(matches!(result, Err(BlockReportError::Fatal(_))), "{:?}", result.err());
+            }
+        }
+    }
 }

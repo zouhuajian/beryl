@@ -7,13 +7,10 @@ use bytes::Bytes;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metadata_cleanup_commands_remove_only_deleted_file_blocks() {
-    let mut cluster = TestCluster::start_with_cleanup_page_size(1)
-        .await
-        .expect("start cleanup-enabled cluster with one replica per scan");
-    cluster
-        .start_metadata_process(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
-        .await
-        .expect("start full metadata runtime with maintenance");
+    let mut cluster =
+        TestCluster::start_with_cleanup_page_size(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")), 1)
+            .await
+            .expect("start cleanup-enabled cluster with one replica per scan");
     let client: beryl_client::FsClient = cluster.client().clone();
     client.mkdirs("/cleanup").await.expect("create cleanup directory");
 
@@ -62,14 +59,9 @@ async fn metadata_cleanup_commands_remove_only_deleted_file_blocks() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recursive_delete_stays_hidden_and_reclaims_after_metadata_restart() {
-    let mut cluster = TestCluster::start_with_cleanup()
+    let mut cluster = TestCluster::start_with_cleanup(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
         .await
         .expect("start cleanup-enabled cluster");
-    let metadata_executable = std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server"));
-    cluster
-        .start_metadata_process(metadata_executable)
-        .await
-        .expect("start full metadata runtime with maintenance");
     let client: beryl_client::FsClient = cluster.client().clone();
     client
         .mkdirs("/restart-delete")
@@ -93,7 +85,7 @@ async fn recursive_delete_stays_hidden_and_reclaims_after_metadata_restart() {
     );
 
     cluster
-        .restart_metadata_process(metadata_executable)
+        .restart_metadata_process()
         .await
         .expect("restart full metadata runtime after detach");
     assert_not_found(

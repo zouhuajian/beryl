@@ -49,14 +49,11 @@ pub mod rpc {
         Conflict,
         NotLeader,
         StaleState,
-        MountEpochMismatch,
-        RouteEpochMismatch,
         OwnerGroupMismatch,
         GroupMismatch,
         Fencing,
         SessionInvalid,
         SessionExpired,
-        EpochMismatch,
         ResourceExhausted,
     }
 
@@ -72,7 +69,6 @@ pub mod rpc {
         NodeUnavailable,
         Timeout,
         ResourceExhausted,
-        Conflict,
         Corrupt,
         Fencing,
         Cancelled,
@@ -89,8 +85,6 @@ pub mod rpc {
         InvalidArgument,
         PermissionDenied,
         Unsupported,
-        Cancelled,
-        Corrupt,
     }
 
     /// Internal or infrastructure failure fact.
@@ -98,10 +92,6 @@ pub mod rpc {
     #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
     pub enum InternalErrorKind {
         NodeUnavailable,
-        Timeout,
-        ResourceExhausted,
-        Cancelled,
-        Corrupt,
         Internal,
     }
 
@@ -117,23 +107,11 @@ pub mod rpc {
         SendFullBlockReport,
     }
 
-    /// Worker endpoint hint used in RPC refresh hints.
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct WorkerEndpointHint {
-        pub worker_id: u64,
-        pub endpoint: String,
-    }
-
     /// Structured refresh hints attached to RPC errors.
     #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct RefreshHint {
         pub leader_endpoint: Option<String>,
         pub group_name: Option<String>,
-        pub mount_epoch: Option<u64>,
-        pub mount_prefix: Option<String>,
-        pub route_epoch: Option<u64>,
-        pub worker_endpoints: Vec<WorkerEndpointHint>,
-        pub worker_resolve_required: bool,
     }
 
     /// RPC error model for Beryl.
@@ -182,32 +160,17 @@ pub mod rpc {
 /// Error kinds for common utility-layer failures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CommonErrorKind {
-    /// Operation timed out.
-    Timeout,
-    /// Service is overloaded (too many concurrent requests).
-    Overloaded,
-    /// Resource not found.
-    NotFound,
-    /// Permission denied.
-    PermissionDenied,
     /// Invalid argument.
     InvalidArgument,
     /// I/O error.
     Io,
-    /// Internal error.
-    Internal,
 }
 
 impl fmt::Display for CommonErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CommonErrorKind::Timeout => write!(f, "Timeout"),
-            CommonErrorKind::Overloaded => write!(f, "Overloaded"),
-            CommonErrorKind::NotFound => write!(f, "NotFound"),
-            CommonErrorKind::PermissionDenied => write!(f, "PermissionDenied"),
             CommonErrorKind::InvalidArgument => write!(f, "InvalidArgument"),
             CommonErrorKind::Io => write!(f, "Io"),
-            CommonErrorKind::Internal => write!(f, "Internal"),
         }
     }
 }

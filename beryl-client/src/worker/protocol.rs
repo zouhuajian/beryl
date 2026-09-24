@@ -4,19 +4,18 @@
 //! Worker data-service wire conversion and response validation helpers.
 
 use crate::error::{ClientError, ClientResult};
-use crate::planner::PlannedBlockRead;
-use crate::rpc_error::{invalid_header_error, validate_data_header};
-use crate::runtime::AttemptContext;
-use beryl_common::header::{HeaderIdentity, HEADER_WORKER_DATA_ERROR_DETAIL, WORKER_DATA_ERROR_DETAIL_V1};
+use crate::metadata::PlannedBlockRead;
+use crate::rpc_error::validate_data_header;
+use crate::runtime::OperationContext;
+use beryl_common::header::{HEADER_WORKER_DATA_ERROR_DETAIL, WORKER_DATA_ERROR_DETAIL_V1};
 use beryl_proto::worker::write_block_request_proto::Payload;
 use beryl_types::range::ByteRange;
-use beryl_types::{validate_block_size, GroupName, LocatedBlock, WorkerEndpointInfo};
+use beryl_types::{GroupName, LocatedBlock, WorkerEndpointInfo};
 use bytes::Bytes;
 use prost::Message;
-use std::time::Duration;
 
 pub(super) fn build_read_block_request(
-    attempt: &AttemptContext,
+    attempt: &OperationContext,
     group_name: &GroupName,
     block_read: &PlannedBlockRead,
     worker: &WorkerEndpointInfo,
@@ -43,13 +42,12 @@ pub(super) fn build_read_block_request(
 /// Builds the control payload carrying Metadata-issued fencing authority for
 /// Worker write authorization.
 pub(super) fn build_write_block_command(
-    attempt: &AttemptContext,
+    attempt: &OperationContext,
     group_name: &GroupName,
     target: &LocatedBlock,
     worker: &WorkerEndpointInfo,
-) -> ClientResult<beryl_proto::worker::WriteBlockRequestProto> {
-    validate_worker_write_target(target)?;
-    Ok(beryl_proto::worker::WriteBlockRequestProto {
+) -> beryl_proto::worker::WriteBlockRequestProto {
+    beryl_proto::worker::WriteBlockRequestProto {
         payload: Some(Payload::Command(Box::new(
             beryl_proto::worker::WriteBlockCommandProto {
                 header: Some(attempt.data_header()),
@@ -62,31 +60,19 @@ pub(super) fn build_write_block_command(
                 tier: beryl_proto::common::TierProto::from(target.tier) as i32,
             },
         ))),
-    })
+    }
 }
 
-/// Builds one ordered data payload without sequence or offset fields.
-pub(super) fn build_write_block_data(data: Bytes) -> ClientResult<beryl_proto::worker::WriteBlockRequestProto> {
-    if data.is_empty() {
-        return Err(ClientError::invalid_argument(
-            "WriteBlock data payload must be nonempty".to_string(),
-        ));
-    }
-    if data.len() > beryl_proto::MAX_WORKER_DATA_FRAME_SIZE as usize {
-        return Err(ClientError::invalid_argument(format!(
-            "WriteBlock data exceeds maximum frame size: actual={}, maximum={}",
-            data.len(),
-            beryl_proto::MAX_WORKER_DATA_FRAME_SIZE
-        )));
-    }
-    Ok(beryl_proto::worker::WriteBlockRequestProto {
+/// Builds one ordered payload already bounded by the writer's block and frame limits.
+pub(super) fn build_write_block_data(data: Bytes) -> beryl_proto::worker::WriteBlockRequestProto {
+    beryl_proto::worker::WriteBlockRequestProto {
         payload: Some(Payload::Data(data)),
-    })
+    }
 }
 
 /// Collects one bounded response, including its terminal status, before delivering bytes.
 pub(super) async fn read_block_stream(
-    attempt: &AttemptContext,
+    attempt: &OperationContext,
     stream: &mut tonic::codec::Streaming<beryl_proto::worker::ReadBlockChunkProto>,
     block_read: &PlannedBlockRead,
 ) -> ClientResult<Bytes> {
@@ -131,52 +117,49 @@ pub(super) async fn read_block_stream(
 }
 
 pub(super) fn parse_worker_control_header(
-    attempt: &AttemptContext,
+    attempt: &OperationContext,
     header: Option<&beryl_proto::worker::DataResponseHeaderProto>,
 ) -> ClientResult<()> {
     let Some(header) = header else {
-        return Err(invalid_worker_header("worker response missing DataResponseHeader"));
+        return Err(ClientError::malformed_response(
+            "worker response missing DataResponseHeader",
+        ));
     };
-    let client = header
-        .client
-        .as_ref()
-        .ok_or_else(|| invalid_worker_header("worker response invalid DataResponseHeader: missing client identity"))?;
-    let client_id = beryl_proto::convert::required_client_id(client.client_id, "client_id")
-        .map_err(|error| invalid_worker_header(format!("worker response invalid DataResponseHeader: {error}")))?;
-    let call_id = beryl_proto::convert::require_call_id(&client.call_id, "call_id")
-        .map_err(|error| invalid_worker_header(format!("worker response invalid DataResponseHeader: {error}")))?;
-    let response_identity = HeaderIdentity {
-        call_id,
-        client_id,
-        group_name: None,
-    };
-    let request_identity = attempt.header_identity();
-    if response_identity.client_id != request_identity.client_id {
-        return Err(invalid_worker_header(
+    let client = header.client.as_ref().ok_or_else(|| {
+        ClientError::malformed_response("worker response invalid DataResponseHeader: missing client identity")
+    })?;
+    let client_id = beryl_proto::convert::required_client_id(client.client_id, "client_id").map_err(|error| {
+        ClientError::malformed_response(format!("worker response invalid DataResponseHeader: {error}"))
+    })?;
+    let call_id = beryl_proto::convert::require_call_id(&client.call_id, "call_id").map_err(|error| {
+        ClientError::malformed_response(format!("worker response invalid DataResponseHeader: {error}"))
+    })?;
+    if client_id != attempt.client_id() {
+        return Err(ClientError::malformed_response(
             "worker response invalid DataResponseHeader: client_id mismatch",
         ));
     }
-    if response_identity.call_id != request_identity.call_id {
-        return Err(invalid_worker_header(
+    if call_id != attempt.call_id() {
+        return Err(ClientError::malformed_response(
             "worker response invalid DataResponseHeader: call_id mismatch",
         ));
     }
-    validate_data_header(Some(header))
+    validate_data_header(header)
 }
 
 /// Restores a structured Worker error from a marked gRPC status.
-pub(super) fn parse_worker_data_status(attempt: &AttemptContext, status: tonic::Status) -> ClientError {
+pub(super) fn parse_worker_data_status(attempt: &OperationContext, status: tonic::Status) -> ClientError {
     match status.metadata().get(HEADER_WORKER_DATA_ERROR_DETAIL) {
         None => return ClientError::from(status),
         Some(value) => match value.to_str() {
             Ok(WORKER_DATA_ERROR_DETAIL_V1) => {}
             Ok(version) => {
-                return invalid_worker_header(format!(
+                return ClientError::malformed_response(format!(
                     "worker status has unsupported structured error detail version: {version}"
                 ));
             }
             Err(error) => {
-                return invalid_worker_header(format!(
+                return ClientError::malformed_response(format!(
                     "worker status has invalid structured error detail version: {error}"
                 ));
             }
@@ -185,12 +168,14 @@ pub(super) fn parse_worker_data_status(attempt: &AttemptContext, status: tonic::
     let header = match beryl_proto::worker::DataResponseHeaderProto::decode(status.details()) {
         Ok(header) => header,
         Err(error) => {
-            return invalid_worker_header(format!("worker status has invalid structured error detail: {error}"));
+            return ClientError::malformed_response(format!(
+                "worker status has invalid structured error detail: {error}"
+            ));
         }
     };
     match parse_worker_control_header(attempt, Some(&header)) {
         Err(error) => error,
-        Ok(()) => invalid_worker_header("worker non-OK status has no structured error"),
+        Ok(()) => ClientError::malformed_response("worker non-OK status has no structured error"),
     }
 }
 
@@ -201,10 +186,6 @@ pub(super) fn has_structured_worker_error(status: &tonic::Status) -> bool {
         .is_some_and(|value| value == WORKER_DATA_ERROR_DETAIL_V1)
 }
 
-pub(super) fn invalid_worker_header(message: impl Into<String>) -> ClientError {
-    invalid_header_error(message)
-}
-
 pub(super) fn is_transient_worker_transport_status(status: &tonic::Status) -> bool {
     matches!(
         status.code(),
@@ -212,47 +193,6 @@ pub(super) fn is_transient_worker_transport_status(status: &tonic::Status) -> bo
     )
 }
 
-pub(super) fn build_tonic_request<T>(attempt: &AttemptContext, message: T) -> tonic::Request<T> {
-    let mut request = tonic::Request::new(message);
-    if let Some(timeout) = attempt.timeout_remaining() {
-        request.set_timeout(timeout.max(Duration::from_millis(1)));
-    }
-    request
-}
-
 pub(super) fn default_frame_size(len: u32) -> u32 {
-    len.clamp(1, beryl_proto::DEFAULT_WORKER_DATA_FRAME_SIZE as u32)
-}
-
-fn validate_worker_write_target(target: &LocatedBlock) -> ClientResult<()> {
-    if target.block_id.inode_id.as_raw() == 0 {
-        return Err(ClientError::invalid_layout(
-            "write target block_id inode_id must be non-zero".to_string(),
-        ));
-    }
-    validate_block_size(target.block_size)
-        .map_err(|error| ClientError::invalid_layout(format!("write target has invalid shape: {error}")))?;
-    if target.workers.is_empty() {
-        return Err(ClientError::invalid_layout(
-            "write target has no worker endpoints".to_string(),
-        ));
-    }
-    if target.write_offset >= target.block_size {
-        return Err(ClientError::invalid_layout(
-            "write target offset exceeds capacity".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use bytes::Bytes;
-
-    use super::build_write_block_data;
-
-    #[test]
-    fn write_block_rejects_empty_data_payload() {
-        assert!(build_write_block_data(Bytes::new()).is_err());
-    }
+    len.min(beryl_proto::DEFAULT_WORKER_DATA_FRAME_SIZE as u32)
 }

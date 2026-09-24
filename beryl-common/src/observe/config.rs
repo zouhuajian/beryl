@@ -3,42 +3,37 @@
 
 //! Observability configuration structures.
 
-use crate::config::{FlatConfig, keys::logging};
+use crate::config::FlatConfig;
 use crate::error::{CommonError, CommonErrorKind};
 use serde::{Deserialize, Serialize};
+
+const LOG_LEVEL: &str = "beryl.logging.level";
+const LOG_FORMAT: &str = "beryl.logging.format";
+const LOG_OUTPUT: &str = "beryl.logging.output";
 
 /// Process observability configuration loaded from shared logging keys.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ObservabilityConfig {
-    /// Logging configuration.
-    pub log: LogConfig,
-}
-
-impl ObservabilityConfig {
-    /// Parse the shared logging configuration model.
-    pub fn from_flat(flat: &FlatConfig) -> Result<Self, CommonError> {
-        let config = Self {
-            log: LogConfig {
-                format: required_str(flat, logging::FORMAT)?,
-                output: required_str(flat, logging::OUTPUT)?,
-                level: required_str(flat, logging::LEVEL)?,
-            },
-        };
-
-        validate_log_config(&config.log)?;
-        Ok(config)
-    }
-}
-
-/// Logging configuration.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LogConfig {
     /// Format: "compact" or "json".
     pub format: String,
     /// Output stream: "stderr" or "stdout".
     pub output: String,
     /// EnvFilter directive string.
     pub level: String,
+}
+
+impl ObservabilityConfig {
+    /// Parse the shared logging configuration model.
+    pub fn from_flat(flat: &FlatConfig) -> Result<Self, CommonError> {
+        let config = Self {
+            format: required_str(flat, LOG_FORMAT)?,
+            output: required_str(flat, LOG_OUTPUT)?,
+            level: required_str(flat, LOG_LEVEL)?,
+        };
+
+        validate_log_config(&config)?;
+        Ok(config)
+    }
 }
 
 /// Service information for observability initialization.
@@ -62,14 +57,14 @@ fn required_str(flat: &FlatConfig, key: &'static str) -> Result<String, CommonEr
     Ok(value)
 }
 
-fn validate_log_config(config: &LogConfig) -> Result<(), CommonError> {
+fn validate_log_config(config: &ObservabilityConfig) -> Result<(), CommonError> {
     match config.format.as_str() {
         "compact" | "json" => {}
-        _ => return Err(invalid_config(logging::FORMAT, "must be compact or json")),
+        _ => return Err(invalid_config(LOG_FORMAT, "must be compact or json")),
     }
     match config.output.as_str() {
         "stderr" | "stdout" => {}
-        _ => return Err(invalid_config(logging::OUTPUT, "must be stderr or stdout")),
+        _ => return Err(invalid_config(LOG_OUTPUT, "must be stderr or stdout")),
     }
     Ok(())
 }

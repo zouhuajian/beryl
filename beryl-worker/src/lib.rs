@@ -10,10 +10,9 @@ pub mod error;
 pub mod net;
 pub mod observe;
 pub(crate) mod report;
-pub mod runtime;
+mod runtime;
 pub mod store;
 
-pub use data::core::{WorkerCore, WorkerCoreResult};
-pub use error::WorkerError;
-pub use runtime::block::BlockManager;
+pub use data::core::WorkerCore;
+pub use error::{WorkerError, WorkerResult};
 pub use store::block::{ReclaimBlockRequest, ReclaimBlockResult};

@@ -3,14 +3,15 @@
 
 //! gRPC WorkerDataService adapter and server entry point.
 
-use crate::config::WorkerRegistrationConfig;
-use crate::control::RegistrationSet;
-use crate::data::convert::{proto_to_read_block_request, proto_to_write_block_request};
-use crate::data::core::{ActiveBlockRead, ActiveBlockWrite, WorkerCore};
-use crate::error::WorkerError;
+use crate::config::{WorkerNetConfig, WorkerRegistrationConfig};
+use crate::control::RegistrationState;
+use crate::data::core::{ActiveBlockRead, ActiveBlockWrite, ReadBlockRequest, WorkerCore, WriteBlockRequest};
+use crate::error::{WorkerError, WorkerResult};
 use crate::observe;
 use crate::runtime::DataRpcPermit;
+use anyhow::Context;
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RpcErrorDetail, WorkerErrorKind};
+use beryl_common::grpc_server::{spawn_grpc_server, GrpcServerHandle};
 use beryl_common::header::TraceContext;
 use beryl_common::header::{
     HEADER_WORKER_DATA_ERROR_DETAIL, HEADER_WORKER_DATA_REJECTION, WORKER_DATA_ERROR_DETAIL_V1,
@@ -18,27 +19,29 @@ use beryl_common::header::{
 };
 use beryl_common::observe::propagation::extract_trace_context;
 use beryl_proto::common::RequestHeaderProto;
-use beryl_proto::common::{ClientInfoProto, ErrorDetailProto, TraceContextProto};
-use beryl_proto::convert::require_worker_run_id;
+use beryl_proto::common::{ClientInfoProto, ErrorDetailProto};
+use beryl_proto::convert::{self as proto_convert, require_worker_run_id};
 use beryl_proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
 use beryl_proto::metadata::AuthorizeBlockWriteRequestProto;
 use beryl_proto::worker::worker_data_service_server::{WorkerDataService, WorkerDataServiceServer};
 use beryl_proto::worker::write_block_request_proto::Payload;
 use beryl_proto::worker::{
     DataRequestHeaderProto, DataResponseHeaderProto, ReadBlockChunkProto, ReadBlockRequestProto,
-    WriteBlockRequestProto, WriteBlockResponseProto,
+    WriteBlockCommandProto, WriteBlockRequestProto, WriteBlockResponseProto,
 };
-use beryl_types::{CallId, ClientId, GroupName};
+use beryl_types::range::ByteRange;
+use beryl_types::{CallId, ClientId, GroupName, WorkerRunId};
 use bytes::Bytes;
 use futures::{stream, Stream, StreamExt};
 use prost::Message;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
 use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::service::Routes;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use tonic::{Code, Request, Response, Status, Streaming};
 use tracing::Span;
 
@@ -46,7 +49,7 @@ use tracing::Span;
 #[derive(Clone)]
 pub struct WorkerDataServiceImpl {
     core: Arc<WorkerCore>,
-    registration_state: Arc<RegistrationSet>,
+    registration_state: Arc<RegistrationState>,
     read_slots: Arc<Semaphore>,
     write_slots: Arc<Semaphore>,
     metadata: FileSystemServiceProtoClient<Channel>,
@@ -57,20 +60,16 @@ impl WorkerDataServiceImpl {
     /// Creates independent process-wide admission pools for the two data modes.
     pub fn new(
         core: Arc<WorkerCore>,
-        registration_state: Arc<RegistrationSet>,
+        registration_state: Arc<RegistrationState>,
         max_concurrent_reads: usize,
         max_concurrent_writes: usize,
         metadata: &WorkerRegistrationConfig,
     ) -> Result<Self, WorkerError> {
-        metadata
+        let endpoint = metadata
             .validate()
             .map_err(|e| WorkerError::InvalidArgument(e.message))?;
         let timeout = std::time::Duration::from_millis(metadata.request_timeout_ms);
-        let channel = Endpoint::from_shared(metadata.endpoints[0].clone())
-            .map_err(|e| WorkerError::InvalidArgument(e.to_string()))?
-            .connect_timeout(timeout)
-            .timeout(timeout)
-            .connect_lazy();
+        let channel = endpoint.connect_timeout(timeout).timeout(timeout).connect_lazy();
         Ok(Self {
             core,
             registration_state,
@@ -101,7 +100,7 @@ impl WorkerDataServiceImpl {
             .clone()
             .authorize_block_write(AuthorizeBlockWriteRequestProto {
                 header: Some(header),
-                group_name: req.group_name.to_string(),
+                block_id: Some(req.block_id.into()),
                 worker_id: registration.worker_id.as_raw(),
                 worker_run_id: req.worker_run_id.to_string(),
                 fencing_token: Some(req.fencing_token.into()),
@@ -159,21 +158,9 @@ impl WorkerDataServiceImpl {
         }
     }
 
-    fn default_client() -> ClientInfoProto {
-        ClientInfoProto {
-            call_id: String::new(),
-            client_id: None,
-            client_name: String::new(),
-        }
-    }
-
     fn error_response_header(header: Option<DataRequestHeaderProto>, error: WorkerError) -> DataResponseHeaderProto {
         DataResponseHeaderProto {
-            client: Some(
-                header
-                    .and_then(|value| value.client)
-                    .unwrap_or_else(Self::default_client),
-            ),
+            client: Some(header.and_then(|value| value.client).unwrap_or_default()),
             error: Some(Self::error_detail(&error)),
         }
     }
@@ -195,7 +182,11 @@ impl WorkerDataServiceImpl {
         Status::with_details_and_metadata(status.code(), status.message(), Bytes::from(details), metadata)
     }
 
-    fn ensure_group_ready_for_run(&self, group_name: &str, worker_run_id: &str) -> Result<(), WorkerError> {
+    fn ensure_group_ready_for_run(
+        &self,
+        group_name: &str,
+        worker_run_id: &str,
+    ) -> Result<(GroupName, WorkerRunId), WorkerError> {
         let group_name = GroupName::parse(group_name)
             .map_err(|error| WorkerError::InvalidArgument(format!("group_name invalid: {error}")))?;
         let requested = require_worker_run_id(worker_run_id, "worker_run_id").map_err(WorkerError::InvalidArgument)?;
@@ -220,7 +211,7 @@ impl WorkerDataServiceImpl {
                 ),
             });
         }
-        Ok(())
+        Ok((group_name, requested))
     }
 
     /// Consumes the command before returning the response stream, making the
@@ -257,7 +248,7 @@ impl WorkerDataServiceImpl {
                 return Err(Self::data_error_status(None, error));
             }
         };
-        let mut command = match first.payload {
+        let command = match first.payload {
             Some(Payload::Command(command)) => command,
             Some(Payload::Data(_)) | None => {
                 let error = WorkerError::InvalidArgument("first WriteBlock payload must be command".to_string());
@@ -270,15 +261,17 @@ impl WorkerDataServiceImpl {
                 return Err(Self::data_error_status(None, error));
             }
         };
-        merge_data_header_transport_context(&mut command.header, transport_context);
+        record_transport_context(transport_context);
         let header = command.header.clone();
-        if let Err(error) = self.ensure_group_ready_for_run(&command.group_name, &command.worker_run_id) {
-            let error_kind = observe::worker_error_kind(&error);
-            observe::record_stream_open("write", "error", error_kind);
-            observe::record_data_rpc("write_block", "error", error_kind, started.elapsed().as_secs_f64());
-            return Err(Self::data_error_status(header, error));
-        }
-        let domain = proto_to_write_block_request(*command).map_err(|error| {
+        let (group_name, worker_run_id) = self
+            .ensure_group_ready_for_run(&command.group_name, &command.worker_run_id)
+            .map_err(|error| {
+                let error_kind = observe::worker_error_kind(&error);
+                observe::record_stream_open("write", "error", error_kind);
+                observe::record_data_rpc("write_block", "error", error_kind, started.elapsed().as_secs_f64());
+                Self::data_error_status(header.clone(), error)
+            })?;
+        let domain = proto_to_write_block_request(*command, group_name, worker_run_id).map_err(|error| {
             let error_kind = observe::worker_error_kind(&error);
             observe::record_stream_open("write", "error", error_kind);
             observe::record_data_rpc("write_block", "error", error_kind, started.elapsed().as_secs_f64());
@@ -451,9 +444,7 @@ where
     }
 
     async fn abort_active(&mut self) {
-        let Some(write) = self.write.take() else {
-            return;
-        };
+        let write = self.write.take().expect("active response state owns a block write");
         if let Err(error) = self.core.abort_block_write(write).await {
             tracing::warn!(
                 target: "worker.state",
@@ -490,15 +481,17 @@ impl WorkerDataService for WorkerDataServiceImpl {
             );
         })?);
         let transport_context = extract_trace_context(request.metadata());
-        let mut request = request.into_inner();
-        merge_data_header_transport_context(&mut request.header, &transport_context);
+        let request = request.into_inner();
+        record_transport_context(&transport_context);
         let header = request.header.clone();
-        if let Err(error) = self.ensure_group_ready_for_run(&request.group_name, &request.worker_run_id) {
-            let error_kind = observe::worker_error_kind(&error);
-            observe::record_data_rpc("read_block", "error", error_kind, started.elapsed().as_secs_f64());
-            return Err(Self::data_error_status(header, error));
-        }
-        let domain = proto_to_read_block_request(request).map_err(|error| {
+        let (group_name, _) = self
+            .ensure_group_ready_for_run(&request.group_name, &request.worker_run_id)
+            .map_err(|error| {
+                let error_kind = observe::worker_error_kind(&error);
+                observe::record_data_rpc("read_block", "error", error_kind, started.elapsed().as_secs_f64());
+                Self::data_error_status(header.clone(), error)
+            })?;
+        let domain = proto_to_read_block_request(request, group_name).map_err(|error| {
             let error_kind = observe::worker_error_kind(&error);
             observe::record_data_rpc("read_block", "error", error_kind, started.elapsed().as_secs_f64());
             Self::data_error_status(header.clone(), error)
@@ -541,33 +534,6 @@ impl WorkerDataService for WorkerDataServiceImpl {
     }
 }
 
-fn merge_data_header_transport_context(header: &mut Option<DataRequestHeaderProto>, context: &TraceContext) {
-    record_transport_context(context);
-    let Some(header) = header else {
-        return;
-    };
-    if header.trace_context.as_ref().is_some_and(trace_context_proto_is_empty) {
-        header.trace_context = None;
-    }
-    if context.is_empty() {
-        return;
-    }
-    let trace_context = header.trace_context.get_or_insert_with(Default::default);
-    if trace_context.traceparent.is_none() {
-        trace_context.traceparent = context.traceparent.clone();
-    }
-    if trace_context.tracestate.is_none() {
-        trace_context.tracestate = context.tracestate.clone();
-    }
-    if trace_context.baggage.is_none() {
-        trace_context.baggage = context.baggage.clone();
-    }
-}
-
-fn trace_context_proto_is_empty(context: &TraceContextProto) -> bool {
-    context.traceparent.is_none() && context.tracestate.is_none() && context.baggage.is_none()
-}
-
 fn record_transport_context(context: &TraceContext) {
     if let Some(traceparent) = &context.traceparent {
         Span::current().record("traceparent", traceparent);
@@ -599,38 +565,84 @@ fn status_error_kind(status: &Status) -> &'static str {
     }
 }
 
-/// Builds the Worker data-plane routes retained by the process-owned listener.
-pub fn worker_data_routes(
+/// Converts the remaining read fields after group/run admission.
+fn proto_to_read_block_request(proto: ReadBlockRequestProto, group_name: GroupName) -> WorkerResult<ReadBlockRequest> {
+    let block_id =
+        proto_convert::required_block_id(proto.block_id, "block_id").map_err(WorkerError::InvalidArgument)?;
+    let byte_range = proto
+        .byte_range
+        .ok_or_else(|| WorkerError::InvalidArgument("missing byte_range".to_string()))?;
+
+    Ok(ReadBlockRequest {
+        group_name,
+        block_id,
+        byte_range: ByteRange {
+            offset: byte_range.offset,
+            len: byte_range.len,
+        },
+
+        block_size: proto.block_size,
+        effective_len: proto.effective_len,
+        frame_size: proto.frame_size,
+    })
+}
+
+/// Converts the first write command using the identity parsed during admission.
+fn proto_to_write_block_request(
+    proto: WriteBlockCommandProto,
+    group_name: GroupName,
+    worker_run_id: WorkerRunId,
+) -> WorkerResult<WriteBlockRequest> {
+    let block_id =
+        proto_convert::required_block_id(proto.block_id, "block_id").map_err(WorkerError::InvalidArgument)?;
+
+    let tier = proto_convert::parse_known_tier(proto.tier)
+        .map_err(|error| WorkerError::InvalidArgument(format!("tier invalid: {error}")))?;
+
+    Ok(WriteBlockRequest {
+        group_name,
+        block_id,
+        worker_run_id,
+        fencing_token: proto_convert::required_fencing_token(proto.fencing_token, "fencing_token")
+            .map_err(WorkerError::InvalidArgument)?,
+        write_offset: proto.write_offset,
+        block_size: proto.block_size,
+
+        tier,
+    })
+}
+
+/// Binds the Worker data plane under the process-owned connection tracker.
+pub fn spawn_worker_data_with_registration(
+    bind: SocketAddr,
+    config: &WorkerNetConfig,
     core: Arc<WorkerCore>,
-    registration_state: Arc<RegistrationSet>,
-    max_concurrent_reads: usize,
-    max_concurrent_writes: usize,
+    registration_state: Arc<RegistrationState>,
     metadata: &WorkerRegistrationConfig,
-) -> Result<Routes, WorkerError> {
+) -> anyhow::Result<GrpcServerHandle> {
     let service = WorkerDataServiceImpl::new(
         core,
         registration_state,
-        max_concurrent_reads,
-        max_concurrent_writes,
+        config.max_concurrent_reads,
+        config.max_concurrent_writes,
         metadata,
     )?;
-    Ok(Routes::new(
+    let routes = Routes::new(
         WorkerDataServiceServer::new(service)
             .max_decoding_message_size(beryl_proto::MAX_WORKER_DATA_MESSAGE_SIZE)
             .max_encoding_message_size(beryl_proto::MAX_WORKER_DATA_MESSAGE_SIZE),
-    ))
+    );
+    spawn_grpc_server(bind, routes).context("failed to bind Worker gRPC listener")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::{Registration, RegistrationSet};
-    use crate::data::core::WorkerCore;
-    use crate::store::block::{BlockState, FullBlockFileStore, FullBlockFileStoreConfig};
-    use beryl_common::observe::propagation::extract_trace_context;
-    use beryl_proto::common::{BlockIdProto, TierProto};
+    use crate::control::{Registration, RegistrationState};
+    use crate::data::core::{WorkerCore, WriteBlockRequest};
+    use crate::store::block::{BlockState, FullBlockFileStore, LocalBlockStore};
     use beryl_proto::worker::write_block_request_proto::Payload;
-    use beryl_proto::worker::{WriteBlockCommandProto, WriteBlockRequestProto};
+    use beryl_proto::worker::WriteBlockRequestProto;
     use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
 
     use beryl_types::{GroupName, WorkerRunId};
@@ -640,7 +652,6 @@ mod tests {
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
     use tokio::time::Instant as TokioInstant;
-    use tonic::metadata::MetadataMap;
     use tonic::{Code, Status};
 
     fn group_name() -> GroupName {
@@ -653,17 +664,14 @@ mod tests {
 
     fn registered_service() -> (TempDir, Arc<FullBlockFileStore>, WorkerDataServiceImpl, WorkerRunId) {
         let temp = TempDir::new().expect("tempdir");
-        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
-            temp.path().to_path_buf(),
-        )));
-        let core = Arc::new(WorkerCore::with_local_store(512, 2048, store.clone()));
-        let registrations = Arc::new(RegistrationSet::new());
+        let store = Arc::new(FullBlockFileStore::new(temp.path().to_path_buf()));
+        let core = Arc::new(WorkerCore::with_local_store(group_name(), 512, 2048, store.clone()));
+        let registrations = Arc::new(RegistrationState::new());
         let worker_run_id = WorkerRunId::new();
         registrations.record_registered(Registration {
             group_name: group_name(),
             worker_id: WorkerId::new(5),
             worker_run_id,
-            advertised_endpoint: "http://127.0.0.1:1".to_string(),
         });
         registrations.record_heartbeat_success(&group_name(), Duration::from_secs(30));
         (
@@ -674,54 +682,32 @@ mod tests {
         )
     }
 
-    fn command(worker_run_id: WorkerRunId) -> WriteBlockRequestProto {
-        WriteBlockRequestProto {
-            payload: Some(Payload::Command(Box::new(WriteBlockCommandProto {
-                header: None,
-                group_name: group_name().to_string(),
-                block_id: Some(BlockIdProto {
-                    inode_id: 7,
-                    block_index: 3,
-                }),
-                worker_run_id: worker_run_id.to_string(),
-                block_size: 4096,
-                fencing_token: Some(
-                    beryl_types::FencingToken::new(block_id(), ClientId::new(9), beryl_types::LeaseEpoch::new(55))
-                        .into(),
-                ),
-                write_offset: 0,
-                tier: TierProto::TierHdd as i32,
-            }))),
-        }
-    }
-
-    impl WorkerDataServiceImpl {
-        // Protocol tests start after online authorization; real RPC authorization is covered by e2e.
-        async fn begin_authorized_test_write<S>(
-            &self,
-            mut requests: S,
-            permit: DataRpcPermit,
-            _context: &TraceContext,
-            started: Instant,
-        ) -> Result<WriteBlockState<S>, Status>
-        where
-            S: Stream<Item = Result<WriteBlockRequestProto, Status>> + Unpin,
-        {
-            let Some(Payload::Command(command)) = requests.next().await.unwrap()?.payload else {
-                panic!("test requires a command")
-            };
-            let req = proto_to_write_block_request(*command).unwrap();
-            let pin = self.core.pin_write_authorization(&req).unwrap();
-            let write = self.core.begin_block_write(req, permit, pin, 0).await.unwrap();
-            Ok(WriteBlockState {
-                core: self.core.clone(),
-                requests,
-                write: Some(write),
-                request_header: None,
-                started,
-                acknowledgement_pending: true,
-                outcome: StreamOutcome::Active,
-            })
+    // Protocol tests start after online authorization; real RPC authorization is covered by e2e.
+    async fn authorized_write<S>(
+        service: &WorkerDataServiceImpl,
+        worker_run_id: WorkerRunId,
+        requests: S,
+    ) -> WriteBlockState<S> {
+        let req = WriteBlockRequest {
+            group_name: group_name(),
+            worker_run_id,
+            block_id: block_id(),
+            block_size: 4096,
+            fencing_token: beryl_types::FencingToken::new(ClientId::new(9), beryl_types::LeaseEpoch::new(55)),
+            write_offset: 0,
+            tier: beryl_types::Tier::Hdd,
+        };
+        let permit = service.acquire_write_rpc().expect("write capacity");
+        let pin = service.core.pin_write_authorization(&req).unwrap();
+        let write = service.core.begin_block_write(req, permit, pin, 0).await.unwrap();
+        WriteBlockState {
+            core: service.core.clone(),
+            requests,
+            write: Some(write),
+            request_header: None,
+            started: Instant::now(),
+            acknowledgement_pending: true,
+            outcome: StreamOutcome::Active,
         }
     }
 
@@ -729,7 +715,6 @@ mod tests {
     async fn write_block_acknowledges_open_then_checkpoints_on_request_eof() {
         let (_temp, store, service, worker_run_id) = registered_service();
         let requests = stream::iter(vec![
-            Ok(command(worker_run_id)),
             Ok(WriteBlockRequestProto {
                 payload: Some(Payload::Data(Bytes::from_static(b"abc"))),
             }),
@@ -737,31 +722,21 @@ mod tests {
                 payload: Some(Payload::Data(Bytes::from_static(b"def"))),
             }),
         ]);
-        let context = extract_trace_context(&MetadataMap::new());
-        let rpc_permit = service.acquire_write_rpc().expect("write capacity");
-        let state = service
-            .begin_authorized_test_write(requests, rpc_permit, &context, Instant::now())
-            .await
-            .expect("begin write");
+        let state = authorized_write(&service, worker_run_id, requests).await;
         let (ack, state) = state.next().await.expect("acknowledgement");
         ack.expect("acknowledgement is successful");
         assert!(state.next().await.is_none());
 
         let meta = store.load_meta(&group_name(), block_id()).expect("ready meta");
-        assert_eq!(meta.visibility.block_state, BlockState::Ready);
-        assert_eq!(meta.source.durable_len, 6);
+        assert_eq!(meta.block_state, BlockState::Ready);
+        assert_eq!(meta.durable_len, 6);
     }
 
     #[tokio::test]
     async fn cancellation_after_ack_releases_write_through_owned_cleanup() {
         let (_temp, _store, service, worker_run_id) = registered_service();
-        let requests = stream::iter(vec![Ok(command(worker_run_id))]);
-        let context = extract_trace_context(&MetadataMap::new());
-        let rpc_permit = service.acquire_write_rpc().expect("write capacity");
-        let state = service
-            .begin_authorized_test_write(requests, rpc_permit, &context, Instant::now())
-            .await
-            .expect("begin write");
+        let requests = stream::empty();
+        let state = authorized_write(&service, worker_run_id, requests).await;
         let (_ack, state) = state.next().await.expect("acknowledgement");
         drop(state);
         assert!(
@@ -771,12 +746,8 @@ mod tests {
                 .await
         );
 
-        let replacement = stream::iter(vec![Ok(command(worker_run_id))]);
-        let rpc_permit = service.acquire_write_rpc().expect("released write capacity");
-        let state = service
-            .begin_authorized_test_write(replacement, rpc_permit, &context, Instant::now())
-            .await
-            .expect("replacement write");
+        let replacement = stream::empty();
+        let state = authorized_write(&service, worker_run_id, replacement).await;
         let (_ack, state) = state.next().await.expect("replacement acknowledgement");
         drop(state);
     }
@@ -784,13 +755,10 @@ mod tests {
     #[tokio::test]
     async fn a_second_command_fails_and_cleans_the_owned_block_write() {
         let (_temp, _store, service, worker_run_id) = registered_service();
-        let requests = stream::iter(vec![Ok(command(worker_run_id)), Ok(command(worker_run_id))]);
-        let context = extract_trace_context(&MetadataMap::new());
-        let rpc_permit = service.acquire_write_rpc().expect("write capacity");
-        let state = service
-            .begin_authorized_test_write(requests, rpc_permit, &context, Instant::now())
-            .await
-            .expect("begin write");
+        let requests = stream::iter(vec![Ok(WriteBlockRequestProto {
+            payload: Some(Payload::Command(Box::default())),
+        })]);
+        let state = authorized_write(&service, worker_run_id, requests).await;
         let (_ack, state) = state.next().await.expect("acknowledgement");
         let (error, _state) = state.next().await.expect("terminal error");
         assert_eq!(
@@ -826,16 +794,7 @@ mod tests {
     #[tokio::test]
     async fn reclaim_revokes_idle_stream_and_releases_its_pin_without_another_frame() {
         let (_temp, store, service, run) = registered_service();
-        let requests = stream::iter(vec![Ok(command(run))]).chain(stream::pending());
-        let state = service
-            .begin_authorized_test_write(
-                requests,
-                service.acquire_write_rpc().unwrap(),
-                &extract_trace_context(&MetadataMap::new()),
-                Instant::now(),
-            )
-            .await
-            .unwrap();
+        let state = authorized_write(&service, run, stream::pending()).await;
         let (_, state) = state.next().await.unwrap();
         let idle = state.next();
         tokio::pin!(idle);

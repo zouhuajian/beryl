@@ -8,16 +8,6 @@ use crate::inode::{FileCommit, FilePublication};
 use beryl_types::{CallId, ClientId, ContentGeneration, LeaseEpoch};
 
 impl AppRaftStateMachine {
-    /// Check the storage key and complete fixed-block shape before file mutation.
-    fn ensure_file_inode_authority(inode_id: InodeId, inode: &Inode) -> MetadataResult<()> {
-        if inode.inode_id != inode_id || !inode.file_type().is_file() {
-            return Err(MetadataError::Internal(format!(
-                "invalid file authority for inode {inode_id}"
-            )));
-        }
-        inode.file()?.validate(inode_id)
-    }
-
     /// Reserve a never-reused index under the exact durable writer epoch.
     pub(super) fn apply_allocate_block(
         &self,
@@ -29,7 +19,6 @@ impl AppRaftStateMachine {
             .storage
             .get_inode(inode_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("inode {inode_id}")))?;
-        Self::ensure_file_inode_authority(inode_id, &inode)?;
         let file = inode.file_mut()?;
         if file.lease_epoch != lease_epoch {
             return Err(MetadataError::LeaseFenced {
@@ -51,19 +40,18 @@ impl AppRaftStateMachine {
         expected_lease_epoch: LeaseEpoch,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<LeaseEpoch> {
+    ) -> MetadataResult<()> {
         let mut inode = self
             .storage
             .get_inode(inode_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("inode {inode_id}")))?;
-        Self::ensure_file_inode_authority(inode_id, &inode)?;
         let file = inode.file_mut()?;
         if let Some(record) = self.storage.get_create_file_replay_for_inode(inode_id)? {
             if record.expires_at_ms > proposed_at_ms
                 && file.len == 0
                 && file.next_index == 0
-                && file.generation == record.generation
-                && file.lease_epoch == record.lease_epoch
+                && file.generation == ContentGeneration::new(0)
+                && file.lease_epoch == LeaseEpoch::new(1)
             {
                 return Err(MetadataError::Again(
                     "CreateFile replay still owns the initial session".into(),
@@ -79,7 +67,7 @@ impl AppRaftStateMachine {
             .ok_or_else(|| MetadataError::InvalidArgument("write lease epoch overflow".into()))?;
         file.lease_epoch = next;
         self.storage.put_inode_atomic(&inode, raft_state)?;
-        Ok(next)
+        Ok(())
     }
 
     /// End an exact lease; immediate-successor replay cannot change content.
@@ -88,19 +76,18 @@ impl AppRaftStateMachine {
         inode_id: InodeId,
         lease_epoch: LeaseEpoch,
         raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<LeaseEpoch> {
+    ) -> MetadataResult<()> {
         let mut inode = self
             .storage
             .get_inode(inode_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("inode {inode_id}")))?;
-        Self::ensure_file_inode_authority(inode_id, &inode)?;
         let file = inode.file_mut()?;
         let next = lease_epoch
             .checked_next()
             .ok_or_else(|| MetadataError::InvalidArgument("write lease epoch overflow".into()))?;
         if file.lease_epoch == next {
             self.storage.commit_applied_state(raft_state)?;
-            return Ok(next);
+            return Ok(());
         }
         if file.lease_epoch != lease_epoch {
             return Err(MetadataError::LeaseFenced {
@@ -110,7 +97,7 @@ impl AppRaftStateMachine {
         }
         file.lease_epoch = next;
         self.storage.put_inode_atomic(&inode, raft_state)?;
-        Ok(next)
+        Ok(())
     }
 
     /// Publish a durable prefix while retaining the writer lease.
@@ -125,7 +112,7 @@ impl AppRaftStateMachine {
             .storage
             .get_inode(inode_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("inode {inode_id}")))?;
-        Self::ensure_file_inode_authority(inode_id, &inode)?;
+        inode.file()?.validate(inode_id)?;
         let (inode, generation, changed) = self.prepare_file_publication(inode, publication, proposed_at_ms)?;
         if changed {
             self.storage.put_inode_atomic(&inode, raft_state)?;
@@ -152,7 +139,8 @@ impl AppRaftStateMachine {
             });
         }
         let generation = file.generation;
-        let matches = publication.matches_visible(file)?;
+        let start = publication.start_index(file.block_size)?;
+        let matches = publication.matches_visible(file, start);
         if publication.expected_generation.checked_next() == Some(generation) && matches {
             return Ok((inode, generation, false));
         }
@@ -162,7 +150,7 @@ impl AppRaftStateMachine {
         if matches {
             return Ok((inode, generation, false));
         }
-        let blocks = publication.merged_blocks(inode_id, file)?;
+        let blocks = publication.merged_blocks(inode_id, file, start)?;
         let generation = generation
             .checked_next()
             .ok_or_else(|| MetadataError::InvalidArgument("content generation overflow".into()))?;
@@ -182,6 +170,7 @@ impl AppRaftStateMachine {
         inode_id: InodeId,
         operation: (ClientId, CallId),
         publication: FilePublication,
+        ended_epoch: LeaseEpoch,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<ContentGeneration> {
@@ -189,7 +178,7 @@ impl AppRaftStateMachine {
             .storage
             .get_inode(inode_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("inode {inode_id}")))?;
-        Self::ensure_file_inode_authority(inode_id, &inode)?;
+        inode.file()?.validate(inode_id)?;
         if let Some(generation) = publication.resolve_commit(&inode, operation.0, operation.1)? {
             self.storage.commit_applied_state(raft_state)?;
             return Ok(generation);
@@ -199,10 +188,6 @@ impl AppRaftStateMachine {
                 "CommitFile generation changed without completion evidence".into(),
             ));
         }
-        let ended_epoch = publication
-            .lease_epoch
-            .checked_next()
-            .ok_or_else(|| MetadataError::InvalidArgument("write lease epoch overflow".into()))?;
         let mut commit = FileCommit {
             client_id: operation.0,
             call_id: operation.1,
@@ -387,7 +372,6 @@ mod tests {
         sm.apply(sync(id, payload.clone())).unwrap();
         assert!(sm.apply(commit(id, payload.clone())).is_err());
         sm.apply(Command::EndWriteLease {
-            proposed_at_ms: 12,
             inode_id: id,
             lease_epoch: LeaseEpoch::new(1),
         })
@@ -440,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_inode_authority_fails_without_advancing_applied_state() {
+    fn publication_rejects_invalid_persisted_layout_without_advancing_applied_state() {
         let (_dir, storage, sm, id) = fixture();
         let mut inode = storage.get_inode(id).unwrap().unwrap();
         inode.file_mut().unwrap().len = 1; // Missing block for the claimed visible byte.
@@ -451,10 +435,6 @@ mod tests {
             ..Default::default()
         };
         for command in [
-            Command::AllocateBlock {
-                inode_id: id,
-                lease_epoch: LeaseEpoch::new(1),
-            },
             sync(id, publication(&[], 0, 0, 0, 1)),
             commit(id, publication(&[], 0, 0, 0, 1)),
         ] {

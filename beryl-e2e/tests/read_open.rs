@@ -10,7 +10,9 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open_status_and_reader_layouts_preserve_inode_state_across_reads_and_restart() {
-    let mut cluster = TestCluster::start().await.unwrap();
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
+        .await
+        .unwrap();
     let client = cluster.client().clone();
     let path = "/read-open";
     let payload = Bytes::from(deterministic_bytes(3500));

@@ -10,43 +10,23 @@ mod publish;
 mod read;
 mod write;
 
-use crate::error::{to_rpc_error, MetadataError, MetadataResult};
-use crate::inode::Inode;
+use crate::error::{to_rpc_error, MetadataError};
+use crate::mount::MountEntry;
 use crate::mount::MountTable;
-use crate::path_resolver::{MountContext, PathResolver, ResolvedPath};
+use crate::path_resolver::{PathResolver, ResolvedPath};
 use crate::raft::{AppRaftNode, RocksDBStorage};
 use crate::readiness::RootReadinessGate;
 use crate::session_registry::SessionRegistry;
-use crate::state::StateStore;
 use crate::worker::WorkerManager;
 use beryl_common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail};
 use beryl_common::header::RequestHeader;
-use beryl_types::ids::{InodeId, WorkerId};
-use beryl_types::{GroupName, GroupStateWatermark, WorkerEndpointInfo, WorkerRunId, WriteHandle};
-use command::RoutedFsWriteCtx;
-use guard::{AdmissionFailure, AdmissionGuard, FreshnessValidator, StaleStateStatus};
+use beryl_types::{GroupName, GroupStateWatermark, WriteHandle};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-pub(super) use namespace::{CreateDirectoryArgs, CreateFileArgs, DeleteArgs, RenameArgs};
-pub(super) use publish::{CommitFileArgs, SyncWriteArgs};
-pub(super) use read::{BlockLocationsTarget, GetBlockLocationsArgs, GetStatusArgs, ListStatusArgs, OpenFileArgs};
-pub(super) use write::{AbortFileWriteArgs, AllocateBlockArgs, AuthorizeBlockWriteArgs, OpenWriteArgs, RenewLeaseArgs};
-
-/// The supported runtime authorizes exactly one worker for each block.
-const SUPPORTED_REPLICA_COUNT: u8 = 1;
-
-#[derive(Clone, Debug)]
-pub(crate) struct RequestContext {
-    pub(crate) caller: RequestHeader,
-    pub(crate) route_epoch: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Freshness {
-    pub(crate) mount_epoch: Option<u64>,
-    pub(crate) route_epoch: Option<u64>,
-}
+pub(super) use namespace::{CreateDirectoryArgs, DeleteArgs, RenameArgs};
+pub(super) use read::{BlockLocationsTarget, GetBlockLocationsArgs, ListStatusArgs};
+pub(super) use write::{AllocateBlockArgs, AuthorizeBlockWriteArgs, OpenWriteArgs};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FileRange {
@@ -58,88 +38,44 @@ pub(crate) struct FileRange {
 pub(crate) struct FsSuccess<T> {
     pub(crate) payload: T,
     pub(crate) group_name: Option<GroupName>,
-    pub(crate) mount_epoch: Option<u64>,
-    pub(crate) route_epoch: Option<u64>,
-    pub(crate) state: Vec<GroupStateWatermark>,
+    pub(crate) state: Option<GroupStateWatermark>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct FsFailure {
     pub(crate) error: Box<RpcErrorDetail>,
     pub(crate) group_name: Option<GroupName>,
-    pub(crate) mount_epoch: Option<u64>,
-    pub(crate) route_epoch: Option<u64>,
-    pub(crate) state: Vec<GroupStateWatermark>,
 }
 
 impl FsFailure {
-    fn new(
-        error: RpcErrorDetail,
-        group_name: Option<GroupName>,
-        mount_epoch: Option<u64>,
-        route_epoch: Option<u64>,
-        state: Vec<GroupStateWatermark>,
-    ) -> Self {
+    fn new(error: RpcErrorDetail, group_name: Option<GroupName>) -> Self {
         Self {
             error: Box::new(error),
             group_name,
-            mount_epoch,
-            route_epoch,
-            state,
         }
     }
 }
 
 pub(crate) type FsResult<T> = Result<FsSuccess<T>, FsFailure>;
 
-fn fs_failure_from_metadata_error(
-    ctx: &RequestContext,
-    err: MetadataError,
-    group_name: Option<GroupName>,
-    mount_epoch: Option<u64>,
-    route_epoch: Option<u64>,
-) -> FsFailure {
-    fs_failure_from_rpc_error(ctx, to_rpc_error(err), group_name, mount_epoch, route_epoch)
+fn fs_failure_from_metadata_error(ctx: &RequestHeader, err: MetadataError, group_name: Option<GroupName>) -> FsFailure {
+    fs_failure_from_rpc_error(ctx, to_rpc_error(err), group_name)
 }
 
-fn fs_failure_from_rpc_error(
-    ctx: &RequestContext,
-    err: RpcErrorDetail,
-    group_name: Option<GroupName>,
-    mount_epoch: Option<u64>,
-    route_epoch: Option<u64>,
-) -> FsFailure {
-    let group_name = group_name.or_else(|| ctx.caller.group_name.clone());
-    FsFailure::new(err, group_name, mount_epoch, route_epoch, Vec::new())
+fn fs_failure_from_rpc_error(ctx: &RequestHeader, err: RpcErrorDetail, group_name: Option<GroupName>) -> FsFailure {
+    let group_name = group_name.or_else(|| ctx.group_name.clone());
+    FsFailure::new(err, group_name)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn refresh_metadata_fs_failure(
-    ctx: &RequestContext,
+    ctx: &RequestHeader,
     kind: ErrorKind,
     message: impl Into<String>,
     group_name: Option<GroupName>,
-    mount_epoch: Option<u64>,
-    route_epoch: Option<u64>,
     hint: Option<RefreshHint>,
 ) -> FsFailure {
     let err = RpcErrorDetail::refresh_metadata(kind, hint.unwrap_or_default(), message);
-    fs_failure_from_rpc_error(ctx, err, group_name, mount_epoch, route_epoch)
-}
-
-fn worker_endpoint_from_parts(
-    worker_id: WorkerId,
-    endpoint: String,
-    worker_net_protocol: i32,
-    worker_run_id: WorkerRunId,
-) -> Result<WorkerEndpointInfo, MetadataError> {
-    if worker_net_protocol != 1 {
-        return Err(MetadataError::InvalidArgument(format!(
-            "unsupported persisted worker network protocol {worker_net_protocol}"
-        )));
-    }
-    beryl_proto::convert::worker_endpoint_info_from_parts(worker_id, endpoint, worker_run_id.to_string())
-        .map_err(MetadataError::InvalidArgument)
+    fs_failure_from_rpc_error(ctx, err, group_name)
 }
 
 fn missing_resolved_target_error(resolved: &ResolvedPath) -> MetadataError {
@@ -152,28 +88,13 @@ fn missing_resolved_target_error(resolved: &ResolvedPath) -> MetadataError {
     MetadataError::NotFound(message)
 }
 
-impl MetadataFileSystem {
-    /// Return whether one exact file has a non-expired opening or active session.
-    fn has_active_write(&self, inode_id: InodeId) -> bool {
-        self.session_registry.has_active_write(inode_id)
-    }
-
-    /// Return whether an inode is or contains a non-expired leader-local write session.
-    ///
-    /// The ancestor index makes this check independent of namespace subtree size.
-    fn has_active_write_under(&self, inode_id: InodeId) -> bool {
-        self.session_registry.has_active_write_under(inode_id)
-    }
-}
-
 pub(crate) struct MetadataFileSystemDeps {
-    pub(crate) state_store: Arc<dyn StateStore>,
     pub(crate) mount_table: Arc<MountTable>,
     pub(crate) storage: Arc<RocksDBStorage>,
     pub(crate) raft_node: Arc<AppRaftNode>,
     pub(crate) session_registry: Arc<SessionRegistry>,
     pub(crate) worker_manager: Arc<WorkerManager>,
-    pub(crate) readiness_gate: Option<Arc<RootReadinessGate>>,
+    pub(crate) readiness_gate: Arc<RootReadinessGate>,
     /// Validated server-owned block capacity used by atomic CreateFile.
     pub(crate) file_block_size: u32,
 }
@@ -188,9 +109,8 @@ pub(crate) struct MetadataFileSystem {
     /// preconditions and persisted fencing epochs provide replay-safe durable
     /// authority, while OpenWrite revalidates its path before replying.
     namespace_topology: RwLock<()>,
-    admission: AdmissionGuard,
+    readiness_gate: Arc<RootReadinessGate>,
     mount_table: Arc<MountTable>,
-    freshness_validator: FreshnessValidator,
     storage: Arc<RocksDBStorage>,
     raft_node: Arc<AppRaftNode>,
     session_registry: Arc<SessionRegistry>,
@@ -201,19 +121,12 @@ pub(crate) struct MetadataFileSystem {
 impl MetadataFileSystem {
     pub(crate) fn new(deps: MetadataFileSystemDeps) -> Self {
         let path_resolver = PathResolver::new(Arc::clone(&deps.mount_table), Arc::clone(&deps.storage));
-        let admission = AdmissionGuard::new(
-            Arc::clone(&deps.mount_table),
-            deps.readiness_gate,
-            Arc::clone(&deps.raft_node),
-        );
-        let freshness_validator = FreshnessValidator::new(Arc::clone(&deps.state_store), Arc::clone(&deps.mount_table));
 
         Self {
             path_resolver,
             namespace_topology: RwLock::new(()),
-            admission,
+            readiness_gate: deps.readiness_gate,
             mount_table: deps.mount_table,
-            freshness_validator,
             storage: deps.storage,
             raft_node: deps.raft_node,
             session_registry: deps.session_registry,
@@ -222,105 +135,53 @@ impl MetadataFileSystem {
         }
     }
 
-    fn response_state_for_success(&self, group_name: Option<&GroupName>) -> Vec<GroupStateWatermark> {
+    fn response_state_for_success(&self, group_name: Option<&GroupName>) -> Option<GroupStateWatermark> {
         let Some(group_name) = group_name else {
             // A response without a known owner group cannot authorize a state cache advance.
-            return Vec::new();
+            return None;
         };
         if !self.raft_node.is_leader() {
-            return Vec::new();
+            return None;
         }
         self.raft_node
             .get_last_applied_state_id()
             .map(|state_id| GroupStateWatermark::new(group_name.clone(), state_id))
-            .into_iter()
-            .collect()
     }
 
-    fn success<T>(&self, payload: T, group_name: Option<GroupName>, mount_epoch: Option<u64>) -> FsResult<T> {
-        self.success_with_route_epoch(payload, group_name, mount_epoch, None)
-    }
-
-    fn success_with_route_epoch<T>(
-        &self,
-        payload: T,
-        group_name: Option<GroupName>,
-        mount_epoch: Option<u64>,
-        route_epoch: Option<u64>,
-    ) -> FsResult<T> {
+    fn success<T>(&self, payload: T, group_name: Option<GroupName>) -> FsResult<T> {
         Ok(FsSuccess {
             payload,
             group_name: group_name.clone(),
-            mount_epoch,
-            route_epoch,
             state: self.response_state_for_success(group_name.as_ref()),
         })
     }
 
-    fn failure_from_error<T>(
-        &self,
-        ctx: &RequestContext,
-        err: MetadataError,
-        group_name: Option<GroupName>,
-        mount_epoch: Option<u64>,
-    ) -> FsResult<T> {
-        self.failure_from_error_with_route_epoch(ctx, err, group_name, mount_epoch, None)
+    fn failure_from_error(&self, ctx: &RequestHeader, err: MetadataError, group_name: Option<GroupName>) -> FsFailure {
+        fs_failure_from_metadata_error(ctx, err, group_name)
     }
 
-    fn failure_from_error_with_route_epoch<T>(
-        &self,
-        ctx: &RequestContext,
-        err: MetadataError,
-        group_name: Option<GroupName>,
-        mount_epoch: Option<u64>,
-        route_epoch: Option<u64>,
-    ) -> FsResult<T> {
-        Err(fs_failure_from_metadata_error(
-            ctx,
-            err,
-            group_name,
-            mount_epoch,
-            route_epoch,
-        ))
-    }
-
-    fn failure_from_admission<T>(&self, failure: AdmissionFailure) -> FsResult<T> {
-        Err(FsFailure {
-            error: failure.err,
-            group_name: failure.group_name,
-            mount_epoch: failure.mount_epoch,
-            route_epoch: None,
-            state: Vec::new(),
-        })
-    }
-
-    fn failure_from_path_error<T>(&self, ctx: &RequestContext, path: &str, err: MetadataError) -> FsResult<T> {
-        let mount_ctx = self
-            .path_resolver
-            .resolve_mount_components(path)
+    fn failure_from_path_error(&self, ctx: &RequestHeader, path: &str, err: MetadataError) -> FsFailure {
+        let mount_ctx = PathResolver::normalize(path)
+            .and_then(|normalized| self.path_resolver.resolve_mount_components(&normalized))
             .ok()
             .map(|(mount_ctx, _)| mount_ctx);
         self.failure_from_resolved_path_error(ctx, err, mount_ctx.as_ref())
     }
 
-    fn failure_from_resolved_path_error<T>(
+    fn failure_from_resolved_path_error(
         &self,
-        ctx: &RequestContext,
+        ctx: &RequestHeader,
         err: MetadataError,
-        mount_ctx: Option<&MountContext>,
-    ) -> FsResult<T> {
-        let (group_name, mount_epoch) = mount_ctx
-            .map(|mount| (Some(mount.owner_group_name.clone()), Some(mount.mount_epoch)))
-            .unwrap_or((None, None));
-        self.failure_from_error(ctx, err, group_name, mount_epoch)
+        mount_ctx: Option<&MountEntry>,
+    ) -> FsFailure {
+        let group_name = mount_ctx.map(|mount| mount.namespace_owner_group_name.clone());
+        self.failure_from_error(ctx, err, group_name)
     }
 
     fn require_worker_lookup_group(
         &self,
-        ctx: &RequestContext,
+        ctx: &RequestHeader,
         group_name: Option<GroupName>,
-        mount_epoch: Option<u64>,
-        route_epoch: Option<u64>,
         intent: &str,
     ) -> Result<GroupName, FsFailure> {
         group_name.clone().ok_or_else(|| {
@@ -328,76 +189,37 @@ impl MetadataFileSystem {
                 ctx,
                 MetadataError::Internal(format!("{intent} worker lookup requires authoritative metadata group")),
                 group_name,
-                mount_epoch,
-                route_epoch,
             )
         })
     }
 
-    // Refresh failures must keep caller and server hint fields explicit.
-    #[allow(clippy::too_many_arguments)]
-    fn refresh_metadata_failure_with_hint<T>(
+    fn refresh_metadata_failure(
         &self,
-        ctx: &RequestContext,
+        ctx: &RequestHeader,
         kind: ErrorKind,
         message: impl Into<String>,
         group_name: Option<GroupName>,
-        mount_epoch: Option<u64>,
-        route_epoch: Option<u64>,
-        mut hint: Option<RefreshHint>,
-    ) -> FsResult<T> {
-        if let Some(group_name_value) = &group_name {
-            hint.get_or_insert_with(RefreshHint::default).group_name = Some(group_name_value.to_string());
-        }
-        if let Some(mount_epoch_value) = mount_epoch {
-            hint.get_or_insert_with(RefreshHint::default).mount_epoch = Some(mount_epoch_value);
-        }
-        if let Some(route_epoch_value) = route_epoch {
-            hint.get_or_insert_with(RefreshHint::default).route_epoch = Some(route_epoch_value);
-        }
-
-        Err(refresh_metadata_fs_failure(
-            ctx,
-            kind,
-            message,
-            group_name.clone(),
-            mount_epoch,
-            route_epoch,
-            hint,
-        ))
+    ) -> FsFailure {
+        let hint = RefreshHint {
+            group_name: group_name.as_ref().map(ToString::to_string),
+            leader_endpoint: None,
+        };
+        refresh_metadata_fs_failure(ctx, kind, message, group_name, Some(hint))
     }
 
-    fn session_terminal_failure<T>(
+    fn session_terminal_failure(
         &self,
-        ctx: &RequestContext,
+        ctx: &RequestHeader,
         kind: ErrorKind,
         message: impl Into<String>,
         group_name: Option<GroupName>,
-        mount_epoch: Option<u64>,
-    ) -> FsResult<T> {
-        let group_name = group_name.or_else(|| ctx.caller.group_name.clone());
-        Err(FsFailure::new(
+    ) -> FsFailure {
+        let group_name = group_name.or_else(|| ctx.group_name.clone());
+        FsFailure::new(
             RpcErrorDetail::reopen_write_session(kind, RefreshHint::default(), message),
             group_name,
-            mount_epoch,
-            None,
-            Vec::new(),
-        ))
+        )
     }
-
-    fn read_inode(&self, inode_id: InodeId) -> MetadataResult<Option<Inode>> {
-        self.storage.get_inode(inode_id)
-    }
-
-    fn read_dentry(&self, parent_inode_id: InodeId, name: &str) -> MetadataResult<Option<InodeId>> {
-        self.storage.get_dentry(parent_inode_id, name)
-    }
-}
-
-/// Check a capacity at the write-service boundary before opening a session.
-fn validate_active_write_block_size(block_size: u32) -> Result<(), MetadataError> {
-    beryl_types::validate_block_size(u64::from(block_size))
-        .map_err(|error| MetadataError::InvalidArgument(format!("invalid file block size: {error}")))
 }
 
 #[cfg(test)]
@@ -407,16 +229,14 @@ mod tests {
     pub(super) use crate::inode::Inode;
     pub(super) use crate::inode::InodeAttrs;
     use crate::inode::InodeKind;
-    pub(super) use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
+    pub(super) use crate::mount::{MountEntry, ROOT_INODE_ID};
     use crate::raft::PublishMode;
     pub(super) use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
-    pub(super) use crate::service::filesystem::publish::{CloseWriteIntent, CloseWriteOutput};
     pub(super) use crate::service::filesystem::write::OpenWriteOutput;
     use crate::session_registry::{BeginAllocateBlock, BeginSessionInput, WriteSession};
-    use crate::state::RouteEpoch;
-    pub(super) use crate::worker::{BlockReportBlock, BlockReportBlockState, WorkerDescriptor, WorkerManager};
+    pub(super) use crate::worker::{BlockReportBlock, BlockReportBlockState, WorkerManager};
     pub(super) use beryl_common::error::rpc::{
-        ErrorKind, InternalErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail, WorkerErrorKind,
+        ErrorKind, MetadataErrorKind, RecoveryAction, RpcErrorDetail, WorkerErrorKind,
     };
     pub(super) use beryl_common::header::RequestHeader;
     pub(super) use beryl_types::ids::{BlockId, BlockIndex, ClientId, InodeId, MountId, WorkerId};
@@ -425,29 +245,9 @@ mod tests {
     pub(super) use beryl_types::{CommittedBlock, GroupName, LocatedBlock, Tier, TierFree, WorkerRunId};
     use beryl_types::{ContentGeneration, LeaseEpoch, WriteMode};
     use std::ops::Deref;
-    use std::sync::atomic::{AtomicU64, Ordering};
     pub(super) use std::sync::Arc;
     pub(super) use std::time::Duration;
     pub(super) use tempfile::TempDir;
-
-    pub(super) struct MemoryStateStore {
-        route_epoch: AtomicU64,
-    }
-
-    impl MemoryStateStore {
-        pub(super) fn new() -> Self {
-            Self {
-                route_epoch: AtomicU64::new(1),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl StateStore for MemoryStateStore {
-        async fn get_route_epoch(&self) -> MetadataResult<RouteEpoch> {
-            Ok(RouteEpoch::new(self.route_epoch.load(Ordering::Acquire)))
-        }
-    }
 
     pub(super) struct TestFilesystem {
         filesystem: MetadataFileSystem,
@@ -472,10 +272,6 @@ mod tests {
             Arc::clone(&self.session_registry)
         }
 
-        pub(super) fn mount_table(&self) -> Arc<MountTable> {
-            Arc::clone(&self.filesystem.mount_table)
-        }
-
         pub(super) fn raft_node(&self) -> Arc<AppRaftNode> {
             Arc::clone(&self.filesystem.raft_node)
         }
@@ -487,7 +283,6 @@ mod tests {
         raft_node: Option<Arc<AppRaftNode>>,
         session_registry: Option<Arc<SessionRegistry>>,
         worker_manager: Option<Arc<WorkerManager>>,
-        state_store: Option<Arc<dyn StateStore>>,
     }
 
     impl TestFilesystemBuilder {
@@ -498,7 +293,6 @@ mod tests {
                 raft_node: None,
                 session_registry: None,
                 worker_manager: None,
-                state_store: None,
             }
         }
 
@@ -526,11 +320,6 @@ mod tests {
             self
         }
 
-        pub(super) fn with_state_store(mut self, state_store: Arc<dyn StateStore>) -> Self {
-            self.state_store = Some(state_store);
-            self
-        }
-
         pub(super) async fn build(self) -> TestFilesystem {
             let (storage, storage_dir) = match self.storage {
                 Some(storage) => (storage, None),
@@ -543,19 +332,15 @@ mod tests {
             let raft_node = match self.raft_node {
                 Some(raft_node) => raft_node,
                 None => {
-                    let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
-                    Arc::new(
-                        AppRaftNode::new(1, Arc::clone(&storage), state_machine, Arc::clone(&self.mount_table))
-                            .await
-                            .unwrap(),
-                    )
+                    single_node_raft(Arc::clone(&storage), Arc::clone(&self.mount_table))
+                        .await
+                        .0
                 }
             };
             let session_registry = self
                 .session_registry
                 .unwrap_or_else(|| Arc::new(SessionRegistry::default()));
             let filesystem = MetadataFileSystem::new(MetadataFileSystemDeps {
-                state_store: self.state_store.unwrap_or_else(|| Arc::new(MemoryStateStore::new())),
                 mount_table: self.mount_table,
                 storage,
                 raft_node,
@@ -563,7 +348,7 @@ mod tests {
                 worker_manager: self
                     .worker_manager
                     .unwrap_or_else(|| Arc::new(WorkerManager::new(60_000))),
-                readiness_gate: None,
+                readiness_gate: Arc::new(RootReadinessGate::new()),
                 file_block_size: crate::config::MetadataConfig::default().file_block_size,
             });
 
@@ -575,28 +360,16 @@ mod tests {
         }
     }
 
-    pub(super) fn request_context() -> RequestContext {
-        RequestContext {
-            caller: RequestHeader::new(ClientId::new(7)),
-            route_epoch: None,
-        }
+    pub(super) fn request_context() -> RequestHeader {
+        RequestHeader::new(ClientId::new(7))
     }
 
     #[test]
     fn failure_without_resolved_authority_preserves_requested_group_identity() {
         let group_name = group_name("requested");
-        let ctx = RequestContext {
-            caller: RequestHeader::new(ClientId::new(7)).with_group_name(group_name.clone()),
-            route_epoch: None,
-        };
+        let ctx = RequestHeader::new(ClientId::new(7)).with_group_name(group_name.clone());
 
-        let failure = fs_failure_from_metadata_error(
-            &ctx,
-            MetadataError::NotFound("missing inode".to_string()),
-            None,
-            None,
-            None,
-        );
+        let failure = fs_failure_from_metadata_error(&ctx, MetadataError::NotFound("missing inode".to_string()), None);
 
         assert_eq!(failure.group_name, Some(group_name));
     }
@@ -605,24 +378,13 @@ mod tests {
         GroupName::parse(raw).unwrap()
     }
 
-    pub(super) fn filesystem_builder_with_mount(
-        mount_id: MountId,
-        mount_epoch: u64,
-        group_name: &GroupName,
-    ) -> TestFilesystemBuilder {
-        let mount_table = Arc::new(MountTable::new());
-        mount_table
-            .upsert(MountEntry {
-                mount_id,
-                mount_prefix: "/".to_string(),
-                mount_kind: MountKind::Internal,
-                ufs_uri: None,
-                data_io_policy: DataIoPolicy::Allow,
-                mount_epoch,
-                namespace_owner_group_name: group_name.clone(),
-                root_inode_id: ROOT_INODE_ID,
-            })
-            .unwrap();
+    pub(super) fn filesystem_builder_with_mount(mount_id: MountId, group_name: &GroupName) -> TestFilesystemBuilder {
+        let mount_table = Arc::new(MountTable::default());
+        mount_table.upsert(MountEntry {
+            mount_id,
+            namespace_owner_group_name: group_name.clone(),
+            root_inode_id: ROOT_INODE_ID,
+        });
         TestFilesystemBuilder::new(mount_table)
     }
 
@@ -645,15 +407,7 @@ mod tests {
         worker_id: WorkerId,
         address: String,
     ) {
-        manager
-            .upsert_descriptor(WorkerDescriptor {
-                group_name: group_name.clone(),
-                worker_id,
-                address,
-                worker_net_protocol: 1,
-                fault_domain: None,
-            })
-            .expect("worker descriptor should register");
+        manager.register_worker_run(group_name, worker_id, address, worker_run_id(group_name, worker_id));
     }
 
     pub(super) fn record_worker_heartbeat(
@@ -663,42 +417,28 @@ mod tests {
         free_bytes: u64,
     ) {
         let descriptor = manager
-            .get_descriptor(group_name, worker_id)
+            .collect_worker_placement_views(group_name)
+            .into_iter()
+            .find(|view| view.worker_id == worker_id)
             .expect("worker descriptor should be registered");
-        let run_id = manager
-            .get_registration(group_name, worker_id)
-            .map(|registration| registration.worker_run_id)
-            .unwrap_or_else(|| {
-                let run_id = worker_run_id(group_name, worker_id);
-                manager
-                    .register_worker_run(
-                        group_name,
-                        worker_id,
-                        descriptor.address.clone(),
-                        descriptor.worker_net_protocol,
-                        run_id,
-                        descriptor.fault_domain.clone(),
-                    )
-                    .expect("worker run should register");
-                run_id
-            });
+        let run_id = manager.get_registered_run(group_name, worker_id).unwrap_or_else(|| {
+            let run_id = worker_run_id(group_name, worker_id);
+            manager.register_worker_run(group_name, worker_id, descriptor.endpoint.clone(), run_id);
+            run_id
+        });
         manager
             .record_heartbeat_with_tier_free(
                 group_name,
                 worker_id,
                 run_id,
                 1,
-                &descriptor.address,
-                descriptor.worker_net_protocol,
+                &descriptor.endpoint,
                 vec![TierFree {
                     tier: Tier::Hdd,
                     free_bytes,
                 }],
             )
             .expect("heartbeat should be accepted");
-        manager
-            .upsert_descriptor(descriptor)
-            .expect("descriptor should be restored");
     }
 
     pub(super) fn report_block(block_id: BlockId) -> BlockReportBlock {
@@ -750,9 +490,8 @@ mod tests {
         blocks: Vec<BlockId>,
     ) {
         let run_id = manager
-            .get_registration(group_name, worker_id)
-            .expect("worker registration")
-            .worker_run_id;
+            .get_registered_run(group_name, worker_id)
+            .expect("worker registration");
         manager
             .receive_full_block_report(
                 group_name,
@@ -781,9 +520,8 @@ mod tests {
         block: BlockReportBlock,
     ) {
         let run_id = manager
-            .get_registration(group_name, worker_id)
-            .expect("worker registration")
-            .worker_run_id;
+            .get_registered_run(group_name, worker_id)
+            .expect("worker registration");
         manager
             .receive_full_block_report(group_name, worker_id, run_id, report_seq, 0, true, vec![block])
             .expect("full block report should publish locations");
@@ -826,13 +564,6 @@ mod tests {
         assert!(matches!(error.recovery, RecoveryAction::RefreshMetadata { .. }));
     }
 
-    pub(super) fn refresh_hint(error: &RpcErrorDetail) -> &RefreshHint {
-        match &error.recovery {
-            RecoveryAction::RefreshMetadata { hint } | RecoveryAction::ReopenWriteSession { hint } => hint,
-            other => panic!("expected refresh-like recovery, got {other:?}"),
-        }
-    }
-
     pub(super) fn install_write_session_with_ancestors(
         filesystem: &TestFilesystem,
         inode_id: InodeId,
@@ -849,7 +580,6 @@ mod tests {
             block_size: 64,
             workers: Vec::new(),
             fencing_token: FencingToken {
-                block_id,
                 owner: writer,
                 epoch: lease_epoch,
             },
@@ -878,7 +608,7 @@ mod tests {
             lease_epoch,
             last_commit: None,
         };
-        opening.activate(lease_epoch, &file, None).expect("session created");
+        opening.activate(&file, None).expect("session created");
         let target_reservation = match session_registry
             .begin_allocate_block(inode_id, lease_epoch, None)
             .expect("target capacity")
@@ -899,17 +629,10 @@ mod tests {
             .get_session(key.inode_id)
             .and_then(|session| session.issued_targets.last().map(|target| target.block_id));
         filesystem
-            .allocate_block_session(
-                &request_context(),
-                key.inode_id,
-                key.lease_epoch,
-                previous_block_id,
-                Freshness::default(),
-            )
+            .allocate_block_session(&request_context(), key.inode_id, key.lease_epoch, previous_block_id)
             .await
             .expect("AllocateBlock should succeed")
             .payload
-            .block
     }
 
     pub(super) async fn commit_for_key(
@@ -917,29 +640,26 @@ mod tests {
         key: &OpenWriteOutput,
         committed_blocks: Vec<CommittedBlock>,
         final_len: u64,
-    ) -> FsResult<CloseWriteOutput> {
+    ) -> FsResult<u64> {
         filesystem
             .close_write_session(
                 &request_context(),
-                WriteHandle {
-                    inode_id: key.inode_id,
-                    lease_epoch: key.lease_epoch,
-                },
-                CloseWriteIntent {
-                    committed_blocks,
-                    final_len,
+                key.inode_id,
+                crate::inode::FilePublication {
+                    blocks: committed_blocks,
+                    target_len: final_len,
                     expected_file_len: key.base_len,
-                },
-                Freshness::default(),
-                key.generation,
-                match filesystem
-                    .session_registry
-                    .get_session(key.inode_id)
-                    .expect("active write session")
-                    .mode
-                {
-                    WriteMode::Overwrite => PublishMode::ReplaceIfUnchanged,
-                    WriteMode::Append => PublishMode::AppendIfUnchanged,
+                    expected_generation: key.generation,
+                    lease_epoch: key.lease_epoch,
+                    mode: match filesystem
+                        .session_registry
+                        .get_session(key.inode_id)
+                        .expect("active write session")
+                        .mode
+                    {
+                        WriteMode::Overwrite => PublishMode::ReplaceIfUnchanged,
+                        WriteMode::Append => PublishMode::AppendIfUnchanged,
+                    },
                 },
             )
             .await
@@ -963,12 +683,10 @@ mod tests {
     ) -> WriteFlowEnv {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-        let mount_id = MountId::new(57 + base_len);
+        let mount_id = MountId::new(1);
         let group_name = group_name(&format!("g{}", 15 + base_len));
         let inode_id = InodeId::new(9570 + base_len);
-        let state_store = Arc::new(MemoryStateStore::new());
-        let builder = filesystem_builder_with_mount(mount_id, 9, &group_name)
-            .with_state_store(Arc::clone(&state_store) as Arc<dyn StateStore>);
+        let builder = filesystem_builder_with_mount(mount_id, &group_name);
         let mount_table = builder.mount_table();
         let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
         let filesystem = builder
@@ -1030,13 +748,13 @@ mod tests {
     pub(super) async fn single_node_raft(
         storage: Arc<RocksDBStorage>,
         mount_table: Arc<MountTable>,
-    ) -> (Arc<AppRaftNode>, Arc<AppRaftStateMachine>) {
-        for mount in mount_table.list_mounts() {
+    ) -> (Arc<AppRaftNode>, AppRaftStateMachine) {
+        if let Some(mount) = mount_table.root() {
             storage.put_mount(&mount).unwrap();
         }
-        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
+        let state_machine = AppRaftStateMachine::new(Arc::clone(&storage));
         let raft_node = Arc::new(
-            AppRaftNode::new(1, storage, Arc::clone(&state_machine), mount_table)
+            AppRaftNode::new(1, Arc::clone(&storage), AppRaftStateMachine::new(storage), mount_table)
                 .await
                 .unwrap(),
         );

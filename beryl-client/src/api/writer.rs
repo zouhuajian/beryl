@@ -5,13 +5,11 @@
 
 use crate::client_inner::{metric_labels, ClientInner};
 use crate::error::{side_effect_response_body_mismatch, ClientError, ClientErrorKind, ClientResult};
-use crate::metrics::ClientMetric;
-use crate::runtime::{
-    is_definite_worker_capacity_rejection, AttemptContext, Operation, OperationContext, OperationDeadline,
-};
-use crate::session::write_session::WriteSession;
+use crate::metrics::{self, ClientMetric};
+use crate::runtime::{is_definite_worker_capacity_rejection, Operation, OperationContext, OperationDeadline};
+use crate::session::WriteSession;
 use crate::worker::{BlockWrite, BlockWriteInput};
-use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, WorkerErrorKind};
+use beryl_common::error::rpc::RecoveryAction;
 use bytes::Bytes;
 use std::fmt;
 use std::sync::Arc;
@@ -77,31 +75,36 @@ impl FileWriter {
     /// Accepts a prefix of `data`. An empty slice returns zero without IO.
     /// Bytes are accepted only after block preparation completes.
     pub async fn write(&mut self, data: &[u8]) -> ClientResult<usize> {
-        if data.is_empty() {
-            return Ok(0);
-        }
-        let deadline = self.inner.metadata.operation_deadline();
-        let cancellation = CancelWrite::new(self);
-        let result = cancellation.writer.prepare_block(deadline).await;
-        let permit = cancellation.complete(result)?;
+        async {
+            if data.is_empty() {
+                return Ok(0);
+            }
+            let deadline = self.inner.metadata.operation_deadline();
+            let cancellation = CancelWrite::new(self);
+            let result = cancellation.writer.prepare_block(deadline).await;
+            let permit = cancellation.complete(result)?;
 
-        // No await separates accepting bytes from recording their position.
-        let block = self.active_block.as_mut().expect("prepared block");
-        let len = data
-            .len()
-            .min(usize::try_from(block.remaining()).unwrap_or(usize::MAX))
-            .min(beryl_proto::DEFAULT_WORKER_DATA_FRAME_SIZE);
-        self.session
-            .position()
-            .checked_add(len as u64)
-            .ok_or_else(|| ClientError::invalid_argument("write position overflow"))?;
-        if let Err(error) = block.write_reserved(permit, Bytes::copy_from_slice(&data[..len])) {
-            mark_session_after_write_error(&mut self.session, &error);
-            self.active_block.take();
-            return Err(self.inner.normalize_outcome_error("WriteBlock", "worker", error));
+            // No await separates accepting bytes from recording their position.
+            let block = self.active_block.as_mut().expect("prepared block");
+            let len = data
+                .len()
+                .min(block.remaining() as usize)
+                .min(beryl_proto::DEFAULT_WORKER_DATA_FRAME_SIZE);
+            let next_position = self
+                .session
+                .position()
+                .checked_add(len as u64)
+                .ok_or_else(|| ClientError::invalid_argument("write position overflow"))?;
+            if let Err(error) = block.write_reserved(permit, Bytes::copy_from_slice(&data[..len])) {
+                mark_session_after_write_error(&mut self.session, &error);
+                self.active_block.take();
+                return Err(self.inner.normalize_outcome_error("WriteBlock", "worker", error));
+            }
+            self.session.set_position(next_position);
+            Ok(len)
         }
-        self.session.advance_position(len)?;
-        Ok(len)
+        .await
+        .inspect_err(|error| metrics::record_unknown_outcome("WriteBlock", "worker", error))
     }
 
     /// Accepts all bytes through sequential writes. On error or cancellation,
@@ -117,19 +120,25 @@ impl FileWriter {
     /// Confirms Worker durability without publishing data. Empty flush does not
     /// allocate a block. Flush after a successful close is a no-op.
     pub async fn flush(&mut self) -> ClientResult<()> {
-        if self.session.is_closed() {
-            return Ok(());
+        async {
+            if self.session.is_closed() {
+                return Ok(());
+            }
+            let deadline = self.inner.metadata.operation_deadline();
+            self.renew_lease_if_needed(deadline.clone()).await?;
+            self.session.ensure_open_for_write()?;
+            self.finish_block(&deadline).await
         }
-        let deadline = self.inner.metadata.operation_deadline();
-        self.renew_lease_if_needed(deadline.clone()).await?;
-        self.session.ensure_open_for_write()?;
-        self.finish_block(&deadline).await
+        .await
+        .inspect_err(|error| metrics::record_unknown_outcome("WriteBlock", "worker", error))
     }
 
     /// Renews the open lease. Idle writers are not renewed in the background.
     pub async fn renew_lease(&mut self) -> ClientResult<()> {
         let deadline = self.inner.metadata.operation_deadline();
-        self.renew_lease_with_deadline(deadline).await
+        self.renew_lease_with_deadline(deadline)
+            .await
+            .inspect_err(|error| metrics::record_unknown_outcome("RenewLease", "metadata", error))
     }
 
     /// Makes all accepted bytes durable and visible while keeping the writer open.
@@ -138,133 +147,132 @@ impl FileWriter {
     /// retry reuses the original operation identity and exact publication
     /// payload; all other writer operations remain blocked until it resolves.
     pub async fn sync(&mut self) -> ClientResult<()> {
-        let deadline = self.inner.metadata.operation_deadline();
-        self.renew_lease_if_needed(deadline.clone()).await?;
-        self.session.ensure_open_for_sync()?;
-        let path = self.session.path().to_string();
-        self.finish_block(&deadline).await?;
-        let target_len = self.session.position();
-        let committed_blocks = self.session.publication_blocks();
-        let plan = self.session.prepare_sync_write(
-            self.inner.metadata.client_id(),
-            self.inner.metadata.client_name(),
-            committed_blocks,
-            target_len,
-            deadline,
-        )?;
-        match self.inner.metadata.sync_write(plan).await {
-            Ok(generation) => {
-                self.session.mark_sync_completed(generation, target_len)?;
-                Ok(())
-            }
-            Err(err) if err.is_outcome_unknown() => {
-                self.inner.record_metric(
-                    ClientMetric::UnknownOutcome,
-                    metric_labels("SyncWrite", "metadata").with_outcome("unknown"),
-                );
-                let message = format!("SyncWrite outcome is unknown for path {path}: {err}");
-                Err(err.with_unknown_outcome_name("SyncWrite", message))
-            }
-            Err(err) => {
-                mark_session_after_metadata_error(&mut self.session, &err);
-                self.inner.record_error_metric("SyncWrite", "metadata", &err);
-                Err(err)
+        async {
+            let deadline = self.inner.metadata.operation_deadline();
+            self.renew_lease_if_needed(deadline.clone()).await?;
+            self.session.ensure_open_for_sync()?;
+            let path = self.session.path().to_string();
+            self.finish_block(&deadline).await?;
+            let target_len = self.session.position();
+            let plan = self.session.prepare_sync_write(
+                self.inner.metadata.client_id(),
+                self.inner.metadata.client_name(),
+                deadline,
+            );
+            match self.inner.metadata.sync_write(plan).await {
+                Ok(generation) => {
+                    self.session.mark_sync_completed(generation, target_len);
+                    Ok(())
+                }
+                Err(err) if err.is_outcome_unknown() => {
+                    let message = format!("SyncWrite outcome is unknown for path {path}: {err}");
+                    Err(err.with_unknown_outcome_name("SyncWrite", message))
+                }
+                Err(err) => {
+                    mark_session_after_metadata_error(&mut self.session, &err);
+                    metrics::record_error("SyncWrite", "metadata", &err);
+                    Err(err)
+                }
             }
         }
+        .await
+        .inspect_err(|error| metrics::record_unknown_outcome("SyncWrite", "metadata", error))
     }
 
     /// Publishes the final contents and ends the lease. Successful close is
     /// idempotent. Retry an unknown Metadata commit with this same writer.
     pub async fn close(&mut self) -> ClientResult<()> {
-        let deadline = self.inner.metadata.operation_deadline();
-        if self.session.is_closed() {
-            return Ok(());
-        }
-        self.renew_lease_if_needed(deadline.clone()).await?;
-        self.session.ensure_open_for_close()?;
-        let path = self.session.path().to_string();
-        self.finish_block(&deadline).await?;
-        let final_len = self.session.position();
-        let committed_blocks = self.session.publication_blocks();
+        async {
+            let deadline = self.inner.metadata.operation_deadline();
+            if self.session.is_closed() {
+                return Ok(());
+            }
+            self.renew_lease_if_needed(deadline.clone()).await?;
+            self.session.ensure_open_for_close()?;
+            let path = self.session.path().to_string();
+            self.finish_block(&deadline).await?;
 
-        let retrying_unknown_commit = self.session.is_commit_pending();
-        let plan = self.session.prepare_commit_file(
-            self.inner.metadata.client_id(),
-            self.inner.metadata.client_name(),
-            committed_blocks,
-            final_len,
-            deadline,
-        )?;
-        if retrying_unknown_commit {
-            self.inner.record_metric(
-                ClientMetric::CommitUnknownRetry,
-                metric_labels("CommitFile", "metadata").with_outcome("retry"),
+            let retrying_unknown_commit = self.session.is_commit_pending();
+            let plan = self.session.prepare_commit_file(
+                self.inner.metadata.client_id(),
+                self.inner.metadata.client_name(),
+                deadline,
             );
-        }
-        match self.inner.metadata.commit_file(plan).await {
-            Ok(_) => {
-                self.session.mark_closed();
-                Ok(())
-            }
-            Err(err)
-                if retrying_unknown_commit || err.is_outcome_unknown() || err.kind() == ClientErrorKind::Internal =>
-            {
-                // A later fence or missing receipt cannot establish the outcome
-                // of the original attempt, including a cancelled close future.
-                // Internal failures also lack proof that Raft did not apply.
-                self.inner.record_metric(
-                    ClientMetric::UnknownOutcome,
-                    metric_labels("CommitFile", "metadata").with_outcome("unknown"),
+            if retrying_unknown_commit {
+                metrics::record(
+                    ClientMetric::CommitUnknownRetry,
+                    metric_labels("CommitFile", "metadata").with_outcome("retry"),
                 );
-                let message = format!("CommitFile outcome is unknown for path {path}: {err}");
-                Err(err.with_unknown_outcome_name("CommitFile", message))
             }
-            Err(err) => {
-                mark_session_after_metadata_error(&mut self.session, &err);
-                self.inner.record_error_metric("CommitFile", "metadata", &err);
+            match self.inner.metadata.commit_file(plan).await {
+                Ok(()) => {
+                    self.session.mark_closed();
+                    Ok(())
+                }
                 Err(err)
+                    if retrying_unknown_commit
+                        || err.is_outcome_unknown()
+                        || err.kind() == ClientErrorKind::Internal =>
+                {
+                    // A later fence or missing receipt cannot establish the outcome
+                    // of the original attempt, including a cancelled close future.
+                    // Internal failures also lack proof that Raft did not apply.
+                    let message = format!("CommitFile outcome is unknown for path {path}: {err}");
+                    Err(err.with_unknown_outcome_name("CommitFile", message))
+                }
+                Err(err) => {
+                    mark_session_after_metadata_error(&mut self.session, &err);
+                    metrics::record_error("CommitFile", "metadata", &err);
+                    Err(err)
+                }
             }
         }
+        .await
+        .inspect_err(|error| metrics::record_unknown_outcome("CommitFile", "metadata", error))
     }
 
     /// Aborts this writer's open write session and reports cleanup failures.
     pub async fn abort(&mut self) -> ClientResult<()> {
-        let deadline = self.inner.metadata.operation_deadline();
-        self.session.ensure_open_for_abort()?;
-        let plan = self.session.prepare_abort_cleanup(
-            self.inner.metadata.client_id(),
-            self.inner.metadata.client_name(),
-            deadline.clone(),
-        )?;
-        self.cancel_block_write(&deadline).await?;
-        self.inner.record_metric(
-            ClientMetric::AbortAttempt,
-            metric_labels("AbortFileWrite", "metadata").with_outcome("attempt"),
-        );
-        if let Err(err) = self
-            .inner
-            .metadata
-            .abort_file_write(plan.metadata_operation(), plan.metadata_write_handle())
-            .await
-        {
-            let normalized = self.inner.normalize_outcome_error("AbortFileWrite", "metadata", err);
-            let metric = if normalized.is_outcome_unknown() {
-                ClientMetric::AbortUnknown
-            } else {
-                ClientMetric::AbortFailure
-            };
-            self.inner.record_metric(
-                metric,
-                metric_labels("AbortFileWrite", "metadata").with_outcome("unknown"),
+        async {
+            let deadline = self.inner.metadata.operation_deadline();
+            self.session.ensure_open_for_abort()?;
+            let operation = self.session.prepare_abort(
+                self.inner.metadata.client_id(),
+                self.inner.metadata.client_name(),
+                deadline.clone(),
             );
-            return Err(normalized);
+            self.cancel_block_write(&deadline).await?;
+            metrics::record(
+                ClientMetric::AbortAttempt,
+                metric_labels("AbortFileWrite", "metadata").with_outcome("attempt"),
+            );
+            if let Err(err) = self
+                .inner
+                .metadata
+                .abort_file_write(operation, self.session.write_handle())
+                .await
+            {
+                let normalized = self.inner.normalize_outcome_error("AbortFileWrite", "metadata", err);
+                let metric = if normalized.is_outcome_unknown() {
+                    ClientMetric::AbortUnknown
+                } else {
+                    ClientMetric::AbortFailure
+                };
+                metrics::record(
+                    metric,
+                    metric_labels("AbortFileWrite", "metadata").with_outcome("unknown"),
+                );
+                return Err(normalized);
+            }
+            self.session.mark_aborted();
+            metrics::record(
+                ClientMetric::AbortSuccess,
+                metric_labels("AbortFileWrite", "metadata").with_outcome("success"),
+            );
+            Ok(())
         }
-        self.session.mark_aborted();
-        self.inner.record_metric(
-            ClientMetric::AbortSuccess,
-            metric_labels("AbortFileWrite", "metadata").with_outcome("success"),
-        );
-        Ok(())
+        .await
+        .inspect_err(|error| metrics::record_unknown_outcome("AbortFileWrite", "metadata", error))
     }
 
     async fn prepare_block(&mut self, deadline: OperationDeadline) -> ClientResult<OwnedPermit<BlockWriteInput>> {
@@ -308,13 +316,12 @@ impl FileWriter {
         let (allocate_block_operation, allocate_block) = if let Some((group_name, block)) = self.session.reusable_tail()
         {
             (
-                worker_write_context(
+                OperationContext::new_named(
                     self.inner.metadata.client_id(),
                     self.inner.metadata.client_name(),
                     Operation::WriteBlock,
-                    self.session.path(),
                     deadline.clone(),
-                )?,
+                ),
                 crate::metadata::model::AllocateBlockResult { group_name, block },
             )
         } else {
@@ -322,7 +329,6 @@ impl FileWriter {
                 .inner
                 .metadata
                 .allocate_block(
-                    self.session.path(),
                     self.session.write_handle(),
                     self.session.previous_block_id(),
                     deadline.clone(),
@@ -338,28 +344,23 @@ impl FileWriter {
         };
         if let Err(err) = self.session.validate_target(&allocate_block.block) {
             self.session.mark_unknown_outcome();
-            self.inner.record_metric(
+            metrics::record(
                 ClientMetric::WorkerResponseBodyMismatch,
-                metric_labels("AllocateBlock", "metadata").with_outcome("unknown"),
-            );
-            self.inner.record_metric(
-                ClientMetric::UnknownOutcome,
                 metric_labels("AllocateBlock", "metadata").with_outcome("unknown"),
             );
             return Err(side_effect_response_body_mismatch("AllocateBlock", err)
                 .with_operation_context(&allocate_block_operation));
         }
-        self.session.record_write_group(allocate_block.group_name.clone())?;
-        let operation = worker_write_context(
+        self.session.record_write_group(allocate_block.group_name.clone());
+        let operation = OperationContext::new_named(
             self.inner.metadata.client_id(),
             self.inner.metadata.client_name(),
             Operation::WriteBlock,
-            self.session.path(),
             deadline,
-        )?;
+        );
         let lease_expires_at_ms = self.session.expires_at_ms();
         for attempt_index in 0..self.inner.config.max_attempts() {
-            let ctx = AttemptContext::for_data(&operation);
+            let ctx = operation.clone();
             match self
                 .inner
                 .worker_rpc_with_timeout(
@@ -379,7 +380,7 @@ impl FileWriter {
                     if !has_next {
                         return Err(err.with_operation_context(&operation));
                     }
-                    self.inner.record_metric(
+                    metrics::record(
                         ClientMetric::RetryAttempt,
                         metric_labels("WriteBlock", "worker").with_error_class("server_retry"),
                     );
@@ -416,9 +417,8 @@ impl FileWriter {
 
     async fn renew_lease_with_deadline(&mut self, deadline: OperationDeadline) -> ClientResult<()> {
         self.session.ensure_open_for_renew()?;
-        let path = self.session.path().to_string();
         let write_handle = self.session.write_handle();
-        self.inner.record_metric(
+        metrics::record(
             ClientMetric::LeaseRenewAttempt,
             metric_labels("RenewLease", "metadata").with_outcome("attempt"),
         );
@@ -427,7 +427,7 @@ impl FileWriter {
             .writer
             .inner
             .metadata
-            .renew_lease(&path, write_handle, deadline)
+            .renew_lease(write_handle, deadline)
             .await;
         let result = cancellation.complete(result);
         match result {
@@ -438,7 +438,7 @@ impl FileWriter {
                     .map(|block| block.update_lease_expiry(expires_at_ms))
                     .transpose();
                 self.session.update_expires_at_ms(expires_at_ms);
-                self.inner.record_metric(
+                metrics::record(
                     ClientMetric::LeaseRenewSuccess,
                     metric_labels("RenewLease", "metadata").with_outcome("success"),
                 );
@@ -450,8 +450,8 @@ impl FileWriter {
             }
             Err(err) => {
                 mark_session_after_metadata_error(&mut self.session, &err);
-                self.inner.record_error_metric("RenewLease", "metadata", &err);
-                self.inner.record_metric(
+                metrics::record_error("RenewLease", "metadata", &err);
+                metrics::record(
                     ClientMetric::LeaseRenewFailure,
                     metric_labels("RenewLease", "metadata")
                         .with_error_class(err.classification_label())
@@ -479,10 +479,7 @@ impl FileWriter {
             .await;
         match cancellation.complete(result) {
             Ok((target, written_len)) => {
-                if let Err(error) = self.session.push_ready_block(target, written_len) {
-                    self.session.mark_session_invalid();
-                    return Err(error);
-                }
+                self.session.push_ready_block(target, written_len);
                 Ok(())
             }
             Err(error) => {
@@ -559,52 +556,18 @@ fn mark_session_after_metadata_error(session: &mut WriteSession, err: &ClientErr
     }
 }
 
-/// Creates the stable operation identity used for worker write attempts.
-fn worker_write_context(
-    client_id: beryl_types::ClientId,
-    client_name: &str,
-    operation: Operation,
-    path: &str,
-    deadline: OperationDeadline,
-) -> ClientResult<OperationContext> {
-    OperationContext::new_named(client_id, client_name, operation, Some(path.to_string()), deadline)
-}
-
 /// Marks a write session after a worker write or add-block failure.
 fn mark_session_after_write_error(session: &mut WriteSession, err: &ClientError) {
-    if has_uncertain_write_effect(err) {
+    if err.is_outcome_unknown() || err.is_retryable_transport() || err.is_invalid_success_response() {
         session.mark_unknown_outcome();
-    } else if is_session_or_fencing_error(err) || is_write_refresh_error(err) {
-        mark_session_after_metadata_error(session, err);
+    } else if err.kind() == ClientErrorKind::SessionExpired
+        && !matches!(
+            err.remote_error().map(|error| &error.recovery),
+            Some(RecoveryAction::RefreshMetadata { .. })
+        )
+    {
+        session.mark_session_expired();
     } else {
         session.mark_session_invalid();
     }
-}
-
-/// Returns true when a failure leaves worker write side effects uncertain.
-fn has_uncertain_write_effect(err: &ClientError) -> bool {
-    err.is_outcome_unknown() || err.is_retryable_transport() || err.is_invalid_success_response()
-}
-
-/// Returns true when the error invalidates or expires the write session.
-fn is_session_or_fencing_error(err: &ClientError) -> bool {
-    matches!(
-        err.kind(),
-        ClientErrorKind::Fenced | ClientErrorKind::SessionInvalid | ClientErrorKind::SessionExpired
-    )
-}
-
-/// Returns true when a write-path metadata refresh cause invalidates the current session.
-fn is_write_refresh_error(err: &ClientError) -> bool {
-    err.remote_error().is_some_and(|error| {
-        matches!(error.recovery, RecoveryAction::RefreshMetadata { .. })
-            && matches!(
-                error.kind,
-                ErrorKind::Metadata(
-                    MetadataErrorKind::RouteEpochMismatch
-                        | MetadataErrorKind::OwnerGroupMismatch
-                        | MetadataErrorKind::StaleState
-                ) | ErrorKind::Worker(WorkerErrorKind::RunMismatch)
-            )
-    })
 }

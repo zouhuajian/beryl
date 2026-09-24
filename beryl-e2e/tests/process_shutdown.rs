@@ -57,13 +57,12 @@ async fn hold_metadata_http_connection(address: std::net::SocketAddr) -> tokio::
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metadata_signals_before_config_load_exit_cleanly() {
-    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server"));
     for signal in [libc::SIGTERM, libc::SIGINT] {
         let temp = tempfile::TempDir::new().expect("startup signal tempdir");
         let config_path = temp.path().join("startup.yaml");
         let c_path = CString::new(config_path.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-        let child = Command::new(executable)
+        let child = Command::new(env!("CARGO_BIN_EXE_metadata-e2e-server"))
             .arg(&config_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -118,12 +117,9 @@ async fn metadata_signals_before_config_load_exit_cleanly() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metadata_signals_exit_cleanly_and_preserve_visible_data() {
-    let mut cluster = TestCluster::start().await.expect("start cluster");
-    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server"));
-    cluster
-        .start_metadata_process(executable)
+    let mut cluster = TestCluster::start(std::path::Path::new(env!("CARGO_BIN_EXE_metadata-e2e-server")))
         .await
-        .expect("start full Metadata process");
+        .expect("start cluster");
     let client = cluster.client().clone();
     let payload = Bytes::from(deterministic_bytes(1_537));
     client.mkdirs("/process-shutdown").await.expect("create directory");
@@ -144,7 +140,7 @@ async fn metadata_signals_exit_cleanly_and_preserve_visible_data() {
         )
         .await;
         cluster
-            .restart_metadata_process_after_signal(executable, signal)
+            .restart_metadata_process_after_signal(signal)
             .await
             .expect("gracefully restart Metadata process");
         let health_closed = tokio::time::timeout(std::time::Duration::from_secs(2), held_health.message())

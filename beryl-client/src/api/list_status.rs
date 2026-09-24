@@ -9,7 +9,7 @@ use std::vec::IntoIter;
 use super::{FileStatus, ListStatusOptions};
 use crate::api::path::NamespacePathBuf;
 use crate::client_inner::ClientInner;
-use crate::error::{invalid_response, ClientResult};
+use crate::error::{ClientError, ClientResult};
 use crate::metadata::ListStatusPage;
 
 /// Asynchronous iterator over Metadata-authorized statuses in one directory.
@@ -54,28 +54,27 @@ impl ListStatusIterator {
     /// A failed page request leaves the continuation cursor and buffered state
     /// unchanged, so callers may decide whether to invoke `next` again.
     pub async fn next(&mut self) -> ClientResult<Option<FileStatus>> {
-        loop {
-            if let Some(status) = self.buffered.next() {
-                return Ok(Some(status));
-            }
-            if self.cursor.is_none() {
-                return Ok(None);
-            }
-
-            let page = self
-                .inner
-                .metadata
-                .list_status_page(self.path.clone(), self.cursor.clone(), self.options.page_size)
-                .await?;
-            if page.next_cursor == self.cursor {
-                return Err(invalid_response(
-                    "ListStatus",
-                    "non-EOF page did not advance next_cursor",
-                ));
-            }
-
-            self.cursor = page.next_cursor;
-            self.buffered = page.entries.into_iter();
+        if let Some(status) = self.buffered.next() {
+            return Ok(Some(status));
         }
+        if self.cursor.is_none() {
+            return Ok(None);
+        }
+
+        let page = self
+            .inner
+            .metadata
+            .list_status_page(self.path.clone(), self.cursor.clone(), self.options.page_size)
+            .await?;
+        if page.next_cursor == self.cursor {
+            return Err(ClientError::invalid_response(
+                "ListStatus",
+                "non-EOF page did not advance next_cursor",
+            ));
+        }
+
+        self.cursor = page.next_cursor;
+        self.buffered = page.entries.into_iter();
+        Ok(self.buffered.next())
     }
 }

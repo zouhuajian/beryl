@@ -10,7 +10,6 @@
 use beryl_common::header::CallerContextFields;
 use beryl_types::ids::{BlockId, WorkerId};
 use beryl_types::{GroupName, Tier, TierFree, WorkerRunId};
-use std::collections::HashSet;
 
 const WRITE_TIER_ORDER: [Tier; 3] = [Tier::Nvme, Tier::Ssd, Tier::Hdd];
 
@@ -22,23 +21,19 @@ pub enum PlacementOp {
 
 /// Logical capacity and placement policy over Metadata-owned live Worker evidence.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PlacementRequest {
+pub struct PlacementRequest<'a> {
     pub group_name: GroupName,
     pub op: PlacementOp,
     pub block_id: BlockId,
     pub visible_len: u64,
     pub block_size: u32,
     pub caller: Option<CallerContextFields>,
-    pub existing: Vec<ReportedBlockLocation>,
-    pub exclude_workers: Vec<WorkerId>,
-    pub target_replicas: u8,
+    pub existing: &'a [ReportedBlockLocation],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReportedBlockLocation {
     pub tier: Tier,
-    pub group_name: GroupName,
-    pub block_id: BlockId,
     pub durable_len: u64,
     pub worker_id: WorkerId,
     pub worker_run_id: WorkerRunId,
@@ -46,18 +41,11 @@ pub struct ReportedBlockLocation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkerPlacementView {
-    pub group_name: GroupName,
     pub worker_id: WorkerId,
     pub worker_run_id: Option<WorkerRunId>,
     pub endpoint: String,
-    pub worker_net_protocol: i32,
-    pub registered: bool,
     pub lease_valid: bool,
-    pub ip: Option<String>,
     pub host: Option<String>,
-    pub az: Option<String>,
-    pub rack: Option<String>,
-    pub region: Option<String>,
     pub tier_free: Vec<TierFree>,
 }
 
@@ -66,25 +54,21 @@ pub struct PlacementWorker {
     pub worker_id: WorkerId,
     pub worker_run_id: WorkerRunId,
     pub endpoint: String,
-    pub worker_net_protocol: i32,
-    pub tier: Option<Tier>,
+    pub tier: Tier,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlacementStatus {
     Ok,
     NoLiveWorker,
-    NoEligibleWorker,
     NoWritableTier,
     InsufficientCapacity,
     NoLiveReplica,
-    NotEnoughReplicas,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PlacementStats {
     pub live_count: usize,
-    pub group_count: usize,
     pub tier_count: usize,
     pub capacity_count: usize,
     pub max_free_bytes: u64,
@@ -94,8 +78,6 @@ pub struct PlacementStats {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlacementPlan {
-    pub group_name: GroupName,
-    pub op: PlacementOp,
     pub workers: Vec<PlacementWorker>,
     pub status: PlacementStatus,
     pub stats: PlacementStats,
@@ -114,13 +96,12 @@ impl PlacementPlan {
             .map(|tier| tier.to_string())
             .unwrap_or_else(|| "-".to_string());
         format!(
-            "placement failed: status={:?} group={} required={} policy=[{}] live={} group_ok={} tier_ok={} capacity_ok={} max_free={} max_worker={} max_tier={}",
+            "placement failed: status={:?} group={} required={} policy=[{}] live={} tier_ok={} capacity_ok={} max_free={} max_worker={} max_tier={}",
             self.status,
             req.group_name,
             req.block_size,
             write_tier_policy_label(),
             self.stats.live_count,
-            self.stats.group_count,
             self.stats.tier_count,
             self.stats.capacity_count,
             self.stats.max_free_bytes,
@@ -130,86 +111,59 @@ impl PlacementPlan {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PlacementPlanner;
-
-impl PlacementPlanner {
-    /// Select eligible live replicas or writable tiers; local disk versions are Worker-owned.
-    pub fn plan(&self, req: &PlacementRequest, workers: &[WorkerPlacementView]) -> PlacementPlan {
-        match req.op {
-            PlacementOp::Read => choose_read(req, workers),
-            PlacementOp::Write => choose_live_targets(req, workers, req.target_replicas.max(1)),
-        }
+/// Select live replicas for reads or one writable target; local disk versions are Worker-owned.
+pub fn plan_placement(req: &PlacementRequest, workers: &[WorkerPlacementView]) -> PlacementPlan {
+    match req.op {
+        PlacementOp::Read => choose_read(req, workers),
+        PlacementOp::Write => choose_write_target(req, workers),
     }
 }
 
 fn choose_read(req: &PlacementRequest, workers: &[WorkerPlacementView]) -> PlacementPlan {
-    let mut seen = HashSet::new();
     let mut candidates = Vec::new();
-    for location in &req.existing {
-        if location.group_name != req.group_name
-            || location.block_id != req.block_id
-            || location.durable_len < req.visible_len
-            || !seen.insert(location.worker_id)
-        {
+    for location in req.existing {
+        if location.durable_len < req.visible_len {
             continue;
         }
-        let Some(worker) = workers
-            .iter()
-            .find(|worker| worker.group_name == req.group_name && worker.worker_id == location.worker_id)
-        else {
+        let Some(worker) = workers.iter().find(|worker| worker.worker_id == location.worker_id) else {
             continue;
         };
-        if is_live(worker)
+        if worker.lease_valid
             && worker
                 .worker_run_id
                 .is_some_and(|worker_run_id| worker_run_id == location.worker_run_id)
         {
-            candidates.push(worker);
+            candidates.push((worker, location.tier));
         }
     }
-    sort_workers(req, &mut candidates, true);
+    sort_workers(req, &mut candidates);
     let selected = workers_from_views(candidates);
     let status = if selected.is_empty() {
         PlacementStatus::NoLiveReplica
     } else {
         PlacementStatus::Ok
     };
-    plan(req, selected, status)
+    PlacementPlan {
+        workers: selected,
+        status,
+        stats: PlacementStats::default(),
+    }
 }
 
-fn choose_live_targets(req: &PlacementRequest, workers: &[WorkerPlacementView], target_replicas: u8) -> PlacementPlan {
-    let exclude: HashSet<WorkerId> = req.exclude_workers.iter().copied().collect();
+fn choose_write_target(req: &PlacementRequest, workers: &[WorkerPlacementView]) -> PlacementPlan {
     let mut stats = PlacementStats::default();
-    let live_candidates: Vec<_> = workers
-        .iter()
-        .filter(|worker| worker.group_name == req.group_name && is_live(worker))
-        .collect();
+    let live_candidates: Vec<_> = workers.iter().filter(|worker| worker.lease_valid).collect();
     stats.live_count = live_candidates.len();
     if live_candidates.is_empty() {
-        return plan_with_stats(req, Vec::new(), PlacementStatus::NoLiveWorker, stats);
+        return PlacementPlan {
+            workers: Vec::new(),
+            status: PlacementStatus::NoLiveWorker,
+            stats,
+        };
     }
 
-    let group_candidates: Vec<_> = live_candidates
-        .into_iter()
-        .filter(|worker| !exclude.contains(&worker.worker_id))
-        .collect();
-    stats.group_count = group_candidates.len();
-    if group_candidates.is_empty() {
-        return plan_with_stats(req, Vec::new(), PlacementStatus::NoEligibleWorker, stats);
-    }
-
-    choose_write_targets(req, group_candidates, target_replicas, stats)
-}
-
-fn choose_write_targets(
-    req: &PlacementRequest,
-    workers: Vec<&WorkerPlacementView>,
-    target_replicas: u8,
-    mut stats: PlacementStats,
-) -> PlacementPlan {
     let required_len = u64::from(req.block_size);
-    for worker in &workers {
+    for worker in &live_candidates {
         for tier in WRITE_TIER_ORDER {
             if let Some(free_bytes) = tier_free_bytes(worker, tier) {
                 record_max_free(&mut stats, worker.worker_id, Some(tier), free_bytes);
@@ -218,7 +172,7 @@ fn choose_write_targets(
     }
 
     let mut candidates = Vec::new();
-    for worker in workers {
+    for worker in live_candidates {
         let mut has_persistent_tier = false;
         for tier in WRITE_TIER_ORDER {
             let Some(free_bytes) = tier_free_bytes(worker, tier) else {
@@ -236,46 +190,29 @@ fn choose_write_targets(
     }
 
     if stats.tier_count == 0 {
-        return plan_with_stats(req, Vec::new(), PlacementStatus::NoWritableTier, stats);
+        return PlacementPlan {
+            workers: Vec::new(),
+            status: PlacementStatus::NoWritableTier,
+            stats,
+        };
     }
 
     stats.capacity_count = candidates.len();
-    sort_write_candidates(req, &mut candidates, true);
+    sort_write_candidates(req, &mut candidates);
     if candidates.is_empty() {
-        return plan_with_stats(req, Vec::new(), PlacementStatus::InsufficientCapacity, stats);
+        return PlacementPlan {
+            workers: Vec::new(),
+            status: PlacementStatus::InsufficientCapacity,
+            stats,
+        };
     }
 
-    let target = usize::from(target_replicas.max(1));
-    let mut seen = HashSet::new();
-    let mut selected = Vec::with_capacity(target);
-    for (worker, tier) in candidates {
-        if !seen.insert(worker.worker_id) {
-            continue;
-        }
-        if let Some(worker_run_id) = worker.worker_run_id {
-            selected.push(PlacementWorker {
-                worker_id: worker.worker_id,
-                worker_run_id,
-                endpoint: worker.endpoint.clone(),
-                worker_net_protocol: worker.worker_net_protocol,
-                tier: Some(tier),
-            });
-        }
-        if selected.len() == target {
-            break;
-        }
+    candidates.truncate(1);
+    PlacementPlan {
+        workers: workers_from_views(candidates),
+        status: PlacementStatus::Ok,
+        stats,
     }
-
-    let status = if selected.len() < target {
-        PlacementStatus::NotEnoughReplicas
-    } else {
-        PlacementStatus::Ok
-    };
-    plan_with_stats(req, selected, status, stats)
-}
-
-fn is_live(worker: &WorkerPlacementView) -> bool {
-    worker.registered && worker.lease_valid && worker.worker_run_id.is_some()
 }
 
 fn tier_free_bytes(worker: &WorkerPlacementView, tier: Tier) -> Option<u64> {
@@ -295,16 +232,13 @@ fn record_max_free(stats: &mut PlacementStats, worker_id: WorkerId, tier: Option
     }
 }
 
-fn sort_workers(req: &PlacementRequest, workers: &mut Vec<&WorkerPlacementView>, use_locality: bool) {
-    workers.sort_by_key(|worker| {
-        let locality = if use_locality {
-            req.caller
-                .as_ref()
-                .map(|caller| locality_rank(caller, worker))
-                .unwrap_or(0)
-        } else {
-            0
-        };
+fn sort_workers(req: &PlacementRequest, workers: &mut [(&WorkerPlacementView, Tier)]) {
+    workers.sort_by_key(|(worker, _)| {
+        let locality = req
+            .caller
+            .as_ref()
+            .map(|caller| locality_rank(caller, worker))
+            .unwrap_or(0);
         (
             locality,
             stable_order(&req.group_name, req.block_id, worker.worker_id),
@@ -313,20 +247,13 @@ fn sort_workers(req: &PlacementRequest, workers: &mut Vec<&WorkerPlacementView>,
     });
 }
 
-fn sort_write_candidates(
-    req: &PlacementRequest,
-    candidates: &mut Vec<(&WorkerPlacementView, Tier)>,
-    use_locality: bool,
-) {
+fn sort_write_candidates(req: &PlacementRequest, candidates: &mut [(&WorkerPlacementView, Tier)]) {
     candidates.sort_by_key(|(worker, tier)| {
-        let locality = if use_locality {
-            req.caller
-                .as_ref()
-                .map(|caller| locality_rank(caller, worker))
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        let locality = req
+            .caller
+            .as_ref()
+            .map(|caller| locality_rank(caller, worker))
+            .unwrap_or(0);
         (
             write_tier_rank(*tier),
             locality,
@@ -336,51 +263,25 @@ fn sort_write_candidates(
     });
 }
 
-fn workers_from_views(workers: Vec<&WorkerPlacementView>) -> Vec<PlacementWorker> {
+fn workers_from_views(workers: Vec<(&WorkerPlacementView, Tier)>) -> Vec<PlacementWorker> {
     workers
         .into_iter()
-        .filter_map(|worker| {
-            worker.worker_run_id.map(|worker_run_id| PlacementWorker {
-                worker_id: worker.worker_id,
-                worker_run_id,
-                endpoint: worker.endpoint.clone(),
-                worker_net_protocol: worker.worker_net_protocol,
-                tier: None,
-            })
+        .map(|(worker, tier)| PlacementWorker {
+            worker_id: worker.worker_id,
+            worker_run_id: worker
+                .worker_run_id
+                .expect("live placement candidates have a registered run"),
+            endpoint: worker.endpoint.clone(),
+            tier,
         })
         .collect()
 }
 
-fn plan(req: &PlacementRequest, workers: Vec<PlacementWorker>, status: PlacementStatus) -> PlacementPlan {
-    plan_with_stats(req, workers, status, PlacementStats::default())
-}
-
-fn plan_with_stats(
-    req: &PlacementRequest,
-    workers: Vec<PlacementWorker>,
-    status: PlacementStatus,
-    stats: PlacementStats,
-) -> PlacementPlan {
-    PlacementPlan {
-        group_name: req.group_name.clone(),
-        op: req.op,
-        workers,
-        status,
-        stats,
-    }
-}
-
 fn locality_rank(caller: &CallerContextFields, worker: &WorkerPlacementView) -> u8 {
-    if matches_pair(caller.host(), &worker.host) || matches_pair(caller.ip(), &worker.ip) {
+    if matches_pair(caller.host(), &worker.host) || matches_pair(caller.ip(), &worker.host) {
         0
-    } else if matches_pair(caller.az(), &worker.az) {
-        1
-    } else if matches_pair(caller.rack(), &worker.rack) {
-        2
-    } else if matches_pair(caller.region(), &worker.region) {
-        3
     } else {
-        4
+        1
     }
 }
 
@@ -420,4 +321,102 @@ fn write_tier_rank(tier: Tier) -> u8 {
 
 fn write_tier_policy_label() -> &'static str {
     "NVME,SSD,HDD"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beryl_common::header::CallerContextFields;
+    use beryl_types::ids::{BlockId, BlockIndex, InodeId, WorkerId};
+    use beryl_types::{GroupName, Tier, TierFree, WorkerRunId};
+
+    fn run_id(suffix: u32) -> WorkerRunId {
+        format!("550e8400-e29b-41d4-a716-{suffix:012}")
+            .parse()
+            .expect("valid worker run id")
+    }
+
+    fn block(inode_id: u64, index: u32) -> BlockId {
+        BlockId::new(InodeId::new(inode_id), BlockIndex::new(index))
+    }
+
+    fn group_name(raw: &str) -> GroupName {
+        GroupName::parse(raw).unwrap()
+    }
+
+    fn worker(worker_id: u64, worker_run_id: WorkerRunId, host: &str) -> WorkerPlacementView {
+        WorkerPlacementView {
+            worker_id: WorkerId::new(worker_id),
+            worker_run_id: Some(worker_run_id),
+            endpoint: format!("{host}:19101"),
+            lease_valid: true,
+            host: Some(host.to_string()),
+            tier_free: vec![TierFree {
+                tier: Tier::Hdd,
+                free_bytes: 4096,
+            }],
+        }
+    }
+
+    fn request(group_name: &GroupName, op: PlacementOp, block_id: BlockId) -> PlacementRequest<'_> {
+        let block_size = 4096;
+        PlacementRequest {
+            group_name: group_name.clone(),
+            op,
+            block_id,
+            visible_len: 64,
+            block_size,
+            caller: None,
+            existing: &[],
+        }
+    }
+
+    #[test]
+    fn write_uses_single_replica_and_prefers_caller_locality() {
+        let group = group_name("g10");
+        let block_id = block(66, 0);
+        let mut req = request(&group, PlacementOp::Write, block_id);
+        req.caller = Some(CallerContextFields::parse("host=host-b"));
+        let workers = vec![worker(1, run_id(21), "host-a"), worker(2, run_id(22), "host-b")];
+
+        let plan = plan_placement(&req, &workers);
+
+        assert_eq!(plan.status, PlacementStatus::Ok);
+        assert_eq!(
+            plan.workers.iter().map(|w| w.worker_id).collect::<Vec<_>>(),
+            vec![WorkerId::new(2)]
+        );
+        assert_eq!(plan.workers[0].tier, Tier::Hdd);
+    }
+
+    #[test]
+    fn read_retains_reported_tier_when_another_tier_has_free_space() {
+        let group = group_name("g10");
+        let block_id = block(66, 0);
+        let mut req = request(&group, PlacementOp::Read, block_id);
+        let mut live_worker = worker(1, run_id(21), "host-a");
+        live_worker.tier_free.push(TierFree {
+            tier: Tier::Ssd,
+            free_bytes: 0,
+        });
+        let workers = vec![live_worker];
+        let reported = [ReportedBlockLocation {
+            durable_len: req.visible_len,
+            worker_id: WorkerId::new(1),
+            worker_run_id: run_id(21),
+            tier: Tier::Ssd,
+        }];
+        req.existing = &reported;
+
+        let plan = plan_placement(&req, &workers);
+
+        assert_eq!(plan.status, PlacementStatus::Ok);
+        assert_eq!(
+            plan.workers
+                .iter()
+                .map(|worker| (worker.worker_id, worker.tier))
+                .collect::<Vec<_>>(),
+            vec![(WorkerId::new(1), Tier::Ssd)]
+        );
+    }
 }

@@ -116,9 +116,6 @@ impl ClientErrorKind {
 pub(crate) struct RefreshHint {
     pub(crate) leader_endpoint: Option<String>,
     pub(crate) group_name: Option<GroupName>,
-    pub(crate) mount_prefix: Option<String>,
-    pub(crate) route_epoch: Option<u64>,
-    pub(crate) mount_epoch: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -146,7 +143,6 @@ pub struct ClientError {
     call_id: Option<CallId>,
     outcome_unknown: bool,
     invalid_success_response: bool,
-    retry_after: Option<Duration>,
     message: String,
     detail: FailureDetail,
 }
@@ -159,7 +155,6 @@ impl ClientError {
             call_id: None,
             outcome_unknown: false,
             invalid_success_response: false,
-            retry_after: None,
             message: message.into(),
             detail: FailureDetail::Local,
         }
@@ -187,7 +182,15 @@ impl ClientError {
 
     /// Returns a validated server retry delay hint, when one was supplied.
     pub const fn retry_after(&self) -> Option<Duration> {
-        self.retry_after
+        match &self.detail {
+            FailureDetail::Remote { rpc_error, .. } => match rpc_error.recovery {
+                RecoveryAction::Retry {
+                    after_ms: Some(after_ms),
+                } => Some(Duration::from_millis(after_ms)),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Returns the diagnostic message without requiring callers to parse Display output.
@@ -286,17 +289,12 @@ impl ClientError {
 
     /// Preserves validated server recovery evidence for internal retry decisions.
     pub(crate) fn from_remote(rpc_error: RpcErrorDetail, hint: RefreshHint) -> Self {
-        let retry_after = match &rpc_error.recovery {
-            RecoveryAction::Retry { after_ms } => after_ms.map(Duration::from_millis),
-            _ => None,
-        };
         Self {
             kind: client_kind_from_rpc(rpc_error.kind),
             operation: None,
             call_id: None,
             outcome_unknown: false,
             invalid_success_response: false,
-            retry_after,
             message: rpc_error.message.clone(),
             detail: FailureDetail::Remote {
                 rpc_error: Box::new(rpc_error),
@@ -417,20 +415,11 @@ pub(crate) fn side_effect_response_body_mismatch(operation: &'static str, detail
     error
 }
 
-pub(crate) fn invalid_response(operation: &'static str, reason: impl Into<String>) -> ClientError {
-    ClientError::invalid_response(operation, reason)
-}
-
 impl From<CommonError> for ClientError {
     fn from(error: CommonError) -> Self {
         let kind = match error.kind {
-            CommonErrorKind::Timeout => ClientErrorKind::Timeout,
-            CommonErrorKind::Overloaded => ClientErrorKind::ResourceExhausted,
-            CommonErrorKind::NotFound => ClientErrorKind::NotFound,
-            CommonErrorKind::PermissionDenied => ClientErrorKind::PermissionDenied,
             CommonErrorKind::InvalidArgument => ClientErrorKind::InvalidArgument,
             CommonErrorKind::Io => ClientErrorKind::Io,
-            CommonErrorKind::Internal => ClientErrorKind::Internal,
         };
         Self::local(kind, error.to_string())
     }
@@ -467,7 +456,6 @@ impl From<Status> for ClientError {
             call_id: None,
             outcome_unknown: false,
             invalid_success_response: false,
-            retry_after: None,
             message: format!("transport status {:?}: {}", status.code(), status.message()),
             detail: FailureDetail::Transport {
                 code: status.code(),
@@ -488,14 +476,12 @@ fn client_kind_from_rpc(kind: ErrorKind) -> ClientErrorKind {
             MetadataErrorKind::CrossMountRename => ClientErrorKind::CrossMount,
             MetadataErrorKind::Busy => ClientErrorKind::Busy,
             MetadataErrorKind::Conflict => ClientErrorKind::Conflict,
-            MetadataErrorKind::Fencing | MetadataErrorKind::EpochMismatch => ClientErrorKind::Fenced,
+            MetadataErrorKind::Fencing => ClientErrorKind::Fenced,
             MetadataErrorKind::SessionInvalid => ClientErrorKind::SessionInvalid,
             MetadataErrorKind::SessionExpired => ClientErrorKind::SessionExpired,
             MetadataErrorKind::ResourceExhausted => ClientErrorKind::ResourceExhausted,
             MetadataErrorKind::NotLeader
             | MetadataErrorKind::StaleState
-            | MetadataErrorKind::MountEpochMismatch
-            | MetadataErrorKind::RouteEpochMismatch
             | MetadataErrorKind::OwnerGroupMismatch
             | MetadataErrorKind::GroupMismatch => ClientErrorKind::Unavailable,
         },
@@ -506,7 +492,6 @@ fn client_kind_from_rpc(kind: ErrorKind) -> ClientErrorKind {
             WorkerErrorKind::Io => ClientErrorKind::Io,
             WorkerErrorKind::Corrupt => ClientErrorKind::CorruptData,
             WorkerErrorKind::Fencing => ClientErrorKind::Fenced,
-            WorkerErrorKind::Conflict => ClientErrorKind::Conflict,
             WorkerErrorKind::NotFound => ClientErrorKind::NotFound,
             WorkerErrorKind::NotRegistered
             | WorkerErrorKind::RunMismatch
@@ -520,18 +505,23 @@ fn client_kind_from_rpc(kind: ErrorKind) -> ClientErrorKind {
             ProtocolErrorKind::InvalidArgument => ClientErrorKind::InvalidArgument,
             ProtocolErrorKind::PermissionDenied => ClientErrorKind::PermissionDenied,
             ProtocolErrorKind::Unsupported => ClientErrorKind::Unsupported,
-            ProtocolErrorKind::Cancelled => ClientErrorKind::Cancelled,
-            ProtocolErrorKind::Corrupt => ClientErrorKind::CorruptData,
         },
         ErrorKind::Internal(kind) => match kind {
             InternalErrorKind::NodeUnavailable => ClientErrorKind::Unavailable,
-            InternalErrorKind::Timeout => ClientErrorKind::Timeout,
-            InternalErrorKind::ResourceExhausted => ClientErrorKind::ResourceExhausted,
-            InternalErrorKind::Cancelled => ClientErrorKind::Cancelled,
-            InternalErrorKind::Corrupt => ClientErrorKind::CorruptData,
             InternalErrorKind::Internal => ClientErrorKind::Internal,
         },
     }
+}
+
+/// Extracts the validated recovery hints used by both Metadata and Worker retries.
+pub(crate) fn refresh_hint_from_error(error: &ClientError) -> RefreshHint {
+    error.refresh_hint().cloned().unwrap_or_default()
+}
+
+pub(crate) fn timeout_error(target_plane: &str, operation: &str) -> ClientError {
+    ClientError::from(tonic::Status::deadline_exceeded(format!(
+        "{target_plane} {operation} exceeded the public operation deadline"
+    )))
 }
 
 #[cfg(test)]

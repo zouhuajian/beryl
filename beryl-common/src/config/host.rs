@@ -9,7 +9,7 @@ use crate::error::{CommonError, CommonErrorKind};
 
 /// Validate a host or IP that will be published to other processes.
 pub fn validate_public_host(key: &str, host: &str) -> Result<(), CommonError> {
-    if host.is_empty() || host != host.trim() || host.chars().any(char::is_whitespace) {
+    if host.is_empty() || host.chars().any(char::is_whitespace) {
         return Err(invalid_config(key, "must be a host or IP without whitespace"));
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -19,7 +19,7 @@ pub fn validate_public_host(key: &str, host: &str) -> Result<(), CommonError> {
             Ok(())
         };
     }
-    if host.contains("://") || host.contains([':', '/', '\\']) {
+    if host.contains([':', '/', '\\']) {
         return Err(invalid_config(key, "must not include a scheme, port, or path"));
     }
     Ok(())

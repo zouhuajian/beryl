@@ -41,40 +41,18 @@ message HeartbeatRequestProto {
   common.EndpointProto advertised_endpoint = 5;
   /// Capacity information.
   CapacityInfoProto capacity = 6;
-  /// Load information.
-  LoadInfoProto load = 7;
-  /// Health status.
-  HealthStatusProto health = 8;
+  reserved 7, 8;
+  reserved "load", "health";
 }
 
 message CapacityInfoProto {
-  /// Total capacity in bytes.
-  uint64 total_bytes = 1;
-  /// Used capacity in bytes.
-  uint64 used_bytes = 2;
-  /// Available capacity in bytes.
-  uint64 available_bytes = 3;
   /// Largest writable free bytes currently available for one new block on each tier.
-  repeated TierFreeProto tier_free = 4;
+  repeated TierFreeProto tier_free = 1;
 }
 
 message TierFreeProto {
   common.TierProto tier = 1;
   uint64 free_bytes = 2;
-}
-
-message LoadInfoProto {
-  /// Number of active read operations.
-  uint32 active_reads = 1;
-  /// Number of active write operations.
-  uint32 active_writes = 2;
-}
-
-enum HealthStatusProto {
-  HEALTH_STATUS_UNSPECIFIED = 0;
-  HEALTH_STATUS_HEALTHY = 1;
-  HEALTH_STATUS_DEGRADED = 2;
-  HEALTH_STATUS_UNHEALTHY = 3;
 }
 
 message HeartbeatResponseProto {
@@ -85,13 +63,9 @@ message HeartbeatResponseProto {
   string accepted_worker_run_id = 3;
   /// Local liveness timeout used by metadata for this worker run.
   uint32 liveness_timeout_ms = 4;
-  /// Bounded, retryable cleanup commands for this accepted worker run.
-  repeated BlockCleanupCommandProto cleanup_commands = 5;
-}
-
-/// Requests deletion of one exact worker-local Ready block.
-message BlockCleanupCommandProto {
-  common.BlockIdProto block_id = 1;
+  /// Bounded, retryable deletion targets for exact worker-local Ready blocks
+  /// belonging to this accepted worker run.
+  repeated common.BlockIdProto cleanup_commands = 5;
 }
 
 // ============================================================================

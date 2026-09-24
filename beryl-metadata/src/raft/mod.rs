@@ -21,7 +21,7 @@ pub(crate) use command::{
     MAX_RECLAIM_DETACHED_ROOT_ENTRIES, MIN_RECLAIM_DETACHED_ROOT_BATCH_BYTES,
 };
 pub(crate) use node::AppRaftNode;
-pub(crate) use read_view::{MetadataReadView, RoutingDelta};
+pub(crate) use read_view::MetadataReadView;
 pub(crate) use response::{ApplySuccess, DetachedRootReclaimResult};
 pub(crate) use state_machine::AppRaftStateMachine;
 pub(crate) use storage::{RocksDBStorage, StorageIdentity};

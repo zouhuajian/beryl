@@ -16,13 +16,6 @@ import "common/errors.proto";
 message TraceContextProto {
   /// W3C Trace Context: traceparent header value.
   optional string traceparent = 1;
-
-  /// W3C Trace Context: tracestate header value.
-  optional string tracestate = 2;
-
-  /// W3C baggage header value.
-  /// Do not carry secrets, credentials, auth tokens, cookies, or raw user IDs.
-  optional string baggage = 3;
 }
 
 // ============================================================================
@@ -60,30 +53,18 @@ message RequestHeaderProto {
   /// Stable metadata group name for metadata-plane routing.
   string group_name = 3;
 
-  /// Mount epoch for FS write operations.
-  /// Client should provide the mount_epoch it knows for the mount being accessed.
-  /// Server validates this against current mount.mount_epoch and returns NEED_REFRESH if mismatch.
-  /// Optional: if not provided, server skips mount_epoch validation for calls without a known mount epoch.
-  optional uint64 mount_epoch = 4;
-
-  /// Client-required metadata state-machine applied watermarks.
-  /// Each entry is scoped by metadata Raft owner group. A follower may serve a
-  /// gated read only after its local applied state for the requested group has
-  /// reached the requested GroupStateWatermark.state_id. Empty means no state
-  /// freshness requirement.
-  repeated GroupStateWatermarkProto state = 5;
-
-  /// Optional route epoch observed by client.
-  /// Used by FileSystemService layout/write-session APIs for refresh+replay loops.
-  optional uint64 route_epoch = 6;
+  /// Client-required metadata state-machine applied watermark for one group.
+  /// A follower may serve a gated read only after its local applied state for
+  /// that group has reached state_id. Absent means no freshness requirement.
+  optional GroupStateWatermarkProto state = 4;
 
   /// Absolute deadline (Unix epoch milliseconds).
   /// For gRPC, grpc-timeout should be authoritative; this is the cross-transport shared wire form.
-  int64 deadline_ms = 7;
+  int64 deadline_ms = 5;
 
   /// Optional caller context for auditing/diagnostics.
   /// This is NOT a generic extension point for protocol-critical fields.
-  CallerContextProto caller_context = 8;
+  CallerContextProto caller_context = 6;
 
 }
 
@@ -114,7 +95,7 @@ message RaftLogIdProto {
 ///
 /// group_name identifies the metadata Raft owner group. state_id is that group's
 /// state-machine applied RaftLogId. It is not a committed index, append index,
-/// private apply counter, route_epoch, mount_epoch, or call_id.
+/// private apply counter, or call_id.
 message GroupStateWatermarkProto {
   /// State-machine applied RaftLogId for this group.
   RaftLogIdProto state_id = 1;
@@ -142,21 +123,12 @@ message ResponseHeaderProto {
   optional ErrorDetailProto error = 2;
 
   /// Server-authorized client state cache update.
-  /// Leaders and msync may return one or more applied watermarks. Follower
-  /// successful responses must return this field empty. Empty means "do not
+  /// Leaders and msync may return one applied watermark. Follower
+  /// successful responses must leave this field absent. Absent means "do not
   /// update client state cache"; stale-state is expressed only through the
   /// RPC stale-state error.
-  repeated GroupStateWatermarkProto state = 3;
-
-  /// Mount epoch returned by server (for FS operations).
-  /// Server fills this with the current mount.mount_epoch so client can update its cache.
-  /// Only set for FS operations that access a mount.
-  optional uint64 mount_epoch = 4;
-
-  /// Route epoch returned by server (for FS route/layout operations).
-  /// Server should fill this with authoritative layout version when available.
-  optional uint64 route_epoch = 5;
+  optional GroupStateWatermarkProto state = 3;
 
   /// Stable metadata group name that processed this request.
-  string group_name = 6;
+  string group_name = 4;
 }

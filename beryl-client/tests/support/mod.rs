@@ -64,9 +64,7 @@ impl<T> MetadataReply<T> {
 
 #[derive(Default)]
 pub(crate) struct ResponseAuthority {
-    pub(crate) state: Vec<GroupStateWatermarkProto>,
-    pub(crate) mount_epoch: Option<u64>,
-    pub(crate) route_epoch: Option<u64>,
+    pub(crate) state: Option<GroupStateWatermarkProto>,
 }
 
 #[derive(Default)]
@@ -148,7 +146,7 @@ impl MockMetadata {
         });
         RunningServer {
             endpoint,
-            shutdown: Some(shutdown),
+            shutdown,
             task,
         }
     }
@@ -174,8 +172,6 @@ fn response_header(
         client: request.client.clone(),
         error: error.as_ref().map(rpc_error_to_proto),
         state: authority.state,
-        mount_epoch: authority.mount_epoch,
-        route_epoch: authority.route_epoch,
         group_name: request.group_name.clone(),
     }
 }
@@ -466,7 +462,7 @@ pub(crate) enum ReadReply {
         started: oneshot::Sender<()>,
         release: oneshot::Receiver<()>,
     },
-    RefreshMetadata,
+    RefreshMetadata(WorkerErrorKind),
     BlockedRefresh {
         started: oneshot::Sender<()>,
         release: oneshot::Receiver<()>,
@@ -500,7 +496,6 @@ pub(crate) struct MockWorker {
 
 struct WorkerState {
     script: Mutex<WorkerScript>,
-    read_calls: AtomicUsize,
     read_requests: Mutex<Vec<ReadBlockRequestProto>>,
     write_calls: AtomicUsize,
     write_data_frames: AtomicUsize,
@@ -514,7 +509,6 @@ impl MockWorker {
         Self {
             state: Arc::new(WorkerState {
                 script: Mutex::new(script),
-                read_calls: AtomicUsize::new(0),
                 read_requests: Mutex::new(Vec::new()),
                 write_calls: AtomicUsize::new(0),
                 write_data_frames: AtomicUsize::new(0),
@@ -526,7 +520,7 @@ impl MockWorker {
     }
 
     pub(crate) fn read_calls(&self) -> usize {
-        self.state.read_calls.load(Ordering::SeqCst)
+        self.state.read_requests.lock().expect("read requests").len()
     }
 
     pub(crate) fn read_requests(&self) -> Vec<ReadBlockRequestProto> {
@@ -577,7 +571,7 @@ impl MockWorker {
         });
         RunningServer {
             endpoint,
-            shutdown: Some(shutdown),
+            shutdown,
             task,
         }
     }
@@ -593,7 +587,6 @@ impl WorkerDataService for MockWorker {
         &self,
         request: Request<ReadBlockRequestProto>,
     ) -> Result<Response<Self::ReadBlockStream>, Status> {
-        self.state.read_calls.fetch_add(1, Ordering::SeqCst);
         let request = request.into_inner();
         self.state
             .read_requests
@@ -641,11 +634,14 @@ impl WorkerDataService for MockWorker {
                     futures::stream::iter([Ok(ReadBlockChunkProto { data })]).chain(end),
                 )))
             }
-            ReadReply::RefreshMetadata => Err(worker_refresh_status(request.header.as_ref())),
+            ReadReply::RefreshMetadata(kind) => Err(worker_refresh_status(request.header.as_ref(), kind)),
             ReadReply::BlockedRefresh { started, release } => {
                 let _ = started.send(());
                 release.await.map_err(|_| Status::cancelled("read gate dropped"))?;
-                Err(worker_refresh_status(request.header.as_ref()))
+                Err(worker_refresh_status(
+                    request.header.as_ref(),
+                    WorkerErrorKind::RunMismatch,
+                ))
             }
         }
     }
@@ -760,14 +756,14 @@ impl WorkerDataService for MockWorker {
     }
 }
 
-fn worker_refresh_status(header: Option<&beryl_proto::worker::DataRequestHeaderProto>) -> Status {
+fn worker_refresh_status(
+    header: Option<&beryl_proto::worker::DataRequestHeaderProto>,
+    kind: WorkerErrorKind,
+) -> Status {
     let error = RpcErrorDetail::refresh_metadata(
-        ErrorKind::Worker(WorkerErrorKind::RunMismatch),
-        RefreshHint {
-            worker_resolve_required: true,
-            ..RefreshHint::default()
-        },
-        "scripted Worker run mismatch",
+        ErrorKind::Worker(kind),
+        RefreshHint::default(),
+        "scripted stale Worker location",
     );
     let response = DataResponseHeaderProto {
         client: header.and_then(|header| header.client.clone()),
@@ -790,7 +786,7 @@ fn worker_refresh_status(header: Option<&beryl_proto::worker::DataRequestHeaderP
 
 pub(crate) struct RunningServer {
     endpoint: String,
-    shutdown: Option<oneshot::Sender<()>>,
+    shutdown: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
 }
 
@@ -799,10 +795,8 @@ impl RunningServer {
         &self.endpoint
     }
 
-    pub(crate) async fn shutdown(mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
+    pub(crate) async fn shutdown(self) {
+        let _ = self.shutdown.send(());
         self.task
             .await
             .expect("mock server task")

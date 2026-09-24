@@ -5,11 +5,10 @@
 
 use crate::config::MetadataConfig;
 use crate::error::{MetadataError, MetadataResult};
-use crate::mount::{DataIoPolicy, MountEntry, MountKind, MountTable, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
+use crate::mount::{MountEntry, MountTable, ROOT_INODE_ID};
 use crate::raft::{AppRaftNode, AppRaftStateMachine, ApplySuccess, Command, RocksDBStorage, StorageIdentity};
-use crate::readiness::{wait_for_root_ready_with_inputs, RootReadinessGate, RootReadinessLogFields, RootReadyInputs};
-use beryl_types::ids::{ClientId, MountId};
-use beryl_types::{CallId, GroupName};
+use beryl_types::ids::MountId;
+use beryl_types::GroupName;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,7 +17,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 const METADATA_MARKER_FILE: &str = "metadata.marker.json";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -38,8 +37,6 @@ pub struct MetadataStorageMarker {
     pub format_version: u32,
     pub created_at_ms: u64,
     pub software_version: String,
-    pub bootstrap_client_id: String,
-    pub bootstrap_call_id: String,
     pub bootstrap_proposed_at_ms: u64,
 }
 
@@ -63,7 +60,7 @@ pub async fn format_metadata_storage(config: &MetadataConfig) -> MetadataResult<
     let storage = Arc::new(RocksDBStorage::create_for_format(&config.storage_dir)?);
     storage.bind_storage_identity(&storage_identity(&marker))?;
     let mount_table = Arc::new(MountTable::load_from_storage(storage.as_ref())?);
-    let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
+    let state_machine = AppRaftStateMachine::new(Arc::clone(&storage));
     let raft_node = Arc::new(
         AppRaftNode::new(
             config.raft.node_id,
@@ -75,7 +72,7 @@ pub async fn format_metadata_storage(config: &MetadataConfig) -> MetadataResult<
     );
 
     raft_node.initialize_single_node(config.rpc_address()).await?;
-    wait_for_single_node_leader(&raft_node, config.startup.root_readiness.timeout_ms).await?;
+    wait_for_single_node_leader(&raft_node, config.startup.timeout_ms).await?;
 
     let group_name = config.authority.group_name.clone();
     let bootstrap_result = raft_node
@@ -85,21 +82,6 @@ pub async fn format_metadata_storage(config: &MetadataConfig) -> MetadataResult<
         })
         .await?;
     require_bootstrap_namespace_success(bootstrap_result, &group_name)?;
-    wait_for_root_ready_with_inputs(RootReadyInputs {
-        raft_node: Arc::clone(&raft_node),
-        mount_table: Arc::clone(&mount_table),
-        storage: Some(Arc::clone(&storage)),
-        namespace_owner_group_name: group_name.clone(),
-        readiness_gate: Arc::new(RootReadinessGate::new(None)),
-        config: config.startup.root_readiness.clone(),
-        log_fields: RootReadinessLogFields {
-            cluster_id: config.cluster_id.clone(),
-            group_name: group_name.to_string(),
-            node_id: config.raft.node_id,
-            storage_dir: config.storage_dir.display().to_string(),
-        },
-    })
-    .await?;
     verify_root(&storage, &mount_table, &marker.group_name)?;
     raft_node.shutdown().await?;
     marker.state = FormatState::Ready;
@@ -107,7 +89,8 @@ pub async fn format_metadata_storage(config: &MetadataConfig) -> MetadataResult<
     Ok(marker)
 }
 
-pub async fn prepare_metadata_start(config: &MetadataConfig) -> MetadataResult<()> {
+/// Open and validate the storage retained for the entire metadata runtime.
+pub(crate) fn open_metadata_storage(config: &MetadataConfig) -> MetadataResult<(RocksDBStorage, MountTable)> {
     validate_format_config(config)?;
     let marker_path = metadata_marker_path(config);
     if !marker_path.exists() {
@@ -130,8 +113,7 @@ pub async fn prepare_metadata_start(config: &MetadataConfig) -> MetadataResult<(
     validate_persisted_rpc_address(config, &storage)?;
     let mount_table = MountTable::load_from_storage(&storage)?;
     verify_root(&storage, &mount_table, &marker.group_name)?;
-    storage.cleanup_unreferenced_generations()?;
-    Ok(())
+    Ok((storage, mount_table))
 }
 
 /// Keeps the configured public RPC address bound to the durable Raft identity.
@@ -170,8 +152,6 @@ fn storage_identity(marker: &MetadataStorageMarker) -> StorageIdentity {
         cluster_id: marker.cluster_id.clone(),
         group_name: marker.group_name.clone(),
         node_id: marker.node_id,
-        bootstrap_client_id: marker.bootstrap_client_id.clone(),
-        bootstrap_call_id: marker.bootstrap_call_id.clone(),
         bootstrap_proposed_at_ms: marker.bootstrap_proposed_at_ms,
     }
 }
@@ -262,12 +242,6 @@ fn validate_marker(config: &MetadataConfig, marker: &MetadataStorageMarker) -> M
             "metadata marker storage_uuid must not be empty".to_string(),
         ));
     }
-    ClientId::parse(&marker.bootstrap_client_id).map_err(|error| {
-        MetadataError::InvalidArgument(format!("metadata marker bootstrap_client_id is invalid: {error}"))
-    })?;
-    CallId::parse(&marker.bootstrap_call_id).map_err(|error| {
-        MetadataError::InvalidArgument(format!("metadata marker bootstrap_call_id is invalid: {error}"))
-    })?;
     if marker.bootstrap_proposed_at_ms == 0 {
         return Err(MetadataError::InvalidArgument(
             "metadata marker bootstrap_proposed_at_ms must be greater than zero".to_string(),
@@ -306,8 +280,6 @@ fn prepare_format_marker(
         format_version: FORMAT_VERSION,
         created_at_ms: proposed_at_ms,
         software_version: env!("CARGO_PKG_VERSION").to_string(),
-        bootstrap_client_id: ClientId::generate().as_raw().to_string(),
-        bootstrap_call_id: CallId::new().to_string(),
         bootstrap_proposed_at_ms: proposed_at_ms,
     })
 }
@@ -455,9 +427,7 @@ fn sync_parent_directory(path: &std::path::Path) -> MetadataResult<()> {
 
 fn verify_root(storage: &RocksDBStorage, mount_table: &MountTable, group_name: &GroupName) -> MetadataResult<()> {
     let root = mount_table
-        .list_mounts()
-        .into_iter()
-        .find(|entry| entry.mount_prefix == ROOT_MOUNT_PREFIX)
+        .root()
         .ok_or_else(|| MetadataError::ServiceUnavailable("root mount missing after metadata format".to_string()))?;
     if !root_mount_matches_bootstrap_contract(&root, group_name) {
         return Err(MetadataError::InvalidArgument(
@@ -467,11 +437,7 @@ fn verify_root(storage: &RocksDBStorage, mount_table: &MountTable, group_name: &
     let inode = storage
         .get_inode(ROOT_INODE_ID)?
         .ok_or_else(|| MetadataError::ServiceUnavailable("root inode missing after metadata format".to_string()))?;
-    if inode.inode_id != ROOT_INODE_ID
-        || !inode.file_type().is_dir()
-        || !matches!(inode.kind, crate::inode::InodeKind::Dir)
-        || inode.mount_id != root.mount_id
-    {
+    if inode.inode_id != ROOT_INODE_ID || !inode.file_type().is_dir() || inode.mount_id != root.mount_id {
         return Err(MetadataError::InvalidArgument(
             "root inode exists but violates bootstrap invariants".to_string(),
         ));
@@ -497,12 +463,7 @@ fn require_bootstrap_namespace_success(result: ApplySuccess, group_name: &GroupN
 /// Check the immutable identity and shape of the internal writable root mount.
 fn root_mount_matches_bootstrap_contract(root: &MountEntry, group_name: &GroupName) -> bool {
     root.root_inode_id == ROOT_INODE_ID
-        && root.mount_kind == MountKind::Internal
-        && root.ufs_uri.is_none()
-        && root.data_io_policy == DataIoPolicy::Allow
         && root.mount_id == MountId::new(1)
-        && root.mount_prefix == ROOT_MOUNT_PREFIX
-        && root.mount_epoch == 1
         && root.namespace_owner_group_name == *group_name
 }
 
@@ -515,7 +476,7 @@ async fn wait_for_single_node_leader(raft_node: &AppRaftNode, timeout_ms: u64) -
         sleep(Duration::from_millis(20)).await;
     }
     Err(MetadataError::ServiceUnavailable(
-        "single-node raft did not become leader before readiness timeout".to_string(),
+        "single-node raft did not become leader before the format election timeout".to_string(),
     ))
 }
 
@@ -560,43 +521,47 @@ mod tests {
         let config = lifecycle_config(&dir);
         format_metadata_storage(&config).await.unwrap();
 
-        prepare_metadata_start(&config).await.unwrap();
-
-        let storage = RocksDBStorage::create_for_format(&config.storage_dir).unwrap();
-        let mount_table = MountTable::load_from_storage(&storage).unwrap();
+        let (storage, mount_table) = open_metadata_storage(&config).unwrap();
         assert!(storage.get_inode(ROOT_INODE_ID).unwrap().is_some());
-        let mounts = mount_table.list_mounts();
-        assert_eq!(mounts.len(), 1);
-        let root = &mounts[0];
+        let root = mount_table.root().unwrap();
         assert_eq!(root.mount_id, MountId::new(1));
-        assert_eq!(root.mount_prefix, ROOT_MOUNT_PREFIX);
-        assert_eq!(root.mount_kind, MountKind::Internal);
-        assert_eq!(root.data_io_policy, DataIoPolicy::Allow);
         assert_eq!(root.namespace_owner_group_name, GroupName::parse("root").unwrap());
     }
 
     #[tokio::test]
-    async fn metadata_start_rejects_root_without_data_io() {
-        let dir = TempDir::new().unwrap();
-        let config = lifecycle_config(&dir);
-        format_metadata_storage(&config).await.unwrap();
-        let storage = RocksDBStorage::create_for_format(&config.storage_dir).unwrap();
-        let mut root = MountTable::load_from_storage(&storage)
-            .unwrap()
-            .list_mounts()
-            .into_iter()
-            .find(|mount| mount.mount_prefix == ROOT_MOUNT_PREFIX)
-            .expect("root mount after format");
-        root.data_io_policy = DataIoPolicy::Forbid;
-        storage.put_mount(&root).unwrap();
-        drop(storage);
+    async fn metadata_start_rejects_wrong_root_owner_and_missing_root_inode() {
+        for missing_inode in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let config = lifecycle_config(&dir);
+            format_metadata_storage(&config).await.unwrap();
+            let (storage, mount_table) = open_metadata_storage(&config).unwrap();
+            if missing_inode {
+                storage
+                    .with_db(|db| {
+                        let mut key = b"inode/".to_vec();
+                        key.extend_from_slice(&ROOT_INODE_ID.as_raw().to_be_bytes());
+                        db.delete_cf(db.cf_handle("inodes").unwrap(), key).unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+            } else {
+                let mut root = mount_table.root().unwrap();
+                root.namespace_owner_group_name = GroupName::parse("other").unwrap();
+                storage.put_mount(&root).unwrap();
+            }
+            drop(storage);
 
-        let err = prepare_metadata_start(&config)
-            .await
-            .expect_err("root must be writable for data IO on start");
-        let message = err.to_string();
-
-        assert!(message.contains("root mount exists"), "{message}");
-        assert!(message.contains("violates root invariants"), "{message}");
+            let error =
+                crate::runtime::MetadataServer::build(Arc::new(config), tokio_util::sync::CancellationToken::new())
+                    .await
+                    .err()
+                    .expect("invalid persisted root must reject startup");
+            let expected = if missing_inode {
+                "root inode missing"
+            } else {
+                "root mount exists but violates root invariants"
+            };
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 }

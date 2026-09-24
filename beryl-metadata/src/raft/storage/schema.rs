@@ -4,93 +4,82 @@
 //! RocksDB schema, identity, and open policy.
 
 use super::{
-    decode_from_slice, durable_raft_write_options, encode_to_vec, standard, Arc, ColumnFamilyDescriptor, DetachedRoot,
-    GenerationHandle, GenerationWriteGuard, InodeId, MetadataError, MetadataResult, Options, Path, PinnedGeneration,
-    RocksDBStorage, StagedGeneration, StorageIdentity, CF_DENTRIES, CF_DETACHED_ROOTS, CF_INODES, CF_META, CF_MOUNTS,
-    CF_RAFT_LOG, CF_RAFT_SNAPSHOT, CF_RAFT_STATE, CF_WORKERS, CURRENT_CFS, DB, ROCKSDB_SCHEMA_VERSION,
+    decode_from_slice, durable_raft_write_options, encode_to_vec, standard, ColumnFamilyDescriptor, MetadataError,
+    MetadataResult, Options, Path, RocksDBStorage, StorageIdentity, CF_DENTRIES, CF_DETACHED_ROOTS, CF_INODES, CF_META,
+    CF_MOUNTS, CF_RAFT_LOG, CF_RAFT_SNAPSHOT, CF_RAFT_STATE, CF_WORKERS, CURRENT_CFS, DB, ROCKSDB_SCHEMA_VERSION,
     ROCKSDB_SCHEMA_VERSION_KEY, STORAGE_IDENTITY_KEY,
 };
 use rocksdb::{IteratorMode, Snapshot};
-use std::path::PathBuf;
+use std::fs::{self, File};
 
 impl RocksDBStorage {
-    /// Create RocksDB state for `metadata format`.
+    /// Initialize a fixed database directory before publishing it for format recovery.
     pub fn create_for_format<P: AsRef<Path>>(path: P) -> MetadataResult<Self> {
-        Self::open_with_create_policy(path, true)
+        let root = path.as_ref();
+        fs::create_dir_all(root).map_err(|error| directory_error("create storage root", root, error))?;
+        let snapshot_dir = root.join("snapshots");
+        fs::create_dir_all(&snapshot_dir)
+            .map_err(|error| directory_error("create snapshot directory", &snapshot_dir, error))?;
+        let database_path = root.join("db");
+        if !database_path.exists() {
+            // An unpublished database contains no authority; format can recreate it.
+            let temporary_path = root.join("db.tmp");
+            if temporary_path.exists() {
+                fs::remove_dir_all(&temporary_path)
+                    .map_err(|error| directory_error("remove incomplete database", &temporary_path, error))?;
+            }
+            fs::create_dir(&temporary_path)
+                .map_err(|error| directory_error("create database directory", &temporary_path, error))?;
+            drop(open_database(&temporary_path, true)?);
+            sync_directory(&temporary_path)?;
+            fs::rename(&temporary_path, &database_path)
+                .map_err(|error| directory_error("publish database directory", &database_path, error))?;
+            sync_directory(root)?;
+        }
+        Self::open_existing_for_start(root)
     }
 
-    /// Open already formatted RocksDB state for `metadata start`.
+    /// Open existing storage without creating or repairing its directories.
     pub fn open_existing_for_start<P: AsRef<Path>>(path: P) -> MetadataResult<Self> {
-        Self::open_with_create_policy(path, false)
+        let root = path.as_ref();
+        let database_path = root.join("db");
+        let metadata = fs::symlink_metadata(&database_path)
+            .map_err(|error| missing_rocksdb_state_error(&database_path, &error.to_string()))?;
+        if !metadata.file_type().is_dir() {
+            return Err(missing_rocksdb_state_error(
+                &database_path,
+                "expected a database directory",
+            ));
+        }
+        let snapshot_dir = root.join("snapshots");
+        if !snapshot_dir.is_dir() {
+            return Err(missing_rocksdb_state_error(
+                &snapshot_dir,
+                "snapshot directory is missing",
+            ));
+        }
+        Ok(Self {
+            db: open_database(&database_path, false)?,
+            snapshot_dir,
+        })
     }
 
-    fn open_with_create_policy<P: AsRef<Path>>(path: P, create_missing: bool) -> MetadataResult<Self> {
-        let path_buf = path.as_ref().to_path_buf();
-        let generations = if create_missing {
-            GenerationHandle::open_for_format(&path_buf, open_generation_db)?
-        } else {
-            GenerationHandle::open_for_start(&path_buf, open_generation_db)
-                .map_err(|error| missing_rocksdb_state_error(&path_buf, &error.to_string()))?
-        };
-        let storage = Self { generations };
-        Ok(storage)
+    pub(crate) fn db(&self) -> &DB {
+        &self.db
     }
 
-    pub(crate) fn pin_generation(&self) -> MetadataResult<PinnedGeneration<'_>> {
-        self.generations.pin()
-    }
-
-    pub(crate) fn generation_write(&self) -> MetadataResult<GenerationWriteGuard<'_>> {
-        self.generations.write()
-    }
-
-    pub(crate) fn create_staged_generation(&self) -> MetadataResult<StagedGeneration> {
-        self.generations.create_staged(open_generation_db)
-    }
-
-    pub(crate) fn publish_staged_generation_with<B, A>(
-        &self,
-        staged: StagedGeneration,
-        before_switch: B,
-        after_switch: A,
-    ) -> MetadataResult<()>
-    where
-        B: FnOnce(&DB, &DB) -> MetadataResult<()>,
-        A: FnOnce(&DB) -> MetadataResult<()>,
-    {
-        self.generation_write()?.publish_staged_with(
-            staged,
-            open_generation_db,
-            |old, staged| before_switch(old.db(), staged.db()),
-            |new| after_switch(new.db()),
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn cleanup_retired_generations(&self) -> MetadataResult<()> {
-        self.generations.cleanup_retired()
-    }
-
-    pub(crate) fn cleanup_unreferenced_generations(&self) -> MetadataResult<()> {
-        self.generations.cleanup_unreferenced()
-    }
-
-    pub(crate) fn with_pinned_snapshot<T>(
+    pub(crate) fn with_snapshot<T>(
         &self,
         operation: impl FnOnce(&DB, &Snapshot<'_>) -> MetadataResult<T>,
     ) -> MetadataResult<T> {
-        let generation = self.pin_generation()?;
-        let snapshot = generation.db().snapshot();
-        operation(generation.db(), &snapshot)
+        let snapshot = self.db().snapshot();
+        operation(self.db(), &snapshot)
     }
 
     /// Bind a pristine formatted database to one lifecycle marker identity.
     pub(crate) fn bind_storage_identity(&self, expected: &StorageIdentity) -> MetadataResult<()> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let meta = db
-            .cf_handle(CF_META)
-            .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
+        let db = self.db();
+        let meta = RocksDBStorage::cf(db, CF_META)?;
         match db.get_cf(meta, STORAGE_IDENTITY_KEY) {
             Ok(Some(raw)) => {
                 let actual: StorageIdentity = decode_from_slice(&raw, standard())
@@ -123,11 +112,8 @@ impl RocksDBStorage {
     }
 
     pub(crate) fn storage_identity(&self) -> MetadataResult<StorageIdentity> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let meta = db
-            .cf_handle(CF_META)
-            .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
+        let db = self.db();
+        let meta = RocksDBStorage::cf(db, CF_META)?;
         let raw = db
             .get_cf(meta, STORAGE_IDENTITY_KEY)
             .map_err(|error| MetadataError::Internal(format!("failed to read storage identity: {error}")))?
@@ -140,12 +126,12 @@ impl RocksDBStorage {
     }
 
     /// Directory where snapshot files are materialized.
-    pub fn snapshot_dir(&self) -> PathBuf {
-        self.generations.snapshot_dir()
+    pub fn snapshot_dir(&self) -> &Path {
+        &self.snapshot_dir
     }
 }
 
-fn open_generation_db(path: &Path, create_missing: bool) -> MetadataResult<Arc<DB>> {
+fn open_database(path: &Path, create_missing: bool) -> MetadataResult<DB> {
     let mut options = Options::default();
     options.create_if_missing(create_missing);
     options.create_missing_column_families(create_missing);
@@ -172,7 +158,7 @@ fn open_generation_db(path: &Path, create_missing: bool) -> MetadataResult<Arc<D
     let db = DB::open_cf_descriptors(&options, path, descriptors).map_err(|error| {
         if create_missing {
             MetadataError::Internal(format!(
-                "failed to create RocksDB generation at {}: {error}",
+                "failed to create RocksDB database at {}: {error}",
                 path.display()
             ))
         } else {
@@ -203,7 +189,7 @@ fn open_generation_db(path: &Path, create_missing: bool) -> MetadataResult<Arc<D
                 )));
             }
         }
-        Ok(None) if create_missing && can_initialize_missing_schema(&db)? => {
+        Ok(None) if create_missing => {
             let encoded = encode_to_vec(ROCKSDB_SCHEMA_VERSION, standard()).map_err(|error| {
                 MetadataError::Internal(format!("failed to encode RocksDB schema version: {error}"))
             })?;
@@ -242,15 +228,11 @@ fn open_generation_db(path: &Path, create_missing: bool) -> MetadataResult<Arc<D
         )));
     }
     validate_detached_root_records(&db)?;
-    Ok(Arc::new(db))
+    Ok(db)
 }
 
 fn is_current_column_family(name: &str) -> bool {
     CURRENT_CFS.contains(&name)
-}
-
-fn can_initialize_missing_schema(db: &DB) -> MetadataResult<bool> {
-    database_is_pristine(db, &[])
 }
 
 fn can_bind_storage_identity(db: &DB) -> MetadataResult<bool> {
@@ -268,18 +250,14 @@ fn database_is_pristine(db: &DB, allowed_meta_keys: &[&[u8]]) -> MetadataResult<
         CF_DENTRIES,
         CF_DETACHED_ROOTS,
     ] {
-        let cf = db
-            .cf_handle(name)
-            .ok_or_else(|| MetadataError::Internal(format!("{name} CF not found")))?;
+        let cf = RocksDBStorage::cf(db, name)?;
         if let Some(item) = db.iterator_cf(cf, IteratorMode::Start).next() {
             item.map_err(|error| MetadataError::Internal(format!("failed to inspect {name} CF: {error}")))?;
             return Ok(false);
         }
     }
 
-    let meta = db
-        .cf_handle(CF_META)
-        .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
+    let meta = RocksDBStorage::cf(db, CF_META)?;
     for item in db.iterator_cf(meta, IteratorMode::Start) {
         let (key, _) = item.map_err(|error| MetadataError::Internal(format!("failed to inspect meta CF: {error}")))?;
         if !allowed_meta_keys.iter().any(|allowed| *allowed == key.as_ref()) {
@@ -306,43 +284,15 @@ pub(super) fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
         .collect()
 }
 
-/// Validate every durable marker before a generation becomes authoritative.
+/// Validate every durable marker before serving metadata authority.
 pub(super) fn validate_detached_root_records(db: &DB) -> MetadataResult<()> {
-    let cf = db
-        .cf_handle(CF_DETACHED_ROOTS)
-        .ok_or_else(|| MetadataError::Internal("Detached roots CF not found".to_string()))?;
+    let cf = RocksDBStorage::cf(db, CF_DETACHED_ROOTS)?;
     for item in db.iterator_cf(cf, IteratorMode::Start) {
         let (key, value) =
             item.map_err(|error| MetadataError::Internal(format!("failed to inspect detached roots: {error}")))?;
-        if key.len() != 8 {
-            return Err(MetadataError::InvalidArgument(format!(
-                "invalid detached-root key length {}; reformat metadata storage",
-                key.len()
-            )));
-        }
-        let inode_id = InodeId::from_be_bytes(key.as_ref().try_into().expect("detached-root key length was checked"));
-        if inode_id.as_raw() == 0 {
-            return Err(MetadataError::InvalidArgument(
-                "detached-root inode ID must be non-zero; reformat metadata storage".to_string(),
-            ));
-        }
-        let (detached_root, consumed): (DetachedRoot, usize) =
-            decode_from_slice(&value, standard()).map_err(|error| {
-                MetadataError::InvalidArgument(format!(
-                    "invalid detached-root record for inode {inode_id}: {error}; reformat metadata storage"
-                ))
-            })?;
-        if consumed != value.len() {
-            return Err(MetadataError::InvalidArgument(format!(
-                "detached-root inode {inode_id} has {} trailing value bytes; reformat metadata storage",
-                value.len() - consumed
-            )));
-        }
-        if detached_root.mount_id.as_raw() == 0 {
-            return Err(MetadataError::InvalidArgument(format!(
-                "detached-root inode {inode_id} has zero mount ID; reformat metadata storage"
-            )));
-        }
+        let decoded = RocksDBStorage::decode_detached_root_key(&key)
+            .and_then(|inode_id| RocksDBStorage::decode_detached_root(inode_id, &value));
+        decoded.map_err(|error| MetadataError::InvalidArgument(format!("{error}; reformat metadata storage")))?;
     }
     Ok(())
 }
@@ -354,20 +304,50 @@ fn missing_rocksdb_state_error(path: &Path, detail: &str) -> MetadataError {
     ))
 }
 
+fn sync_directory(path: &Path) -> MetadataResult<()> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| directory_error("sync directory", path, error))
+}
+
+fn directory_error(operation: &str, path: &Path, error: std::io::Error) -> MetadataError {
+    MetadataError::Internal(format!("{operation} {}: {error}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::inode::Inode;
     use crate::inode::InodeAttrs;
 
-    use beryl_types::MountId;
+    use beryl_types::{InodeId, MountId};
     use tempfile::TempDir;
 
     impl RocksDBStorage {
-        pub(crate) fn with_pinned_db<T>(&self, operation: impl FnOnce(&DB) -> MetadataResult<T>) -> MetadataResult<T> {
-            let generation = self.pin_generation()?;
-            operation(generation.db())
+        pub(crate) fn with_db<T>(&self, operation: impl FnOnce(&DB) -> MetadataResult<T>) -> MetadataResult<T> {
+            operation(self.db())
         }
+    }
+
+    #[test]
+    fn format_recovers_unpublished_database_and_preserves_published_authority() {
+        let dir = TempDir::new().unwrap();
+        let temporary_path = dir.path().join("db.tmp");
+        fs::create_dir(&temporary_path).unwrap();
+        fs::write(temporary_path.join("incomplete"), b"interrupted initialization").unwrap();
+        assert!(RocksDBStorage::open_existing_for_start(dir.path()).is_err());
+        assert!(temporary_path.join("incomplete").exists());
+
+        let inode = Inode::new_dir(InodeId::new(1), InodeAttrs::new(), MountId::new(1));
+        let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
+        storage.put_inode(&inode).unwrap();
+        drop(storage);
+
+        let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
+        assert_eq!(storage.get_inode(inode.inode_id).unwrap(), Some(inode.clone()));
+        drop(storage);
+        let storage = RocksDBStorage::open_existing_for_start(dir.path()).unwrap();
+        assert_eq!(storage.get_inode(inode.inode_id).unwrap(), Some(inode));
     }
 
     #[test]
@@ -377,8 +357,8 @@ mod tests {
             let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
             drop(storage);
 
-            let generation_path = dir.path().join("generations/gen-000001");
-            let db = DB::open_cf_descriptors(&Options::default(), &generation_path, cf_descriptors()).unwrap();
+            let database_path = dir.path().join("db");
+            let db = DB::open_cf_descriptors(&Options::default(), &database_path, cf_descriptors()).unwrap();
             let meta = db.cf_handle(CF_META).unwrap();
             let unsupported = bincode::serde::encode_to_vec(unsupported_version, bincode::config::standard()).unwrap();
             db.put_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY, &unsupported).unwrap();
@@ -400,7 +380,7 @@ mod tests {
                 "unexpected startup error: {error}"
             );
 
-            let db = DB::open_cf_descriptors(&Options::default(), generation_path, cf_descriptors()).unwrap();
+            let db = DB::open_cf_descriptors(&Options::default(), database_path, cf_descriptors()).unwrap();
             let meta = db.cf_handle(CF_META).unwrap();
             assert_eq!(
                 db.get_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY).unwrap().as_deref(),
@@ -414,7 +394,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
         storage
-            .with_pinned_db(|db| {
+            .with_db(|db| {
                 let detached_roots = db.cf_handle(CF_DETACHED_ROOTS).unwrap();
                 db.put_cf(detached_roots, b"short", b"invalid")
                     .map_err(|error| MetadataError::Internal(error.to_string()))
@@ -427,7 +407,7 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("invalid detached-root key length"));
+        assert!(error.to_string().contains("Invalid detached-root key length"));
         assert!(error.to_string().contains("reformat metadata storage"));
     }
 
@@ -439,7 +419,7 @@ mod tests {
             .put_inode(&Inode::new_dir(InodeId::new(1), InodeAttrs::new(), MountId::new(1)))
             .unwrap();
         storage
-            .with_pinned_db(|db| {
+            .with_db(|db| {
                 let meta = db.cf_handle(CF_META).unwrap();
                 db.delete_cf(meta, ROCKSDB_SCHEMA_VERSION_KEY).unwrap();
                 Ok(())
