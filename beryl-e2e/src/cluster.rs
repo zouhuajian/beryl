@@ -23,7 +23,7 @@ use beryl_worker::control::{
     prepare_worker_start, BlockCleanupRuntime, MetadataBlockReportLoop, MetadataHeartbeatLoop, MetadataRegistrar,
 };
 use beryl_worker::store::dirs::StoreDirs;
-use beryl_worker::WorkerCore;
+use beryl_worker::WorkerRuntime;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -561,14 +561,14 @@ fn start_worker_instance(
         worker_config.store.reserve_space_bytes,
         worker_config.store.check_interval_ms,
     )?);
-    let worker_core = Arc::new(WorkerCore::with_local_store(
+    let worker_runtime = Arc::new(WorkerRuntime::with_local_store(
         worker_config.metadata.group_name.clone(),
         worker_config.default_frame_size,
         worker_config.max_frame_size,
         Arc::clone(&block_store) as Arc<dyn beryl_worker::store::block::LocalBlockStore + Send + Sync>,
     ));
     let cleanup = BlockCleanupRuntime::start(
-        Arc::clone(&worker_core),
+        Arc::clone(&worker_runtime),
         Arc::clone(&registration_state),
         worker_config.block_cleanup.clone(),
     )?;
@@ -583,13 +583,13 @@ fn start_worker_instance(
         worker_config.metadata.clone(),
         Arc::clone(&registration_state),
         Arc::clone(&block_store),
-        Arc::clone(&worker_core),
+        Arc::clone(&worker_runtime),
         worker_config.block_report_batch_size,
         Duration::from_millis(worker_config.block_report_delta_flush_interval_ms),
     )?);
     let worker_server = WorkerServiceInstance::start(
         listener,
-        worker_core,
+        worker_runtime,
         Arc::clone(&registration_state),
         worker_config.metadata.clone(),
     );

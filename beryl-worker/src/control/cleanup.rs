@@ -6,7 +6,7 @@
 use crate::config::BlockCleanupOptions;
 use crate::control::{Registration, RegistrationState};
 use crate::error::WorkerError;
-use crate::{observe, ReclaimBlockRequest, ReclaimBlockResult, WorkerCore};
+use crate::{observe, ReclaimBlockRequest, ReclaimBlockResult, WorkerRuntime};
 use beryl_types::{BlockId, GroupName, WorkerId, WorkerRunId};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -33,7 +33,7 @@ enum CleanupPhase {
 }
 
 struct BlockCleanupInner {
-    core: Arc<WorkerCore>,
+    worker_runtime: Arc<WorkerRuntime>,
     registrations: Arc<RegistrationState>,
     options: BlockCleanupOptions,
     pending: Mutex<HashMap<CleanupReplicaKey, CleanupPhase>>,
@@ -66,11 +66,11 @@ pub struct BlockCleanupRuntime {
 impl BlockCleanupRuntime {
     /// Starts cleanup with an explicit process-owned task handle.
     pub fn start(
-        core: Arc<WorkerCore>,
+        worker_runtime: Arc<WorkerRuntime>,
         registrations: Arc<RegistrationState>,
         options: BlockCleanupOptions,
     ) -> Result<Self, WorkerError> {
-        let (executor, receiver) = BlockCleanupExecutor::build(core, registrations, options)?;
+        let (executor, receiver) = BlockCleanupExecutor::build(worker_runtime, registrations, options)?;
         let shutdown = CancellationToken::new();
         let force = CancellationToken::new();
         let task = tokio::spawn(run_executor(
@@ -124,7 +124,7 @@ impl Drop for BlockCleanupRuntime {
 
 impl BlockCleanupExecutor {
     fn build(
-        core: Arc<WorkerCore>,
+        worker_runtime: Arc<WorkerRuntime>,
         registrations: Arc<RegistrationState>,
         options: BlockCleanupOptions,
     ) -> Result<(Self, Receiver<CleanupReplicaKey>), WorkerError> {
@@ -133,7 +133,7 @@ impl BlockCleanupExecutor {
             .map_err(|error| WorkerError::InvalidArgument(error.message))?;
         let (sender, receiver) = mpsc::channel(options.max_pending);
         let inner = Arc::new(BlockCleanupInner {
-            core,
+            worker_runtime,
             registrations,
             concurrency: Arc::new(Semaphore::new(options.max_concurrent)),
             options,
@@ -283,7 +283,7 @@ async fn run_cleanup_task(inner: Arc<BlockCleanupInner>, key: CleanupReplicaKey)
             group_name: key.group_name.clone(),
             block_id: key.block_id,
         };
-        match inner.core.reclaim_block(request).await {
+        match inner.worker_runtime.reclaim_block(request).await {
             Ok(ReclaimBlockResult::Deleted { .. }) => {
                 finish_task(&inner, &key);
                 observe::record_cleanup_result("deleted");
@@ -555,14 +555,14 @@ mod tests {
             let run_id = WorkerRunId::new();
             let registrations = registered(run_id);
             let store = Arc::new(ControlledStore::new(ReclaimBehavior::Fail));
-            let core = Arc::new(WorkerCore::with_local_store(
+            let worker_runtime = Arc::new(WorkerRuntime::with_local_store(
                 GroupName::parse("root").unwrap(),
                 1_024,
                 1_024,
                 store.clone(),
             ));
             let runtime = BlockCleanupRuntime::start(
-                core,
+                worker_runtime,
                 registrations,
                 BlockCleanupOptions {
                     max_pending: 2,
@@ -596,13 +596,13 @@ mod tests {
         registrations: Arc<RegistrationState>,
         options: BlockCleanupOptions,
     ) -> BlockCleanupRuntime {
-        let core = Arc::new(WorkerCore::with_local_store(
+        let worker_runtime = Arc::new(WorkerRuntime::with_local_store(
             GroupName::parse("root").unwrap(),
             1_024,
             1_024,
             store,
         ));
-        BlockCleanupRuntime::start(core, registrations, options).expect("start cleanup executor")
+        BlockCleanupRuntime::start(worker_runtime, registrations, options).expect("start cleanup executor")
     }
 
     fn registered(run_id: WorkerRunId) -> Arc<RegistrationState> {

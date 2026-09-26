@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Worker core domain types and data-plane facade.
+//! Worker-local block execution and resource lifecycle.
 
 use crate::error::{WorkerError, WorkerResult};
 use crate::observe;
@@ -91,9 +91,9 @@ impl ActiveBlockWrite {
     }
 }
 
-/// Data-plane lifecycle boundary used by the gRPC service.
+/// Coordinates worker-local block IO, access fencing, and write cleanup.
 #[derive(Clone)]
-pub struct WorkerCore {
+pub struct WorkerRuntime {
     default_frame_size: u32,
     max_frame_size: u32,
     block_access: Arc<BlockAccessRegistry>,
@@ -101,9 +101,9 @@ pub struct WorkerCore {
     block_writes: Arc<BlockWriteRegistry>,
 }
 
-impl WorkerCore {
-    /// Creates a Worker data core and tracks reclaim reports for `group_name`.
-    /// The report loop must use the same group as this core and its store.
+impl WorkerRuntime {
+    /// Creates a Worker runtime and tracks reclaim reports for `group_name`.
+    /// The report loop must use the same group as this runtime and its store.
     pub fn with_local_store(
         group_name: GroupName,
         default_frame_size: u32,
@@ -634,7 +634,7 @@ fn begin_active_write_io(write: &ActiveBlockWrite) -> WorkerResult<BlockWriteIoG
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadBlockRequest, WorkerCore, WriteBlockRequest};
+    use super::{ReadBlockRequest, WorkerRuntime, WriteBlockRequest};
     use crate::error::{WorkerError, WorkerResult};
     use crate::runtime::DataRpcPermit;
     use crate::store::block::{BlockMetaPayload, BlockState};
@@ -682,7 +682,7 @@ mod tests {
         }
     }
 
-    impl WorkerCore {
+    impl WorkerRuntime {
         async fn begin_test_write(
             &self,
             req: WriteBlockRequest,
@@ -705,11 +705,11 @@ mod tests {
         Arc::new(rpc_permit(Arc::new(Semaphore::new(1)), "read"))
     }
 
-    fn core_with_store() -> (TempDir, Arc<FullBlockFileStore>, WorkerCore) {
+    fn runtime_with_store() -> (TempDir, Arc<FullBlockFileStore>, WorkerRuntime) {
         let temp = TempDir::new().expect("tempdir");
         let store = Arc::new(FullBlockFileStore::new(temp.path().to_path_buf()));
-        let core = WorkerCore::with_local_store(group_name(), 512, 2048, store.clone());
-        (temp, store, core)
+        let worker_runtime = WorkerRuntime::with_local_store(group_name(), 512, 2048, store.clone());
+        (temp, store, worker_runtime)
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -782,16 +782,16 @@ mod tests {
         }
     }
 
-    struct BlockingCoreFixture {
+    struct BlockingRuntimeFixture {
         _temp: TempDir,
         store: Arc<FullBlockFileStore>,
-        core: Arc<WorkerCore>,
+        worker_runtime: Arc<WorkerRuntime>,
         started: Receiver<()>,
         release: Sender<()>,
         abort_calls: Arc<AtomicUsize>,
     }
 
-    fn blocking_core(operation: BlockingOperation) -> BlockingCoreFixture {
+    fn blocking_runtime(operation: BlockingOperation) -> BlockingRuntimeFixture {
         let temp = TempDir::new().expect("tempdir");
         let inner = Arc::new(FullBlockFileStore::new(temp.path().to_path_buf()));
         let (started_tx, started_rx) = mpsc::channel();
@@ -804,11 +804,11 @@ mod tests {
             release: Mutex::new(release_rx),
             abort_calls: Arc::clone(&abort_calls),
         });
-        let core = Arc::new(WorkerCore::with_local_store(group_name(), 512, 2048, store));
-        BlockingCoreFixture {
+        let worker_runtime = Arc::new(WorkerRuntime::with_local_store(group_name(), 512, 2048, store));
+        BlockingRuntimeFixture {
             _temp: temp,
             store: inner,
-            core,
+            worker_runtime,
             started: started_rx,
             release: release_tx,
             abort_calls,
@@ -847,49 +847,50 @@ mod tests {
             )
             .unwrap(),
         );
-        let core = WorkerCore::with_local_store(group_name(), 512, 2048, store.clone());
+        let worker_runtime = WorkerRuntime::with_local_store(group_name(), 512, 2048, store.clone());
         let mut request = write_request();
         request.write_offset = 1;
         assert!(matches!(
-            core.begin_test_write(request, write_rpc_permit()).await,
+            worker_runtime.begin_test_write(request, write_rpc_permit()).await,
             Err(WorkerError::Corrupt(_))
         ));
-        let mut write = core
+        let mut write = worker_runtime
             .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("begin write");
-        core.write_block_data(&mut write, Bytes::from_static(b"partial"))
+        worker_runtime
+            .write_block_data(&mut write, Bytes::from_static(b"partial"))
             .await
             .expect("partial data");
         drop(write);
         assert!(
-            !core
+            !worker_runtime
                 .drain_block_writes_until(Instant::now() + Duration::from_secs(1))
                 .await
         );
 
-        let reused = core
+        let reused = worker_runtime
             .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("reuse block");
-        core.abort_block_write(reused).await.expect("abort reuse");
+        worker_runtime.abort_block_write(reused).await.expect("abort reuse");
         assert_eq!(store.report().free_bytes, BLOCK_SIZE);
     }
 
     #[tokio::test]
     async fn cancelled_create_stays_owned_until_blocking_io_exits() {
-        let BlockingCoreFixture {
+        let BlockingRuntimeFixture {
             _temp,
             store: _store,
-            core,
+            worker_runtime,
             started,
             release,
             abort_calls: _abort_calls,
-        } = blocking_core(BlockingOperation::Create);
+        } = blocking_runtime(BlockingOperation::Create);
         let write_slots = Arc::new(Semaphore::new(1));
         let rpc_permit = rpc_permit(Arc::clone(&write_slots), "write");
-        let task_core = Arc::clone(&core);
-        let write = tokio::spawn(async move { task_core.begin_test_write(write_request(), rpc_permit).await });
+        let task_runtime = Arc::clone(&worker_runtime);
+        let write = tokio::spawn(async move { task_runtime.begin_test_write(write_request(), rpc_permit).await });
         tokio::task::spawn_blocking(move || started.recv().expect("blocking create started"))
             .await
             .expect("wait for create");
@@ -901,44 +902,49 @@ mod tests {
         }
         assert_eq!(write_slots.available_permits(), 0);
         assert!(
-            core.drain_block_writes_until(Instant::now() + Duration::from_millis(50))
+            worker_runtime
+                .drain_block_writes_until(Instant::now() + Duration::from_millis(50))
                 .await,
             "cleanup must not release ownership while create IO is still running"
         );
 
         release.send(()).expect("release create");
         assert!(
-            !core
+            !worker_runtime
                 .drain_block_writes_until(Instant::now() + Duration::from_secs(1))
                 .await
         );
         assert_eq!(write_slots.available_permits(), 1);
-        let reused = core
+        let reused = worker_runtime
             .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("reuse after cleanup");
-        core.abort_block_write(reused).await.expect("abort reused write");
+        worker_runtime
+            .abort_block_write(reused)
+            .await
+            .expect("abort reused write");
     }
 
     #[tokio::test]
     async fn cancelled_publish_cannot_be_cleaned_before_ready_io_exits() {
-        let BlockingCoreFixture {
+        let BlockingRuntimeFixture {
             _temp,
             store,
-            core,
+            worker_runtime,
             started,
             release,
             abort_calls: _abort_calls,
-        } = blocking_core(BlockingOperation::Publish);
-        let mut write = core
+        } = blocking_runtime(BlockingOperation::Publish);
+        let mut write = worker_runtime
             .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("begin write");
-        core.write_block_data(&mut write, Bytes::from_static(b"ready"))
+        worker_runtime
+            .write_block_data(&mut write, Bytes::from_static(b"ready"))
             .await
             .expect("write data");
-        let task_core = Arc::clone(&core);
-        let publish = tokio::spawn(async move { task_core.finish_block_write(&mut write).await });
+        let task_runtime = Arc::clone(&worker_runtime);
+        let publish = tokio::spawn(async move { task_runtime.finish_block_write(&mut write).await });
         tokio::task::spawn_blocking(move || started.recv().expect("blocking publish started"))
             .await
             .expect("wait for publish");
@@ -946,14 +952,15 @@ mod tests {
         publish.abort();
         assert!(publish.await.expect_err("finish write cancelled").is_cancelled());
         assert!(
-            core.drain_block_writes_until(Instant::now() + Duration::from_millis(50))
+            worker_runtime
+                .drain_block_writes_until(Instant::now() + Duration::from_millis(50))
                 .await,
             "cleanup must not race a detached publish"
         );
 
         release.send(()).expect("release publish");
         assert!(
-            !core
+            !worker_runtime
                 .drain_block_writes_until(Instant::now() + Duration::from_secs(1))
                 .await
         );
@@ -964,22 +971,22 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_cleanup_waiter_keeps_claim_owned_until_abort_finishes() {
-        let BlockingCoreFixture {
+        let BlockingRuntimeFixture {
             _temp,
             store: _store,
-            core,
+            worker_runtime,
             started,
             release,
             abort_calls,
-        } = blocking_core(BlockingOperation::Abort);
-        let write = core
+        } = blocking_runtime(BlockingOperation::Abort);
+        let write = worker_runtime
             .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("begin write");
         drop(write);
 
-        let cleanup_core = Arc::clone(&core);
-        let cleanup = tokio::spawn(async move { cleanup_core.cleanup_block_write_batch(false).await });
+        let cleanup_runtime = Arc::clone(&worker_runtime);
+        let cleanup = tokio::spawn(async move { cleanup_runtime.cleanup_block_write_batch(false).await });
         tokio::task::spawn_blocking(move || started.recv().expect("blocking abort started"))
             .await
             .expect("wait for abort");
@@ -987,12 +994,16 @@ mod tests {
         assert!(cleanup.await.expect_err("cleanup waiter cancelled").is_cancelled());
 
         assert!(
-            core.drain_block_writes_until(Instant::now() + Duration::from_millis(50))
+            worker_runtime
+                .drain_block_writes_until(Instant::now() + Duration::from_millis(50))
                 .await,
             "a second cleanup pass must wait for the claimed abort"
         );
         assert_eq!(abort_calls.load(Ordering::SeqCst), 1);
-        match core.begin_test_write(write_request(), write_rpc_permit()).await {
+        match worker_runtime
+            .begin_test_write(write_request(), write_rpc_permit())
+            .await
+        {
             Err(WorkerError::ResourceExhausted(_)) => {}
             Err(error) => panic!("unexpected reuse error while cleanup is claimed: {error:?}"),
             Ok(_) => panic!("new write must not replace an entry with cleanup in progress"),
@@ -1000,36 +1011,39 @@ mod tests {
 
         release.send(()).expect("release abort");
         assert!(
-            !core
+            !worker_runtime
                 .drain_block_writes_until(Instant::now() + Duration::from_secs(1))
                 .await
         );
-        let reused = core
+        let reused = worker_runtime
             .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("reuse after claimed cleanup exits");
-        core.abort_block_write(reused).await.expect("abort reused write");
+        worker_runtime
+            .abort_block_write(reused)
+            .await
+            .expect("abort reused write");
     }
 
     #[tokio::test]
     async fn drain_deadline_detaches_owned_cleanup_and_returns_forced() {
-        let BlockingCoreFixture {
+        let BlockingRuntimeFixture {
             _temp,
             store: _store,
-            core,
+            worker_runtime,
             started,
             release,
             abort_calls,
-        } = blocking_core(BlockingOperation::Abort);
-        let write = core
+        } = blocking_runtime(BlockingOperation::Abort);
+        let write = worker_runtime
             .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("begin write");
         drop(write);
 
-        let drain_core = Arc::clone(&core);
+        let drain_runtime = Arc::clone(&worker_runtime);
         let drain = tokio::spawn(async move {
-            drain_core
+            drain_runtime
                 .drain_block_writes_until(Instant::now() + Duration::from_millis(50))
                 .await
         });
@@ -1048,123 +1062,116 @@ mod tests {
 
         release.send(()).expect("release drain abort");
         assert!(
-            !core
+            !worker_runtime
                 .drain_block_writes_until(Instant::now() + Duration::from_secs(1))
                 .await
         );
-        let reused = core
+        let reused = worker_runtime
             .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("reuse after detached cleanup exits");
-        core.abort_block_write(reused).await.expect("abort reused write");
+        worker_runtime
+            .abort_block_write(reused)
+            .await
+            .expect("abort reused write");
     }
 
     #[tokio::test]
     async fn block_write_rejects_empty_and_capacity_overflow() {
-        let (_temp, _store, core) = core_with_store();
+        let (_temp, _store, worker_runtime) = runtime_with_store();
         let mut request = write_request();
         request.block_size = 3;
-        let mut write = core
+        let mut write = worker_runtime
             .begin_test_write(request, write_rpc_permit())
             .await
             .expect("begin write");
-        assert!(core.write_block_data(&mut write, Bytes::new()).await.is_err());
-        assert!(core
+        assert!(worker_runtime.write_block_data(&mut write, Bytes::new()).await.is_err());
+        assert!(worker_runtime
             .write_block_data(&mut write, Bytes::from_static(b"four"))
             .await
             .is_err());
-        core.abort_block_write(write).await.expect("abort");
+        worker_runtime.abort_block_write(write).await.expect("abort");
     }
 
     #[tokio::test]
     async fn cancelled_blocking_read_keeps_reclaim_pin_until_io_exits() {
-        let (_temp, store, core) = core_with_store();
-        let mut write = core
+        let BlockingRuntimeFixture {
+            _temp,
+            worker_runtime,
+            started,
+            release,
+            ..
+        } = blocking_runtime(BlockingOperation::Read);
+        let mut write = worker_runtime
             .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("begin write");
-        core.write_block_data(&mut write, Bytes::from_static(b"abcdefgh"))
+        worker_runtime
+            .write_block_data(&mut write, Bytes::from_static(b"abcdefgh"))
             .await
             .expect("write data");
-        core.finish_block_write(&mut write).await.expect("finish write");
-        drop(core);
-
-        let (started_tx, started_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let blocking_store: Arc<dyn LocalBlockStore + Send + Sync> = Arc::new(BlockingStore {
-            inner: store,
-            operation: BlockingOperation::Read,
-            started: Mutex::new(Some(started_tx)),
-            release: Mutex::new(release_rx),
-            abort_calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let core = Arc::new(WorkerCore::with_local_store(group_name(), 512, 2048, blocking_store));
+        worker_runtime
+            .finish_block_write(&mut write)
+            .await
+            .expect("finish write");
         let read_slots = Arc::new(Semaphore::new(1));
         let rpc_permit = Arc::new(rpc_permit(Arc::clone(&read_slots), "read"));
-        let mut read = core
+        let mut read = worker_runtime
             .begin_block_read(read_request(8), rpc_permit)
             .await
             .expect("begin read");
-        let read_core = Arc::clone(&core);
-        let read_task = tokio::spawn(async move { read_core.read_block_chunk(&mut read).await });
-        tokio::task::spawn_blocking(move || started_rx.recv().expect("blocking read started"))
+        let read_runtime = Arc::clone(&worker_runtime);
+        let read_task = tokio::spawn(async move { read_runtime.read_block_chunk(&mut read).await });
+        tokio::task::spawn_blocking(move || started.recv().expect("blocking read started"))
             .await
             .expect("wait for read");
         read_task.abort();
         assert!(read_task.await.expect_err("read task cancelled").is_cancelled());
         assert_eq!(read_slots.available_permits(), 0);
 
-        let reclaim_core = core.as_ref().clone();
-        let reclaim = tokio::spawn(async move {
-            reclaim_core
-                .reclaim_block(ReclaimBlockRequest {
-                    group_name: group_name(),
-                    block_id: block_id(),
-                })
-                .await
+        let reclaim = worker_runtime.reclaim_block(ReclaimBlockRequest {
+            group_name: group_name(),
+            block_id: block_id(),
         });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                match core.begin_block_read(read_request(1), read_rpc_permit()).await {
-                    Err(WorkerError::RefreshMetadata {
-                        kind: ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
-                        ..
-                    }) => break,
-                    Ok(extra) => drop(extra),
-                    Err(error) => panic!("unexpected read-open result while reclaim starts: {error:?}"),
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("reclaim starts");
-        assert!(!reclaim.is_finished(), "reclaim passed cancelled blocking IO");
+        tokio::pin!(reclaim);
+        assert!(
+            futures::poll!(&mut reclaim).is_pending(),
+            "reclaim passed cancelled blocking IO"
+        );
+        assert!(matches!(
+            worker_runtime
+                .begin_block_read(read_request(1), read_rpc_permit())
+                .await,
+            Err(WorkerError::RefreshMetadata {
+                kind: ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
+                ..
+            })
+        ));
 
-        release_tx.send(()).expect("release read");
+        release.send(()).expect("release read");
         assert!(tokio::time::timeout(Duration::from_secs(1), reclaim)
             .await
             .expect("reclaim completes")
-            .expect("reclaim task")
             .is_ok());
         assert_eq!(read_slots.available_permits(), 1);
     }
     #[tokio::test]
     async fn new_epoch_waits_for_old_io_and_fences_the_lingering_stream() {
-        let BlockingCoreFixture {
+        let BlockingRuntimeFixture {
             _temp,
             store,
-            core,
+            worker_runtime,
             started,
             release,
             ..
-        } = blocking_core(BlockingOperation::Write);
-        let mut old = core
+        } = blocking_runtime(BlockingOperation::Write);
+        let mut old = worker_runtime
             .begin_test_write(write_request(), write_rpc_permit())
             .await
             .unwrap();
-        let old_core = core.clone();
+        let old_runtime = worker_runtime.clone();
         let io = tokio::spawn(async move {
-            old_core
+            old_runtime
                 .write_block_data(&mut old, Bytes::from_static(b"orphan"))
                 .await
                 .unwrap();
@@ -1175,10 +1182,10 @@ mod tests {
             .unwrap();
         let mut next = write_request();
         next.fencing_token.epoch = beryl_types::LeaseEpoch::new(56);
-        let takeover = core.begin_test_write(next, write_rpc_permit());
+        let takeover = worker_runtime.begin_test_write(next, write_rpc_permit());
         tokio::pin!(takeover);
         assert!(futures::poll!(&mut takeover).is_pending());
-        core.cleanup_block_write_batch(false).await;
+        worker_runtime.cleanup_block_write_batch(false).await;
         assert!(
             futures::poll!(&mut takeover).is_pending(),
             "actual IO pins old ownership"
@@ -1194,40 +1201,41 @@ mod tests {
         );
         release.send(()).unwrap();
         let mut old = io.await.unwrap();
-        assert!(core
+        assert!(worker_runtime
             .write_block_data(&mut old, Bytes::from_static(b"late"))
             .await
             .is_err());
-        core.cleanup_block_write_batch(false).await;
+        worker_runtime.cleanup_block_write_batch(false).await;
         let mut new = takeover.await.unwrap();
         assert!(
-            core.finish_block_write(&mut old).await.is_err(),
+            worker_runtime.finish_block_write(&mut old).await.is_err(),
             "old EOF cannot checkpoint the new epoch"
         );
-        core.write_block_data(&mut new, Bytes::from_static(b"new"))
+        worker_runtime
+            .write_block_data(&mut new, Bytes::from_static(b"new"))
             .await
             .unwrap();
-        core.finish_block_write(&mut new).await.unwrap();
+        worker_runtime.finish_block_write(&mut new).await.unwrap();
         assert_eq!(store.read_at(&group_name(), block_id(), 0, 3).unwrap(), b"new"[..]);
     }
 
     #[tokio::test]
     async fn reclaim_fences_authorization_that_finishes_after_the_delete_gate() {
-        let (_temp, store, core) = core_with_store();
+        let (_temp, store, worker_runtime) = runtime_with_store();
         let request = write_request();
-        let pending_authorization = core.pin_write_authorization(&request).unwrap();
-        let reclaim = core.reclaim_block(ReclaimBlockRequest {
+        let pending_authorization = worker_runtime.pin_write_authorization(&request).unwrap();
+        let reclaim = worker_runtime.reclaim_block(ReclaimBlockRequest {
             group_name: group_name(),
             block_id: block_id(),
         });
         tokio::pin!(reclaim);
         assert!(futures::poll!(&mut reclaim).is_pending());
-        assert!(core.pin_write_authorization(&request).is_err());
-        assert!(core
+        assert!(worker_runtime.pin_write_authorization(&request).is_err());
+        assert!(worker_runtime
             .begin_block_write(request, write_rpc_permit(), pending_authorization, 0)
             .await
             .is_err());
-        core.cleanup_block_write_batch(false).await;
+        worker_runtime.cleanup_block_write_batch(false).await;
         assert_eq!(reclaim.await.unwrap(), ReclaimBlockResult::AlreadyAbsent);
         assert!(matches!(
             store.load_meta(&group_name(), block_id()),

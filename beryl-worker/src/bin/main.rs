@@ -22,7 +22,7 @@ use beryl_worker::{
     },
     net, observe,
     store::dirs::StoreDirs,
-    WorkerCore,
+    WorkerRuntime,
 };
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::task::{JoinError, JoinHandle};
@@ -193,14 +193,14 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
         signal_result?;
         return Ok(());
     }
-    let core = Arc::new(WorkerCore::with_local_store(
+    let worker_runtime = Arc::new(WorkerRuntime::with_local_store(
         config.metadata.group_name.clone(),
         config.default_frame_size,
         config.max_frame_size,
         block_store.clone(),
     ));
     let cleanup = match BlockCleanupRuntime::start(
-        Arc::clone(&core),
+        Arc::clone(&worker_runtime),
         Arc::clone(&registration_state),
         config.block_cleanup.clone(),
     ) {
@@ -229,7 +229,7 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
         config.metadata.clone(),
         Arc::clone(&registration_state),
         Arc::clone(&block_store),
-        Arc::clone(&core),
+        Arc::clone(&worker_runtime),
         config.block_report_batch_size,
         Duration::from_millis(config.block_report_delta_flush_interval_ms),
     ) {
@@ -275,7 +275,7 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
     let mut rpc = match net::spawn_worker_data_with_registration(
         config.rpc_bind_addr(),
         &config.net,
-        Arc::clone(&core),
+        Arc::clone(&worker_runtime),
         Arc::clone(&registration_state),
         &config.metadata,
     ) {
@@ -295,9 +295,9 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
     );
     let block_report_handle = block_report.spawn_until_shutdown(background_shutdown.child_token());
     let write_cleanup_handle = {
-        let core = Arc::clone(&core);
+        let worker_runtime = Arc::clone(&worker_runtime);
         let shutdown = background_shutdown.child_token();
-        tokio::spawn(async move { core.run_block_write_cleanup(shutdown).await })
+        tokio::spawn(async move { worker_runtime.run_block_write_cleanup(shutdown).await })
     };
 
     let mut stop_error = None;
@@ -322,7 +322,7 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
     let deadline = Instant::now() + Duration::from_millis(config.shutdown_timeout_ms);
     let rpc_and_writes = async {
         let rpc_result = rpc.shutdown_until(deadline).await;
-        let write_drain_forced = core.drain_block_writes_until(deadline).await;
+        let write_drain_forced = worker_runtime.drain_block_writes_until(deadline).await;
         (rpc_result, write_drain_forced)
     };
     let (

@@ -8,7 +8,7 @@ use std::{path::Path, process::Stdio};
 use beryl_proto::worker::worker_data_service_server::WorkerDataServiceServer;
 use beryl_worker::control::RegistrationState;
 use beryl_worker::net::WorkerDataServiceImpl;
-use beryl_worker::WorkerCore;
+use beryl_worker::WorkerRuntime;
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
@@ -86,13 +86,13 @@ pub struct WorkerServiceInstance {
 impl WorkerServiceInstance {
     pub fn start(
         listener: TcpListener,
-        core: Arc<WorkerCore>,
+        worker_runtime: Arc<WorkerRuntime>,
         registration_state: Arc<RegistrationState>,
         metadata: beryl_worker::config::WorkerRegistrationConfig,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let service = WorkerDataServiceImpl::new(core, registration_state, 64, 32, &metadata)
+            let service = WorkerDataServiceImpl::new(worker_runtime, registration_state, 64, 32, &metadata)
                 .expect("data service configuration");
             Server::builder()
                 .add_service(WorkerDataServiceServer::new(service))

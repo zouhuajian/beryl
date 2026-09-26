@@ -26,7 +26,7 @@ use beryl_worker::store::block::{
     CheckpointBlockRequest, FullBlockFileStore, LocalBlockStore, OpenBlockWriteRequest, ReclaimBlockRequest,
 };
 use beryl_worker::store::dirs::StoreDirs;
-use beryl_worker::{ReclaimBlockResult, WorkerCore};
+use beryl_worker::{ReclaimBlockResult, WorkerRuntime};
 use bytes::Bytes;
 use futures::StreamExt;
 use std::collections::{BTreeMap, VecDeque};
@@ -282,8 +282,8 @@ fn report_store(temp: &TempDir) -> Arc<StoreDirs> {
     )
 }
 
-fn test_worker_core(store: Arc<StoreDirs>) -> Arc<WorkerCore> {
-    Arc::new(WorkerCore::with_local_store(group_name(), 1024, 1024, store))
+fn test_worker_runtime(store: Arc<StoreDirs>) -> Arc<WorkerRuntime> {
+    Arc::new(WorkerRuntime::with_local_store(group_name(), 1024, 1024, store))
 }
 
 fn publish_ready_block_for(
@@ -618,9 +618,9 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_absent() {
     let temp = TempDir::new().expect("tempdir");
     let store = report_store(&temp);
     publish_ready_block_for(store.as_ref(), group_name(), block_id(), payload(), 101);
-    let core = test_worker_core(Arc::clone(&store));
+    let worker_runtime = test_worker_runtime(Arc::clone(&store));
     let cleanup_runtime = BlockCleanupRuntime::start(
-        Arc::clone(&core),
+        Arc::clone(&worker_runtime),
         Arc::clone(&state),
         BlockCleanupOptions {
             max_pending: 4,
@@ -643,14 +643,14 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_absent() {
         test_registration_config(endpoint),
         Arc::clone(&state),
         Arc::clone(&store),
-        Arc::clone(&core),
+        Arc::clone(&worker_runtime),
         beryl_types::MAX_REPORT_ENTRIES,
         Duration::from_secs(1),
     )
     .expect("block reporter");
 
     let service = WorkerDataServiceImpl::new(
-        Arc::clone(&core),
+        Arc::clone(&worker_runtime),
         Arc::clone(&state),
         64,
         32,
@@ -771,12 +771,12 @@ async fn block_report_loop_sends_coalesced_present_and_absent_entries_on_store_c
     let store = report_store(&temp);
     let first = BlockId::new(InodeId::new(7), BlockIndex::new(0));
     let second = BlockId::new(InodeId::new(7), BlockIndex::new(1));
-    let core = test_worker_core(Arc::clone(&store));
+    let worker_runtime = test_worker_runtime(Arc::clone(&store));
     let reporter = MetadataBlockReportLoop::new(
         test_registration_config(endpoint),
         Arc::clone(&state),
         Arc::clone(&store),
-        Arc::clone(&core),
+        Arc::clone(&worker_runtime),
         beryl_types::MAX_REPORT_ENTRIES,
         Duration::from_millis(20),
     )
@@ -809,12 +809,13 @@ async fn block_report_loop_sends_coalesced_present_and_absent_entries_on_store_c
     );
 
     assert_eq!(
-        core.reclaim_block(ReclaimBlockRequest {
-            group_name: group_name(),
-            block_id: first,
-        })
-        .await
-        .expect("reclaim Ready block"),
+        worker_runtime
+            .reclaim_block(ReclaimBlockRequest {
+                group_name: group_name(),
+                block_id: first,
+            })
+            .await
+            .expect("reclaim Ready block"),
         ReclaimBlockResult::Deleted {
             effective_len: BLOCK_SIZE
         }
@@ -859,7 +860,7 @@ async fn result_unknown_retries_immutable_batches_and_preserves_newer_changes() 
         test_registration_config(endpoint),
         Arc::clone(&state),
         Arc::clone(&store),
-        test_worker_core(Arc::clone(&store)),
+        test_worker_runtime(Arc::clone(&store)),
         1,
         Duration::from_secs(1),
     )
@@ -960,7 +961,7 @@ async fn full_report_rejects_acknowledgement_beyond_local_batches() {
         test_registration_config(endpoint),
         Arc::clone(&state),
         Arc::clone(&store),
-        test_worker_core(Arc::clone(&store)),
+        test_worker_runtime(Arc::clone(&store)),
         1,
         Duration::from_secs(1),
     )
@@ -1014,7 +1015,7 @@ async fn startup_deleting_recovery_precedes_first_full_block_report() {
         test_registration_config(endpoint),
         Arc::clone(&state),
         Arc::clone(&store),
-        test_worker_core(Arc::clone(&store)),
+        test_worker_runtime(Arc::clone(&store)),
         beryl_types::MAX_REPORT_ENTRIES,
         Duration::from_secs(1),
     )
@@ -1043,7 +1044,7 @@ async fn block_report_waits_for_registration_and_heartbeat_readiness() {
         test_registration_config(endpoint),
         Arc::clone(&state),
         Arc::clone(&store),
-        test_worker_core(Arc::clone(&store)),
+        test_worker_runtime(Arc::clone(&store)),
         beryl_types::MAX_REPORT_ENTRIES,
         Duration::from_secs(1),
     )

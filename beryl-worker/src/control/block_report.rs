@@ -30,7 +30,7 @@ use crate::observe;
 use crate::report::DirtyBlock;
 use crate::store::block::{BlockMetaPayload, BlockState};
 use crate::store::dirs::StoreDirs;
-use crate::WorkerCore;
+use crate::WorkerRuntime;
 
 /// Configuration, retryable transport, and fatal protocol failures from reporting.
 #[derive(Debug, Error)]
@@ -108,7 +108,7 @@ pub struct MetadataBlockReportLoop {
     state: Arc<RegistrationState>,
     endpoint: Endpoint,
     store: Arc<StoreDirs>,
-    core: Arc<WorkerCore>,
+    worker_runtime: Arc<WorkerRuntime>,
     batch_size: usize,
     delta_flush_interval: Duration,
     control_identity: ControlIdentity,
@@ -121,7 +121,7 @@ impl MetadataBlockReportLoop {
         config: WorkerRegistrationConfig,
         state: Arc<RegistrationState>,
         store: Arc<StoreDirs>,
-        core: Arc<WorkerCore>,
+        worker_runtime: Arc<WorkerRuntime>,
         batch_size: usize,
         delta_flush_interval: Duration,
     ) -> Result<Self, BlockReportError> {
@@ -135,7 +135,7 @@ impl MetadataBlockReportLoop {
         }
         validate_batch_limit(batch_size)?;
         if store.block_report_changes().group_name != config.group_name
-            || core.block_report_changes().group_name != config.group_name
+            || worker_runtime.block_report_changes().group_name != config.group_name
         {
             return Err(BlockReportError::InvalidConfig(
                 "block report sources must track the configured group".into(),
@@ -147,7 +147,7 @@ impl MetadataBlockReportLoop {
             state,
             endpoint,
             store,
-            core,
+            worker_runtime,
             batch_size,
             delta_flush_interval,
             control_identity: ControlIdentity::new_local(),
@@ -247,7 +247,7 @@ impl MetadataBlockReportLoop {
         }
 
         let store_snapshot_revision = self.store.block_report_changes().begin_full_snapshot();
-        let runtime_snapshot_revision = self.core.block_report_changes().begin_full_snapshot();
+        let runtime_snapshot_revision = self.worker_runtime.block_report_changes().begin_full_snapshot();
         let blocks = self.scan_report_blocks()?;
         report.next_baseline_seq = report
             .next_baseline_seq
@@ -291,7 +291,7 @@ impl MetadataBlockReportLoop {
                 return Ok(DeltaPreparation::FullRequired);
             }
         };
-        let runtime_dirty = match self.core.block_report_changes().snapshot() {
+        let runtime_dirty = match self.worker_runtime.block_report_changes().snapshot() {
             Ok(dirty) => dirty,
             Err(()) => {
                 reset_baseline(&mut report);
@@ -325,7 +325,7 @@ impl MetadataBlockReportLoop {
         group_name: &GroupName,
         block_id: BlockId,
     ) -> Result<DeltaBlockReportEntryProto, BlockReportError> {
-        if self.core.is_reclaiming(group_name, block_id) {
+        if self.worker_runtime.is_reclaiming(group_name, block_id) {
             return Ok(present_entry(ReportedBlockProto {
                 block_id: Some(block_id.into()),
                 lease_epoch: 0,
@@ -355,7 +355,7 @@ impl MetadataBlockReportLoop {
         for meta in metas {
             blocks.insert(meta.block_id, meta_to_report_block(meta));
         }
-        for block_id in self.core.reclaiming_blocks(&self.config.group_name) {
+        for block_id in self.worker_runtime.reclaiming_blocks(&self.config.group_name) {
             blocks.insert(
                 block_id,
                 ReportedBlockProto {
@@ -384,7 +384,7 @@ impl MetadataBlockReportLoop {
             .block_report_changes()
             .acknowledge_full(full.store_snapshot_revision);
         let runtime_continuous = self
-            .core
+            .worker_runtime
             .block_report_changes()
             .acknowledge_full(full.runtime_snapshot_revision);
         report.full_inflight = None;
@@ -441,7 +441,7 @@ impl MetadataBlockReportLoop {
             })
             .collect::<Vec<_>>();
         self.store.block_report_changes().acknowledge(&store_ack);
-        self.core.block_report_changes().acknowledge(&runtime_ack);
+        self.worker_runtime.block_report_changes().acknowledge(&runtime_ack);
         report.delta_inflight = None;
         report.next_delta_batch_seq = next_batch_seq;
         Ok(())
@@ -610,7 +610,7 @@ impl MetadataBlockReportLoop {
                 _ = shutdown.cancelled() => return,
                 _ = interval.tick() => {}
                 _ = self.store.wait_for_block_report_change() => {}
-                _ = self.core.wait_for_block_report_change() => {}
+                _ = self.worker_runtime.wait_for_block_report_change() => {}
             }
             let report = async {
                 if self.has_delta_baseline() {
