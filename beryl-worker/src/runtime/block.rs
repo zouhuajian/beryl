@@ -30,11 +30,11 @@ pub(crate) struct BlockAccessRegistry {
     block_report_changes: BlockReportChangeTracker,
 }
 
-/// RAII guard that keeps a Ready block available for one complete read RPC.
+/// RAII guard that keeps reclamation behind authorized access and pending authorization.
 ///
-/// The guard is acquired before local metadata validation so cleanup cannot pass
-/// between validation and response-stream ownership. A blocking read clones the
-/// guard so cancellation cannot release reclamation before filesystem IO exits.
+/// Acquired before read validation or online write authorization, it does not
+/// establish block existence, readiness, or Metadata authority. Reads and writes
+/// retain the pin until their filesystem IO and required cleanup have finished.
 #[derive(Clone, Debug)]
 pub(crate) struct BlockPin {
     _inner: Arc<BlockPinInner>,
@@ -67,10 +67,10 @@ impl Drop for BlockPinInner {
     }
 }
 
-/// Exclusive permission to reclaim one local block after all prior readers exit.
+/// Exclusive permission to reclaim one local block after all prior access pins exit.
 ///
 /// A failed or cancelled operation leaves the block in `Reclaiming` so new
-/// readers remain rejected and a later cleanup retry can safely resume.
+/// access remains rejected and a later cleanup retry can safely resume.
 #[derive(Debug)]
 pub(crate) struct ReclaimPermit {
     registry: Arc<BlockAccessRegistry>,
@@ -129,7 +129,7 @@ impl BlockAccessRegistry {
         }
     }
 
-    /// Atomically pins an available block or rejects a read after reclaim starts.
+    /// Atomically pins one block identity or rejects access after reclaim starts.
     pub(crate) fn pin_block(self: &Arc<Self>, group_name: &GroupName, block_id: BlockId) -> WorkerResult<BlockPin> {
         let key = BlockIdentity {
             group_name: group_name.clone(),
@@ -162,7 +162,7 @@ impl BlockAccessRegistry {
         })
     }
 
-    /// Starts or resumes reclamation and waits for all previously pinned readers.
+    /// Starts or resumes reclamation, closing admission before existing pins drain.
     pub(crate) fn begin_reclaim(
         self: &Arc<Self>,
         group_name: &GroupName,
