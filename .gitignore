@@ -1,0 +1,62 @@
+# =========================
+# Rust / Cargo
+# =========================
+/target/
+/**/target/
+
+
+# Rustfmt / clippy / coverage artifacts
+*.rlib
+*.rmeta
+*.d
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# =========================
+# IDE / Editor
+# =========================
+# IntelliJ / RustRover
+.idea/
+*.iml
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# CLion / JetBrains
+cmake-build-*/
+out/
+
+# Vim / Emacs / swap
+*~
+*.swp
+*.swo
+*.tmp
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# =========================
+# Language Server / Tooling
+# =========================
+# rust-analyzer
+rust-analyzer.log
+# Flycheck (your tree has target/flycheck0, but ignore generic cases too)
+flycheck*
+**/flycheck*
+
+# =========================
+# Logs / Runtime data
+# =========================
+*.log
+logs/
+log/
